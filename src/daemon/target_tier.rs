@@ -13,20 +13,25 @@
 //!
 //! 1. cargo structure at its top: `CACHEDIR.TAG` or `.rustc_info.json`;
 //! 2. pure: its top level holds only what cargo writes there (`debug`,
-//!    `release`, `release-*` profiles, `doc`, `tmp`, `package`, a target
-//!    triple such as `wasm32-wasip1`, the two marker files and cargo's lock
-//!    and report files) plus the macOS `.DS_Store` and
-//!    `.metadata_never_index`; anything else, benchmark baselines included,
-//!    makes it work, not output;
+//!    `release`, `release-*` profiles holding a build, `doc`, an empty
+//!    `tmp`, `package`, a target triple such as `wasm32-wasip1`, the two
+//!    marker files and cargo's lock and report files) plus the macOS
+//!    `.DS_Store` and `.metadata_never_index`; anything else, benchmark
+//!    baselines included, makes it work, not output;
 //! 3. no `.sbh-protect` marker in it, inside it or in a directory between it
-//!    and the root, and no `.git` inside it;
-//! 4. nothing inside it modified within `scanner.target_only_idle_hours`;
+//!    and the root, no `.git` inside it, and not at or below one of
+//!    `scanner.excluded_paths`;
+//! 4. within `scanner.target_only_idle_hours`, the directory was neither
+//!    created nor modified (the walker's age rule) and nothing inside it was
+//!    modified;
 //! 5. no process holds a file open in it or works inside it.
 //!
 //! The survivors are scored like any candidate and reach the executor as a
-//! target-only batch: the policy mode, the decision ledger, dampening, the
-//! certainty gate, the planner and every executor check still apply. Only
-//! the operator's `protected_paths` patterns are not applied to these paths.
+//! target-only batch pinned to the inodes surveyed: the policy mode, the
+//! decision ledger, dampening, the certainty gate, the planner and every
+//! executor check still apply, and the executor drops any candidate outside
+//! the root. Only the `protected_paths` patterns that protect the root as a
+//! whole are not applied; one naming something inside it still is.
 //! Everything else under the root stays untouchable, and with no roots
 //! configured the tier never reads the disk.
 
@@ -63,12 +68,18 @@ pub const PASS_INTERVAL: Duration = Duration::from_mins(10);
 const MAX_DEPTH: usize = 6;
 /// Directories one discovery may read.
 const MAX_DIRECTORIES: usize = 50_000;
+/// Entries discovery reads from one directory; a larger listing is skipped
+/// and leaves the root uncovered.
+const MAX_LISTING_ENTRIES: usize = 65_536;
 /// Wall time of one discovery.
 const DISCOVERY_BUDGET: Duration = Duration::from_secs(30);
 /// Entries one candidate's survey may visit before it fails closed.
 const SURVEY_MAX_ENTRIES: u64 = 2_000_000;
-/// Wall time for surveying all of one pass's candidates.
+/// Wall time for surveying all of one root's candidates.
 const SURVEY_BUDGET: Duration = Duration::from_secs(120);
+/// Shortest gap between two checks of whether any root is due, so the main
+/// loop does not expand the root patterns on every tick.
+const PROBE_INTERVAL: Duration = Duration::from_mins(1);
 
 /// What one pass found under one root.
 #[derive(Debug, Default)]
@@ -167,7 +178,8 @@ fn is_cargo_entry(name: &str, is_dir: bool) -> bool {
     }
 }
 
-/// A custom profile derived from release, such as `release-lto`.
+/// A custom profile derived from release, such as `release-lto`, by name;
+/// [`holds_what_cargo_writes`] also checks its contents.
 fn is_release_profile(name: &str) -> bool {
     name.strip_prefix("release-").is_some_and(|profile| {
         !profile.is_empty()
@@ -179,8 +191,16 @@ fn is_release_profile(name: &str) -> bool {
 
 /// A rustc target triple such as `x86_64-unknown-linux-gnu`,
 /// `aarch64-apple-darwin` or `wasm32-wasip1`: cargo's output dir for
-/// `--target`. A custom profile dir (`release-lto`) is not one.
+/// `--target`. Its second part must be a vendor or OS rustc uses, so an
+/// agent's `x86_64-trace` or `arm-e2e` is not one, nor is a custom profile
+/// dir (`release-lto`). A custom target spec's dir is not recognized, which
+/// keeps its target dir.
 fn is_target_triple(name: &str) -> bool {
+    const VENDORS_AND_SYSTEMS: &[&str] = &[
+        "unknown", "apple", "pc", "none", "linux", "wasi", "wasip1", "wasip2", "uwp", "fortanix",
+        "nvidia", "sun", "ibm", "esp", "esp32", "kmc", "sony", "nintendo", "win7", "wrs",
+        "unikraft", "lynx", "amd", "openwrt", "fuchsia",
+    ];
     const ARCHES: &[&str] = &[
         "x86_64",
         "i386",
@@ -192,6 +212,7 @@ fn is_target_triple(name: &str) -> bool {
         "arm64e",
         "arm",
         "wasm32",
+        "wasm32v1",
         "wasm64",
         "s390x",
         "loongarch64",
@@ -214,13 +235,32 @@ fn is_target_triple(name: &str) -> bool {
             .iter()
             .any(|prefix| arch.starts_with(prefix));
     known_arch
-        && !rest.is_empty()
+        && rest
+            .first()
+            .is_some_and(|second| VENDORS_AND_SYSTEMS.contains(second))
         && rest.iter().all(|part| {
             !part.is_empty()
                 && part
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
         })
+}
+
+/// Whether a top-level directory cargo's name allows also holds what cargo
+/// puts there. `tmp` is `CARGO_TARGET_TMPDIR`, where integration tests may
+/// leave output someone wants, so it counts only while empty; a `release-*`
+/// name must hold a build (`deps`, `build`, `.fingerprint` or `incremental`),
+/// so `release-notes` does not pass for a profile.
+fn holds_what_cargo_writes(dir: &Path, name: &str) -> std::io::Result<bool> {
+    if name == "tmp" {
+        return Ok(fs::read_dir(dir)?.next().is_none());
+    }
+    if is_release_profile(name) {
+        return Ok(["deps", "build", ".fingerprint", "incremental"]
+            .iter()
+            .any(|inner| fs::symlink_metadata(dir.join(inner)).is_ok_and(|meta| meta.is_dir())));
+    }
+    Ok(true)
 }
 
 /// The first top-level entry of `dir` that cargo did not write, or an error
@@ -230,7 +270,9 @@ fn first_impurity(dir: &Path) -> std::io::Result<Option<String>> {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let file_type = entry.file_type()?;
-        let pure = !file_type.is_symlink() && is_cargo_entry(&name, file_type.is_dir());
+        let pure = !file_type.is_symlink()
+            && is_cargo_entry(&name, file_type.is_dir())
+            && (!file_type.is_dir() || holds_what_cargo_writes(&entry.path(), &name)?);
         if !pure {
             return Ok(Some(name));
         }
@@ -238,26 +280,77 @@ fn first_impurity(dir: &Path) -> std::io::Result<Option<String>> {
     Ok(None)
 }
 
+/// Why a survey keeps its directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kept {
+    /// A `.sbh-protect` marker inside.
+    Marker,
+    /// A `.git` entry inside.
+    Git,
+    /// The directory or an entry changed after the idle cutoff, or is dated
+    /// in the future.
+    Recent,
+    /// A budget, another device or an unreadable entry ended the walk.
+    Unsurveyed,
+}
+
+impl Kept {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Marker => "protect_marker",
+            Self::Git => "git",
+            Self::Recent => "recent",
+            Self::Unsurveyed => "unsurveyed",
+        }
+    }
+}
+
 /// What a walk of one candidate found.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Survey {
+    /// The directory the walk started from, as the executor must find it.
+    identity: Option<FsIdentity>,
     newest: Option<SystemTime>,
     bytes: u64,
-    marker: bool,
-    git: bool,
-    complete: bool,
+    /// `None` only when the walk covered the whole directory and found
+    /// nothing that keeps it.
+    kept: Option<Kept>,
+}
+
+/// When the candidate itself arrived or last changed: the later of its
+/// modification and birth times, the walker's age rule, so a target copied
+/// in with preserved mtimes (`cp -a`, `rsync -a`, `tar x`) is not idle at
+/// once. Entries inside count by modification time.
+fn touched_at(meta: &fs::Metadata) -> Option<SystemTime> {
+    let modified = meta.modified().ok();
+    let created = meta.created().ok();
+    modified.max(created)
 }
 
 /// Walk `dir` without following symlinks or leaving its device. Stops at the
-/// first marker or `.git`; a budget, another device or an unreadable entry
-/// leaves the survey incomplete, which keeps the directory.
-fn survey(dir: &Path, deadline: Instant) -> Survey {
-    let mut found = Survey::default();
+/// first marker, `.git` or entry touched after `idle_cutoff`; a budget,
+/// another device or an unreadable entry leaves the survey incomplete, which
+/// keeps the directory.
+fn survey(dir: &Path, idle_cutoff: SystemTime, deadline: Instant) -> Survey {
+    let mut found = Survey {
+        identity: None,
+        newest: None,
+        bytes: 0,
+        kept: Some(Kept::Unsurveyed),
+    };
     let Ok(top) = fs::symlink_metadata(dir) else {
         return found;
     };
+    if !top.is_dir() {
+        return found;
+    }
+    found.identity = identity_of(&top);
     let device = device_of(&top);
-    found.newest = top.modified().ok();
+    found.newest = touched_at(&top);
+    if found.newest.is_some_and(|touched| touched > idle_cutoff) {
+        found.kept = Some(Kept::Recent);
+        return found;
+    }
     let mut entries = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -274,19 +367,23 @@ fn survey(dir: &Path, deadline: Instant) -> Survey {
             };
             let name = entry.file_name();
             if name == MARKER_FILENAME {
-                found.marker = true;
+                found.kept = Some(Kept::Marker);
                 return found;
             }
             if name == ".git" {
-                found.git = true;
+                found.kept = Some(Kept::Git);
                 return found;
             }
             let path = entry.path();
             let Ok(meta) = fs::symlink_metadata(&path) else {
                 return found;
             };
-            if let Ok(modified) = meta.modified() {
-                found.newest = Some(found.newest.map_or(modified, |newest| newest.max(modified)));
+            if let Ok(touched) = meta.modified() {
+                if touched > idle_cutoff {
+                    found.kept = Some(Kept::Recent);
+                    return found;
+                }
+                found.newest = Some(found.newest.map_or(touched, |newest| newest.max(touched)));
             }
             found.bytes = found.bytes.saturating_add(allocated_bytes(&meta));
             if meta.is_dir() {
@@ -297,7 +394,7 @@ fn survey(dir: &Path, deadline: Instant) -> Survey {
             }
         }
     }
-    found.complete = true;
+    found.kept = None;
     found
 }
 
@@ -349,6 +446,16 @@ fn identity_of(meta: &fs::Metadata) -> Option<FsIdentity> {
     }
 }
 
+/// The identity of the directory at `path` now, without following a final
+/// symlink; `None` when it is gone, not a directory, or off Unix.
+fn current_identity(path: &Path) -> Option<FsIdentity> {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(fs::Metadata::is_dir)
+        .as_ref()
+        .and_then(identity_of)
+}
+
 /// Names a listing holds that steer discovery.
 #[derive(Debug, Default)]
 struct Markers {
@@ -357,11 +464,24 @@ struct Markers {
     cargo: bool,
 }
 
-fn markers_in(dir: &Path) -> Option<(Markers, Vec<PathBuf>)> {
+/// Why a directory's listing gave discovery nothing to go on.
+enum Unlisted {
+    /// Unreadable: skipped, as the walker skips it.
+    Unreadable,
+    /// Over [`MAX_LISTING_ENTRIES`] or past the deadline: skipped, and the
+    /// root counts as not covered.
+    Budget,
+}
+
+fn markers_in(dir: &Path, deadline: Instant) -> Result<(Markers, Vec<PathBuf>), Unlisted> {
     let mut markers = Markers::default();
     let mut children = Vec::new();
-    for entry in fs::read_dir(dir).ok()? {
-        let entry = entry.ok()?;
+    let listing = fs::read_dir(dir).map_err(|_| Unlisted::Unreadable)?;
+    for (index, entry) in listing.enumerate() {
+        if index >= MAX_LISTING_ENTRIES || Instant::now() >= deadline {
+            return Err(Unlisted::Budget);
+        }
+        let entry = entry.map_err(|_| Unlisted::Unreadable)?;
         let name = entry.file_name();
         if name == MARKER_FILENAME {
             markers.protect = true;
@@ -375,19 +495,24 @@ fn markers_in(dir: &Path) -> Option<(Markers, Vec<PathBuf>)> {
         }
     }
     children.sort();
-    Some((markers, children))
+    Ok((markers, children))
 }
 
 /// Directories under `root` with cargo structure at their top, shallowest
-/// first. Never the root itself, and never below a candidate, a marker, a
-/// `.git` entry, another device or an unreadable directory. Returns whether
-/// the walk covered the root.
-fn discover(root: &Path, found: &mut Vec<PathBuf>) -> bool {
+/// first. Never the root itself, and never at or below a candidate, a marker,
+/// a `.git` entry, one of `excluded` (exact paths, as the walker takes
+/// `scanner.excluded_paths`), another device or an unreadable directory.
+/// Returns whether the walk covered the root.
+fn discover(root: &Path, excluded: &[PathBuf], found: &mut Vec<PathBuf>) -> bool {
     let deadline = Instant::now() + DISCOVERY_BUDGET;
     let Ok(root_meta) = fs::symlink_metadata(root) else {
         return false;
     };
+    if excluded.iter().any(|path| path == root) {
+        return true;
+    }
     let device = device_of(&root_meta);
+    let mut covered = true;
     let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
     let mut read = 0usize;
     while let Some((dir, depth)) = queue.pop_front() {
@@ -395,8 +520,13 @@ fn discover(root: &Path, found: &mut Vec<PathBuf>) -> bool {
         if read > MAX_DIRECTORIES || Instant::now() >= deadline {
             return false;
         }
-        let Some((markers, children)) = markers_in(&dir) else {
-            continue;
+        let (markers, children) = match markers_in(&dir, deadline) {
+            Ok(listing) => listing,
+            Err(Unlisted::Unreadable) => continue,
+            Err(Unlisted::Budget) => {
+                covered = false;
+                continue;
+            }
         };
         if markers.protect || markers.git {
             continue;
@@ -409,12 +539,65 @@ fn discover(root: &Path, found: &mut Vec<PathBuf>) -> bool {
             continue;
         }
         for child in children {
-            if fs::symlink_metadata(&child).is_ok_and(|meta| device_of(&meta) == device) {
+            if !excluded.contains(&child)
+                && fs::symlink_metadata(&child).is_ok_and(|meta| device_of(&meta) == device)
+            {
                 queue.push_back((child, depth + 1));
             }
         }
     }
-    true
+    covered
+}
+
+/// A discovered directory that passed the purity check and its survey.
+struct Checked {
+    /// Resolved: the reference index keys resolved paths, so a parent symlink
+    /// must not hide a process working inside the candidate.
+    path: PathBuf,
+    bytes: u64,
+    age: Duration,
+    identity: FsIdentity,
+}
+
+/// Purity, survey and identity checks for one discovered directory: the
+/// directory, or why it stays.
+fn check(
+    dir: &Path,
+    idle_cutoff: SystemTime,
+    now: SystemTime,
+    deadline: Instant,
+) -> std::result::Result<Checked, &'static str> {
+    match first_impurity(dir) {
+        Ok(None) => {}
+        Ok(Some(_)) => return Err("impure"),
+        Err(_) => return Err("unreadable"),
+    }
+    let facts = survey(dir, idle_cutoff, deadline);
+    if let Some(kept) = facts.kept {
+        return Err(kept.reason());
+    }
+    if facts.bytes == 0 {
+        return Err("empty");
+    }
+    let (Some(identity), Some(age)) = (
+        facts.identity,
+        facts
+            .newest
+            .and_then(|newest| now.duration_since(newest).ok()),
+    ) else {
+        return Err("unreadable");
+    };
+    // The resolved path must still be the directory surveyed.
+    let path = resolve_absolute_path(dir);
+    if current_identity(&path) != Some(identity) {
+        return Err("changed");
+    }
+    Ok(Checked {
+        path,
+        bytes: facts.bytes,
+        age,
+        identity,
+    })
 }
 
 /// Find, check and score target-only candidates under one root.
@@ -428,69 +611,43 @@ pub fn select(
 ) -> Selection {
     let mut selection = Selection::default();
     let mut found = Vec::new();
-    selection.complete = discover(root, &mut found);
+    selection.complete = discover(root, &config.scanner.excluded_paths, &mut found);
     selection.discovered = found.len();
 
     let idle = Duration::from_secs(config.scanner.target_only_idle_hours.saturating_mul(3600));
+    let idle_cutoff = now.checked_sub(idle).unwrap_or(SystemTime::UNIX_EPOCH);
     let deadline = Instant::now() + SURVEY_BUDGET;
     let mut checked = Vec::new();
     for dir in found {
-        match first_impurity(&dir) {
-            Ok(None) => {}
-            Ok(Some(_)) => {
-                selection.leave("impure");
-                continue;
-            }
-            Err(_) => {
-                selection.leave("unreadable");
-                continue;
-            }
-        }
-        let facts = survey(&dir, deadline);
-        let reason = if facts.marker {
-            Some("protect_marker")
-        } else if facts.git {
-            Some("git")
-        } else if !facts.complete {
-            Some("unsurveyed")
-        } else if facts.bytes == 0 {
-            Some("empty")
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            selection.leave(reason);
-            continue;
-        }
-        let age = facts
-            .newest
-            .and_then(|newest| now.duration_since(newest).ok());
-        match age {
-            // The reference index keys resolved paths: a parent symlink
-            // must not hide a process working inside the candidate.
-            Some(age) if age >= idle => {
-                checked.push((resolve_absolute_path(&dir), facts.bytes, age));
-            }
-            _ => selection.leave("recent"),
+        match check(&dir, idle_cutoff, now, deadline) {
+            Ok(candidate) => checked.push(candidate),
+            Err(reason) => selection.leave(reason),
         }
     }
     if checked.is_empty() {
         return selection;
     }
 
-    let paths: Vec<PathBuf> = checked.iter().map(|(dir, _, _)| dir.clone()).collect();
+    let paths: Vec<PathBuf> = checked
+        .iter()
+        .map(|candidate| candidate.path.clone())
+        .collect();
     let references = collect_active_reference_index(platform, &paths);
     let registry = ArtifactPatternRegistry::default();
     let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
-    for (dir, bytes, age) in checked {
-        let Some(identity) = fs::symlink_metadata(&dir)
-            .ok()
-            .as_ref()
-            .and_then(identity_of)
-        else {
-            selection.leave("unreadable");
+    for Checked {
+        path: dir,
+        bytes,
+        age,
+        identity,
+    } in checked
+    {
+        // The batch pins the surveyed inode, which the executor checks again
+        // before removal; a directory swapped since the survey is left.
+        if current_identity(&dir) != Some(identity) {
+            selection.leave("changed");
             continue;
-        };
+        }
         // An agent's target dir has any name (`target-wasm`, `cargo-target`):
         // with a valid CACHEDIR.TAG the classifier calls it a tagged cache.
         let signals = structural_signals_for_path(&dir);
@@ -549,6 +706,8 @@ pub struct DueRoot {
 pub struct TargetTier {
     running: Arc<AtomicBool>,
     last_start: Option<Instant>,
+    /// When the roots were last expanded to see whether one is due.
+    last_probe: Option<Instant>,
 }
 
 impl TargetTier {
@@ -568,9 +727,13 @@ impl TargetTier {
             || self
                 .last_start
                 .is_some_and(|last| now.saturating_duration_since(last) < PASS_INTERVAL)
+            || self
+                .last_probe
+                .is_some_and(|last| now.saturating_duration_since(last) < PROBE_INTERVAL)
         {
             return;
         }
+        self.last_probe = Some(now);
         let due: Vec<DueRoot> = expand_roots(&config.scanner.target_only_roots)
             .into_iter()
             .filter_map(|root| {
@@ -598,7 +761,13 @@ impl TargetTier {
             .spawn(move || {
                 let _guard = guard;
                 for root in due {
-                    let message = run_root(&root, &config, platform.as_ref(), &del_tx);
+                    let message = run_root(
+                        &root,
+                        &config,
+                        platform.as_ref(),
+                        &del_tx,
+                        SystemTime::now(),
+                    );
                     eprintln!("[SBH-TARGETS] {message}");
                     logger.send(ActivityEvent::Info { message });
                 }
@@ -617,8 +786,9 @@ fn run_root(
     config: &Config,
     platform: &dyn Platform,
     del_tx: &Sender<DeletionBatch>,
+    now: SystemTime,
 ) -> String {
-    let selection = select(&due.root, config, platform, due.urgency, SystemTime::now());
+    let selection = select(&due.root, config, platform, due.urgency, now);
     let summary = selection.summary(&due.root);
     if selection.candidates.is_empty() {
         return summary;
@@ -628,7 +798,9 @@ fn run_root(
         pressure_level: due.level,
         urgency: due.urgency,
         target_bytes: None,
-        target_only: true,
+        // Resolved like the candidates' paths, so the executor's containment
+        // check compares like with like.
+        target_only_root: Some(resolve_absolute_path(&due.root)),
     };
     match del_tx.try_send(batch) {
         Ok(()) => format!("{summary}; sent to the executor (level={:?})", due.level),
@@ -695,8 +867,23 @@ mod tests {
         (temp, root)
     }
 
+    /// The clock the tests select at. A directory's birth time cannot be set
+    /// back, and the tier counts a candidate's own birth time, so the tests
+    /// move the clock forward past the 24 h idle window instead: what `age`
+    /// set back 48 h, and anything created during the test, is idle then.
+    fn later() -> SystemTime {
+        SystemTime::now() + Duration::from_hours(25)
+    }
+
+    /// Set `path`'s times to `hours` after now (inside the window as seen
+    /// from [`later`]).
+    fn touch_ahead(path: &Path, hours: u64) {
+        let ahead = FileTime::from_system_time(SystemTime::now() + Duration::from_hours(hours));
+        set_symlink_file_times(path, ahead, ahead).unwrap();
+    }
+
     fn select_in(root: &Path, platform: &MockPlatform) -> Selection {
-        select(root, &Config::default(), platform, 0.5, SystemTime::now())
+        select(root, &Config::default(), platform, 0.5, later())
     }
 
     fn names(selection: &Selection) -> Vec<String> {
@@ -786,6 +973,7 @@ mod tests {
         cargo_target(&recent);
         age(&recent, 48);
         fs::write(recent.join("debug/deps/fresh.d"), b"x").unwrap();
+        touch_ahead(&recent.join("debug/deps/fresh.d"), 2);
 
         let selection = select_in(&root, &MockPlatform::healthy());
         assert!(
@@ -800,6 +988,115 @@ mod tests {
         assert_eq!(selection.left.get("recent"), Some(&1));
         // The four impure ones, the one marked inside and the recent one.
         assert_eq!(selection.discovered, 6);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_symlinks_future_times_and_non_cargo_contents_keep_a_target() {
+        let (_temp, root) = scratch_root();
+        for name in [
+            "target-git",
+            "target-symlink",
+            "target-future",
+            "target-release-notes",
+            "target-tmp-output",
+            "target-empty-tmp",
+        ] {
+            cargo_target(&root.join("s").join(name));
+        }
+        let dir = |name: &str| root.join("s").join(name);
+        fs::create_dir_all(dir("target-git").join("debug/vendored/.git")).unwrap();
+        std::os::unix::fs::symlink("debug", dir("target-symlink").join("debug-link")).unwrap();
+        fs::create_dir(dir("target-release-notes").join("release-notes")).unwrap();
+        fs::write(
+            dir("target-release-notes").join("release-notes/0.2.md"),
+            b"# notes\n",
+        )
+        .unwrap();
+        fs::create_dir(dir("target-tmp-output").join("tmp")).unwrap();
+        fs::write(dir("target-tmp-output").join("tmp/report.json"), b"{}").unwrap();
+        fs::create_dir(dir("target-empty-tmp").join("tmp")).unwrap();
+        age(&root, 48);
+        // In the future even as seen from `later`: fails closed.
+        touch_ahead(&dir("target-future").join("debug/deps/libdemo.rlib"), 48);
+
+        let selection = select_in(&root, &MockPlatform::healthy());
+        assert_eq!(
+            names(&selection),
+            ["target-empty-tmp"],
+            "{}",
+            selection.summary(&root)
+        );
+        assert_eq!(selection.left.get("impure"), Some(&3));
+        assert_eq!(selection.left.get("git"), Some(&1));
+        assert_eq!(selection.left.get("recent"), Some(&1));
+    }
+
+    #[test]
+    fn excluded_paths_are_not_walked() {
+        let (_temp, root) = scratch_root();
+        cargo_target(&root.join("s1/target"));
+        cargo_target(&root.join("s2/target"));
+        age(&root, 48);
+        let mut config = Config::default();
+        config.scanner.excluded_paths.push(root.join("s1"));
+
+        let selection = select(&root, &config, &MockPlatform::healthy(), 0.5, later());
+        assert_eq!(selection.discovered, 1);
+        assert_eq!(selection.candidates.len(), 1);
+        assert!(selection.candidates[0].path.ends_with("s2/target"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_replaced_after_its_survey_no_longer_matches_its_identity() {
+        let (_temp, root) = scratch_root();
+        let target = root.join("s1/target");
+        cargo_target(&target);
+        age(&root, 48);
+        let idle_cutoff = later() - Duration::from_hours(24);
+        let surveyed = survey(&target, idle_cutoff, Instant::now() + SURVEY_BUDGET);
+        assert_eq!(surveyed.kept, None);
+        assert_eq!(current_identity(&target), surveyed.identity);
+
+        // Swapped for another directory, or for a symlink to one.
+        fs::rename(&target, root.join("s1/moved")).unwrap();
+        cargo_target(&target);
+        assert!(surveyed.identity.is_some());
+        assert_ne!(current_identity(&target), surveyed.identity);
+        fs::remove_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(root.join("s1/moved"), &target).unwrap();
+        assert_eq!(current_identity(&target), None, "a symlink is not the dir");
+    }
+
+    #[test]
+    fn a_due_root_sends_one_target_only_batch_pinned_to_its_root() {
+        let (_temp, root) = scratch_root();
+        cargo_target(&root.join("s1/target"));
+        age(&root, 48);
+        let (del_tx, del_rx) = crossbeam_channel::bounded(1);
+        let due = DueRoot {
+            root: root.clone(),
+            level: PressureLevel::Red,
+            urgency: 0.8,
+        };
+
+        let summary = run_root(
+            &due,
+            &Config::default(),
+            &MockPlatform::healthy(),
+            &del_tx,
+            later(),
+        );
+        let batch = del_rx
+            .try_recv()
+            .unwrap_or_else(|_| panic!("no batch: {summary}"));
+        assert_eq!(batch.target_only_root, Some(resolve_absolute_path(&root)));
+        assert_eq!(batch.pressure_level, PressureLevel::Red);
+        assert_eq!(batch.candidates.len(), 1);
+        let candidate = &batch.candidates[0];
+        assert!(candidate.path.starts_with(resolve_absolute_path(&root)));
+        assert!(candidate.identity.is_some());
     }
 
     #[test]
@@ -913,6 +1210,8 @@ mod tests {
             "armv7-unknown-linux-gnueabihf",
             "thumbv7em-none-eabihf",
             "riscv64gc-unknown-linux-gnu",
+            "wasm32v1-none",
+            "aarch64-linux-android",
         ] {
             assert!(is_target_triple(triple), "{triple}");
         }
@@ -924,6 +1223,10 @@ mod tests {
             "x86_64",
             "wasm32-",
             "notes",
+            // An architecture and an agent's own word are not a triple.
+            "x86_64-trace",
+            "arm-e2e",
+            "wasm32-replay",
         ] {
             assert!(!is_target_triple(other), "{other}");
         }

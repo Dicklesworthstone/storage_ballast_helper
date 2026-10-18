@@ -983,12 +983,13 @@ pub struct DeletionBatch {
     pub urgency: f64,
     /// W1 planner: the byte target of the pass that produced the batch.
     pub target_bytes: Option<u64>,
-    /// Pure, idle cargo target dirs the target-only tier vetted inside a
-    /// `scanner.target_only_roots` root (bd-232u). The executor does not apply
-    /// the operator's `protected_paths` to them, since such a root is usually
-    /// protected as a whole; every other check, `.sbh-protect` markers
-    /// included, still runs. Only that tier sets it.
-    pub target_only: bool,
+    /// Set by the target-only tier alone (bd-232u): the resolved
+    /// `scanner.target_only_roots` root whose pure, idle cargo target dirs
+    /// the batch holds. The executor drops any candidate that is not strictly
+    /// inside it or carries no identity, and lifts only the `protected_paths`
+    /// patterns that cover the root as a whole; patterns naming something
+    /// inside it, `.sbh-protect` markers and every other check still apply.
+    pub target_only_root: Option<PathBuf>,
 }
 
 /// Results reported from worker threads back to the main monitoring loop.
@@ -7074,7 +7075,7 @@ fn dispatch_top_candidates(
         pressure_level: request.pressure_level,
         urgency: request.urgency,
         target_bytes: request.target_bytes,
-        target_only: false,
+        target_only_root: None,
     };
     let batch_len = batch.candidates.len();
     let batch_paths: Vec<PathBuf> = batch.candidates.iter().map(|c| c.path.clone()).collect();
@@ -9836,18 +9837,40 @@ impl RepeatDeletionTracker {
 
 // ──────────────────── executor thread ────────────────────
 
-/// The operator's `protected_paths` as the executor applies them to a batch:
-/// none for a target-only batch, whose root they usually cover as a whole
-/// (bd-232u). `.sbh-protect` markers are checked separately and always apply.
+/// The operator's `protected_paths` as the executor applies them to a batch.
+/// A target-only batch (bd-232u) goes without the patterns that protect its
+/// root as a whole, which is why the tier exists; one naming something inside
+/// the root still applies. `.sbh-protect` markers are checked separately and
+/// always apply.
 fn batch_protected_paths(
     batch: &DeletionBatch,
     scanner: &crate::core::config::ScannerConfig,
 ) -> Vec<String> {
-    if batch.target_only {
-        Vec::new()
-    } else {
-        scanner.protected_paths.clone()
-    }
+    batch.target_only_root.as_deref().map_or_else(
+        || scanner.protected_paths.clone(),
+        |root| {
+            scanner
+                .protected_paths
+                .iter()
+                .filter(|pattern| !protection::pattern_covers_subtree(pattern, root))
+                .cloned()
+                .collect()
+        },
+    )
+}
+
+/// Keep only the candidates a target-only batch may hold: strictly inside its
+/// root, with the identity the tier recorded when it surveyed them. Returns
+/// how many were dropped; an ordinary batch is left as it is.
+fn retain_target_only_candidates(batch: &mut DeletionBatch) -> usize {
+    let Some(root) = &batch.target_only_root else {
+        return 0;
+    };
+    let before = batch.candidates.len();
+    batch.candidates.retain(|candidate| {
+        candidate.identity.is_some() && candidate.path != *root && candidate.path.starts_with(root)
+    });
+    before - batch.candidates.len()
 }
 
 /// Executor thread: receives deletion batches and safely removes artifacts.
@@ -9897,7 +9920,7 @@ fn executor_thread_main(
             break;
         }
 
-        let batch = match del_rx.recv_timeout(WORKER_SHUTDOWN_POLL_INTERVAL) {
+        let mut batch = match del_rx.recv_timeout(WORKER_SHUTDOWN_POLL_INTERVAL) {
             Ok(batch) => batch,
             Err(RecvTimeoutError::Timeout) => {
                 // Idle is alive: "stalled" must mean stuck inside a batch,
@@ -9913,6 +9936,23 @@ fn executor_thread_main(
 
         heartbeat.beat();
         batch_count += 1;
+
+        let outside = retain_target_only_candidates(&mut batch);
+        if outside > 0 {
+            let message = format!(
+                "dropped {outside} target-only candidate(s) outside {} or without an identity",
+                batch
+                    .target_only_root
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("?"))
+                    .display()
+            );
+            eprintln!("[SBH-EXECUTOR] {message}");
+            logger.send(ActivityEvent::Info { message });
+            if batch.candidates.is_empty() {
+                continue;
+            }
+        }
 
         // Enforce circuit breaker cooldown from a previous trip. If the breaker
         // tripped recently, skip this batch entirely and drain the channel.
@@ -10090,10 +10130,10 @@ fn executor_thread_main(
                 dry_run,
                 min_score,
                 check_open_files: true,
-                require_identity: matches!(
-                    shared_scanner_config.read().engine,
-                    ScannerEngineMode::V2
-                ),
+                // A target-only batch is pinned to the inodes the tier
+                // surveyed, whatever the engine.
+                require_identity: batch.target_only_root.is_some()
+                    || matches!(shared_scanner_config.read().engine, ScannerEngineMode::V2),
                 sacred_paths: executor_sacred_paths,
                 // Layer 7: at Green there is time to keep the bytes around,
                 // so the batch quarantines; from Yellow up the space is
@@ -11698,15 +11738,19 @@ mod tests {
         );
     }
 
-    /// bd-232u: the operator's `protected_paths` stop an ordinary batch but
-    /// not a target-only one, and a `.sbh-protect` marker stops both. The
-    /// executor is composed as `executor_thread_main` composes it, from
-    /// `batch_protected_paths`, but with the mock platform's open-file
-    /// evidence: in a non-root test the real /proc sweep is incomplete and
-    /// holds every candidate, whatever its protection.
+    /// bd-232u: a pattern protecting the whole root stops an ordinary batch
+    /// but not a target-only one; a pattern naming a dir inside the root and
+    /// a `.sbh-protect` marker stop both; a target-only batch never reaches
+    /// outside its root or deletes a candidate without an identity. The
+    /// executor is composed in the test as `executor_thread_main` composes it
+    /// (`retain_target_only_candidates`, `batch_protected_paths`), not run on
+    /// its thread, and with the mock platform's open-file evidence: in a
+    /// non-root test the real /proc sweep is incomplete and holds every
+    /// candidate, whatever its protection.
     #[cfg(unix)]
     #[test]
-    fn executor_skips_protected_paths_only_for_target_only_batches() {
+    #[allow(clippy::too_many_lines)]
+    fn executor_lifts_only_root_wide_protection_for_target_only_batches() {
         use crate::scanner::walker::{FsEntryKind, FsIdentity};
         use std::os::unix::fs::MetadataExt;
 
@@ -11716,13 +11760,26 @@ mod tests {
         let ordinary = root.join("a/target-ordinary");
         let target_only = root.join("b/target-only");
         let marked = root.join("c/target-marked");
-        for dir in [&ordinary, &target_only, &marked] {
+        let named = root.join("d/target-named");
+        let no_identity = root.join("e/target-no-identity");
+        let outside = scratch.path().join("elsewhere/target-outside");
+        for dir in [
+            &ordinary,
+            &target_only,
+            &marked,
+            &named,
+            &no_identity,
+            &outside,
+        ] {
             std::fs::create_dir_all(dir.join("debug")).unwrap();
             std::fs::write(dir.join("debug/libdemo.rlib"), [7u8; 64]).unwrap();
         }
         protection::create_marker(&marked, None).unwrap();
         let scanner = crate::core::config::ScannerConfig {
-            protected_paths: vec![root.to_string_lossy().into_owned()],
+            protected_paths: vec![
+                root.to_string_lossy().into_owned(),
+                named.to_string_lossy().into_owned(),
+            ],
             ..Default::default()
         };
         let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
@@ -11738,14 +11795,24 @@ mod tests {
             });
             candidate
         };
-        let run = |paths: &[&PathBuf], target_only: bool| {
-            let batch = DeletionBatch {
-                candidates: paths.iter().map(|path| candidate(path)).collect(),
+        let run = |paths: &[&PathBuf], target_only_root: Option<&Path>| {
+            let mut batch = DeletionBatch {
+                candidates: paths
+                    .iter()
+                    .map(|path| {
+                        let mut candidate = candidate(path);
+                        if *path == &no_identity {
+                            candidate.identity = None;
+                        }
+                        candidate
+                    })
+                    .collect(),
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.9,
                 target_bytes: None,
-                target_only,
+                target_only_root: target_only_root.map(Path::to_path_buf),
             };
+            let dropped = retain_target_only_candidates(&mut batch);
             let patterns = batch_protected_paths(&batch, &scanner);
             let skip_sacred = protection::sacred_paths_from_protected_patterns(&patterns);
             let mut catalog = platform.sacred_paths();
@@ -11771,10 +11838,11 @@ mod tests {
             )
             .with_platform(Arc::clone(&platform));
             let plan = executor.plan(batch.candidates);
-            executor.execute(&plan, Some(&skip_protected))
+            (dropped, executor.execute(&plan, Some(&skip_protected)))
         };
 
-        let report = run(&[&ordinary], false);
+        let (dropped, report) = run(&[&ordinary], None);
+        assert_eq!(dropped, 0);
         assert_eq!(
             report.skipped_by_reason.get("sacred_stowaway"),
             Some(&1),
@@ -11783,14 +11851,27 @@ mod tests {
         );
         assert!(ordinary.exists(), "protected_paths stop an ordinary batch");
 
-        let report = run(&[&target_only, &marked], true);
+        let (dropped, report) = run(
+            &[&target_only, &marked, &named, &no_identity, &outside],
+            Some(&root),
+        );
+        assert_eq!(dropped, 2, "outside the root, and without an identity");
         assert_eq!(report.items_deleted, 1, "{:?}", report.skipped_by_reason);
-        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&2));
         assert!(
             !target_only.exists(),
-            "a target-only batch is not stopped by protected_paths"
+            "a target-only batch is not stopped by a pattern covering its root"
         );
         assert!(marked.exists(), "a marker stops a target-only batch");
+        assert!(
+            named.exists(),
+            "a pattern naming a dir inside the root still applies"
+        );
+        assert!(no_identity.exists());
+        assert!(
+            outside.exists(),
+            "a target-only batch stays inside its root"
+        );
     }
 
     #[cfg(unix)]
@@ -14663,7 +14744,7 @@ mod tests {
             pressure_level: PressureLevel::Orange,
             urgency: 0.5,
             target_bytes: None,
-            target_only: false,
+            target_only_root: None,
         };
         del_tx.send(batch).unwrap();
         let received_batch = del_rx.recv().unwrap();
@@ -15823,7 +15904,7 @@ mod tests {
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.5,
                 target_bytes: None,
-                target_only: false,
+                target_only_root: None,
             })
             .expect("prefill channel");
 

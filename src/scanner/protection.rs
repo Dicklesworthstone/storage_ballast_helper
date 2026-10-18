@@ -694,6 +694,27 @@ pub fn sacred_paths_from_protected_patterns(patterns: &[String]) -> Vec<SacredPa
         .collect()
 }
 
+/// Whether `pattern` protects everything under `root`.
+///
+/// It does when it matches the root, one of its ancestors, or any entry
+/// directly inside it (`<root>/**`, `<root>/*`). That is what a target-only
+/// root lifts (bd-232u); a pattern naming something further inside
+/// (`**/target`, one directory, a stowaway suffix) does not cover the root and
+/// still applies. A pattern that does not compile is reported as not
+/// covering, so it stays in force.
+#[must_use]
+pub fn pattern_covers_subtree(pattern: &str, root: &Path) -> bool {
+    let Ok(regex) = glob_to_regex(&normalize_protected_pattern_for_matching(pattern)) else {
+        return false;
+    };
+    // A name no operator writes into a pattern: matching it means matching
+    // any child. Its match texts include the root and every ancestor.
+    let probe = root.join(".sbh-target-only-probe");
+    path_match_texts(&probe)
+        .iter()
+        .any(|text| regex.is_match(text))
+}
+
 /// B7: mtime of a candidate root, used to invalidate memoized verdicts.
 ///
 /// `None` on any error (missing path, permission denied). Since `None` is also
@@ -1665,6 +1686,31 @@ mod tests {
 
         assert!(reg.is_protected(Path::new(r"C:\Users\alice\critical-builds")));
         assert!(!reg.is_protected(Path::new(r"C:\Users\alice\other-builds")));
+    }
+
+    #[test]
+    fn only_patterns_protecting_the_whole_root_cover_its_subtree() {
+        let root = Path::new("/srv/sbh-cover-test/claude-501");
+        for covering in [
+            "/srv/sbh-cover-test/claude-*",
+            "/srv/sbh-cover-test/claude-501",
+            "/srv/sbh-cover-test/**",
+            "/srv/sbh-cover-test/claude-*/**",
+            "/srv/sbh-cover-test/claude-501/*",
+            "/srv",
+        ] {
+            assert!(pattern_covers_subtree(covering, root), "{covering}");
+        }
+        for inside in [
+            "**/target",
+            "/srv/sbh-cover-test/claude-501/proj/target",
+            "/srv/sbh-cover-test/claude-*/*/target",
+            "**/*.sqlite3",
+            "/srv/sbh-cover-test/claude-502",
+            "/srv/sbh-cover-test/claude-5011/**",
+        ] {
+            assert!(!pattern_covers_subtree(inside, root), "{inside}");
+        }
     }
 
     #[test]

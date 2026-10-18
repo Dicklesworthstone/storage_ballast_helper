@@ -35,14 +35,17 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
   is at Yellow or above, the daemon now looks every 10 minutes for
   directories with `CACHEDIR.TAG` or `.rustc_info.json` whose top level
   holds only cargo's own entries, with no `.sbh-protect` or `.git` in,
-  inside or above them below the root, nothing changed within
+  inside or above them below the root, nothing created or changed within
   `scanner.target_only_idle_hours` (24), and no process with a file open
   or its working directory in them. Those go to the executor as a
-  target-only batch: the policy mode, the decision ledger, the planner and
-  every executor check still apply, but `protected_paths` does not.
-  Everything else under the root stays untouchable. A user-scoped macOS
-  daemon cannot see other users' processes and so keeps every candidate;
-  the tier needs the system-scope service there.
+  target-only batch pinned to the directories surveyed: the policy mode,
+  the decision ledger, the planner and every executor check still apply,
+  the executor drops anything outside the root, and only the
+  `protected_paths` patterns that protect the root as a whole are lifted
+  (one naming something inside it still applies). Everything else under
+  the root stays untouchable. A user-scoped macOS daemon cannot see other
+  users' processes and so keeps every candidate; the tier needs the
+  system-scope service there.
 - **macOS: browsers' leftover app copies are reclaimed** (`0bd2dbb`).
   Chrome, Canary, Edge, Brave and Opera copy their app bundle into
   `/var/folders/<xx>/<hash>/X` at every launch and remove the copy only

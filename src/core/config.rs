@@ -968,9 +968,12 @@ impl Default for CompressConfig {
 }
 
 impl ScannerConfig {
-    /// Reject target-only roots the tier could not bound: relative paths, and
-    /// more roots or a shorter idle window than an operator plausibly means.
+    /// Reject target-only roots the tier could not bound: relative paths, the
+    /// filesystem root, `.` or `..` components (which would walk outside the
+    /// directory the pattern names), and more roots or a shorter idle window
+    /// than an operator plausibly means.
     fn validate_target_only(&self) -> Result<()> {
+        use std::path::Component;
         let invalid = |details: String| SbhError::InvalidConfig { details };
         if self.target_only_roots.len() > 32 {
             return Err(invalid(format!(
@@ -985,6 +988,18 @@ impl ScannerConfig {
         {
             return Err(invalid(format!(
                 "scanner.target_only_roots must be absolute: {}",
+                root.display()
+            )));
+        }
+        if let Some(root) = self.target_only_roots.iter().find(|root| {
+            root.components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+                || !root
+                    .components()
+                    .any(|component| matches!(component, Component::Normal(_)))
+        }) {
+            return Err(invalid(format!(
+                "scanner.target_only_roots must name a directory below the filesystem root, without . or ..: {}",
                 root.display()
             )));
         }
@@ -4288,6 +4303,10 @@ mod tests {
         assert!(with(vec![PathBuf::from("tmp/claude-*")], 24).is_err());
         assert!(with(vec![PathBuf::from("/data/tmp")], 0).is_err());
         assert!(with(vec![PathBuf::from("/data/tmp"); 33], 24).is_err());
+        // The filesystem root, and a `..` that walks out of the named dir.
+        for root in ["/", "/data/tmp/claude-501/..", "/data/../etc"] {
+            assert!(with(vec![PathBuf::from(root)], 24).is_err(), "{root}");
+        }
 
         let parsed: Config = toml::from_str(
             "[scanner]\ntarget_only_roots = [\"/data/tmp/claude-*\"]\ntarget_only_idle_hours = 48\n",
