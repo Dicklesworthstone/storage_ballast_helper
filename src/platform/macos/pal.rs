@@ -199,6 +199,10 @@ impl Platform for MacOsPal {
         super::build_directories::collect()
     }
 
+    fn build_directories_in_use_checked(&self) -> (Vec<(i32, PathBuf)>, bool) {
+        super::build_directories::collect_checked()
+    }
+
     fn process_io(&self, pid: i32) -> Result<ProcessIo> {
         let usage = proc_pid_rusage_v4_safe(pid)
             .map_err(|error| macos_method_error("process_io", &error))?;
