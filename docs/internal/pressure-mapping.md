@@ -71,6 +71,11 @@ direction:
 - Recovering transitions are rate-limited against the previous recovery.
 - Escalation and recovery timers are independent, so a genuine reversal can
   still apply immediately.
+- A deferred transition applies when its window ends. The memory subscription
+  reports a level only when it changes, so the daemon keeps the deferred level
+  as its latest memory reading, re-evaluates it on every tick and every 500 ms
+  while sleeping, and logs `behavior mode transition deferred` once per target.
+  A newer reading replaces it; a config reload keeps it.
 
 The interval is configured with `pressure.behavior_hysteresis_secs` or the
 `SBH_PRESSURE_BEHAVIOR_HYSTERESIS_SECS` environment variable. A value of `0`

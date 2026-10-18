@@ -41,6 +41,18 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
 
 ### Fixed
 
+- **A deferred behavior-mode change now takes effect when its window
+  ends.** A memory transition that came within
+  `pressure.behavior_hysteresis_secs` of the previous one in the same
+  direction was held back and then lost: the memory subscription reports
+  a level only when it changes, and the next disk tick evaluated the old
+  level, which cancelled the held transition. The daemon then ran in the
+  wrong mode until memory changed level again. On one host none of 12
+  deferrals in three days was applied, and the next logged change came up
+  to four minutes later. The held level now counts as the latest
+  reading, survives a config reload, and is retried every 500 ms while
+  the daemon sleeps and on every tick; it applies once the window has
+  passed.
 - **Btrfs compression no longer leaves large files part-compressed**
   (`3110b29`). On Linux 6.17 one defrag call over a large uncompressed
   extent compresses only its first 256 KiB, so `sbh compress --apply`

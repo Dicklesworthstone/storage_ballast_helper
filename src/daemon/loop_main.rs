@@ -1276,6 +1276,8 @@ enum BehaviorUpdate {
     Deferred {
         direction: BehaviorTransitionDirection,
         remaining: Duration,
+        /// The same target was already waiting; the daemon logs a deferral once.
+        repeated: bool,
     },
 }
 
@@ -1309,10 +1311,11 @@ impl PressureBehaviorState {
     }
 
     /// Swap in a reloaded matrix and re-resolve the current cell without
-    /// hysteresis (the pressure levels did not change; the policy did).
+    /// hysteresis (the pressure levels did not change; the policy did). A
+    /// deferred target stays: it holds the latest memory reading, and the
+    /// next evaluation re-resolves its mode against the new matrix.
     fn replace_table(&mut self, table: BehaviorDispatchTable) -> Option<BehaviorTransition> {
         self.table = table;
-        self.pending_target = None;
         let next_mode = self.table.mode_for(self.memory_level, self.disk_level);
         if next_mode == self.mode {
             return None;
@@ -1322,6 +1325,20 @@ impl PressureBehaviorState {
 
     fn table(&self) -> &BehaviorDispatchTable {
         &self.table
+    }
+
+    /// The memory level to evaluate next: a deferred target's while one waits
+    /// out its hysteresis window, else the applied one. The subscription
+    /// reports a level once, when it changes, so a deferred target is the
+    /// daemon's only record of it; evaluating the applied level instead would
+    /// cancel the target and run the wrong mode until the next change.
+    fn latest_memory_level(&self) -> MemoryPressureLevel {
+        self.pending_target
+            .map_or(self.memory_level, |pending| pending.memory_level)
+    }
+
+    const fn has_pending_target(&self) -> bool {
+        self.pending_target.is_some()
     }
 
     #[cfg(test)]
@@ -1367,6 +1384,8 @@ impl PressureBehaviorState {
         };
 
         if let Some(remaining) = self.hysteresis_remaining(direction, now, min_interval) {
+            // A differing target was cleared above, so one still here is this one.
+            let repeated = self.pending_target.is_some();
             self.pending_target = Some(PendingBehaviorTarget {
                 memory_level,
                 disk_level,
@@ -1375,6 +1394,7 @@ impl PressureBehaviorState {
             return BehaviorUpdate::Deferred {
                 direction,
                 remaining,
+                repeated,
             };
         }
 
@@ -3633,6 +3653,7 @@ impl MonitoringDaemon {
             BehaviorUpdate::Deferred {
                 direction,
                 remaining,
+                repeated: false,
             } => {
                 let message = format!(
                     "behavior mode transition deferred source={source} direction={direction:?} \
@@ -3641,7 +3662,7 @@ impl MonitoringDaemon {
                 );
                 eprintln!("[SBH-DAEMON] {message}");
             }
-            BehaviorUpdate::Unchanged => {}
+            BehaviorUpdate::Deferred { repeated: true, .. } | BehaviorUpdate::Unchanged => {}
         }
     }
 
@@ -3786,7 +3807,18 @@ impl MonitoringDaemon {
                     }
                     break;
                 }
-                default(wait) => {}
+                // No new event will come for a deferred target; retry it
+                // so it applies when its hysteresis window ends.
+                default(wait) => {
+                    if self.behavior_state.has_pending_target() {
+                        self.update_behavior_mode(
+                            self.behavior_state.latest_memory_level(),
+                            disk_level,
+                            "deferred",
+                            Duration::ZERO,
+                        );
+                    }
+                }
             }
         }
     }
@@ -4409,7 +4441,7 @@ impl MonitoringDaemon {
             }
 
             self.update_behavior_mode(
-                self.behavior_state.memory_level,
+                self.behavior_state.latest_memory_level(),
                 response.level,
                 "disk_pressure",
                 Duration::ZERO,
@@ -13492,9 +13524,11 @@ mod tests {
             BehaviorUpdate::Deferred {
                 direction,
                 remaining,
+                repeated,
             } => {
                 assert_eq!(direction, BehaviorTransitionDirection::Escalating);
                 assert_eq!(remaining, Duration::from_secs(4));
+                assert!(!repeated, "a new target's deferral is logged");
             }
             other => panic!("second escalation should be deferred: {other:?}"),
         }
@@ -13547,9 +13581,11 @@ mod tests {
             BehaviorUpdate::Deferred {
                 direction,
                 remaining,
+                repeated,
             } => {
                 assert_eq!(direction, BehaviorTransitionDirection::Recovering);
                 assert_eq!(remaining, Duration::from_secs(4));
+                assert!(!repeated, "a new target's deferral is logged");
             }
             other => panic!("second recovery should be deferred: {other:?}"),
         }
@@ -13602,9 +13638,11 @@ mod tests {
             BehaviorUpdate::Deferred {
                 direction,
                 remaining,
+                repeated,
             } => {
                 assert_eq!(direction, BehaviorTransitionDirection::Escalating);
                 assert_eq!(remaining, Duration::from_secs(4));
+                assert!(!repeated, "a new target's deferral is logged");
             }
             other => panic!("second escalation should be deferred: {other:?}"),
         }
@@ -13633,6 +13671,115 @@ mod tests {
             BehaviorUpdate::Unchanged
         ));
         assert_eq!(state.memory_level, MemoryPressureLevel::Warn);
+    }
+
+    #[test]
+    fn a_deferred_memory_target_survives_disk_ticks_until_its_window_ends() {
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
+        let mut state = PressureBehaviorState::new(
+            BehaviorDispatchTable::default(),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+        );
+        assert!(matches!(
+            state.update_with_hysteresis(
+                MemoryPressureLevel::Warn,
+                PressureLevel::Green,
+                t0,
+                hysteresis,
+            ),
+            BehaviorUpdate::Applied(_)
+        ));
+        assert!(matches!(
+            state.update_with_hysteresis(
+                MemoryPressureLevel::Critical,
+                PressureLevel::Green,
+                t0 + Duration::from_secs(1),
+                hysteresis,
+            ),
+            BehaviorUpdate::Deferred {
+                repeated: false,
+                ..
+            }
+        ));
+        assert_eq!(state.latest_memory_level(), MemoryPressureLevel::Critical);
+
+        // A disk tick inside the window re-defers without logging again and
+        // keeps the target the subscription will not report a second time.
+        assert!(matches!(
+            state.update_with_hysteresis(
+                state.latest_memory_level(),
+                PressureLevel::Green,
+                t0 + Duration::from_secs(2),
+                hysteresis,
+            ),
+            BehaviorUpdate::Deferred { repeated: true, .. }
+        ));
+        assert_eq!(state.memory_level, MemoryPressureLevel::Warn);
+        assert_eq!(state.latest_memory_level(), MemoryPressureLevel::Critical);
+
+        // So does a matrix reload.
+        assert!(
+            state
+                .replace_table(BehaviorDispatchTable::default())
+                .is_none()
+        );
+        assert_eq!(state.latest_memory_level(), MemoryPressureLevel::Critical);
+
+        match state.update_with_hysteresis(
+            state.latest_memory_level(),
+            PressureLevel::Green,
+            t0 + hysteresis,
+            hysteresis,
+        ) {
+            BehaviorUpdate::Applied(transition) => {
+                assert_eq!(transition.from_memory, MemoryPressureLevel::Warn);
+                assert_eq!(transition.to_memory, MemoryPressureLevel::Critical);
+            }
+            other => panic!("the first tick after the window should apply it: {other:?}"),
+        }
+        assert!(!state.has_pending_target());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sleep_loop_applies_a_deferred_memory_transition_without_a_new_event() {
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        daemon.config.pressure.behavior_hysteresis_secs = 1;
+        daemon.behavior_state = PressureBehaviorState::new(
+            behavior_table_from_config(&daemon.config),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+        );
+        let disk = PressureLevel::Green;
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Warn,
+            disk,
+            "memory_pressure",
+            Duration::ZERO,
+        );
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            disk,
+            "memory_pressure",
+            Duration::ZERO,
+        );
+        assert_eq!(
+            daemon.behavior_state.memory_level,
+            MemoryPressureLevel::Warn,
+            "a second escalation inside the window waits"
+        );
+
+        // The subscription reports a level once, so no event follows.
+        let (_tx, rx) = bounded::<MemoryPressureEvent>(1);
+        daemon.sleep_with_memory_pressure_events(&rx, disk, Duration::from_millis(1_500));
+        assert_eq!(
+            daemon.behavior_state.memory_level,
+            MemoryPressureLevel::Critical
+        );
+        assert!(!daemon.behavior_state.has_pending_target());
     }
 
     fn mock_memory_pressure(level: MemoryPressureLevel) -> MemoryPressure {
