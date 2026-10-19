@@ -30,6 +30,8 @@ use crate::platform::types::{
 };
 
 #[cfg(target_os = "linux")]
+pub mod cgroup;
+#[cfg(target_os = "linux")]
 pub mod disk;
 #[cfg(target_os = "linux")]
 pub mod memory;
