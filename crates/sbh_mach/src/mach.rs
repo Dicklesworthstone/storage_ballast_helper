@@ -553,6 +553,7 @@ pub fn host_vm_stats() -> Result<VmStats, MachError> {
 }
 
 /// Return a bounded, freshly enumerated inventory of visible process IDs.
+///
 /// A full buffer is retried with actual growth, never accepted as complete.
 /// Native failures and exhausted retry/allocation budgets remain errors.
 #[allow(unsafe_code)]

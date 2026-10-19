@@ -1,7 +1,7 @@
 //! Error-preserving iteration over native file-backed memory mappings.
 //!
 //! libproc returns zero on syscall failure and leaves the reason in errno.
-//! A zero result must not be converted to generic NotFound: callers need to
+//! A zero result must not be converted to generic `NotFound`: callers need to
 //! distinguish an exhausted vnode query from inaccessible process memory.
 
 use std::io;

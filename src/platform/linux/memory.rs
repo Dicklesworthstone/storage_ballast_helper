@@ -717,7 +717,7 @@ mod tests {
                 }
                 super::wait_for_pressure(
                     &mut source,
-                    |_| super::epoll_wake(Ok(0), super::EpollFlags::empty()),
+                    |()| super::epoll_wake(Ok(0), super::EpollFlags::empty()),
                     |_| panic!("a live timeout must not discard its event source"),
                 )
             },
@@ -863,7 +863,7 @@ mod tests {
         let mut source = Some(());
         assert!(!super::wait_for_pressure(
             &mut source,
-            |_| super::epoll_wake(Err(super::Errno::EINTR), super::EpollFlags::empty()),
+            |()| super::epoll_wake(Err(super::Errno::EINTR), super::EpollFlags::empty()),
             |_| panic!("EINTR is not a broken event source"),
         ));
         assert!(source.is_some());
