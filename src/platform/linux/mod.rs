@@ -145,6 +145,12 @@ impl Platform for LinuxPal {
         memory::read_memory_info()
     }
 
+    fn ram_write_memory_refusal(&self, minimum_available_percent: u8) -> Result<Option<String>> {
+        cgroup::ram_write_refusal(minimum_available_percent).map_err(|error| {
+            PalError::method_failed("linux", "ram_write_memory_refusal", error.to_string()).into()
+        })
+    }
+
     fn memory_pressure(&self) -> Result<MemoryPressure> {
         memory::read_memory_pressure()
     }

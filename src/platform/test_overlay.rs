@@ -304,6 +304,10 @@ impl Platform for TestOverlayPlatform {
         self.inner.memory_info()
     }
 
+    fn ram_write_memory_refusal(&self, minimum_available_percent: u8) -> Result<Option<String>> {
+        self.inner.ram_write_memory_refusal(minimum_available_percent)
+    }
+
     fn service_manager(&self) -> Box<dyn ServiceManager> {
         self.inner.service_manager()
     }

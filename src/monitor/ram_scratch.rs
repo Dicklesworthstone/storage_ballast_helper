@@ -276,7 +276,16 @@ pub fn ram_log_mirror_refusal_for(
         return Some(format!("{} is read-only", dir.display()));
     }
     if ram_log_destination_has(&memory, stats.total_bytes, stats.available_bytes, headroom) {
-        return None;
+        let minimum = match headroom {
+            RamLogHeadroom::Keep => 10,
+            RamLogHeadroom::Start => 15,
+        };
+        // Healthy host counters cannot override an exhausted service/container
+        // limit. The platform adds constraints without rewriting host memory.
+        return match platform.ram_write_memory_refusal(minimum) {
+            Ok(refusal) => refusal,
+            Err(error) => Some(format!("process memory limits are unreadable: {error}")),
+        };
     }
     let (ram, swap, _) = headroom.floors();
     let reason = if memory.total_bytes == 0

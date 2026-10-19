@@ -127,13 +127,49 @@ five-minute report-only observer. A RAM-backed destination requires at least
 An empty tmpfs does not override low host RAM. Missing filesystem identity,
 unreadable or inconsistent RAM/mount counters, and a read-only RAM filesystem
 refuse admission rather than being interpreted as healthy. A verified disk-backed
-fallback is not subject to the RAM-headroom policy.
+fallback is not subject to the RAM-headroom policy. The existing `Start` margin
+used when the daemon requests a mirror is 15% host RAM, 15% swap and 25% filesystem
+headroom; the `Keep` check uses the lower floors above.
+
+On Linux, a host-healthy RAM route also needs headroom within **this process's
+visible cgroup-v2 hierarchy**. The guard observes `memory.current` against each
+finite `memory.high` and `memory.max`, separately for the leaf and every visible
+ancestor. It never compares a parent's limit with a child's smaller usage.
+Each finite constraint requires 10% remaining for `Keep`, or 15% for `Start`.
+A zero memory limit or usage beyond a finite limit refuses the route.
+
+Finite, nonzero `memory.swap.max` is checked against that scope's
+`memory.swap.current` with the same percentage margin. A disabled swap allowance
+(`memory.swap.max=0`, with zero usage) is not itself a refusal. Unlimited values
+and kernels without both swap-accounting files add no swap constraint. Swap is
+never added to a RAM allocation allowance, and the independent host swap check
+still applies.
+
+The cgroup observer reads only kernel metadata. It verifies procfs/cgroup2 file
+identity, opens cgroup path components without following symlinks, and rejects
+traversal, malformed records and changed membership, mount tables or limits.
+A missing memory-controller interface needs evidence that its parent has not
+enabled the controller; partially missing interfaces are unknown, not unlimited.
+Only a visible hierarchy mounted from its root is accepted: a bind-mounted
+subtree cannot stand in for hidden enforcing ancestors. Legacy cgroup-v1 memory
+controllers, missing unified membership and unreadable hierarchy evidence refuse
+RAM logging rather than silently falling back to host-only admission. This does
+not disable the primary disk route or a verified disk-backed fallback.
+
+One cgroup observation has bounds of 32 ancestor scopes, 512 logical file reads,
+3 MiB of aggregate input and a 100 ms cooperative deadline, with smaller per-file
+limits. Component opens and metadata verification are additional bounded work,
+not included in the logical-read count. The deadline does not interrupt a blocked
+kernel operation. Healthy/absent observations are not cached between checks;
+recovery is evaluated from new evidence. Filesystem-only platform overlays
+forward the same local constraint query instead of discarding it.
 
 Checks cover opening, recovery, ongoing writes, explicit flush/fsync, idle ticks,
 mirror shutdown, and writer destruction. Memory and filesystem capacity are read
 at admission; the platform's existing bounded mount-table cache is reused. These
 checks do not enumerate processes or perform directory attribution on the logger
-thread.
+thread. `sbh check --ram-scratch`, its host report schema and the periodic
+report-only observer remain host-wide diagnostics, not cgroup reports.
 
 When a mirror becomes unsafe, mirroring stops and the primary continues. When an
 active fallback becomes unsafe, subsequent records use stderr. Pending buffers
@@ -153,8 +189,10 @@ Rotation failure applies the cap to the newly selected fallback too. Handover
 closes the mirror before opening the same file as the fallback, avoiding two
 buffered writers and duplicate handover records.
 
-These are best-effort host observations, not memory reservations, atomic
-filesystem snapshots, cgroup headroom guarantees, or protection against concurrent
-path/mount replacement. The guard covers JSONL fallback and mirror routes, not an
-operator-selected primary on RAM, SQLite, or storage chosen by a stderr consumer.
-No new deletion paths or automatic cleanup actions are introduced.
+These are best-effort observations, not memory reservations or atomic filesystem
+snapshots. Cgroup namespaces can hide further enforcing ancestors, charges and
+limits can change after a check, and concurrent path/mount replacement is not
+prevented. The guard covers JSONL fallback and mirror routes, not an operator-
+selected primary on RAM, SQLite, or storage chosen by a stderr consumer. No
+cgroup controls are written, no reclaim is requested, and no new deletion paths
+or automatic cleanup actions are introduced.

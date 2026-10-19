@@ -298,6 +298,15 @@ pub trait Platform: Send + Sync {
     fn memory_info(&self) -> Result<MemoryInfo>;
     fn service_manager(&self) -> Box<dyn ServiceManager>;
 
+    /// Additional process-local memory constraints for a RAM-backed writer.
+    /// Host memory and filesystem checks remain the caller's responsibility.
+    /// Linux observes visible cgroup limits; the default adds no platform-local
+    /// policy. An error is missing evidence and must refuse the RAM route, not
+    /// be treated as an unconstrained process. This never reserves memory.
+    fn ram_write_memory_refusal(&self, _minimum_available_percent: u8) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     fn capacity(&self, mount: &Path) -> Result<Capacity> {
         self.fs_stats(mount).map(Into::into)
     }
