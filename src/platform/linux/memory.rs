@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,12 +37,31 @@ pub(super) fn read_memory_info() -> Result<MemoryInfo> {
 
 pub(super) fn read_memory_pressure() -> Result<MemoryPressure> {
     let info = read_memory_info()?;
-    let psi_avg10 = read_memory_psi_avg10().ok();
-    Ok(memory_pressure_from_info(
+    Ok(memory_pressure_with_local(
         &info,
-        psi_avg10,
+        read_memory_psi_avg10().ok(),
+        super::cgroup::pressure::read(),
         system_page_size_bytes(),
     ))
+}
+
+/// Use the stronger observed stall signal, without adding percentages from
+/// overlapping task populations. Byte/page counters remain host-wide. The PSI
+/// value is the maximum known host/process-cgroup sample, also used by the exit
+/// band. Missing v2 evidence can retain positive pressure but cannot say Normal.
+fn memory_pressure_with_local(
+    info: &MemoryInfo,
+    host: Option<u64>,
+    local: io::Result<Option<u64>>,
+    page_size_bytes: u64,
+) -> MemoryPressure {
+    let complete = host.is_some() && local.is_ok();
+    let strongest = host.into_iter().chain(local.ok().flatten()).max();
+    let mut pressure = memory_pressure_from_info(info, strongest, page_size_bytes);
+    if !complete && pressure.level == MemoryPressureLevel::Normal {
+        pressure.level = MemoryPressureLevel::Unknown;
+    }
+    pressure
 }
 
 pub(super) fn subscribe_memory_pressure(
@@ -113,43 +132,26 @@ pub(super) fn parse_meminfo(raw: &str) -> Result<MemoryInfo> {
 }
 
 fn read_memory_psi_avg10() -> Result<u64> {
-    let raw = fs::read_to_string(MEMORY_PSI_PATH).map_err(|source| SbhError::Io {
-        path: PathBuf::from(MEMORY_PSI_PATH),
-        source,
-    })?;
+    let mut raw = String::new();
+    let limit = u64::try_from(super::cgroup::pressure::PSI_BYTES).unwrap_or(4096) + 1;
+    File::open(MEMORY_PSI_PATH)
+        .and_then(|file| file.take(limit).read_to_string(&mut raw))
+        .map_err(|source| SbhError::Io {
+            path: PathBuf::from(MEMORY_PSI_PATH),
+            source,
+        })?;
     parse_memory_psi_avg10(&raw).ok_or_else(|| {
         PalError::method_failed(
             "linux",
             "memory_pressure",
-            "missing 'some avg10=' in /proc/pressure/memory",
+            "invalid or incomplete 'some' record in /proc/pressure/memory",
         )
         .into()
     })
 }
 
 fn parse_memory_psi_avg10(raw: &str) -> Option<u64> {
-    raw.lines()
-        .find_map(|line| line.strip_prefix("some "))
-        .and_then(|rest| {
-            rest.split_whitespace()
-                .find_map(|field| field.strip_prefix("avg10="))
-        })
-        .and_then(parse_centipercent)
-}
-
-fn parse_centipercent(raw: &str) -> Option<u64> {
-    let (whole, fractional) = raw.split_once('.').unwrap_or((raw, ""));
-    let whole = whole.parse::<u64>().ok()?;
-    let mut cents = fractional
-        .chars()
-        .take(2)
-        .collect::<String>()
-        .parse::<u64>()
-        .unwrap_or(0);
-    if fractional.len() == 1 {
-        cents = cents.saturating_mul(10);
-    }
-    Some(whole.saturating_mul(100).saturating_add(cents))
+    super::cgroup::pressure::parse_avg10(raw)
 }
 
 fn memory_pressure_from_info(
@@ -295,12 +297,10 @@ where
                     if !flags.contains(EpollFlags::EPOLLPRI) {
                         continue;
                     }
-                } else if last_level == MemoryPressureLevel::Normal {
-                    continue;
                 }
-                // The trigger fires only on stalls, so a host that goes
-                // quiet after pressure never fires it again: above Normal,
-                // the timeout samples too, or recovery would go unseen.
+                // Always sample on the timeout, even at Normal: this fd watches
+                // host stalls, not this service's cgroup PSI or its migrations.
+                // The same sample also notices recovery when triggers go quiet.
 
                 let Ok(mut pressure) = sampler() else {
                     continue;
@@ -543,6 +543,54 @@ mod tests {
             MemoryPressureLevel::Critical
         );
         drop(handle);
+    }
+
+    #[test]
+    fn local_stalls_raise_pressure_without_rewriting_host_capacity() {
+        let info = super::MemoryInfo {
+            total_bytes: 1024 * 1024,
+            available_bytes: 512 * 1024,
+            swap_total_bytes: 8192,
+            swap_free_bytes: 4096,
+        };
+        let host = memory_pressure_from_info(&info, Some(0), 4096);
+        let local = super::memory_pressure_with_local(&info, Some(0), Ok(Some(7350)), 4096);
+        assert_eq!(local.level, MemoryPressureLevel::Critical);
+        assert_eq!(local.linux_psi_avg10, Some(7350));
+        assert_eq!(local.free_pages, host.free_pages);
+        assert_eq!(local.used_pages, host.used_pages);
+        assert_eq!(local.swap_total_bytes, host.swap_total_bytes);
+        assert_eq!(local.swap_used_bytes, host.swap_used_bytes);
+        let host_pressure = super::memory_pressure_with_local(&info, Some(2500), Ok(Some(500)), 4096);
+        assert_eq!(host_pressure.linux_psi_avg10, Some(2500), "do not add overlapping PSI percentages");
+        assert_eq!(host_pressure.level, MemoryPressureLevel::Critical);
+    }
+
+    #[test]
+    fn missing_v2_evidence_is_unknown_unless_a_known_signal_already_shows_pressure() {
+        let info = super::MemoryInfo { total_bytes: 100, available_bytes: 50, swap_total_bytes: 0, swap_free_bytes: 0 };
+        for (host, local, expected) in [
+            (Some(0), Err(std::io::ErrorKind::PermissionDenied.into()), MemoryPressureLevel::Unknown),
+            (Some(500), Err(std::io::ErrorKind::PermissionDenied.into()), MemoryPressureLevel::Warn),
+            (Some(2000), Err(std::io::ErrorKind::PermissionDenied.into()), MemoryPressureLevel::Critical),
+            (None, Ok(Some(0)), MemoryPressureLevel::Unknown),
+            (None, Ok(Some(2000)), MemoryPressureLevel::Critical),
+            (Some(0), Ok(None), MemoryPressureLevel::Normal),
+            (None, Ok(None), MemoryPressureLevel::Unknown),
+        ] {
+            assert_eq!(super::memory_pressure_with_local(&info, host, local, 1).level, expected);
+        }
+    }
+
+    #[test]
+    fn exit_band_uses_local_stalls_even_when_the_host_is_quiet() {
+        let info = super::MemoryInfo { total_bytes: 100, available_bytes: 50, swap_total_bytes: 0, swap_free_bytes: 0 };
+        let mut last = MemoryPressureLevel::Critical;
+        for (local, expected) in [(1700, MemoryPressureLevel::Critical), (450, MemoryPressureLevel::Warn), (399, MemoryPressureLevel::Normal)] {
+            let sample = super::memory_pressure_with_local(&info, Some(0), Ok(Some(local)), 1);
+            last = banded_level(last, sample.linux_psi_avg10, sample.level);
+            assert_eq!(last, expected);
+        }
     }
 
     fn test_memory_pressure(level: MemoryPressureLevel) -> MemoryPressure {

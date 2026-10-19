@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use rustix::fs::{Mode, OFlags, fstatfs, open, openat};
 
+pub(super) mod pressure;
+
 const MEMBERSHIP: &str = "/proc/self/cgroup";
 const MOUNTS: &str = "/proc/self/mountinfo";
 const MEMBERSHIP_BYTES: usize = 64 * 1024;
