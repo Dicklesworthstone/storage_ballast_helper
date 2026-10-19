@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use crate::core::errors::Result;
 use crate::platform::macos::libproc::{
-    ProcFdInfo, ProcFdType, ProcRegionWithPathInfo, ProcTaskAllInfo, VnodeFdInfoWithPath,
-    proc_listpids_safe, proc_pid_command_line, proc_pid_list_fds, proc_pid_region_path,
+    ProcFdInfo, ProcFdType, ProcTaskAllInfo, VnodeFdInfoWithPath,
+    proc_listpids_safe, proc_pid_command_line, proc_pid_list_fds,
     proc_pid_rusage_v4_safe, proc_pidfdinfo_vnode_path, proc_pidinfo_task_all, proc_pidpath_safe,
 };
 use crate::platform::macos::sacred_catalog::platform_macos_sacred_paths;
@@ -33,6 +33,7 @@ use crate::platform::types::{
 use parking_lot::RwLock;
 
 mod executables;
+mod mappings;
 mod references;
 
 const FDA_CACHE_TTL_SECS: u64 = 60;
@@ -40,7 +41,6 @@ const FDA_CACHE_TTL: Duration = Duration::from_secs(FDA_CACHE_TTL_SECS);
 const OPEN_FILES_CACHE_TTL_SECS: u64 = 30;
 const OPEN_FILES_CACHE_TTL: Duration = Duration::from_secs(OPEN_FILES_CACHE_TTL_SECS);
 const OPEN_FILES_CACHE_MAX_ENTRIES: usize = 64;
-const MMAP_REGIONS_SCAN_TIMEOUT: Duration = Duration::from_secs(12);
 const MEMORY_PRESSURE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 static FDA_STATUS_CACHE: OnceLock<RwLock<Option<(Instant, FullDiskAccessStatus)>>> =
     OnceLock::new();
@@ -242,28 +242,14 @@ impl Platform for MacOsPal {
     }
 
     fn mmap_regions_under(&self, path: &Path) -> Result<Vec<MappedRegion>> {
-        let root = process_observed_path(path);
-        let root_variants = macos_process_path_variants(&root);
-        let deadline = Instant::now() + MMAP_REGIONS_SCAN_TIMEOUT;
-        let mut regions = Vec::new();
-        for pid in process_pids_current_first()
-            .map_err(|error| macos_method_error("mmap_regions_under", &error))?
-        {
-            if Instant::now() >= deadline {
-                return Err(macos_scan_timeout(
-                    "mmap_regions_under",
-                    MMAP_REGIONS_SCAN_TIMEOUT,
-                ));
-            }
-            regions.extend(mapped_regions_for_pid_under(pid, &root_variants, deadline)?);
-        }
-        regions.sort_by(|left, right| {
-            left.pid
-                .cmp(&right.pid)
-                .then_with(|| left.start_address.cmp(&right.start_address))
-                .then_with(|| left.path.cmp(&right.path))
-        });
-        Ok(regions)
+        self.mmap_regions_under_roots(&[path.to_path_buf()])
+    }
+
+    /// The Vec API cannot label partial coverage. Refuse failed or truncated
+    /// observations, with one fresh budget and bounded caller wait for all roots.
+    fn mmap_regions_under_roots(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+        mappings::collect(roots)
+            .map_err(|error| macos_method_error("mmap_regions_under_roots", &error))
     }
 
     fn self_stats(&self) -> Result<SelfStats> {
@@ -437,13 +423,6 @@ fn macos_method_error(
     error: &impl ToString,
 ) -> crate::core::errors::SbhError {
     PalError::method_failed("macos", method, error.to_string()).into()
-}
-
-fn macos_scan_timeout(method: &'static str, timeout: Duration) -> crate::core::errors::SbhError {
-    macos_method_error(
-        method,
-        &format!("{method} exceeded {timeout:?} scan budget"),
-    )
 }
 
 fn macos_total_memory_bytes(method: &'static str) -> Result<u64> {
@@ -1032,17 +1011,6 @@ fn nanos_to_micros(nanos: u64) -> u64 {
     nanos / 1_000
 }
 
-fn process_pids_current_first() -> io::Result<Vec<i32>> {
-    let current_pid = current_process_pid();
-    let mut pids: Vec<i32> = proc_listpids_safe()?
-        .into_iter()
-        .filter(|pid| *pid > 0)
-        .collect();
-    pids.sort_by_key(|pid| (*pid != current_pid, *pid));
-    pids.dedup();
-    Ok(pids)
-}
-
 fn open_files_for_pid_under(pid: i32, root: &Path) -> Vec<OpenFile> {
     let Ok(fds) = proc_pid_list_fds(pid) else {
         return Vec::new();
@@ -1113,61 +1081,6 @@ fn open_file_mode(open_flags: u32) -> OpenFileMode {
         (false, true) => OpenFileMode::Write,
         (false, false) => OpenFileMode::Unknown,
     }
-}
-
-fn mapped_regions_for_pid_under(
-    pid: i32,
-    root_variants: &[PathBuf],
-    deadline: Instant,
-) -> Result<Vec<MappedRegion>> {
-    const MAX_REGIONS_PER_PID: usize = 16_384;
-
-    let mut address = 0;
-    let mut regions = Vec::new();
-    for _ in 0..MAX_REGIONS_PER_PID {
-        if Instant::now() >= deadline {
-            return Err(macos_scan_timeout(
-                "mmap_regions_under",
-                MMAP_REGIONS_SCAN_TIMEOUT,
-            ));
-        }
-        let Ok(info) = proc_pid_region_path(pid, address) else {
-            break;
-        };
-        let start = info.prp_prinfo.pri_address;
-        let size = info.prp_prinfo.pri_size;
-        if size == 0 {
-            break;
-        }
-        if let Some(region) = mapped_region_under(pid, &info, root_variants) {
-            regions.push(region);
-        }
-        let Some(next_address) = start.checked_add(size) else {
-            break;
-        };
-        if next_address <= address {
-            break;
-        }
-        address = next_address;
-    }
-    Ok(regions)
-}
-
-fn mapped_region_under(
-    pid: i32,
-    info: &ProcRegionWithPathInfo,
-    root_variants: &[PathBuf],
-) -> Option<MappedRegion> {
-    let path = observed_process_path_under_root(info.prp_vip.path().ok()?, root_variants)?;
-    let start = info.prp_prinfo.pri_address;
-    let end = start.checked_add(info.prp_prinfo.pri_size);
-    Some(MappedRegion {
-        pid,
-        path,
-        start_address: Some(start),
-        end_address: end,
-        protection: Some(region_protection(info.prp_prinfo.pri_protection)),
-    })
 }
 
 #[cfg(test)]
@@ -1271,7 +1184,7 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, mpsc};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use crate::platform::macos::sys::{
         ApfsContainer, ApfsInventory, ApfsVolume, ApfsVolumeRole,
@@ -2236,12 +2149,8 @@ mod tests {
             std::fs::canonicalize(&current_exe).expect("current executable should canonicalize");
 
         let root_variants = super::macos_process_path_variants(root);
-        let regions = super::mapped_regions_for_pid_under(
-            super::current_process_pid(),
-            &root_variants,
-            Instant::now() + super::MMAP_REGIONS_SCAN_TIMEOUT,
-        )
-        .expect("current process macOS mapped region scan should be readable");
+        let regions = super::mappings::collect_pid(super::current_process_pid(), &root_variants)
+            .expect("current process macOS mapped region scan should be readable");
 
         assert!(regions.iter().any(|region| {
             region.pid == super::current_process_pid()
