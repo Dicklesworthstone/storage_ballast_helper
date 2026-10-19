@@ -14142,6 +14142,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_sleep_loop_applies_a_deferred_memory_transition_without_a_new_event() {
+        // A signal raised by another test would end the sleep early.
+        let _serial = crate::daemon::signals::process_signal_test_guard();
         let mut fixture = RegretDaemonFixture::new();
         let daemon = &mut fixture.daemon;
         daemon.config.pressure.behavior_hysteresis_secs = 1;

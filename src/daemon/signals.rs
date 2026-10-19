@@ -15,6 +15,17 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 
 use crate::platform::pal::{NoopServiceManager, ServiceManager};
 
+/// Serializes a test that raises a real signal in the test process with the
+/// tests whose daemon must not receive it. A raised signal sets the flag of
+/// every handler registered in the process: a SIGINFO raised by one test made
+/// a concurrent sleep-loop test's daemon see a status-dump request and end its
+/// sleep at once (macOS, 2026-10-19). Take it before creating the daemon.
+#[cfg(test)]
+pub(crate) fn process_signal_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    LOCK.lock()
+}
+
 // ──────────────────── signal handler ────────────────────
 
 /// Thread-safe signal state shared between the signal handler and the main loop.
@@ -457,6 +468,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn siginfo_sets_status_dump_flag_on_macos() {
+        let _serial = process_signal_test_guard();
         let handler = SignalHandler::new();
 
         signal_hook::low_level::raise(signal_hook::consts::SIGINFO)
