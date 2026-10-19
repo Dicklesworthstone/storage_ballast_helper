@@ -11874,6 +11874,82 @@ mod tests {
         );
     }
 
+    /// bd-232u, through the executor thread itself (`spawn_executor_thread`):
+    /// a target-only batch's candidate outside its root is dropped before the
+    /// policy engine, so it never reaches the decision ledger, while the one
+    /// inside does. What the thread then deletes depends on the host's /proc
+    /// sweep (incomplete without root, which holds everything), so deletion
+    /// is not asserted.
+    #[cfg(unix)]
+    #[test]
+    fn executor_thread_drops_target_only_candidates_outside_their_root() {
+        use crate::scanner::walker::{FsEntryKind, FsIdentity};
+        use std::os::unix::fs::MetadataExt;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let base = fixture.directory.path().to_path_buf();
+        let root = base.join("claude-501");
+        let inside = root.join("s1/target-inside");
+        let outside = base.join("elsewhere/target-outside");
+        let candidates = [&inside, &outside]
+            .into_iter()
+            .map(|path| {
+                std::fs::create_dir_all(path.join("debug")).unwrap();
+                std::fs::write(path.join("debug/libdemo.rlib"), [7u8; 64]).unwrap();
+                let meta = std::fs::symlink_metadata(path).unwrap();
+                let mut candidate = test_candidate(&path.to_string_lossy(), 3.0);
+                candidate.size_bytes = 64;
+                candidate.identity = Some(FsIdentity {
+                    device_id: meta.dev(),
+                    inode: meta.ino(),
+                    kind: FsEntryKind::Directory,
+                });
+                candidate
+            })
+            .collect();
+        let (del_tx, del_rx) = crossbeam_channel::bounded(1);
+        let (report_tx, _report_rx) = crossbeam_channel::bounded(16);
+        let (index_tx, _index_rx) = crossbeam_channel::bounded(16);
+        let executor = fixture
+            .daemon
+            .spawn_executor_thread(
+                del_rx,
+                fixture.daemon.logger_handle.clone(),
+                ThreadHeartbeat::new("sbh-executor"),
+                report_tx,
+                index_tx,
+            )
+            .unwrap();
+        del_tx
+            .send(DeletionBatch {
+                candidates,
+                pressure_level: PressureLevel::Critical,
+                urgency: 0.9,
+                target_bytes: None,
+                target_only_root: Some(root),
+            })
+            .unwrap();
+        // The thread handles the batch, then stops on the closed channel.
+        drop(del_tx);
+        executor.join().unwrap();
+        fixture.flush_logger();
+
+        let log = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
+        assert!(
+            log.contains("dropped 1 target-only candidate(s) outside"),
+            "{log}"
+        );
+        assert!(
+            log.contains(inside.to_string_lossy().as_ref()),
+            "the candidate inside the root reaches the ledger: {log}"
+        );
+        assert!(
+            !log.contains(outside.to_string_lossy().as_ref()),
+            "the one outside never does"
+        );
+        assert!(outside.join("debug/libdemo.rlib").exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn executor_regret_guard_stops_queued_category_after_a_midbatch_alarm() {
