@@ -97,7 +97,11 @@ impl ProcessAccess for NativeProcesses {
         Ok(Some(Region {
             start: info.prp_prinfo.pri_address,
             size: info.prp_prinfo.pri_size,
-            path: info.prp_vip.path()?.to_path_buf(),
+            path: info
+                .prp_vip
+                .path()
+                .map_err(|_| invalid("malformed mapping pathname"))?
+                .to_path_buf(),
             protection: info.prp_prinfo.pri_protection,
         }))
     }
