@@ -7593,6 +7593,19 @@ impl ScanCursor {
     }
 }
 
+/// Record that `candidate` and every directory above it hold a candidate.
+/// Marking only the direct parent let a budget-stopped pass cache `/r/a` as
+/// barren for a candidate at `/r/a/b/target`, and the candidate directory
+/// itself, so the next pass skipped both (bd-y70k). Stops at the first
+/// ancestor already marked: its own ancestors were marked with it.
+fn mark_candidate_ancestors(dirs_with_candidates: &mut HashSet<PathBuf>, candidate: &Path) {
+    for dir in candidate.ancestors() {
+        if dir.as_os_str().is_empty() || !dirs_with_candidates.insert(dir.to_path_buf()) {
+            break;
+        }
+    }
+}
+
 /// How often an unchanged "maintenance keep" verdict for one path is repeated.
 const MAINTENANCE_KEEP_REPEAT: Duration = Duration::from_hours(1);
 /// Paths whose last keep line is remembered; past this, older ones are dropped.
@@ -9306,11 +9319,9 @@ fn scanner_thread_main(
                 continue;
             }
 
-            // This entry is classified — mark its parent as having candidates
-            // so the scan cursor knows NOT to cache it as barren.
-            if let Some(parent) = entry.path.parent() {
-                dirs_with_candidates.insert(parent.to_path_buf());
-            }
+            // This entry is classified: the scan cursor must not cache it or
+            // any directory above it as barren.
+            mark_candidate_ancestors(&mut dirs_with_candidates, &entry.path);
 
             let mut input = crate::scanner::scoring::CandidateInput {
                 path: entry.path.clone(), // Clone needed for input
@@ -11639,6 +11650,31 @@ mod tests {
 
     fn path_set(paths: &[&str]) -> HashSet<PathBuf> {
         paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn a_candidate_keeps_itself_and_every_ancestor_out_of_the_barren_cache() {
+        let mut cursor = scan_cursor(100, &[("/r/a", 1)]);
+        let visited = path_set(&["/r/a", "/r/a/b", "/r/a/b/target", "/r/x", "/r/x/y"]);
+        let mut candidates = HashSet::new();
+        mark_candidate_ancestors(&mut candidates, Path::new("/r/a/b/target"));
+        // A second candidate under the same tree stops at the marked parent.
+        mark_candidate_ancestors(&mut candidates, Path::new("/r/a/b/node_modules"));
+
+        cursor.update(&visited, &candidates, true);
+
+        let mut kept: Vec<&str> = cursor
+            .barren_dirs
+            .keys()
+            .map(|dir| dir.to_str().unwrap())
+            .collect();
+        kept.sort_unstable();
+        // /r/a was cached by an earlier pass and gained a candidate below it.
+        assert_eq!(kept, ["/r/x", "/r/x/y"]);
+        for marked in ["/r/a/b/target", "/r/a/b", "/r/a", "/r", "/"] {
+            assert!(candidates.contains(Path::new(marked)), "{marked}");
+        }
+        assert!(candidates.contains(Path::new("/r/a/b/node_modules")));
     }
 
     #[test]
