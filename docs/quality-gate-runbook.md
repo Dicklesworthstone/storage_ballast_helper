@@ -46,26 +46,29 @@ and in docs/testing-and-logging.md after a change to the script, and
 | 10 | `decision-plane` | HARD | test | Integration Tests | policy-correctness | `cargo test --test proof_harness -- --test-threads=4` |
 | 11 | `decision-e2e` | HARD | test | Integration Tests | policy-lifecycle | `cargo test --test decision_plane_e2e -- --test-threads=4` |
 | 12 | `explain-ledger` | HARD | test | Integration Tests | explainability | `cargo test --test explain_ledger -- --test-threads=4` |
-| 13 | `fallback` | HARD | test | Integration Tests | fallback-safety | `cargo test --test fallback_verification --features tui -- --test-threads=4` |
-| 14 | `tui-unit` | HARD | test | Dashboard / TUI Tests | dashboard-correctness | `cargo test --lib --features tui tui:: -- --test-threads=4` |
-| 15 | `tui-replay` | HARD | test | Dashboard / TUI Tests | deterministic-replay | `cargo test --lib --features tui tui::test_replay -- --test-threads=4` |
-| 16 | `tui-scenarios` | HARD | test | Dashboard / TUI Tests | operator-workflows | `cargo test --lib --features tui tui::test_scenario_drills -- --test-threads=4` |
-| 17 | `tui-properties` | HARD | test | Dashboard / TUI Tests | invariant-safety | `cargo test --lib --features tui tui::test_properties -- --test-threads=4` |
-| 18 | `tui-fault-injection` | HARD | test | Dashboard / TUI Tests | degraded-recovery | `cargo test --lib --features tui tui::test_fault_injection -- --test-threads=4` |
-| 19 | `tui-snapshots` | SOFT | test | Dashboard / TUI Tests | visual-contract | `cargo test --lib --features tui tui::test_snapshot_golden -- --test-threads=4` |
-| 20 | `tui-parity` | HARD | test | Dashboard / TUI Tests | legacy-parity | `cargo test --lib --features tui tui::parity_harness -- --test-threads=4` |
-| 21 | `tui-benchmarks` | SOFT | test | Dashboard / TUI Tests | operator-efficiency | `cargo test --lib --features tui tui::test_operator_benchmark -- --test-threads=4` |
-| 22 | `dashboard-integration` | HARD | test | Dashboard / TUI Tests | dashboard-e2e | `cargo test --test dashboard_integration_tests --features tui -- --test-threads=4` |
-| 23 | `dashboard-pty` | HARD | test | Dashboard / TUI Tests | dashboard-pty-session | `cargo test --test dashboard_pty --features tui -- --test-threads=1` |
-| 24 | `stress` | HARD | test | Stress & Performance | daemon-stability | `cargo test --test stress_tests -- --test-threads=2` |
-| 25 | `fuzz` | SOFT | test | Stress & Performance | parser-robustness | `cargo test --test fuzz_smoke` |
-| 26 | `stress-harness` | SOFT | test | Stress & Performance | concurrency-safety | `cargo test --test stress_harness -- --test-threads=2` |
-| 27 | `tui-stress` | SOFT | test | Stress & Performance | dashboard-endurance | `cargo test --lib --features tui tui::test_stress -- --test-threads=4` |
-| 28 | `daemon-e2e` | SOFT | test | E2E & Installer | daemon-lifecycle | `cargo test --test daemon_e2e -- --test-threads=2` |
-| 29 | `installer` | HARD | test | E2E & Installer | install-safety | `cargo test --test installer_e2e -- --test-threads=4` |
-| 30 | `e2e` | HARD | e2e | E2E & Installer | user-experience | `./scripts/e2e_test.sh` |
+| 13 | `source-root` | HARD | test | Integration Tests | source-root-safety | `cargo test --locked --lib source_root -- --test-threads=4` |
+| 14 | `fallback` | HARD | test | Integration Tests | fallback-safety | `cargo test --test fallback_verification --features tui -- --test-threads=4` |
+| 15 | `tui-unit` | HARD | test | Dashboard / TUI Tests | dashboard-correctness | `cargo test --lib --features tui tui:: -- --test-threads=4` |
+| 16 | `tui-replay` | HARD | test | Dashboard / TUI Tests | deterministic-replay | `cargo test --lib --features tui tui::test_replay -- --test-threads=4` |
+| 17 | `tui-scenarios` | HARD | test | Dashboard / TUI Tests | operator-workflows | `cargo test --lib --features tui tui::test_scenario_drills -- --test-threads=4` |
+| 18 | `tui-properties` | HARD | test | Dashboard / TUI Tests | invariant-safety | `cargo test --lib --features tui tui::test_properties -- --test-threads=4` |
+| 19 | `tui-fault-injection` | HARD | test | Dashboard / TUI Tests | degraded-recovery | `cargo test --lib --features tui tui::test_fault_injection -- --test-threads=4` |
+| 20 | `tui-snapshots` | SOFT | test | Dashboard / TUI Tests | visual-contract | `cargo test --lib --features tui tui::test_snapshot_golden -- --test-threads=4` |
+| 21 | `tui-parity` | HARD | test | Dashboard / TUI Tests | legacy-parity | `cargo test --lib --features tui tui::parity_harness -- --test-threads=4` |
+| 22 | `tui-benchmarks` | SOFT | test | Dashboard / TUI Tests | operator-efficiency | `cargo test --lib --features tui tui::test_operator_benchmark -- --test-threads=4` |
+| 23 | `dashboard-integration` | HARD | test | Dashboard / TUI Tests | dashboard-e2e | `cargo test --test dashboard_integration_tests --features tui -- --test-threads=4` |
+| 24 | `dashboard-pty` | HARD | test | Dashboard / TUI Tests | dashboard-pty-session | `cargo test --test dashboard_pty --features tui -- --test-threads=1` |
+| 25 | `stress` | HARD | test | Stress & Performance | daemon-stability | `cargo test --test stress_tests -- --test-threads=2` |
+| 26 | `fuzz` | SOFT | test | Stress & Performance | parser-robustness | `cargo test --test fuzz_smoke` |
+| 27 | `stress-harness` | SOFT | test | Stress & Performance | concurrency-safety | `cargo test --test stress_harness -- --test-threads=2` |
+| 28 | `tui-stress` | SOFT | test | Stress & Performance | dashboard-endurance | `cargo test --lib --features tui tui::test_stress -- --test-threads=4` |
+| 29 | `daemon-e2e` | SOFT | test | E2E & Installer | daemon-lifecycle | `cargo test --test daemon_e2e -- --test-threads=1` |
+| 30 | `installer` | HARD | test | E2E & Installer | install-safety | `cargo test --test installer_e2e -- --test-threads=4` |
+| 31 | `e2e` | HARD | e2e | E2E & Installer | user-experience | `./scripts/e2e_test.sh` |
+| 32 | `native-btrfs` | HARD | native | Native Linux (--native, dsr) | btrfs-compression | `./scripts/quality-gate.sh --stage native-btrfs` |
+| 33 | `native-systemd` | HARD | native | Native Linux (--native, dsr) | systemd-namespace | `./scripts/quality-gate.sh --stage native-systemd` |
 
-30 stages: 21 HARD, 9 SOFT.
+33 stages: 24 HARD, 9 SOFT.
 <!-- sbh-qg:stages:end -->
 
 `tui` is a default feature since
