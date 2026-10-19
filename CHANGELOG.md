@@ -192,6 +192,34 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
   of 10% of RAM and swap, 25% instead of 20% of the destination), and
   sbh checks that headroom about once a second instead of on every log
   line.
+- **Linux: the log's RAM copy also needs headroom in sbh's own cgroup**
+  (`9da9e8d`, `4662995`). The host can have plenty of free RAM while the
+  service's cgroup, or one above it, sits near its `memory.high`,
+  `memory.max` or swap limit; writing the log to RAM there pushes sbh
+  toward the cgroup's reclaim or OOM killer. After the host and mount
+  checks pass, the same 10% keep and 15% start margins now apply to every
+  visible cgroup-v2 scope, each against its own usage. When that evidence
+  can't be read (a legacy hierarchy, a hidden ancestor, a limit changing
+  mid-read), sbh refuses the RAM copy and stays on disk.
+- **Linux: memory pressure inside sbh's own cgroup counts** (`772d43b`,
+  `863784f`). The daemon read only the host's memory stall (PSI), so a
+  service cgroup stalling on its own limit looked healthy. It now also
+  reads its cgroup's `memory.pressure` and uses the larger of the two
+  stall figures, never their sum; host page and swap counts are unchanged.
+  The memory subscription survives its event source breaking (it falls
+  back to sampling once a second) and a failed sample reports the level
+  as unknown instead of repeating the last one.
+- **macOS: the live-process checks report what they could not see**
+  (`16feafc`, `61a303e`, `4c0119a`, `0aaaeef`, `9c7e282`, `9585207`,
+  `0741675`, `3684721`, `a588eaf`). Before a deletion, sbh asks which
+  processes use the candidate: running builds' outputs, open files,
+  executables and memory mappings. On macOS those queries dropped
+  processes they could not read and returned what was left as the whole
+  answer. They now say when coverage is incomplete (access errors,
+  budgets, a process list that would not fit), and the deletion waits;
+  what they did see still protects. One query covers all roots under
+  shared limits, a stalled native call no longer blocks its caller, and
+  the process list grows its buffer instead of retrying at the same size.
 
 ## v0.7.9 **[release]**
 
