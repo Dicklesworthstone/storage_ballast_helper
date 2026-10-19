@@ -19,6 +19,7 @@ use storage_ballast_helper::platform::types::PalError;
 
 const LOG: &str = "/scratch/activity.jsonl";
 
+#[allow(clippy::struct_excessive_bools)] // a test double's independent switches
 struct LocalMemory {
     ram: bool,
     readonly: bool,

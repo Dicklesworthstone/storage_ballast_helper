@@ -177,6 +177,7 @@ impl Constraint {
 }
 
 /// Additional RAM-write refusal, without changing the host-wide memory API.
+///
 /// Legacy memory-controller hierarchies, unreadable evidence and hidden bind
 /// ancestors are errors rather than a claim of available capacity. No writes,
 /// reclaim requests, process enumeration or configuration changes are performed.
@@ -196,8 +197,8 @@ fn refusal_with(access: &impl Access, percent: u8) -> io::Result<Option<String>>
         .find(|limit| limit.refuses(percent))
         .map(|limit| {
             format!(
-                "cgroup {:?} {} has {} of {} bytes headroom ({}% required)",
-                limit.scope,
+                "cgroup {} {} has {} of {} bytes headroom ({}% required)",
+                limit.scope.display(),
                 limit.field,
                 limit.limit.saturating_sub(limit.used),
                 limit.limit,
@@ -794,8 +795,10 @@ mod tests {
             (MOUNTS, b"37 25 0:32 / /cg rw - cgroup2 cgroup rw\n"),
             ("/cg/service/memory.max", b"1\n"),
         ] {
-            let mut fixture = Fixture::default();
-            fixture.replacement = Some((path.into(), 2, replacement.to_vec()));
+            let fixture = Fixture {
+                replacement: Some((path.into(), 2, replacement.to_vec())),
+                ..Fixture::default()
+            };
             assert!(refusal_with(&fixture, 10).is_err(), "{path}");
         }
     }

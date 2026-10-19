@@ -38,7 +38,7 @@ fn invalid(message: &'static str) -> io::Error {
 }
 
 fn slots(bytes: usize) -> io::Result<usize> {
-    if bytes == 0 || bytes % size_of::<i32>() != 0 {
+    if bytes == 0 || !bytes.is_multiple_of(size_of::<i32>()) {
         return Err(invalid("native PID byte count is empty or misaligned"));
     }
     Ok(bytes / size_of::<i32>())
