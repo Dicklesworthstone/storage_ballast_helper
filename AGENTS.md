@@ -297,7 +297,7 @@ src/
     scoring.rs        # Multi-factor candidacy scoring engine
     deletion.rs       # Circuit-breaker-guarded deletion executor
     protection.rs     # .sbh-protect markers + config glob patterns
-    merkle.rs         # Incremental Merkle scan index
+    merkle.rs         # Legacy Merkle scan index (inactive: tests only; the daemon uses index.rs)
 
   ballast/
     manager.rs        # Ballast pool lifecycle (provision, verify, inventory)
@@ -342,7 +342,7 @@ src/
 | `src/cli/bootstrap.rs` | ~2800 | Bootstrap migration with 16 migration reason types |
 | `src/cli/assets.rs` | ~1240 | Asset manifest pipeline with SHA-256 verification |
 | `src/daemon/loop_main.rs` | ~1170 | Main daemon monitoring loop |
-| `src/scanner/merkle.rs` | ~1080 | Incremental Merkle scan index with full-scan fallback |
+| `src/scanner/merkle.rs` | ~1300 | Legacy Merkle scan index, not wired into the daemon (tests only) |
 | `src/cli/uninstall.rs` | ~1020 | Uninstall parity with 5 cleanup modes |
 | `src/daemon/notifications.rs` | ~1020 | Multi-channel notification system |
 | `src/cli/mod.rs` | ~910 | Shared installer/update contracts |
