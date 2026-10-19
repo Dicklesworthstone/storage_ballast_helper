@@ -3,6 +3,8 @@
 //! A successful pathname lookup is positive evidence even when optional task
 //! statistics cannot be read. Never fetch argv, cwd or resource counters here.
 //! Failed lookups revoke coverage; they are not proof of an idle candidate.
+//! Two native errors are not failures: ESRCH (the process exited) and ENOENT
+//! (its executable was unlinked, so it lies under no root).
 //! This is a fresh observation of visible PIDs, not an atomic exec snapshot.
 
 use std::collections::BTreeSet;
@@ -203,9 +205,17 @@ fn collect_with(
         }
         let executable = match access.executable(pid) {
             Ok(path) => path,
-            // ESRCH is the native exited-process signal. Generic NotFound,
-            // EACCES, EPERM, EIO and malformed path data remain unknown use.
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => continue,
+            // ESRCH is the native exited-process signal. A native ENOENT is a
+            // process whose executable was unlinked after it started (a tool
+            // that updated itself in place): that file is in no directory, so
+            // no candidate root can hold it. On one Mac, 10 of 1,670 processes
+            // were such (agent CLIs on a deleted version); counting them as
+            // unknown left coverage incomplete on every pass, so nothing was
+            // ever deleted there. EACCES, EPERM, EIO, an ENOENT without a
+            // native errno and malformed path data remain unknown use.
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) => {
+                continue;
+            }
             Err(_) => {
                 result.complete = false;
                 continue;
@@ -358,13 +368,7 @@ mod tests {
 
     #[test]
     fn denied_or_failed_lookup_keeps_other_positives_and_revokes_coverage() {
-        for code in [
-            libc::EACCES,
-            libc::EPERM,
-            libc::EIO,
-            libc::ENOENT,
-            libc::EINVAL,
-        ] {
+        for code in [libc::EACCES, libc::EPERM, libc::EIO, libc::EINVAL] {
             let mut fixture = Fixture::default();
             fixture.failures.insert(42, code);
             let result = scan(&fixture, Limits::default());
@@ -380,12 +384,16 @@ mod tests {
 
     #[test]
     fn exited_pid_is_distinct_from_an_unreadable_process() {
-        let mut fixture = Fixture::default();
-        fixture.failures.insert(42, libc::ESRCH);
-        let result = scan(&fixture, Limits::default());
-        assert!(result.complete);
-        assert_eq!(result.processes.len(), 1);
-        assert_eq!(result.processes[0].pid, 41);
+        // ESRCH: the process exited. ENOENT: its executable was unlinked, so
+        // no root holds it. Neither is unknown use.
+        for code in [libc::ESRCH, libc::ENOENT] {
+            let mut fixture = Fixture::default();
+            fixture.failures.insert(42, code);
+            let result = scan(&fixture, Limits::default());
+            assert!(result.complete, "errno {code}");
+            assert_eq!(result.processes.len(), 1);
+            assert_eq!(result.processes[0].pid, 41);
+        }
     }
 
     #[test]

@@ -2410,23 +2410,29 @@ mod tests {
     #[test]
     fn open_path_ancestors_uses_platform_collector_on_macos() {
         let dir = tempfile::tempdir().unwrap();
-        let active_dir = dir.path().join("active-target");
+        // The kernel reports /private/var/..., not the /var symlink.
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let active_dir = root.join("active-target");
         fs::create_dir(&active_dir).unwrap();
         let active_file = active_dir.join("in-use.bin");
         fs::write(&active_file, "payload").unwrap();
         let handle = fs::File::open(&active_file).unwrap();
 
-        let (ancestors, complete) = collect_open_path_ancestors(&[dir.path().to_path_buf()]);
-        assert!(
-            complete,
-            "macOS PAL open-file preflight should complete for a temp root"
-        );
-
-        if !ancestors.contains(&active_file) {
-            drop(handle);
-            return;
+        let (ancestors, complete) = collect_open_path_ancestors(std::slice::from_ref(&root));
+        // Only root can read every process's descriptors: as a user, other
+        // users' processes fail with EPERM, which correctly leaves coverage
+        // incomplete (the same rule as a non-root daemon on Linux).
+        if nix::unistd::geteuid().is_root() {
+            assert!(
+                complete,
+                "macOS PAL open-file preflight should complete for a temp root"
+            );
         }
-
+        // This process's own descriptor is readable either way.
+        assert!(
+            ancestors.contains(&active_file),
+            "the open file was not found: {ancestors:?}"
+        );
         assert!(ancestors.contains(&active_dir));
         assert!(is_path_open_by_ancestor(&active_dir, &ancestors));
         drop(handle);

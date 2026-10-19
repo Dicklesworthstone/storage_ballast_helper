@@ -15,6 +15,7 @@ use super::{
     macos_process_path_variants, observed_process_path_under_root, open_file_kind, open_file_mode,
     proc_listpids_safe, proc_pid_list_fds, proc_pidfdinfo_vnode_path, proc_pidinfo_task_all,
 };
+use crate::platform::macos::libproc::native_or;
 use crate::platform::types::{OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET};
 
 const MAX_DESCRIPTORS: usize = 262_144;
@@ -55,6 +56,9 @@ trait ProcessAccess {
         roots: &[PathBuf],
     ) -> io::Result<Option<OpenFile>>;
     fn now(&self) -> Instant;
+    /// Whether this process runs as root, which can read every descriptor
+    /// the kernel does not guard.
+    fn privileged(&self) -> bool;
 }
 
 struct NativeProcesses;
@@ -111,7 +115,7 @@ impl ProcessAccess for NativeProcesses {
             return Ok(None);
         }
         let info = proc_pidfdinfo_vnode_path(pid, fd)?
-            .ok_or_else(|| io::Error::other("vnode descriptor returned no metadata"))?;
+            .ok_or_else(|| native_or(io::Error::other("vnode descriptor returned no metadata")))?;
         let path = info
             .path()
             .map_err(|_| io::Error::other("invalid vnode pathname"))?;
@@ -131,6 +135,10 @@ impl ProcessAccess for NativeProcesses {
 
     fn now(&self) -> Instant {
         Instant::now()
+    }
+
+    fn privileged(&self) -> bool {
+        nix::unistd::geteuid().is_root()
     }
 }
 
@@ -264,6 +272,17 @@ fn collect_with(
                 // the descriptor-level EBADF is benign; list/identity errors
                 // with the same errno still represent missing coverage.
                 Err(error) if error.raw_os_error() == Some(libc::EBADF) => {}
+                // A native ENOENT for a descriptor is an open file that was
+                // unlinked (Spotlight's mds held one): it lies under no root.
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                // As root every descriptor is readable except those the kernel
+                // guards: routined's SQLite caches refuse PROC_PIDFDVNODEPATHINFO
+                // with EPERM even to root, on every Mac. They are system
+                // daemons' own container files; counting them as unknown use
+                // left coverage incomplete on every pass, so nothing was ever
+                // deleted. Without root, EPERM is a missing privilege and
+                // still revokes coverage.
+                Err(error) if access.privileged() && error.raw_os_error() == Some(libc::EPERM) => {}
                 Err(_) => incomplete(&mut result, "macOS descriptor metadata was unreadable"),
             }
         }
@@ -329,6 +348,7 @@ mod tests {
         now: Cell<Instant>,
         step: Duration,
         discovery_step: Duration,
+        privileged: bool,
     }
 
     impl Default for Fixture {
@@ -342,6 +362,7 @@ mod tests {
                 now: Cell::new(Instant::now()),
                 step: Duration::ZERO,
                 discovery_step: Duration::ZERO,
+                privileged: false,
             }
         }
     }
@@ -407,6 +428,10 @@ mod tests {
         fn now(&self) -> Instant {
             self.now.get()
         }
+
+        fn privileged(&self) -> bool {
+            self.privileged
+        }
     }
 
     #[test]
@@ -466,6 +491,36 @@ mod tests {
     }
 
     #[test]
+    fn a_guarded_descriptor_is_not_missing_coverage_only_for_root() {
+        // routined's guarded SQLite descriptors refuse even root with EPERM.
+        for privileged in [false, true] {
+            let fixture = Fixture {
+                fault: Some((41, "fd0", libc::EPERM)),
+                privileged,
+                ..Fixture::default()
+            };
+            let result = fixture.scan(Limits::default());
+            assert_eq!(result.complete, privileged, "privileged={privileged}");
+            assert_eq!(result.files.len(), 2);
+        }
+        // Root still loses coverage for any other descriptor error, and for
+        // EPERM on a process's identity or descriptor list.
+        for (field, code) in [
+            ("fd0", libc::EACCES),
+            ("fd0", libc::EIO),
+            ("identity", libc::EPERM),
+            ("descriptors", libc::EPERM),
+        ] {
+            let fixture = Fixture {
+                fault: Some((41, field, code)),
+                privileged: true,
+                ..Fixture::default()
+            };
+            assert!(!fixture.scan(Limits::default()).complete, "{field}: {code}");
+        }
+    }
+
+    #[test]
     fn closed_descriptor_and_exited_process_are_not_permission_failures() {
         for field in ["identity", "descriptors", "fd1"] {
             let fixture = Fixture {
@@ -477,13 +532,17 @@ mod tests {
             assert_eq!(result.files.len(), 1);
             assert_eq!(result.files[0].pid, 42);
         }
-        let fixture = Fixture {
-            fault: Some((41, "fd0", libc::EBADF)),
-            ..Fixture::default()
-        };
-        let result = fixture.scan(Limits::default());
-        assert!(result.complete);
-        assert_eq!(result.files.len(), 2);
+        // A descriptor closed since the inventory (EBADF), or whose file was
+        // unlinked (ENOENT): neither is missing coverage.
+        for code in [libc::EBADF, libc::ENOENT] {
+            let fixture = Fixture {
+                fault: Some((41, "fd0", code)),
+                ..Fixture::default()
+            };
+            let result = fixture.scan(Limits::default());
+            assert!(result.complete, "errno {code}");
+            assert_eq!(result.files.len(), 2);
+        }
     }
 
     #[test]
