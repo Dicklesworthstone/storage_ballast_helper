@@ -199,7 +199,7 @@ fn refusal_with(access: &impl Access, percent: u8) -> io::Result<Option<String>>
         .find(|limit| limit.refuses(percent))
         .map(|limit| {
             format!(
-                "cgroup {} {} has {} of {} bytes headroom ({}% required)",
+                "cgroup \"{}\" {} has {} of {} bytes headroom ({}% required)",
                 limit.scope.display(),
                 limit.field,
                 limit.limit.saturating_sub(limit.used),
