@@ -15,6 +15,7 @@
 
 mod common;
 
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
@@ -172,6 +173,21 @@ struct PtyDashboard {
 
 impl PtyDashboard {
     fn spawn(config: &Path, args: &[&str]) -> Self {
+        let mut command_line: Vec<OsString> =
+            vec!["--config".into(), config.into(), "dashboard".into()];
+        command_line.extend(args.iter().map(OsString::from));
+        // The slave copy is dropped here: the reader sees EOF when sbh exits.
+        Self::spawn_program(
+            &common::sbh_bin_path(),
+            &command_line,
+            &[("SBH_OUTPUT_FORMAT", "human")],
+        )
+        .0
+    }
+
+    /// `program` with a fresh pty as its controlling terminal. Also returns a
+    /// copy of the slave end, for reading the terminal settings afterwards.
+    fn spawn_program(program: &Path, argv: &[OsString], envs: &[(&str, &str)]) -> (Self, OwnedFd) {
         let size = Winsize {
             ws_row: 32,
             ws_col: 110,
@@ -181,23 +197,23 @@ impl PtyDashboard {
         let pty = openpty(Some(&size), None).expect("openpty");
         let slave: OwnedFd = pty.slave;
         let master: OwnedFd = pty.master;
+        let kept = slave.try_clone().unwrap();
         // `setsid -c -w`: new session, stdin (the slave) becomes the
-        // controlling terminal, and the wrapper exits with sbh's status.
+        // controlling terminal, and the wrapper exits with the program's
+        // status. The spawned process is not a group leader, so setsid execs
+        // in place: the child's pid is the program's.
         let child = Command::new("setsid")
             .args(["-c", "-w", "--"])
-            .arg(common::sbh_bin_path())
-            .arg("--config")
-            .arg(config)
-            .arg("dashboard")
-            .args(args)
+            .arg(program)
+            .args(argv)
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave))
             .env("TERM", "xterm-256color")
-            .env("SBH_OUTPUT_FORMAT", "human")
+            .envs(envs.iter().copied())
             .env_remove("NO_COLOR")
             .spawn()
-            .expect("spawn sbh dashboard on a pty");
+            .expect("spawn a program on a pty");
         let writer = File::from(master.try_clone().unwrap());
         let mut reader = File::from(master);
         let output = Arc::new(Mutex::new(Vec::new()));
@@ -211,11 +227,14 @@ impl PtyDashboard {
                 }
             }
         });
-        Self {
-            child,
-            writer,
-            output,
-        }
+        (
+            Self {
+                child,
+                writer,
+                output,
+            },
+            kept,
+        )
     }
 
     /// What the cockpit has drawn so far, escape sequences stripped.
@@ -271,7 +290,10 @@ impl PtyDashboard {
             if Instant::now() >= deadline {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
-                panic!("dashboard did not exit on q; output:\n{}", self.text());
+                panic!(
+                    "the program on the pty did not exit; output:\n{}",
+                    self.text()
+                );
             }
             thread::sleep(Duration::from_millis(50));
         }
@@ -546,4 +568,159 @@ fn without_a_pty_the_explicit_cockpit_is_refused() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("stdout is not a TTY"), "{stderr}");
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+const LEAVE_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049l";
+
+/// A SIGTERM from another process ends the cockpit inside ftui-tty's 2 s
+/// grace: the loop sees it, stops drawing on the screen ftui-tty restored,
+/// tears down and exits with 128 + 15. Before, the loop drew on until
+/// ftui-tty gave up waiting and exited the process itself, 2 s later.
+#[test]
+fn pty_sigterm_ends_the_cockpit_promptly_without_drawing_on_the_shell() {
+    use storage_ballast_helper::logger::jsonl::{EventType, LogEntry, Severity};
+
+    if Command::new("setsid").arg("--version").output().is_err() {
+        eprintln!("SKIP: util-linux setsid is not installed; the pty session needs it");
+        return;
+    }
+    let dir = scratch();
+    let config = write_config(dir.path());
+    let log = dir.path().join("captured.jsonl");
+    let mut lines = String::new();
+    for (i, event) in [EventType::BallastProvision, EventType::ScanComplete]
+        .into_iter()
+        .enumerate()
+    {
+        let mut entry = LogEntry::new(event, Severity::Info);
+        entry.ts = format!("2026-08-30T10:00:0{i}Z");
+        lines.push_str(&serde_json::to_string(&entry).unwrap());
+        lines.push('\n');
+    }
+    fs::write(&log, lines).unwrap();
+
+    let replay = PtyDashboard::spawn(
+        &config,
+        &["--replay", log.to_str().unwrap(), "--speed", "max"],
+    );
+    replay.wait_for_text_from(0, "REPLAY captured.jsonl", Duration::from_secs(20));
+    let output = Arc::clone(&replay.output);
+    let sent = Instant::now();
+    assert!(
+        Command::new("kill")
+            .arg("-TERM")
+            .arg(replay.child.id().to_string())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (status, text) = replay.wait_exit(Duration::from_secs(10));
+    let elapsed = sent.elapsed();
+    assert_eq!(status.code(), Some(128 + 15), "{text}");
+    assert!(
+        elapsed < Duration::from_millis(1800),
+        "exit took {elapsed:?}: that is ftui-tty's own exit after its 2 s grace, not the loop's"
+    );
+    let bytes = output.lock().unwrap().clone();
+    let last_leave = bytes
+        .windows(LEAVE_ALTERNATE_SCREEN.len())
+        .rposition(|window| window == LEAVE_ALTERNATE_SCREEN)
+        .expect("the alternate screen was left");
+    let after = strip_escapes(&String::from_utf8_lossy(&bytes[last_leave..]));
+    assert!(
+        after.trim().is_empty(),
+        "drawn on the restored screen: {after:?}"
+    );
+}
+
+/// The child half of `a_panic_restores_the_terminal_before_its_message`:
+/// it does nothing unless that test runs it on a pty.
+#[test]
+#[ignore = "the child process of a_panic_restores_the_terminal_before_its_message"]
+fn guard_panic_child() {
+    use ftui_backend::BackendFeatures;
+    use ftui_tty::TtySessionOptions;
+    use storage_ballast_helper::tui::terminal_guard::TerminalGuard;
+
+    if std::env::var_os("SBH_GUARD_PANIC_CHILD").is_none() {
+        return;
+    }
+    let _guard = TerminalGuard::open(TtySessionOptions {
+        alternate_screen: true,
+        intercept_signals: true,
+        features: BackendFeatures {
+            mouse_capture: true,
+            ..BackendFeatures::default()
+        },
+    })
+    .expect("the pty is this process's terminal");
+    panic!("guard-probe");
+}
+
+/// A panic while the cockpit owns the terminal, in a build where panics
+/// unwind (debug and test builds; release builds abort, and ftui-tty's own
+/// hook covers them): the terminal is restored before the message is
+/// printed, so the message stays on the normal screen, nothing leaves the
+/// alternate screen again after it (which would move the cursor back over
+/// it), and the terminal settings are back to cooked mode.
+#[test]
+fn a_panic_restores_the_terminal_before_its_message() {
+    use nix::sys::termios::{LocalFlags, tcgetattr};
+
+    if Command::new("setsid").arg("--version").output().is_err() {
+        eprintln!("SKIP: util-linux setsid is not installed; the pty session needs it");
+        return;
+    }
+    let argv: Vec<OsString> = [
+        "guard_panic_child",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    let (child, slave) = PtyDashboard::spawn_program(
+        &std::env::current_exe().unwrap(),
+        &argv,
+        &[("SBH_GUARD_PANIC_CHILD", "1")],
+    );
+    let cooked = LocalFlags::ECHO | LocalFlags::ICANON;
+    assert!(tcgetattr(&slave).unwrap().local_flags.contains(cooked));
+    let output = Arc::clone(&child.output);
+    let (status, text) = child.wait_exit(Duration::from_secs(60));
+    let bytes = output.lock().unwrap().clone();
+
+    let probe = find(&bytes, b"guard-probe")
+        .unwrap_or_else(|| panic!("no panic message on the terminal:\n{text}"));
+    let leave = find(&bytes, LEAVE_ALTERNATE_SCREEN).expect("the alternate screen was left");
+    assert!(
+        leave < probe,
+        "the message was printed on the alternate screen:\n{text}"
+    );
+    assert_eq!(
+        find(&bytes[probe..], LEAVE_ALTERNATE_SCREEN),
+        None,
+        "the alternate screen was left again after the message"
+    );
+    assert!(
+        !text.contains("panicked while processing panic")
+            && !text.contains("panic in a destructor"),
+        "{text}"
+    );
+    // libtest reports the panicking test as failed (101); an abort while
+    // unwinding would end the process by SIGABRT instead.
+    assert_eq!(status.code(), Some(101), "{text}");
+    let flags = tcgetattr(&slave).unwrap().local_flags;
+    assert!(
+        flags.contains(cooked),
+        "the terminal was left raw: {flags:?}"
+    );
 }

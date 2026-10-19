@@ -1,8 +1,9 @@
 //! Canonical runtime entrypoint for dashboard execution.
 //!
-//! The new cockpit path uses ftui-tty's [`TtyBackend`] for panic-safe terminal
-//! lifecycle management and native event polling. The legacy fallback retains
-//! its own cleanup logic.
+//! The new cockpit path opens the terminal through
+//! [`TerminalGuard`](super::terminal_guard::TerminalGuard) (ftui-tty
+//! underneath), which restores it on exit, on a panic and on a termination
+//! signal. The legacy fallback retains its own cleanup logic.
 
 #![allow(missing_docs)]
 
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use ftui::{Buffer, BufferDiff, Event, Frame, GraphemePool, KeyEventKind};
 use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
-use ftui_tty::{TtyBackend, TtySessionOptions};
+use ftui_tty::TtySessionOptions;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -25,6 +26,7 @@ use super::telemetry::{
     CompositeTelemetryAdapter, NullTelemetryHook, TelemetryHook, TelemetryQueryAdapter,
     TelemetrySample,
 };
+use super::terminal_guard::{TerminalGuard, Wait};
 use super::theme::AccessibilityProfile;
 use super::{input, render, update};
 use crate::ballast::manager::BallastManager;
@@ -361,8 +363,9 @@ pub fn run_dashboard(config: &DashboardRuntimeConfig) -> io::Result<()> {
 
 #[allow(clippy::too_many_lines)] // TUI event loop is a natural single flow
 fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
-    // TtyBackend handles raw mode + alternate screen with RAII cleanup.
-    // Drop restores the terminal even on panic or early return.
+    // The guard owns raw mode and the alternate screen: it restores them on
+    // drop, before a panic message is printed, and stops the loop below on a
+    // termination signal (see terminal_guard).
     let options = TtySessionOptions {
         alternate_screen: true,
         intercept_signals: true,
@@ -371,9 +374,9 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
             ..Default::default()
         },
     };
-    let mut backend = TtyBackend::open(80, 24, options)?;
+    let mut term = TerminalGuard::open(options)?;
 
-    let (raw_cols, raw_rows) = backend.size()?;
+    let (raw_cols, raw_rows) = term.backend().size()?;
     let (cols, rows) = (raw_cols.max(1), raw_rows.max(1));
     let mut model = DashboardModel::new(
         config.state_file.clone(),
@@ -493,7 +496,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
         } else {
             BufferDiff::compute(&prev_buffer, &frame.buffer)
         };
-        backend
+        term.backend()
             .presenter()
             .present_ui(&frame.buffer, Some(&diff), full_repaint)?;
         first_frame = false;
@@ -511,11 +514,16 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
             update::update(&mut model, DashboardMsg::NotificationExpired(id));
         }
 
-        // Poll for terminal events (timeout = refresh interval).
-        let poll_timeout = model.refresh;
-        if backend.poll_event(poll_timeout)? {
+        // Wait for terminal events (timeout = refresh interval).
+        let wait = term.wait_for_event(model.refresh)?;
+        if let Wait::Terminated(signal) = wait {
+            // ftui-tty has restored the screen; drawing again would land on
+            // the shell's.
+            return Err(term.acknowledge_termination(signal));
+        }
+        if wait == Wait::Event {
             // Drain all available events.
-            while let Some(event) = backend.read_event()? {
+            while let Some(event) = term.backend().read_event()? {
                 let cmd = match event {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         update::update(&mut model, input::map_key_event(key))
@@ -563,7 +571,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
         }
     }
 
-    // TtyBackend Drop handles cleanup.
+    // The guard's drop restores the terminal.
     Ok(())
 }
 

@@ -7667,8 +7667,19 @@ fn run_new_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Re
         }),
         replay,
     };
-    tui::run_dashboard(&config)
-        .map_err(|e| CliError::Runtime(format!("dashboard runtime failure: {e}")))
+    match tui::run_dashboard(&config) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // A termination signal, after a clean teardown: exit as ftui-tty
+            // would have, with 128 + the signal.
+            if let Some(signal) = tui::terminal_guard::TerminatedBySignal::in_error(&error) {
+                std::process::exit(128 + signal);
+            }
+            Err(CliError::Runtime(format!(
+                "dashboard runtime failure: {error}"
+            )))
+        }
+    }
 }
 
 /// Without the `tui` feature the cockpit cannot run. An explicit
