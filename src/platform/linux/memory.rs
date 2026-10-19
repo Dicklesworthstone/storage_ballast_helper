@@ -279,15 +279,17 @@ where
             pressure_subscription_loop(
                 initial,
                 &weak_liveness,
-                || wait_for_pressure(
-                    &mut source,
-                    |(epoll, _)| {
-                        let mut events = [EpollEvent::empty()];
-                        let result = epoll.wait(&mut events, MEMORY_PRESSURE_EPOLL_TIMEOUT_MS);
-                        epoll_wake(result, events[0].events())
-                    },
-                    std::thread::sleep,
-                ),
+                || {
+                    wait_for_pressure(
+                        &mut source,
+                        |(epoll, _)| {
+                            let mut events = [EpollEvent::empty()];
+                            let result = epoll.wait(&mut events, MEMORY_PRESSURE_EPOLL_TIMEOUT_MS);
+                            epoll_wake(result, events[0].events())
+                        },
+                        std::thread::sleep,
+                    )
+                },
                 sampler,
                 |pressure| callback(pressure),
             );
@@ -348,8 +350,9 @@ enum PressureWake {
 fn epoll_wake(result: std::result::Result<usize, Errno>, flags: EpollFlags) -> PressureWake {
     match result {
         Ok(0) => PressureWake::Sample,
-        Ok(1) if flags.contains(EpollFlags::EPOLLPRI)
-            && !flags.intersects(EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP) =>
+        Ok(1)
+            if flags.contains(EpollFlags::EPOLLPRI)
+                && !flags.intersects(EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP) =>
         {
             PressureWake::Sample
         }
@@ -628,32 +631,66 @@ mod tests {
         assert_eq!(local.used_pages, host.used_pages);
         assert_eq!(local.swap_total_bytes, host.swap_total_bytes);
         assert_eq!(local.swap_used_bytes, host.swap_used_bytes);
-        let host_pressure = super::memory_pressure_with_local(&info, Some(2500), Ok(Some(500)), 4096);
-        assert_eq!(host_pressure.linux_psi_avg10, Some(2500), "do not add overlapping PSI percentages");
+        let host_pressure =
+            super::memory_pressure_with_local(&info, Some(2500), Ok(Some(500)), 4096);
+        assert_eq!(
+            host_pressure.linux_psi_avg10,
+            Some(2500),
+            "do not add overlapping PSI percentages"
+        );
         assert_eq!(host_pressure.level, MemoryPressureLevel::Critical);
     }
 
     #[test]
     fn missing_v2_evidence_is_unknown_unless_a_known_signal_already_shows_pressure() {
-        let info = super::MemoryInfo { total_bytes: 100, available_bytes: 50, swap_total_bytes: 0, swap_free_bytes: 0 };
+        let info = super::MemoryInfo {
+            total_bytes: 100,
+            available_bytes: 50,
+            swap_total_bytes: 0,
+            swap_free_bytes: 0,
+        };
         for (host, local, expected) in [
-            (Some(0), Err(std::io::ErrorKind::PermissionDenied.into()), MemoryPressureLevel::Unknown),
-            (Some(500), Err(std::io::ErrorKind::PermissionDenied.into()), MemoryPressureLevel::Warn),
-            (Some(2000), Err(std::io::ErrorKind::PermissionDenied.into()), MemoryPressureLevel::Critical),
+            (
+                Some(0),
+                Err(std::io::ErrorKind::PermissionDenied.into()),
+                MemoryPressureLevel::Unknown,
+            ),
+            (
+                Some(500),
+                Err(std::io::ErrorKind::PermissionDenied.into()),
+                MemoryPressureLevel::Warn,
+            ),
+            (
+                Some(2000),
+                Err(std::io::ErrorKind::PermissionDenied.into()),
+                MemoryPressureLevel::Critical,
+            ),
             (None, Ok(Some(0)), MemoryPressureLevel::Unknown),
             (None, Ok(Some(2000)), MemoryPressureLevel::Critical),
             (Some(0), Ok(None), MemoryPressureLevel::Normal),
             (None, Ok(None), MemoryPressureLevel::Unknown),
         ] {
-            assert_eq!(super::memory_pressure_with_local(&info, host, local, 1).level, expected);
+            assert_eq!(
+                super::memory_pressure_with_local(&info, host, local, 1).level,
+                expected
+            );
         }
     }
 
     #[test]
     fn exit_band_uses_local_stalls_even_when_the_host_is_quiet() {
-        let info = super::MemoryInfo { total_bytes: 100, available_bytes: 50, swap_total_bytes: 0, swap_free_bytes: 0 };
+        let info = super::MemoryInfo {
+            total_bytes: 100,
+            available_bytes: 50,
+            swap_total_bytes: 0,
+            swap_free_bytes: 0,
+        };
         let mut last = MemoryPressureLevel::Critical;
-        for (local, expected) in [(1700, MemoryPressureLevel::Critical), (450, MemoryPressureLevel::Warn), (399, MemoryPressureLevel::Normal)] {
+        for (local, expected) in [
+            (1700, MemoryPressureLevel::Critical),
+            (450, MemoryPressureLevel::Warn),
+            (399, MemoryPressureLevel::Normal),
+        ] {
             let sample = super::memory_pressure_with_local(&info, Some(0), Ok(Some(local)), 1);
             last = banded_level(last, sample.linux_psi_avg10, sample.level);
             assert_eq!(last, expected);
@@ -691,7 +728,9 @@ mod tests {
     }
 
     fn unavailable_sample() -> super::Result<MemoryPressure> {
-        Err(SbhError::MountParse { details: "injected memory read failure".to_owned() })
+        Err(SbhError::MountParse {
+            details: "injected memory read failure".to_owned(),
+        })
     }
 
     #[test]
@@ -702,26 +741,50 @@ mod tests {
             swap_total_bytes: 0,
             swap_free_bytes: 0,
         };
-        let samples = [7350, 1700, 450, 399].into_iter().map(|local| {
-            Ok(super::memory_pressure_with_local(&info, Some(0), Ok(Some(local)), 1))
-        }).collect();
-        let updates = subscription_updates(test_memory_pressure(MemoryPressureLevel::Normal), samples);
-        assert_eq!(updates.iter().map(|sample| sample.level).collect::<Vec<_>>(), vec![
-            MemoryPressureLevel::Critical, MemoryPressureLevel::Warn, MemoryPressureLevel::Normal,
-        ]);
-        assert_eq!(updates.iter().map(|sample| sample.linux_psi_avg10).collect::<Vec<_>>(), vec![
-            Some(7350), Some(450), Some(399),
-        ]);
+        let samples = [7350, 1700, 450, 399]
+            .into_iter()
+            .map(|local| {
+                Ok(super::memory_pressure_with_local(
+                    &info,
+                    Some(0),
+                    Ok(Some(local)),
+                    1,
+                ))
+            })
+            .collect();
+        let updates =
+            subscription_updates(test_memory_pressure(MemoryPressureLevel::Normal), samples);
+        assert_eq!(
+            updates
+                .iter()
+                .map(|sample| sample.level)
+                .collect::<Vec<_>>(),
+            vec![
+                MemoryPressureLevel::Critical,
+                MemoryPressureLevel::Warn,
+                MemoryPressureLevel::Normal,
+            ]
+        );
+        assert_eq!(
+            updates
+                .iter()
+                .map(|sample| sample.linux_psi_avg10)
+                .collect::<Vec<_>>(),
+            vec![Some(7350), Some(450), Some(399),]
+        );
     }
 
     #[test]
     fn failed_samples_emit_unknown_once_then_report_recovery_without_stale_counters() {
-        let updates = subscription_updates(test_memory_pressure(MemoryPressureLevel::Normal), vec![
-            unavailable_sample(),
-            unavailable_sample(),
-            Ok(test_memory_pressure(MemoryPressureLevel::Normal)),
-            Ok(test_memory_pressure(MemoryPressureLevel::Normal)),
-        ]);
+        let updates = subscription_updates(
+            test_memory_pressure(MemoryPressureLevel::Normal),
+            vec![
+                unavailable_sample(),
+                unavailable_sample(),
+                Ok(test_memory_pressure(MemoryPressureLevel::Normal)),
+                Ok(test_memory_pressure(MemoryPressureLevel::Normal)),
+            ],
+        );
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[0].level, MemoryPressureLevel::Unknown);
         assert!(updates[0].free_pages.is_none());
@@ -740,7 +803,9 @@ mod tests {
 
         struct Trigger<'a>(&'a Cell<usize>);
         impl Drop for Trigger<'_> {
-            fn drop(&mut self) { self.0.set(self.0.get() + 1); }
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
         }
         let drops = Cell::new(0);
         let calls = Cell::new(0);
@@ -758,7 +823,11 @@ mod tests {
         }
         assert!(source.is_none());
         assert_eq!(drops.get(), 1);
-        assert_eq!(calls.get(), 1, "never retry a permanently failed event source");
+        assert_eq!(
+            calls.get(),
+            1,
+            "never retry a permanently failed event source"
+        );
         assert_eq!(*delays.borrow(), vec![std::time::Duration::from_secs(1); 2]);
     }
 
@@ -767,14 +836,26 @@ mod tests {
         use super::{EpollFlags, Errno, PressureWake, epoll_wake};
 
         assert_eq!(epoll_wake(Ok(0), EpollFlags::empty()), PressureWake::Sample);
-        assert_eq!(epoll_wake(Ok(1), EpollFlags::EPOLLPRI), PressureWake::Sample);
-        assert_eq!(epoll_wake(Err(Errno::EINTR), EpollFlags::empty()), PressureWake::Interrupted);
-        for flags in [EpollFlags::EPOLLERR, EpollFlags::EPOLLHUP,
-            EpollFlags::EPOLLPRI | EpollFlags::EPOLLERR, EpollFlags::empty()]
-        {
+        assert_eq!(
+            epoll_wake(Ok(1), EpollFlags::EPOLLPRI),
+            PressureWake::Sample
+        );
+        assert_eq!(
+            epoll_wake(Err(Errno::EINTR), EpollFlags::empty()),
+            PressureWake::Interrupted
+        );
+        for flags in [
+            EpollFlags::EPOLLERR,
+            EpollFlags::EPOLLHUP,
+            EpollFlags::EPOLLPRI | EpollFlags::EPOLLERR,
+            EpollFlags::empty(),
+        ] {
             assert_eq!(epoll_wake(Ok(1), flags), PressureWake::Failed);
         }
-        assert_eq!(epoll_wake(Err(Errno::EBADF), EpollFlags::empty()), PressureWake::Failed);
+        assert_eq!(
+            epoll_wake(Err(Errno::EBADF), EpollFlags::empty()),
+            PressureWake::Failed
+        );
     }
 
     #[test]
@@ -795,7 +876,10 @@ mod tests {
         super::pressure_subscription_loop(
             test_memory_pressure(MemoryPressureLevel::Normal),
             &liveness,
-            || { drop(owner.take()); true },
+            || {
+                drop(owner.take());
+                true
+            },
             || panic!("subscription ended while waiting"),
             |_| panic!("no sample may be published after the waiter saw shutdown"),
         );
@@ -827,12 +911,26 @@ mod tests {
         let handle = spawn_memory_pressure_subscription(
             "linux-memory-pressure-recovery-test",
             std::time::Duration::from_millis(1),
-            Box::new(move |pressure| { let _ = tx.send(pressure.level); }),
-            move || samples.lock().unwrap().pop_front()
-                .unwrap_or_else(|| Ok(test_memory_pressure(MemoryPressureLevel::Normal))),
-        ).expect("a transient read failure must not prevent the subscription from starting");
-        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), MemoryPressureLevel::Unknown);
-        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), MemoryPressureLevel::Normal);
+            Box::new(move |pressure| {
+                let _ = tx.send(pressure.level);
+            }),
+            move || {
+                samples
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| Ok(test_memory_pressure(MemoryPressureLevel::Normal)))
+            },
+        )
+        .expect("a transient read failure must not prevent the subscription from starting");
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            MemoryPressureLevel::Unknown
+        );
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            MemoryPressureLevel::Normal
+        );
         drop(handle);
     }
 

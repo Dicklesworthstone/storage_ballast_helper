@@ -8,8 +8,8 @@ use std::io;
 use std::path::Path;
 
 use super::{
-    Access, MEMBERSHIP, MEMBERSHIP_BYTES, MOUNT_BYTES, MOUNTS, Native, Observation,
-    PATH_BYTES, SCALAR_BYTES, Source, hierarchy_mount, invalid, membership_path,
+    Access, MEMBERSHIP, MEMBERSHIP_BYTES, MOUNT_BYTES, MOUNTS, Native, Observation, PATH_BYTES,
+    SCALAR_BYTES, Source, hierarchy_mount, invalid, membership_path,
 };
 
 pub(in crate::platform::linux) const PSI_BYTES: usize = 4096;
@@ -27,7 +27,9 @@ fn read_with(access: &impl Access) -> io::Result<Option<u64>> {
     let member = match membership_path(&membership) {
         Ok(member) => member,
         Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-            if observation.read(Path::new(MEMBERSHIP), MEMBERSHIP_BYTES, Source::Proc)? != membership {
+            if observation.read(Path::new(MEMBERSHIP), MEMBERSHIP_BYTES, Source::Proc)?
+                != membership
+            {
                 return Err(invalid("cgroup membership changed during PSI observation"));
             }
             return Ok(None);
@@ -36,7 +38,9 @@ fn read_with(access: &impl Access) -> io::Result<Option<u64>> {
     };
     let mounts = observation.read(Path::new(MOUNTS), MOUNT_BYTES, Source::Proc)?;
     let mount = hierarchy_mount(&mounts, &member)?;
-    let relative = member.strip_prefix("/").map_err(|_| invalid("invalid PSI membership"))?;
+    let relative = member
+        .strip_prefix("/")
+        .map_err(|_| invalid("invalid PSI membership"))?;
     let scope = mount.join(relative);
     let pressure_path = scope.join("memory.pressure");
     if pressure_path.as_os_str().as_encoded_bytes().len() > PATH_BYTES {
@@ -52,13 +56,17 @@ fn read_with(access: &impl Access) -> io::Result<Option<u64>> {
         return Err(invalid("cgroup PSI accounting is disabled or invalid"));
     }
     let raw = observation.read(&pressure_path, PSI_BYTES, Source::Cgroup)?;
-    let avg10 = std::str::from_utf8(&raw).ok().and_then(parse_avg10)
+    let avg10 = std::str::from_utf8(&raw)
+        .ok()
+        .and_then(parse_avg10)
         .ok_or_else(|| invalid("invalid cgroup memory pressure record"))?;
     if observation.optional(&enabled_path, SCALAR_BYTES)? != enabled
         || observation.read(Path::new(MEMBERSHIP), MEMBERSHIP_BYTES, Source::Proc)? != membership
         || observation.read(Path::new(MOUNTS), MOUNT_BYTES, Source::Proc)? != mounts
     {
-        return Err(invalid("cgroup PSI scope or accounting changed during observation"));
+        return Err(invalid(
+            "cgroup PSI scope or accounting changed during observation",
+        ));
     }
     observation.check_time()?;
     Ok(Some(avg10))
@@ -132,7 +140,10 @@ fn centipercent(raw: &str) -> Option<u64> {
         Some(fraction) => unsigned(fraction)? * if fraction.len() == 1 { 10 } else { 1 },
         None => 0,
     };
-    whole.checked_mul(100)?.checked_add(fraction).filter(|value| *value <= 10_000)
+    whole
+        .checked_mul(100)?
+        .checked_add(fraction)
+        .filter(|value| *value <= 10_000)
 }
 
 #[cfg(test)]
@@ -161,7 +172,10 @@ mod tests {
             Self {
                 files: BTreeMap::from([
                     (MEMBERSHIP.into(), b"0::/service\n".to_vec()),
-                    (MOUNTS.into(), b"36 25 0:32 / /cg rw - cgroup2 cgroup rw\n".to_vec()),
+                    (
+                        MOUNTS.into(),
+                        b"36 25 0:32 / /cg rw - cgroup2 cgroup rw\n".to_vec(),
+                    ),
                     ("/cg/service/cgroup.pressure".into(), b"1\n".to_vec()),
                     ("/cg/service/memory.pressure".into(), psi("73.50")),
                 ]),
@@ -184,14 +198,20 @@ mod tests {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             if let Some((changed, raw)) = &self.changed
-                && changed == path && *count > 1
+                && changed == path
+                && *count > 1
             {
                 return Ok(raw.clone());
             }
-            self.files.get(path).cloned().ok_or_else(|| io::ErrorKind::NotFound.into())
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| io::ErrorKind::NotFound.into())
         }
 
-        fn now(&self) -> Instant { self.now.get() }
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
     }
 
     #[test]
@@ -199,7 +219,13 @@ mod tests {
         let fixture = Fixture::default();
         assert_eq!(read_with(&fixture).unwrap(), Some(7350));
         assert_eq!(fixture.reads.borrow().values().sum::<usize>(), 7);
-        assert!(fixture.reads.borrow().keys().all(|path| fixture.files.contains_key(path)));
+        assert!(
+            fixture
+                .reads
+                .borrow()
+                .keys()
+                .all(|path| fixture.files.contains_key(path))
+        );
     }
 
     #[test]
@@ -209,7 +235,10 @@ mod tests {
             (MOUNTS, b"37 25 0:32 / /cg rw - cgroup2 cgroup rw\n"),
             ("/cg/service/cgroup.pressure", b"0\n"),
         ] {
-            let fixture = Fixture { changed: Some((path.into(), raw.to_vec())), ..Fixture::default() };
+            let fixture = Fixture {
+                changed: Some((path.into(), raw.to_vec())),
+                ..Fixture::default()
+            };
             assert!(read_with(&fixture).is_err(), "{path}");
         }
     }
@@ -218,46 +247,81 @@ mod tests {
     fn disabled_or_invalid_accounting_never_returns_a_healthy_sample() {
         for raw in [b"0\n".as_slice(), b"2\n", b"garbage\n"] {
             let mut fixture = Fixture::default();
-            fixture.files.insert("/cg/service/cgroup.pressure".into(), raw.to_vec());
+            fixture
+                .files
+                .insert("/cg/service/cgroup.pressure".into(), raw.to_vec());
             assert!(read_with(&fixture).is_err());
-            assert!(!fixture.reads.borrow().contains_key(Path::new("/cg/service/memory.pressure")));
+            assert!(
+                !fixture
+                    .reads
+                    .borrow()
+                    .contains_key(Path::new("/cg/service/memory.pressure"))
+            );
         }
     }
 
     #[test]
     fn a_kernel_without_the_accounting_switch_still_needs_a_valid_psi_record() {
         let mut fixture = Fixture::default();
-        fixture.files.remove(Path::new("/cg/service/cgroup.pressure"));
+        fixture
+            .files
+            .remove(Path::new("/cg/service/cgroup.pressure"));
         assert_eq!(read_with(&fixture).unwrap(), Some(7350));
-        fixture.files.insert("/cg/service/memory.pressure".into(), b"some avg10=0.00\n".to_vec());
+        fixture.files.insert(
+            "/cg/service/memory.pressure".into(),
+            b"some avg10=0.00\n".to_vec(),
+        );
         assert!(read_with(&fixture).is_err());
     }
 
     #[test]
     fn inaccessible_or_missing_v2_pressure_is_not_an_unsupported_hierarchy() {
-        for path in [MEMBERSHIP, MOUNTS, "/cg/service/cgroup.pressure", "/cg/service/memory.pressure"] {
-            let fixture = Fixture { denied: Some(path.into()), ..Fixture::default() };
-            assert_eq!(read_with(&fixture).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        for path in [
+            MEMBERSHIP,
+            MOUNTS,
+            "/cg/service/cgroup.pressure",
+            "/cg/service/memory.pressure",
+        ] {
+            let fixture = Fixture {
+                denied: Some(path.into()),
+                ..Fixture::default()
+            };
+            assert_eq!(
+                read_with(&fixture).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
         }
         let mut fixture = Fixture::default();
-        fixture.files.remove(Path::new("/cg/service/memory.pressure"));
+        fixture
+            .files
+            .remove(Path::new("/cg/service/memory.pressure"));
         assert!(read_with(&fixture).is_err());
     }
 
     #[test]
     fn legacy_hierarchy_is_explicitly_host_only_but_malformed_membership_is_not() {
         let mut fixture = Fixture::default();
-        fixture.files.insert(MEMBERSHIP.into(), b"5:memory:/service\n".to_vec());
+        fixture
+            .files
+            .insert(MEMBERSHIP.into(), b"5:memory:/service\n".to_vec());
         assert_eq!(read_with(&fixture).unwrap(), None);
         assert_eq!(fixture.reads.borrow().len(), 1);
-        fixture.files.insert(MEMBERSHIP.into(), b"invalid\n".to_vec());
+        fixture
+            .files
+            .insert(MEMBERSHIP.into(), b"invalid\n".to_vec());
         assert!(read_with(&fixture).is_err());
     }
 
     #[test]
     fn failed_final_read_cannot_renew_the_original_deadline() {
-        let fixture = Fixture { step: super::super::SCAN_TIME / 7 + Duration::from_nanos(1), ..Fixture::default() };
-        assert_eq!(read_with(&fixture).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let fixture = Fixture {
+            step: super::super::SCAN_TIME / 7 + Duration::from_nanos(1),
+            ..Fixture::default()
+        };
+        assert_eq!(
+            read_with(&fixture).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
         assert_eq!(fixture.reads.borrow().values().sum::<usize>(), 7);
     }
 
@@ -265,24 +329,59 @@ mod tests {
     fn pressure_is_fresh_after_recovery_and_between_process_migrations() {
         let mut fixture = Fixture::default();
         assert_eq!(read_with(&fixture).unwrap(), Some(7350));
-        fixture.files.insert(MEMBERSHIP.into(), b"0::/next\n".to_vec());
-        fixture.files.insert("/cg/next/cgroup.pressure".into(), b"1\n".to_vec());
-        fixture.files.insert("/cg/next/memory.pressure".into(), psi("0.00"));
+        fixture
+            .files
+            .insert(MEMBERSHIP.into(), b"0::/next\n".to_vec());
+        fixture
+            .files
+            .insert("/cg/next/cgroup.pressure".into(), b"1\n".to_vec());
+        fixture
+            .files
+            .insert("/cg/next/memory.pressure".into(), psi("0.00"));
         assert_eq!(read_with(&fixture).unwrap(), Some(0));
     }
 
     #[test]
     fn parses_complete_some_rows_in_any_key_order_without_coercion() {
-        for (raw, expected) in [("0", 0), ("5", 500), ("5.1", 510), ("12.34", 1234), ("100.00", 10000)] {
-            assert_eq!(parse_avg10(std::str::from_utf8(&psi(raw)).unwrap()), Some(expected));
+        for (raw, expected) in [
+            ("0", 0),
+            ("5", 500),
+            ("5.1", 510),
+            ("12.34", 1234),
+            ("100.00", 10000),
+        ] {
+            assert_eq!(
+                parse_avg10(std::str::from_utf8(&psi(raw)).unwrap()),
+                Some(expected)
+            );
         }
-        assert_eq!(parse_avg10("some total=18446744073709551615 avg300=0 avg10=12.34 avg60=0 future=1\n"), Some(1234));
+        assert_eq!(
+            parse_avg10("some total=18446744073709551615 avg300=0 avg10=12.34 avg60=0 future=1\n"),
+            Some(1234)
+        );
     }
 
     #[test]
     fn malformed_percentages_cannot_become_zero_pressure() {
-        for raw in ["", ".5", "5.", "5.x", "5.123", "-1", "+1", "101", "100.01", "1e2", "NaN", "18446744073709551616"] {
-            assert_eq!(parse_avg10(std::str::from_utf8(&psi(raw)).unwrap()), None, "{raw}");
+        for raw in [
+            "",
+            ".5",
+            "5.",
+            "5.x",
+            "5.123",
+            "-1",
+            "+1",
+            "101",
+            "100.01",
+            "1e2",
+            "NaN",
+            "18446744073709551616",
+        ] {
+            assert_eq!(
+                parse_avg10(std::str::from_utf8(&psi(raw)).unwrap()),
+                None,
+                "{raw}"
+            );
         }
     }
 
@@ -299,7 +398,10 @@ mod tests {
             assert_eq!(parse_avg10(raw), None, "{raw:?}");
         }
         let mut fixture = Fixture::default();
-        fixture.files.insert("/cg/service/memory.pressure".into(), vec![b'x'; PSI_BYTES + 1]);
+        fixture.files.insert(
+            "/cg/service/memory.pressure".into(),
+            vec![b'x'; PSI_BYTES + 1],
+        );
         assert!(read_with(&fixture).is_err());
     }
 }
