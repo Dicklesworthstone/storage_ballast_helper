@@ -5,7 +5,7 @@
 //! tick. A pass starts when a configured root sits on btrfs whose mount is at
 //! or above `start_level`, no pass is running, and `interval_minutes` have
 //! passed since the last start. The pass runs on its own `sbh-compress` thread,
-//! so the monitor never waits on file I/O. It discovers cold files under the
+//! so discovery and rewrite I/O do not run on the monitor. It finds files under
 //! due roots, resuming where the previous pass stopped, and runs the same
 //! checked executor as `sbh compress --discover --apply`. Every file outcome
 //! reaches the activity log, and a summary line names the bytes saved. Nothing
@@ -16,6 +16,7 @@
 //! deletion scanner freed megabytes per hour.
 
 use std::collections::HashMap;
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -53,16 +54,9 @@ pub fn due_roots(
     last_start: Option<Instant>,
     now: Instant,
 ) -> Vec<PathBuf> {
-    let Some(start) = config.start_pressure_level() else {
+    let Some(start) = due_start_level(config, running, last_start, now) else {
         return Vec::new();
     };
-    let interval = Duration::from_secs(config.interval_minutes.saturating_mul(60));
-    if !config.enabled
-        || running
-        || last_start.is_some_and(|last| now.saturating_duration_since(last) < interval)
-    {
-        return Vec::new();
-    }
     roots
         .iter()
         .filter(|status| status.btrfs && status.level.is_some_and(|level| level >= start))
@@ -70,13 +64,34 @@ pub fn due_roots(
         .collect()
 }
 
+/// Decide whether mount evidence is needed, before issuing filesystem queries.
+/// A busy or cooling tier must not repeatedly stat roots on the monitor thread.
+fn due_start_level(
+    config: &CompressConfig,
+    running: bool,
+    last_start: Option<Instant>,
+    now: Instant,
+) -> Option<PressureLevel> {
+    let start = config.start_pressure_level()?;
+    let interval = Duration::from_secs(config.interval_minutes.saturating_mul(60));
+    if !config.enabled
+        || running
+        || last_start.is_some_and(|last| now.saturating_duration_since(last) < interval)
+    {
+        return None;
+    }
+    Some(start)
+}
+
 /// Scheduling state of the tier: at most one pass in flight.
 #[derive(Debug, Default)]
 pub struct CompressTier {
     running: Arc<AtomicBool>,
     last_start: Option<Instant>,
-    /// Where the next discovery resumes: the last selected path of a pass
-    /// that stopped at its file or byte limit. `None` starts from the top.
+    /// Where discovery may resume without skipping unvisited selected files.
+    /// Execution commits only its visited prefix; after all selected files
+    /// have been considered, discovery's own frontier takes over.
+    /// `None` starts from the top. This is not a durable completion ledger.
     resume_after: Arc<Mutex<Option<PathBuf>>>,
 }
 
@@ -90,17 +105,12 @@ impl CompressTier {
         mount_levels: &HashMap<PathBuf, PressureLevel>,
         logger: &ActivityLoggerHandle,
     ) {
-        if !config.compress.enabled {
+        let running = self.running.load(Ordering::Acquire);
+        if due_start_level(&config.compress, running, self.last_start, now).is_none() {
             return;
         }
         let statuses = root_statuses(&config.compress.roots, platform.as_ref(), mount_levels);
-        let roots = due_roots(
-            &config.compress,
-            &statuses,
-            self.running.load(Ordering::Acquire),
-            self.last_start,
-            now,
-        );
+        let roots = due_roots(&config.compress, &statuses, running, self.last_start, now);
         if roots.is_empty() {
             return;
         }
@@ -186,14 +196,21 @@ fn run_pass(
         }
     };
     let report = selection.report();
-    let next = report
+    let next = match report
         .resume_after_hex
         .as_deref()
-        .and_then(|hex| discovery::continuation_path(hex).ok());
-    if let Ok(mut resume) = resume_after.lock() {
-        *resume = next;
-    }
+        .map(discovery::continuation_path)
+        .transpose()
+    {
+        Ok(next) => next,
+        Err(error) => return format!("discovery returned an invalid continuation: {error}"),
+    };
     if report.selected_files == 0 {
+        // No selected work can be lost here. Retain discovery progress through
+        // excluded entries, including incomplete pages with no eligible files.
+        if let Ok(mut resume) = resume_after.lock() {
+            *resume = next;
+        }
         return format!(
             "nothing eligible under {} root(s) ({} entries examined{})",
             roots.len(),
@@ -209,9 +226,63 @@ fn run_pass(
     let mut observer = |observation: CompressionObservation<'_>| {
         record_outcome(observation, logger);
     };
-    match compression::run_discovered(&selection, policy, mode, config, platform, &mut observer) {
-        Ok(report) => summarize(&report),
-        Err(error) => format!("pass refused before any rewrite: {error}"),
+    execute_and_resume(&selection.paths(), next, resume_after, || {
+        compression::run_discovered(&selection, policy, mode, config, platform, &mut observer)
+    })
+}
+
+/// Commit a skip hint only after the checked executor returns. Discovery can
+/// run far ahead of rewriting; its last selected path is not an execution
+/// receipt. Timeouts and safety stops must leave the unvisited tail available.
+/// The closure is the ordinary executor, with unchanged admission and auditing.
+fn execute_and_resume(
+    selected: &[PathBuf],
+    discovery_next: Option<PathBuf>,
+    resume_after: &Mutex<Option<PathBuf>>,
+    execute: impl FnOnce() -> io::Result<CompressionReport>,
+) -> String {
+    let before = match resume_after.lock() {
+        Ok(resume) => resume.clone(),
+        Err(_) => return "pass refused before any rewrite: continuation state is poisoned".into(),
+    };
+    // Do not hold the cursor mutex during native I/O or activity callbacks.
+    let report = match execute() {
+        Ok(report) => report,
+        Err(error) => return format!("pass refused before any rewrite: {error}"),
+    };
+    let summary = summarize(&report);
+    if !report.supported || report.dry_run {
+        return summary;
+    }
+    let visited = report.files.len();
+    if visited.checked_add(report.unvisited_files) != Some(selected.len())
+        || report
+            .files
+            .iter()
+            .zip(selected)
+            .any(|(file, path)| &file.path != path)
+    {
+        // A canonical path changing after selection, or a future executor
+        // changing its ordering, must not move the cursor outside the observed
+        // prefix. Retrying is safer than guessing from lossy display strings.
+        return format!("{summary}; continuation retained: execution was not a selected prefix");
+    }
+    let next = if report.unvisited_files == 0 {
+        discovery_next
+    } else if visited == 0 {
+        before
+    } else {
+        // A visit includes a checked skip/failure, not just a successful
+        // compression. Retrying a permanently refused first file every pass
+        // would starve the rest; its outcome remains in the pass report.
+        Some(selected[visited - 1].clone())
+    };
+    match resume_after.lock() {
+        Ok(mut resume) => {
+            *resume = next;
+            summary
+        }
+        Err(_) => format!("{summary}; continuation unavailable: next pass must rediscover"),
     }
 }
 
@@ -266,6 +337,273 @@ fn summarize(report: &CompressionReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn paths() -> Vec<PathBuf> {
+        ["/cache/a.bin", "/cache/b.bin", "/cache/c.bin"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    fn execution_report(selected: &[PathBuf], outcomes: &[&str]) -> CompressionReport {
+        use crate::scanner::compression::{CompressionFileReport, CompressionPolicy};
+
+        assert!(outcomes.len() <= selected.len());
+        CompressionReport {
+            schema: "sbh.compression.v1",
+            dry_run: false,
+            supported: true,
+            policy: CompressionPolicy::default(),
+            journal_path: None,
+            files: selected
+                .iter()
+                .zip(outcomes)
+                .map(|(path, outcome)| CompressionFileReport {
+                    path: path.clone(),
+                    operation_id: None,
+                    outcome: (*outcome).to_owned(),
+                    detail: "injected executor visit; no native mutation".into(),
+                    logical_bytes: 1024,
+                    physical_data_bytes_before: None,
+                    physical_data_bytes_after: None,
+                    processed_bytes: 0,
+                    mutation_attempted: false,
+                    sha256_before: None,
+                    sha256_after: None,
+                    content_verified: false,
+                    reclaim: None,
+                    accounting_error: None,
+                })
+                .collect(),
+            unvisited_files: selected.len() - outcomes.len(),
+            stop_reason: (outcomes.len() < selected.len()).then(|| "injected stop".into()),
+            elapsed_ms: 0,
+            exit_code: if outcomes.len() < selected.len() { 4 } else { 0 },
+        }
+    }
+
+    #[test]
+    fn partial_execution_commits_only_the_visited_prefix_after_the_executor_returns() {
+        let selected = paths();
+        let previous = Some(PathBuf::from("/cache/0.bin"));
+        let cursor = Mutex::new(previous.clone());
+        let message = execute_and_resume(&selected, Some(selected[2].clone()), &cursor, || {
+            assert_eq!(
+                *cursor.lock().unwrap(),
+                previous,
+                "no early cursor publication"
+            );
+            Ok(execution_report(&selected, &["compressed"]))
+        });
+        assert_eq!(*cursor.lock().unwrap(), Some(selected[0].clone()));
+        assert!(message.contains("2 unvisited"), "{message}");
+    }
+
+    #[test]
+    fn complete_discovery_does_not_wrap_while_selected_files_are_unvisited() {
+        let selected = paths();
+        let cursor = Mutex::new(None);
+        execute_and_resume(&selected, None, &cursor, || {
+            Ok(execution_report(&selected, &["skipped", "failed"]))
+        });
+        assert_eq!(*cursor.lock().unwrap(), Some(selected[1].clone()));
+    }
+
+    #[test]
+    fn fully_visited_selection_uses_discoverys_frontier_or_wraps_on_completion() {
+        let selected = paths();
+        // Discovery can finish excluded entries beyond the last selected file.
+        for next in [Some(PathBuf::from("/cache/z-excluded")), None] {
+            let cursor = Mutex::new(Some(PathBuf::from("/cache/0.bin")));
+            execute_and_resume(&selected, next.clone(), &cursor, || {
+                Ok(execution_report(
+                    &selected,
+                    &["skipped", "failed", "compressed"],
+                ))
+            });
+            assert_eq!(*cursor.lock().unwrap(), next);
+        }
+    }
+
+    #[test]
+    fn failed_or_zero_visit_pass_retains_the_incoming_cursor() {
+        let selected = paths();
+        for previous in [None, Some(PathBuf::from("/cache/0.bin"))] {
+            let cursor = Mutex::new(previous.clone());
+            let message = execute_and_resume(&selected, Some(selected[2].clone()), &cursor, || {
+                Err(io::Error::other("I/O priority admission failed"))
+            });
+            assert!(message.contains("I/O priority admission failed"));
+            assert_eq!(*cursor.lock().unwrap(), previous);
+            execute_and_resume(&selected, None, &cursor, || {
+                Ok(execution_report(&selected, &[]))
+            });
+            assert_eq!(*cursor.lock().unwrap(), previous);
+        }
+    }
+
+    #[test]
+    fn preview_and_unsupported_reports_never_consume_daemon_work() {
+        let selected = paths();
+        let previous = Some(PathBuf::from("/cache/0.bin"));
+        for (supported, dry_run) in [(false, false), (true, true)] {
+            let cursor = Mutex::new(previous.clone());
+            execute_and_resume(&selected, None, &cursor, || {
+                let mut report =
+                    execution_report(&selected, &["eligible", "eligible", "eligible"]);
+                report.supported = supported;
+                report.dry_run = dry_run;
+                Ok(report)
+            });
+            assert_eq!(*cursor.lock().unwrap(), previous);
+        }
+    }
+
+    #[test]
+    fn malformed_or_nonprefix_execution_reports_cannot_advance_continuation() {
+        let selected = paths();
+        let previous = Some(PathBuf::from("/cache/0.bin"));
+        for case in 0..5 {
+            let cursor = Mutex::new(previous.clone());
+            let message = execute_and_resume(&selected, Some(selected[2].clone()), &cursor, || {
+                let mut report = execution_report(&selected, &["skipped", "failed"]);
+                match case {
+                    0 => report.unvisited_files = usize::MAX,
+                    1 => report.unvisited_files = 0,
+                    2 => report.files.swap(0, 1),
+                    3 => report.files[1].path = selected[0].clone(),
+                    _ => report.files[0].path = PathBuf::from("/other/replaced.bin"),
+                }
+                Ok(report)
+            });
+            assert!(
+                message.contains("continuation retained"),
+                "case {case}: {message}"
+            );
+            assert_eq!(*cursor.lock().unwrap(), previous);
+        }
+    }
+
+    #[test]
+    fn consecutive_partial_passes_reach_every_unvisited_file_before_wrapping() {
+        let selected = paths();
+        let cursor = Mutex::new(None);
+        let mut visited = Vec::new();
+        for expected in &selected {
+            let after = cursor.lock().unwrap().clone();
+            let remaining: Vec<_> = selected
+                .iter()
+                .filter(|path| after.as_ref().is_none_or(|after| *path > after))
+                .cloned()
+                .collect();
+            assert_eq!(remaining.first(), Some(expected));
+            execute_and_resume(&remaining, None, &cursor, || {
+                visited.push(remaining[0].clone());
+                Ok(execution_report(&remaining, &["skipped"]))
+            });
+        }
+        assert_eq!(visited, selected);
+        assert_eq!(*cursor.lock().unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_byte_paths_are_not_reconstructed_from_display_reports() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let selected = vec![
+            PathBuf::from(OsString::from_vec(b"/cache/a-\xff.bin".to_vec())),
+            PathBuf::from("/cache/b.bin"),
+        ];
+        let cursor = Mutex::new(None);
+        execute_and_resume(&selected, None, &cursor, || {
+            Ok(execution_report(&selected, &["skipped"]))
+        });
+        assert_eq!(*cursor.lock().unwrap(), Some(selected[0].clone()));
+        let cursor = Mutex::new(None);
+        let message = execute_and_resume(&selected, None, &cursor, || {
+            let mut report = execution_report(&selected, &["skipped"]);
+            report.files[0].path = PathBuf::from(selected[0].to_string_lossy().into_owned());
+            Ok(report)
+        });
+        assert!(message.contains("continuation retained"));
+        assert_eq!(*cursor.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn running_cooling_and_invalid_schedules_do_not_issue_root_io() {
+        use crate::core::errors::Result;
+        use crate::logger::dual::{DualLoggerConfig, spawn_logger};
+        use crate::logger::jsonl::JsonlConfig;
+        use crate::platform::pal::{
+            FsStats, MemoryInfo, MountPoint, PlatformPaths, ServiceManager,
+        };
+        use std::path::Path;
+
+        struct NoQueries;
+        impl Platform for NoQueries {
+            fn fs_stats(&self, _: &Path) -> Result<FsStats> {
+                panic!("root I/O before due time")
+            }
+            fn mount_points(&self) -> Result<Vec<MountPoint>> {
+                panic!("unexpected mount query")
+            }
+            fn is_ram_backed(&self, _: &Path) -> Result<bool> {
+                panic!("unexpected RAM query")
+            }
+            fn default_paths(&self) -> PlatformPaths {
+                PlatformPaths::default()
+            }
+            fn memory_info(&self) -> Result<MemoryInfo> {
+                panic!("unexpected memory query")
+            }
+            fn service_manager(&self) -> Box<dyn ServiceManager> {
+                panic!("unexpected service query")
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (logger, join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: JsonlConfig {
+                path: dir.path().join("activity.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 1024 * 1024,
+                max_rotated_files: 1,
+                fsync_interval_secs: 60,
+            },
+            channel_capacity: 8,
+            run_id: None,
+        })
+        .unwrap();
+        let platform: Arc<dyn Platform> = Arc::new(NoQueries);
+        let now = Instant::now();
+        for (running, last_start, start_level) in [
+            (true, None, "yellow"),
+            (false, Some(now), "yellow"),
+            (false, None, "invalid"),
+        ] {
+            let config = Config {
+                compress: CompressConfig {
+                    start_level: start_level.into(),
+                    ..enabled()
+                },
+                ..Config::default()
+            };
+            let mut tier = CompressTier {
+                running: Arc::new(AtomicBool::new(running)),
+                last_start,
+                ..CompressTier::default()
+            };
+            tier.tick(now, &config, &platform, &HashMap::new(), &logger);
+            assert_eq!(tier.last_start, last_start);
+            assert_eq!(tier.running.load(Ordering::Acquire), running);
+            assert_eq!(*tier.resume_after.lock().unwrap(), None);
+        }
+        logger.shutdown();
+        join.join().unwrap();
+    }
 
     fn enabled() -> CompressConfig {
         CompressConfig {
