@@ -18,8 +18,15 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
   one at a time and at most every `interval_minutes` (default 30), bounded
   by `[compress.policy]` (files idle 24 hours and at least 16 MiB, 128
   files and 8 GiB per pass by default). Each file is rewritten losslessly:
-  open, mapped, leased, young and shared files are skipped, and the result
-  is checked against a SHA-256 read back from disk. Outcomes go to the
+  open, mapped, leased, young and shared files are skipped, the file is
+  held through a read-only descriptor (running it stays possible), and the
+  result is checked against a SHA-256 read back from disk after its cached
+  pages are dropped. A started file is finished on its own allowance, not
+  the pass deadline, and one an earlier pass stopped inside is finished
+  later rather than skipped as compressed. The no-compress flag btrfs puts
+  on a file whose data did not compress (`m` in lsattr) is cleared again.
+  The tier does not run in observe or fallback-safe mode, under the kill
+  switch or in dry-run. Outcomes go to the
   activity log; an `[SBH-COMPRESS]` line summarizes each pass. Enabling it
   stands in for the CLI's `--quiescent`: a snapshot or reflink made during
   a pass keeps the old extents, so those bytes are freed only when it

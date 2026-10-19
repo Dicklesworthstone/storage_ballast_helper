@@ -967,13 +967,25 @@ impl Default for CompressConfig {
     }
 }
 
+/// Whether a root a tier walks names a directory below the filesystem root:
+/// not `/` itself, and with no `..` that would walk out of the directory it
+/// names (`Path::components` already drops an inner `.`).
+fn names_a_directory_below_root(root: &Path) -> bool {
+    use std::path::Component;
+    !root
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        && root
+            .components()
+            .any(|component| matches!(component, Component::Normal(_)))
+}
+
 impl ScannerConfig {
     /// Reject target-only roots the tier could not bound: relative paths, the
     /// filesystem root, `.` or `..` components (which would walk outside the
     /// directory the pattern names), and more roots or a shorter idle window
     /// than an operator plausibly means.
     fn validate_target_only(&self) -> Result<()> {
-        use std::path::Component;
         let invalid = |details: String| SbhError::InvalidConfig { details };
         if self.target_only_roots.len() > 32 {
             return Err(invalid(format!(
@@ -991,13 +1003,11 @@ impl ScannerConfig {
                 root.display()
             )));
         }
-        if let Some(root) = self.target_only_roots.iter().find(|root| {
-            root.components()
-                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-                || !root
-                    .components()
-                    .any(|component| matches!(component, Component::Normal(_)))
-        }) {
+        if let Some(root) = self
+            .target_only_roots
+            .iter()
+            .find(|root| !names_a_directory_below_root(root))
+        {
             return Err(invalid(format!(
                 "scanner.target_only_roots must name a directory below the filesystem root, without . or ..: {}",
                 root.display()
@@ -1042,6 +1052,16 @@ impl CompressConfig {
         if let Some(root) = self.roots.iter().find(|root| !root.is_absolute()) {
             return Err(invalid(format!(
                 "compress.roots must be absolute: {}",
+                root.display()
+            )));
+        }
+        if let Some(root) = self
+            .roots
+            .iter()
+            .find(|root| !names_a_directory_below_root(root))
+        {
+            return Err(invalid(format!(
+                "compress.roots must name a directory below the filesystem root, without ..: {}",
                 root.display()
             )));
         }
@@ -4340,10 +4360,16 @@ mod tests {
             config.validate()
         };
         enabled(|_| {}).unwrap();
-        let rejected: [(&str, Edit); 6] = [
+        let rejected: [(&str, Edit); 8] = [
             ("no roots", |c| c.roots.clear()),
             ("relative root", |c| {
                 c.roots = vec![PathBuf::from("data/tmp")];
+            }),
+            ("the filesystem root", |c| {
+                c.roots = vec![PathBuf::from("/")];
+            }),
+            ("a root with ..", |c| {
+                c.roots = vec![PathBuf::from("/data/tmp/../etc")];
             }),
             ("unknown level", |c| c.start_level = "amber".to_string()),
             ("zero interval", |c| c.interval_minutes = 0),

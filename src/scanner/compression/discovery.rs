@@ -516,6 +516,12 @@ mod native {
                 self.skip("young_or_future_timestamp");
             } else if super::super::already_compressed(&path) {
                 self.skip("compressed_suffix");
+            } else if !raw_data_remains(
+                &self.selection.native.roots[task.root].file,
+                relative,
+                self.deadline,
+            ) {
+                self.skip("already_compressed_extents");
             } else if stamp.size
                 > self
                     .policy
@@ -538,6 +544,26 @@ mod native {
             }
             Ok(())
         }
+    }
+
+    /// Whether the file at `relative` under `root` still holds raw data. One
+    /// an earlier pass compressed in full would only spend the byte budget and
+    /// starve the files after it, pass after pass. Anything that stops the
+    /// check keeps the file: the executor inspects it again before touching it.
+    fn raw_data_remains(root: &File, relative: &Path, deadline: Instant) -> bool {
+        let Ok(fd) = openat2(
+            root,
+            relative,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH
+                | ResolveFlags::NO_SYMLINKS
+                | ResolveFlags::NO_MAGICLINKS
+                | ResolveFlags::NO_XDEV,
+        ) else {
+            return true;
+        };
+        sbh_btrfs::has_raw_data(&File::from(fd), deadline).unwrap_or(true)
     }
 
     pub(super) fn discover(

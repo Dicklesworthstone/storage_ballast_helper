@@ -197,9 +197,26 @@ promise on a shared host. Content stays protected by the checks every apply runs
 anyway:
 
 - the minimum idle age;
-- the open, mmap and lease vetoes;
-- the file stamp and root scope, rechecked between chunks;
-- a SHA-256 re-read from disk after the rewrite.
+- the open-file, executable and mmap vetoes, rechecked before the first chunk
+  and then at most every 5 seconds while a file is rewritten;
+- the protection markers and rules, the lease veto, the file stamp and the
+  root scope, rechecked before every chunk;
+- a SHA-256 re-read from disk after the rewrite, once the file's cached pages
+  are dropped (hashing them would compare the cache with itself).
+
+The file is held through a read-only descriptor, which is all the defrag ioctl
+needs, so running it during the rewrite still works and closing it reports no
+modification. The tier runs only when the policy may change the filesystem: not
+in observe or fallback-safe mode, under the kill switch, or with
+`scanner.dry_run`.
+
+A file is started only while the pass has time left, and once started it is
+finished on its own allowance (a minute plus 4 MiB/s, at most an hour): a file
+left part-compressed can use more space than before, because the raw remainder
+of an extent keeps the whole original allocation. If a pass still stops inside
+a file (a process opens it, the free-space reserve is reached), a later pass
+finishes the raw remainder instead of skipping the file as compressed, and
+discovery leaves out files with nothing raw left.
 
 What you accept by enabling it is about space, not data: a snapshot or reflink
 made during a pass keeps the old extents alive, so those bytes are freed only

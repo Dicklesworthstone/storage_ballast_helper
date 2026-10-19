@@ -130,27 +130,41 @@ pub struct ExtentMap {
     pub inode_flags: u32,
     /// At least one extent uses compression or another encoding.
     pub encoded: bool,
+    /// At least one written data extent is stored raw (neither compressed nor
+    /// otherwise encoded). With `encoded`, the file is part-compressed: a pass
+    /// stopped inside it, and a later one finishes it.
+    pub raw: bool,
+    /// At least one extent is encrypted or encoded beyond compression.
+    pub foreign_encoding: bool,
     /// At least one extent is preallocated rather than written data.
     pub preallocated: bool,
 }
 
 impl ExtentMap {
-    /// Explain why an inspection is ineligible. Unknown flags fail closed.
+    /// Explain why an inspection is ineligible. Unknown flags fail closed. A
+    /// part-compressed file stays eligible: left as it is, the raw remainder
+    /// of an extent it shares with a compressed range keeps the whole original
+    /// allocation, so the file uses more space than before it was touched.
     #[must_use]
     pub fn exclusion(&self) -> Option<&'static str> {
+        let encoded = self.encoded || self.fiemap_flags & ioctl::FIEMAP_EXTENT_ENCODED != 0;
         if self.stamp.links != 1 {
             Some("hard_linked_or_unlinked")
         } else if self.inode_flags & ioctl::EXCLUDED_INODE_FLAGS != 0 {
             Some("nocow_nocompress_immutable_or_append_only")
         } else if self.fiemap_flags & ioctl::FIEMAP_EXTENT_SHARED != 0 {
             Some("shared_or_reflinked_extents")
-        } else if self.encoded || self.fiemap_flags & ioctl::FIEMAP_EXTENT_ENCODED != 0 {
+        } else if self.foreign_encoding {
+            Some("encrypted_or_foreign_encoding")
+        } else if encoded && !self.raw {
             Some("already_encoded_or_compressed")
         } else if self.preallocated {
             Some("preallocated_extents")
         } else if self.inline_bytes != 0 {
             Some("inline_data")
-        } else if self.fiemap_flags & !ioctl::FIEMAP_EXTENT_LAST != 0 {
+        } else if self.fiemap_flags & !(ioctl::FIEMAP_EXTENT_LAST | ioctl::FIEMAP_EXTENT_ENCODED)
+            != 0
+        {
             Some("unknown_delayed_or_unsupported_extent_layout")
         } else if self.physical_data_bytes == 0 {
             Some("no_allocated_data")
@@ -204,10 +218,14 @@ pub fn inspect(file: &File, deadline: Instant) -> io::Result<ExtentMap> {
     let mut allocations = BTreeMap::new();
     let mut inline_bytes = 0_u64;
     let mut encoded = false;
+    let mut raw = false;
+    let mut foreign_encoding = false;
     let mut preallocated = false;
     ioctl::visit_items(file, 0, stamp.inode, 108, deadline, |_, item| {
         let parsed = parse_file_extent(item)?;
         encoded |= parsed.encoded;
+        raw |= parsed.extent.is_some() && !parsed.encoded && !parsed.preallocated;
+        foreign_encoding |= parsed.foreign_encoding;
         preallocated |= parsed.preallocated;
         inline_bytes = inline_bytes
             .checked_add(parsed.inline_bytes)
@@ -242,8 +260,76 @@ pub fn inspect(file: &File, deadline: Instant) -> io::Result<ExtentMap> {
         fiemap_flags,
         inode_flags,
         encoded,
+        raw,
+        foreign_encoding,
         preallocated,
     })
+}
+
+/// The parts of `start..start + length` still stored raw: data extents that
+/// are neither compressed nor otherwise encoded, clipped to the window,
+/// adjacent ones merged, holes left out. A pass that resumes a part-compressed
+/// file compresses only these; [`compress_range`] still refuses any of them
+/// that is shared, delayed or otherwise unsupported.
+pub fn raw_ranges(
+    file: &File,
+    start: u64,
+    length: u64,
+    deadline: Instant,
+) -> io::Result<Vec<(u64, u64)>> {
+    validate_range(start, length, FileStamp::read(file)?.size)?;
+    let end = start + length;
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for extent in ioctl::fiemap_extents(file, start, length, deadline)? {
+        if extent.flags & ioctl::FIEMAP_EXTENT_ENCODED != 0 {
+            continue;
+        }
+        let from = extent.logical.max(start);
+        let to = extent.logical.saturating_add(extent.length).min(end);
+        if to <= from {
+            continue;
+        }
+        match ranges.last_mut() {
+            Some((last_start, last_length)) if *last_start + *last_length == from => {
+                *last_length += to - from;
+            }
+            _ => ranges.push((from, to - from)),
+        }
+    }
+    Ok(ranges)
+}
+
+/// Clear FS_NOCOMP_FL (`m` in lsattr) if the file did not have it in
+/// `flags_before`: btrfs sets it on an inode when a range it was asked to
+/// compress came out no smaller, so a rewrite would otherwise leave a visible
+/// attribute on the user's file. Returns whether it cleared the flag.
+///
+/// btrfs reads FS_IOC_SETFLAGS as a statement about the `btrfs.compression`
+/// property: with FS_COMPR_FL it resets the property to the mount default,
+/// without it it removes the property. btrfs sets FS_NOCOMP_FL only on inodes
+/// without that property, but a file showing FS_COMPR_FL is left alone anyway.
+pub fn clear_nocompress_set_by_rewrite(file: &File, flags_before: u32) -> io::Result<bool> {
+    if flags_before & ioctl::FS_NOCOMP_FL != 0 {
+        return Ok(false);
+    }
+    let now = ioctl::inode_flags(file)?;
+    if now & ioctl::FS_NOCOMP_FL == 0 || now & ioctl::FS_COMPR_FL != 0 {
+        return Ok(false);
+    }
+    ioctl::set_inode_flags(file, now & !ioctl::FS_NOCOMP_FL)?;
+    Ok(true)
+}
+
+/// Whether any of the file's data is still stored raw (see [`raw_ranges`]).
+/// A file compressed in full has none and is not worth selecting again.
+pub fn has_raw_data(file: &File, deadline: Instant) -> io::Result<bool> {
+    let size = FileStamp::read(file)?.size;
+    if size == 0 {
+        return Ok(false);
+    }
+    Ok(ioctl::fiemap_extents(file, 0, size, deadline)?
+        .iter()
+        .any(|extent| extent.flags & ioctl::FIEMAP_EXTENT_ENCODED == 0))
 }
 
 /// Compress a bounded range of an already-open file in place.
@@ -527,6 +613,9 @@ struct ParsedExtent {
     extent: Option<DataExtent>,
     inline_bytes: u64,
     encoded: bool,
+    /// Encrypted or otherwise encoded beyond compression (fields mainline
+    /// btrfs leaves zero): never touched.
+    foreign_encoding: bool,
     preallocated: bool,
 }
 
@@ -535,11 +624,14 @@ fn parse_file_extent(item: &[u8]) -> io::Result<ParsedExtent> {
     if item.len() < 21 {
         return Err(invalid("truncated file extent item"));
     }
+    // compression (1 byte), encryption (1), other_encoding (2)
     let encoded = item[16..20].iter().any(|byte| *byte != 0);
+    let foreign_encoding = item[17..20].iter().any(|byte| *byte != 0);
     match item[20] {
         0 => Ok(ParsedExtent {
             inline_bytes: (item.len() - 21) as u64,
             encoded,
+            foreign_encoding,
             ..ParsedExtent::default()
         }),
         kind @ (1 | 2) => {
@@ -568,6 +660,7 @@ fn parse_file_extent(item: &[u8]) -> io::Result<ParsedExtent> {
                     disk_num_bytes,
                 }),
                 encoded,
+                foreign_encoding,
                 preallocated: kind == 2,
                 ..ParsedExtent::default()
             })

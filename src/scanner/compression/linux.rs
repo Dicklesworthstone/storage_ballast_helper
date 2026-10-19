@@ -229,15 +229,14 @@ fn process_file(
     check_protection(&canonical, config, platform)?;
     // Resolve every component without symlinks in one kernel operation. There
     // is no fallback to a pathname-following open on unsupported kernels.
-    let flags = OFlags::CLOEXEC
-        | OFlags::NOFOLLOW
-        | OFlags::NONBLOCK
-        | OFlags::NOATIME
-        | if mode.apply {
-            OFlags::RDWR
-        } else {
-            OFlags::RDONLY
-        };
+    // Read-only even to apply: BTRFS_IOC_DEFRAG_RANGE needs write permission
+    // on the inode (or CAP_SYS_ADMIN), not a writable descriptor, on every
+    // kernel with openat2. A writable one would make running the file fail
+    // with ETXTBSY while it is compressed (cold debug binaries are what this
+    // tier mostly rewrites) and would close with IN_CLOSE_WRITE, which
+    // watchers and sync tools read as a modification.
+    let flags =
+        OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOATIME | OFlags::RDONLY;
     let file = File::from(openat2(
         CWD,
         &canonical,
@@ -287,7 +286,13 @@ fn process_file(
         report.detail = "eligible at inspection time; preview changed no extents and promises no compression ratio".into();
         return Ok(());
     }
-    let hash_before = digest(&file, before.stamp.size, deadline)?;
+    // From here the file is finished on its own allowance, not the pass
+    // deadline: a file left part-compressed can use more space than before
+    // (see `ExtentMap::exclusion`). The pass deadline decided whether to
+    // start it; the next file waits for the next pass.
+    budget(deadline)?;
+    let file_deadline = Instant::now() + file_allowance(before.stamp.size);
+    let hash_before = digest(&file, before.stamp.size, file_deadline)?;
     report.sha256_before = Some(hash_before.clone());
     if FileStamp::read(&file)? != before.stamp {
         return Err(io::Error::other("file changed during preflight hashing"));
@@ -299,21 +304,37 @@ fn process_file(
     let consent = ZstdConsent::acknowledge_filesystem_compatibility_change();
     let mut expected = before.stamp;
     let mut operation_error = None;
+    // None: the first chunk always checks, since hashing a large file can take
+    // minutes after the check before it.
+    let mut last_active_check: Option<Instant> = None;
     while report.processed_bytes < before.stamp.size {
         let offset = report.processed_bytes;
         let length = (before.stamp.size - offset).min(MAX_CHUNK_BYTES);
         let result = (|| -> io::Result<()> {
-            budget(deadline)?;
+            budget(file_deadline)?;
             check_protection(&canonical, config, platform)?;
             if let Some(selection) = selection {
                 selection.validate_scope(&canonical)?;
             }
-            check_active(&canonical, file.as_raw_fd(), platform)?;
+            // Three /proc sweeps per check: between chunks, at most every
+            // few seconds. A writer is caught by the stamp check on every
+            // chunk and by the final hash; this keeps users' readers and
+            // executables from sharing the file with a rewrite.
+            if last_active_check.is_none_or(|at| at.elapsed() >= ACTIVE_RECHECK_INTERVAL) {
+                check_active(&canonical, file.as_raw_fd(), platform)?;
+                last_active_check = Some(Instant::now());
+            }
             check_headroom(&file, policy.min_free_bytes)?;
             verify_path(&canonical, &file, expected)?;
-            budget(deadline)?;
-            report.mutation_attempted = true;
-            sbh_btrfs::compress_range(&file, offset, length, consent, deadline)?;
+            budget(file_deadline)?;
+            // Ranges an earlier pass compressed are left as they are: a pass
+            // that resumes a part-compressed file rewrites only what is raw.
+            for (raw_start, raw_length) in
+                sbh_btrfs::raw_ranges(&file, offset, length, file_deadline)?
+            {
+                report.mutation_attempted = true;
+                sbh_btrfs::compress_range(&file, raw_start, raw_length, consent, file_deadline)?;
+            }
             expected = FileStamp::read(&file)?;
             Ok(())
         })();
@@ -332,8 +353,16 @@ fn process_file(
     }
     // Postflight has a separate, bounded budget. A rewrite timeout must not
     // suppress content verification or erase the fact that mutation happened.
-    let verification_deadline = Instant::now() + Duration::from_secs(120);
-    match digest(&file, before.stamp.size, verification_deadline) {
+    // The hash must read what the disk now holds: the rewrite leaves the
+    // original bytes in the page cache, and hashing those compares the cache
+    // with itself. Every range ended with a fsync, so the pages are clean and
+    // the kernel drops them (a page mapped elsewhere it keeps, but a mapped
+    // file is refused before the rewrite).
+    let verification_deadline = Instant::now() + file_allowance(before.stamp.size);
+    let from_disk = file.sync_all().and_then(|()| {
+        rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed).map_err(io::Error::from)
+    });
+    match from_disk.and_then(|()| digest(&file, before.stamp.size, verification_deadline)) {
         Ok(hash_after) => {
             let stable = before
                 .stamp
@@ -353,6 +382,14 @@ fn process_file(
             ));
         }
     }
+    // A file with FS_NOCOMP_FL was excluded, so a flag there now is one btrfs
+    // set during the rewrite (a range came out no smaller): the user's
+    // attributes are put back. Only the inode's ctime changes.
+    let flag_note = sbh_btrfs::clear_nocompress_set_by_rewrite(&file, before.inode_flags)
+        .err()
+        .map(|error| {
+            format!("; btrfs marked the file no-compress and clearing that failed: {error}")
+        });
     let accounting_deadline = Instant::now() + Duration::from_secs(30);
     match sbh_btrfs::inspect(&file, accounting_deadline) {
         Ok(after) => {
@@ -391,6 +428,9 @@ fn process_file(
     } else {
         report.outcome = "compressed".into();
         report.detail = "content, size and mtime verified; physical data accounting excludes metadata and delayed reuse".into();
+    }
+    if let Some(note) = flag_note {
+        report.detail.push_str(&note);
     }
     Ok(())
 }
@@ -502,7 +542,17 @@ fn check_active(path: &Path, own_fd: i32, platform: &dyn Platform) -> io::Result
             "executable inspection incomplete or file is executing",
         ));
     }
-    if !platform.mmap_regions_under(path).map_err(other)?.is_empty() {
+    // The mapping snapshot is shared with the scanner, which may be refreshing
+    // it: an incomplete answer is retried briefly before it vetoes the file.
+    let mut mapped = platform.mmap_regions_under(path);
+    for _ in 0..MMAP_RETRIES {
+        if mapped.is_ok() {
+            break;
+        }
+        std::thread::sleep(MMAP_RETRY_WAIT);
+        mapped = platform.mmap_regions_under(path);
+    }
+    if !mapped.map_err(other)?.is_empty() {
         return Err(io::Error::other("file has active memory mappings"));
     }
     let (build_directories, build_complete) = platform.build_directories_in_use_checked();
@@ -564,6 +614,19 @@ fn verify_path(path: &Path, file: &File, expected: FileStamp) -> io::Result<()> 
         ));
     }
     Ok(())
+}
+
+/// Shortest gap between two open-file, executable and mapping checks of the
+/// file being rewritten.
+const ACTIVE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// Retries of a mapping query that came back incomplete, and the wait between.
+const MMAP_RETRIES: u32 = 10;
+const MMAP_RETRY_WAIT: Duration = Duration::from_millis(500);
+
+/// Time a started file gets to be hashed, rewritten and hashed again: a minute
+/// plus 4 MiB/s (idle I/O priority on a loaded disk), at most an hour.
+fn file_allowance(size: u64) -> Duration {
+    Duration::from_secs(60 + size / (4 * 1024 * 1024)).min(Duration::from_hours(1))
 }
 
 fn budget(deadline: Instant) -> io::Result<()> {

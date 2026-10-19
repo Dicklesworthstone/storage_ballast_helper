@@ -2579,6 +2579,15 @@ fn v2_effective_parallelism(config: &ScannerConfig, pressure_level: PressureLeve
     }
 }
 
+/// Whether the Btrfs compression tier (bd-rxq5) may start a pass. It rewrites
+/// files in place, so it runs only where the policy lets the daemon change the
+/// filesystem: not in observe or fallback-safe mode (the kill switch forces
+/// the latter), and not under `scanner.dry_run`. A pass already running
+/// finishes within its own deadline.
+fn compress_tier_may_run(config: &Config, mode: ActiveMode) -> bool {
+    config.compress.enabled && !config.scanner.dry_run && mode.allows_deletion()
+}
+
 fn fallback_log_truncation_free_pct(pressure_level: PressureLevel) -> f64 {
     match pressure_level {
         PressureLevel::Green | PressureLevel::Yellow => 100.0,
@@ -5504,7 +5513,7 @@ impl MonitoringDaemon {
         }
         self.emit_reclaim_unavailable(&unprotected_mounts, now);
         self.report_unreclaimable_growth(now);
-        if self.config.compress.enabled {
+        if compress_tier_may_run(&self.config, self.policy_engine.lock().mode()) {
             let mount_levels: HashMap<PathBuf, PressureLevel> = self
                 .mount_controllers
                 .iter()
@@ -15757,6 +15766,26 @@ mod tests {
             &synthetic,
             5,
         ));
+    }
+
+    /// bd-rxq5: the compression tier rewrites files, so the policy modes that
+    /// change nothing (observe, fallback-safe, which the kill switch forces)
+    /// and dry-run keep it from starting a pass.
+    #[test]
+    fn compress_tier_runs_only_where_the_policy_may_change_the_filesystem() {
+        let mut config = Config::default();
+        config.compress.enabled = true;
+        for mode in [ActiveMode::Enforce, ActiveMode::Canary] {
+            assert!(compress_tier_may_run(&config, mode), "{mode}");
+        }
+        for mode in [ActiveMode::Observe, ActiveMode::FallbackSafe] {
+            assert!(!compress_tier_may_run(&config, mode), "{mode}");
+        }
+        config.scanner.dry_run = true;
+        assert!(!compress_tier_may_run(&config, ActiveMode::Enforce));
+        config.scanner.dry_run = false;
+        config.compress.enabled = false;
+        assert!(!compress_tier_may_run(&config, ActiveMode::Enforce));
     }
 
     #[test]
