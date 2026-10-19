@@ -498,13 +498,13 @@ mkdir -p "$ARTIFACT_DIR"
 
 Build fallback artifacts with the same nightly Rust toolchain and feature set as
 `dsr build`, whose sbh config builds with
-`--no-default-features --features cli,daemon,sqlite`. The repository
+`--no-default-features --features cli,daemon,sqlite,tui`. The repository
 `rust-toolchain.toml` pins nightly;
 keep `+nightly` in manual release commands so shell-level overrides cannot
 accidentally publish stable-built binaries:
 
 ```bash
-export CI_FEATURES="--no-default-features --features cli,daemon,sqlite"
+export CI_FEATURES="--no-default-features --features cli,daemon,sqlite,tui"
 cargo +nightly build $CI_FEATURES --release --target aarch64-apple-darwin
 cargo +nightly build $CI_FEATURES --release --target x86_64-apple-darwin
 cross +nightly build $CI_FEATURES --release --target aarch64-unknown-linux-gnu

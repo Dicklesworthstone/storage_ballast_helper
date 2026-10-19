@@ -220,6 +220,38 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
   what they did see still protects. One query covers all roots under
   shared limits, a stalled native call no longer blocks its caller, and
   the process list grows its buffer instead of retrying at the same size.
+- **macOS: deletion no longer waits forever on processes that cannot use a
+  candidate** (`00d8b23`). On a busy Mac the new checks above never
+  reported complete coverage, even as root, so nothing would have been
+  deleted:
+  - About 20 zombie processes, children their parents never reaped, read
+    as unreadable instead of exited. The errno libproc leaves behind is
+    now read.
+  - Agent CLIs still running a version their updater had deleted (10 of
+    1,670 processes) had no executable path. An unlinked executable or
+    open file lies under no candidate root.
+  - Apple daemons' guarded descriptors refuse even root. As root, those no
+    longer count as missing coverage. Without root, missing privileges
+    still hold deletions, as on Linux.
+
+  Also fixed: the macOS build (`mappings.rs` did not compile), two clippy
+  lints, and three tests that never passed on a Mac. Measured on the
+  3.6 TB Mac these checks were written for, whose daemon runs as root.
+- **The dashboard leaves the terminal usable after a panic or a kill**
+  (`ca17048`). `sbh dashboard` now opens the terminal through one guard.
+  A SIGTERM, SIGHUP, SIGQUIT or SIGINT from another process used to make
+  the terminal library restore the screen and then wait 2 s for the
+  dashboard, which went on drawing frames over the shell and was then
+  killed. The dashboard now notices the signal within 0.2 s, stops
+  drawing, restores the terminal and exits with 128 + the signal. In
+  builds where a panic unwinds (debug and test builds; release builds
+  abort, and the library covers them), the terminal is restored before
+  the panic message is printed. The message now stays readable instead of
+  being printed on the alternate screen and wiped.
+- **Release binaries include the dashboard cockpit.** dsr built the
+  release binaries without the `tui` feature that Cargo.toml lists for
+  them, so `sbh dashboard --new-dashboard` on v0.7.9 said "TUI feature not
+  enabled". dsr's build now passes `--features cli,daemon,sqlite,tui`.
 
 ## v0.7.9 **[release]**
 
