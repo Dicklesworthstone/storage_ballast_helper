@@ -2582,8 +2582,8 @@ fn v2_effective_parallelism(config: &ScannerConfig, pressure_level: PressureLeve
 /// Whether the Btrfs compression tier (bd-rxq5) may start a pass. It rewrites
 /// files in place, so it runs only where the policy lets the daemon change the
 /// filesystem: not in observe or fallback-safe mode (the kill switch forces
-/// the latter), and not under `scanner.dry_run`. A pass already running
-/// finishes within its own deadline.
+/// the latter), and not under `scanner.dry_run`. When it may not, a pass
+/// already running is told to stop (`CompressTier::stop_running_pass`).
 fn compress_tier_may_run(config: &Config, mode: ActiveMode) -> bool {
     config.compress.enabled && !config.scanner.dry_run && mode.allows_deletion()
 }
@@ -5526,6 +5526,8 @@ impl MonitoringDaemon {
                 &mount_levels,
                 &self.logger_handle,
             );
+        } else {
+            self.compress_tier.stop_running_pass();
         }
         if !self.config.scanner.target_only_roots.is_empty() {
             let mounts: HashMap<PathBuf, (PressureLevel, f64)> = self

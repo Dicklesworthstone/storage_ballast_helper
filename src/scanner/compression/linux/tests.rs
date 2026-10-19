@@ -156,7 +156,10 @@ fn git_packfile_preview_and_apply_stop_before_hashing_or_journaling() {
             },
             &Config::default(),
             &platform,
-            Instant::now() + Duration::from_secs(30),
+            &PassControl {
+                deadline: Instant::now() + Duration::from_secs(30),
+                stop: None,
+            },
             &mut bytes,
             &mut identities,
             &mut audit,
@@ -191,4 +194,64 @@ fn per_chunk_protection_detects_a_new_gitfile_without_reusing_admission() {
     let error = check_protection(&path, &config, &platform).unwrap_err();
     assert!(error.to_string().contains("Git repository"));
     assert_eq!(fs::read(&path).unwrap(), b"not rewritten");
+}
+
+#[test]
+fn a_stop_ends_a_started_file_between_chunks_but_the_deadline_does_not() {
+    let stop = AtomicBool::new(false);
+    let control = PassControl {
+        deadline: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+        stop: Some(&stop),
+    };
+    // Past the pass deadline no file starts, but a started one goes on.
+    assert_eq!(control.admit().unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert!(control.check_stop().is_ok());
+    stop.store(true, Ordering::Release);
+    assert_eq!(
+        control.check_stop().unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert_eq!(
+        control.admit().unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    let unstoppable = PassControl {
+        deadline: Instant::now() + Duration::from_secs(30),
+        stop: None,
+    };
+    assert!(unstoppable.admit().is_ok());
+}
+
+#[test]
+fn a_raised_stop_ends_the_pass_before_any_file_is_opened() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("cold.bin");
+    fs::write(&path, b"untouched").unwrap();
+    let stop = AtomicBool::new(true);
+    let mut observed = 0;
+    let report = run(
+        std::slice::from_ref(&path),
+        None,
+        &CompressionPolicy::default(),
+        CompressionMode::default(),
+        &Config::default(),
+        &MockPlatform::healthy(),
+        Some(&stop),
+        &mut |_| observed += 1,
+    )
+    .unwrap();
+    assert!(report.files.is_empty());
+    assert_eq!(observed, 0);
+    assert_eq!(report.unvisited_files, 1);
+    assert_eq!(report.exit_code, 4, "unvisited files are not a clean pass");
+    assert!(
+        report
+            .stop_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no longer allows changes")),
+        "{:?}",
+        report.stop_reason
+    );
+    assert!(report.journal_path.is_none());
+    assert_eq!(fs::read(&path).unwrap(), b"untouched");
 }

@@ -299,27 +299,6 @@ pub fn raw_ranges(
     Ok(ranges)
 }
 
-/// Clear FS_NOCOMP_FL (`m` in lsattr) if the file did not have it in
-/// `flags_before`: btrfs sets it on an inode when a range it was asked to
-/// compress came out no smaller, so a rewrite would otherwise leave a visible
-/// attribute on the user's file. Returns whether it cleared the flag.
-///
-/// btrfs reads FS_IOC_SETFLAGS as a statement about the `btrfs.compression`
-/// property: with FS_COMPR_FL it resets the property to the mount default,
-/// without it it removes the property. btrfs sets FS_NOCOMP_FL only on inodes
-/// without that property, but a file showing FS_COMPR_FL is left alone anyway.
-pub fn clear_nocompress_set_by_rewrite(file: &File, flags_before: u32) -> io::Result<bool> {
-    if flags_before & ioctl::FS_NOCOMP_FL != 0 {
-        return Ok(false);
-    }
-    let now = ioctl::inode_flags(file)?;
-    if now & ioctl::FS_NOCOMP_FL == 0 || now & ioctl::FS_COMPR_FL != 0 {
-        return Ok(false);
-    }
-    ioctl::set_inode_flags(file, now & !ioctl::FS_NOCOMP_FL)?;
-    Ok(true)
-}
-
 /// Whether any of the file's data is still stored raw (see [`raw_ranges`]).
 /// A file compressed in full has none and is not worth selecting again.
 pub fn has_raw_data(file: &File, deadline: Instant) -> io::Result<bool> {
@@ -345,10 +324,20 @@ pub fn has_raw_data(file: &File, deadline: Instant) -> io::Result<bool> {
 /// waited for before the next, and passes repeat over whatever the range
 /// still stores raw in its original extents until none is left or a pass
 /// makes no progress; a remainder is an error, never a silent success.
+///
+/// `inode_flags_before` are the file's flags when the caller inspected it,
+/// before its first range ([`ExtentMap::inode_flags`]). btrfs sets
+/// FS_NOCOMP_FL (`m` in lsattr) on an inode when a range it compressed came
+/// out no smaller; one that appeared since then came from this file's own
+/// earlier ranges, so the rest of the file is still compressed (the defrag
+/// ioctl compresses past it). The flag is left in place: it is btrfs's record
+/// that the file holds incompressible data, and [`ExtentMap::exclusion`]
+/// skips the file in later passes instead of rewriting that data again.
 pub fn compress_range(
     file: &File,
     start: u64,
     length: u64,
+    inode_flags_before: u32,
     _consent: ZstdConsent,
     deadline: Instant,
 ) -> io::Result<()> {
@@ -364,7 +353,7 @@ pub fn compress_range(
             "not a Btrfs file",
         ));
     }
-    if ioctl::inode_flags(file)? & ioctl::EXCLUDED_INODE_FLAGS != 0 {
+    if forbidden_flags(ioctl::inode_flags(file)?, inode_flags_before) != 0 {
         return Err(invalid("inode flags forbid compression"));
     }
     let flags = ioctl::fiemap_flags(file, start, length, deadline)?;
@@ -584,6 +573,13 @@ fn validate_range(start: u64, length: u64, size: u64) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The excluded flags among `now`, less an FS_NOCOMP_FL that `before` did not
+/// have (btrfs set it during this file's own rewrite; see [`compress_range`]).
+const fn forbidden_flags(now: u32, before: u32) -> u32 {
+    let acquired_nocompress = ioctl::FS_NOCOMP_FL & !before;
+    now & ioctl::EXCLUDED_INODE_FLAGS & !acquired_nocompress
 }
 
 fn check_deadline(deadline: Instant) -> io::Result<()> {

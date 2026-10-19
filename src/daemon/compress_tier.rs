@@ -74,6 +74,9 @@ pub fn due_roots(
 #[derive(Debug, Default)]
 pub struct CompressTier {
     running: Arc<AtomicBool>,
+    /// Raised by [`CompressTier::stop_running_pass`]; the pass checks it
+    /// before each file and between the chunks of a started one.
+    stop: Arc<AtomicBool>,
     last_start: Option<Instant>,
     /// Where the next discovery resumes: the last selected path of a pass
     /// that stopped at its file or byte limit. `None` starts from the top.
@@ -105,8 +108,11 @@ impl CompressTier {
             return;
         }
         self.last_start = Some(now);
+        // No pass is running (due_roots checked), so no stop is pending.
+        self.stop.store(false, Ordering::Release);
         self.running.store(true, Ordering::Release);
         let guard = RunningGuard(Arc::clone(&self.running));
+        let stop = Arc::clone(&self.stop);
         let resume_after = Arc::clone(&self.resume_after);
         let config = config.clone();
         let platform = Arc::clone(platform);
@@ -115,13 +121,33 @@ impl CompressTier {
             .name("sbh-compress".to_string())
             .spawn(move || {
                 let _guard = guard;
-                let message = run_pass(&roots, &config, platform.as_ref(), &resume_after, &logger);
+                let message = run_pass(
+                    &roots,
+                    &config,
+                    platform.as_ref(),
+                    &resume_after,
+                    &stop,
+                    &logger,
+                );
                 eprintln!("[SBH-COMPRESS] {message}");
                 logger.send(ActivityEvent::Info { message });
             });
         if let Err(error) = spawned {
             // The closure, and with it the guard, was dropped: running is clear.
             eprintln!("[SBH-COMPRESS] pass thread failed to start: {error}");
+        }
+    }
+
+    /// Tell a running pass to stop: the daemon's policy no longer allows
+    /// changes (observe or fallback-safe mode, the kill switch, dry-run, or
+    /// the tier was switched off). It stops before its next file, or before
+    /// the next chunk of the file it is rewriting, whose raw remainder a
+    /// later pass picks up. Does nothing when no pass is running.
+    pub fn stop_running_pass(&self) {
+        if self.running.load(Ordering::Acquire) && !self.stop.swap(true, Ordering::AcqRel) {
+            eprintln!(
+                "[SBH-COMPRESS] stopping the running pass: the policy no longer allows changes"
+            );
         }
     }
 }
@@ -160,6 +186,7 @@ fn run_pass(
     config: &Config,
     platform: &dyn Platform,
     resume_after: &Mutex<Option<PathBuf>>,
+    stop: &AtomicBool,
     logger: &ActivityLoggerHandle,
 ) -> String {
     let policy = &config.compress.policy;
@@ -209,7 +236,15 @@ fn run_pass(
     let mut observer = |observation: CompressionObservation<'_>| {
         record_outcome(observation, logger);
     };
-    match compression::run_discovered(&selection, policy, mode, config, platform, &mut observer) {
+    match compression::run_discovered(
+        &selection,
+        policy,
+        mode,
+        config,
+        platform,
+        Some(stop),
+        &mut observer,
+    ) {
         Ok(report) => summarize(&report),
         Err(error) => format!("pass refused before any rewrite: {error}"),
     }
@@ -336,6 +371,22 @@ mod tests {
         };
         let roots = [status("/data/tmp", true, Some(PressureLevel::Critical))];
         assert!(due_roots(&config, &roots, false, None, Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn a_stop_reaches_only_a_running_pass() {
+        let tier = CompressTier::default();
+        tier.stop_running_pass();
+        assert!(
+            !tier.stop.load(Ordering::Acquire),
+            "nothing running, nothing to stop"
+        );
+        tier.running.store(true, Ordering::Release);
+        tier.stop_running_pass();
+        assert!(tier.stop.load(Ordering::Acquire));
+        // Repeated ticks outside the policy keep it raised (and log once).
+        tier.stop_running_pass();
+        assert!(tier.stop.load(Ordering::Acquire));
     }
 
     #[test]

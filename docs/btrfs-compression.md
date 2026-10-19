@@ -149,10 +149,13 @@ and preserves uncertainty rather than converting verified contents into success.
 
 ## Validation and scope
 
-The dedicated Btrfs workflow contains dependency-free backend tests, application
-policy/journal/CLI tests, Linux UAPI assertions, and opt-in native tests on a
-disposable Btrfs loop mount. The native tests check byte preservation, size/mtime
-stability, physical allocation reduction, and reflink refusal. Journal tests
+The `native-btrfs` quality-gate stage (`scripts/quality-gate.sh --native`, or
+`scripts/dsr_native_checks.sh`, which dsr runs before a release) contains
+dependency-free backend tests, application policy/journal/CLI tests, Linux UAPI
+assertions, and opt-in native tests on a disposable Btrfs loop mount. The native
+tests check byte preservation, size/mtime stability, physical allocation
+reduction, reflink refusal, and that a file with an incompressible range is
+still compressed past it and keeps btrfs's no-compress mark. Journal tests
 exercise interrupted and torn records, locking, identity/hash changes, ownership,
 write/read budgets, failure poisoning, and native filename preservation. To run:
 
@@ -202,21 +205,31 @@ anyway:
 - the protection markers and rules, the lease veto, the file stamp and the
   root scope, rechecked before every chunk;
 - a SHA-256 re-read from disk after the rewrite, once the file's cached pages
-  are dropped (hashing them would compare the cache with itself).
+  are dropped (hashing them would compare the cache with itself); the mmap
+  veto runs once more just before it, since a mapped page is not dropped.
 
 The file is held through a read-only descriptor, which is all the defrag ioctl
 needs, so running it during the rewrite still works and closing it reports no
 modification. The tier runs only when the policy may change the filesystem: not
 in observe or fallback-safe mode, under the kill switch, or with
-`scanner.dry_run`.
+`scanner.dry_run`. When the daemon enters one of these during a pass, the pass
+stops before its next file, or before the next chunk of the file it is
+rewriting.
 
 A file is started only while the pass has time left, and once started it is
 finished on its own allowance (a minute plus 4 MiB/s, at most an hour): a file
 left part-compressed can use more space than before, because the raw remainder
 of an extent keeps the whole original allocation. If a pass still stops inside
-a file (a process opens it, the free-space reserve is reached), a later pass
-finishes the raw remainder instead of skipping the file as compressed, and
-discovery leaves out files with nothing raw left.
+a file (a process opens it, the free-space reserve is reached, the policy
+changes), a later pass finishes the raw remainder instead of skipping the file
+as compressed, and discovery leaves out files with nothing raw left.
+
+When part of a file does not compress, btrfs marks the inode no-compress (`m`
+in lsattr). The rest of that file is still compressed in the same pass: only
+a mark the file had before the pass started stops it. The mark is left in
+place, so later passes skip the file (NOCOMP is excluded) instead of rewriting
+its incompressible data every time. The cost: a file that got the mark and was
+then stopped part-way is not finished later.
 
 What you accept by enabling it is about space, not data: a snapshot or reflink
 made during a pass keeps the old extents alive, so those bytes are freed only

@@ -8,6 +8,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -270,7 +271,7 @@ pub fn run_observed(
     platform: &dyn Platform,
     observer: &mut dyn FnMut(CompressionObservation<'_>),
 ) -> io::Result<CompressionReport> {
-    run_checked(paths, None, policy, mode, config, platform, observer)
+    run_checked(paths, None, policy, mode, config, platform, None, observer)
 }
 
 /// Execute the same pass on the files a [`discovery::discover`] walk selected.
@@ -279,12 +280,18 @@ pub fn run_observed(
 /// since discovery and still lie beneath its pinned, unreplaced root without
 /// new Git ancestry; this is rechecked before the rewrite and between chunks.
 /// The selection narrows what may be rewritten and never authorizes more.
+///
+/// `stop`, once raised, ends the pass before the next file and a started
+/// file before its next chunk (the daemon raises it when its policy no longer
+/// allows changes); a later pass picks up the raw remainder of a file it
+/// left part-compressed.
 pub fn run_discovered(
     selection: &discovery::Selection,
     policy: &CompressionPolicy,
     mode: CompressionMode,
     config: &Config,
     platform: &dyn Platform,
+    stop: Option<&AtomicBool>,
     observer: &mut dyn FnMut(CompressionObservation<'_>),
 ) -> io::Result<CompressionReport> {
     let paths = selection.paths();
@@ -295,10 +302,12 @@ pub fn run_discovered(
         mode,
         config,
         platform,
+        stop,
         observer,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_checked(
     paths: &[PathBuf],
     selection: Option<&discovery::Selection>,
@@ -306,6 +315,7 @@ fn run_checked(
     mode: CompressionMode,
     config: &Config,
     platform: &dyn Platform,
+    stop: Option<&AtomicBool>,
     observer: &mut dyn FnMut(CompressionObservation<'_>),
 ) -> io::Result<CompressionReport> {
     policy.validate()?;
@@ -328,14 +338,16 @@ fn run_checked(
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
-        linux::run(paths, selection, policy, mode, config, platform, observer)
+        linux::run(
+            paths, selection, policy, mode, config, platform, stop, observer,
+        )
     }
     #[cfg(not(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     )))]
     {
-        let _ = (selection, config, platform, observer);
+        let _ = (selection, config, platform, stop, observer);
         Ok(CompressionReport {
             schema: "sbh.compression.v1",
             dry_run: !mode.apply,

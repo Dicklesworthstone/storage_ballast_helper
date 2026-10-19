@@ -163,7 +163,9 @@ fn execute(
         };
         Some(
             super::activity_cli::execute_with(&config, |observer| {
-                compression::run_discovered(&selection, &policy, mode, &config, &platform, observer)
+                compression::run_discovered(
+                    &selection, &policy, mode, &config, &platform, None, observer,
+                )
             })
             .map_err(|error| (super::io_exit_code(&error), error.to_string()))?,
         )

@@ -155,6 +155,22 @@ fn policy_never_overrides_nocow_hardlinks_or_preallocation() {
 }
 
 #[test]
+fn only_a_nocompress_flag_acquired_during_the_rewrite_is_tolerated() {
+    let nocomp = ioctl::FS_NOCOMP_FL;
+    // btrfs set it after an incompressible range of this file: keep going.
+    assert_eq!(forbidden_flags(nocomp, 0), 0);
+    // The file had it before the rewrite: the user's (or btrfs's) choice.
+    assert_eq!(forbidden_flags(nocomp, nocomp), nocomp);
+    // Every other excluded flag forbids compression however it appeared.
+    for flag in [0x10, 0x20, 0x0080_0000] {
+        assert_eq!(forbidden_flags(flag | nocomp, 0), flag);
+        assert_eq!(forbidden_flags(flag, flag), flag);
+    }
+    // Flags outside the excluded set (here FS_COMPR_FL) never forbid it.
+    assert_eq!(forbidden_flags(0x4, 0), 0);
+}
+
+#[test]
 fn compression_requests_are_finite_aligned_and_inside_the_file() {
     assert!(validate_range(0, MAX_CHUNK_BYTES, MAX_CHUNK_BYTES).is_ok());
     assert!(validate_range(4096, 123, 4219).is_ok());

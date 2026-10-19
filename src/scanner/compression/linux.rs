@@ -7,6 +7,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use nix::sys::statvfs::{FsFlags, fstatvfs};
@@ -25,7 +26,40 @@ use crate::scanner::{active_lease, protection};
 
 pub(super) mod repository;
 
-#[allow(clippy::too_many_lines)] // one bounded pass, in order
+/// The pass deadline and the daemon's stop flag, which it raises when its
+/// policy no longer allows changes (observe, fallback-safe, the kill switch,
+/// dry-run).
+struct PassControl<'a> {
+    deadline: Instant,
+    stop: Option<&'a AtomicBool>,
+}
+
+impl PassControl<'_> {
+    /// Before a new file: the stop flag and the pass deadline.
+    fn admit(&self) -> io::Result<()> {
+        self.check_stop()?;
+        budget(self.deadline)
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop.is_some_and(|stop| stop.load(Ordering::Acquire))
+    }
+
+    /// Between chunks of a started file, which has its own allowance: only
+    /// the stop flag. A file stopped here is finished by a later pass.
+    fn check_stop(&self) -> io::Result<()> {
+        if self.stop_requested() {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "stopped: the daemon's policy no longer allows changes",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // one bounded pass, in order
 pub(super) fn run(
     paths: &[std::path::PathBuf],
     selection: Option<&Selection>,
@@ -33,10 +67,12 @@ pub(super) fn run(
     mode: CompressionMode,
     config: &Config,
     platform: &dyn Platform,
+    stop: Option<&AtomicBool>,
     observer: &mut dyn FnMut(CompressionObservation<'_>),
 ) -> io::Result<CompressionReport> {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(policy.timeout_secs);
+    let control = PassControl { deadline, stop };
     let mut report = CompressionReport {
         schema: "sbh.compression.v1",
         dry_run: !mode.apply,
@@ -67,6 +103,10 @@ pub(super) fn run(
         None
     };
     for path in paths.iter().take(policy.max_files) {
+        if let Err(error) = control.check_stop() {
+            report.stop_reason = Some(error.to_string());
+            break;
+        }
         if Instant::now() >= deadline {
             report.stop_reason = Some("pass deadline exhausted".into());
             break;
@@ -80,14 +120,21 @@ pub(super) fn run(
             mode,
             config,
             platform,
-            deadline,
+            &control,
             &mut admitted_bytes,
             &mut identities,
             &mut audit,
         );
+        let mut stopped = false;
         if let Err(error) = result {
+            // A stop before the first range leaves the file as it was.
+            stopped = error.kind() == io::ErrorKind::Interrupted
+                && control.stop_requested()
+                && !item.mutation_attempted;
             item.outcome = if item.mutation_attempted {
                 "partial"
+            } else if stopped {
+                "skipped"
             } else {
                 "failed"
             }
@@ -117,7 +164,13 @@ pub(super) fn run(
             journal_path: audit.path(),
             journal_outcome_recorded: item.operation_id.is_some() && !audit.failed(),
         });
+        if stopped {
+            report.stop_reason = Some(item.detail.clone());
+        }
         report.files.push(item);
+        if stopped && !audit.failed() {
+            break;
+        }
         if unsafe_to_continue {
             report.stop_reason = Some(if audit.failed() {
                 "stopped because durable compression auditing failed; inspect the journal and per-file report"
@@ -179,7 +232,7 @@ fn process_file(
     mode: CompressionMode,
     config: &Config,
     platform: &dyn Platform,
-    deadline: Instant,
+    control: &PassControl<'_>,
     admitted_bytes: &mut u64,
     identities: &mut BTreeSet<(u64, u64)>,
     audit: &mut AuditSession,
@@ -270,7 +323,7 @@ fn process_file(
         file.try_lock()?;
     }
     check_active(&canonical, file.as_raw_fd(), platform)?;
-    let before = sbh_btrfs::inspect(&file, deadline)?;
+    let before = sbh_btrfs::inspect(&file, control.deadline)?;
     report.physical_data_bytes_before = Some(before.physical_data_bytes);
     if let Some(reason) = before.exclusion() {
         report.detail = reason.into();
@@ -289,8 +342,10 @@ fn process_file(
     // From here the file is finished on its own allowance, not the pass
     // deadline: a file left part-compressed can use more space than before
     // (see `ExtentMap::exclusion`). The pass deadline decided whether to
-    // start it; the next file waits for the next pass.
-    budget(deadline)?;
+    // start it; the next file waits for the next pass. Only the daemon's stop
+    // flag ends a started file early, between chunks; a later pass picks up
+    // its raw remainder.
+    control.admit()?;
     let file_deadline = Instant::now() + file_allowance(before.stamp.size);
     let hash_before = digest(&file, before.stamp.size, file_deadline)?;
     report.sha256_before = Some(hash_before.clone());
@@ -311,6 +366,7 @@ fn process_file(
         let offset = report.processed_bytes;
         let length = (before.stamp.size - offset).min(MAX_CHUNK_BYTES);
         let result = (|| -> io::Result<()> {
+            control.check_stop()?;
             budget(file_deadline)?;
             check_protection(&canonical, config, platform)?;
             if let Some(selection) = selection {
@@ -333,7 +389,14 @@ fn process_file(
                 sbh_btrfs::raw_ranges(&file, offset, length, file_deadline)?
             {
                 report.mutation_attempted = true;
-                sbh_btrfs::compress_range(&file, raw_start, raw_length, consent, file_deadline)?;
+                sbh_btrfs::compress_range(
+                    &file,
+                    raw_start,
+                    raw_length,
+                    before.inode_flags,
+                    consent,
+                    file_deadline,
+                )?;
             }
             expected = FileStamp::read(&file)?;
             Ok(())
@@ -356,12 +419,17 @@ fn process_file(
     // The hash must read what the disk now holds: the rewrite leaves the
     // original bytes in the page cache, and hashing those compares the cache
     // with itself. Every range ended with a fsync, so the pages are clean and
-    // the kernel drops them (a page mapped elsewhere it keeps, but a mapped
-    // file is refused before the rewrite).
+    // the kernel drops them, except pages mapped elsewhere: the active check
+    // runs between chunks at most every few seconds, so it runs once more
+    // here, and a file mapped since is left unverified rather than hashed
+    // from its cache.
     let verification_deadline = Instant::now() + file_allowance(before.stamp.size);
-    let from_disk = file.sync_all().and_then(|()| {
-        rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed).map_err(io::Error::from)
-    });
+    let from_disk = check_active(&canonical, file.as_raw_fd(), platform)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)
+                .map_err(io::Error::from)
+        });
     match from_disk.and_then(|()| digest(&file, before.stamp.size, verification_deadline)) {
         Ok(hash_after) => {
             let stable = before
@@ -382,14 +450,6 @@ fn process_file(
             ));
         }
     }
-    // A file with FS_NOCOMP_FL was excluded, so a flag there now is one btrfs
-    // set during the rewrite (a range came out no smaller): the user's
-    // attributes are put back. Only the inode's ctime changes.
-    let flag_note = sbh_btrfs::clear_nocompress_set_by_rewrite(&file, before.inode_flags)
-        .err()
-        .map(|error| {
-            format!("; btrfs marked the file no-compress and clearing that failed: {error}")
-        });
     let accounting_deadline = Instant::now() + Duration::from_secs(30);
     match sbh_btrfs::inspect(&file, accounting_deadline) {
         Ok(after) => {
@@ -428,9 +488,6 @@ fn process_file(
     } else {
         report.outcome = "compressed".into();
         report.detail = "content, size and mtime verified; physical data accounting excludes metadata and delayed reuse".into();
-    }
-    if let Some(note) = flag_note {
-        report.detail.push_str(&note);
     }
     Ok(())
 }

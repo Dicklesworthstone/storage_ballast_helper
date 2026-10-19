@@ -17,8 +17,6 @@ pub(super) const FIEMAP_EXTENT_SHARED: u32 = 0x2000;
 pub(super) const EXCLUDED_INODE_FLAGS: u32 = 0x10 | 0x20 | FS_NOCOMP_FL | 0x0080_0000;
 /// FS_NOCOMP_FL (`m` in lsattr).
 pub(super) const FS_NOCOMP_FL: u32 = 0x400;
-/// FS_COMPR_FL (`c` in lsattr).
-pub(super) const FS_COMPR_FL: u32 = 0x4;
 
 const fn request(direction: u32, kind: u8, number: u8, size: u32) -> c_ulong {
     ((direction << 30) | (size << 16) | ((kind as u32) << 8) | number as u32) as c_ulong
@@ -26,7 +24,6 @@ const fn request(direction: u32, kind: u8, number: u8, size: u32) -> c_ulong {
 
 const GET_FEATURES: c_ulong = request(2, 0x94, 57, 24);
 const GET_FLAGS: c_ulong = request(2, b'f', 1, 8);
-const SET_FLAGS: c_ulong = request(1, b'f', 2, 8);
 const FIEMAP: c_ulong = request(3, b'f', 11, 32);
 const TREE_SEARCH: c_ulong = request(3, 0x94, 17, 4096);
 const DEFRAG_RANGE: c_ulong = request(1, 0x94, 16, 48);
@@ -79,13 +76,6 @@ pub(super) fn inode_flags(file: &File) -> io::Result<u32> {
     let mut flags: c_long = 0;
     call(file, GET_FLAGS, &mut flags)?;
     u32::try_from(flags).map_err(|_| invalid("unsupported inode flags"))
-}
-
-/// FS_IOC_SETFLAGS: the inode owner (or CAP_FOWNER) may set them through any
-/// descriptor, as chattr does through a read-only one.
-pub(super) fn set_inode_flags(file: &File, flags: u32) -> io::Result<()> {
-    let mut flags = c_long::from(flags);
-    call(file, SET_FLAGS, &mut flags)
 }
 
 #[repr(C)]

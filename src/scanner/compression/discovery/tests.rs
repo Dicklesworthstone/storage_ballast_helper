@@ -471,6 +471,7 @@ mod native_tests {
             crate::scanner::compression::CompressionMode::default(),
             &Config::default(),
             platform,
+            None,
             &mut |_| {},
         )
         .unwrap()

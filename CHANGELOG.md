@@ -23,10 +23,13 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
   result is checked against a SHA-256 read back from disk after its cached
   pages are dropped. A started file is finished on its own allowance, not
   the pass deadline, and one an earlier pass stopped inside is finished
-  later rather than skipped as compressed. The no-compress flag btrfs puts
-  on a file whose data did not compress (`m` in lsattr) is cleared again.
+  later rather than skipped as compressed. When part of a file does not
+  compress, btrfs marks it no-compress (`m` in lsattr); the rest of that
+  file is still compressed in the same pass, and the mark stays so later
+  passes skip the file instead of rewriting the incompressible part again.
   The tier does not run in observe or fallback-safe mode, under the kill
-  switch or in dry-run. Outcomes go to the
+  switch or in dry-run, and a pass running when the daemon enters one of
+  them stops before its next file or chunk. Outcomes go to the
   activity log; an `[SBH-COMPRESS]` line summarizes each pass. Enabling it
   stands in for the CLI's `--quiescent`: a snapshot or reflink made during
   a pass keeps the old extents, so those bytes are freed only when it
