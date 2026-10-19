@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use nix::errno::Errno;
@@ -252,7 +252,7 @@ fn spawn_memory_pressure_epoll_subscription<F>(
 where
     F: Fn() -> Result<MemoryPressure> + Send + 'static,
 {
-    let initial = sampler()?;
+    let initial = sampler().unwrap_or_else(|_| unknown_memory_pressure());
     let trigger = memory_psi_trigger_spec();
     let psi_fd = open_memory_psi_trigger(Path::new(MEMORY_PSI_PATH), &trigger)?;
     let epoll = Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC).map_err(|error| {
@@ -275,42 +275,22 @@ where
     let thread = std::thread::Builder::new()
         .name("sbh-linux-memory-pressure-psi-epoll".to_string())
         .spawn(move || {
-            // The kernel removes the PSI trigger when its file descriptor closes.
-            let _psi_fd = psi_fd;
-            let mut last_level = initial.level;
-            let mut events = [EpollEvent::empty()];
-            loop {
-                if weak_liveness.upgrade().is_none() {
-                    break;
-                }
-
-                let count = match epoll.wait(&mut events, MEMORY_PRESSURE_EPOLL_TIMEOUT_MS) {
-                    Ok(count) => count,
-                    Err(Errno::EINTR) => continue,
-                    Err(_) => break,
-                };
-                if count > 0 {
-                    let flags = events[0].events();
-                    if flags.intersects(EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP) {
-                        break;
-                    }
-                    if !flags.contains(EpollFlags::EPOLLPRI) {
-                        continue;
-                    }
-                }
-                // Always sample on the timeout, even at Normal: this fd watches
-                // host stalls, not this service's cgroup PSI or its migrations.
-                // The same sample also notices recovery when triggers go quiet.
-
-                let Ok(mut pressure) = sampler() else {
-                    continue;
-                };
-                pressure.level = banded_level(last_level, pressure.linux_psi_avg10, pressure.level);
-                if pressure.level != last_level {
-                    last_level = pressure.level;
-                    callback(pressure);
-                }
-            }
+            let mut source = Some((epoll, psi_fd));
+            pressure_subscription_loop(
+                initial,
+                &weak_liveness,
+                || wait_for_pressure(
+                    &mut source,
+                    |(epoll, _)| {
+                        let mut events = [EpollEvent::empty()];
+                        let result = epoll.wait(&mut events, MEMORY_PRESSURE_EPOLL_TIMEOUT_MS);
+                        epoll_wake(result, events[0].events())
+                    },
+                    std::thread::sleep,
+                ),
+                sampler,
+                |pressure| callback(pressure),
+            );
         })
         .map_err(|error| {
             PalError::method_failed("linux", "subscribe_memory_pressure", error.to_string())
@@ -332,28 +312,23 @@ fn spawn_memory_pressure_subscription<F>(
 where
     F: Fn() -> Result<MemoryPressure> + Send + 'static,
 {
-    let initial = sampler()?;
+    let initial = sampler().unwrap_or_else(|_| unknown_memory_pressure());
     let liveness = Arc::new(());
     let weak_liveness = Arc::downgrade(&liveness);
     let thread_name = format!("sbh-{source}");
     let thread = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let mut last_level = initial.level;
-            loop {
-                std::thread::sleep(interval);
-                if weak_liveness.upgrade().is_none() {
-                    break;
-                }
-                let Ok(mut pressure) = sampler() else {
-                    continue;
-                };
-                pressure.level = banded_level(last_level, pressure.linux_psi_avg10, pressure.level);
-                if pressure.level != last_level {
-                    last_level = pressure.level;
-                    callback(pressure);
-                }
-            }
+            pressure_subscription_loop(
+                initial,
+                &weak_liveness,
+                || {
+                    std::thread::sleep(interval);
+                    true
+                },
+                sampler,
+                callback,
+            );
         })
         .map_err(|error| {
             PalError::method_failed("linux", "subscribe_memory_pressure", error.to_string())
@@ -361,6 +336,98 @@ where
     drop(thread);
 
     Ok(SubscriptionHandle::active_with_liveness(source, liveness))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PressureWake {
+    Sample,
+    Interrupted,
+    Failed,
+}
+
+fn epoll_wake(result: std::result::Result<usize, Errno>, flags: EpollFlags) -> PressureWake {
+    match result {
+        Ok(0) => PressureWake::Sample,
+        Ok(1) if flags.contains(EpollFlags::EPOLLPRI)
+            && !flags.intersects(EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP) =>
+        {
+            PressureWake::Sample
+        }
+        Err(Errno::EINTR) => PressureWake::Interrupted,
+        _ => PressureWake::Failed,
+    }
+}
+
+/// A broken event source is dropped once, including its trigger descriptor.
+/// The same worker then samples on paced timeouts; no retry/spawn loop is needed.
+fn wait_for_pressure<S>(
+    source: &mut Option<S>,
+    wait: impl FnOnce(&S) -> PressureWake,
+    delay: impl FnOnce(Duration),
+) -> bool {
+    let Some(active) = source.as_ref() else {
+        delay(MEMORY_PRESSURE_POLL_INTERVAL);
+        return true;
+    };
+    match wait(active) {
+        PressureWake::Sample => true,
+        PressureWake::Interrupted => false,
+        PressureWake::Failed => {
+            // Closing the fd deregisters the kernel PSI trigger. First sample
+            // immediately; all subsequent waits use the polling interval.
+            *source = None;
+            true
+        }
+    }
+}
+
+fn unknown_memory_pressure() -> MemoryPressure {
+    MemoryPressure {
+        level: MemoryPressureLevel::Unknown,
+        free_pages: None,
+        used_pages: None,
+        page_size_bytes: None,
+        compressor_used_bytes: None,
+        swap_total_bytes: None,
+        swap_used_bytes: None,
+        linux_psi_avg10: None,
+    }
+}
+
+/// Both event-backed and polling subscriptions use the same coverage/lifetime
+/// rules. Failed samples cannot leave a stale Normal verdict latched forever.
+/// Only level changes are delivered, except an initial Unknown is announced so
+/// an earlier successful daemon seed cannot hide a failed subscription seed.
+fn pressure_subscription_loop(
+    initial: MemoryPressure,
+    liveness: &Weak<()>,
+    mut wait: impl FnMut() -> bool,
+    mut sampler: impl FnMut() -> Result<MemoryPressure>,
+    mut callback: impl FnMut(MemoryPressure),
+) {
+    let mut last_level = initial.level;
+    if last_level == MemoryPressureLevel::Unknown && liveness.upgrade().is_some() {
+        callback(initial);
+    }
+    while liveness.upgrade().is_some() {
+        if !wait() {
+            continue;
+        }
+        if liveness.upgrade().is_none() {
+            break;
+        }
+        let mut pressure = sampler().unwrap_or_else(|_| unknown_memory_pressure());
+        // A slow sample may finish after shutdown. Do not publish that late
+        // observation or acquire another sample on an abandoned subscription.
+        if liveness.upgrade().is_none() {
+            break;
+        }
+        pressure.level = banded_level(last_level, pressure.linux_psi_avg10, pressure.level);
+        if pressure.level != last_level {
+            last_level = pressure.level;
+            callback(pressure);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -591,6 +658,182 @@ mod tests {
             last = banded_level(last, sample.linux_psi_avg10, sample.level);
             assert_eq!(last, expected);
         }
+    }
+
+    fn subscription_updates(
+        initial: MemoryPressure,
+        samples: Vec<super::Result<MemoryPressure>>,
+    ) -> Vec<MemoryPressure> {
+        use std::cell::RefCell;
+
+        let owner = RefCell::new(Some(Arc::new(())));
+        let liveness = Arc::downgrade(owner.borrow().as_ref().unwrap());
+        let samples = RefCell::new(VecDeque::from(samples));
+        let updates = RefCell::new(Vec::new());
+        let mut source = Some(());
+        super::pressure_subscription_loop(
+            initial,
+            &liveness,
+            || {
+                if samples.borrow().is_empty() {
+                    drop(owner.borrow_mut().take());
+                }
+                super::wait_for_pressure(
+                    &mut source,
+                    |_| super::epoll_wake(Ok(0), super::EpollFlags::empty()),
+                    |_| panic!("a live timeout must not discard its event source"),
+                )
+            },
+            || samples.borrow_mut().pop_front().unwrap(),
+            |pressure| updates.borrow_mut().push(pressure),
+        );
+        updates.into_inner()
+    }
+
+    fn unavailable_sample() -> super::Result<MemoryPressure> {
+        Err(SbhError::MountParse { details: "injected memory read failure".to_owned() })
+    }
+
+    #[test]
+    fn idle_subscription_reports_local_only_stalls_and_banded_recovery() {
+        let info = super::MemoryInfo {
+            total_bytes: 100,
+            available_bytes: 50,
+            swap_total_bytes: 0,
+            swap_free_bytes: 0,
+        };
+        let samples = [7350, 1700, 450, 399].into_iter().map(|local| {
+            Ok(super::memory_pressure_with_local(&info, Some(0), Ok(Some(local)), 1))
+        }).collect();
+        let updates = subscription_updates(test_memory_pressure(MemoryPressureLevel::Normal), samples);
+        assert_eq!(updates.iter().map(|sample| sample.level).collect::<Vec<_>>(), vec![
+            MemoryPressureLevel::Critical, MemoryPressureLevel::Warn, MemoryPressureLevel::Normal,
+        ]);
+        assert_eq!(updates.iter().map(|sample| sample.linux_psi_avg10).collect::<Vec<_>>(), vec![
+            Some(7350), Some(450), Some(399),
+        ]);
+    }
+
+    #[test]
+    fn failed_samples_emit_unknown_once_then_report_recovery_without_stale_counters() {
+        let updates = subscription_updates(test_memory_pressure(MemoryPressureLevel::Normal), vec![
+            unavailable_sample(),
+            unavailable_sample(),
+            Ok(test_memory_pressure(MemoryPressureLevel::Normal)),
+            Ok(test_memory_pressure(MemoryPressureLevel::Normal)),
+        ]);
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].level, MemoryPressureLevel::Unknown);
+        assert!(updates[0].free_pages.is_none());
+        assert!(updates[0].used_pages.is_none());
+        assert!(updates[0].page_size_bytes.is_none());
+        assert!(updates[0].swap_total_bytes.is_none());
+        assert!(updates[0].swap_used_bytes.is_none());
+        assert!(updates[0].linux_psi_avg10.is_none());
+        assert_eq!(updates[1].level, MemoryPressureLevel::Normal);
+        assert_eq!(updates[1].free_pages, Some(10));
+    }
+
+    #[test]
+    fn lost_event_source_is_dropped_once_and_replaced_by_paced_sampling() {
+        use std::cell::{Cell, RefCell};
+
+        struct Trigger<'a>(&'a Cell<usize>);
+        impl Drop for Trigger<'_> {
+            fn drop(&mut self) { self.0.set(self.0.get() + 1); }
+        }
+        let drops = Cell::new(0);
+        let calls = Cell::new(0);
+        let delays = RefCell::new(Vec::new());
+        let mut source = Some(Trigger(&drops));
+        for _ in 0..3 {
+            assert!(super::wait_for_pressure(
+                &mut source,
+                |_| {
+                    calls.set(calls.get() + 1);
+                    super::epoll_wake(Err(super::Errno::EIO), super::EpollFlags::empty())
+                },
+                |interval| delays.borrow_mut().push(interval),
+            ));
+        }
+        assert!(source.is_none());
+        assert_eq!(drops.get(), 1);
+        assert_eq!(calls.get(), 1, "never retry a permanently failed event source");
+        assert_eq!(*delays.borrow(), vec![std::time::Duration::from_secs(1); 2]);
+    }
+
+    #[test]
+    fn epoll_timeouts_and_faults_have_distinct_subscription_actions() {
+        use super::{EpollFlags, Errno, PressureWake, epoll_wake};
+
+        assert_eq!(epoll_wake(Ok(0), EpollFlags::empty()), PressureWake::Sample);
+        assert_eq!(epoll_wake(Ok(1), EpollFlags::EPOLLPRI), PressureWake::Sample);
+        assert_eq!(epoll_wake(Err(Errno::EINTR), EpollFlags::empty()), PressureWake::Interrupted);
+        for flags in [EpollFlags::EPOLLERR, EpollFlags::EPOLLHUP,
+            EpollFlags::EPOLLPRI | EpollFlags::EPOLLERR, EpollFlags::empty()]
+        {
+            assert_eq!(epoll_wake(Ok(1), flags), PressureWake::Failed);
+        }
+        assert_eq!(epoll_wake(Err(Errno::EBADF), EpollFlags::empty()), PressureWake::Failed);
+    }
+
+    #[test]
+    fn interrupted_wait_keeps_the_source_without_sampling_or_entering_fallback() {
+        let mut source = Some(());
+        assert!(!super::wait_for_pressure(
+            &mut source,
+            |_| super::epoll_wake(Err(super::Errno::EINTR), super::EpollFlags::empty()),
+            |_| panic!("EINTR is not a broken event source"),
+        ));
+        assert!(source.is_some());
+    }
+
+    #[test]
+    fn shutdown_during_wait_does_not_start_another_sample() {
+        let mut owner = Some(Arc::new(()));
+        let liveness = Arc::downgrade(owner.as_ref().unwrap());
+        super::pressure_subscription_loop(
+            test_memory_pressure(MemoryPressureLevel::Normal),
+            &liveness,
+            || { drop(owner.take()); true },
+            || panic!("subscription ended while waiting"),
+            |_| panic!("no sample may be published after the waiter saw shutdown"),
+        );
+    }
+
+    #[test]
+    fn shutdown_during_sampling_discards_the_late_result() {
+        let mut owner = Some(Arc::new(()));
+        let liveness = Arc::downgrade(owner.as_ref().unwrap());
+        super::pressure_subscription_loop(
+            test_memory_pressure(MemoryPressureLevel::Normal),
+            &liveness,
+            || true,
+            || {
+                drop(owner.take());
+                Ok(test_memory_pressure(MemoryPressureLevel::Critical))
+            },
+            |_| panic!("a completed sample must recheck subscription liveness"),
+        );
+    }
+
+    #[test]
+    fn polling_subscription_survives_an_unreadable_initial_sample() {
+        let samples = Arc::new(Mutex::new(VecDeque::from([
+            unavailable_sample(),
+            Ok(test_memory_pressure(MemoryPressureLevel::Normal)),
+        ])));
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn_memory_pressure_subscription(
+            "linux-memory-pressure-recovery-test",
+            std::time::Duration::from_millis(1),
+            Box::new(move |pressure| { let _ = tx.send(pressure.level); }),
+            move || samples.lock().unwrap().pop_front()
+                .unwrap_or_else(|| Ok(test_memory_pressure(MemoryPressureLevel::Normal))),
+        ).expect("a transient read failure must not prevent the subscription from starting");
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), MemoryPressureLevel::Unknown);
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), MemoryPressureLevel::Normal);
+        drop(handle);
     }
 
     fn test_memory_pressure(level: MemoryPressureLevel) -> MemoryPressure {
