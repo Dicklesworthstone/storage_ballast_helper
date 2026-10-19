@@ -20,7 +20,9 @@ pub(super) fn native_byte_count(returned: i32, errno: Option<i32>) -> io::Result
     }
     match errno {
         Some(code) if code != 0 => Err(io::Error::from_raw_os_error(code)),
-        _ => Err(io::Error::other("native process inventory failed without errno")),
+        _ => Err(io::Error::other(
+            "native process inventory failed without errno",
+        )),
     }
 }
 
@@ -56,7 +58,9 @@ fn collect_with(
     }
     let hint = slots(query(None)?)?;
     if hint > max_slots {
-        return Err(io::Error::other("native PID inventory exceeds its buffer budget"));
+        return Err(io::Error::other(
+            "native PID inventory exceeds its buffer budget",
+        ));
     }
     let mut wanted = hint.saturating_add(EXTRA_PID_SLOTS).min(max_slots);
     let mut pids = Vec::new();
@@ -75,7 +79,9 @@ fn collect_with(
         }
         if returned == pids.len() {
             if wanted == max_slots {
-                return Err(io::Error::other("native PID inventory filled its maximum buffer"));
+                return Err(io::Error::other(
+                    "native PID inventory filled its maximum buffer",
+                ));
             }
             wanted = wanted.saturating_mul(2).min(max_slots);
             continue;
@@ -84,11 +90,15 @@ fn collect_with(
         // partial earlier list with a later list from a different observation.
         pids.truncate(returned);
         if pids.iter().any(|pid| *pid < 0) || !pids.contains(&observer) {
-            return Err(invalid("native PID inventory is invalid or omitted its observer"));
+            return Err(invalid(
+                "native PID inventory is invalid or omitted its observer",
+            ));
         }
         return Ok(pids);
     }
-    Err(io::Error::other("native PID inventory did not stabilize within its query budget"))
+    Err(io::Error::other(
+        "native PID inventory did not stabilize within its query budget",
+    ))
 }
 
 #[cfg(test)]
@@ -106,9 +116,14 @@ mod tests {
         let mut lengths = Vec::new();
         let result = collect_with(
             |buffer| {
-                let Some(buffer) = buffer else { return Ok(byte_len(1)); };
+                let Some(buffer) = buffer else {
+                    return Ok(byte_len(1));
+                };
                 lengths.push(buffer.len());
-                assert!(buffer.iter().all(|pid| *pid == 0), "clear stale observations");
+                assert!(
+                    buffer.iter().all(|pid| *pid == 0),
+                    "clear stale observations"
+                );
                 if lengths.len() == 1 {
                     buffer.fill(99);
                     return Ok(byte_len(buffer.len()));
@@ -116,8 +131,11 @@ mod tests {
                 buffer[..2].copy_from_slice(&[OBSERVER, 42]);
                 Ok(byte_len(2))
             },
-            OBSERVER, 128, 8,
-        ).unwrap();
+            OBSERVER,
+            128,
+            8,
+        )
+        .unwrap();
         assert_eq!(lengths, vec![33, 66]);
         assert_eq!(result, vec![OBSERVER, 42]);
     }
@@ -125,12 +143,19 @@ mod tests {
     #[test]
     fn perpetual_process_growth_stops_after_the_fill_call_budget() {
         let mut lengths = Vec::new();
-        let result = collect_with(|buffer| {
-            let Some(buffer) = buffer else { return Ok(byte_len(1)); };
-            lengths.push(buffer.len());
-            buffer.fill(OBSERVER);
-            Ok(byte_len(buffer.len()))
-        }, OBSERVER, 1024, 3);
+        let result = collect_with(
+            |buffer| {
+                let Some(buffer) = buffer else {
+                    return Ok(byte_len(1));
+                };
+                lengths.push(buffer.len());
+                buffer.fill(OBSERVER);
+                Ok(byte_len(buffer.len()))
+            },
+            OBSERVER,
+            1024,
+            3,
+        );
         assert!(result.is_err());
         assert_eq!(lengths, vec![33, 66, 132]);
     }
@@ -138,12 +163,20 @@ mod tests {
     #[test]
     fn final_allowed_call_can_finish_a_growing_inventory() {
         let mut fills = 0;
-        let result = collect_with(|buffer| {
-            let Some(buffer) = buffer else { return Ok(byte_len(1)); };
-            fills += 1;
-            buffer[0] = OBSERVER;
-            Ok(byte_len(if fills == 1 { buffer.len() } else { 1 }))
-        }, OBSERVER, 128, 2).unwrap();
+        let result = collect_with(
+            |buffer| {
+                let Some(buffer) = buffer else {
+                    return Ok(byte_len(1));
+                };
+                fills += 1;
+                buffer[0] = OBSERVER;
+                Ok(byte_len(if fills == 1 { buffer.len() } else { 1 }))
+            },
+            OBSERVER,
+            128,
+            2,
+        )
+        .unwrap();
         assert_eq!(fills, 2);
         assert_eq!(result, vec![OBSERVER]);
     }
@@ -152,13 +185,20 @@ mod tests {
     fn maximum_buffer_requires_a_short_response_not_an_exact_fit() {
         for full in [false, true] {
             let mut fills = 0;
-            let result = collect_with(|buffer| {
-                let Some(buffer) = buffer else { return Ok(byte_len(4)); };
-                fills += 1;
-                assert_eq!(buffer.len(), 4);
-                buffer.fill(OBSERVER);
-                Ok(byte_len(if full { 4 } else { 3 }))
-            }, OBSERVER, 4, 8);
+            let result = collect_with(
+                |buffer| {
+                    let Some(buffer) = buffer else {
+                        return Ok(byte_len(4));
+                    };
+                    fills += 1;
+                    assert_eq!(buffer.len(), 4);
+                    buffer.fill(OBSERVER);
+                    Ok(byte_len(if full { 4 } else { 3 }))
+                },
+                OBSERVER,
+                4,
+                8,
+            );
             assert_eq!(result.is_err(), full);
             assert_eq!(fills, 1);
         }
@@ -167,32 +207,60 @@ mod tests {
     #[test]
     fn oversized_size_hints_are_rejected_before_any_fill_allocation() {
         let mut probes = 0;
-        assert!(collect_with(|buffer| {
-            assert!(buffer.is_none());
-            probes += 1;
-            Ok(byte_len(129))
-        }, OBSERVER, 128, 8).is_err());
+        assert!(
+            collect_with(
+                |buffer| {
+                    assert!(buffer.is_none());
+                    probes += 1;
+                    Ok(byte_len(129))
+                },
+                OBSERVER,
+                128,
+                8
+            )
+            .is_err()
+        );
         assert_eq!(probes, 1);
     }
 
     #[test]
     fn zero_or_misaligned_size_hints_never_start_a_fill() {
         for hint in [0, 1, 3, 5, usize::MAX] {
-            assert!(collect_with(|buffer| {
-                assert!(buffer.is_none());
-                Ok(hint)
-            }, OBSERVER, 128, 8).is_err(), "hint={hint}");
+            assert!(
+                collect_with(
+                    |buffer| {
+                        assert!(buffer.is_none());
+                        Ok(hint)
+                    },
+                    OBSERVER,
+                    128,
+                    8
+                )
+                .is_err(),
+                "hint={hint}"
+            );
         }
     }
 
     #[test]
     fn invalid_returned_byte_counts_are_not_complete_inventories() {
         for count in [0, 1, 3, 5, byte_len(129), usize::MAX] {
-            assert!(collect_with(|buffer| {
-                let Some(buffer) = buffer else { return Ok(byte_len(1)); };
-                buffer[0] = OBSERVER;
-                Ok(count)
-            }, OBSERVER, 128, 8).is_err(), "count={count}");
+            assert!(
+                collect_with(
+                    |buffer| {
+                        let Some(buffer) = buffer else {
+                            return Ok(byte_len(1));
+                        };
+                        buffer[0] = OBSERVER;
+                        Ok(count)
+                    },
+                    OBSERVER,
+                    128,
+                    8
+                )
+                .is_err(),
+                "count={count}"
+            );
         }
     }
 
@@ -200,16 +268,26 @@ mod tests {
     fn discovery_and_later_fill_errors_preserve_the_original_error() {
         for fail_at in 0..=2 {
             let mut call = 0;
-            let result = collect_with(|buffer| {
-                let current = call;
-                call += 1;
-                if current == fail_at {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "native refusal"));
-                }
-                let Some(buffer) = buffer else { return Ok(byte_len(1)); };
-                buffer.fill(OBSERVER);
-                Ok(byte_len(buffer.len()))
-            }, OBSERVER, 128, 8);
+            let result = collect_with(
+                |buffer| {
+                    let current = call;
+                    call += 1;
+                    if current == fail_at {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "native refusal",
+                        ));
+                    }
+                    let Some(buffer) = buffer else {
+                        return Ok(byte_len(1));
+                    };
+                    buffer.fill(OBSERVER);
+                    Ok(byte_len(buffer.len()))
+                },
+                OBSERVER,
+                128,
+                8,
+            );
             let error = result.unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
             assert_eq!(error.to_string(), "native refusal");
@@ -220,40 +298,67 @@ mod tests {
     #[test]
     fn missing_observer_or_negative_pids_are_missing_evidence() {
         for values in [[42, 43], [OBSERVER, -1]] {
-            assert!(collect_with(|buffer| {
-                let Some(buffer) = buffer else { return Ok(byte_len(2)); };
-                buffer[..2].copy_from_slice(&values);
-                Ok(byte_len(2))
-            }, OBSERVER, 128, 8).is_err());
+            assert!(
+                collect_with(
+                    |buffer| {
+                        let Some(buffer) = buffer else {
+                            return Ok(byte_len(2));
+                        };
+                        buffer[..2].copy_from_slice(&values);
+                        Ok(byte_len(2))
+                    },
+                    OBSERVER,
+                    128,
+                    8
+                )
+                .is_err()
+            );
         }
     }
 
     #[test]
     fn only_returned_slots_are_read_and_kernel_pid_zero_is_retained() {
-        let result = collect(|buffer| {
-            let Some(buffer) = buffer else { return Ok(byte_len(2)); };
-            buffer.fill(-1);
-            buffer[..2].copy_from_slice(&[0, OBSERVER]);
-            Ok(byte_len(2))
-        }, OBSERVER).unwrap();
+        let result = collect(
+            |buffer| {
+                let Some(buffer) = buffer else {
+                    return Ok(byte_len(2));
+                };
+                buffer.fill(-1);
+                buffer[..2].copy_from_slice(&[0, OBSERVER]);
+                Ok(byte_len(2))
+            },
+            OBSERVER,
+        )
+        .unwrap();
         assert_eq!(result, vec![0, OBSERVER]);
     }
 
     #[test]
     fn each_call_takes_a_new_inventory_instead_of_reusing_previous_absence() {
         for child in [42, 43] {
-            let result = collect(|buffer| {
-                let Some(buffer) = buffer else { return Ok(byte_len(2)); };
-                buffer[..2].copy_from_slice(&[OBSERVER, child]);
-                Ok(byte_len(2))
-            }, OBSERVER).unwrap();
+            let result = collect(
+                |buffer| {
+                    let Some(buffer) = buffer else {
+                        return Ok(byte_len(2));
+                    };
+                    buffer[..2].copy_from_slice(&[OBSERVER, child]);
+                    Ok(byte_len(2))
+                },
+                OBSERVER,
+            )
+            .unwrap();
             assert_eq!(result, vec![OBSERVER, child]);
         }
     }
 
     #[test]
     fn invalid_observer_or_disabled_budget_stops_before_native_io() {
-        for (observer, slots, fills) in [(0, 128, 8), (-1, 128, 8), (OBSERVER, 0, 8), (OBSERVER, 128, 0)] {
+        for (observer, slots, fills) in [
+            (0, 128, 8),
+            (-1, 128, 8),
+            (OBSERVER, 0, 8),
+            (OBSERVER, 128, 0),
+        ] {
             assert!(collect_with(|_| panic!("must not query"), observer, slots, fills).is_err());
         }
     }
@@ -262,7 +367,12 @@ mod tests {
     fn zero_native_failure_preserves_errno_and_success_ignores_stale_errno() {
         for returned in [0, -1] {
             for errno in [1, 5, 13] {
-                assert_eq!(native_byte_count(returned, Some(errno)).unwrap_err().raw_os_error(), Some(errno));
+                assert_eq!(
+                    native_byte_count(returned, Some(errno))
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(errno)
+                );
             }
             for errno in [None, Some(0)] {
                 assert!(native_byte_count(returned, errno).is_err());

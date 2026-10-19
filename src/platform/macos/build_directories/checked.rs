@@ -122,8 +122,7 @@ pub(super) fn collect_with(
                 continue;
             }
             let bytes = key.1.as_os_str().as_encoded_bytes().len();
-            if directories.len() >= limits.paths
-                || bytes > limits.bytes.saturating_sub(path_bytes)
+            if directories.len() >= limits.paths || bytes > limits.bytes.saturating_sub(path_bytes)
             {
                 complete = false;
                 break 'processes;
@@ -140,8 +139,8 @@ pub(super) fn collect_with(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::ProcessIdentity;
+    use super::*;
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
@@ -183,17 +182,29 @@ mod tests {
             raw.extend_from_slice(name.as_bytes());
             raw.push(0);
             raw.extend_from_slice(env);
-            self.processes.insert(pid, Process {
-                name: name.as_bytes().to_vec(), raw, cwd: Some("/workspace".into()),
-            });
+            self.processes.insert(
+                pid,
+                Process {
+                    name: name.as_bytes().to_vec(),
+                    raw,
+                    cwd: Some("/workspace".into()),
+                },
+            );
         }
 
         fn read(&self, pid: i32, kind: &'static str) -> io::Result<usize> {
             self.reads.borrow_mut().push((pid, kind));
             self.now.set(self.now.get() + self.step);
-            let count = self.reads.borrow().iter().filter(|entry| **entry == (pid, kind)).count();
+            let count = self
+                .reads
+                .borrow()
+                .iter()
+                .filter(|entry| **entry == (pid, kind))
+                .count();
             if let Some((target, field, nth, code)) = self.fault
-                && target == pid && field == kind && (nth == 0 || nth == count)
+                && target == pid
+                && field == kind
+                && (nth == 0 || nth == count)
             {
                 return Err(io::Error::from_raw_os_error(code));
             }
@@ -225,9 +236,14 @@ mod tests {
         }
         fn cwd(&self, pid: i32) -> io::Result<PathBuf> {
             self.read(pid, "cwd")?;
-            self.processes[&pid].cwd.clone().ok_or_else(|| io::ErrorKind::PermissionDenied.into())
+            self.processes[&pid]
+                .cwd
+                .clone()
+                .ok_or_else(|| io::ErrorKind::PermissionDenied.into())
         }
-        fn now(&self) -> Instant { self.now.get() }
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
     }
 
     #[test]
@@ -255,23 +271,38 @@ mod tests {
 
     #[test]
     fn native_process_exit_is_not_an_inspection_failure() {
-        for (field, nth) in [("identity", 1), ("arguments", 1), ("cwd", 1), ("identity", 2)] {
+        for (field, nth) in [
+            ("identity", 1),
+            ("arguments", 1),
+            ("cwd", 1),
+            ("identity", 2),
+        ] {
             let mut fixture = Fixture::default();
             fixture.add(41, "rustc", b"CARGO_TARGET_DIR=/exited\0");
             fixture.add(42, "rustc", b"CARGO_TARGET_DIR=/live\0");
             fixture.fault = Some((41, field, nth, libc::ESRCH));
-            assert_eq!(fixture.collect(Limits::default()), (vec![(42, PathBuf::from("/live"))], true));
+            assert_eq!(
+                fixture.collect(Limits::default()),
+                (vec![(42, PathBuf::from("/live"))], true)
+            );
         }
     }
 
     #[test]
     fn malformed_or_oversized_arguments_are_not_an_empty_complete_observation() {
-        for raw in [Vec::new(), vec![0xff; 3], vec![0; sbh_mach::PROCESS_ARGUMENTS_MAX_BYTES + 1]] {
+        for raw in [
+            Vec::new(),
+            vec![0xff; 3],
+            vec![0; sbh_mach::PROCESS_ARGUMENTS_MAX_BYTES + 1],
+        ] {
             let mut fixture = Fixture::default();
             fixture.add(41, "rustc", b"CARGO_TARGET_DIR=/bad\0");
             fixture.add(42, "rustc", b"CARGO_TARGET_DIR=/kept\0");
             fixture.processes.get_mut(&41).unwrap().raw = raw;
-            assert_eq!(fixture.collect(Limits::default()), (vec![(42, PathBuf::from("/kept"))], false));
+            assert_eq!(
+                fixture.collect(Limits::default()),
+                (vec![(42, PathBuf::from("/kept"))], false)
+            );
         }
     }
 
@@ -279,9 +310,16 @@ mod tests {
     fn missing_or_relative_cwd_keeps_absolute_paths_and_revokes_coverage() {
         for cwd in [None, Some(PathBuf::from("relative"))] {
             let mut fixture = Fixture::default();
-            fixture.add(41, "rustc", b"CARGO_TARGET_DIR=../target\0SCCACHE_DIR=/kept\0");
+            fixture.add(
+                41,
+                "rustc",
+                b"CARGO_TARGET_DIR=../target\0SCCACHE_DIR=/kept\0",
+            );
             fixture.processes.get_mut(&41).unwrap().cwd = cwd;
-            assert_eq!(fixture.collect(Limits::default()), (vec![(41, PathBuf::from("/kept"))], false));
+            assert_eq!(
+                fixture.collect(Limits::default()),
+                (vec![(41, PathBuf::from("/kept"))], false)
+            );
         }
     }
 
@@ -295,24 +333,48 @@ mod tests {
 
     #[test]
     fn discovery_and_last_identity_read_consume_the_original_deadline() {
-        let fixture = Fixture { discovery_time: Duration::from_secs(2), ..Fixture::default() };
-        let limits = Limits { time: Duration::from_secs(2), ..Limits::default() };
+        let fixture = Fixture {
+            discovery_time: Duration::from_secs(2),
+            ..Fixture::default()
+        };
+        let limits = Limits {
+            time: Duration::from_secs(2),
+            ..Limits::default()
+        };
         assert_eq!(fixture.collect(limits), (Vec::new(), false));
-        let mut fixture = Fixture { step: Duration::from_secs(1), ..Fixture::default() };
+        let mut fixture = Fixture {
+            step: Duration::from_secs(1),
+            ..Fixture::default()
+        };
         fixture.add(41, "rustc", b"CARGO_TARGET_DIR=/verified\0");
-        let (paths, complete) = fixture.collect(Limits { time: Duration::from_secs(5), ..limits });
+        let (paths, complete) = fixture.collect(Limits {
+            time: Duration::from_secs(5),
+            ..limits
+        });
         assert_eq!(paths, vec![(41, PathBuf::from("/verified"))]);
-        assert!(!complete, "the final identity syscall finished at the deadline");
+        assert!(
+            !complete,
+            "the final identity syscall finished at the deadline"
+        );
         assert_eq!(fixture.reads.borrow().len(), 5);
     }
 
     #[test]
     fn exhausted_budget_does_not_start_another_metadata_call() {
-        let mut fixture = Fixture { step: Duration::from_secs(1), ..Fixture::default() };
+        let mut fixture = Fixture {
+            step: Duration::from_secs(1),
+            ..Fixture::default()
+        };
         fixture.add(41, "rustc", b"CARGO_TARGET_DIR=/unknown\0");
-        let result = fixture.collect(Limits { time: Duration::from_secs(3), ..Limits::default() });
+        let result = fixture.collect(Limits {
+            time: Duration::from_secs(3),
+            ..Limits::default()
+        });
         assert_eq!(result, (Vec::new(), false));
-        assert_eq!(*fixture.reads.borrow(), vec![(0, "pids"), (41, "identity"), (41, "arguments")]);
+        assert_eq!(
+            *fixture.reads.borrow(),
+            vec![(0, "pids"), (41, "identity"), (41, "arguments")]
+        );
     }
 
     #[test]
@@ -321,10 +383,16 @@ mod tests {
             let mut fixture = Fixture::default();
             fixture.add(41, "rustc", b"CARGO_TARGET_DIR=/a\0");
             fixture.add(42, "rustc", b"CARGO_TARGET_DIR=/b\0");
-            let (paths, complete) = fixture.collect(Limits { pids: cap, ..Limits::default() });
+            let (paths, complete) = fixture.collect(Limits {
+                pids: cap,
+                ..Limits::default()
+            });
             assert_eq!(paths.len(), cap.min(2));
             assert_eq!(complete, cap >= 2);
-            let (paths, complete) = fixture.collect(Limits { paths: cap, ..Limits::default() });
+            let (paths, complete) = fixture.collect(Limits {
+                paths: cap,
+                ..Limits::default()
+            });
             assert_eq!(paths.len(), cap.min(2));
             assert_eq!(complete, cap >= 2);
         }
@@ -335,8 +403,17 @@ mod tests {
         let mut fixture = Fixture::default();
         fixture.add(41, "rustc", b"CARGO_TARGET_DIR=/one\0SCCACHE_DIR=/two\0");
         for bytes in [3, 4, 7, 8, 9] {
-            let (paths, complete) = fixture.collect(Limits { bytes, ..Limits::default() });
-            assert!(paths.iter().map(|(_, path)| path.as_os_str().as_encoded_bytes().len()).sum::<usize>() <= bytes);
+            let (paths, complete) = fixture.collect(Limits {
+                bytes,
+                ..Limits::default()
+            });
+            assert!(
+                paths
+                    .iter()
+                    .map(|(_, path)| path.as_os_str().as_encoded_bytes().len())
+                    .sum::<usize>()
+                    <= bytes
+            );
             assert_eq!(paths.len(), (bytes / 4).min(2));
             assert_eq!(complete, bytes >= 8);
         }
@@ -356,9 +433,25 @@ mod tests {
     fn independent_builders_sharing_a_directory_retain_both_identities() {
         let mut fixture = Fixture::default();
         for pid in [41, 42] {
-            fixture.add(pid, "rustc", b"CARGO_TARGET_DIR=/shared\0SCCACHE_DIR=/shared\0");
+            fixture.add(
+                pid,
+                "rustc",
+                b"CARGO_TARGET_DIR=/shared\0SCCACHE_DIR=/shared\0",
+            );
         }
-        assert_eq!(fixture.collect(Limits { paths: 2, bytes: 14, ..Limits::default() }),
-            (vec![(41, PathBuf::from("/shared")), (42, PathBuf::from("/shared"))], true));
+        assert_eq!(
+            fixture.collect(Limits {
+                paths: 2,
+                bytes: 14,
+                ..Limits::default()
+            }),
+            (
+                vec![
+                    (41, PathBuf::from("/shared")),
+                    (42, PathBuf::from("/shared"))
+                ],
+                true
+            )
+        );
     }
 }

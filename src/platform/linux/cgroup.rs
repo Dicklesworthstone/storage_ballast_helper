@@ -53,7 +53,9 @@ impl Access for Native {
             Source::Cgroup => 0x6367_7270,
         };
         if fstatfs(&file)?.f_type != expected || !file.metadata()?.is_file() {
-            return Err(invalid("memory evidence is not a regular file on the expected kernel filesystem"));
+            return Err(invalid(
+                "memory evidence is not a regular file on the expected kernel filesystem",
+            ));
         }
         let mut bytes = Vec::new();
         file.take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
@@ -97,23 +99,36 @@ struct Observation<'a, A> {
 
 impl<'a, A: Access> Observation<'a, A> {
     fn new(access: &'a A) -> Self {
-        Self { access, started: access.now(), reads: 0, bytes: 0 }
+        Self {
+            access,
+            started: access.now(),
+            reads: 0,
+            bytes: 0,
+        }
     }
 
     fn check_time(&self) -> io::Result<()> {
-        if self.access.now().checked_duration_since(self.started)
+        if self
+            .access
+            .now()
+            .checked_duration_since(self.started)
             .is_some_and(|elapsed| elapsed < SCAN_TIME)
         {
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::TimedOut, "cgroup memory observation timed out"))
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "cgroup memory observation timed out",
+            ))
         }
     }
 
     fn read(&mut self, path: &Path, limit: usize, source: Source) -> io::Result<Vec<u8>> {
         self.check_time()?;
         if self.reads >= MAX_READS || limit > TOTAL_BYTES.saturating_sub(self.bytes) {
-            return Err(invalid("cgroup memory observation exhausted its work budget"));
+            return Err(invalid(
+                "cgroup memory observation exhausted its work budget",
+            ));
         }
         self.reads += 1;
         let result = self.access.read(path, limit, source);
@@ -171,14 +186,24 @@ pub fn ram_write_refusal(percent: u8) -> io::Result<Option<String>> {
 
 fn refusal_with(access: &impl Access, percent: u8) -> io::Result<Option<String>> {
     if !(1..=100).contains(&percent) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid memory headroom percentage"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid memory headroom percentage",
+        ));
     }
-    Ok(inspect(access)?.into_iter().find(|limit| limit.refuses(percent)).map(|limit| {
-        format!(
-            "cgroup {:?} {} has {} of {} bytes headroom ({}% required)",
-            limit.scope, limit.field, limit.limit.saturating_sub(limit.used), limit.limit, percent,
-        )
-    }))
+    Ok(inspect(access)?
+        .into_iter()
+        .find(|limit| limit.refuses(percent))
+        .map(|limit| {
+            format!(
+                "cgroup {:?} {} has {} of {} bytes headroom ({}% required)",
+                limit.scope,
+                limit.field,
+                limit.limit.saturating_sub(limit.used),
+                limit.limit,
+                percent,
+            )
+        }))
 }
 
 fn inspect(access: &impl Access) -> io::Result<Vec<Constraint>> {
@@ -187,7 +212,9 @@ fn inspect(access: &impl Access) -> io::Result<Vec<Constraint>> {
     let member = membership_path(&membership)?;
     let mounts = observation.read(Path::new(MOUNTS), MOUNT_BYTES, Source::Proc)?;
     let mount = hierarchy_mount(&mounts, &member)?;
-    let relative = member.strip_prefix("/").map_err(|_| invalid("invalid cgroup membership"))?;
+    let relative = member
+        .strip_prefix("/")
+        .map_err(|_| invalid("invalid cgroup membership"))?;
     let leaf = mount.join(relative);
     if leaf.as_os_str().as_encoded_bytes().len() > PATH_BYTES {
         return Err(invalid("resolved cgroup path exceeded its allowance"));
@@ -212,7 +239,9 @@ fn inspect(access: &impl Access) -> io::Result<Vec<Constraint>> {
     if observation.read(Path::new(MEMBERSHIP), MEMBERSHIP_BYTES, Source::Proc)? != membership
         || observation.read(Path::new(MOUNTS), MOUNT_BYTES, Source::Proc)? != mounts
     {
-        return Err(invalid("cgroup membership or mounts changed during observation"));
+        return Err(invalid(
+            "cgroup membership or mounts changed during observation",
+        ));
     }
     observation.check_time()?;
     Ok(constraints)
@@ -234,10 +263,14 @@ fn observe_scope(
             // it, missing files need evidence that the parent did not enable
             // this controller; missing files alone never certify no limit.
             memory_enabled(&observation.read(
-                &scope.join("cgroup.controllers"), CONTROLLER_BYTES, Source::Cgroup,
+                &scope.join("cgroup.controllers"),
+                CONTROLLER_BYTES,
+                Source::Cgroup,
             )?)?;
             if scope != mount {
-                let parent = scope.parent().ok_or_else(|| invalid("missing cgroup parent"))?;
+                let parent = scope
+                    .parent()
+                    .ok_or_else(|| invalid("missing cgroup parent"))?;
                 let control = parent.join("cgroup.subtree_control");
                 let before = observation.read(&control, CONTROLLER_BYTES, Source::Cgroup)?;
                 if memory_enabled(&before)?
@@ -250,7 +283,8 @@ fn observe_scope(
         }
         _ => return Err(invalid("cgroup memory controller evidence is incomplete")),
     };
-    let current_after = observation.read(&scope.join("memory.current"), SCALAR_BYTES, Source::Cgroup)?;
+    let current_after =
+        observation.read(&scope.join("memory.current"), SCALAR_BYTES, Source::Cgroup)?;
     let used = counter(&current)?.max(counter(&current_after)?);
     for (field, raw) in [("memory.high", high), ("memory.max", max)] {
         let limit = limit(&raw)?;
@@ -258,7 +292,12 @@ fn observe_scope(
             return Err(invalid("cgroup memory limit changed during observation"));
         }
         if let Some(limit) = limit {
-            constraints.push(Constraint { scope: scope.to_path_buf(), field, used, limit });
+            constraints.push(Constraint {
+                scope: scope.to_path_buf(),
+                field,
+                used,
+                limit,
+            });
         }
     }
     let swap_current = observation.optional(&scope.join("memory.swap.current"), SCALAR_BYTES)?;
@@ -269,14 +308,23 @@ fn observe_scope(
         (None, None) => {}
         (Some(current), Some(max)) => {
             let used = counter(&current)?.max(counter(&observation.read(
-                &scope.join("memory.swap.current"), SCALAR_BYTES, Source::Cgroup,
+                &scope.join("memory.swap.current"),
+                SCALAR_BYTES,
+                Source::Cgroup,
             )?)?);
             let limit = limit(&max)?;
-            if observation.read(&scope.join("memory.swap.max"), SCALAR_BYTES, Source::Cgroup)? != max {
+            if observation.read(&scope.join("memory.swap.max"), SCALAR_BYTES, Source::Cgroup)?
+                != max
+            {
                 return Err(invalid("cgroup swap limit changed during observation"));
             }
             if let Some(limit) = limit {
-                constraints.push(Constraint { scope: scope.to_path_buf(), field: "memory.swap.max", used, limit });
+                constraints.push(Constraint {
+                    scope: scope.to_path_buf(),
+                    field: "memory.swap.max",
+                    used,
+                    limit,
+                });
             }
         }
         _ => return Err(invalid("cgroup swap controller evidence is incomplete")),
@@ -293,12 +341,16 @@ fn scalar(raw: &[u8]) -> io::Result<&[u8]> {
 }
 
 fn memory_enabled(raw: &[u8]) -> io::Result<bool> {
-    if raw.len() > CONTROLLER_BYTES || raw.iter().any(|byte| {
-        !byte.is_ascii_alphanumeric() && !byte.is_ascii_whitespace() && !b"_-".contains(byte)
-    }) {
+    if raw.len() > CONTROLLER_BYTES
+        || raw.iter().any(|byte| {
+            !byte.is_ascii_alphanumeric() && !byte.is_ascii_whitespace() && !b"_-".contains(byte)
+        })
+    {
         return Err(invalid("invalid cgroup controller inventory"));
     }
-    Ok(raw.split(u8::is_ascii_whitespace).any(|name| name == b"memory"))
+    Ok(raw
+        .split(u8::is_ascii_whitespace)
+        .any(|name| name == b"memory"))
 }
 
 fn counter(raw: &[u8]) -> io::Result<u64> {
@@ -306,17 +358,27 @@ fn counter(raw: &[u8]) -> io::Result<u64> {
     if !value.iter().all(u8::is_ascii_digit) {
         return Err(invalid("invalid cgroup counter"));
     }
-    std::str::from_utf8(value).ok().and_then(|text| text.parse().ok())
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|text| text.parse().ok())
         .ok_or_else(|| invalid("cgroup counter overflow"))
 }
 
 fn limit(raw: &[u8]) -> io::Result<Option<u64>> {
-    if scalar(raw)? == b"max" { Ok(None) } else { counter(raw).map(Some) }
+    if scalar(raw)? == b"max" {
+        Ok(None)
+    } else {
+        counter(raw).map(Some)
+    }
 }
 
 fn path(raw: &[u8]) -> io::Result<PathBuf> {
-    if raw.first() != Some(&b'/') || raw.len() > PATH_BYTES || raw.contains(&0)
-        || raw.split(|byte| *byte == b'/').any(|part| part == b"." || part == b"..")
+    if raw.first() != Some(&b'/')
+        || raw.len() > PATH_BYTES
+        || raw.contains(&0)
+        || raw
+            .split(|byte| *byte == b'/')
+            .any(|part| part == b"." || part == b"..")
     {
         return Err(invalid("invalid or traversing cgroup path"));
     }
@@ -331,22 +393,41 @@ fn membership_path(raw: &[u8]) -> io::Result<PathBuf> {
     for line in raw[..raw.len() - 1].split(|byte| *byte == b'\n') {
         let mut fields = line.splitn(3, |byte| *byte == b':');
         let id = fields.next().unwrap_or_default();
-        let controllers = fields.next().ok_or_else(|| invalid("invalid cgroup membership record"))?;
-        let member = fields.next().ok_or_else(|| invalid("invalid cgroup membership record"))?;
-        if id.is_empty() || !id.iter().all(u8::is_ascii_digit)
-            || (id == b"0" && !controllers.is_empty()) || member.first() != Some(&b'/')
+        let controllers = fields
+            .next()
+            .ok_or_else(|| invalid("invalid cgroup membership record"))?;
+        let member = fields
+            .next()
+            .ok_or_else(|| invalid("invalid cgroup membership record"))?;
+        if id.is_empty()
+            || !id.iter().all(u8::is_ascii_digit)
+            || (id == b"0" && !controllers.is_empty())
+            || member.first() != Some(&b'/')
         {
             return Err(invalid("invalid cgroup membership record"));
         }
-        if controllers.split(|byte| *byte == b',').any(|name| name == b"memory") {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "legacy cgroup memory limits are not observable by this guard"));
+        if controllers
+            .split(|byte| *byte == b',')
+            .any(|name| name == b"memory")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "legacy cgroup memory limits are not observable by this guard",
+            ));
         }
         if id == b"0" && controllers.is_empty() {
-            if unified.is_some() { return Err(invalid("ambiguous cgroup membership")); }
+            if unified.is_some() {
+                return Err(invalid("ambiguous cgroup membership"));
+            }
             unified = Some(path(member)?);
         }
     }
-    unified.ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no unified cgroup membership was observed"))
+    unified.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no unified cgroup membership was observed",
+        )
+    })
 }
 
 fn unescape(raw: &[u8]) -> io::Result<PathBuf> {
@@ -354,9 +435,14 @@ fn unescape(raw: &[u8]) -> io::Result<PathBuf> {
     let mut position = 0;
     while position < raw.len() {
         if raw[position] == b'\\' {
-            let escape = raw.get(position + 1..position + 4).ok_or_else(|| invalid("truncated mountinfo escape"))?;
+            let escape = raw
+                .get(position + 1..position + 4)
+                .ok_or_else(|| invalid("truncated mountinfo escape"))?;
             decoded.push(match escape {
-                b"040" => b' ', b"011" => b'\t', b"012" => b'\n', b"134" => b'\\',
+                b"040" => b' ',
+                b"011" => b'\t',
+                b"012" => b'\n',
+                b"134" => b'\\',
                 _ => return Err(invalid("invalid mountinfo escape")),
             });
             position += 4;
@@ -373,21 +459,35 @@ fn hierarchy_mount(raw: &[u8], member: &Path) -> io::Result<PathBuf> {
         return Err(invalid("mountinfo is oversized or truncated"));
     }
     let mut selected = None;
-    for (index, line) in raw[..raw.len() - 1].split(|byte| *byte == b'\n').enumerate() {
+    for (index, line) in raw[..raw.len() - 1]
+        .split(|byte| *byte == b'\n')
+        .enumerate()
+    {
         if index >= 4096 || line.len() > 16 * 1024 {
             return Err(invalid("mountinfo exceeded its record budget"));
         }
-        let separator = line.windows(3).position(|part| part == b" - ")
+        let separator = line
+            .windows(3)
+            .position(|part| part == b" - ")
             .ok_or_else(|| invalid("invalid mountinfo record"))?;
         if line[separator + 3..].split(|byte| *byte == b' ').next() != Some(b"cgroup2") {
             continue;
         }
         let mut fields = line[..separator].split(|byte| *byte == b' ');
-        let root = unescape(fields.nth(3).ok_or_else(|| invalid("missing cgroup mount root"))?)?;
-        let mount = unescape(fields.next().ok_or_else(|| invalid("missing cgroup mount path"))?)?;
+        let root = unescape(
+            fields
+                .nth(3)
+                .ok_or_else(|| invalid("missing cgroup mount root"))?,
+        )?;
+        let mount = unescape(
+            fields
+                .next()
+                .ok_or_else(|| invalid("missing cgroup mount path"))?,
+        )?;
         // A bind-mounted subtree hides enforcing ancestors. Do not substitute
         // its headroom for the whole visible hierarchy, even if it contains us.
-        if root == Path::new("/") && member.starts_with(&root)
+        if root == Path::new("/")
+            && member.starts_with(&root)
             && selected.as_ref().is_none_or(|old: &PathBuf| mount < *old)
         {
             selected = Some(mount);
@@ -449,12 +549,19 @@ mod tests {
         }
 
         fn swap(&mut self, path: &str, used: u64, max: &[u8]) {
-            self.put(Path::new(path).join("memory.swap.current"), format!("{used}\n").as_bytes());
+            self.put(
+                Path::new(path).join("memory.swap.current"),
+                format!("{used}\n").as_bytes(),
+            );
             self.put(Path::new(path).join("memory.swap.max"), max);
         }
 
         fn calls(&self, path: &str) -> usize {
-            self.reads.borrow().get(Path::new(path)).copied().unwrap_or(0)
+            self.reads
+                .borrow()
+                .get(Path::new(path))
+                .copied()
+                .unwrap_or(0)
         }
     }
 
@@ -471,14 +578,20 @@ mod tests {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             if let Some((target, at, bytes)) = &self.replacement
-                && path == target && nth >= *at
+                && path == target
+                && nth >= *at
             {
                 return Ok(bytes.clone());
             }
-            self.files.get(path).cloned().ok_or_else(|| io::ErrorKind::NotFound.into())
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| io::ErrorKind::NotFound.into())
         }
 
-        fn now(&self) -> Instant { self.now.get() }
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
     }
 
     #[test]
@@ -486,7 +599,10 @@ mod tests {
         let mut fixture = Fixture::default();
         assert_eq!(refusal_with(&fixture, 10).unwrap(), None);
         fixture.denied = Some("/cg/service/memory.max".into());
-        assert_eq!(refusal_with(&fixture, 10).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            refusal_with(&fixture, 10).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
@@ -505,36 +621,71 @@ mod tests {
         let mut fixture = Fixture::default();
         fixture.scope("/cg/service", 89, b"100\n", b"1000\n");
         assert_eq!(refusal_with(&fixture, 10).unwrap(), None);
-        assert!(refusal_with(&fixture, 15).unwrap().unwrap().contains("memory.high"));
+        assert!(
+            refusal_with(&fixture, 15)
+                .unwrap()
+                .unwrap()
+                .contains("memory.high")
+        );
         fixture.scope("/cg/service", 91, b"100\n", b"1000\n");
         assert!(refusal_with(&fixture, 10).unwrap().is_some());
     }
 
     #[test]
     fn exact_memory_threshold_is_allowed_but_zero_and_overage_are_not() {
-        for (used, max, refused) in [(90, 100, false), (91, 100, true), (101, 100, true), (0, 0, true)] {
+        for (used, max, refused) in [
+            (90, 100, false),
+            (91, 100, true),
+            (101, 100, true),
+            (0, 0, true),
+        ] {
             let mut fixture = Fixture::default();
             fixture.scope("/cg/service", used, b"max\n", format!("{max}\n").as_bytes());
-            assert_eq!(refusal_with(&fixture, 10).unwrap().is_some(), refused, "{used}/{max}");
+            assert_eq!(
+                refusal_with(&fixture, 10).unwrap().is_some(),
+                refused,
+                "{used}/{max}"
+            );
         }
     }
 
     #[test]
     fn disabled_swap_is_not_added_to_ram_or_treated_as_exhausted_swap() {
-        for (used, max, refused) in [(0, 0, false), (1, 0, true), (90, 100, false), (91, 100, true)] {
+        for (used, max, refused) in [
+            (0, 0, false),
+            (1, 0, true),
+            (90, 100, false),
+            (91, 100, true),
+        ] {
             let mut fixture = Fixture::default();
             fixture.swap("/cg/service", used, format!("{max}\n").as_bytes());
-            assert_eq!(refusal_with(&fixture, 10).unwrap().is_some(), refused, "{used}/{max}");
+            assert_eq!(
+                refusal_with(&fixture, 10).unwrap().is_some(),
+                refused,
+                "{used}/{max}"
+            );
         }
         let mut fixture = Fixture::default();
         fixture.scope("/cg/service", 100, b"max\n", b"100\n");
         fixture.swap("/cg/service", 0, b"1000000\n");
-        assert!(refusal_with(&fixture, 10).unwrap().is_some(), "swap cannot back a RAM allowance");
+        assert!(
+            refusal_with(&fixture, 10).unwrap().is_some(),
+            "swap cannot back a RAM allowance"
+        );
     }
 
     #[test]
     fn malformed_scalars_and_overflow_are_not_unlimited() {
-        for raw in [b"".as_slice(), b"-1\n", b"+1\n", b"10 kB\n", b"1\n2\n", b"18446744073709551616\n", b"MAX\n", b" 12\n"] {
+        for raw in [
+            b"".as_slice(),
+            b"-1\n",
+            b"+1\n",
+            b"10 kB\n",
+            b"1\n2\n",
+            b"18446744073709551616\n",
+            b"MAX\n",
+            b" 12\n",
+        ] {
             let mut fixture = Fixture::default();
             fixture.put("/cg/service/memory.max", raw);
             assert!(refusal_with(&fixture, 10).is_err(), "{raw:?}");
@@ -551,14 +702,24 @@ mod tests {
         fixture.put("/cg/service/child/cgroup.controllers", b"cpu\n");
         fixture.put("/cg/service/cgroup.subtree_control", b"cpu\n");
         fixture.scope("/cg/service", 95, b"max\n", b"100\n");
-        assert!(refusal_with(&fixture, 10).unwrap().unwrap().contains("/cg/service"));
+        assert!(
+            refusal_with(&fixture, 10)
+                .unwrap()
+                .unwrap()
+                .contains("/cg/service")
+        );
         fixture.put("/cg/service/cgroup.subtree_control", b"memory\n");
         assert!(refusal_with(&fixture, 10).is_err());
     }
 
     #[test]
     fn partial_memory_or_swap_interfaces_are_not_a_disabled_controller() {
-        for field in ["memory.current", "memory.high", "memory.max", "memory.swap.max"] {
+        for field in [
+            "memory.current",
+            "memory.high",
+            "memory.max",
+            "memory.swap.max",
+        ] {
             let mut fixture = Fixture::default();
             fixture.swap("/cg/service", 0, b"max\n");
             fixture.files.remove(&Path::new("/cg/service").join(field));
@@ -570,33 +731,60 @@ mod tests {
     fn legacy_memory_and_ambiguous_or_truncated_memberships_are_refused() {
         for raw in [
             b"5:memory:/service\n0::/service\n".as_slice(),
-            b"0::/one\n0::/two\n", b"0::/service", b"", b"invalid\n", b"0:cpu:/service\n",
+            b"0::/one\n0::/two\n",
+            b"0::/service",
+            b"",
+            b"invalid\n",
+            b"0:cpu:/service\n",
         ] {
             assert!(membership_path(raw).is_err(), "{raw:?}");
         }
-        assert_eq!(membership_path(b"5:cpu:/other\n0::/service\n").unwrap(), Path::new("/service"));
+        assert_eq!(
+            membership_path(b"5:cpu:/other\n0::/service\n").unwrap(),
+            Path::new("/service")
+        );
     }
 
     #[test]
     fn namespace_traversal_and_hidden_bind_ancestors_do_not_certify_headroom() {
-        for raw in [b"0::/../outside\n".as_slice(), b"0::/a/./b\n", b"0::relative\n", b"0::/a\0b\n"] {
+        for raw in [
+            b"0::/../outside\n".as_slice(),
+            b"0::/a/./b\n",
+            b"0::relative\n",
+            b"0::/a\0b\n",
+        ] {
             assert!(membership_path(raw).is_err(), "{raw:?}");
         }
         let bind = b"36 25 0:32 /service /cg rw - cgroup2 cgroup rw\n";
         assert!(hierarchy_mount(bind, Path::new("/service/child")).is_err());
-        assert!(hierarchy_mount(b"36 25 0:32 / /cg rw - ext4 /dev/x rw\n", Path::new("/service")).is_err());
+        assert!(
+            hierarchy_mount(
+                b"36 25 0:32 / /cg rw - ext4 /dev/x rw\n",
+                Path::new("/service")
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn escaped_mount_names_and_native_membership_bytes_are_preserved() {
         let raw = b"36 25 0:32 / /cg\\040space rw - cgroup2 cgroup rw\n";
-        assert_eq!(hierarchy_mount(raw, Path::new("/service")).unwrap(), Path::new("/cg space"));
+        assert_eq!(
+            hierarchy_mount(raw, Path::new("/service")).unwrap(),
+            Path::new("/cg space")
+        );
         let member = membership_path(b"0::/service-\xff\n").unwrap();
         assert_eq!(member.as_os_str().as_encoded_bytes(), b"/service-\xff");
         for raw in [b"/cg\\".as_slice(), b"/cg\\000x", b"/cg\\777"] {
             assert!(unescape(raw).is_err());
         }
-        assert_eq!(unescape(b"/cg\\134x").unwrap().as_os_str().as_encoded_bytes(), b"/cg\\x");
+        assert_eq!(
+            unescape(b"/cg\\134x")
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes(),
+            b"/cg\\x"
+        );
     }
 
     #[test]
@@ -638,10 +826,22 @@ mod tests {
         inspect(&baseline).unwrap();
         let calls: usize = baseline.reads.borrow().values().sum();
         let step = SCAN_TIME / u32::try_from(calls).unwrap() + Duration::from_nanos(1);
-        let fixture = Fixture { step, ..Fixture::default() };
-        assert_eq!(inspect(&fixture).unwrap_err().kind(), io::ErrorKind::TimedOut);
-        let fixture = Fixture { step: SCAN_TIME, ..Fixture::default() };
-        assert_eq!(inspect(&fixture).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let fixture = Fixture {
+            step,
+            ..Fixture::default()
+        };
+        assert_eq!(
+            inspect(&fixture).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        let fixture = Fixture {
+            step: SCAN_TIME,
+            ..Fixture::default()
+        };
+        assert_eq!(
+            inspect(&fixture).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
         assert_eq!(fixture.calls(MEMBERSHIP), 1);
         assert_eq!(fixture.calls(MOUNTS), 0);
     }
@@ -650,7 +850,11 @@ mod tests {
     fn oversized_inputs_and_deep_ancestry_are_not_complete_observations() {
         for field in [MEMBERSHIP, MOUNTS, "/cg/service/memory.max"] {
             let mut fixture = Fixture::default();
-            let size = match field { MEMBERSHIP => MEMBERSHIP_BYTES, MOUNTS => MOUNT_BYTES, _ => SCALAR_BYTES };
+            let size = match field {
+                MEMBERSHIP => MEMBERSHIP_BYTES,
+                MOUNTS => MOUNT_BYTES,
+                _ => SCALAR_BYTES,
+            };
             fixture.put(field, &vec![b'x'; size + 1]);
             assert!(inspect(&fixture).is_err(), "{field}");
         }
@@ -669,9 +873,18 @@ mod tests {
         let fixture = Fixture::default();
         let mut observation = Observation::new(&fixture);
         for _ in 0..MAX_READS {
-            assert!(observation.optional(Path::new("/cg/missing"), SCALAR_BYTES).unwrap().is_none());
+            assert!(
+                observation
+                    .optional(Path::new("/cg/missing"), SCALAR_BYTES)
+                    .unwrap()
+                    .is_none()
+            );
         }
-        assert!(observation.optional(Path::new("/cg/missing"), SCALAR_BYTES).is_err());
+        assert!(
+            observation
+                .optional(Path::new("/cg/missing"), SCALAR_BYTES)
+                .is_err()
+        );
         assert_eq!(fixture.calls("/cg/missing"), MAX_READS);
     }
 

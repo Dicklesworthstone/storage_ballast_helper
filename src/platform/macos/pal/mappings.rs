@@ -71,8 +71,13 @@ impl ProcessAccess for NativeProcesses {
         let pids = proc_listpids_safe()?;
         // An all-process native inventory includes this running observer. In
         // particular, an adapter's zero-byte failure cannot certify emptiness.
-        if !pids.iter().any(|pid| u32::try_from(*pid).ok() == Some(std::process::id())) {
-            return Err(io::Error::other("native mapping inventory omitted its observer"));
+        if !pids
+            .iter()
+            .any(|pid| u32::try_from(*pid).ok() == Some(std::process::id()))
+        {
+            return Err(io::Error::other(
+                "native mapping inventory omitted its observer",
+            ));
         }
         Ok(pids)
     }
@@ -116,8 +121,10 @@ fn exited(error: &io::Error) -> bool {
 
 fn valid_mapping_path(path: &Path) -> bool {
     let bytes = path.as_os_str().as_encoded_bytes();
-    path.is_absolute() && path.file_name().is_some()
-        && bytes.len() <= MAX_PATH_BYTES && !bytes.contains(&0)
+    path.is_absolute()
+        && path.file_name().is_some()
+        && bytes.len() <= MAX_PATH_BYTES
+        && !bytes.contains(&0)
 }
 
 /// Limits count attempted queries, including the terminal query, and are shared
@@ -136,10 +143,17 @@ fn collect_with(
     }
     let started = access.now();
     let check_time = || {
-        if access.now().checked_duration_since(started).is_some_and(|age| age < limits.time) {
+        if access
+            .now()
+            .checked_duration_since(started)
+            .is_some_and(|age| age < limits.time)
+        {
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::TimedOut, "mapping inspection deadline exhausted"))
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "mapping inspection deadline exhausted",
+            ))
         }
     };
     check_time()?;
@@ -172,7 +186,9 @@ fn collect_with(
         loop {
             check_time()?;
             if queries >= limits.queries || per_pid >= limits.per_pid {
-                return Err(exhausted("mapping query budget exhausted before termination"));
+                return Err(exhausted(
+                    "mapping query budget exhausted before termination",
+                ));
             }
             queries += 1;
             per_pid += 1;
@@ -185,9 +201,13 @@ fn collect_with(
                 }
                 Err(error) => return Err(error),
             };
-            let end = region.start.checked_add(region.size)
+            let end = region
+                .start
+                .checked_add(region.size)
                 .filter(|end| region.size > 0 && region.start >= address && *end > address)
-                .ok_or_else(|| invalid("mapping range overflowed, overlapped or failed to advance"))?;
+                .ok_or_else(|| {
+                    invalid("mapping range overflowed, overlapped or failed to advance")
+                })?;
             if !valid_mapping_path(&region.path) {
                 return Err(invalid("mapping pathname was unavailable or malformed"));
             }
@@ -224,7 +244,8 @@ fn collect_with(
         }
     }
     regions.sort_by(|left, right| {
-        left.pid.cmp(&right.pid)
+        left.pid
+            .cmp(&right.pid)
             .then_with(|| left.start_address.cmp(&right.start_address))
             .then_with(|| left.path.cmp(&right.path))
     });
@@ -238,7 +259,12 @@ struct Admission(Arc<AtomicBool>);
 impl Admission {
     fn acquire(busy: Arc<AtomicBool>) -> io::Result<Self> {
         busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "mapping inspection already in progress"))?;
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "mapping inspection already in progress",
+                )
+            })?;
         Ok(Self(busy))
     }
 }
@@ -271,23 +297,35 @@ impl Probe {
     }
 
     fn wait(&self, timeout: Duration) -> io::Result<Vec<MappedRegion>> {
-        self.receiver.recv_timeout(timeout).map_err(|error| match error {
-            mpsc::RecvTimeoutError::Timeout => io::Error::new(
-                io::ErrorKind::TimedOut, "mapping worker exceeded caller wait budget",
-            ),
-            mpsc::RecvTimeoutError::Disconnected => {
-                io::Error::other("mapping worker stopped without a result")
-            }
-        })?
+        self.receiver
+            .recv_timeout(timeout)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "mapping worker exceeded caller wait budget",
+                ),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    io::Error::other("mapping worker stopped without a result")
+                }
+            })?
     }
 }
 
 fn check_root_budget(roots: &[PathBuf]) -> io::Result<()> {
-    if roots.len() > MAX_ROOTS || roots.iter().try_fold(0_usize, |bytes, root| {
-        bytes.checked_add(root.as_os_str().as_encoded_bytes().len())
-            .filter(|total| *total <= MAX_RETAINED_BYTES)
-    }).is_none() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "mapping root inventory is too large"));
+    if roots.len() > MAX_ROOTS
+        || roots
+            .iter()
+            .try_fold(0_usize, |bytes, root| {
+                bytes
+                    .checked_add(root.as_os_str().as_encoded_bytes().len())
+                    .filter(|total| *total <= MAX_RETAINED_BYTES)
+            })
+            .is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mapping root inventory is too large",
+        ));
     }
     Ok(())
 }
@@ -302,8 +340,10 @@ pub(super) fn collect(roots: &[PathBuf]) -> io::Result<Vec<MappedRegion>> {
     let roots = roots.to_vec();
     let probe = Probe::start(admission, move || {
         // getcwd and native enumeration belong to the admitted worker too.
-        let mut variants: Vec<_> = roots.iter()
-            .flat_map(|root| macos_process_path_variants(root)).collect();
+        let mut variants: Vec<_> = roots
+            .iter()
+            .flat_map(|root| macos_process_path_variants(root))
+            .collect();
         variants.sort();
         variants.dedup();
         collect_with(&NativeProcesses, &variants, Limits::default())
@@ -374,17 +414,28 @@ mod tests {
     }
 
     fn row(path: &str, start: u64) -> Region {
-        Region { start, size: 4096, path: path.into(), protection: 5 }
+        Region {
+            start,
+            size: 4096,
+            path: path.into(),
+            protection: 5,
+        }
     }
 
     impl Fixture {
         fn record(&self, pid: i32, field: &'static str) -> io::Result<usize> {
             self.calls.borrow_mut().push((pid, field));
             self.now.set(self.now.get() + self.step);
-            let nth = self.calls.borrow().iter()
-                .filter(|entry| **entry == (pid, field)).count();
+            let nth = self
+                .calls
+                .borrow()
+                .iter()
+                .filter(|entry| **entry == (pid, field))
+                .count();
             if let Some((target, name, attempt, code)) = self.fault
-                && pid == target && field == name && nth == attempt
+                && pid == target
+                && field == name
+                && nth == attempt
             {
                 return Err(io::Error::from_raw_os_error(code));
             }
@@ -419,26 +470,50 @@ mod tests {
     fn one_sweep_serves_every_root_without_duplicate_mapping_records() {
         let fixture = Fixture::default();
         let found = collect_with(
-            &fixture, &["/scan".into(), "/scan/one".into()], Limits::default(),
-        ).unwrap();
+            &fixture,
+            &["/scan".into(), "/scan/one".into()],
+            Limits::default(),
+        )
+        .unwrap();
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].pid, 41);
         assert_eq!(found[0].start_address, Some(4096));
         assert_eq!(found[0].end_address, Some(8192));
         assert_eq!(found[0].protection.as_deref(), Some("r-x"));
-        assert_eq!(fixture.calls.borrow().iter().filter(|call| **call == (0, "pids")).count(), 1);
+        assert_eq!(
+            fixture
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == (0, "pids"))
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn read_failures_never_return_a_partial_vector_as_complete() {
         for (pid, field, nth) in [
-            (0, "pids", 1), (41, "identity", 1), (41, "region", 2), (42, "identity", 2),
+            (0, "pids", 1),
+            (41, "identity", 1),
+            (41, "region", 2),
+            (42, "identity", 2),
         ] {
-            for code in [libc::EACCES, libc::EPERM, libc::EIO, libc::ENOENT, libc::EINVAL] {
+            for code in [
+                libc::EACCES,
+                libc::EPERM,
+                libc::EIO,
+                libc::ENOENT,
+                libc::EINVAL,
+            ] {
                 let fixture = Fixture {
-                    fault: Some((pid, field, nth, code)), ..Fixture::default()
+                    fault: Some((pid, field, nth, code)),
+                    ..Fixture::default()
                 };
-                assert_eq!(fixture.scan(Limits::default()).unwrap_err().raw_os_error(), Some(code));
+                assert_eq!(
+                    fixture.scan(Limits::default()).unwrap_err().raw_os_error(),
+                    Some(code)
+                );
             }
         }
     }
@@ -447,7 +522,8 @@ mod tests {
     fn process_exit_discards_only_that_process_after_earlier_regions() {
         for (field, nth) in [("identity", 1), ("region", 2), ("identity", 2)] {
             let fixture = Fixture {
-                fault: Some((41, field, nth, libc::ESRCH)), ..Fixture::default()
+                fault: Some((41, field, nth, libc::ESRCH)),
+                ..Fixture::default()
             };
             let found = fixture.scan(Limits::default()).unwrap();
             assert_eq!(found.len(), 1);
@@ -457,95 +533,219 @@ mod tests {
 
     #[test]
     fn changed_identity_is_not_a_complete_mapping_observation() {
-        let fixture = Fixture { changed: Some(41), ..Fixture::default() };
-        assert_eq!(fixture.scan(Limits::default()).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let fixture = Fixture {
+            changed: Some(41),
+            ..Fixture::default()
+        };
+        assert_eq!(
+            fixture.scan(Limits::default()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
     fn malformed_ranges_fail_even_when_the_path_is_outside_the_scope() {
         for (start, size) in [(0, 0), (u64::MAX, 1), (8191, 1)] {
             let mut fixture = Fixture::default();
-            fixture.rows.insert((41, 8192), Region {
-                start, size, path: "/outside/file".into(), protection: 0,
-            });
-            assert_eq!(fixture.scan(Limits::default()).unwrap_err().kind(), io::ErrorKind::InvalidData);
+            fixture.rows.insert(
+                (41, 8192),
+                Region {
+                    start,
+                    size,
+                    path: "/outside/file".into(),
+                    protection: 0,
+                },
+            );
+            assert_eq!(
+                fixture.scan(Limits::default()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
         }
     }
 
     #[test]
     fn missing_relative_overlong_and_nul_paths_are_not_negative_evidence() {
         for path in [
-            PathBuf::new(), PathBuf::from("relative"), PathBuf::from("/"),
+            PathBuf::new(),
+            PathBuf::from("relative"),
+            PathBuf::from("/"),
             PathBuf::from(format!("/{}", "x".repeat(MAX_PATH_BYTES))),
             PathBuf::from("/nul\0name"),
         ] {
             let mut fixture = Fixture::default();
             fixture.rows.get_mut(&(41, 0)).unwrap().path = path;
-            assert_eq!(fixture.scan(Limits::default()).unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                fixture.scan(Limits::default()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
         }
     }
 
     #[test]
     fn terminal_queries_share_the_exact_global_and_per_process_budgets() {
         let mut fixture = Fixture::default();
-        assert_eq!(fixture.scan(Limits {
-            queries: 4, per_pid: 2, pids: 2, ..Limits::default()
-        }).unwrap().len(), 2);
+        assert_eq!(
+            fixture
+                .scan(Limits {
+                    queries: 4,
+                    per_pid: 2,
+                    pids: 2,
+                    ..Limits::default()
+                })
+                .unwrap()
+                .len(),
+            2
+        );
         for limits in [
-            Limits { queries: 3, ..Limits::default() },
-            Limits { per_pid: 1, ..Limits::default() },
-            Limits { pids: 1, ..Limits::default() },
+            Limits {
+                queries: 3,
+                ..Limits::default()
+            },
+            Limits {
+                per_pid: 1,
+                ..Limits::default()
+            },
+            Limits {
+                pids: 1,
+                ..Limits::default()
+            },
         ] {
             assert!(fixture.scan(limits).is_err());
         }
         fixture.rows.get_mut(&(41, 0)).unwrap().path = "/unrelated/object".into();
-        assert!(fixture.scan(Limits { queries: 3, ..Limits::default() }).is_err(),
-            "irrelevant records consume query work");
+        assert!(
+            fixture
+                .scan(Limits {
+                    queries: 3,
+                    ..Limits::default()
+                })
+                .is_err(),
+            "irrelevant records consume query work"
+        );
     }
 
     #[test]
     fn record_and_string_limits_reject_truncation_not_exact_fits() {
         let fixture = Fixture::default();
         let bytes = "/scan/one/object".len() + "/scan/two/object".len() + 6;
-        assert_eq!(fixture.scan(Limits { regions: 2, bytes, ..Limits::default() }).unwrap().len(), 2);
-        assert!(fixture.scan(Limits { regions: 1, ..Limits::default() }).is_err());
-        assert!(fixture.scan(Limits { bytes: bytes - 1, ..Limits::default() }).is_err());
+        assert_eq!(
+            fixture
+                .scan(Limits {
+                    regions: 2,
+                    bytes,
+                    ..Limits::default()
+                })
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            fixture
+                .scan(Limits {
+                    regions: 1,
+                    ..Limits::default()
+                })
+                .is_err()
+        );
+        assert!(
+            fixture
+                .scan(Limits {
+                    bytes: bytes - 1,
+                    ..Limits::default()
+                })
+                .is_err()
+        );
     }
 
     #[test]
     fn discovery_and_late_final_identity_reads_cannot_renew_the_deadline() {
         let fixture = Fixture {
-            pids: Vec::new(), discovery_time: Duration::from_secs(1), ..Fixture::default()
+            pids: Vec::new(),
+            discovery_time: Duration::from_secs(1),
+            ..Fixture::default()
         };
-        assert_eq!(fixture.scan(Limits { time: Duration::from_secs(1), ..Limits::default() })
-            .unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            fixture
+                .scan(Limits {
+                    time: Duration::from_secs(1),
+                    ..Limits::default()
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
         let fixture = Fixture {
-            pids: vec![41], step: Duration::from_secs(1), ..Fixture::default()
+            pids: vec![41],
+            step: Duration::from_secs(1),
+            ..Fixture::default()
         };
-        assert_eq!(fixture.scan(Limits { time: Duration::from_secs(5), ..Limits::default() })
-            .unwrap_err().kind(), io::ErrorKind::TimedOut);
-        assert_eq!(fixture.calls.borrow().iter().filter(|call| **call == (41, "identity")).count(), 2);
+        assert_eq!(
+            fixture
+                .scan(Limits {
+                    time: Duration::from_secs(5),
+                    ..Limits::default()
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            fixture
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == (41, "identity"))
+                .count(),
+            2
+        );
     }
 
     #[test]
     fn empty_scopes_skip_native_work_and_duplicate_pids_do_not_repeat_queries() {
-        let fixture = Fixture { pids: vec![0, 41, 41], ..Fixture::default() };
-        assert!(collect_with(&fixture, &[], Limits::default()).unwrap().is_empty());
+        let fixture = Fixture {
+            pids: vec![0, 41, 41],
+            ..Fixture::default()
+        };
+        assert!(
+            collect_with(&fixture, &[], Limits::default())
+                .unwrap()
+                .is_empty()
+        );
         assert!(fixture.calls.borrow().is_empty());
         assert_eq!(fixture.scan(Limits::default()).unwrap().len(), 1);
-        assert_eq!(fixture.calls.borrow().iter().filter(|call| **call == (41, "region")).count(), 2);
-        let fixture = Fixture { pids: vec![-1], ..Fixture::default() };
+        assert_eq!(
+            fixture
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == (41, "region"))
+                .count(),
+            2
+        );
+        let fixture = Fixture {
+            pids: vec![-1],
+            ..Fixture::default()
+        };
         assert!(fixture.scan(Limits::default()).is_err());
     }
 
     #[test]
     fn native_byte_paths_and_private_aliases_survive_projection() {
-        let mut fixture = Fixture { pids: vec![41], ..Fixture::default() };
-        let path = PathBuf::from(OsString::from_vec(b"/private/tmp/active/object-\xff".to_vec()));
+        let mut fixture = Fixture {
+            pids: vec![41],
+            ..Fixture::default()
+        };
+        let path = PathBuf::from(OsString::from_vec(
+            b"/private/tmp/active/object-\xff".to_vec(),
+        ));
         fixture.rows.get_mut(&(41, 0)).unwrap().path = path.clone();
         let found = collect_with(&fixture, &["/tmp/active".into()], Limits::default()).unwrap();
         assert_eq!(found[0].path, path);
-        assert!(collect_with(&fixture, &["/tmp/active-other".into()], Limits::default()).unwrap().is_empty());
+        assert!(
+            collect_with(&fixture, &["/tmp/active-other".into()], Limits::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -575,15 +775,25 @@ mod tests {
         let probe = Probe::start(Admission::acquire(Arc::clone(&busy)).unwrap(), move || {
             released.recv().unwrap();
             Err(io::ErrorKind::PermissionDenied.into())
-        }).unwrap();
-        assert_eq!(probe.wait(Duration::ZERO).unwrap_err().kind(), io::ErrorKind::TimedOut);
-        assert_eq!(Admission::acquire(Arc::clone(&busy)).err().unwrap().kind(), io::ErrorKind::WouldBlock);
+        })
+        .unwrap();
+        assert_eq!(
+            probe.wait(Duration::ZERO).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            Admission::acquire(Arc::clone(&busy)).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
         release.send(()).unwrap();
         probe.worker.join().unwrap();
         let fresh = Probe::start(Admission::acquire(busy).unwrap(), || Ok(Vec::new())).unwrap();
         assert!(fresh.wait(Duration::from_secs(5)).unwrap().is_empty());
         fresh.worker.join().unwrap();
-        assert_eq!(probe.receiver.try_recv().unwrap().unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            probe.receiver.try_recv().unwrap().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
@@ -593,16 +803,23 @@ mod tests {
         let probe = Probe::start(Admission::acquire(Arc::clone(&busy)).unwrap(), move || {
             released.recv().unwrap();
             Ok(Vec::new())
-        }).unwrap();
+        })
+        .unwrap();
         drop(probe.receiver);
         assert!(Admission::acquire(Arc::clone(&busy)).is_err());
         release.send(()).unwrap();
         probe.worker.join().unwrap();
         let panics = Probe::start(Admission::acquire(Arc::clone(&busy)).unwrap(), || {
             panic!("injected mapping failure");
-        }).unwrap();
+        })
+        .unwrap();
         assert!(panics.worker.join().is_err());
-        assert!(panics.receiver.recv_timeout(Duration::from_secs(5)).is_err());
+        assert!(
+            panics
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .is_err()
+        );
         assert!(Admission::acquire(busy).is_ok());
     }
 }

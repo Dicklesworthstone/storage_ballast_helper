@@ -69,10 +69,12 @@ struct Admission(Arc<AtomicBool>);
 impl Admission {
     fn acquire(busy: Arc<AtomicBool>) -> io::Result<Self> {
         busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "macOS executable inspection is already in progress",
-            ))?;
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "macOS executable inspection is already in progress",
+                )
+            })?;
         Ok(Self(busy))
     }
 }
@@ -107,21 +109,26 @@ impl Probe {
     }
 
     fn wait(&self, timeout: Duration) -> io::Result<ExecutablesResult> {
-        self.receiver.recv_timeout(timeout).map_err(|error| match error {
-            mpsc::RecvTimeoutError::Timeout => io::Error::new(
-                io::ErrorKind::TimedOut,
-                "macOS executable inspection exceeded its caller wait budget",
-            ),
-            mpsc::RecvTimeoutError::Disconnected => {
-                io::Error::other("macOS executable worker stopped without a result")
-            }
-        })?
+        self.receiver
+            .recv_timeout(timeout)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "macOS executable inspection exceeded its caller wait budget",
+                ),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    io::Error::other("macOS executable worker stopped without a result")
+                }
+            })?
     }
 }
 
 pub(super) fn collect(roots: &[PathBuf]) -> io::Result<ExecutablesResult> {
     if roots.is_empty() {
-        return Ok(ExecutablesResult { processes: Vec::new(), complete: true });
+        return Ok(ExecutablesResult {
+            processes: Vec::new(),
+            complete: true,
+        });
     }
     let busy = PROBE_BUSY.get_or_init(|| Arc::new(AtomicBool::new(false)));
     // Acquire before copying root data or starting any native work.
@@ -341,12 +348,23 @@ mod tests {
         );
         assert_eq!(*fixture.calls.borrow(), vec![42, 41]);
         assert_eq!(fixture.discoveries.get(), 1);
-        assert!(result.processes.iter().all(|p| p.command_line.is_empty() && p.cwd.is_none()));
+        assert!(
+            result
+                .processes
+                .iter()
+                .all(|p| p.command_line.is_empty() && p.cwd.is_none())
+        );
     }
 
     #[test]
     fn denied_or_failed_lookup_keeps_other_positives_and_revokes_coverage() {
-        for code in [libc::EACCES, libc::EPERM, libc::EIO, libc::ENOENT, libc::EINVAL] {
+        for code in [
+            libc::EACCES,
+            libc::EPERM,
+            libc::EIO,
+            libc::ENOENT,
+            libc::EINVAL,
+        ] {
             let mut fixture = Fixture::default();
             fixture.failures.insert(42, code);
             let result = scan(&fixture, Limits::default());
@@ -399,32 +417,51 @@ mod tests {
         };
         assert!(scan(&fixture, Limits::default()).complete);
         fixture.discovery_time = Duration::from_secs(2);
-        assert!(!scan(&fixture, Limits {
-            time: Duration::from_secs(1),
-            ..Limits::default()
-        }).complete);
+        assert!(
+            !scan(
+                &fixture,
+                Limits {
+                    time: Duration::from_secs(1),
+                    ..Limits::default()
+                }
+            )
+            .complete
+        );
         assert!(fixture.calls.borrow().is_empty());
     }
 
     #[test]
     fn expired_budget_starts_no_native_work_and_progress_cannot_renew_it() {
         let fixture = Fixture::default();
-        assert!(!scan(&fixture, Limits {
-            time: Duration::ZERO,
-            ..Limits::default()
-        }).complete);
+        assert!(
+            !scan(
+                &fixture,
+                Limits {
+                    time: Duration::ZERO,
+                    ..Limits::default()
+                }
+            )
+            .complete
+        );
         assert_eq!(fixture.discoveries.get(), 0);
         let fixture = Fixture {
             lookup_time: Duration::from_secs(2),
             ..Fixture::default()
         };
-        let result = scan(&fixture, Limits {
-            time: Duration::from_secs(1),
-            ..Limits::default()
-        });
+        let result = scan(
+            &fixture,
+            Limits {
+                time: Duration::from_secs(1),
+                ..Limits::default()
+            },
+        );
         assert!(!result.complete);
         assert_eq!(*fixture.calls.borrow(), vec![42]);
-        assert_eq!(result.processes.len(), 1, "retain a positive from a late syscall");
+        assert_eq!(
+            result.processes.len(),
+            1,
+            "retain a positive from a late syscall"
+        );
     }
 
     #[test]
@@ -437,7 +474,10 @@ mod tests {
         let result = collect_with(
             &fixture,
             &["/elsewhere".into()],
-            Limits { time: Duration::from_secs(1), ..Limits::default() },
+            Limits {
+                time: Duration::from_secs(1),
+                ..Limits::default()
+            },
         )
         .unwrap();
         assert!(!result.complete);
@@ -448,7 +488,13 @@ mod tests {
     fn exact_pid_limit_is_complete_only_when_discovery_was_exhausted() {
         for limit in 0..=3 {
             let fixture = Fixture::default();
-            let result = scan(&fixture, Limits { pids: limit, ..Limits::default() });
+            let result = scan(
+                &fixture,
+                Limits {
+                    pids: limit,
+                    ..Limits::default()
+                },
+            );
             assert_eq!(result.complete, limit >= 2);
             assert_eq!(fixture.calls.borrow().len(), limit.min(2));
             assert_eq!(result.processes.len(), limit.min(2));
@@ -459,13 +505,40 @@ mod tests {
     fn retained_byte_limit_counts_names_and_paths_without_discarding_earlier_records() {
         let fixture = Fixture::default();
         let bytes = "/scan/two/program".len() + "program".len();
-        let result = scan(&fixture, Limits { bytes, ..Limits::default() });
+        let result = scan(
+            &fixture,
+            Limits {
+                bytes,
+                ..Limits::default()
+            },
+        );
         assert!(!result.complete);
         assert_eq!(result.processes.len(), 1);
         assert_eq!(result.processes[0].pid, 42);
-        let fixture = Fixture { pids: vec![42], ..Fixture::default() };
-        assert!(scan(&fixture, Limits { bytes, ..Limits::default() }).complete);
-        assert!(!scan(&fixture, Limits { bytes: bytes - 1, ..Limits::default() }).complete);
+        let fixture = Fixture {
+            pids: vec![42],
+            ..Fixture::default()
+        };
+        assert!(
+            scan(
+                &fixture,
+                Limits {
+                    bytes,
+                    ..Limits::default()
+                }
+            )
+            .complete
+        );
+        assert!(
+            !scan(
+                &fixture,
+                Limits {
+                    bytes: bytes - 1,
+                    ..Limits::default()
+                }
+            )
+            .complete
+        );
     }
 
     #[test]
@@ -532,8 +605,12 @@ mod tests {
     fn worker_failure_preserves_the_error_and_releases_admission() {
         let busy = Arc::new(AtomicBool::new(false));
         let admission = Admission::acquire(Arc::clone(&busy)).unwrap();
-        let probe = Probe::start(admission, || Err(io::ErrorKind::PermissionDenied.into())).unwrap();
-        assert_eq!(probe.wait(Duration::from_secs(5)).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        let probe =
+            Probe::start(admission, || Err(io::ErrorKind::PermissionDenied.into())).unwrap();
+        assert_eq!(
+            probe.wait(Duration::from_secs(5)).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
         probe.worker.join().unwrap();
         assert!(!busy.load(Ordering::Acquire));
         assert!(Admission::acquire(busy).is_ok());
@@ -551,10 +628,17 @@ mod tests {
                 processes: vec![executable_reference(41, "/first/program".into())],
                 complete: true,
             })
-        }).unwrap();
+        })
+        .unwrap();
         start.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(probe.wait(Duration::ZERO).unwrap_err().kind(), io::ErrorKind::TimedOut);
-        assert_eq!(Admission::acquire(Arc::clone(&busy)).err().unwrap().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            probe.wait(Duration::ZERO).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            Admission::acquire(Arc::clone(&busy)).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
         release.send(()).unwrap();
         probe.worker.join().unwrap();
         assert!(!busy.load(Ordering::Acquire));
@@ -563,12 +647,19 @@ mod tests {
                 processes: vec![executable_reference(42, "/second/program".into())],
                 complete: true,
             })
-        }).unwrap();
+        })
+        .unwrap();
         let current = fresh.wait(Duration::from_secs(5)).unwrap();
         fresh.worker.join().unwrap();
-        assert_eq!(current.processes[0].executable.as_deref(), Some(Path::new("/second/program")));
+        assert_eq!(
+            current.processes[0].executable.as_deref(),
+            Some(Path::new("/second/program"))
+        );
         let late = probe.receiver.try_recv().unwrap().unwrap();
-        assert_eq!(late.processes[0].executable.as_deref(), Some(Path::new("/first/program")));
+        assert_eq!(
+            late.processes[0].executable.as_deref(),
+            Some(Path::new("/first/program"))
+        );
     }
 
     #[test]
@@ -577,10 +668,17 @@ mod tests {
         let (release, released) = mpsc::sync_channel(1);
         let probe = Probe::start(Admission::acquire(Arc::clone(&busy)).unwrap(), move || {
             released.recv().unwrap();
-            Ok(ExecutablesResult { processes: Vec::new(), complete: true })
-        }).unwrap();
+            Ok(ExecutablesResult {
+                processes: Vec::new(),
+                complete: true,
+            })
+        })
+        .unwrap();
         drop(probe.receiver);
-        assert_eq!(Admission::acquire(Arc::clone(&busy)).err().unwrap().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            Admission::acquire(Arc::clone(&busy)).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
         release.send(()).unwrap();
         probe.worker.join().unwrap();
         assert!(!busy.load(Ordering::Acquire));
@@ -591,7 +689,8 @@ mod tests {
         let busy = Arc::new(AtomicBool::new(false));
         let probe = Probe::start(Admission::acquire(Arc::clone(&busy)).unwrap(), || {
             panic!("injected executable observer failure");
-        }).unwrap();
+        })
+        .unwrap();
         assert!(probe.worker.join().is_err());
         assert!(probe.receiver.recv_timeout(Duration::from_secs(5)).is_err());
         assert!(!busy.load(Ordering::Acquire));

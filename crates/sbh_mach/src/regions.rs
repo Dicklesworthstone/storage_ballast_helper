@@ -48,7 +48,9 @@ pub fn proc_pid_next_mapped_region(
     };
     // Read errno immediately, before any other native call or diagnostic.
     // A successful response must not inherit stale errno from an earlier call.
-    let errno = (returned <= 0).then(|| io::Error::last_os_error().raw_os_error()).flatten();
+    let errno = (returned <= 0)
+        .then(|| io::Error::last_os_error().raw_os_error())
+        .flatten();
     if !has_region(returned, size, errno)? {
         return Ok(None);
     }
@@ -71,7 +73,9 @@ fn has_region(returned: i32, expected: i32, errno: Option<i32>) -> io::Result<bo
         // never apply it to PID discovery, identity checks or path decoding.
         Some(libc::EINVAL) if returned == 0 => Ok(false),
         Some(code) if code != 0 => Err(io::Error::from_raw_os_error(code)),
-        _ => Err(io::Error::other("native mapped-region query failed without errno")),
+        _ => Err(io::Error::other(
+            "native mapped-region query failed without errno",
+        )),
     }
 }
 
@@ -82,8 +86,19 @@ mod tests {
     #[test]
     fn zero_and_negative_returns_preserve_native_failures() {
         for returned in [0, -1] {
-            for code in [libc::EACCES, libc::EPERM, libc::ESRCH, libc::EIO, libc::ENOENT] {
-                assert_eq!(has_region(returned, 64, Some(code)).unwrap_err().raw_os_error(), Some(code));
+            for code in [
+                libc::EACCES,
+                libc::EPERM,
+                libc::ESRCH,
+                libc::EIO,
+                libc::ENOENT,
+            ] {
+                assert_eq!(
+                    has_region(returned, 64, Some(code))
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(code)
+                );
             }
         }
     }
@@ -91,7 +106,12 @@ mod tests {
     #[test]
     fn only_native_zero_einval_is_the_end_of_region_signal() {
         assert!(!has_region(0, 64, Some(libc::EINVAL)).unwrap());
-        assert_eq!(has_region(-1, 64, Some(libc::EINVAL)).unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(
+            has_region(-1, 64, Some(libc::EINVAL))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
         for errno in [None, Some(0)] {
             assert!(has_region(0, 64, errno).is_err());
         }
@@ -100,7 +120,12 @@ mod tests {
     #[test]
     fn short_or_oversized_records_are_not_complete_or_end_of_scan() {
         for returned in [1, 63, 65, i32::MAX] {
-            assert_eq!(has_region(returned, 64, Some(libc::EINVAL)).unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                has_region(returned, 64, Some(libc::EINVAL))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
         }
         assert!(has_region(64, 64, Some(libc::EACCES)).unwrap());
     }
@@ -108,16 +133,25 @@ mod tests {
     #[test]
     fn invalid_process_ids_fail_before_a_native_query() {
         for pid in [i32::MIN, -1, 0] {
-            assert_eq!(proc_pid_next_mapped_region(pid, 0).err().unwrap().kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                proc_pid_next_mapped_region(pid, 0).err().unwrap().kind(),
+                io::ErrorKind::InvalidInput
+            );
         }
     }
 
     #[test]
     fn native_current_process_has_a_region_and_a_terminal_address() {
         let pid = i32::try_from(std::process::id()).unwrap();
-        let region = proc_pid_next_mapped_region(pid, 0).unwrap().expect("current executable must have a file-backed mapping");
+        let region = proc_pid_next_mapped_region(pid, 0)
+            .unwrap()
+            .expect("current executable must have a file-backed mapping");
         assert!(region.prp_prinfo.pri_size > 0);
         assert!(region.prp_vip.path().unwrap().is_absolute());
-        assert!(proc_pid_next_mapped_region(pid, u64::MAX).unwrap().is_none());
+        assert!(
+            proc_pid_next_mapped_region(pid, u64::MAX)
+                .unwrap()
+                .is_none()
+        );
     }
 }

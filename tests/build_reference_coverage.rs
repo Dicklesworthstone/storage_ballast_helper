@@ -52,7 +52,9 @@ impl SnapshotPlatform {
 }
 
 impl Platform for SnapshotPlatform {
-    fn name(&self) -> &'static str { "checked-build-fixture" }
+    fn name(&self) -> &'static str {
+        "checked-build-fixture"
+    }
     fn fs_stats(&self, _: &Path) -> Result<FsStats> {
         Ok(FsStats {
             total_bytes: 1024 * 1024,
@@ -63,9 +65,15 @@ impl Platform for SnapshotPlatform {
             is_readonly: false,
         })
     }
-    fn mount_points(&self) -> Result<Vec<MountPoint>> { Ok(Vec::new()) }
-    fn is_ram_backed(&self, _: &Path) -> Result<bool> { Ok(false) }
-    fn default_paths(&self) -> PlatformPaths { PlatformPaths::default() }
+    fn mount_points(&self) -> Result<Vec<MountPoint>> {
+        Ok(Vec::new())
+    }
+    fn is_ram_backed(&self, _: &Path) -> Result<bool> {
+        Ok(false)
+    }
+    fn default_paths(&self) -> PlatformPaths {
+        PlatformPaths::default()
+    }
     fn memory_info(&self) -> Result<MemoryInfo> {
         Ok(MemoryInfo {
             total_bytes: 1024,
@@ -77,20 +85,30 @@ impl Platform for SnapshotPlatform {
     fn service_manager(&self) -> Box<dyn ServiceManager> {
         panic!("reference inspection must not control services")
     }
-    fn process_list(&self) -> Result<Vec<ProcessInfo>> { Ok(Vec::new()) }
+    fn process_list(&self) -> Result<Vec<ProcessInfo>> {
+        Ok(Vec::new())
+    }
     fn open_files_under(&self, _: &Path) -> Result<OpenFilesResult> {
         Ok(OpenFilesResult::complete(Vec::new()))
     }
     fn executables_under(&self, _: &Path) -> Result<ExecutablesResult> {
-        Ok(ExecutablesResult { processes: Vec::new(), complete: true })
+        Ok(ExecutablesResult {
+            processes: Vec::new(),
+            complete: true,
+        })
     }
-    fn mmap_regions_under(&self, _: &Path) -> Result<Vec<MappedRegion>> { Ok(Vec::new()) }
+    fn mmap_regions_under(&self, _: &Path) -> Result<Vec<MappedRegion>> {
+        Ok(Vec::new())
+    }
     fn build_directories_in_use(&self) -> Vec<(i32, PathBuf)> {
         panic!("safety consumers must not discard build observation coverage")
     }
     fn build_directories_in_use_checked(&self) -> (Vec<(i32, PathBuf)>, bool) {
         self.build_reads.fetch_add(1, Ordering::SeqCst);
-        (self.directories.clone(), self.complete.load(Ordering::SeqCst))
+        (
+            self.directories.clone(),
+            self.complete.load(Ordering::SeqCst),
+        )
     }
 }
 
@@ -110,7 +128,11 @@ fn artifact(root: &Path, relative: &str) -> CandidacyScore {
         path,
         total_score: 0.9,
         factors: ScoreFactors {
-            location: 0.8, name: 0.9, age: 0.7, size: 0.6, structure: 0.85,
+            location: 0.8,
+            name: 0.9,
+            age: 0.7,
+            size: 0.6,
+            structure: 0.85,
             pressure_multiplier: 1.0,
         },
         vetoed: false,
@@ -136,13 +158,19 @@ fn artifact(root: &Path, relative: &str) -> CandidacyScore {
             regret_calibration: 1.0,
             category_suspended: false,
         },
-        ledger: EvidenceLedger { terms: Vec::new(), summary: "checked build fixture".to_owned() },
+        ledger: EvidenceLedger {
+            terms: Vec::new(),
+            summary: "checked build fixture".to_owned(),
+        },
     }
 }
 
 fn plan(candidates: Vec<CandidacyScore>, mode: DeletionMode) -> DeletionPlan {
     DeletionPlan {
-        total_reclaimable_bytes: candidates.iter().map(|candidate| candidate.size_bytes).sum(),
+        total_reclaimable_bytes: candidates
+            .iter()
+            .map(|candidate| candidate.size_bytes)
+            .sum(),
         estimated_items: candidates.len(),
         candidates,
         mode,
@@ -151,13 +179,17 @@ fn plan(candidates: Vec<CandidacyScore>, mode: DeletionMode) -> DeletionPlan {
 }
 
 fn executor(root: &Path, platform: Arc<SnapshotPlatform>, mode: DeletionMode) -> DeletionExecutor {
-    DeletionExecutor::new(DeletionConfig {
-        mode,
-        check_open_files: true,
-        require_identity: true,
-        quarantine_roots: vec![root.to_path_buf()],
-        ..DeletionConfig::default()
-    }, None).with_platform(platform)
+    DeletionExecutor::new(
+        DeletionConfig {
+            mode,
+            check_open_files: true,
+            require_identity: true,
+            quarantine_roots: vec![root.to_path_buf()],
+            ..DeletionConfig::default()
+        },
+        None,
+    )
+    .with_platform(platform)
 }
 
 #[test]
@@ -173,12 +205,18 @@ fn incomplete_empty_build_evidence_holds_unlink_and_quarantine_without_backoff()
         assert_eq!(report.items_deleted, 0);
         assert_eq!(report.items_failed, 0);
         assert_eq!(report.items_skipped, 2);
-        assert_eq!(report.skipped_by_reason.get("open_scan_incomplete"), Some(&2));
+        assert_eq!(
+            report.skipped_by_reason.get("open_scan_incomplete"),
+            Some(&2)
+        );
         assert_eq!(report.bytes_freed, 0);
         assert_eq!(report.bytes_quarantined, 0);
         assert!(report.backoff_candidates.is_empty());
         assert!(report.deleted_paths.is_empty());
-        assert!(!root.join(".sbh").exists(), "refusal must not allocate a quarantine store");
+        assert!(
+            !root.join(".sbh").exists(),
+            "refusal must not allocate a quarantine store"
+        );
         for candidate in &plan.candidates {
             assert_eq!(fs::read(&candidate.path).unwrap(), PAYLOAD);
         }
@@ -195,20 +233,34 @@ fn partial_positive_scopes_and_missing_coverage_survive_both_projections() {
     let index = collect_active_reference_index(&platform, std::slice::from_ref(&root));
     assert!(!index.is_complete());
     let busy_summary = index.summary_for(&busy.path);
-    assert!(busy_summary.processes.iter().any(|process| process.pid == 41 && process.build_directory));
+    assert!(
+        busy_summary
+            .processes
+            .iter()
+            .any(|process| process.pid == 41 && process.build_directory)
+    );
     assert!(busy_summary.incomplete_reason.is_some());
     let idle_summary = index.summary_for(&idle.path);
     assert!(idle_summary.processes.is_empty());
     assert!(idle_summary.incomplete_reason.is_some());
     for candidate in [&busy, &idle] {
-        assert!(index.summary_for_identity(candidate.identity.unwrap()).incomplete_reason.is_some());
+        assert!(
+            index
+                .summary_for_identity(candidate.identity.unwrap())
+                .incomplete_reason
+                .is_some()
+        );
     }
     let (paths, complete) = collect_open_path_ancestors_with_platform(
-        &platform, &[busy.path.clone(), idle.path.clone()],
+        &platform,
+        &[busy.path.clone(), idle.path.clone()],
     );
     assert!(!complete);
     assert!(paths.contains(&busy.path));
-    assert!(!paths.contains(&idle.path), "unknown use is not an invented positive reference");
+    assert!(
+        !paths.contains(&idle.path),
+        "unknown use is not an invented positive reference"
+    );
 }
 
 #[test]
@@ -216,9 +268,16 @@ fn complete_build_scope_protects_nested_output_without_holding_an_idle_sibling()
     let (_temp, root) = scratch();
     let busy = artifact(&root, "active/deep/object.o");
     let idle = artifact(&root, "idle/object.o");
-    let platform = Arc::new(SnapshotPlatform::new(&root, vec![(41, root.join("active"))], true));
+    let platform = Arc::new(SnapshotPlatform::new(
+        &root,
+        vec![(41, root.join("active"))],
+        true,
+    ));
     let executor = executor(&root, platform, DeletionMode::Unlink);
-    let report = executor.execute(&plan(vec![busy.clone(), idle.clone()], DeletionMode::Unlink), None);
+    let report = executor.execute(
+        &plan(vec![busy.clone(), idle.clone()], DeletionMode::Unlink),
+        None,
+    );
     assert_eq!(report.items_deleted, 1, "{report:?}");
     assert_eq!(report.items_failed, 0);
     assert_eq!(report.items_skipped, 1);

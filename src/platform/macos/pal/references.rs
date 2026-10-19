@@ -12,9 +12,8 @@ use std::time::{Duration, Instant};
 
 use super::{
     OpenFile, OpenFileKind, OpenFileMode, OpenFilesResult, ProcFdInfo, ProcFdType,
-    macos_process_path_variants, observed_process_path_under_root, open_file_kind,
-    open_file_mode, proc_listpids_safe, proc_pid_list_fds, proc_pidfdinfo_vnode_path,
-    proc_pidinfo_task_all,
+    macos_process_path_variants, observed_process_path_under_root, open_file_kind, open_file_mode,
+    proc_listpids_safe, proc_pid_list_fds, proc_pidfdinfo_vnode_path, proc_pidinfo_task_all,
 };
 use crate::platform::types::{OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET};
 
@@ -98,13 +97,15 @@ impl ProcessAccess for NativeProcesses {
             };
             // Relative bindings cannot be reconstructed from a later cwd.
             // Preserve the existing absolute-bound-socket observation scope.
-            return Ok(observed_process_path_under_root(&bound, roots).map(|path| OpenFile {
-                pid,
-                path,
-                fd: Some(fd),
-                kind: OpenFileKind::Socket,
-                mode: OpenFileMode::ReadWrite,
-            }));
+            return Ok(
+                observed_process_path_under_root(&bound, roots).map(|path| OpenFile {
+                    pid,
+                    path,
+                    fd: Some(fd),
+                    kind: OpenFileKind::Socket,
+                    mode: OpenFileMode::ReadWrite,
+                }),
+            );
         }
         if kind != ProcFdType::VNODE {
             return Ok(None);
@@ -117,13 +118,15 @@ impl ProcessAccess for NativeProcesses {
         if !path.is_absolute() {
             return Err(io::Error::other("vnode pathname is not absolute"));
         }
-        Ok(observed_process_path_under_root(path, roots).map(|path| OpenFile {
-            pid,
-            path,
-            fd: Some(fd),
-            kind: open_file_kind(&info),
-            mode: open_file_mode(info.pfi.fi_openflags),
-        }))
+        Ok(
+            observed_process_path_under_root(path, roots).map(|path| OpenFile {
+                pid,
+                path,
+                fd: Some(fd),
+                kind: open_file_kind(&info),
+                mode: open_file_mode(info.pfi.fi_openflags),
+            }),
+        )
     }
 
     fn now(&self) -> Instant {
@@ -146,7 +149,9 @@ pub(super) fn collect(roots: &[PathBuf]) -> io::Result<OpenFilesResult> {
 
 fn incomplete(result: &mut OpenFilesResult, reason: &'static str) {
     result.complete = false;
-    result.incomplete_reason.get_or_insert_with(|| reason.to_owned());
+    result
+        .incomplete_reason
+        .get_or_insert_with(|| reason.to_owned());
 }
 
 fn gone(error: &io::Error) -> bool {
@@ -165,11 +170,16 @@ fn collect_with(
     }
     let started = access.now();
     let in_budget = || {
-        access.now().checked_duration_since(started)
+        access
+            .now()
+            .checked_duration_since(started)
             .is_some_and(|elapsed| elapsed < limits.time)
     };
     if !in_budget() {
-        incomplete(&mut result, "macOS descriptor inspection deadline exhausted");
+        incomplete(
+            &mut result,
+            "macOS descriptor inspection deadline exhausted",
+        );
         return Ok(result);
     }
     let pids = access.pids()?;
@@ -185,7 +195,10 @@ fn collect_with(
             continue;
         }
         if pid < 0 {
-            incomplete(&mut result, "macOS process inventory contained an invalid pid");
+            incomplete(
+                &mut result,
+                "macOS process inventory contained an invalid pid",
+            );
             continue;
         }
         let before = match access.identity(pid) {
@@ -198,14 +211,20 @@ fn collect_with(
             }
         };
         if !in_budget() {
-            incomplete(&mut result, "macOS descriptor inspection deadline exhausted");
+            incomplete(
+                &mut result,
+                "macOS descriptor inspection deadline exhausted",
+            );
             break;
         }
         let descriptors = match access.descriptors(pid) {
             Ok(descriptors) => descriptors,
             Err(error) => {
                 if !gone(&error) {
-                    incomplete(&mut result, "macOS process descriptor inventory was unreadable");
+                    incomplete(
+                        &mut result,
+                        "macOS process descriptor inventory was unreadable",
+                    );
                 }
                 continue;
             }
@@ -251,7 +270,10 @@ fn collect_with(
         let verified = if exited {
             false
         } else if !in_budget() {
-            incomplete(&mut result, "macOS descriptor inspection deadline exhausted");
+            incomplete(
+                &mut result,
+                "macOS descriptor inspection deadline exhausted",
+            );
             stop = true;
             false
         } else {
@@ -259,7 +281,10 @@ fn collect_with(
                 Ok(after) if after == before => true,
                 Err(error) if gone(&error) => false,
                 _ => {
-                    incomplete(&mut result, "macOS process changed during descriptor inspection");
+                    incomplete(
+                        &mut result,
+                        "macOS process changed during descriptor inspection",
+                    );
                     false
                 }
             }
@@ -274,13 +299,17 @@ fn collect_with(
         }
     }
     result.files.sort_by(|left, right| {
-        left.pid.cmp(&right.pid)
+        left.pid
+            .cmp(&right.pid)
             .then_with(|| left.fd.cmp(&right.fd))
             .then_with(|| left.path.cmp(&right.path))
     });
     // The last failed syscall, identity recheck and ordering count too.
     if !in_budget() {
-        incomplete(&mut result, "macOS descriptor inspection deadline exhausted");
+        incomplete(
+            &mut result,
+            "macOS descriptor inspection deadline exhausted",
+        );
     }
     Ok(result)
 }
@@ -322,7 +351,8 @@ mod tests {
             self.calls.borrow_mut().push((pid, field));
             self.now.set(self.now.get() + self.step);
             if let Some((target, name, code)) = self.fault
-                && target == pid && name == field
+                && target == pid
+                && name == field
             {
                 return Err(io::Error::from_raw_os_error(code));
             }
@@ -345,8 +375,12 @@ mod tests {
 
         fn identity(&self, pid: i32) -> io::Result<(u64, u64)> {
             self.record(pid, "identity")?;
-            let count = self.calls.borrow().iter()
-                .filter(|call| **call == (pid, "identity")).count();
+            let count = self
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == (pid, "identity"))
+                .count();
             Ok((100 + u64::from(self.changed == Some(pid) && count > 1), 0))
         }
 
@@ -358,29 +392,56 @@ mod tests {
         fn reference(&self, pid: i32, fd: i32, roots: &[PathBuf]) -> io::Result<Option<OpenFile>> {
             self.record(pid, if fd == 0 { "fd0" } else { "fd1" })?;
             let path = PathBuf::from(format!("/scan/pid-{pid}/fd-{fd}"));
-            Ok(roots.iter().any(|root| path.starts_with(root)).then_some(OpenFile {
-                pid, path, fd: Some(fd), kind: OpenFileKind::Regular, mode: OpenFileMode::Read,
-            }))
+            Ok(roots
+                .iter()
+                .any(|root| path.starts_with(root))
+                .then_some(OpenFile {
+                    pid,
+                    path,
+                    fd: Some(fd),
+                    kind: OpenFileKind::Regular,
+                    mode: OpenFileMode::Read,
+                }))
         }
 
-        fn now(&self) -> Instant { self.now.get() }
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
     }
 
     #[test]
     fn readable_inventory_is_complete_and_sorted() {
-        let fixture = Fixture { pids: vec![42, 41], ..Fixture::default() };
+        let fixture = Fixture {
+            pids: vec![42, 41],
+            ..Fixture::default()
+        };
         let result = fixture.scan(Limits::default());
         assert!(result.complete);
         assert!(result.incomplete_reason.is_none());
-        assert_eq!(result.files.iter().map(|file| (file.pid, file.fd)).collect::<Vec<_>>(),
-            vec![(41, Some(0)), (41, Some(1)), (42, Some(0))]);
+        assert_eq!(
+            result
+                .files
+                .iter()
+                .map(|file| (file.pid, file.fd))
+                .collect::<Vec<_>>(),
+            vec![(41, Some(0)), (41, Some(1)), (42, Some(0))]
+        );
     }
 
     #[test]
     fn unreadable_process_preserves_other_processes_and_revokes_coverage() {
         for field in ["identity", "descriptors"] {
-            for code in [libc::EACCES, libc::EPERM, libc::EIO, libc::EBADF, libc::ENOENT] {
-                let fixture = Fixture { fault: Some((41, field, code)), ..Fixture::default() };
+            for code in [
+                libc::EACCES,
+                libc::EPERM,
+                libc::EIO,
+                libc::EBADF,
+                libc::ENOENT,
+            ] {
+                let fixture = Fixture {
+                    fault: Some((41, field, code)),
+                    ..Fixture::default()
+                };
                 let result = fixture.scan(Limits::default());
                 assert!(!result.complete, "{field}: {code}");
                 assert!(result.incomplete_reason.is_some());
@@ -392,7 +453,10 @@ mod tests {
 
     #[test]
     fn unreadable_descriptor_keeps_other_descriptors_of_the_same_process() {
-        let fixture = Fixture { fault: Some((41, "fd0", libc::EACCES)), ..Fixture::default() };
+        let fixture = Fixture {
+            fault: Some((41, "fd0", libc::EACCES)),
+            ..Fixture::default()
+        };
         let result = fixture.scan(Limits::default());
         assert!(!result.complete);
         assert_eq!(result.files.len(), 2);
@@ -404,13 +468,19 @@ mod tests {
     #[test]
     fn closed_descriptor_and_exited_process_are_not_permission_failures() {
         for field in ["identity", "descriptors", "fd1"] {
-            let fixture = Fixture { fault: Some((41, field, libc::ESRCH)), ..Fixture::default() };
+            let fixture = Fixture {
+                fault: Some((41, field, libc::ESRCH)),
+                ..Fixture::default()
+            };
             let result = fixture.scan(Limits::default());
             assert!(result.complete);
             assert_eq!(result.files.len(), 1);
             assert_eq!(result.files[0].pid, 42);
         }
-        let fixture = Fixture { fault: Some((41, "fd0", libc::EBADF)), ..Fixture::default() };
+        let fixture = Fixture {
+            fault: Some((41, "fd0", libc::EBADF)),
+            ..Fixture::default()
+        };
         let result = fixture.scan(Limits::default());
         assert!(result.complete);
         assert_eq!(result.files.len(), 2);
@@ -418,7 +488,10 @@ mod tests {
 
     #[test]
     fn reused_pid_does_not_publish_mixed_descriptor_evidence() {
-        let fixture = Fixture { changed: Some(41), ..Fixture::default() };
+        let fixture = Fixture {
+            changed: Some(41),
+            ..Fixture::default()
+        };
         let result = fixture.scan(Limits::default());
         assert!(!result.complete);
         assert_eq!(result.files.len(), 1);
@@ -428,56 +501,124 @@ mod tests {
     #[test]
     fn multiple_roots_share_one_process_and_descriptor_sweep() {
         let fixture = Fixture::default();
-        let result = collect_with(&fixture,
-            &[PathBuf::from("/scan/pid-41"), PathBuf::from("/scan/pid-42"), PathBuf::from("/scan")],
-            Limits::default()).unwrap();
+        let result = collect_with(
+            &fixture,
+            &[
+                PathBuf::from("/scan/pid-41"),
+                PathBuf::from("/scan/pid-42"),
+                PathBuf::from("/scan"),
+            ],
+            Limits::default(),
+        )
+        .unwrap();
         assert!(result.complete);
         assert_eq!(result.files.len(), 3);
         let calls = fixture.calls.borrow();
-        assert_eq!(calls.iter().filter(|(_, field)| *field == "pids").count(), 1);
-        assert_eq!(calls.iter().filter(|(_, field)| *field == "descriptors").count(), 2);
-        assert_eq!(calls.iter().filter(|(_, field)| matches!(*field, "fd0" | "fd1")).count(), 3);
+        assert_eq!(
+            calls.iter().filter(|(_, field)| *field == "pids").count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(_, field)| *field == "descriptors")
+                .count(),
+            2
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(_, field)| matches!(*field, "fd0" | "fd1"))
+                .count(),
+            3
+        );
     }
 
     #[test]
     fn per_pid_limit_preserves_later_processes_and_exact_eof() {
         let fixture = Fixture::default();
-        let result = fixture.scan(Limits { per_pid: 1, ..Limits::default() });
+        let result = fixture.scan(Limits {
+            per_pid: 1,
+            ..Limits::default()
+        });
         assert!(!result.complete);
         assert_eq!(result.files.len(), 2);
         assert_eq!(result.files[1].pid, 42);
-        assert!(Fixture::default().scan(Limits { per_pid: 2, ..Limits::default() }).complete);
+        assert!(
+            Fixture::default()
+                .scan(Limits {
+                    per_pid: 2,
+                    ..Limits::default()
+                })
+                .complete
+        );
     }
 
     #[test]
     fn total_descriptor_and_pid_limits_distinguish_exact_eof_from_truncation() {
         for descriptors in 0..=4 {
-            let result = Fixture::default().scan(Limits { descriptors, ..Limits::default() });
+            let result = Fixture::default().scan(Limits {
+                descriptors,
+                ..Limits::default()
+            });
             assert_eq!(result.files.len(), descriptors.min(3));
             assert_eq!(result.complete, descriptors >= 3);
         }
         for pids in 0..=3 {
-            let result = Fixture::default().scan(Limits { pids, ..Limits::default() });
+            let result = Fixture::default().scan(Limits {
+                pids,
+                ..Limits::default()
+            });
             assert_eq!(result.complete, pids >= 2);
         }
     }
 
     #[test]
     fn pathname_retention_budget_has_an_exact_boundary() {
-        let fixture = Fixture { pids: vec![42], ..Fixture::default() };
+        let fixture = Fixture {
+            pids: vec![42],
+            ..Fixture::default()
+        };
         let bytes = "/scan/pid-42/fd-0".len();
-        assert!(fixture.scan(Limits { bytes, ..Limits::default() }).complete);
-        let result = fixture.scan(Limits { bytes: bytes - 1, ..Limits::default() });
+        assert!(
+            fixture
+                .scan(Limits {
+                    bytes,
+                    ..Limits::default()
+                })
+                .complete
+        );
+        let result = fixture.scan(Limits {
+            bytes: bytes - 1,
+            ..Limits::default()
+        });
         assert!(!result.complete);
         assert!(result.files.is_empty());
     }
 
     #[test]
     fn deadline_includes_empty_discovery_and_does_not_start_another_syscall() {
-        let fixture = Fixture { pids: Vec::new(), discovery_step: Duration::from_secs(2), ..Fixture::default() };
-        assert!(!fixture.scan(Limits { time: Duration::from_secs(1), ..Limits::default() }).complete);
-        let fixture = Fixture { step: Duration::from_secs(1), ..Fixture::default() };
-        let result = fixture.scan(Limits { time: Duration::from_secs(2), ..Limits::default() });
+        let fixture = Fixture {
+            pids: Vec::new(),
+            discovery_step: Duration::from_secs(2),
+            ..Fixture::default()
+        };
+        assert!(
+            !fixture
+                .scan(Limits {
+                    time: Duration::from_secs(1),
+                    ..Limits::default()
+                })
+                .complete
+        );
+        let fixture = Fixture {
+            step: Duration::from_secs(1),
+            ..Fixture::default()
+        };
+        let result = fixture.scan(Limits {
+            time: Duration::from_secs(2),
+            ..Limits::default()
+        });
         assert!(!result.complete);
         assert!(result.files.is_empty());
         assert_eq!(*fixture.calls.borrow(), vec![(0, "pids"), (41, "identity")]);
@@ -485,8 +626,15 @@ mod tests {
 
     #[test]
     fn late_final_identity_retains_verified_positive_but_not_complete_verdict() {
-        let fixture = Fixture { pids: vec![42], step: Duration::from_secs(1), ..Fixture::default() };
-        let result = fixture.scan(Limits { time: Duration::from_secs(5), ..Limits::default() });
+        let fixture = Fixture {
+            pids: vec![42],
+            step: Duration::from_secs(1),
+            ..Fixture::default()
+        };
+        let result = fixture.scan(Limits {
+            time: Duration::from_secs(5),
+            ..Limits::default()
+        });
         assert!(!result.complete);
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].pid, 42);
@@ -494,7 +642,10 @@ mod tests {
 
     #[test]
     fn missing_scope_and_failed_discovery_have_distinct_results() {
-        let fixture = Fixture { fault: Some((0, "pids", libc::EACCES)), ..Fixture::default() };
+        let fixture = Fixture {
+            fault: Some((0, "pids", libc::EACCES)),
+            ..Fixture::default()
+        };
         let empty = collect_with(&fixture, &[], Limits::default()).unwrap();
         assert!(empty.complete);
         assert!(fixture.calls.borrow().is_empty());
@@ -503,7 +654,10 @@ mod tests {
 
     #[test]
     fn successive_observations_do_not_reuse_an_empty_negative_snapshot() {
-        let mut fixture = Fixture { files: BTreeMap::new(), ..Fixture::default() };
+        let mut fixture = Fixture {
+            files: BTreeMap::new(),
+            ..Fixture::default()
+        };
         let first = fixture.scan(Limits::default());
         assert!(first.complete);
         assert!(first.files.is_empty());

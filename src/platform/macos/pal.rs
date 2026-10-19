@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use crate::core::errors::Result;
 use crate::platform::macos::libproc::{
-    ProcFdInfo, ProcFdType, ProcTaskAllInfo, VnodeFdInfoWithPath,
-    proc_listpids_safe, proc_pid_command_line, proc_pid_list_fds,
-    proc_pid_rusage_v4_safe, proc_pidfdinfo_vnode_path, proc_pidinfo_task_all, proc_pidpath_safe,
+    ProcFdInfo, ProcFdType, ProcTaskAllInfo, VnodeFdInfoWithPath, proc_listpids_safe,
+    proc_pid_command_line, proc_pid_list_fds, proc_pid_rusage_v4_safe, proc_pidfdinfo_vnode_path,
+    proc_pidinfo_task_all, proc_pidpath_safe,
 };
 use crate::platform::macos::sacred_catalog::platform_macos_sacred_paths;
 use crate::platform::macos::sys::{

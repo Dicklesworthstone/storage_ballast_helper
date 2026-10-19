@@ -305,7 +305,8 @@ impl Platform for TestOverlayPlatform {
     }
 
     fn ram_write_memory_refusal(&self, minimum_available_percent: u8) -> Result<Option<String>> {
-        self.inner.ram_write_memory_refusal(minimum_available_percent)
+        self.inner
+            .ram_write_memory_refusal(minimum_available_percent)
     }
 
     fn service_manager(&self) -> Box<dyn ServiceManager> {
@@ -551,10 +552,12 @@ mod tests {
     mod reference_delegation {
         use super::*;
         use crate::core::errors::Result;
-        use crate::platform::pal::{FsStats, MemoryInfo, MountPoint, PlatformPaths, ServiceManager};
+        use crate::platform::pal::{
+            FsStats, MemoryInfo, MountPoint, PlatformPaths, ServiceManager,
+        };
         use crate::platform::types::{
-            ExecutablesResult, MappedRegion, OpenFile, OpenFileKind, OpenFileMode,
-            OpenFilesResult, PalError, ProcessInfo,
+            ExecutablesResult, MappedRegion, OpenFile, OpenFileKind, OpenFileMode, OpenFilesResult,
+            PalError, ProcessInfo,
         };
         use std::sync::Mutex;
 
@@ -578,10 +581,18 @@ mod tests {
             fn fs_stats(&self, path: &Path) -> Result<FsStats> {
                 MockPlatform::healthy().fs_stats(path)
             }
-            fn mount_points(&self) -> Result<Vec<MountPoint>> { Ok(Vec::new()) }
-            fn is_ram_backed(&self, _: &Path) -> Result<bool> { Ok(false) }
-            fn default_paths(&self) -> PlatformPaths { PlatformPaths::default() }
-            fn memory_info(&self) -> Result<MemoryInfo> { MockPlatform::healthy().memory_info() }
+            fn mount_points(&self) -> Result<Vec<MountPoint>> {
+                Ok(Vec::new())
+            }
+            fn is_ram_backed(&self, _: &Path) -> Result<bool> {
+                Ok(false)
+            }
+            fn default_paths(&self) -> PlatformPaths {
+                PlatformPaths::default()
+            }
+            fn memory_info(&self) -> Result<MemoryInfo> {
+                MockPlatform::healthy().memory_info()
+            }
             fn service_manager(&self) -> Box<dyn ServiceManager> {
                 panic!("process evidence must not control services")
             }
@@ -621,14 +632,22 @@ mod tests {
             }
             fn executables_under_roots(&self, roots: &[PathBuf]) -> Result<ExecutablesResult> {
                 self.batch("executables", roots);
-                Ok(ExecutablesResult { processes: Vec::new(), complete: false })
+                Ok(ExecutablesResult {
+                    processes: Vec::new(),
+                    complete: false,
+                })
             }
             fn mmap_regions_under(&self, _: &Path) -> Result<Vec<MappedRegion>> {
                 panic!("batch mapping scope must not be split")
             }
             fn mmap_regions_under_roots(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
                 self.batch("mappings", roots);
-                Err(PalError::method_failed("fixture", "mmap_regions_under_roots", "mapped metadata refused").into())
+                Err(PalError::method_failed(
+                    "fixture",
+                    "mmap_regions_under_roots",
+                    "mapped metadata refused",
+                )
+                .into())
             }
         }
 
@@ -649,7 +668,10 @@ mod tests {
             let roots = vec![PathBuf::from("/one"), PathBuf::from("/two")];
             let files = overlay.open_files_under_roots(&roots).unwrap();
             assert!(!files.complete);
-            assert_eq!(files.incomplete_reason.as_deref(), Some("unreadable peer process"));
+            assert_eq!(
+                files.incomplete_reason.as_deref(),
+                Some("unreadable peer process")
+            );
             assert_eq!(files.files.len(), 1);
             assert_eq!(files.files[0].path, PathBuf::from("/one/active"));
             assert_eq!(files.files[0].pid, 42);
@@ -659,15 +681,26 @@ mod tests {
             assert!(executables.processes.is_empty());
             let error = overlay.mmap_regions_under_roots(&roots).unwrap_err();
             assert!(error.to_string().contains("mapped metadata refused"));
-            assert_eq!(*inner.calls.lock().unwrap(), vec!["files", "executables", "mappings"]);
+            assert_eq!(
+                *inner.calls.lock().unwrap(),
+                vec!["files", "executables", "mappings"]
+            );
         }
 
         #[test]
         fn nested_overlays_do_not_reintroduce_argv_reads_or_complete_verdicts() {
             let inner = Arc::new(StrictReferences::default());
-            let first = Arc::new(TestOverlayPlatform::new(inner.clone(), InjectedFsTable::default()));
+            let first = Arc::new(TestOverlayPlatform::new(
+                inner.clone(),
+                InjectedFsTable::default(),
+            ));
             let outer = TestOverlayPlatform::new(first, InjectedFsTable::default());
-            assert!(outer.process_list_without_command_lines().unwrap().is_empty());
+            assert!(
+                outer
+                    .process_list_without_command_lines()
+                    .unwrap()
+                    .is_empty()
+            );
             let (directories, complete) = outer.build_directories_in_use_checked();
             assert!(!complete);
             assert_eq!(directories, vec![(42, PathBuf::from("/active"))]);

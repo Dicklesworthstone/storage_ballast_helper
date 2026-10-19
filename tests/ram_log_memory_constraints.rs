@@ -71,7 +71,12 @@ impl Platform for LocalMemory {
 
     fn is_ram_backed(&self, _: &Path) -> Result<bool> {
         if self.classification_error {
-            return Err(PalError::method_failed(self.name(), "is_ram_backed", "unknown filesystem").into());
+            return Err(PalError::method_failed(
+                self.name(),
+                "is_ram_backed",
+                "unknown filesystem",
+            )
+            .into());
         }
         Ok(self.ram)
     }
@@ -83,7 +88,9 @@ impl Platform for LocalMemory {
     fn memory_info(&self) -> Result<MemoryInfo> {
         self.host_queries.fetch_add(1, Ordering::SeqCst);
         if self.host_error {
-            return Err(PalError::method_failed(self.name(), "memory_info", "host unavailable").into());
+            return Err(
+                PalError::method_failed(self.name(), "memory_info", "host unavailable").into(),
+            );
         }
         Ok(MemoryInfo {
             total_bytes: 100,
@@ -98,14 +105,22 @@ impl Platform for LocalMemory {
     }
 
     fn ram_write_memory_refusal(&self, minimum_available_percent: u8) -> Result<Option<String>> {
-        self.local_queries.lock().unwrap().push(minimum_available_percent);
+        self.local_queries
+            .lock()
+            .unwrap()
+            .push(minimum_available_percent);
         if self.local_error.load(Ordering::SeqCst) {
             return Err(PalError::method_failed(
-                self.name(), "ram_write_memory_refusal", "cgroup evidence denied",
-            ).into());
+                self.name(),
+                "ram_write_memory_refusal",
+                "cgroup evidence denied",
+            )
+            .into());
         }
-        Ok((self.local_available.load(Ordering::SeqCst) < minimum_available_percent)
-            .then(|| "cgroup memory.max lacks headroom".to_owned()))
+        Ok(
+            (self.local_available.load(Ordering::SeqCst) < minimum_available_percent)
+                .then(|| "cgroup memory.max lacks headroom".to_owned()),
+        )
     }
 }
 
@@ -118,7 +133,11 @@ fn healthy_host_does_not_override_process_local_memory_refusal() {
         ram_log_mirror_refusal(&platform, Path::new(LOG)).as_deref(),
         Some("cgroup memory.max lacks headroom"),
     );
-    assert_eq!(platform.memory_info().unwrap(), host, "local limits must not rewrite host counters");
+    assert_eq!(
+        platform.memory_info().unwrap(),
+        host,
+        "local limits must not rewrite host counters"
+    );
     assert_eq!(*platform.local_queries.lock().unwrap(), vec![10]);
 }
 
@@ -128,7 +147,10 @@ fn unreadable_local_limits_refuse_both_admission_modes() {
     platform.local_error.store(true, Ordering::SeqCst);
     for headroom in [RamLogHeadroom::Keep, RamLogHeadroom::Start] {
         let reason = ram_log_mirror_refusal_for(&platform, Path::new(LOG), headroom).unwrap();
-        assert!(reason.starts_with("process memory limits are unreadable:"), "{reason}");
+        assert!(
+            reason.starts_with("process memory limits are unreadable:"),
+            "{reason}"
+        );
         assert!(reason.contains("cgroup evidence denied"), "{reason}");
     }
     assert_eq!(*platform.local_queries.lock().unwrap(), vec![10, 15]);
@@ -163,11 +185,26 @@ fn verified_disk_routes_do_not_query_host_or_local_memory() {
 #[test]
 fn existing_host_and_destination_refusals_avoid_local_io() {
     for platform in [
-        LocalMemory { host_available: 1, ..LocalMemory::default() },
-        LocalMemory { mount_available: 1, ..LocalMemory::default() },
-        LocalMemory { readonly: true, ..LocalMemory::default() },
-        LocalMemory { host_error: true, ..LocalMemory::default() },
-        LocalMemory { classification_error: true, ..LocalMemory::default() },
+        LocalMemory {
+            host_available: 1,
+            ..LocalMemory::default()
+        },
+        LocalMemory {
+            mount_available: 1,
+            ..LocalMemory::default()
+        },
+        LocalMemory {
+            readonly: true,
+            ..LocalMemory::default()
+        },
+        LocalMemory {
+            host_error: true,
+            ..LocalMemory::default()
+        },
+        LocalMemory {
+            classification_error: true,
+            ..LocalMemory::default()
+        },
     ] {
         assert!(ram_log_mirror_refusal(&platform, Path::new(LOG)).is_some());
         assert!(platform.local_queries.lock().unwrap().is_empty());
@@ -179,20 +216,34 @@ fn local_pressure_and_missing_evidence_can_recover_on_the_next_check() {
     let platform = LocalMemory::default();
     assert!(ram_log_mirror_refusal(&platform, Path::new(LOG)).is_none());
     platform.local_available.store(0, Ordering::SeqCst);
-    assert!(ram_log_mirror_refusal(&platform, Path::new(LOG)).unwrap().contains("memory.max"));
+    assert!(
+        ram_log_mirror_refusal(&platform, Path::new(LOG))
+            .unwrap()
+            .contains("memory.max")
+    );
     platform.local_error.store(true, Ordering::SeqCst);
     platform.local_available.store(50, Ordering::SeqCst);
-    assert!(ram_log_mirror_refusal(&platform, Path::new(LOG)).unwrap().contains("unreadable"));
+    assert!(
+        ram_log_mirror_refusal(&platform, Path::new(LOG))
+            .unwrap()
+            .contains("unreadable")
+    );
     platform.local_error.store(false, Ordering::SeqCst);
     assert!(ram_log_mirror_refusal(&platform, Path::new(LOG)).is_none());
-    assert_eq!(*platform.local_queries.lock().unwrap(), vec![10, 10, 10, 10]);
+    assert_eq!(
+        *platform.local_queries.lock().unwrap(),
+        vec![10, 10, 10, 10]
+    );
 }
 
 #[test]
 fn nested_filesystem_overlays_preserve_local_limits_errors_and_margins() {
     let inner = Arc::new(LocalMemory::default());
     inner.local_available.store(12, Ordering::SeqCst);
-    let first = Arc::new(TestOverlayPlatform::new(inner.clone(), InjectedFsTable::default()));
+    let first = Arc::new(TestOverlayPlatform::new(
+        inner.clone(),
+        InjectedFsTable::default(),
+    ));
     let outer = TestOverlayPlatform::new(first, InjectedFsTable::default());
     assert!(ram_log_mirror_refusal_for(&outer, Path::new(LOG), RamLogHeadroom::Keep).is_none());
     assert!(ram_log_mirror_refusal_for(&outer, Path::new(LOG), RamLogHeadroom::Start).is_some());
@@ -211,7 +262,14 @@ fn linux_pal_dispatches_to_the_native_guard_instead_of_the_default() {
     // Invalid percentages fail before any native file reads. This verifies
     // dispatch without requiring or mutating the runner's cgroup environment.
     for percent in [0, 101] {
-        let error = LinuxPal::new().ram_write_memory_refusal(percent).unwrap_err();
-        assert!(error.to_string().contains("invalid memory headroom percentage"), "{error}");
+        let error = LinuxPal::new()
+            .ram_write_memory_refusal(percent)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid memory headroom percentage"),
+            "{error}"
+        );
     }
 }
