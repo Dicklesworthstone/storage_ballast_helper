@@ -591,7 +591,10 @@ mod tests {
         let refilled = b.pass_cpu_allowance(PressureLevel::Orange).unwrap();
         assert!((refilled - 4.75).abs() < 1e-9, "{refilled}");
         // A Critical pass has the same funded slice, not an unlimited bypass.
-        assert_eq!(b.pass_cpu_allowance(PressureLevel::Critical), Some(refilled));
+        assert_eq!(
+            b.pass_cpu_allowance(PressureLevel::Critical),
+            Some(refilled)
+        );
         let (off, _) = budget(0);
         assert_eq!(off.pass_cpu_allowance(PressureLevel::Green), None);
     }
@@ -736,7 +739,10 @@ mod tests {
         assert!(!guard.exhausted(t0));
         *cpu.lock().unwrap() = 100.0 + BURST_SECS;
         assert!(guard.exhausted(t0));
-        assert_eq!(b.yield_for(PressureLevel::Critical, MAX_TICK_YIELD), Duration::ZERO);
+        assert_eq!(
+            b.yield_for(PressureLevel::Critical, MAX_TICK_YIELD),
+            Duration::ZERO
+        );
     }
 
     #[test]
@@ -744,7 +750,10 @@ mod tests {
         let (mut b, t0) = budget(25);
         b.observe(t0 + secs(1.0), 106.0); // 5 + .25 - 6 = -.75.
         assert_eq!(b.pass_cpu_allowance(PressureLevel::Critical), Some(0.0));
-        assert_eq!(b.yield_for(PressureLevel::Critical, MAX_TICK_YIELD), Duration::ZERO);
+        assert_eq!(
+            b.yield_for(PressureLevel::Critical, MAX_TICK_YIELD),
+            Duration::ZERO
+        );
         // At 22 seconds the balance is 4.5, still below the 4.75 start floor.
         b.observe(t0 + secs(22.0), 106.0);
         assert_eq!(b.pass_cpu_allowance(PressureLevel::Critical), Some(0.0));
@@ -758,7 +767,11 @@ mod tests {
         b.observe(t0 + secs(1.0), 108.0);
         let before = b.snapshot(t0 + secs(1.0));
         for _ in 0..100 {
-            for level in [PressureLevel::Green, PressureLevel::Critical, PressureLevel::Red] {
+            for level in [
+                PressureLevel::Green,
+                PressureLevel::Critical,
+                PressureLevel::Red,
+            ] {
                 assert_eq!(b.pass_cpu_allowance(level), Some(0.0));
             }
         }
@@ -773,7 +786,11 @@ mod tests {
         let (mut b, t0) = budget(25);
         b.observe(t0 + secs(1.0), 200.0);
         b.set_pct(0);
-        for level in [PressureLevel::Green, PressureLevel::Red, PressureLevel::Critical] {
+        for level in [
+            PressureLevel::Green,
+            PressureLevel::Red,
+            PressureLevel::Critical,
+        ] {
             assert_eq!(b.pass_cpu_allowance(level), None);
         }
         let mut forced = PassCpuGuard::unlimited(t0);
@@ -793,7 +810,10 @@ mod tests {
         b.observe(t0 + secs(23.0), 6.0);
         assert_eq!(b.pass_cpu_allowance(PressureLevel::Critical), Some(4.75));
         let mut wider = CpuBudget::new(25, t0, 0.0).with_burst_secs(120.0);
-        assert_eq!(wider.pass_cpu_allowance(PressureLevel::Critical), Some(120.0));
+        assert_eq!(
+            wider.pass_cpu_allowance(PressureLevel::Critical),
+            Some(120.0)
+        );
         wider.set_burst_secs(2.0);
         assert_eq!(wider.pass_cpu_allowance(PressureLevel::Critical), Some(2.0));
     }
@@ -814,9 +834,12 @@ mod tests {
                 match b.pass_cpu_allowance(PressureLevel::Critical) {
                     Some(allowance) if allowance > 0.0 => {
                         let sample = std::sync::Arc::clone(&cpu);
-                        guard = Some(PassCpuGuard::new(Some(allowance), now, move || {
-                            Some(*sample.lock().unwrap())
-                        }).with_sample_interval(Duration::ZERO));
+                        guard = Some(
+                            PassCpuGuard::new(Some(allowance), now, move || {
+                                Some(*sample.lock().unwrap())
+                            })
+                            .with_sample_interval(Duration::ZERO),
+                        );
                     }
                     Some(_) => deferred += 1,
                     None => panic!("enabled Critical scanning must not be unlimited"),
@@ -832,12 +855,18 @@ mod tests {
             }
             let consumed = *cpu.lock().unwrap();
             b.observe(end, consumed);
-            assert_eq!(b.yield_for(PressureLevel::Critical, MAX_TICK_YIELD), Duration::ZERO);
+            assert_eq!(
+                b.yield_for(PressureLevel::Critical, MAX_TICK_YIELD),
+                Duration::ZERO
+            );
             let elapsed = end.duration_since(t0).as_secs_f64();
             // One synthetic work quantum may cross the measured boundary.
-            assert!(consumed <= elapsed * b.rate() + BURST_SECS + 0.100_001);
+            assert!(consumed <= elapsed.mul_add(b.rate(), BURST_SECS) + 0.100_001);
         }
-        assert!(completed > 10, "finite slices must continue to make progress");
+        assert!(
+            completed > 10,
+            "finite slices must continue to make progress"
+        );
         assert!(deferred > 0, "permanent Critical must not erase pacing");
     }
 
@@ -928,9 +957,11 @@ mod tests {
                 if pct == 0 {
                     proptest::prop_assert_eq!(allowance, None);
                 } else {
-                    proptest::prop_assert!(allowance.is_some_and(|value| {
-                        value.is_finite() && value >= 0.0 && value <= BURST_SECS
-                    }));
+                    // prop_assert! turns its expression into a format string,
+                    // so the closure's braces cannot appear inside it.
+                    let bounded = allowance
+                        .is_some_and(|value| value.is_finite() && (0.0..=BURST_SECS).contains(&value));
+                    proptest::prop_assert!(bounded, "allowance {allowance:?} outside 0..={BURST_SECS}");
                     proptest::prop_assert_eq!(allowance, b.pass_cpu_allowance(PressureLevel::Green));
                 }
                 proptest::prop_assert!(wait <= MAX_TICK_YIELD);

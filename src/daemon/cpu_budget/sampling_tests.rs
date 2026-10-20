@@ -26,16 +26,16 @@ fn scripted(
 #[test]
 fn failed_startup_read_recovers_without_charging_process_lifetime_cpu() {
     let t0 = Instant::now();
-    let (mut guard, calls) = scripted(
-        2.0,
-        t0,
-        [None, None, Some(400.0), Some(401.5), Some(402.0)],
-    );
+    let (mut guard, calls) = scripted(2.0, t0, [None, None, Some(400.0), Some(401.5), Some(402.0)]);
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert!(!guard.exhausted(t0 + Duration::from_millis(100)));
     assert_eq!(guard.spent_secs(), 0.0);
     assert!(!guard.exhausted(t0 + Duration::from_millis(200)));
-    assert_eq!(guard.spent_secs(), 0.0, "400 seconds are not this pass's cost");
+    assert_eq!(
+        guard.spent_secs(),
+        0.0,
+        "400 seconds are not this pass's cost"
+    );
     assert!(!guard.exhausted(t0 + Duration::from_millis(300)));
     assert_eq!(guard.spent_secs(), 1.5);
     assert!(guard.exhausted(t0 + Duration::from_millis(400)));
@@ -46,12 +46,24 @@ fn failed_startup_read_recovers_without_charging_process_lifetime_cpu() {
 
 #[test]
 fn unusable_startup_counters_are_not_a_baseline_or_permanent_bypass() {
-    for initial in [None, Some(f64::NAN), Some(f64::INFINITY), Some(f64::NEG_INFINITY), Some(-1.0)] {
+    for initial in [
+        None,
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        Some(f64::NEG_INFINITY),
+        Some(-1.0),
+    ] {
         let t0 = Instant::now();
         let (mut guard, _) = scripted(2.0, t0, [initial, Some(1000.0), Some(1002.0)]);
-        assert!(!guard.exhausted(t0 + Duration::from_millis(100)), "{initial:?}");
+        assert!(
+            !guard.exhausted(t0 + Duration::from_millis(100)),
+            "{initial:?}"
+        );
         assert_eq!(guard.spent_secs(), 0.0);
-        assert!(guard.exhausted(t0 + Duration::from_millis(200)), "{initial:?}");
+        assert!(
+            guard.exhausted(t0 + Duration::from_millis(200)),
+            "{initial:?}"
+        );
         assert_eq!(guard.spent_secs(), 2.0);
     }
 }
@@ -59,17 +71,17 @@ fn unusable_startup_counters_are_not_a_baseline_or_permanent_bypass() {
 #[test]
 fn temporary_read_failures_do_not_restart_an_established_allowance() {
     let t0 = Instant::now();
-    let (mut guard, calls) = scripted(
-        2.0,
-        t0,
-        [Some(10.0), None, Some(11.0), None, Some(12.0)],
-    );
+    let (mut guard, calls) = scripted(2.0, t0, [Some(10.0), None, Some(11.0), None, Some(12.0)]);
     for (tick, expected) in [(1, 0.0), (2, 1.0), (3, 1.0)] {
         assert!(!guard.exhausted(t0 + Duration::from_millis(tick * 100)));
         assert_eq!(guard.spent_secs(), expected);
     }
     assert!(guard.exhausted(t0 + Duration::from_millis(400)));
-    assert_eq!(guard.spent_secs(), 2.0, "the cumulative counter covers both gaps");
+    assert_eq!(
+        guard.spent_secs(),
+        2.0,
+        "the cumulative counter covers both gaps"
+    );
     assert_eq!(calls.load(Ordering::Relaxed), 5);
 }
 
@@ -77,11 +89,18 @@ fn temporary_read_failures_do_not_restart_an_established_allowance() {
 fn invalid_and_regressing_readings_never_refund_observed_cpu() {
     let t0 = Instant::now();
     let bad = [
-        Some(11.0), Some(9.0), None, Some(f64::NAN),
-        Some(f64::INFINITY), Some(f64::NEG_INFINITY), Some(-1.0),
+        Some(11.0),
+        Some(9.0),
+        None,
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        Some(f64::NEG_INFINITY),
+        Some(-1.0),
     ];
-    let samples = [Some(10.0), Some(11.5)].into_iter()
-        .chain(bad).chain([Some(12.0)]);
+    let samples = [Some(10.0), Some(11.5)]
+        .into_iter()
+        .chain(bad)
+        .chain([Some(12.0)]);
     let (mut guard, _) = scripted(2.0, t0, samples);
     assert!(!guard.exhausted(t0 + Duration::from_millis(100)));
     assert_eq!(guard.spent_secs(), 1.5);
@@ -95,7 +114,14 @@ fn invalid_and_regressing_readings_never_refund_observed_cpu() {
 
 #[test]
 fn final_accounting_preserves_cost_when_its_last_sample_is_unusable() {
-    for last in [None, Some(9.0), Some(11.0), Some(f64::NAN), Some(f64::INFINITY), Some(-1.0)] {
+    for last in [
+        None,
+        Some(9.0),
+        Some(11.0),
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        Some(-1.0),
+    ] {
         let t0 = Instant::now();
         let (mut guard, calls) = scripted(2.0, t0, [Some(10.0), Some(12.0), last]);
         assert!(guard.exhausted(t0 + Duration::from_millis(100)));
@@ -106,7 +132,11 @@ fn final_accounting_preserves_cost_when_its_last_sample_is_unusable() {
     let t0 = Instant::now();
     let (mut guard, _) = scripted(2.0, t0, [Some(10.0), Some(12.0), Some(13.0)]);
     assert!(guard.exhausted(t0 + Duration::from_millis(100)));
-    assert_eq!(guard.finish(), 3.0, "final accounting includes observed overshoot");
+    assert_eq!(
+        guard.finish(),
+        3.0,
+        "final accounting includes observed overshoot"
+    );
 }
 
 #[test]
@@ -132,14 +162,22 @@ fn persistent_measurement_failure_stays_wall_bounded_without_hot_polling() {
     assert_eq!(calls.load(Ordering::Relaxed), 2);
     assert!(!guard.exhausted(t0 + Duration::from_millis(200)));
     assert_eq!(calls.load(Ordering::Relaxed), 3);
-    assert_eq!(guard.spent_secs(), 0.0, "unknown measurements invent no cost");
+    assert_eq!(
+        guard.spent_secs(),
+        0.0,
+        "unknown measurements invent no cost"
+    );
 }
 
 #[test]
 fn finish_can_observe_recovery_but_does_not_invent_an_unmeasured_prefix() {
     let t0 = Instant::now();
     let (mut guard, calls) = scripted(2.0, t0, [None, Some(900.0), Some(901.0)]);
-    assert_eq!(guard.finish(), 0.0, "first valid reading is only a baseline");
+    assert_eq!(
+        guard.finish(),
+        0.0,
+        "first valid reading is only a baseline"
+    );
     assert_eq!(guard.finish(), 1.0);
     assert_eq!(calls.load(Ordering::Relaxed), 3);
 }
