@@ -2197,3 +2197,108 @@ fn e2e_changelog_check_script_enforces_headings_and_release_markers() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// scripts/install.sh with an explicit `--dest` installs a copy there and
+/// leaves an installed sbh service alone. Before, it synced the service's
+/// binary from that copy and restarted the service: the e2e installer case
+/// replaced /usr/local/bin/sbh with a debug fixture build on two hosts that
+/// had a system sbh.service and passwordless sudo (2026-10-19). Here a
+/// user-scope unit points at a fake service binary, and stub `systemctl` and
+/// `sudo` first on PATH record any call.
+#[cfg(target_os = "linux")]
+#[test]
+fn install_script_with_dest_leaves_an_installed_service_alone() {
+    use std::process::Command;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let write_executable = |path: &Path, body: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+
+    let home = root.join("home");
+    let service_binary = root.join("service/sbh");
+    write_executable(&service_binary, "#!/bin/sh\necho service-binary\n");
+    let unit = home.join(".config/systemd/user/sbh.service");
+    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    std::fs::write(
+        &unit,
+        format!("[Service]\nExecStart={} daemon\n", service_binary.display()),
+    )
+    .unwrap();
+
+    let calls = root.join("calls.log");
+    for stub in ["systemctl", "sudo"] {
+        write_executable(
+            &root.join("stubs").join(stub),
+            &format!(
+                "#!/bin/sh\necho \"{stub} $*\" >> '{}'\nexit 0\n",
+                calls.display()
+            ),
+        );
+    }
+
+    let payload = root.join("payload/sbh");
+    let payload_body = "#!/bin/sh\necho 'sbh 9.9.9'\n";
+    write_executable(&payload, payload_body);
+    let artifact = root.join("artifact.tar.xz");
+    let packed = Command::new("tar")
+        .arg("-cJf")
+        .arg(&artifact)
+        .arg("-C")
+        .arg(payload.parent().unwrap())
+        .arg("sbh")
+        .status()
+        .unwrap();
+    assert!(packed.success());
+    let checksum = root.join("artifact.sha256");
+    let digest = hex_lower(Sha256::digest(std::fs::read(&artifact).unwrap()));
+    std::fs::write(&checksum, format!("{digest}  artifact.tar.xz\n")).unwrap();
+
+    let dest = root.join("dest");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh");
+    let output = Command::new("bash")
+        .arg(&script)
+        .arg("--dest")
+        .arg(&dest)
+        .args(["--version", "v9.9.9", "--no-verify", "--no-color"])
+        .env("HOME", &home)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("stubs").display()),
+        )
+        .env(
+            "SBH_INSTALLER_ASSET_URL",
+            format!("file://{}", artifact.display()),
+        )
+        .env(
+            "SBH_INSTALLER_CHECKSUM_URL",
+            format!("file://{}", checksum.display()),
+        )
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(dest.join("sbh")).unwrap(),
+        payload_body,
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&service_binary).unwrap(),
+        "#!/bin/sh\necho service-binary\n",
+        "the service binary was replaced: {text}"
+    );
+    let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        !recorded.contains("stop") && !recorded.contains("start") && !recorded.contains("install"),
+        "the service was touched: {recorded}"
+    );
+    assert!(text.contains("left as it is"), "{text}");
+}

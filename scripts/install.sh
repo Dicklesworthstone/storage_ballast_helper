@@ -6,6 +6,8 @@ REPO_DEFAULT="Dicklesworthstone/storage_ballast_helper"
 
 DEST_MODE="user"
 DEST_DIR=""
+# Set by --dest: put a copy there and touch nothing else (see sync_system_service).
+DEST_EXPLICIT=0
 VERSION="latest"
 DRY_RUN=0
 JSON_MODE=0
@@ -205,7 +207,8 @@ Usage:
 
 Options:
   --version <tag|semver>  Install a specific release tag (default: latest)
-  --dest <dir>            Destination directory for sbh binary
+  --dest <dir>            Destination directory for sbh binary (an installed
+                          sbh service is left as it is)
   --user                  Install to user location (default: ~/.local/bin)
   --system                Install to system location (/usr/local/bin)
   --dry-run               Print planned actions without changing the system
@@ -250,6 +253,7 @@ parse_args() {
       --dest)
         [[ $# -ge 2 ]] || die "--dest requires a value"
         DEST_DIR="$2"
+        DEST_EXPLICIT=1
         shift 2
         ;;
       --user)
@@ -1117,6 +1121,15 @@ sync_systemd_service() {
 }
 
 sync_system_service() {
+  # An explicit --dest installs a copy there and nothing else. Syncing the
+  # installed service from it once replaced /usr/local/bin/sbh with an e2e
+  # fixture's debug build and restarted the daemon, on two hosts with a system
+  # sbh.service and passwordless sudo (2026-10-19). `sbh update` and
+  # --user/--system installs still sync the service.
+  if [[ "$DEST_EXPLICIT" -eq 1 ]]; then
+    log_info "Explicit --dest: the installed sbh service is left as it is"
+    return 0
+  fi
   case "$(uname -s)" in
     Linux) sync_systemd_service ;;
     Darwin) sync_launchd_service ;;
