@@ -4,6 +4,55 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
+## Unreleased
+
+### Fixed
+
+- **A scan pass that stops on its budget no longer hides unexplored ground
+  from the next one** (bd-y70k; `efc01b1`, `ad7fcaf`). After such a pass
+  (on ts2, every pass: they stop at 500,000 entries) the daemon cached as
+  barren for 30 minutes every listed directory that was not the direct
+  parent of a candidate, and the next walk skipped it. That took in a
+  candidate's grandparents and the candidate directory itself, and every
+  listed directory whose children were still queued, being listed, or
+  emitted but never read when the pass stopped. The v2 index still replayed
+  candidates it knew; new ones below those directories were not found. The
+  walker now reports what a stopped pass left unseen, and nothing at or
+  above it is cached. If the walker threads have not stopped 5 seconds
+  after the stop, the pass caches nothing.
+- **CPU scan budgets apply at Critical, and survive a failed first CPU
+  sample** (`41ad7f5`, `de7bb8a`). Sustained Critical pressure bypassed the
+  token bucket, and a pass whose first CPU reading failed ran without a CPU
+  limit.
+- **Zero-byte size hints no longer crowd real candidates out of index
+  replay** (`c707669`). Empty estimates are dropped before the replay's
+  result limit applies.
+- **The compression tier resumes after the files it processed** (`ecd7d1a`).
+  A pass that stopped early no longer moved its cursor past the files
+  discovery selected but the pass never reached.
+- **`install.sh --dest DIR` leaves the installed service alone** (`2e913dc`).
+  It went on to sync the system service from the copy, so an install into a
+  scratch directory replaced `/usr/local/bin/sbh` and restarted the daemon
+  (two hosts on 2026-10-19, with an e2e fixture's debug build).
+
+### Removed
+
+- **Five config keys that had no effect** (bd-65vb):
+  `scheduler.exploration_quota_fraction`, `scheduler.fp_risk_weight` and
+  `scheduler.exploration_weight` (the scheduler's hazard index replaced
+  them); `update.background_refresh`, which nothing read; and
+  `platform.macos.query_foundation_purgeable`, since the macOS code reads only
+  the `SBH_MACOS_QUERY_FOUNDATION_PURGEABLE` environment variable, which stays.
+  `update.background_refresh` defaulted to true and was refused together
+  with `update.enabled = false`, so turning updates off in `config.toml`
+  failed validation unless both lines were set. A file that still sets these
+  keys loads; each one is reported as removed (an error only with
+  `strict_config = true`). The dashboard's VOI panel no longer shows an
+  exploit/explore split computed from the dead quota; each planned path
+  still says whether it was an exploration pick. `SBH_UPDATE_BACKGROUND_REFRESH`
+  is gone, and `SBH_UPDATE_OPT_OUT` is documented as the environment switch
+  it is rather than as a config key.
+
 ## v0.7.10 **[release]**
 
 Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.9...v0.7.10)

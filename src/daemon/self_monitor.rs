@@ -613,8 +613,6 @@ pub struct VoiState {
     pub budget_total: usize,
     /// Paths the last plan used.
     pub budget_used: usize,
-    /// `scheduler.exploration_quota_fraction`.
-    pub exploration_quota_fraction: f64,
     /// Round-robin fallback (disabled, or calibration tripped).
     pub fallback_active: bool,
     pub consecutive_bad_windows: u32,
@@ -644,7 +642,6 @@ impl VoiState {
                 plan.budget_total
             }),
             budget_used: last_plan.map_or(0, |(_, plan)| plan.budget_used),
-            exploration_quota_fraction: config.exploration_quota_fraction,
             fallback_active,
             consecutive_bad_windows: summary.consecutive_bad_windows,
             consecutive_good_windows: summary.consecutive_good_windows,
@@ -1706,7 +1703,6 @@ mod tests {
         let config = crate::core::config::VoiConfig {
             enabled: true,
             scan_budget_per_interval: 5,
-            exploration_quota_fraction: 0.25,
             ..crate::core::config::VoiConfig::default()
         };
         let summary = CalibrationSummary {
@@ -1739,7 +1735,6 @@ mod tests {
         let voi = VoiState::from_scheduler(&config, &summary, true, Some(&planned));
         assert!(voi.reported && voi.enabled && voi.fallback_active);
         assert_eq!((voi.budget_total, voi.budget_used), (5, 2));
-        assert!((voi.exploration_quota_fraction - 0.25).abs() < f64::EPSILON);
         assert_eq!(voi.consecutive_bad_windows, 2);
         assert_eq!(voi.recent_mapes, vec![0.6, 0.55]);
         assert_eq!(voi.paths_tracked, 3);

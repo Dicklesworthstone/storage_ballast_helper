@@ -90,10 +90,7 @@ file_size_bytes = 2147483648
 |-----|---------|-------------|
 | `enabled` | true | Enable Value-of-Information scan scheduling |
 | `scan_budget_per_interval` | 5 | Max scans per monitoring interval |
-| `exploration_quota_fraction` | 0.20 | Fraction of budget for exploratory scans |
 | `io_cost_weight` | 0.1 | IO cost penalty weight |
-| `fp_risk_weight` | 0.15 | False-positive risk weight |
-| `exploration_weight` | 0.25 | Exploration bonus weight |
 
 ## [notifications]
 

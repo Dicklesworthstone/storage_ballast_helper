@@ -50,6 +50,8 @@ pub enum EnvArea {
     Dashboard,
     /// Service integration.
     Service,
+    /// What the platform layer asks the operating system.
+    Platform,
     /// Release and update plumbing.
     Release,
     /// Test and CI hooks (honored only under `SBH_TEST_MODE=1` where noted).
@@ -64,6 +66,7 @@ impl EnvArea {
             Self::Output => "output",
             Self::Dashboard => "dashboard",
             Self::Service => "service",
+            Self::Platform => "platform",
             Self::Release => "release",
             Self::Test => "test",
         }
@@ -146,9 +149,10 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
         EnvArea::Service,
         "Leased target `sbh lease run` hands the leased command (default for `lease status`/`renew`)",
     ),
-    cfg(
+    var(
         "SBH_MACOS_QUERY_FOUNDATION_PURGEABLE",
-        "`platform.macos.query_foundation_purgeable`",
+        EnvArea::Platform,
+        "`0`/`false`/`no`/`off` stops the macOS purgeable-space query to Foundation; the estimate then comes from the APFS container inventory",
     ),
     cfg("SBH_BEHAVIOR_PRESET", "`pressure.behavior_preset`"),
     cfg("SBH_POLICY_KILL_SWITCH", "`policy.kill_switch`"),
@@ -332,11 +336,11 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
         "`telemetry.daemon_rss_hard_limit_bytes`",
     ),
     cfg("SBH_UPDATE_ENABLED", "`update.enabled`"),
-    cfg(
-        "SBH_UPDATE_BACKGROUND_REFRESH",
-        "`update.background_refresh`",
+    var(
+        "SBH_UPDATE_OPT_OUT",
+        EnvArea::Release,
+        "A true value turns `update.enabled` and `update.notices_enabled` off",
     ),
-    cfg("SBH_UPDATE_OPT_OUT", "`update.opt_out`"),
     cfg(
         "SBH_UPDATE_METADATA_CACHE_TTL_SECONDS",
         "`update.metadata_cache_ttl_seconds`",

@@ -82,7 +82,6 @@ pub struct Config {
     pub behavior: BehaviorConfig,
     pub special_locations: SpecialLocationsConfig,
     pub system_tuning: SystemTuningConfig,
-    pub platform: PlatformConfig,
     /// Opt-in lossless compression of cold btrfs files (`[compress]`).
     pub compress: CompressConfig,
     /// Keys the loaded file contained that no section declares. Not part
@@ -217,6 +216,15 @@ fn legacy_config_key_hint(path: &str) -> Option<&'static str> {
         "policy.canary_delete_cap_per_hour" => "use [policy] max_canary_deletes_per_hour",
         "policy.fallback_safe" => {
             "use [policy] kill_switch = true to hold the daemon in fallback-safe"
+        }
+        "scheduler.exploration_quota_fraction"
+        | "scheduler.fp_risk_weight"
+        | "scheduler.exploration_weight" => {
+            "removed: it had no effect (the scheduler's hazard index replaced it); delete the line"
+        }
+        "update.background_refresh" => "removed: nothing read it; delete the line",
+        "platform" => {
+            "removed: [platform.macos] query_foundation_purgeable had no effect; SBH_MACOS_QUERY_FOUNDATION_PURGEABLE=0 in the environment stops the Foundation query"
         }
         _ => match leaf {
             "file_size_mb" => "use file_size_bytes",
@@ -760,17 +768,8 @@ pub struct VoiConfig {
     pub enabled: bool,
     /// Maximum number of paths to scan per scheduling interval.
     pub scan_budget_per_interval: usize,
-    /// Retained for config compatibility; the hazard-driven index (Q6)
-    /// replaced the exploration quota, so this key has no effect.
-    pub exploration_quota_fraction: f64,
     /// Weight for the visit-cost penalty (`w_c` in the Q6 index).
     pub io_cost_weight: f64,
-    /// Retained for config compatibility; the Q6 index does not penalize
-    /// false positives (scoring vetoes handle them), so this key has no effect.
-    pub fp_risk_weight: f64,
-    /// Retained for config compatibility; the hazard term of the Q6 index
-    /// replaced the exploration bonus, so this key has no effect.
-    pub exploration_weight: f64,
     /// Forecast-error threshold: if MAPE exceeds this, switch to fallback.
     pub forecast_error_threshold: f64,
     /// Number of consecutive windows with high forecast error before triggering fallback.
@@ -788,10 +787,7 @@ impl Default for VoiConfig {
         Self {
             enabled: true,
             scan_budget_per_interval: 5,
-            exploration_quota_fraction: 0.20,
             io_cost_weight: 0.1,
-            fp_risk_weight: 0.15,
-            exploration_weight: 0.25,
             forecast_error_threshold: 0.5,
             fallback_trigger_windows: 3,
             recovery_trigger_windows: 5,
@@ -848,7 +844,6 @@ pub struct UpdateConfig {
     pub enabled: bool,
     pub metadata_cache_ttl_seconds: u64,
     pub metadata_cache_file: PathBuf,
-    pub background_refresh: bool,
     pub notices_enabled: bool,
 }
 
@@ -900,29 +895,6 @@ impl Default for SystemTuningConfig {
             writeback_benchmark_bytes: 96 * 1024 * 1024,
             writeback_pool_warn_bytes: 4 * 1024 * 1024 * 1024,
             writeback_sysctl_path: PathBuf::from("/etc/sysctl.d/99-sbh-writeback.conf"),
-        }
-    }
-}
-
-/// Platform-specific configuration options (`[platform]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
-pub struct PlatformConfig {
-    pub macos: PlatformMacOsConfig,
-}
-
-/// macOS platform configuration (`[platform.macos]`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
-pub struct PlatformMacOsConfig {
-    /// Query Foundation for purgeable space on macOS (default: true).
-    pub query_foundation_purgeable: bool,
-}
-
-impl Default for PlatformMacOsConfig {
-    fn default() -> Self {
-        Self {
-            query_foundation_purgeable: true,
         }
     }
 }
@@ -1537,7 +1509,6 @@ impl Default for UpdateConfig {
             enabled: true,
             metadata_cache_ttl_seconds: 30 * 60,
             metadata_cache_file: default_update_metadata_cache_file(&paths),
-            background_refresh: true,
             notices_enabled: true,
         }
     }
@@ -2541,12 +2512,6 @@ impl Config {
             &mut self.system_tuning.writeback_pool_warn_bytes,
         )?;
 
-        // platform
-        set_env_bool(
-            "SBH_MACOS_QUERY_FOUNDATION_PURGEABLE",
-            &mut self.platform.macos.query_foundation_purgeable,
-        )?;
-
         Ok(())
     }
 
@@ -2599,20 +2564,15 @@ impl Config {
             self.update.metadata_cache_file = PathBuf::from(raw);
         }
 
-        if let Some(raw) = lookup("SBH_UPDATE_BACKGROUND_REFRESH") {
-            self.update.background_refresh = parse_env_bool("SBH_UPDATE_BACKGROUND_REFRESH", &raw)?;
-        }
-
         if let Some(raw) = lookup("SBH_UPDATE_NOTICES_ENABLED") {
             self.update.notices_enabled = parse_env_bool("SBH_UPDATE_NOTICES_ENABLED", &raw)?;
         }
 
-        // Global opt-out: disables checks, background refresh, and update notices.
+        // Global opt-out: disables checks and update notices.
         if let Some(raw) = lookup("SBH_UPDATE_OPT_OUT")
             && parse_env_bool("SBH_UPDATE_OPT_OUT", &raw)?
         {
             self.update.enabled = false;
-            self.update.background_refresh = false;
             self.update.notices_enabled = false;
         }
 
@@ -2896,10 +2856,6 @@ impl Config {
             });
         }
 
-        validate_prob(
-            "scheduler.exploration_quota_fraction",
-            self.scheduler.exploration_quota_fraction,
-        )?;
         validate_prob("scheduler.ewma_alpha", self.scheduler.ewma_alpha)?;
         if self.scheduler.scan_budget_per_interval == 0 {
             return Err(SbhError::InvalidConfig {
@@ -2913,8 +2869,6 @@ impl Config {
         }
         for (name, val) in [
             ("io_cost_weight", self.scheduler.io_cost_weight),
-            ("fp_risk_weight", self.scheduler.fp_risk_weight),
-            ("exploration_weight", self.scheduler.exploration_weight),
             (
                 "forecast_error_threshold",
                 self.scheduler.forecast_error_threshold,
@@ -3117,13 +3071,6 @@ impl Config {
         if self.update.metadata_cache_ttl_seconds == 0 {
             return Err(SbhError::InvalidConfig {
                 details: "update.metadata_cache_ttl_seconds must be > 0".to_string(),
-            });
-        }
-
-        if !self.update.enabled && self.update.background_refresh {
-            return Err(SbhError::InvalidConfig {
-                details: "update.background_refresh cannot be true when update.enabled=false"
-                    .to_string(),
             });
         }
 
@@ -3928,6 +3875,39 @@ mod tests {
         assert!(parse_config_lenient("[scanner]\nparallelism = \"two\"\n").is_err());
     }
 
+    /// bd-65vb: a file written before the five no-effect keys were removed
+    /// (mac-mini-max's carried four of them) still loads, and each removed
+    /// key is reported with a note saying it did nothing.
+    #[test]
+    fn a_config_setting_the_removed_no_effect_keys_still_loads() {
+        use super::parse_config_lenient;
+        let raw = "[scheduler]\nscan_budget_per_interval = 7\nexploration_quota_fraction = 0.2\n\
+                   exploration_weight = 0.25\nfp_risk_weight = 0.15\n\n\
+                   [update]\nenabled = false\nbackground_refresh = true\n\n\
+                   [platform.macos]\nquery_foundation_purgeable = false\n";
+        let (config, unknown) = parse_config_lenient(raw).expect("lenient parse succeeds");
+        assert_eq!(config.scheduler.scan_budget_per_interval, 7);
+        assert!(!config.update.enabled);
+        config.validate().expect("what remains is a valid config");
+
+        let mut paths: Vec<&str> = unknown.iter().map(|k| k.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            [
+                "platform",
+                "scheduler.exploration_quota_fraction",
+                "scheduler.exploration_weight",
+                "scheduler.fp_risk_weight",
+                "update.background_refresh",
+            ]
+        );
+        for key in &unknown {
+            let note = key.suggestion.as_deref().unwrap_or_default();
+            assert!(note.starts_with("removed:"), "{}: {note}", key.path);
+        }
+    }
+
     #[test]
     fn config_load_reports_unknown_keys_without_failing() {
         let dir = tempfile::tempdir().unwrap();
@@ -4479,15 +4459,18 @@ mod tests {
         assert!(err.to_string().contains("metadata_cache_ttl_seconds"));
     }
 
+    /// bd-65vb: `update.enabled = false` on its own is a valid config. The
+    /// removed `update.background_refresh` defaulted to true and was refused
+    /// alongside disabled updates, so this failed validation.
     #[test]
-    fn update_disabled_disallows_background_refresh() {
+    fn disabling_updates_alone_is_a_valid_config() {
         let mut cfg = Config::default();
         cfg.update.enabled = false;
-        cfg.update.background_refresh = true;
-        let err = cfg
+        cfg.validate().expect("updates off is a valid config");
+        let parsed: Config = toml::from_str("[update]\nenabled = false\n").unwrap();
+        parsed
             .validate()
-            .expect_err("expected update background refresh validation error");
-        assert!(err.to_string().contains("background_refresh"));
+            .expect("a file that turns updates off validates");
     }
 
     #[test]
@@ -4506,7 +4489,6 @@ mod tests {
         let mut cfg = Config::default();
         let overrides = vars(&[
             ("SBH_UPDATE_ENABLED", "true"),
-            ("SBH_UPDATE_BACKGROUND_REFRESH", "true"),
             ("SBH_UPDATE_NOTICES_ENABLED", "true"),
             ("SBH_UPDATE_OPT_OUT", "true"),
         ]);
@@ -4515,7 +4497,6 @@ mod tests {
             .expect("update env overrides should parse");
 
         assert!(!cfg.update.enabled);
-        assert!(!cfg.update.background_refresh);
         assert!(!cfg.update.notices_enabled);
     }
 

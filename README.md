@@ -746,8 +746,7 @@ Environment overrides are available for operator automation:
 - `SBH_UPDATE_METADATA_CACHE_FILE`
 - `SBH_UPDATE_NOTICES_ENABLED`
 - `SBH_UPDATE_ENABLED`
-- `SBH_UPDATE_BACKGROUND_REFRESH`
-- `SBH_UPDATE_OPT_OUT`
+- `SBH_UPDATE_OPT_OUT` (turns both `update.enabled` and `update.notices_enabled` off)
 
 ### Update Command Flags
 
@@ -871,10 +870,7 @@ kp_scale_max = 2.0
 [scheduler]
 enabled = true
 scan_budget_per_interval = 5
-exploration_quota_fraction = 0.20
 io_cost_weight = 0.1
-fp_risk_weight = 0.15
-exploration_weight = 0.25
 forecast_error_threshold = 0.5
 fallback_trigger_windows = 3
 recovery_trigger_windows = 5
@@ -939,7 +935,7 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_SYSTEMD_UNIT_DIR` | service | Directory the systemd unit is written to and read from |
 | `SBH_ACTIVE_LEASE_TOKEN` | service | Renewal token `sbh lease run` hands the leased command (`lease renew` reads it) |
 | `SBH_ACTIVE_LEASE_TARGET` | service | Leased target `sbh lease run` hands the leased command (default for `lease status`/`renew`) |
-| `SBH_MACOS_QUERY_FOUNDATION_PURGEABLE` | config override | `platform.macos.query_foundation_purgeable` |
+| `SBH_MACOS_QUERY_FOUNDATION_PURGEABLE` | platform | `0`/`false`/`no`/`off` stops the macOS purgeable-space query to Foundation; the estimate then comes from the APFS container inventory |
 | `SBH_BEHAVIOR_PRESET` | config override | `pressure.behavior_preset` |
 | `SBH_POLICY_KILL_SWITCH` | config override | `policy.kill_switch` |
 | `SBH_PREDICTION_ENABLED` | config override | `prediction.enabled` |
@@ -1002,8 +998,7 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_TELEMETRY_DAEMON_RSS_WARNING_BYTES` | config override | `telemetry.daemon_rss_warning_bytes` |
 | `SBH_TELEMETRY_DAEMON_RSS_HARD_LIMIT_BYTES` | config override | `telemetry.daemon_rss_hard_limit_bytes` |
 | `SBH_UPDATE_ENABLED` | config override | `update.enabled` |
-| `SBH_UPDATE_BACKGROUND_REFRESH` | config override | `update.background_refresh` |
-| `SBH_UPDATE_OPT_OUT` | config override | `update.opt_out` |
+| `SBH_UPDATE_OPT_OUT` | release | A true value turns `update.enabled` and `update.notices_enabled` off |
 | `SBH_UPDATE_METADATA_CACHE_TTL_SECONDS` | config override | `update.metadata_cache_ttl_seconds` |
 | `SBH_UPDATE_METADATA_CACHE_FILE` | config override | `update.metadata_cache_file` |
 | `SBH_UPDATE_NOTICES_ENABLED` | config override | `update.notices_enabled` |

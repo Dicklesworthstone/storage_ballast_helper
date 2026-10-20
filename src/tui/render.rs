@@ -3207,17 +3207,6 @@ fn voi_live_lines<'a>(model: &'a DashboardModel, theme: &'a Theme) -> Vec<Line<'
             Style::default().fg(secondary),
         ),
     ]));
-    let explore_pct = (voi.exploration_quota_fraction * 100.0).round();
-    let exploit_pct = 100.0 - explore_pct;
-    let exploit_text = format!("{exploit_pct:.0}%");
-    let explore_text = format!("{explore_pct:.0}%");
-    lines.push(Line::from_spans([
-        Span::styled("  split        ", Style::default().fg(muted)),
-        styled_badge(&exploit_text, theme.palette.success_color()),
-        Span::styled(" exploit  ", Style::default().fg(secondary)),
-        styled_badge(&explore_text, theme.palette.warning_color()),
-        Span::styled(" explore", Style::default().fg(secondary)),
-    ]));
     let mape = voi
         .recent_mapes
         .last()
@@ -7034,7 +7023,6 @@ mod tests {
             enabled: true,
             budget_total: 5,
             budget_used: 3,
-            exploration_quota_fraction: 0.2,
             fallback_active: false,
             consecutive_bad_windows: 1,
             consecutive_good_windows: 4,
@@ -7052,7 +7040,10 @@ mod tests {
         let frame = voi_text(&model);
         assert!(frame.contains("VOI ranking"), "{frame}");
         assert!(frame.contains("3 used by the last plan"), "{frame}");
-        assert!(frame.contains("80%"), "{frame}");
+        assert!(
+            !frame.contains("split"),
+            "no exploit/explore quota exists: {frame}"
+        );
         assert!(frame.contains("last MAPE 12%"), "{frame}");
         assert!(frame.contains("explore /work/alpha"), "{frame}");
         assert!(frame.contains("2026-09-03T08:00:00Z"), "{frame}");
