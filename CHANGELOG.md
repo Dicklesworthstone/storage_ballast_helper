@@ -4,9 +4,26 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
-## v0.7.10
+## v0.7.10 **[release]**
 
 Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.9...v0.7.10)
+
+On Btrfs the daemon can now compress cold files instead of deleting
+anything (opt-in `[compress]`). It also reclaims idle cargo targets inside
+agent scratch that is otherwise protected (`scanner.target_only_roots`).
+Most of the fixes come from a Linux host whose `/` sat at Critical for
+days:
+- the activity database no longer grows by about 0.4 GB a day of
+  empty-candidate records;
+- the generated unit's memory cap no longer stalls the daemon;
+- the RSS limits no longer restart it on a normal working set.
+
+On macOS, the checks for processes using a candidate now report what they
+could not see. Running them on a Mac found cases that would have held
+every deletion: zombies, unlinked files and guarded descriptors. Those are
+fixed. The dashboard leaves the terminal usable after a panic or a kill,
+and the release binaries now include it. The native Btrfs and systemd
+checks run through dsr before each release; sbh has no GitHub workflows.
 
 ### Added
 
@@ -248,6 +265,14 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
   abort, and the library covers them), the terminal is restored before
   the panic message is printed. The message now stays readable instead of
   being printed on the alternate screen and wiped.
+- **`sbh config validate` reports a config that does not parse as
+  INVALID again.** Since v0.7.9 the source-root assessment that runs
+  first printed "Source-root configuration: FAIL" for a syntax error and
+  stopped there, so the real check never ran and its "Configuration is
+  INVALID" message was never printed. A load failure is now left to the
+  command: `config validate` and a targeted `doctor` report it themselves.
+  A plain `sbh doctor`, which the assessment answers alone, still reports
+  it there.
 - **Release binaries include the dashboard cockpit.** dsr built the
   release binaries without the `tui` feature that Cargo.toml lists for
   them, so `sbh dashboard --new-dashboard` on v0.7.9 said "TUI feature not
