@@ -42,6 +42,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 - **The compression tier resumes after the files it processed** (`ecd7d1a`).
   A pass that stopped early no longer moved its cursor past the files
   discovery selected but the pass never reached.
+- **Target-only reclaim re-checks a target before deleting it** (bd-232u;
+  `715913c`). The tier nominates a cargo target dir only while its top level
+  holds nothing but cargo's own entries; the executor then checked only that
+  it was the same inode. A trace dir or log written into the target while
+  its batch waited is now noticed, and the target is kept.
 - **`install.sh --dest DIR` leaves the installed service alone** (`2e913dc`).
   It went on to sync the system service from the copy, so an install into a
   scratch directory replaced `/usr/local/bin/sbh` and restarted the daemon
