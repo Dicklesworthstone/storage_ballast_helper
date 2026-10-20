@@ -413,7 +413,11 @@ mod tests {
             unvisited_files: selected.len() - outcomes.len(),
             stop_reason: (outcomes.len() < selected.len()).then(|| "injected stop".into()),
             elapsed_ms: 0,
-            exit_code: if outcomes.len() < selected.len() { 4 } else { 0 },
+            exit_code: if outcomes.len() < selected.len() {
+                4
+            } else {
+                0
+            },
         }
     }
 
@@ -484,8 +488,7 @@ mod tests {
         for (supported, dry_run) in [(false, false), (true, true)] {
             let cursor = Mutex::new(previous.clone());
             execute_and_resume(&selected, None, &cursor, || {
-                let mut report =
-                    execution_report(&selected, &["eligible", "eligible", "eligible"]);
+                let mut report = execution_report(&selected, &["eligible", "eligible", "eligible"]);
                 report.supported = supported;
                 report.dry_run = dry_run;
                 Ok(report)

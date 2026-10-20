@@ -243,7 +243,10 @@ mod tests {
         index.upsert(current.clone());
         assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![current.clone()]);
         assert_eq!(index.get(current.identity).unwrap().fail_count, 0);
-        assert_eq!(index.get(current.identity).unwrap().cooldown_until_nanos, None);
+        assert_eq!(
+            index.get(current.identity).unwrap().cooldown_until_nanos,
+            None
+        );
 
         current.size_estimate_bytes = 0;
         index.upsert(current.clone());
