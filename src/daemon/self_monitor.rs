@@ -594,13 +594,14 @@ pub struct VoiPathState {
     pub path: String,
     /// Expected reclaim per unit of scan cost, as ranked.
     pub utility: f64,
-    /// Chosen by the exploration quota rather than by utility.
+    /// An exploration pick (the plan's reserved exploration slot, or a path
+    /// never scanned) rather than a pick by utility.
     pub is_exploration: bool,
     pub forecast_reclaim_bytes: f64,
 }
 
 /// The VOI (value-of-information) scan scheduler as the daemon last saw it
-/// (bd-rc-master-ajg1.4.11): the budget and split from the config, the
+/// (bd-rc-master-ajg1.4.11): the budget from the config, the
 /// calibration guard's state, and the paths of the last plan.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

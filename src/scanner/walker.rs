@@ -213,9 +213,11 @@ struct WorkItem {
     opaque_tree: Option<OpaqueTreeClassification>,
 }
 
-/// Entries of a running walk, one at a time. The workers send them in
-/// batches of up to [`WALK_BATCH_ENTRIES`]; the stream ends when every
-/// worker has finished or been cancelled.
+/// Entries of a running walk, one at a time.
+///
+/// The workers send them in batches of up to [`WALK_BATCH_ENTRIES`]; the
+/// stream ends when every worker has finished or been cancelled. Dropping
+/// the stream cancels the walk.
 #[derive(Debug)]
 pub struct WalkStream {
     rx: channel::Receiver<Vec<WalkEntry>>,
@@ -224,6 +226,8 @@ pub struct WalkStream {
     work: Option<channel::Receiver<WorkItem>>,
     /// Paths the workers recorded as unfinished (see [`ResultBatch`]).
     unfinished: Arc<parking_lot::Mutex<Vec<PathBuf>>>,
+    /// The walk's cancel flag (the walker's [`DirectoryWalker::cancel_token`]).
+    cancel: Arc<AtomicBool>,
 }
 
 impl WalkStream {
@@ -231,12 +235,14 @@ impl WalkStream {
         rx: channel::Receiver<Vec<WalkEntry>>,
         work: Option<channel::Receiver<WorkItem>>,
         unfinished: Arc<parking_lot::Mutex<Vec<PathBuf>>>,
+        cancel: Arc<AtomicBool>,
     ) -> Self {
         Self {
             rx,
             pending: Vec::new().into_iter(),
             work,
             unfinished,
+            cancel,
         }
     }
 
@@ -246,7 +252,7 @@ impl WalkStream {
         let (tx, rx) = channel::bounded(1);
         // Room for exactly this batch, and the receiver is alive.
         let _ = tx.send(entries);
-        Self::new(rx, None, Arc::default())
+        Self::new(rx, None, Arc::default(), Arc::default())
     }
 
     /// For a consumer that stopped early and set the walker's cancel flag:
@@ -295,6 +301,16 @@ impl WalkStream {
             }
             self.pending = self.rx.recv_timeout(timeout)?.into_iter();
         }
+    }
+}
+
+impl Drop for WalkStream {
+    /// Nobody reads what the workers would send. Without this a consumer that
+    /// went away without cancelling (a scanner thread that panicked and was
+    /// respawned) left its walk listing the rest of the tree in the
+    /// background, every batch lost.
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
     }
 }
 
@@ -833,7 +849,8 @@ impl DirectoryWalker {
 
     /// Stream entries as they are discovered.
     ///
-    /// The walk runs in background threads.
+    /// The walk runs in background threads. Dropping the stream sets the
+    /// walker's cancel flag, so one walker serves one stream.
     pub fn stream(&self) -> Result<WalkStream> {
         let parallelism = self.config.parallelism.max(1);
 
@@ -925,7 +942,12 @@ impl DirectoryWalker {
 
         // The stream keeps a receiver of the work queue, so what a cancelled
         // walk never listed can still be read once the workers are gone.
-        Ok(WalkStream::new(result_rx, Some(work_rx), unfinished))
+        Ok(WalkStream::new(
+            result_rx,
+            Some(work_rx),
+            unfinished,
+            Arc::clone(&self.cancel),
+        ))
     }
 
     /// Access the protection registry (e.g. to list discovered markers).
@@ -1412,9 +1434,10 @@ pub fn opaque_context_for_path(path: &Path) -> OpaqueTreeContext {
 
 /// Allocated bytes of `dir`'s immediate regular files.
 ///
-/// Read the way a measuring walk reads them: its first
-/// [`MAX_ENTRIES_PER_DIR`] entries, with subdirectories and symlinks adding
-/// nothing. For a consumer of a walk
+/// Read much as a measuring walk reads them: up to [`MAX_ENTRIES_PER_DIR`]
+/// entries (the first ones; the walk reads its current window of a longer
+/// listing), with subdirectories and symlinks adding nothing. For a consumer
+/// of a walk
 /// [without file sizes](DirectoryWalker::without_file_sizes). An unreadable
 /// directory yields 0.
 #[must_use]
@@ -4826,7 +4849,7 @@ mod tests {
         tx.send(vec![bare_entry("/a"), bare_entry("/b")]).unwrap();
         tx.send(vec![bare_entry("/c")]).unwrap();
         drop(tx);
-        let mut stream = WalkStream::new(rx, None, Arc::default());
+        let mut stream = WalkStream::new(rx, None, Arc::default(), Arc::default());
         let wait = Duration::from_secs(1);
         assert_eq!(stream.recv_timeout(wait).unwrap().path, Path::new("/a"));
         assert_eq!(stream.next().unwrap().path, Path::new("/b"));
@@ -4943,6 +4966,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A consumer that goes away without cancelling stops the walk. Before,
+    /// the workers listed the rest of the tree with nobody reading, each
+    /// listing beating the heart.
+    #[test]
+    fn dropping_the_stream_stops_the_walk() {
+        let tmp = TempDir::new().unwrap();
+        // 40 + 40 * 40 = 1,640 directories.
+        for a in 0..40 {
+            for b in 0..40 {
+                fs::create_dir_all(tmp.path().join(format!("a{a}/b{b}"))).unwrap();
+            }
+        }
+        let beats = Arc::new(AtomicUsize::new(0));
+        let walker =
+            DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only())
+                .with_heartbeat({
+                    let beats = Arc::clone(&beats);
+                    move || {
+                        beats.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+        let stream = walker.stream().unwrap();
+        // Every worker holds this until it exits.
+        let workers = Arc::clone(&stream.unfinished);
+        drop(stream);
+        let at_drop = beats.load(Ordering::Relaxed);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&workers) > 1 {
+            assert!(Instant::now() < deadline, "the workers did not stop");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let after_drop = beats.load(Ordering::Relaxed) - at_drop;
+        assert!(
+            after_drop < 64,
+            "{after_drop} heartbeats after the stream was dropped"
+        );
     }
 
     /// A directory longer than one processing window is unfinished even when
