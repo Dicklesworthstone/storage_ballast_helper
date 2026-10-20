@@ -285,45 +285,7 @@ pub fn classify_opaque_tree(
     }
 
     if is_cargo_target_name(&name) {
-        // The broad `target-<x>` / `target_<x>` PREFIX forms are the only
-        // target-like shapes that ordinary crate and project names also
-        // satisfy (`target-triple`, `target_spec`), so temp-like placement
-        // alone is not enough to promote them: the tree must additionally
-        // carry a cargo build marker at its root. Every other shape keeps the
-        // plain temp-context promotion.
-        // Descriptive `<prefix>-target` / `<prefix>_target` names need the
-        // same corroboration: release-evidence and fixture trees name
-        // directories `invalid_target` or `ambient-target` on purpose, and on
-        // ts2 (2026-09-25) eight such directories inside non-git hfdt
-        // evidence bundles were deleted on the name alone.
-        let needs_markers = has_broad_target_prefix(&name) || has_descriptive_target_suffix(&name);
-        let has_markers = needs_markers && has_cargo_target_root_markers(path);
-        let tmp_promotes = tmp_like && (!needs_markers || has_markers);
-        if (name == "target" && context.parent_has_cargo_toml)
-            || tmp_promotes
-            || is_agent_build_target_name(&name)
-            // A descriptive suffix name WITH cargo's root markers is a
-            // `CARGO_TARGET_DIR` output, so V2 nominates it as a single opaque
-            // candidate even without tmp/agent/parent-cargo context. This is
-            // what lets a stranded `/root/cass-ft-target` be reclaimed. The
-            // broad `target-`/`target_` PREFIX forms stay SignalOnly in a
-            // source context, matching the conservative
-            // `opaque_tree_does_not_promote_broad_target_like_names_in_source_context`
-            // guarantee. All downstream deletion vetoes still apply.
-            || (has_descriptive_target_suffix(&name) && has_markers)
-        {
-            return Some(OpaqueTreeClassification::candidate(
-                "cargo/build target with regenerable context",
-                "opaque-cargo-target",
-                ArtifactCategory::RustTarget,
-                0.93,
-            ));
-        }
-        return Some(OpaqueTreeClassification::signal_only(if tmp_like {
-            "target-prefixed name under temp storage lacks cargo build markers"
-        } else {
-            "target-like directory lacks cargo/temp context"
-        }));
+        return Some(classify_cargo_target_name(path, &name, context, tmp_like));
     }
 
     if name == "node_modules" {
@@ -387,6 +349,60 @@ fn classify_code_sign_clone_area(path: &Path) -> Option<OpaqueTreeClassification
         CodeSignCloneLevel::Other => OpaqueTreeClassification::protected(
             "macOS code-sign clone area: only browser clones are candidates",
         ),
+    })
+}
+
+/// A directory whose name is target-like ([`is_cargo_target_name`]).
+///
+/// The broad `target-<x>` / `target_<x>` PREFIX forms are the only
+/// target-like shapes that ordinary crate and project names also satisfy
+/// (`target-triple`, `target_spec`), so temp-like placement alone is not
+/// enough to promote them: the tree must additionally carry a cargo build
+/// marker at its root. Descriptive `<prefix>-target` / `<prefix>_target`
+/// names need the same corroboration: release-evidence and fixture trees name
+/// directories `invalid_target` or `ambient-target` on purpose, and on ts2
+/// (2026-09-25) eight such directories inside non-git hfdt evidence bundles
+/// were deleted on the name alone. A plain `target` with no Cargo manifest
+/// beside it needs them too: hfdt stores keep a `target/` of their own
+/// (store-doctor undo data), and on ts2 the daemon deleted two agent store
+/// copies' `target` (2026-09-29) and nominated a 4.8 GB `target/doctor-undo`
+/// on the name alone (2026-10-20, bd-u9ua). Cargo writes CACHEDIR.TAG and
+/// .rustc_info.json into every target dir it builds in.
+fn classify_cargo_target_name(
+    path: &Path,
+    name: &str,
+    context: OpaqueTreeContext,
+    tmp_like: bool,
+) -> OpaqueTreeClassification {
+    let needs_markers = has_broad_target_prefix(name)
+        || has_descriptive_target_suffix(name)
+        || (name == "target" && !context.parent_has_cargo_toml);
+    let has_markers = needs_markers && has_cargo_target_root_markers(path);
+    let tmp_promotes = tmp_like && (!needs_markers || has_markers);
+    if (name == "target" && context.parent_has_cargo_toml)
+        || tmp_promotes
+        || is_agent_build_target_name(name)
+        // A descriptive suffix name WITH cargo's root markers is a
+        // `CARGO_TARGET_DIR` output, so V2 nominates it as a single opaque
+        // candidate even without tmp/agent/parent-cargo context. This is
+        // what lets a stranded `/root/cass-ft-target` be reclaimed. The
+        // broad `target-`/`target_` PREFIX forms stay SignalOnly in a
+        // source context, matching the conservative
+        // `opaque_tree_does_not_promote_broad_target_like_names_in_source_context`
+        // guarantee. All downstream deletion vetoes still apply.
+        || (has_descriptive_target_suffix(name) && has_markers)
+    {
+        return OpaqueTreeClassification::candidate(
+            "cargo/build target with regenerable context",
+            "opaque-cargo-target",
+            ArtifactCategory::RustTarget,
+            0.93,
+        );
+    }
+    OpaqueTreeClassification::signal_only(if tmp_like {
+        "target-like name under temp storage lacks cargo build markers"
+    } else {
+        "target-like directory lacks cargo/temp context"
     })
 }
 
@@ -2804,8 +2820,8 @@ mod tests {
         let opaque = classify_opaque_tree(&forged, OpaqueTreeContext::default()).unwrap();
         assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
 
-        // Descriptive suffix shapes need the same markers (issue #34); the
-        // plain `target` keeps the temp promotion.
+        // Descriptive suffix shapes need the same markers (issue #34), and so
+        // does a plain `target` without a Cargo manifest beside it.
         let descriptive = base.path().join("cass-ft-target");
         std::fs::create_dir_all(&descriptive).unwrap();
         let opaque = classify_opaque_tree(&descriptive, OpaqueTreeContext::default()).unwrap();
@@ -2816,7 +2832,40 @@ mod tests {
         let plain = base.path().join("target");
         std::fs::create_dir_all(&plain).unwrap();
         let opaque = classify_opaque_tree(&plain, OpaqueTreeContext::default()).unwrap();
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::SignalOnly);
+        std::fs::write(plain.join(".rustc_info.json"), "{}").unwrap();
+        let opaque = classify_opaque_tree(&plain, OpaqueTreeContext::default()).unwrap();
         assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
+    }
+
+    /// An hfdt store keeps a `target/` of its own (store-doctor undo data).
+    /// Under a temp root, with no Cargo manifest beside it and no cargo
+    /// marker inside, it is not a build target; beside a Cargo.toml it still
+    /// is, as before.
+    #[test]
+    fn an_hfdt_store_target_under_tmp_is_not_a_cargo_target() {
+        let base = tempfile::tempdir_in("/tmp").expect("tempdir under /tmp");
+        let store = base.path().join("freshstore_built");
+        std::fs::create_dir_all(store.join("target/doctor-undo/10726d")).unwrap();
+        std::fs::write(store.join("hfdt.sqlite"), b"SQLite format 3\0").unwrap();
+        std::fs::write(store.join("target/doctor-undo/10726d/page.bin"), [7u8; 64]).unwrap();
+
+        let opaque =
+            classify_opaque_tree(&store.join("target"), OpaqueTreeContext::default()).unwrap();
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::SignalOnly);
+
+        let beside_manifest = classify_opaque_tree(
+            &store.join("target"),
+            OpaqueTreeContext {
+                parent_has_cargo_toml: true,
+                parent_has_node_manifest: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            beside_manifest.disposition,
+            OpaqueTreeDisposition::CandidateOpaque
+        );
     }
 
     /// A non-temp scratch parent inside the checkout (`tmp/` is gitignored and
