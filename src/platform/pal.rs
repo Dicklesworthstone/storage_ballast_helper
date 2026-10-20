@@ -350,6 +350,16 @@ pub trait Platform: Send + Sync {
         self.process_list()
     }
 
+    /// [`Self::process_list_without_command_lines`] cut to what one
+    /// `/proc/<pid>/stat` read gives on Linux: pid, parent, name, start time
+    /// and CPU times, with no executable, cwd or memory counters. For a
+    /// sampler that keys processes by (pid, start time): the full list reads
+    /// three files and two links per process, every 30 s on the monitor
+    /// thread for the I/O history (~2,000 processes on trj, bd-du48).
+    fn process_list_brief(&self) -> Result<Vec<ProcessInfo>> {
+        self.process_list_without_command_lines()
+    }
+
     fn process_io(&self, _pid: i32) -> Result<ProcessIo> {
         pal_not_implemented(self.name(), "process_io")
     }

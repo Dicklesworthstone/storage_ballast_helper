@@ -170,6 +170,10 @@ impl Platform for LinuxPal {
         process::read_process_list_without_command_lines()
     }
 
+    fn process_list_brief(&self) -> Result<Vec<ProcessInfo>> {
+        process::read_process_list_brief()
+    }
+
     fn process_io(&self, pid: i32) -> Result<ProcessIo> {
         process::read_process_io(pid)
     }

@@ -356,6 +356,10 @@ impl Platform for TestOverlayPlatform {
         self.inner.process_list_without_command_lines()
     }
 
+    fn process_list_brief(&self) -> Result<Vec<ProcessInfo>> {
+        self.inner.process_list_brief()
+    }
+
     fn process_io(&self, pid: i32) -> Result<ProcessIo> {
         self.inner.process_io(pid)
     }

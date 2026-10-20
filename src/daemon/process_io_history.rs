@@ -151,8 +151,9 @@ impl ProcessIoHistory {
         let collected_at_unix_ms = unix_time_ms();
         self.prune_history(collected_at_unix_ms);
         // Runs on the monitor thread: no argv reads, which can block behind
-        // another process's memory-map lock.
-        let processes = match platform.process_list_without_command_lines() {
+        // another process's memory-map lock. Only pid and start time are
+        // used, so the brief list (one stat read per process) is enough.
+        let processes = match platform.process_list_brief() {
             Ok(processes) => processes,
             Err(error) => {
                 return (
