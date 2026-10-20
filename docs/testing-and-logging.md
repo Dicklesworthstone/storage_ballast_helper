@@ -126,37 +126,56 @@ macOS-only tests are compiled out here, `#[ignore]` tests are listed.
 <!-- sbh-census:begin -->
 | Target | Tests |
 | --- | --- |
-| `cargo test --lib` (default features, with the TUI) | 2605 |
-| `cargo test --lib --no-default-features --features cli,daemon,sqlite` (lean) | 1625 |
-| `cargo test --bin sbh` | 151 |
-| `cargo test --test cli_exit_codes` | 5 |
-| `cargo test --test daemon_e2e` | 22 |
+| `cargo test --lib` (default features, with the TUI) | 4183 |
+| `cargo test --lib --no-default-features --features cli,daemon,sqlite` (lean) | 3205 |
+| `cargo test --bin sbh` | 189 |
+| `cargo test --test build_reference_coverage` | 5 |
+| `cargo test --test cli_exit_codes` | 6 |
+| `cargo test --test compression_activity` | 4 |
+| `cargo test --test compression_discovery` | 4 |
+| `cargo test --test daemon_e2e` | 27 |
 | `cargo test --test dashboard_integration_tests` | 31 |
-| `cargo test --test dashboard_pty` | 3 |
+| `cargo test --test dashboard_pty` | 6 |
 | `cargo test --test decision_plane_e2e` | 7 |
-| `cargo test --test explain_ledger` | 4 |
+| `cargo test --test deletion_boundary` | 20 |
+| `cargo test --test explain_ledger` | 5 |
 | `cargo test --test fallback_verification` | 42 |
 | `cargo test --test fuzz_smoke` | 2 |
 | `cargo test --test installer_e2e` | 50 |
 | `cargo test --test integration_tests` | 71 |
+| `cargo test --test macos_fsevents` | 0 |
+| `cargo test --test macos_pid_inventory` | 13 |
+| `cargo test --test mount_pressure_wake` | 16 |
 | `cargo test --test proof_harness` | 26 |
+| `cargo test --test ram_log_memory_constraints` | 8 |
 | `cargo test --test regression_issue_pid_slow_attack` | 1 |
 | `cargo test --test regression_path_traversal` | 4 |
 | `cargo test --test regression_risky_patterns` | 16 |
 | `cargo test --test repro_ballast_restart_stability` | 1 |
+| `cargo test --test repro_cachedir_tag_evidence` | 12 |
 | `cargo test --test repro_dangerous_patterns` | 1 |
 | `cargo test --test repro_glob` | 2 |
+| `cargo test --test repro_inotify_lifecycle` | 10 |
 | `cargo test --test repro_issue` | 2 |
+| `cargo test --test repro_linux_executable_coverage` | 1 |
+| `cargo test --test repro_linux_mmap_coverage` | 1 |
 | `cargo test --test repro_merkle_index_integration` | 1 |
 | `cargo test --test repro_pid_skew` | 1 |
+| `cargo test --test repro_pressure_scan_scheduling` | 6 |
 | `cargo test --test repro_risky_patterns` | 2 |
 | `cargo test --test repro_symlink_loop` | 1 |
 | `cargo test --test repro_tui_panic` | 2 |
+| `cargo test --test root_install_script` | 3 |
+| `cargo test --test self_update_service_restart` | 17 |
+| `cargo test --test source_root_cli` | 7 |
+| `cargo test --test source_root_default_executor` | 16 |
 | `cargo test --test stress_harness` | 9 |
 | `cargo test --test stress_tests` | 12 |
-| Integration test files (sum of the `--test` rows) | 318 |
+| `cargo test --test update_transaction_lock` | 8 |
+| `cargo test --test walker_result_batch` | 10 |
+| Integration test files (sum of the `--test` rows) | 489 |
 | E2E shell cases defined in `scripts/e2e_test.sh` | 129 |
-| **Cargo tests on Linux, default features (lib + bin + integration)** | **3074** |
+| **Cargo tests on Linux, default features (lib + bin + integration)** | **4861** |
 <!-- sbh-census:end -->
 
 ### Binary Tests (CLI)
