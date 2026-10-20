@@ -2302,3 +2302,149 @@ fn install_script_with_dest_leaves_an_installed_service_alone() {
     );
     assert!(text.contains("left as it is"), "{text}");
 }
+
+/// What scripts/install.sh did to an installed system service whose binary
+/// reports `sbh <service_version>`, installing a release that reports
+/// `sbh 9.9.9` (`--version` when `pinned`): the service binary afterwards,
+/// the stubbed `sudo`/`systemctl` calls, and the installer's output. The
+/// unit is a fixture (`SBH_TEST_MODE` + `SBH_SYSTEMD_UNIT_DIR`), `sudo` runs
+/// its command after recording it, and a stub `curl` keeps https (the skill
+/// tarball) off the network.
+#[cfg(target_os = "linux")]
+fn install_over_a_service_reporting(
+    service_version: &str,
+    pinned: Option<&str>,
+) -> (String, String, String) {
+    use std::process::Command;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let write_executable = |path: &Path, body: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+
+    let service_binary = root.join("service/sbh");
+    write_executable(
+        &service_binary,
+        &format!("#!/bin/sh\necho 'sbh {service_version}'\n"),
+    );
+    let unit_dir = root.join("units");
+    std::fs::create_dir_all(&unit_dir).unwrap();
+    std::fs::write(
+        unit_dir.join("sbh.service"),
+        format!("[Service]\nExecStart={} daemon\n", service_binary.display()),
+    )
+    .unwrap();
+
+    let calls = root.join("calls.log");
+    let stubs = root.join("stubs");
+    write_executable(
+        &stubs.join("systemctl"),
+        &format!(
+            "#!/bin/sh\necho \"systemctl $*\" >> '{}'\nexit 0\n",
+            calls.display()
+        ),
+    );
+    write_executable(
+        &stubs.join("sudo"),
+        &format!(
+            "#!/bin/sh\necho \"sudo $*\" >> '{}'\nexec \"$@\"\n",
+            calls.display()
+        ),
+    );
+    write_executable(
+        &stubs.join("curl"),
+        "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in http://*|https://*) exit 22 ;; esac\n\
+         done\nPATH=/usr/bin:/bin exec curl \"$@\"\n",
+    );
+
+    let payload = root.join("payload/sbh");
+    write_executable(&payload, "#!/bin/sh\necho 'sbh 9.9.9'\n");
+    let artifact = root.join("artifact.tar.xz");
+    let packed = Command::new("tar")
+        .arg("-cJf")
+        .arg(&artifact)
+        .arg("-C")
+        .arg(payload.parent().unwrap())
+        .arg("sbh")
+        .status()
+        .unwrap();
+    assert!(packed.success());
+    let checksum = root.join("artifact.sha256");
+    let digest = hex_lower(Sha256::digest(std::fs::read(&artifact).unwrap()));
+    std::fs::write(&checksum, format!("{digest}  artifact.tar.xz\n")).unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh");
+    let mut command = Command::new("bash");
+    command
+        .arg(&script)
+        .args(["--no-verify", "--no-color"])
+        .env("HOME", root.join("home"))
+        .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
+        .env("SBH_TEST_MODE", "1")
+        .env("SBH_SYSTEMD_UNIT_DIR", &unit_dir)
+        .env(
+            "SBH_INSTALLER_ASSET_URL",
+            format!("file://{}", artifact.display()),
+        )
+        .env(
+            "SBH_INSTALLER_CHECKSUM_URL",
+            format!("file://{}", checksum.display()),
+        );
+    if let Some(version) = pinned {
+        command.args(["--version", version]);
+    }
+    let output = command.output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("home/.local/bin/sbh")).unwrap(),
+        "#!/bin/sh\necho 'sbh 9.9.9'\n",
+        "{text}"
+    );
+    (
+        std::fs::read_to_string(&service_binary).unwrap(),
+        std::fs::read_to_string(&calls).unwrap_or_default(),
+        text,
+    )
+}
+
+/// scripts/install.sh never downgrades an installed service unasked. The
+/// nightly ACFS update runs it without --version: on ts2 it found v0.7.9
+/// "already up to date" in ~/.local/bin, then copied that over the v0.7.10
+/// /usr/local/bin/sbh and restarted the daemon (2026-10-20). A service on a
+/// newer release is now left alone; an older one is still upgraded, and a
+/// --version still installs an older release on purpose.
+#[cfg(target_os = "linux")]
+#[test]
+fn install_script_never_downgrades_the_service_unasked() {
+    let payload = "#!/bin/sh\necho 'sbh 9.9.9'\n";
+
+    let (service, calls, text) = install_over_a_service_reporting("9.9.10", None);
+    assert_eq!(service, "#!/bin/sh\necho 'sbh 9.9.10'\n", "{text}");
+    assert!(
+        !calls.contains("stop") && !calls.contains("install"),
+        "the newer service was touched: {calls}"
+    );
+    assert!(
+        text.contains("runs v9.9.10, newer than the v9.9.9"),
+        "{text}"
+    );
+
+    let (service, calls, text) = install_over_a_service_reporting("9.9.8", None);
+    assert_eq!(service, payload, "an older service is upgraded: {text}");
+    assert!(
+        calls.contains("sudo systemctl stop sbh.service")
+            && calls.contains("sudo systemctl start sbh.service"),
+        "{calls}"
+    );
+
+    let (service, _, text) = install_over_a_service_reporting("9.9.10", Some("v9.9.9"));
+    assert_eq!(service, payload, "a pinned --version downgrades: {text}");
+}
