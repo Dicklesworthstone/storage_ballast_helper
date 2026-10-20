@@ -17,9 +17,19 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   instead of 10.8 s). With file stats, CPU also grew with walker threads,
   from btrfs's per-root inode lock; without them it stays flat. Trees with
   fewer files per directory gain less. CLI walks are unchanged.
+- **The I/O-history sampler reads one `/proc` file per process** (bd-du48;
+  `678707e`). Every 30 s the monitor thread listed every process with its
+  `comm`, `status` and `stat` files and `exe` and `cwd` links, though the
+  sampler uses only the pid and start time, both in `/proc/<pid>/stat`.
 
 ### Fixed
 
+- **A directory named `target` under a temp root is no longer a cargo target
+  on its name alone** (bd-u9ua; `14f5b71`). Without a `Cargo.toml` beside it,
+  it now needs cargo's own markers (`CACHEDIR.TAG`, `.rustc_info.json`,
+  `debug/`, ...). hfdt stores keep a `target/` of their own: on ts2 the
+  daemon deleted it from two agent store copies (2026-09-29), and a 5 GB
+  `target/doctor-undo` scored as a 0.93 cargo target.
 - **A scan pass that stops on its budget no longer hides unexplored ground
   from the next one** (bd-y70k; `efc01b1`, `ad7fcaf`). After such a pass
   (on ts2, every pass: they stop at 500,000 entries) the daemon cached as
