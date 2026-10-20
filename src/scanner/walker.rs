@@ -220,13 +220,23 @@ struct WorkItem {
 pub struct WalkStream {
     rx: channel::Receiver<Vec<WalkEntry>>,
     pending: std::vec::IntoIter<WalkEntry>,
+    /// The walk's work queue: what is still in it was never listed.
+    work: Option<channel::Receiver<WorkItem>>,
+    /// Paths the workers recorded as unfinished (see [`ResultBatch`]).
+    unfinished: Arc<parking_lot::Mutex<Vec<PathBuf>>>,
 }
 
 impl WalkStream {
-    fn new(rx: channel::Receiver<Vec<WalkEntry>>) -> Self {
+    fn new(
+        rx: channel::Receiver<Vec<WalkEntry>>,
+        work: Option<channel::Receiver<WorkItem>>,
+        unfinished: Arc<parking_lot::Mutex<Vec<PathBuf>>>,
+    ) -> Self {
         Self {
             rx,
             pending: Vec::new().into_iter(),
+            work,
+            unfinished,
         }
     }
 
@@ -236,7 +246,42 @@ impl WalkStream {
         let (tx, rx) = channel::bounded(1);
         // Room for exactly this batch, and the receiver is alive.
         let _ = tx.send(entries);
-        Self::new(rx)
+        Self::new(rx, None, Arc::default())
+    }
+
+    /// For a consumer that stopped early and set the walker's cancel flag:
+    /// the paths whose subtrees it has not seen. Each returned path and every
+    /// directory above it is unfinished, so a directory listed before the
+    /// stop is complete only if nothing returned lies at or below it. They
+    /// are the entries still in this stream, the parents of directories still
+    /// queued, directories a worker was listing or dispatching when it
+    /// stopped, entries it had not sent, and directories longer than one
+    /// processing window. Waits up to `wait` for the workers to stop, and is
+    /// `None` if they have not: until then the answer is not final.
+    pub fn unfinished_after_cancel(mut self, wait: Duration) -> Option<Vec<PathBuf>> {
+        let deadline = Instant::now() + wait;
+        let mut unfinished: HashSet<PathBuf> =
+            self.pending.by_ref().map(|entry| entry.path).collect();
+        loop {
+            match self
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(batch) => unfinished.extend(batch.into_iter().map(|entry| entry.path)),
+                Err(channel::RecvTimeoutError::Disconnected) => break,
+                Err(channel::RecvTimeoutError::Timeout) => return None,
+            }
+        }
+        // Every worker has exited, so the queue and the record are final.
+        // A wide queue holds many siblings: their parent stands for them.
+        if let Some(work) = &self.work {
+            unfinished.extend(
+                work.try_iter()
+                    .filter_map(|item| item.path.parent().map(Path::to_path_buf)),
+            );
+        }
+        unfinished.extend(self.unfinished.lock().drain(..));
+        Some(unfinished.into_iter().collect())
     }
 
     /// The next entry, waiting up to `timeout` for the workers to send more.
@@ -266,21 +311,41 @@ impl Iterator for WalkStream {
     }
 }
 
-/// A worker's results not yet sent to the collector.
+/// A worker's results not yet sent to the collector, and its record of what
+/// the collector will not see: entries lost to a cancelled or abandoned send
+/// (or still held when the worker stops), and directories the worker left
+/// part-done. [`WalkStream::unfinished_after_cancel`] reports them.
 struct ResultBatch<'a> {
     tx: &'a channel::Sender<Vec<WalkEntry>>,
     pending: Vec<WalkEntry>,
     capacity: usize,
+    unfinished: &'a parking_lot::Mutex<Vec<PathBuf>>,
 }
 
 impl<'a> ResultBatch<'a> {
-    fn new(tx: &'a channel::Sender<Vec<WalkEntry>>, capacity: usize) -> Self {
+    fn new(
+        tx: &'a channel::Sender<Vec<WalkEntry>>,
+        capacity: usize,
+        unfinished: &'a parking_lot::Mutex<Vec<PathBuf>>,
+    ) -> Self {
         let capacity = capacity.max(1);
         Self {
             tx,
             pending: Vec::with_capacity(capacity),
             capacity,
+            unfinished,
         }
+    }
+
+    /// Record that the collector will not see all of `dir`'s subtree.
+    fn mark_unfinished(&self, dir: &Path) {
+        self.unfinished.lock().push(dir.to_path_buf());
+    }
+
+    fn lose(&self, batch: Vec<WalkEntry>) {
+        self.unfinished
+            .lock()
+            .extend(batch.into_iter().map(|entry| entry.path));
     }
 
     /// Queue `entry`, sending the batch once it is full. False when the walk
@@ -291,7 +356,7 @@ impl<'a> ResultBatch<'a> {
     }
 
     /// Send the queued entries, waiting while the channel is full. False,
-    /// with the entries dropped, when the walk was cancelled or the
+    /// with the entries recorded as lost, when the walk was cancelled or the
     /// collector is gone.
     fn flush(&mut self, cancel: &AtomicBool) -> bool {
         if self.pending.is_empty() {
@@ -303,12 +368,26 @@ impl<'a> ResultBatch<'a> {
                 Ok(()) => return true,
                 Err(channel::SendTimeoutError::Timeout(unsent)) => {
                     if cancel.load(Ordering::Relaxed) {
+                        self.lose(unsent);
                         return false;
                     }
                     batch = unsent;
                 }
-                Err(channel::SendTimeoutError::Disconnected(_)) => return false,
+                Err(channel::SendTimeoutError::Disconnected(unsent)) => {
+                    self.lose(unsent);
+                    return false;
+                }
             }
+        }
+    }
+}
+
+impl Drop for ResultBatch<'_> {
+    /// A worker that stops on cancellation holds entries it never sent.
+    fn drop(&mut self) {
+        if !self.pending.is_empty() {
+            let held = std::mem::take(&mut self.pending);
+            self.lose(held);
         }
     }
 }
@@ -781,6 +860,7 @@ impl DirectoryWalker {
             size: self.dir_window,
             starts: oversized_window_starts().lock().clone(),
         });
+        let unfinished = Arc::new(parking_lot::Mutex::new(Vec::new()));
 
         // Clone sender for workers; drop original so channel closes when workers finish.
         for _ in 0..parallelism {
@@ -793,6 +873,7 @@ impl DirectoryWalker {
             let heartbeat = self.heartbeat.clone();
             let cancel = Arc::clone(&self.cancel);
             let windows = Arc::clone(&windows);
+            let unfinished = Arc::clone(&unfinished);
 
             thread::spawn(move || {
                 walker_thread(
@@ -805,11 +886,14 @@ impl DirectoryWalker {
                     &protection,
                     heartbeat.as_ref(),
                     &cancel,
+                    &unfinished,
                 );
             });
         }
 
-        Ok(WalkStream::new(result_rx))
+        // The stream keeps a receiver of the work queue, so what a cancelled
+        // walk never listed can still be read once the workers are gone.
+        Ok(WalkStream::new(result_rx, Some(work_rx), unfinished))
     }
 
     /// Access the protection registry (e.g. to list discovered markers).
@@ -831,8 +915,9 @@ fn walker_thread(
     protection: &parking_lot::RwLock<ProtectionRegistry>,
     heartbeat: Option<&Arc<dyn Fn() + Send + Sync>>,
     cancel: &AtomicBool,
+    unfinished: &parking_lot::Mutex<Vec<PathBuf>>,
 ) {
-    let mut results = ResultBatch::new(result_tx, WALK_BATCH_ENTRIES);
+    let mut results = ResultBatch::new(result_tx, WALK_BATCH_ENTRIES, unfinished);
     loop {
         // Check cancellation flag before doing any work.
         if cancel.load(Ordering::Relaxed) {
@@ -979,6 +1064,7 @@ fn process_directory(
         // when a scan budget expires instead of waiting for the entire
         // directory to finish.
         if cancel.load(Ordering::Relaxed) {
+            results.mark_unfinished(dir_path);
             return;
         }
 
@@ -1105,6 +1191,10 @@ fn process_directory(
 
     // A listing longer than one window: the next pass takes the next window.
     let next_start = next_window_start(window_start, total_count, windows.size);
+    if next_start.is_some() {
+        // This pass leaves the rest of the listing unexamined.
+        results.mark_unfinished(dir_path);
+    }
     if next_start.is_some() || window_start > 0 {
         let mut starts = oversized_window_starts().lock();
         match next_start {
@@ -1122,6 +1212,7 @@ fn process_directory(
     // threads stuck on a full work channel will notice within 100ms and exit.
     for child_path in pending_children {
         if cancel.load(Ordering::Relaxed) {
+            results.mark_unfinished(dir_path);
             return;
         }
         let opaque_tree = if config.opaque_pruning {
@@ -1184,6 +1275,7 @@ fn process_directory(
                         opaque_tree: Some(opaque),
                     };
                     if !results.push(walk_entry, cancel) {
+                        results.mark_unfinished(dir_path);
                         return;
                     }
                     continue;
@@ -1208,11 +1300,13 @@ fn process_directory(
                     // Channel full — check cancel before retrying.
                     if cancel.load(Ordering::Relaxed) {
                         in_flight.fetch_sub(1, Ordering::Release);
+                        results.mark_unfinished(dir_path);
                         return;
                     }
                 }
                 Err(channel::SendTimeoutError::Disconnected(_)) => {
                     in_flight.fetch_sub(1, Ordering::Release);
+                    results.mark_unfinished(dir_path);
                     return;
                 }
             }
@@ -4517,11 +4611,17 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
 
-        let dir_clone = dir;
+        let unfinished = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let worker_unfinished = Arc::clone(&unfinished);
+
+        // The directory's own device: with any other, the cross-device guard
+        // returns before the listing and nothing below is exercised.
+        let root_dev = device_id(&fs::metadata(&dir).unwrap());
+        let dir_clone = dir.clone();
         let start = Instant::now();
         let join = thread::spawn(move || {
             // A one-entry batch sends on every push, so the emitter blocks.
-            let mut results = ResultBatch::new(&result_tx, 1);
+            let mut results = ResultBatch::new(&result_tx, 1, &worker_unfinished);
             let windows = DirWindows {
                 size: MAX_ENTRIES_PER_DIR,
                 starts: HashMap::new(),
@@ -4529,7 +4629,7 @@ mod tests {
             process_directory(
                 &dir_clone,
                 1,
-                0,
+                root_dev,
                 None,
                 &work_tx,
                 &mut results,
@@ -4551,6 +4651,11 @@ mod tests {
             "process_directory should stop promptly when cancellation is requested",
         );
         assert_eq!(result_rx.len(), 1, "no extra entries should be emitted");
+        assert_eq!(
+            *unfinished.lock(),
+            [dir],
+            "the entry the cancel kept from the collector is recorded as unfinished"
+        );
     }
 
     fn bare_entry(path: &str) -> WalkEntry {
@@ -4583,7 +4688,8 @@ mod tests {
 
         let (tx, rx) = channel::unbounded::<Vec<WalkEntry>>();
         let cancel = AtomicBool::new(false);
-        let mut results = ResultBatch::new(&tx, 4);
+        let unfinished = parking_lot::Mutex::new(Vec::new());
+        let mut results = ResultBatch::new(&tx, 4, &unfinished);
         for i in 0..10 {
             assert!(results.push(bare_entry(&format!("/d{i}")), &cancel));
         }
@@ -4607,7 +4713,7 @@ mod tests {
         tx.send(vec![bare_entry("/a"), bare_entry("/b")]).unwrap();
         tx.send(vec![bare_entry("/c")]).unwrap();
         drop(tx);
-        let mut stream = WalkStream::new(rx);
+        let mut stream = WalkStream::new(rx, None, Arc::default());
         let wait = Duration::from_secs(1);
         assert_eq!(stream.recv_timeout(wait).unwrap().path, Path::new("/a"));
         assert_eq!(stream.next().unwrap().path, Path::new("/b"));
@@ -4659,6 +4765,95 @@ mod tests {
                 assert_eq!(unique, expected, "parallelism {parallelism}");
             }
         }
+    }
+
+    /// bd-y70k: whenever a consumer stops early, every directory it took
+    /// that has unseen directories below it lies at or above a path the
+    /// stream reports unfinished, however the stop falls against the workers.
+    /// A walk the consumer saw to the end reports nothing.
+    #[test]
+    fn a_cancelled_walk_reports_every_subtree_its_consumer_did_not_finish() {
+        let tmp = TempDir::new().unwrap();
+        // Fan-out 5, depth 4: 5 + 25 + 125 + 625 = 780 directories.
+        let mut tree = HashSet::new();
+        for a in 0..5 {
+            for b in 0..5 {
+                for c in 0..5 {
+                    for d in 0..5 {
+                        let leaf = tmp.path().join(format!("a{a}/b{b}/c{c}/d{d}"));
+                        fs::create_dir_all(&leaf).unwrap();
+                        tree.extend(
+                            leaf.ancestors()
+                                .take_while(|dir| *dir != tmp.path())
+                                .map(Path::to_path_buf),
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(tree.len(), 780);
+
+        for parallelism in [1, 4] {
+            for take in [1, 7, 60, 400, 779, 780] {
+                let mut config = test_config(tmp.path());
+                config.parallelism = parallelism;
+                let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+                let cancel = walker.cancel_token();
+                let mut stream = walker.stream().unwrap();
+                let seen: HashSet<PathBuf> =
+                    stream.by_ref().take(take).map(|entry| entry.path).collect();
+                cancel.store(true, Ordering::Relaxed);
+                let unfinished = stream
+                    .unfinished_after_cancel(Duration::from_secs(10))
+                    .expect("cancelled workers stop well inside the wait");
+
+                let marked: HashSet<&Path> = unfinished
+                    .iter()
+                    .flat_map(|path| path.ancestors())
+                    .collect();
+                let incomplete: HashSet<&Path> = tree
+                    .iter()
+                    .filter(|dir| !seen.contains(*dir))
+                    .flat_map(|dir| dir.ancestors().skip(1))
+                    .collect();
+                for dir in seen.iter().filter(|dir| incomplete.contains(dir.as_path())) {
+                    assert!(
+                        marked.contains(dir.as_path()),
+                        "parallelism {parallelism}, took {take}: {} has unseen directories \
+                         below it but no unfinished path at or below it",
+                        dir.display()
+                    );
+                }
+                if take == tree.len() {
+                    assert_eq!(seen, tree);
+                    assert_eq!(unfinished, Vec::<PathBuf>::new(), "a finished walk");
+                }
+            }
+        }
+    }
+
+    /// A directory longer than one processing window is unfinished even when
+    /// the walk runs to the end: the rest of its listing waits for later passes.
+    #[test]
+    fn a_directory_longer_than_its_window_is_reported_unfinished() {
+        let tmp = TempDir::new().unwrap();
+        let wide = tmp.path().join("wide");
+        let narrow = tmp.path().join("narrow");
+        for index in 0..6 {
+            fs::create_dir_all(wide.join(format!("c{index}"))).unwrap();
+        }
+        fs::create_dir_all(narrow.join("only")).unwrap();
+
+        let walker =
+            DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only())
+                .with_dir_window(4);
+        let mut stream = walker.stream().unwrap();
+        let entries = stream.by_ref().count();
+        assert!(entries > 0);
+        let unfinished = stream
+            .unfinished_after_cancel(Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(unfinished, [wide]);
     }
 
     #[test]

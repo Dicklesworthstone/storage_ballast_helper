@@ -7535,7 +7535,8 @@ impl ScanCursor {
     /// Update the cache after a scan pass.
     ///
     /// `visited_dirs` — all directories the walker emitted entries for.
-    /// `dirs_with_candidates` — directories that had at least one classified child.
+    /// `non_barren_dirs` — directories at or above a classified entry, or at
+    /// or above ground the pass left unseen (see [`mark_non_barren`]).
     /// `timed_out` — whether the scan hit its time/entry budget.
     ///
     /// Only caches barren dirs when the scan timed out (no point caching if the
@@ -7544,7 +7545,7 @@ impl ScanCursor {
     fn update(
         &mut self,
         visited_dirs: &HashSet<PathBuf>,
-        dirs_with_candidates: &HashSet<PathBuf>,
+        non_barren_dirs: &HashSet<PathBuf>,
         timed_out: bool,
     ) {
         if !timed_out {
@@ -7557,7 +7558,7 @@ impl ScanCursor {
 
         // Remove dirs that turned out to have candidates (they may have been
         // cached as barren from a prior pass but gained artifacts since).
-        for dir in dirs_with_candidates {
+        for dir in non_barren_dirs {
             self.barren_dirs.remove(dir);
         }
 
@@ -7573,9 +7574,7 @@ impl ScanCursor {
         // older timestamp.
         let fresh: Vec<&PathBuf> = visited_dirs
             .iter()
-            .filter(|dir| {
-                !dirs_with_candidates.contains(*dir) && !self.barren_dirs.contains_key(*dir)
-            })
+            .filter(|dir| !non_barren_dirs.contains(*dir) && !self.barren_dirs.contains_key(*dir))
             .take(self.max_entries)
             .collect();
 
@@ -7593,18 +7592,26 @@ impl ScanCursor {
     }
 }
 
-/// Record that `candidate` and every directory above it hold a candidate.
-/// Marking only the direct parent let a budget-stopped pass cache `/r/a` as
-/// barren for a candidate at `/r/a/b/target`, and the candidate directory
-/// itself, so the next pass skipped both (bd-y70k). Stops at the first
-/// ancestor already marked: its own ancestors were marked with it.
-fn mark_candidate_ancestors(dirs_with_candidates: &mut HashSet<PathBuf>, candidate: &Path) {
-    for dir in candidate.ancestors() {
-        if dir.as_os_str().is_empty() || !dirs_with_candidates.insert(dir.to_path_buf()) {
+/// Record that `path` and every directory above it must not be cached as
+/// barren: `path` is a classified entry, or ground a budget-stopped pass left
+/// unseen ([`WalkStream::unfinished_after_cancel`]). Marking only a
+/// candidate's direct parent let a pass cache `/r/a` as barren for a
+/// candidate at `/r/a/b/target`, and the candidate directory itself; and a
+/// listed directory whose children were still queued at the stop was cached
+/// with them unseen. The next pass skipped all of them for 30 minutes
+/// (bd-y70k). Stops at the first ancestor already marked: its own ancestors
+/// were marked with it.
+fn mark_non_barren(non_barren_dirs: &mut HashSet<PathBuf>, path: &Path) {
+    for dir in path.ancestors() {
+        if dir.as_os_str().is_empty() || !non_barren_dirs.insert(dir.to_path_buf()) {
             break;
         }
     }
 }
+
+/// How long a budget-stopped pass waits for its walker threads to stop
+/// before it gives up on knowing what they left unseen.
+const WALK_STOP_WAIT: Duration = Duration::from_secs(5);
 
 /// How often an unchanged "maintenance keep" verdict for one path is repeated.
 const MAINTENANCE_KEEP_REPEAT: Duration = Duration::from_hours(1);
@@ -9179,7 +9186,7 @@ fn scanner_thread_main(
 
         // Track directories for the incremental scan cursor.
         let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
-        let mut dirs_with_candidates: HashSet<PathBuf> = HashSet::new();
+        let mut non_barren_dirs: HashSet<PathBuf> = HashSet::new();
         let dispatch_threshold = request
             .max_delete_batch
             .max(1)
@@ -9321,7 +9328,7 @@ fn scanner_thread_main(
 
             // This entry is classified: the scan cursor must not cache it or
             // any directory above it as barren.
-            mark_candidate_ancestors(&mut dirs_with_candidates, &entry.path);
+            mark_non_barren(&mut non_barren_dirs, &entry.path);
 
             let mut input = crate::scanner::scoring::CandidateInput {
                 path: entry.path.clone(), // Clone needed for input
@@ -9552,6 +9559,25 @@ fn scanner_thread_main(
             }
         }
 
+        // A pass stopped by its budget left part of the tree unseen: nothing
+        // at or above that ground may be cached as barren (bd-y70k). If the
+        // walker threads do not stop in time, what they left is unknown, and
+        // the pass caches nothing new.
+        if scan_timed_out {
+            let unfinished = rx.unfinished_after_cancel(WALK_STOP_WAIT);
+            for path in unfinished.iter().flatten() {
+                mark_non_barren(&mut non_barren_dirs, path);
+            }
+            if unfinished.is_none() {
+                eprintln!(
+                    "[SBH-SCANNER] walker threads still running {}s after the stop; \
+                     the scan cursor caches nothing from this pass",
+                    WALK_STOP_WAIT.as_secs()
+                );
+                visited_dirs.clear();
+            }
+        }
+
         // Distribute total scan duration across roots so the VOI scheduler gets
         // non-zero IO cost estimates.  The walker interleaves entries from all
         // roots, so per-root wall time is not available; dividing evenly is an
@@ -9597,7 +9623,7 @@ fn scanner_thread_main(
         // Update the incremental scan cursor. On timeout, barren dirs are
         // cached so the next pass skips them. On full completion, cache is
         // cleared for a fresh scan.
-        scan_cursor.update(&visited_dirs, &dirs_with_candidates, scan_timed_out);
+        scan_cursor.update(&visited_dirs, &non_barren_dirs, scan_timed_out);
 
         // Persist v2 candidate-index state before reporting completion.
         if scanner_index_enabled && let Some(index) = scanner_index.as_mut() {
@@ -11657,9 +11683,9 @@ mod tests {
         let mut cursor = scan_cursor(100, &[("/r/a", 1)]);
         let visited = path_set(&["/r/a", "/r/a/b", "/r/a/b/target", "/r/x", "/r/x/y"]);
         let mut candidates = HashSet::new();
-        mark_candidate_ancestors(&mut candidates, Path::new("/r/a/b/target"));
+        mark_non_barren(&mut candidates, Path::new("/r/a/b/target"));
         // A second candidate under the same tree stops at the marked parent.
-        mark_candidate_ancestors(&mut candidates, Path::new("/r/a/b/node_modules"));
+        mark_non_barren(&mut candidates, Path::new("/r/a/b/node_modules"));
 
         cursor.update(&visited, &candidates, true);
 
@@ -11675,6 +11701,65 @@ mod tests {
             assert!(candidates.contains(Path::new(marked)), "{marked}");
         }
         assert!(candidates.contains(Path::new("/r/a/b/node_modules")));
+    }
+
+    /// bd-y70k: a pass that stops on its budget must not cache a listed
+    /// directory as barren while ground below it is unseen. One worker walks
+    /// breadth-first, so a pass that stops after the top level has listed
+    /// every top-level directory and seen nothing below; the next pass must
+    /// still reach a directory two levels down. The old rule (visited minus
+    /// candidates) cached every top-level directory and never reached it.
+    #[test]
+    fn the_pass_after_a_budget_stop_reaches_ground_the_stopped_pass_never_saw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for top in 0..8 {
+            for mid in 0..3 {
+                std::fs::create_dir_all(root.join(format!("t{top}/m{mid}"))).unwrap();
+            }
+        }
+        let deep = root.join("t5/m1/target");
+        std::fs::create_dir_all(&deep).unwrap();
+        let config = |excluded: HashSet<PathBuf>| WalkerConfig {
+            root_paths: vec![root.to_path_buf()],
+            max_depth: 10,
+            follow_symlinks: false,
+            cross_devices: false,
+            parallelism: 1,
+            excluded_paths: excluded,
+            opaque_pruning: false,
+        };
+
+        // Pass 1 stops after the eight top-level directories.
+        let walker =
+            DirectoryWalker::new(config(HashSet::new()), ProtectionRegistry::marker_only());
+        let cancel = walker.cancel_token();
+        let mut stream = walker.stream().unwrap();
+        let visited: HashSet<PathBuf> = stream.by_ref().take(8).map(|entry| entry.path).collect();
+        cancel.store(true, Ordering::Relaxed);
+        assert!(visited.iter().all(|dir| dir.parent() == Some(root)));
+        let mut non_barren = HashSet::new();
+        for path in stream.unfinished_after_cancel(WALK_STOP_WAIT).unwrap() {
+            mark_non_barren(&mut non_barren, &path);
+        }
+        let mut cursor = ScanCursor::new();
+        cursor.update(&visited, &non_barren, true);
+        let mut old_rule = ScanCursor::new();
+        old_rule.update(&visited, &HashSet::new(), true);
+
+        let second_pass = |cursor: &ScanCursor| -> Vec<PathBuf> {
+            DirectoryWalker::new(
+                config(cursor.barren_exclusions()),
+                ProtectionRegistry::marker_only(),
+            )
+            .walk()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect()
+        };
+        assert!(second_pass(&cursor).contains(&deep));
+        assert!(!second_pass(&old_rule).contains(&deep));
     }
 
     #[test]
