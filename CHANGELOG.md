@@ -30,6 +30,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   `debug/`, ...). hfdt stores keep a `target/` of their own: on ts2 the
   daemon deleted it from two agent store copies (2026-09-29), and a 5 GB
   `target/doctor-undo` scored as a 0.93 cargo target.
+- **`sbh clean`, `sbh emergency`, and the daemon's pre-scan and index replay
+  classify a directory as the walk does** (bd-10yj; `93c6c4f`). They classified by name
+  and ignored the walker's verdict, so `clean` missed a Go build cache that
+  `scan` nominated, and a tree the walk only descends into (an hfdt store's
+  own `target/`, a repo copy's `scripts/build`) could still be nominated by
+  its name. On ts2 the daemon made 472 such name-only `target` decisions
+  between 10-13 and 10-18.
 - **A scan pass that stops on its budget no longer hides unexplored ground
   from the next one** (bd-y70k; `efc01b1`, `ad7fcaf`). After such a pass
   (on ts2, every pass: they stop at 500,000 entries) the daemon cached as
