@@ -271,12 +271,19 @@ impl Platform for TestOverlayPlatform {
     }
 
     fn mount_points(&self) -> Result<Vec<MountPoint>> {
+        // A real mount at or under an injected one is shadowed: the injected
+        // mount answers every query below it. Listed anyway, it gave the
+        // collector a binding whose readings named the injected mount, so
+        // each collection of it failed the ownership check and dropped the
+        // whole topology; with `/` injected that was every real mount, and
+        // the idle daemon re-resolved all of them several times a second
+        // (~100 mounts on trj, bd-du48).
         let mut mounts: Vec<MountPoint> = self
             .inner
             .mount_points()
             .unwrap_or_default()
             .into_iter()
-            .filter(|real| !self.table.mounts.iter().any(|m| m.path == real.path))
+            .filter(|real| self.table.owner(&real.path).is_none())
             .collect();
         mounts.extend(self.table.mounts.iter().map(InjectedMount::mount_point));
         Ok(mounts)
@@ -508,6 +515,78 @@ mod tests {
             1_000_000
         );
         assert_eq!(overlay.name(), MockPlatform::healthy().name());
+    }
+
+    /// bd-du48: a real mount under an injected one is not listed, so the
+    /// collector binds the path to the injected mount and reads it without
+    /// rediscovering the topology. Before, the real `/injected/real` was
+    /// listed, its reading named `/injected`, and every collection failed
+    /// the ownership check and dropped the topology.
+    #[test]
+    fn real_mounts_under_an_injected_mount_are_shadowed() {
+        use crate::monitor::fs_stats::FsStatsCollector;
+        use crate::platform::pal::{FsStats, MemoryInfo, MountPoint, PlatformPaths};
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        let real = |path: &str| MountPoint {
+            path: PathBuf::from(path),
+            device: format!("dev{path}"),
+            fs_type: "realfs".to_string(),
+            is_ram_backed: false,
+        };
+        let stats = |path: &str| FsStats {
+            total_bytes: 9_000,
+            free_bytes: 9_000,
+            available_bytes: 9_000,
+            fs_type: "realfs".to_string(),
+            mount_point: PathBuf::from(path),
+            is_readonly: false,
+        };
+        let mounts = ["/", "/injected/real", "/other"];
+        let inner = MockPlatform::new(
+            mounts.iter().map(|path| real(path)).collect(),
+            mounts
+                .iter()
+                .map(|path| (PathBuf::from(path), stats(path)))
+                .collect::<HashMap<_, _>>(),
+            MemoryInfo {
+                total_bytes: 1 << 30,
+                available_bytes: 1 << 29,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            },
+            PlatformPaths::default(),
+        );
+        let overlay =
+            TestOverlayPlatform::new(Arc::new(inner), InjectedFsTable::parse(TABLE).unwrap());
+
+        let listed: Vec<PathBuf> = overlay
+            .mount_points()
+            .unwrap()
+            .into_iter()
+            .map(|mount| mount.path)
+            .collect();
+        assert!(listed.contains(&PathBuf::from("/other")), "{listed:?}");
+        assert!(listed.contains(&PathBuf::from("/injected")), "{listed:?}");
+        assert!(
+            !listed.contains(&PathBuf::from("/injected/real")),
+            "{listed:?}"
+        );
+
+        let collector = FsStatsCollector::new(Arc::new(overlay), Duration::from_secs(60));
+        let reading = collector
+            .collect(Path::new("/injected/real/file"))
+            .expect("the injected mount answers for the shadowed real one");
+        assert_eq!(reading.mount_point, PathBuf::from("/injected"));
+        assert_eq!(reading.available_bytes, 120_000);
+        assert_eq!(
+            collector
+                .collect(Path::new("/other/x"))
+                .unwrap()
+                .available_bytes,
+            9_000
+        );
     }
 
     #[test]
