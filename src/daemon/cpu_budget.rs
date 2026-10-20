@@ -410,16 +410,18 @@ impl std::fmt::Debug for PassCpuGuard {
 impl PassCpuGuard {
     /// A guard over `allowance_secs` CPU-seconds (`None` = unlimited),
     /// reading the process's cumulative user+system CPU seconds from
-    /// `sampler`. A sampler that returns `None` (the platform cannot report
-    /// CPU time) makes the guard inert: the pass is then bounded by its wall
-    /// budget alone, which is the safe direction — the old code's failure was
-    /// stopping too early, not too late.
+    /// `sampler`. Unavailable or invalid CPU readings do not invent a cost.
+    /// Sampling continues at the configured interval, so a transient startup
+    /// failure does not disable pacing for the entire pass. The first valid
+    /// reading becomes the baseline; CPU before it is unknown, not the process's
+    /// lifetime total. If no usable measurements arrive, only the caller's wall
+    /// budget bounds the pass, preserving the unsupported-platform fallback.
     pub fn new(
         allowance_secs: Option<f64>,
         now: Instant,
         mut sampler: impl FnMut() -> Option<f64> + Send + 'static,
     ) -> Self {
-        let baseline_secs = sampler();
+        let baseline_secs = sampler().filter(|value| value.is_finite() && *value >= 0.0);
         Self {
             allowance_secs,
             baseline_secs,
@@ -451,7 +453,8 @@ impl PassCpuGuard {
         self.allowance_secs
     }
 
-    /// CPU-seconds charged to this pass so far (as of the last sample).
+    /// Greatest valid CPU delta observed for this pass. A missing initial
+    /// baseline leaves the unmeasured prefix out, so this can be a lower bound.
     #[must_use]
     pub const fn spent_secs(&self) -> f64 {
         self.spent_secs
@@ -466,10 +469,13 @@ impl PassCpuGuard {
         let Some(allowance) = self.allowance_secs else {
             return false;
         };
-        if self.baseline_secs.is_none() {
-            return false;
-        }
-        if now.saturating_duration_since(self.last_sample) < self.sample_interval {
+        // A failed baseline must not make the guard permanently inert. Retry
+        // at the same bounded cadence used after successful observations.
+        // A regressing caller clock never renews the sampling allowance.
+        if now
+            .checked_duration_since(self.last_sample)
+            .is_none_or(|elapsed| elapsed < self.sample_interval)
+        {
             return false;
         }
         self.last_sample = now;
@@ -478,16 +484,22 @@ impl PassCpuGuard {
         self.exhausted
     }
 
-    /// Read the sampler once and update `spent_secs` (no latching).
+    /// Recover a missing baseline, then keep the largest observed delta.
+    /// A later failed, malformed or regressing sample cannot erase CPU already
+    /// charged. Retaining the original baseline also counts a temporary read
+    /// gap when the cumulative process counter becomes available again.
     fn sample(&mut self) {
-        let (Some(baseline), Some(current)) = (self.baseline_secs, (self.sampler)()) else {
+        let Some(current) = (self.sampler)().filter(|value| value.is_finite() && *value >= 0.0)
+        else {
             return;
         };
-        self.spent_secs = (current - baseline).max(0.0);
+        let baseline = *self.baseline_secs.get_or_insert(current);
+        self.spent_secs = self.spent_secs.max((current - baseline).max(0.0));
     }
 
-    /// Final accounting for the pass, ignoring the sampling interval. Call
-    /// once when the pass ends so the reported figure is the whole pass.
+    /// Final accounting, ignoring the sampling interval. Call once when the
+    /// pass ends. A failed final read preserves the greatest observed cost;
+    /// this cannot reconstruct CPU spent before the first usable baseline.
     pub fn finish(&mut self) -> f64 {
         self.sample();
         self.spent_secs
@@ -931,3 +943,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod sampling_tests;
