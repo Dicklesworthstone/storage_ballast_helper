@@ -6,6 +6,18 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+### Changed
+
+- **The daemon's scan walk no longer stats every file** (bd-gh0x;
+  `c858c27`). It stat-ed each file of every directory it listed to size the
+  directory, though only entries that classify as candidates use the size.
+  Those now read their own files, so candidates are sized as before. On a
+  180,000-file test tree a walk issued 6,580 `statx` calls instead of
+  186,537 and used about a tenth of the CPU (cold btrfs, 8 threads: 1.0 s
+  instead of 10.8 s). With file stats, CPU also grew with walker threads,
+  from btrfs's per-root inode lock; without them it stays flat. Trees with
+  fewer files per directory gain less. CLI walks are unchanged.
+
 ### Fixed
 
 - **A scan pass that stops on its budget no longer hides unexplored ground
