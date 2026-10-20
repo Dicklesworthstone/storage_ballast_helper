@@ -51,6 +51,18 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   It went on to sync the system service from the copy, so an install into a
   scratch directory replaced `/usr/local/bin/sbh` and restarted the daemon
   (two hosts on 2026-10-19, with an e2e fixture's debug build).
+- **`install.sh` never downgrades an installed service unasked** (bd-zuuq;
+  `2931767`). Its service sync replaced the service's binary whenever it
+  differed from the one just installed. A nightly ACFS update, installing
+  the latest release (v0.7.9), so put v0.7.9 over a v0.7.10
+  `/usr/local/bin/sbh` and restarted the daemon (ts2, 2026-10-20). Without
+  `--version`, a service binary that reports a newer release is now left as
+  it is, as `sbh update` already did; `--version` still installs an older
+  release on purpose.
+- **A dropped walk stream stops its walk** (`4a6baa8`). A consumer that went
+  away without cancelling, such as a scanner thread that panicked and was
+  respawned, left its walker threads listing the rest of the tree with
+  nobody reading.
 
 ### Removed
 
