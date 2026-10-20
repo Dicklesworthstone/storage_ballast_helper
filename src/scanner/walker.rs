@@ -714,6 +714,19 @@ impl WalkEntry {
         );
         probe.newest_mtime.map_or(base, |newest| newest.max(base))
     }
+
+    /// Give a walked directory the size a measuring walk would have given it
+    /// (its immediate files, when they hold any bytes). Opaque trees, already
+    /// measured by their probe, and non-directories are left alone.
+    pub fn measure_immediate_files(&mut self) {
+        if !self.metadata.is_dir || self.opaque_tree.is_some() {
+            return;
+        }
+        let bytes = immediate_file_bytes(&self.path);
+        if bytes > 0 {
+            self.metadata.content_size_bytes = bytes;
+        }
+    }
 }
 
 /// Identity of a multiply-linked file, for counting its blocks exactly once.
@@ -754,6 +767,8 @@ pub struct DirectoryWalker {
     cancel: Arc<AtomicBool>,
     /// Entries of one directory processed per pass.
     dir_window: u32,
+    /// Whether a walked directory's entry carries its immediate files' size.
+    measure_files: bool,
 }
 
 impl DirectoryWalker {
@@ -764,7 +779,22 @@ impl DirectoryWalker {
             heartbeat: None,
             cancel: Arc::new(AtomicBool::new(false)),
             dir_window: MAX_ENTRIES_PER_DIR,
+            measure_files: true,
         }
+    }
+
+    /// Walk without stat-ing files: a walked directory's entry then carries
+    /// only its own inode's size, and a consumer that needs the size of a
+    /// directory it scores reads it with [`immediate_file_bytes`]. Stat-ing
+    /// every file of every listed directory was most of a daemon pass's
+    /// syscalls, and on a single-subvolume btrfs each cold one spins on the
+    /// root's inode lock (ts2: 84% of the daemon's samples, bd-gh0x), while
+    /// only the few entries that classify as candidates ever use the size.
+    /// Opaque trees are still measured by their probe.
+    #[must_use]
+    pub fn without_file_sizes(mut self) -> Self {
+        self.measure_files = false;
+        self
     }
 
     #[cfg(test)]
@@ -874,6 +904,7 @@ impl DirectoryWalker {
             let cancel = Arc::clone(&self.cancel);
             let windows = Arc::clone(&windows);
             let unfinished = Arc::clone(&unfinished);
+            let measure_files = self.measure_files;
 
             thread::spawn(move || {
                 walker_thread(
@@ -887,6 +918,7 @@ impl DirectoryWalker {
                     heartbeat.as_ref(),
                     &cancel,
                     &unfinished,
+                    measure_files,
                 );
             });
         }
@@ -916,6 +948,7 @@ fn walker_thread(
     heartbeat: Option<&Arc<dyn Fn() + Send + Sync>>,
     cancel: &AtomicBool,
     unfinished: &parking_lot::Mutex<Vec<PathBuf>>,
+    measure_files: bool,
 ) {
     let mut results = ResultBatch::new(result_tx, WALK_BATCH_ENTRIES, unfinished);
     loop {
@@ -950,6 +983,7 @@ fn walker_thread(
                     protection,
                     heartbeat,
                     cancel,
+                    measure_files,
                 );
                 // Mark this work item as completed.
                 let remaining = in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -999,6 +1033,7 @@ fn process_directory(
     protection: &parking_lot::RwLock<ProtectionRegistry>,
     heartbeat: Option<&Arc<dyn Fn() + Send + Sync>>,
     cancel: &AtomicBool,
+    measure_files: bool,
 ) {
     // Check exclusion list.
     if config.excluded_paths.contains(dir_path) {
@@ -1173,8 +1208,12 @@ fn process_directory(
         // For files: lstat to get actual size. On ext4 this is ~1μs per call,
         // so 2000 children ≈ 2ms — acceptable for accurate scoring.
         // For child dirs: skip (their recursive size will be computed when they
-        // are processed as their own WalkEntry).
-        if !is_dir && let Ok(child_meta) = entry.metadata() {
+        // are processed as their own WalkEntry). A walk without file sizes
+        // skips this (see `DirectoryWalker::without_file_sizes`).
+        if measure_files
+            && !is_dir
+            && let Ok(child_meta) = entry.metadata()
+        {
             // Allocated blocks, not apparent length (see `allocated_size`):
             // sparse files must not inflate the directory's reclaim estimate.
             content_size = content_size.saturating_add(allocated_size(&child_meta));
@@ -1369,6 +1408,27 @@ pub fn opaque_context_for_path(path: &Path) -> OpaqueTreeContext {
         }
     }
     context
+}
+
+/// Allocated bytes of `dir`'s immediate regular files.
+///
+/// Read the way a measuring walk reads them: its first
+/// [`MAX_ENTRIES_PER_DIR`] entries, with subdirectories and symlinks adding
+/// nothing. For a consumer of a walk
+/// [without file sizes](DirectoryWalker::without_file_sizes). An unreadable
+/// directory yields 0.
+#[must_use]
+pub fn immediate_file_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .take(MAX_ENTRIES_PER_DIR as usize)
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|ft| ft.is_file()))
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|meta| allocated_size(&meta))
+        .fold(0u64, u64::saturating_add)
 }
 
 /// Structural signals for one directory from its immediate children, for
@@ -2905,6 +2965,58 @@ mod tests {
             dir_entry.metadata.content_size_bytes,
             APPARENT
         );
+        assert!(immediate_file_bytes(&dir) < ALLOCATED_CEILING);
+    }
+
+    /// bd-gh0x: a walk without file sizes stats no files, so its directory
+    /// entries carry only their own inode's size; a consumer that measures an
+    /// entry gets exactly what a measuring walk reported. Subdirectories and
+    /// symlinks add nothing either way.
+    #[test]
+    fn a_walk_without_file_sizes_leaves_the_size_to_the_consumer_and_it_matches() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("build-out");
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        for (name, len) in [("a.o", 70_000usize), ("b.o", 9_000), ("c.log", 1)] {
+            fs::write(dir.join(name), vec![7u8; len]).unwrap();
+        }
+        fs::write(dir.join("nested").join("deep.bin"), vec![1u8; 300_000]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("a.o"), dir.join("link.o")).unwrap();
+
+        let entry_for = |walker: DirectoryWalker| {
+            walker
+                .walk()
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.path == dir)
+                .unwrap()
+        };
+        let measured = entry_for(DirectoryWalker::new(
+            test_config(tmp.path()),
+            ProtectionRegistry::marker_only(),
+        ));
+        let mut unmeasured = entry_for(
+            DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only())
+                .without_file_sizes(),
+        );
+
+        let files: u64 = ["a.o", "b.o", "c.log"]
+            .iter()
+            .map(|name| allocated_size(&fs::symlink_metadata(dir.join(name)).unwrap()))
+            .sum();
+        assert!(files >= 79_001, "the fixture allocated its files: {files}");
+        assert_eq!(measured.metadata.content_size_bytes, files);
+        assert_eq!(immediate_file_bytes(&dir), files);
+        let inode_only = entry_metadata(&fs::metadata(&dir).unwrap()).content_size_bytes;
+        assert_eq!(unmeasured.metadata.content_size_bytes, inode_only);
+        assert!(inode_only < files);
+        // The rest of the entry is the same walk.
+        assert_eq!(unmeasured.structural_signals, measured.structural_signals);
+        assert_eq!(unmeasured.depth, measured.depth);
+
+        unmeasured.measure_immediate_files();
+        assert_eq!(unmeasured.metadata.content_size_bytes, files);
     }
 
     /// bd-d1kt: every rustc on an rch worker names the shared cargo cache as
@@ -4639,6 +4751,7 @@ mod tests {
                 &protection,
                 None,
                 &worker_cancel,
+                true,
             );
         });
 

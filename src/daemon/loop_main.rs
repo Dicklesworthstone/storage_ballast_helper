@@ -9138,10 +9138,14 @@ fn scanner_thread_main(
         // candidate unit, sized and dated by a bounded probe, and flows
         // through the same classification, scoring, vetoes and dispatch below.
         let (mut rx, cancel_token) = if request.catalog_roots.is_empty() {
-            let walker = DirectoryWalker::new(walker_config, protection).with_heartbeat({
-                let hb = Arc::clone(heartbeat);
-                move || hb.beat()
-            });
+            // Only classified entries use a walked directory's size, and they
+            // read it below (bd-gh0x).
+            let walker = DirectoryWalker::new(walker_config, protection)
+                .without_file_sizes()
+                .with_heartbeat({
+                    let hb = Arc::clone(heartbeat);
+                    move || hb.beat()
+                });
             let cancel_token = walker.cancel_token();
 
             // Perform the walk (streaming).
@@ -9219,7 +9223,7 @@ fn scanner_thread_main(
                 scanner_should_exit = true;
                 break;
             }
-            let entry = match rx.recv_timeout(Duration::from_secs(2)) {
+            let mut entry = match rx.recv_timeout(Duration::from_secs(2)) {
                 Ok(entry) => entry,
                 Err(RecvTimeoutError::Timeout) => {
                     if shutdown.load(Ordering::Relaxed) {
@@ -9329,6 +9333,12 @@ fn scanner_thread_main(
             // This entry is classified: the scan cursor must not cache it or
             // any directory above it as barren.
             mark_non_barren(&mut non_barren_dirs, &entry.path);
+            // The walk did not stat files (bd-gh0x); a classified walked
+            // directory reads its own now. Catalog units carry their probe's
+            // whole-tree size and are left alone.
+            if request.catalog_roots.is_empty() {
+                entry.measure_immediate_files();
+            }
 
             let mut input = crate::scanner::scoring::CandidateInput {
                 path: entry.path.clone(), // Clone needed for input
