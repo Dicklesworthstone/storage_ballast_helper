@@ -21,8 +21,8 @@ use crossbeam_channel as channel;
 use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::Platform;
 use crate::scanner::patterns::{
-    OpaqueTreeClassification, OpaqueTreeContext, OpaqueTreeDisposition, StructuralSignals,
-    classify_opaque_tree,
+    ArtifactClassification, ArtifactPatternRegistry, OpaqueTreeClassification, OpaqueTreeContext,
+    OpaqueTreeDisposition, StructuralSignals, classify_opaque_tree,
 };
 use crate::scanner::protection::ProtectionRegistry;
 use crate::scanner::scoring::ActiveReferenceSummary;
@@ -742,6 +742,47 @@ impl WalkEntry {
         if bytes > 0 {
             self.metadata.content_size_bytes = bytes;
         }
+    }
+
+    /// The class the daemon's walk scores this entry with: an opaque
+    /// candidate's own (structural) classification, nothing for a tree the
+    /// walker only descends into or protects, and the name registry where
+    /// it made no opaque verdict. `sbh scan`, `clean` and `emergency` all
+    /// classify through this, so they agree on what is a candidate.
+    #[must_use]
+    pub fn walk_classification(
+        &self,
+        registry: &ArtifactPatternRegistry,
+    ) -> Option<ArtifactClassification> {
+        self.opaque_tree.as_ref().map_or_else(
+            || Some(registry.classify(&self.path, self.structural_signals)),
+            |opaque| {
+                (opaque.disposition == OpaqueTreeDisposition::CandidateOpaque)
+                    .then(|| opaque.classification.clone())
+            },
+        )
+    }
+}
+
+/// [`WalkEntry::walk_classification`] for a directory looked at outside a
+/// walk (the daemon's priority pre-scan and index replay).
+///
+/// The opaque verdict the walker would give it, from its name and its
+/// parent's manifests, comes before the name registry. Without this the
+/// pre-scan nominated on the name alone directories the walk declines (a
+/// plain `target` with no cargo markers inside an hfdt store, bd-u9ua;
+/// `build` without a manifest, bd-8nol), and missed ones only the structure
+/// identifies (bd-10yj).
+#[must_use]
+pub fn classify_dir_as_walked(
+    registry: &ArtifactPatternRegistry,
+    path: &Path,
+    signals: StructuralSignals,
+) -> Option<ArtifactClassification> {
+    match classify_opaque_tree(path, opaque_context_for_path(path)) {
+        Some(opaque) => (opaque.disposition == OpaqueTreeDisposition::CandidateOpaque)
+            .then_some(opaque.classification),
+        None => Some(registry.classify(path, signals)),
     }
 }
 
@@ -4966,6 +5007,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// bd-10yj: a directory looked at outside a walk classifies as the walk
+    /// would: by its structure when the walker would prune it as an opaque
+    /// candidate (a Go build cache under any name), not at all when the
+    /// walker only descends into it (an hfdt store's own `target/`), and by
+    /// name otherwise.
+    #[test]
+    fn a_directory_outside_a_walk_classifies_as_the_walk_would() {
+        use crate::scanner::patterns::ArtifactCategory;
+        let tmp = TempDir::new().unwrap();
+        let registry = ArtifactPatternRegistry::default();
+
+        let cache = tmp.path().join("ci-gocache-1");
+        fs::create_dir_all(cache.join("a1")).unwrap();
+        fs::write(cache.join("trim.txt"), "x").unwrap();
+        assert_eq!(
+            registry
+                .classify(&cache, StructuralSignals::default())
+                .category,
+            ArtifactCategory::Unknown,
+            "the name alone says nothing"
+        );
+        let class = classify_dir_as_walked(&registry, &cache, StructuralSignals::default())
+            .expect("an opaque candidate");
+        assert_eq!(class.category, ArtifactCategory::GoCache);
+
+        let store_target = tmp.path().join("store-a/target");
+        fs::create_dir_all(store_target.join("doctor-undo")).unwrap();
+        fs::write(tmp.path().join("store-a/hfdt.sqlite"), "x").unwrap();
+        assert!(
+            classify_dir_as_walked(&registry, &store_target, StructuralSignals::default())
+                .is_none(),
+            "the walk only descends into a target without cargo markers"
+        );
+
+        let plain = tmp.path().join("pkg/notes");
+        fs::create_dir_all(&plain).unwrap();
+        assert!(classify_opaque_tree(&plain, opaque_context_for_path(&plain)).is_none());
+        assert_eq!(
+            classify_dir_as_walked(&registry, &plain, StructuralSignals::default()),
+            Some(registry.classify(&plain, StructuralSignals::default())),
+            "no opaque verdict: the name registry decides"
+        );
+
+        // The same rule for an entry the walk emitted.
+        let mut entry = bare_entry("/x/ci-gocache-1");
+        entry.opaque_tree = classify_opaque_tree(&cache, OpaqueTreeContext::default());
+        assert_eq!(
+            entry.walk_classification(&registry).map(|c| c.category),
+            Some(ArtifactCategory::GoCache)
+        );
+        entry.opaque_tree =
+            classify_opaque_tree(&store_target, opaque_context_for_path(&store_target));
+        assert!(entry.walk_classification(&registry).is_none());
     }
 
     /// A consumer that goes away without cancelling stops the walk. Before,

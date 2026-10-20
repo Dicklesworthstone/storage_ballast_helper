@@ -10010,7 +10010,9 @@ fn count_sacred_scan_overlaps(
     let mut candidate_count = 0usize;
     let mut overlap_count = 0usize;
     for entry in entries.iter().filter(|entry| entry.metadata.is_dir) {
-        let classification = patterns.classify(&entry.path, entry.structural_signals);
+        let Some(classification) = entry.walk_classification(&patterns) else {
+            continue;
+        };
         if classification.category == ArtifactCategory::Unknown {
             continue;
         }
@@ -12105,16 +12107,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     let scored_entries = entries
         .iter()
         .filter_map(|entry| {
-            let classification = if let Some(opaque_tree) = &entry.opaque_tree {
-                match opaque_tree.disposition {
-                    OpaqueTreeDisposition::CandidateOpaque => opaque_tree.classification.clone(),
-                    OpaqueTreeDisposition::SignalOnly | OpaqueTreeDisposition::ProtectedOpaque => {
-                        return None;
-                    }
-                }
-            } else {
-                registry.classify(&entry.path, entry.structural_signals)
-            };
+            let classification = entry.walk_classification(&registry)?;
             let age = now
                 .duration_since(
                     entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
@@ -13126,8 +13119,9 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
 
     let scored: Vec<CandidacyScore> = entries
         .iter()
-        .map(|entry| {
-            let classification = registry.classify(&entry.path, entry.structural_signals);
+        .filter_map(|entry| {
+            // As `sbh scan` and the daemon walk classify (bd-10yj).
+            let classification = entry.walk_classification(&registry)?;
             let age = now
                 .duration_since(
                     entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
@@ -13172,7 +13166,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                 |base_score| !base_score.vetoed && base_score.total_score >= args.min_score,
             );
             score.identity = Some(entry.metadata.identity());
-            score
+            Some(score)
         })
         .filter(|score| !score.vetoed && score.total_score >= args.min_score)
         .collect();
@@ -14985,8 +14979,9 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
 
     let scored: Vec<CandidacyScore> = entries
         .iter()
-        .map(|entry| {
-            let classification = registry.classify(&entry.path, entry.structural_signals);
+        .filter_map(|entry| {
+            // As `sbh scan` and the daemon walk classify (bd-10yj).
+            let classification = entry.walk_classification(&registry)?;
             let age = now
                 .duration_since(
                     entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
@@ -15033,7 +15028,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                 },
             );
             score.identity = Some(entry.metadata.identity());
-            score
+            Some(score)
         })
         .filter(|score| !score.vetoed)
         .collect();
@@ -19373,6 +19368,9 @@ mod tests {
         let candidate = tmp.path().join("old-target");
         let protected = candidate.join("critical-data");
         std::fs::create_dir_all(&protected).unwrap();
+        // A cargo output dir: a `<x>-target` name is a candidate only with
+        // cargo's root markers, for this count as for the walk (bd-10yj).
+        std::fs::write(candidate.join(".rustc_info.json"), "{}").unwrap();
         std::fs::write(
             &config_path,
             format!(

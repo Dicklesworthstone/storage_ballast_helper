@@ -2465,6 +2465,163 @@ critical = 1.0
     );
 }
 
+/// bd-10yj: `sbh clean` classifies what the walk hands it as `sbh scan` and
+/// the daemon do, with the walker's opaque verdict first. A Go build cache
+/// under an arbitrary name is recognized only by its structure (`trim.txt`
+/// and two-hex shard dirs); `scan` nominated it while `clean`, classifying
+/// every entry by name, never considered it. An hfdt-style store's own
+/// `target/` (no cargo markers) stays out of both.
+#[cfg(target_os = "linux")]
+#[test]
+fn clean_and_scan_agree_on_what_the_walker_classifies_by_structure() {
+    let base = system_temp_base();
+    let dir = tempfile::Builder::new()
+        .prefix("sbh-walk-class-")
+        .tempdir_in(base)
+        .expect("temp dir");
+    let scan_root = dir.path().join("scan-root");
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    build_walk_classification_fixture(&scan_root);
+    let scan_root = scan_root.canonicalize().unwrap();
+    let config_path = dir.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"[paths]
+state_file = "{}"
+sqlite_db = "{}"
+jsonl_log = "{}"
+ballast_dir = "{}"
+
+[scanner]
+include_user_temp_dir = false
+root_paths = ["{}"]
+min_file_age_minutes = 0
+max_depth = 8
+parallelism = 1
+
+[notifications]
+enabled = false
+"#,
+            toml_path(&state_dir.join("state.json")),
+            toml_path(&state_dir.join("activity.sqlite3")),
+            toml_path(&state_dir.join("activity.jsonl")),
+            toml_path(&state_dir.join("ballast")),
+            toml_path(&scan_root),
+        ),
+    )
+    .expect("write config");
+    let config_arg = config_path.to_string_lossy().to_string();
+    let root_arg = scan_root.to_string_lossy().to_string();
+
+    let clean = common::run_cli_case(
+        "clean_dry_run_classifies_as_the_walk",
+        &[
+            "--config",
+            &config_arg,
+            "clean",
+            &root_arg,
+            "--dry-run",
+            "--min-score",
+            "0",
+            "--json",
+        ],
+    );
+    assert_cli_success(&clean, "clean --dry-run --json");
+
+    // clean records every candidate it scores (keep verdicts included). On
+    // its name alone the store's target scored as a cargo target and was
+    // recorded; the walk only descends into it, and so does clean now.
+    let last = common::run_cli_case(
+        "explain_after_walk_classified_clean",
+        &["--config", &config_arg, "explain", "--last", "50", "--json"],
+    );
+    assert_cli_success(&last, "explain --last 50 --json");
+    let recorded: Vec<String> = parse_json_stdout(&last)["decisions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|d| d["path"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        recorded.iter().any(|p| p.ends_with("ci-gocache-1")) || !common::sees_every_process(),
+        "clean scored the Go build cache as scan does: {recorded:?}"
+    );
+    assert!(
+        !recorded.iter().any(|p| p.ends_with("store-a/target")),
+        "the store's own target was scored as a cargo target: {recorded:?}"
+    );
+
+    // Deleting the cache (a probed category) needs a complete open-file
+    // sweep, so only a user who sees every process can show it chosen.
+    if !common::sees_every_process() {
+        eprintln!("skipped the Go-cache half: this user cannot see every process");
+        return;
+    }
+    let chosen: Vec<String> = clean
+        .stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|v| v.get("plan").is_some())
+        .and_then(|report| report["plan"]["chosen"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| c["path"].as_str().map(str::to_string))
+        .collect();
+    let cache_path = scan_root.join("ci-gocache-1").to_string_lossy().to_string();
+    assert!(
+        chosen.contains(&cache_path),
+        "clean must nominate the Go build cache scan nominates: {chosen:?}\n{}",
+        clean.stdout
+    );
+}
+
+/// Under `scan_root`, all idle for 72 h: a Go build cache under an arbitrary
+/// name (`trim.txt` and two-hex shard dirs), an hfdt-style store with its
+/// own unmarked `target/`, and a real cargo target beside its manifest
+/// (scored, and recorded, on any host, so the ledger the test reads exists).
+#[cfg(target_os = "linux")]
+fn build_walk_classification_fixture(scan_root: &Path) {
+    let cache = scan_root.join("ci-gocache-1");
+    fs::create_dir_all(cache.join("a1")).unwrap();
+    fs::create_dir_all(cache.join("ff")).unwrap();
+    fs::write(cache.join("trim.txt"), "go build cache\n").unwrap();
+    fs::write(cache.join("a1").join("obj-d"), vec![7u8; 1 << 20]).unwrap();
+    let store = scan_root.join("store-a");
+    fs::create_dir_all(store.join("target/doctor-undo/10726d")).unwrap();
+    fs::write(store.join("hfdt.sqlite"), b"SQLite format 3\0").unwrap();
+    fs::write(
+        store.join("target/doctor-undo/10726d/page.bin"),
+        vec![7u8; 1 << 20],
+    )
+    .unwrap();
+    let project = scan_root.join("proj");
+    common::create_fake_rust_target(&project, Duration::from_hours(72));
+    fs::write(project.join("Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+    let idle = filetime::FileTime::from_system_time(
+        std::time::SystemTime::now() - Duration::from_hours(72),
+    );
+    for entry in walkdir_all(scan_root) {
+        let _ = filetime::set_file_mtime(&entry, idle);
+    }
+}
+
+/// Every path under `root`, directories included.
+#[cfg(target_os = "linux")]
+fn walkdir_all(root: &Path) -> Vec<PathBuf> {
+    let mut out = vec![root.to_path_buf()];
+    let mut index = 0;
+    while index < out.len() {
+        if let Ok(entries) = fs::read_dir(&out[index]) {
+            out.extend(entries.flatten().map(|entry| entry.path()));
+        }
+        index += 1;
+    }
+    out
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn clean_quarantines_at_green_and_undo_restores_the_target() {
@@ -2703,6 +2860,10 @@ fn explain_reads_back_decisions_recorded_by_clean_dry_run() {
     // never look old; the config below disables the age floor and the clean
     // runs with --min-score 0 so the target is scored (and recorded) either way.
     let target = common::create_fake_rust_target(&scan_root, Duration::from_hours(72));
+    // Beside its manifest: clean classifies as the walk does (bd-10yj), and
+    // the walk takes a target whole there or under a temp root, which this
+    // tempdir is not where TMPDIR points elsewhere (trj: /scratch/tmp).
+    fs::write(scan_root.join("Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
     let config_path = dir.path().join("config.toml");
     fs::write(
         &config_path,

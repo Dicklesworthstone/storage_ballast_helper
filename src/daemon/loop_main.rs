@@ -7327,7 +7327,12 @@ fn replay_indexed_record(
             signals = record.structural_signals;
             opaque.classification
         }
-        None => registry.classify(path, signals),
+        // As the walk would classify it now (bd-10yj): a tree it only
+        // descends into or protects is not replayed on its name.
+        None => crate::scanner::walker::classify_dir_as_walked(registry, path, signals)
+            .ok_or_else(|| {
+                ReplayDrop::Vetoed("the walk declines it (opaque verdict)".to_string())
+            })?,
     };
     if classification.category == ArtifactCategory::Unknown {
         return Err(ReplayDrop::Vetoed(
@@ -8652,8 +8657,17 @@ fn scanner_thread_main(
                         // nominated and left the dispatch to the walk).
                         let candidate_signals =
                             crate::scanner::walker::structural_signals_for_path(&candidate_path);
-                        let candidate_class =
-                            pattern_registry.classify(&candidate_path, candidate_signals);
+                        // As the walk would classify it (bd-10yj): the
+                        // walker's opaque verdict first, so a tree it only
+                        // descends into or protects is not nominated here on
+                        // its name (a plain `target` inside an hfdt store).
+                        let Some(candidate_class) = crate::scanner::walker::classify_dir_as_walked(
+                            &pattern_registry,
+                            &candidate_path,
+                            candidate_signals,
+                        ) else {
+                            continue;
+                        };
                         if candidate_class.category
                             == crate::scanner::patterns::ArtifactCategory::Unknown
                         {
@@ -11255,6 +11269,14 @@ mod tests {
             std::fs::create_dir_all(target.join(sub)).unwrap();
         }
         std::fs::write(target.join("debug/deps/libfoo.rlib"), vec![0u8; 8192]).unwrap();
+        // Beside its manifest, as a project's target is: replay classifies
+        // it as the walk does (bd-10yj), and the walk takes a target whole
+        // there or under a temp root (TMPDIR may be neither).
+        std::fs::write(
+            temp.path().join("proj/Cargo.toml"),
+            "[package]\nname = \"p\"\n",
+        )
+        .unwrap();
 
         let mut config = Config::default();
         config.scanner.min_file_age_minutes = 0;
@@ -12665,12 +12687,17 @@ mod tests {
     /// re-examined the same leading directories on every pass and logged
     /// `0 entries, 0 candidates` forever while the disk filled.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn prescan_resumes_from_the_persisted_cursor_instead_of_restarting() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("scan-root");
         for name in ["aaa_repo", "zzz_repo"] {
             let repo = root.join(name);
             std::fs::create_dir_all(repo.join(".git")).unwrap();
+            // A Rust repo: the pre-scan classifies its target as the walk
+            // does, and the walk takes a marked target whole only beside its
+            // manifest or under a temp root (TMPDIR may be neither).
+            std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"r\"\n").unwrap();
             let debug = repo.join("target").join("debug");
             std::fs::create_dir_all(debug.join("deps")).unwrap();
             std::fs::write(debug.join("artifact.o"), b"mock object file").unwrap();
