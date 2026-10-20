@@ -263,6 +263,16 @@ fn holds_what_cargo_writes(dir: &Path, name: &str) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// Whether `dir`'s top level still holds only what cargo writes.
+///
+/// The executor asks again before it deletes a target-only candidate: the
+/// survey that nominated it may be minutes old, and a trace dir or log
+/// written into the target since then makes it work, not output. An
+/// unreadable listing is not pure.
+pub fn still_pure(dir: &Path) -> bool {
+    matches!(first_impurity(dir), Ok(None))
+}
+
 /// The first top-level entry of `dir` that cargo did not write, or an error
 /// when the listing cannot be read (which keeps the directory).
 fn first_impurity(dir: &Path) -> std::io::Result<Option<String>> {

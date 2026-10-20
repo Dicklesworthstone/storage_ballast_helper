@@ -9918,15 +9918,19 @@ fn batch_protected_paths(
 }
 
 /// Keep only the candidates a target-only batch may hold: strictly inside its
-/// root, with the identity the tier recorded when it surveyed them. Returns
-/// how many were dropped; an ordinary batch is left as it is.
+/// root, with the identity the tier recorded when it surveyed them, and
+/// still pure now (`target_tier::still_pure`). Returns how many were dropped;
+/// an ordinary batch is left as it is.
 fn retain_target_only_candidates(batch: &mut DeletionBatch) -> usize {
     let Some(root) = &batch.target_only_root else {
         return 0;
     };
     let before = batch.candidates.len();
     batch.candidates.retain(|candidate| {
-        candidate.identity.is_some() && candidate.path != *root && candidate.path.starts_with(root)
+        candidate.identity.is_some()
+            && candidate.path != *root
+            && candidate.path.starts_with(root)
+            && crate::daemon::target_tier::still_pure(&candidate.path)
     });
     before - batch.candidates.len()
 }
@@ -9998,7 +10002,8 @@ fn executor_thread_main(
         let outside = retain_target_only_candidates(&mut batch);
         if outside > 0 {
             let message = format!(
-                "dropped {outside} target-only candidate(s) outside {} or without an identity",
+                "dropped {outside} target-only candidate(s) outside {}, without an identity, \
+                 or no longer pure",
                 batch
                     .target_only_root
                     .as_deref()
@@ -11882,7 +11887,7 @@ mod tests {
 
     /// bd-232u: a pattern protecting the whole root stops an ordinary batch
     /// but not a target-only one; a pattern naming a dir inside the root and
-    /// a `.sbh-protect` marker stop both; a target-only batch never reaches
+    /// a `.sbh-protect` marker above the target stop both; a target-only batch never reaches
     /// outside its root or deletes a candidate without an identity. The
     /// executor is composed in the test as `executor_thread_main` composes it
     /// (`retain_target_only_candidates`, `batch_protected_paths`), not run on
@@ -11916,7 +11921,10 @@ mod tests {
             std::fs::create_dir_all(dir.join("debug")).unwrap();
             std::fs::write(dir.join("debug/libdemo.rlib"), [7u8; 64]).unwrap();
         }
-        protection::create_marker(&marked, None).unwrap();
+        // On the target's parent, inside the root: the target itself stays
+        // pure (a marker at its own top level would make it impure, and the
+        // purity re-check would drop it before the marker check ran).
+        protection::create_marker(marked.parent().unwrap(), None).unwrap();
         let scanner = crate::core::config::ScannerConfig {
             protected_paths: vec![
                 root.to_string_lossy().into_owned(),
@@ -12014,6 +12022,63 @@ mod tests {
             outside.exists(),
             "a target-only batch stays inside its root"
         );
+    }
+
+    /// bd-232u gap (b): a target dir the tier surveyed as pure that gained a
+    /// non-cargo entry before its batch reached the executor (a trace dir, a
+    /// log) is dropped; one that stayed pure goes on, as does an ordinary
+    /// batch, which this re-check does not touch.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_only_candidate_that_turned_impure_since_its_survey_is_dropped() {
+        use crate::scanner::walker::{FsEntryKind, FsIdentity};
+        use std::os::unix::fs::MetadataExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().join("claude-501");
+        let still_pure = root.join("s1/target-a");
+        let turned = root.join("s2/target-b");
+        for dir in [&still_pure, &turned] {
+            std::fs::create_dir_all(dir.join("debug")).unwrap();
+            std::fs::write(dir.join("debug/libdemo.rlib"), [7u8; 64]).unwrap();
+            std::fs::write(dir.join(".rustc_info.json"), b"{}").unwrap();
+        }
+        let candidates = || {
+            [&still_pure, &turned]
+                .into_iter()
+                .map(|path| {
+                    let meta = std::fs::symlink_metadata(path).unwrap();
+                    let mut candidate = test_candidate(&path.to_string_lossy(), 3.0);
+                    candidate.identity = Some(FsIdentity {
+                        device_id: meta.dev(),
+                        inode: meta.ino(),
+                        kind: FsEntryKind::Directory,
+                    });
+                    candidate
+                })
+                .collect::<Vec<_>>()
+        };
+        let batch = |target_only_root: Option<PathBuf>| DeletionBatch {
+            candidates: candidates(),
+            pressure_level: PressureLevel::Critical,
+            urgency: 0.9,
+            target_bytes: None,
+            target_only_root,
+        };
+
+        let mut before = batch(Some(root.clone()));
+        assert_eq!(retain_target_only_candidates(&mut before), 0, "both pure");
+
+        // Written into the target after the survey: the same inode, now work.
+        std::fs::create_dir(turned.join("trace")).unwrap();
+        let mut after = batch(Some(root));
+        assert_eq!(retain_target_only_candidates(&mut after), 1);
+        let kept: Vec<&Path> = after.candidates.iter().map(|c| c.path.as_path()).collect();
+        assert_eq!(kept, [still_pure.as_path()]);
+
+        let mut ordinary = batch(None);
+        assert_eq!(retain_target_only_candidates(&mut ordinary), 0);
+        assert_eq!(ordinary.candidates.len(), 2);
     }
 
     /// bd-232u, through the executor thread itself (`spawn_executor_thread`):
