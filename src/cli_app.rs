@@ -41,7 +41,7 @@ use storage_ballast_helper::daemon::service::{
     launchd_system_plist_path_for_label, launchd_user_plist_path_for_label,
 };
 use storage_ballast_helper::logger::sqlite::SqliteLogger;
-use storage_ballast_helper::logger::stats::{StatsEngine, window_label};
+use storage_ballast_helper::logger::stats::{RamScratchNotice, StatsEngine, window_label};
 use storage_ballast_helper::monitor::burst::BurstStats;
 use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
 use storage_ballast_helper::monitor::pid::{PressureLevel, classify_level};
@@ -10083,6 +10083,21 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     } else {
         None
     };
+    // bd-paeg: the daemon's RAM-scratch warning, which repeats every 15
+    // minutes while the risk lasts; one older than two repeats (plus a
+    // 5-minute sample) is stale.
+    let ram_scratch = if config.paths.sqlite_db.exists() {
+        SqliteLogger::open_read_only(&config.paths.sqlite_db)
+            .ok()
+            .and_then(|db| {
+                StatsEngine::new(&db)
+                    .ram_scratch_notice(std::time::Duration::from_mins(35))
+                    .ok()
+                    .flatten()
+            })
+    } else {
+        None
+    };
     let memory_info = platform.memory_info().ok();
     let memory_pressure = platform.memory_pressure().ok();
     let process_visibility =
@@ -10210,6 +10225,9 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 } else {
                     println!("  Swap: disabled");
                 }
+            }
+            for line in ram_scratch.iter().flat_map(ram_scratch_status_lines) {
+                println!("{line}");
             }
 
             if let Some(visibility) = process_visibility {
@@ -10651,6 +10669,8 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     })
                 }),
                 "memory_pressure": memory_pressure.as_ref().map(status_memory_pressure_json),
+                // The daemon's latest RAM-scratch notice (bd-paeg), or null.
+                "ram_scratch": ram_scratch,
                 "process_attribution": {
                     "visibility": process_visibility.as_ref().map(process_attribution_visibility_json),
                 },
@@ -11194,6 +11214,48 @@ fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
     // available RAM, swap usage alone doesn't indicate thrashing — the kernel
     // simply swapped out cold pages, which is normal Linux behavior.
     memory.available_bytes < MIN_AVAILABLE_RAM_BYTES
+}
+
+/// `sbh status` lines for the daemon's RAM-scratch notice (bd-paeg): only a
+/// warning prints, with the largest trees the observer attributed. The swap
+/// thrash hint above stays quiet on zram with free RAM, which is exactly
+/// when tmpfs scratch fills the swap.
+fn ram_scratch_status_lines(notice: &RamScratchNotice) -> Vec<String> {
+    if notice.state != "warning" {
+        return Vec::new();
+    }
+    let size = |bytes: Option<u64>| bytes.map_or_else(|| "?".to_string(), format_bytes);
+    let swap = match (notice.swap_free_bytes, notice.swap_total_bytes) {
+        (Some(free), Some(total)) if total > 0 => {
+            format!(
+                "{:.0}% used",
+                bytes_to_pct(total.saturating_sub(free), total)
+            )
+        }
+        _ => "?".to_string(),
+    };
+    let mut lines = vec![format!(
+        "  RAM scratch: WARNING (logged {}): tmpfs holds {}, swap {swap}, processes hold {} of it [{}]",
+        notice.logged_at,
+        size(notice.tmpfs_used_bytes),
+        size(notice.process_swap_bytes),
+        notice.reasons.join(", ")
+    )];
+    for tree in &notice.largest {
+        let idle = tree
+            .idle_hours
+            .map_or_else(|| "idle ?".to_string(), |hours| format!("idle {hours} h"));
+        lines.push(format!(
+            "    {} {} ({idle})",
+            format_bytes(tree.allocated_bytes),
+            tree.path
+        ));
+    }
+    lines.push(
+        "    Report only: sbh deletes nothing for it; `sbh check --ram-scratch` gives a fresh report."
+            .to_string(),
+    );
+    lines
 }
 
 fn status_memory_pressure_json(pressure: &MemoryPressure) -> Value {
@@ -20832,6 +20894,51 @@ mod tests {
             swap_free_bytes: 10 * 1024 * 1024 * 1024,
         };
         assert!(is_swap_thrash_risk(&thrashing));
+    }
+
+    /// bd-paeg: a RAM-scratch warning prints with its numbers and the largest
+    /// trees; a recovered or incomplete notice prints nothing.
+    #[test]
+    fn status_prints_the_daemons_ram_scratch_warning() {
+        use storage_ballast_helper::logger::stats::RamScratchTree;
+        let mut notice = RamScratchNotice {
+            logged_at: "2026-10-21T00:22:22.854Z".to_string(),
+            state: "warning".to_string(),
+            tmpfs_used_bytes: Some(34_146_168_832),
+            process_swap_bytes: Some(17_808_011_264),
+            swap_free_bytes: Some(2_491_097_088),
+            swap_total_bytes: Some(68_719_472_640),
+            reasons: vec!["low_swap_tmpfs_exceeds_process_swap".to_string()],
+            largest: vec![
+                RamScratchTree {
+                    path: "/tmp/hfdt-artifacts".to_string(),
+                    allocated_bytes: 3_889_455_104,
+                    idle_hours: Some(4),
+                },
+                RamScratchTree {
+                    path: "/run/user/1000/qualification".to_string(),
+                    allocated_bytes: 309_514_240,
+                    idle_hours: None,
+                },
+            ],
+        };
+        let lines = ram_scratch_status_lines(&notice);
+        assert_eq!(lines.len(), 4, "{lines:#?}");
+        assert!(lines[0].contains("RAM scratch: WARNING"), "{lines:#?}");
+        assert!(lines[0].contains("swap 96% used"), "{lines:#?}");
+        assert!(
+            lines[0].contains("low_swap_tmpfs_exceeds_process_swap"),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[1].contains("/tmp/hfdt-artifacts") && lines[1].contains("idle 4 h"),
+            "{lines:#?}"
+        );
+        assert!(lines[2].contains("idle ?"), "{lines:#?}");
+        for state in ["recovered", "incomplete"] {
+            notice.state = state.to_string();
+            assert!(ram_scratch_status_lines(&notice).is_empty(), "{state}");
+        }
     }
 
     #[test]
