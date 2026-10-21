@@ -8,20 +8,21 @@ use std::io;
 use std::path::Path;
 
 use super::{
-    Access, MEMBERSHIP, MEMBERSHIP_BYTES, MOUNT_BYTES, MOUNTS, Native, Observation, PATH_BYTES,
-    SCALAR_BYTES, Source, hierarchy_mount, invalid, membership_path,
+    Access, CONTROLLER_BYTES, MEMBERSHIP, MEMBERSHIP_BYTES, MOUNT_BYTES, MOUNTS, Native,
+    Observation, PATH_BYTES, SCALAR_BYTES, Source, hierarchy_mount, invalid, membership_path,
 };
 
 pub(in crate::platform::linux) const PSI_BYTES: usize = 4096;
 
-/// None means that the existing resolver identified an unsupported hierarchy;
-/// the caller may use host PSI alone there. A v2 read failure is an error, not
-/// a zero-pressure sample. Do not cache paths across process migration.
+/// None means that the existing resolver identified an unsupported hierarchy,
+/// or that this process is alone in its cgroup; the caller uses host PSI alone
+/// there. A v2 read failure is an error, not a zero-pressure sample. Do not
+/// cache paths across process migration.
 pub(in crate::platform::linux) fn read() -> io::Result<Option<u64>> {
-    read_with(&Native)
+    read_with(&Native, std::process::id())
 }
 
-fn read_with(access: &impl Access) -> io::Result<Option<u64>> {
+fn read_with(access: &impl Access, own_pid: u32) -> io::Result<Option<u64>> {
     let mut observation = Observation::new(access);
     let membership = observation.read(Path::new(MEMBERSHIP), MEMBERSHIP_BYTES, Source::Proc)?;
     let member = match membership_path(&membership) {
@@ -45,6 +46,15 @@ fn read_with(access: &impl Access) -> io::Result<Option<u64>> {
     let pressure_path = scope.join("memory.pressure");
     if pressure_path.as_os_str().as_encoded_bytes().len() > PATH_BYTES {
         return Err(invalid("cgroup PSI path exceeded its allowance"));
+    }
+    if holds_only(&mut observation, &scope, own_pid)? {
+        if observation.read(Path::new(MEMBERSHIP), MEMBERSHIP_BYTES, Source::Proc)? != membership
+            || observation.read(Path::new(MOUNTS), MOUNT_BYTES, Source::Proc)? != mounts
+        {
+            return Err(invalid("cgroup PSI scope changed during observation"));
+        }
+        observation.check_time()?;
+        return Ok(None);
     }
     // Older kernels do not expose this switch. A readable PSI file is still
     // usable on those kernels, but an explicit zero must not certify health.
@@ -70,6 +80,42 @@ fn read_with(access: &impl Access) -> io::Result<Option<u64>> {
     }
     observation.check_time()?;
     Ok(Some(avg10))
+}
+
+/// Whether `scope` holds this process and nothing else: no other process and
+/// no descendant cgroup whose tasks its PSI would also count.
+///
+/// Such a cgroup's PSI is this process's own stall. A dedicated service at its
+/// own MemoryMax reclaims the dentries and page cache its walk charged (ts2,
+/// 2026-10-21: sbh.service avg10 2.8% -> 35% within 10 s, host avg10 near 2%),
+/// and reading that as workload memory pressure flipped the behavior mode 53-146
+/// times an hour and raised 3-8 Critical+Critical emergencies an hour.
+fn holds_only(
+    observation: &mut Observation<'_, impl Access>,
+    scope: &Path,
+    own_pid: u32,
+) -> io::Result<bool> {
+    let procs = observation.read(
+        &scope.join("cgroup.procs"),
+        MEMBERSHIP_BYTES,
+        Source::Cgroup,
+    )?;
+    let own = own_pid.to_string();
+    let alone = std::str::from_utf8(&procs)
+        .is_ok_and(|raw| !raw.is_empty() && raw.lines().all(|pid| pid == own));
+    if !alone {
+        return Ok(false);
+    }
+    let stat = observation.read(&scope.join("cgroup.stat"), CONTROLLER_BYTES, Source::Cgroup)?;
+    std::str::from_utf8(&stat)
+        .ok()
+        .and_then(|raw| {
+            raw.lines()
+                .find_map(|line| line.strip_prefix("nr_descendants "))
+        })
+        .and_then(|count| count.parse::<u64>().ok())
+        .map(|count| count == 0)
+        .ok_or_else(|| invalid("cgroup.stat has no valid nr_descendants count"))
 }
 
 /// Parse the kernel's complete `some` row, shared with host PSI. Invalid,
@@ -163,6 +209,8 @@ mod tests {
         step: Duration,
     }
 
+    const OWN: u32 = 42;
+
     fn psi(avg10: &str) -> Vec<u8> {
         format!("some avg10={avg10} avg60=0.00 avg300=0.00 total=123\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n").into_bytes()
     }
@@ -176,6 +224,7 @@ mod tests {
                         MOUNTS.into(),
                         b"36 25 0:32 / /cg rw - cgroup2 cgroup rw\n".to_vec(),
                     ),
+                    ("/cg/service/cgroup.procs".into(), b"7\n42\n".to_vec()),
                     ("/cg/service/cgroup.pressure".into(), b"1\n".to_vec()),
                     ("/cg/service/memory.pressure".into(), psi("73.50")),
                 ]),
@@ -217,8 +266,8 @@ mod tests {
     #[test]
     fn reads_the_process_scope_without_scanning_siblings_or_memory_limits() {
         let fixture = Fixture::default();
-        assert_eq!(read_with(&fixture).unwrap(), Some(7350));
-        assert_eq!(fixture.reads.borrow().values().sum::<usize>(), 7);
+        assert_eq!(read_with(&fixture, OWN).unwrap(), Some(7350));
+        assert_eq!(fixture.reads.borrow().values().sum::<usize>(), 8);
         assert!(
             fixture
                 .reads
@@ -226,6 +275,63 @@ mod tests {
                 .keys()
                 .all(|path| fixture.files.contains_key(path))
         );
+    }
+
+    #[test]
+    fn a_cgroup_holding_only_this_process_defers_to_host_psi() {
+        let alone = || {
+            let mut fixture = Fixture::default();
+            fixture
+                .files
+                .insert("/cg/service/cgroup.procs".into(), b"42\n".to_vec());
+            fixture.files.insert(
+                "/cg/service/cgroup.stat".into(),
+                b"nr_descendants 0\nnr_dying_descendants 3\n".to_vec(),
+            );
+            fixture
+        };
+        let fixture = alone();
+        assert_eq!(read_with(&fixture, OWN).unwrap(), None);
+        let reads = fixture.reads.borrow();
+        assert!(!reads.contains_key(Path::new("/cg/service/memory.pressure")));
+        assert!(!reads.contains_key(Path::new("/cg/service/cgroup.pressure")));
+        assert_eq!(reads.values().sum::<usize>(), 6);
+        drop(reads);
+
+        // Its own stall still counts once the cgroup is shared: another
+        // process, or a descendant cgroup whose tasks the PSI includes.
+        let mut fixture = alone();
+        fixture
+            .files
+            .insert("/cg/service/cgroup.procs".into(), b"42\n43\n".to_vec());
+        assert_eq!(read_with(&fixture, OWN).unwrap(), Some(7350));
+        let mut fixture = alone();
+        fixture.files.insert(
+            "/cg/service/cgroup.stat".into(),
+            b"nr_descendants 1\nnr_dying_descendants 0\n".to_vec(),
+        );
+        assert_eq!(read_with(&fixture, OWN).unwrap(), Some(7350));
+        assert_eq!(read_with(&alone(), 43).unwrap(), Some(7350));
+
+        // Alone but unprovable is an error, never a quiet Normal.
+        let mut fixture = alone();
+        fixture.files.remove(Path::new("/cg/service/cgroup.stat"));
+        assert!(read_with(&fixture, OWN).is_err());
+        for raw in [
+            b"nr_dying_descendants 0\n".as_slice(),
+            b"nr_descendants x\n",
+        ] {
+            let mut fixture = alone();
+            fixture
+                .files
+                .insert("/cg/service/cgroup.stat".into(), raw.to_vec());
+            assert!(read_with(&fixture, OWN).is_err(), "{raw:?}");
+        }
+        let fixture = Fixture {
+            changed: Some((MEMBERSHIP.into(), b"0::/moved\n".to_vec())),
+            ..alone()
+        };
+        assert!(read_with(&fixture, OWN).is_err());
     }
 
     #[test]
@@ -239,7 +345,7 @@ mod tests {
                 changed: Some((path.into(), raw.to_vec())),
                 ..Fixture::default()
             };
-            assert!(read_with(&fixture).is_err(), "{path}");
+            assert!(read_with(&fixture, OWN).is_err(), "{path}");
         }
     }
 
@@ -250,7 +356,7 @@ mod tests {
             fixture
                 .files
                 .insert("/cg/service/cgroup.pressure".into(), raw.to_vec());
-            assert!(read_with(&fixture).is_err());
+            assert!(read_with(&fixture, OWN).is_err());
             assert!(
                 !fixture
                     .reads
@@ -266,12 +372,12 @@ mod tests {
         fixture
             .files
             .remove(Path::new("/cg/service/cgroup.pressure"));
-        assert_eq!(read_with(&fixture).unwrap(), Some(7350));
+        assert_eq!(read_with(&fixture, OWN).unwrap(), Some(7350));
         fixture.files.insert(
             "/cg/service/memory.pressure".into(),
             b"some avg10=0.00\n".to_vec(),
         );
-        assert!(read_with(&fixture).is_err());
+        assert!(read_with(&fixture, OWN).is_err());
     }
 
     #[test]
@@ -279,6 +385,7 @@ mod tests {
         for path in [
             MEMBERSHIP,
             MOUNTS,
+            "/cg/service/cgroup.procs",
             "/cg/service/cgroup.pressure",
             "/cg/service/memory.pressure",
         ] {
@@ -287,7 +394,7 @@ mod tests {
                 ..Fixture::default()
             };
             assert_eq!(
-                read_with(&fixture).unwrap_err().kind(),
+                read_with(&fixture, OWN).unwrap_err().kind(),
                 io::ErrorKind::PermissionDenied
             );
         }
@@ -295,7 +402,7 @@ mod tests {
         fixture
             .files
             .remove(Path::new("/cg/service/memory.pressure"));
-        assert!(read_with(&fixture).is_err());
+        assert!(read_with(&fixture, OWN).is_err());
     }
 
     #[test]
@@ -304,41 +411,44 @@ mod tests {
         fixture
             .files
             .insert(MEMBERSHIP.into(), b"5:memory:/service\n".to_vec());
-        assert_eq!(read_with(&fixture).unwrap(), None);
+        assert_eq!(read_with(&fixture, OWN).unwrap(), None);
         assert_eq!(fixture.reads.borrow().len(), 1);
         fixture
             .files
             .insert(MEMBERSHIP.into(), b"invalid\n".to_vec());
-        assert!(read_with(&fixture).is_err());
+        assert!(read_with(&fixture, OWN).is_err());
     }
 
     #[test]
     fn failed_final_read_cannot_renew_the_original_deadline() {
         let fixture = Fixture {
-            step: super::super::SCAN_TIME / 7 + Duration::from_nanos(1),
+            step: super::super::SCAN_TIME / 8 + Duration::from_nanos(1),
             ..Fixture::default()
         };
         assert_eq!(
-            read_with(&fixture).unwrap_err().kind(),
+            read_with(&fixture, OWN).unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
-        assert_eq!(fixture.reads.borrow().values().sum::<usize>(), 7);
+        assert_eq!(fixture.reads.borrow().values().sum::<usize>(), 8);
     }
 
     #[test]
     fn pressure_is_fresh_after_recovery_and_between_process_migrations() {
         let mut fixture = Fixture::default();
-        assert_eq!(read_with(&fixture).unwrap(), Some(7350));
+        assert_eq!(read_with(&fixture, OWN).unwrap(), Some(7350));
         fixture
             .files
             .insert(MEMBERSHIP.into(), b"0::/next\n".to_vec());
+        fixture
+            .files
+            .insert("/cg/next/cgroup.procs".into(), b"42\n43\n".to_vec());
         fixture
             .files
             .insert("/cg/next/cgroup.pressure".into(), b"1\n".to_vec());
         fixture
             .files
             .insert("/cg/next/memory.pressure".into(), psi("0.00"));
-        assert_eq!(read_with(&fixture).unwrap(), Some(0));
+        assert_eq!(read_with(&fixture, OWN).unwrap(), Some(0));
     }
 
     #[test]
@@ -402,6 +512,6 @@ mod tests {
             "/cg/service/memory.pressure".into(),
             vec![b'x'; PSI_BYTES + 1],
         );
-        assert!(read_with(&fixture).is_err());
+        assert!(read_with(&fixture, OWN).is_err());
     }
 }

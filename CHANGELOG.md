@@ -86,6 +86,16 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   away without cancelling, such as a scanner thread that panicked and was
   respawned, left its walker threads listing the rest of the tree with
   nobody reading.
+- **The daemon no longer reads its own cgroup's stall as memory pressure**
+  (bd-90af). Since 0.7.10 the memory level took the larger of host PSI and
+  the PSI of sbh's own cgroup. In a service cgroup that holds only sbh,
+  that PSI is the daemon reclaiming its own walk's dentries and page cache
+  against `MemoryMax`: on ts2 it rose from 3% to 35% within 10 s while host
+  PSI stayed near 2%, and the daemon changed behavior mode 53-146 times an
+  hour, narrowing its scan and raising 3-8 Critical+Critical emergency
+  notifications an hour. A cgroup that holds only sbh (`cgroup.procs`, no
+  descendants in `cgroup.stat`) now defers to host PSI; a shared one, such
+  as an agent's scope or a container, still counts.
 
 ### Removed
 
