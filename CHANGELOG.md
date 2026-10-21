@@ -17,6 +17,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   instead of 10.8 s). With file stats, CPU also grew with walker threads,
   from btrfs's per-root inode lock; without them it stays flat. Trees with
   fewer files per directory gain less. CLI walks are unchanged.
+- **`sbh status` shows the daemon's RAM-scratch warning** (bd-paeg). The
+  observer that relates tmpfs occupancy to RAM and swap logged its warnings
+  only to the activity log; `status` now prints the latest one from the last
+  35 minutes (tmpfs, swap and process-swap figures, reasons, and the largest
+  idle trees) and adds `ram_scratch` to its JSON. Report only: nothing is
+  deleted on its account.
 - **The I/O-history sampler reads one `/proc` file per process** (bd-du48;
   `678707e`). Every 30 s the monitor thread listed every process with its
   `comm`, `status` and `stat` files and `exe` and `cwd` links, though the
@@ -34,7 +40,7 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   classify a directory as the walk does** (bd-10yj; `93c6c4f`). They classified by name
   and ignored the walker's verdict, so `clean` missed a Go build cache that
   `scan` nominated, and a tree the walk only descends into (an hfdt store's
-  own `target/`, a repo copy's `scripts/build`) could still be nominated by
+  own `target/`, a repo copy's scripts/build directory) could still be nominated by
   its name. On ts2 the daemon made 472 such name-only `target` decisions
   between 10-13 and 10-18.
 - **A scan pass that stops on its budget no longer hides unexplored ground
