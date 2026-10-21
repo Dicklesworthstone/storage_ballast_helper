@@ -96,6 +96,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   notifications an hour. A cgroup that holds only sbh (`cgroup.procs`, no
   descendants in `cgroup.stat`) now defers to host PSI; a shared one, such
   as an agent's scope or a container, still counts.
+- **The priority pre-scan no longer starves the walk at Critical**
+  (bd-6ydh). Since
+  CPU budgets apply at Critical, a pre-scan that probes each nominee's tree
+  could spend a pass's whole CPU allowance by itself: on ts2 every pass
+  after the sixth stopped inside it after 38-1,041 of /data/tmp's 23,301
+  top-level entries, and the walk did not run. The pre-scan now stops at
+  half the pass's allowance and the walk gets the rest.
 
 ### Removed
 

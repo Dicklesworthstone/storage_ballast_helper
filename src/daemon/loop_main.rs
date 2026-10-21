@@ -2609,6 +2609,9 @@ enum PassStop {
     /// `scanner.prescan_time_budget_secs` — the *phase* is over, but the pass
     /// continues into the general walker.
     PrescanPhase,
+    /// The pre-scan spent [`PRESCAN_CPU_SHARE`] of the pass's CPU allowance;
+    /// like [`Self::PrescanPhase`] it ends only the phase.
+    PrescanCpuShare,
     /// `scanner.scan_time_budget_secs` — the pass's wall ceiling.
     Wall,
     /// The daemon's measured CPU allowance for this pass (Q7).
@@ -2620,6 +2623,7 @@ impl PassStop {
     const fn label(self) -> &'static str {
         match self {
             Self::PrescanPhase => "prescan wall budget",
+            Self::PrescanCpuShare => "prescan cpu share",
             Self::Wall => "scan wall budget",
             Self::Cpu => "daemon cpu budget",
         }
@@ -2685,7 +2689,13 @@ impl PassLimits {
         if self.cpu.exhausted(now) {
             return Some(PassStop::Cpu);
         }
-        (now >= self.prescan_deadline).then_some(PassStop::PrescanPhase)
+        if now >= self.prescan_deadline {
+            return Some(PassStop::PrescanPhase);
+        }
+        self.cpu
+            .allowance_secs()
+            .is_some_and(|allowance| self.cpu.spent_secs() >= allowance * PRESCAN_CPU_SHARE)
+            .then_some(PassStop::PrescanCpuShare)
     }
 
     /// Whether the general walk must stop now, and which limit says so.
@@ -2702,6 +2712,15 @@ impl PassLimits {
         self.scan_start.elapsed()
     }
 }
+
+/// Share of a pass's CPU allowance the priority pre-scan may spend before the
+/// general walk takes over.
+///
+/// Since the CPU budget binds at Critical (41ad7f5), a pre-scan that probes
+/// each nominee's tree spent the whole allowance on its own: on ts2
+/// (2026-10-21) every pass after the restart's sixth stopped inside it after
+/// 38-1,041 of /data/tmp's 23,301 top-level entries, and the walk never ran.
+const PRESCAN_CPU_SHARE: f64 = 0.5;
 
 /// Shortest gap between two operator-facing `SBH-2007` budget warnings.
 const BUDGET_WARNING_INTERVAL: Duration = Duration::from_mins(5);
@@ -12578,6 +12597,41 @@ mod tests {
         assert_eq!(spent.prescan_stop(), Some(PassStop::Wall));
         assert_eq!(spent.walk_stop(), Some(PassStop::Wall));
         assert!(PassStop::Wall.ends_pass() && PassStop::Cpu.ends_pass());
+    }
+
+    /// The pre-scan stops at its share of the pass's CPU allowance and hands
+    /// the rest to the walk; with the budget off it has no CPU share at all.
+    #[test]
+    fn prescan_spends_only_its_share_of_the_pass_cpu() {
+        let start = Instant::now();
+        let cpu = Arc::new(Mutex::new(0.0_f64));
+        let handle = Arc::clone(&cpu);
+        let guard = PassCpuGuard::new(Some(4.0), start, move || Some(*handle.lock()))
+            .with_sample_interval(Duration::ZERO);
+        let mut limits = PassLimits::new(
+            start,
+            start + Duration::from_mins(15),
+            Duration::from_mins(15),
+            guard,
+        );
+        *cpu.lock() = 1.9;
+        assert_eq!(limits.prescan_stop(), None);
+        *cpu.lock() = 2.0;
+        let stop = limits.prescan_stop().expect("half the allowance is spent");
+        assert_eq!(stop, PassStop::PrescanCpuShare);
+        assert!(!stop.ends_pass(), "the walk gets the other half");
+        assert_eq!(limits.walk_stop(), None);
+        *cpu.lock() = 4.0;
+        assert_eq!(limits.walk_stop(), Some(PassStop::Cpu));
+        assert_eq!(limits.prescan_stop(), Some(PassStop::Cpu));
+
+        let mut unlimited = PassLimits::new(
+            start,
+            start + Duration::from_mins(15),
+            Duration::from_mins(15),
+            PassCpuGuard::unlimited(start),
+        );
+        assert_eq!(unlimited.prescan_stop(), None);
     }
 
     /// A spent CPU allowance ends the pass; an unspent one does not, however

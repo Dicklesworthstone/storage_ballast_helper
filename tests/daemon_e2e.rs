@@ -1866,6 +1866,11 @@ fn an_idle_yellow_mount_rebuilds_an_empty_reserve() {
 /// accounting, so the empty-pass cooldown never armed and a large, busy root
 /// was rescanned back to back at the CPU-budget ceiling with nothing to
 /// reclaim. Such passes are now paced by `min_rescan_interval_secs`.
+///
+/// Since bd-6ydh the pre-scan stops at its share of the pass's CPU and the
+/// walk spends the rest, so a budget-cut pass usually ends in the walk
+/// (`(timed out)`) rather than in the pre-scan (`(timed out in the priority
+/// pre-scan)`). Both kinds count: every budget-cut pass must be paced.
 #[test]
 fn prescan_timeouts_on_a_busy_root_are_paced_by_the_rescan_interval() {
     if common::other_users_hidden() {
@@ -1916,19 +1921,19 @@ fn prescan_timeouts_on_a_busy_root_are_paced_by_the_rescan_interval() {
             }
         })
     };
-    let prescan_timeouts = |run: &DaemonRun| {
+    let budget_cut_passes = |run: &DaemonRun| {
         run.stderr()
             .lines()
-            .filter(|line| line.contains("timed out in the priority pre-scan"))
+            .filter(|line| line.contains("scan complete:") && line.contains("(timed out"))
             .count()
     };
     run.wait_until(
-        "the first pre-scan timeout",
+        "the first budget-cut pass",
         Duration::from_secs(60),
-        |run| prescan_timeouts(run) >= 1,
+        |run| budget_cut_passes(run) >= 1,
     )
     .unwrap_or_else(|e| panic!("{e}"));
-    let first = prescan_timeouts(&run);
+    let first = budget_cut_passes(&run);
     let window_start = run.wall_secs();
     run.wait_until("a 60 s window", Duration::from_secs(80), |run| {
         run.wall_secs() >= window_start + 60.0
@@ -1936,14 +1941,14 @@ fn prescan_timeouts_on_a_busy_root_are_paced_by_the_rescan_interval() {
     .unwrap_or_else(|e| panic!("{e}"));
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     writer.join().unwrap();
-    let in_window = prescan_timeouts(&run) - first;
-    eprintln!("prescan timeouts in the 60 s window: {in_window}");
+    let in_window = budget_cut_passes(&run) - first;
+    eprintln!("budget-cut passes in the 60 s window: {in_window}");
     // A 20 s interval allows at most four in 60 s. Unpaced, the passes are
     // limited only by the CPU bucket refilling one CPU-second (~6.5 s at 25%),
     // about nine in 60 s.
     assert!(
         in_window <= 4,
-        "{in_window} pre-scan timeouts in 60 s; expected pacing by the 20 s interval"
+        "{in_window} budget-cut passes in 60 s; expected pacing by the 20 s interval"
     );
     assert!(run.stop().success());
 }
