@@ -10793,7 +10793,7 @@ mod tests {
         }]);
         // Filling fast: 10 GB at 100 MB/s is 100 s from full, urgency ~0.94,
         // which the release controller answers with every file in the pool.
-        daemon.mount_rates.insert(mount, 100_000_000.0);
+        daemon.mount_rates.insert(mount.clone(), 100_000_000.0);
         let (scan_tx, scan_rx) = crossbeam_channel::bounded(4);
         daemon.check_special_locations(&scan_tx, &scan_rx);
 
@@ -10805,6 +10805,26 @@ mod tests {
         let request = scan_rx.try_recv().expect("the alert still queues a scan");
         assert_eq!(request.pressure_level, PressureLevel::Orange);
         assert!(request.paths.contains(&tmp), "{:?}", request.paths);
+
+        // Control: the call this path used to make, with the alert's Orange
+        // response at urgency ~0.94, empties this very pool, so the kept files
+        // above are not an artifact of the fixture.
+        let old_alert_response = crate::monitor::pid::PressureResponse {
+            level: PressureLevel::Orange,
+            urgency: 0.94,
+            scan_interval: Duration::from_secs(0),
+            release_ballast_files: 0,
+            max_delete_batch: 60,
+            fallback_active: false,
+            causing_mount: mount.clone(),
+            free_pct: 1.0,
+            predicted_seconds: None,
+        };
+        assert_eq!(
+            daemon.release_ballast(&mount, &old_alert_response).unwrap(),
+            2
+        );
+        assert_eq!(available(&daemon), 0);
 
         daemon.logger_handle.shutdown();
         if let Some(logger) = daemon.logger_join.take() {
