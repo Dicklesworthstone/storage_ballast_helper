@@ -406,11 +406,11 @@ mod tests {
         let total = 2_000_000_000_000_u64;
         // 4.95% free: just under the 5% percentage floor, ~99 GB.
         let temp = tempfile::tempdir().unwrap();
-        let mut manager = manager(temp.path(), Some(stats(total, 99_000_000_000)));
+        let mut pool = manager(temp.path(), Some(stats(total, 99_000_000_000)));
         let pct = [10.0, 8.0, 5.0, 3.0];
 
-        manager.set_provision_floor_rule(ProvisionFloor::Thresholds { pct, bytes: [0; 4] });
-        let refused = manager.provision(None).unwrap();
+        pool.set_provision_floor_rule(ProvisionFloor::Thresholds { pct, bytes: [0; 4] });
+        let refused = pool.provision(None).unwrap();
         assert_eq!(refused.files_created, 0);
         assert_eq!(refused.skipped_for_floor, 3);
         assert!(
@@ -418,11 +418,11 @@ mod tests {
             "{}",
             refused.floor_pct
         );
-        assert!(!manager.file_path(1).exists());
+        assert!(!pool.file_path(1).exists());
 
         let bytes = [80 * GIB, 60 * GIB, 40 * GIB, 25 * GIB];
-        manager.set_provision_floor_rule(ProvisionFloor::Thresholds { pct, bytes });
-        let built = manager.provision(None).unwrap();
+        pool.set_provision_floor_rule(ProvisionFloor::Thresholds { pct, bytes });
+        let built = pool.provision(None).unwrap();
         assert_eq!(built.files_created, 3, "{built:?}");
         assert_eq!(built.skipped_for_floor, 0);
         #[allow(clippy::cast_precision_loss)]
