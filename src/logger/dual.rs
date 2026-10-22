@@ -478,6 +478,8 @@ fn logger_thread_main(
     let mut last_drop_report = Instant::now();
     let mut last_diagnostic_check = Instant::now();
     let mut stopping = false;
+    // bd-jl92: what the evidence ledger has already said about each artifact.
+    let mut decisions = crate::logger::decision_dedupe::DecisionDedupe::default();
     loop {
         // Heartbeat for the daemon's thread health: once a second while
         // idle, and on every event while busy.
@@ -532,6 +534,14 @@ fn logger_thread_main(
         }
         if let ActivityEvent::MirrorJsonl(on) = event {
             jsonl.set_mirror(on);
+            continue;
+        }
+        // bd-jl92: a verdict that cannot delete anything and repeats the last
+        // one recorded for the same artifact is recorded once per refresh,
+        // not on every scan pass (JSONL and SQLite alike).
+        if let ActivityEvent::DecisionRecorded(record) = &event
+            && !decisions.should_record(record, now)
+        {
             continue;
         }
 
@@ -1417,6 +1427,44 @@ mod tests {
             std::fs::write(&blocker, b"regular file standing in for an unwritable dir").unwrap();
         }
         blocker.join(leaf)
+    }
+
+    /// bd-jl92 through the real logger: a kept artifact re-evaluated on every
+    /// pass is one `decision_log` row and one JSONL `decision` line, a changed
+    /// verdict and every delete add one each, and `sbh explain --id` (the
+    /// latest row for the stable id) still answers with the latest verdict.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn repeated_kept_verdicts_are_one_ledger_row() {
+        use crate::scanner::decision_record::{ActionRecord, PolicyMode, sample_record_for_tests};
+        use crate::scanner::scoring::DecisionAction;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join) = spawn_logger(test_config(dir.path())).unwrap();
+        let decided = |effective| {
+            let mut record = sample_record_for_tests(PolicyMode::Live, Some(effective));
+            record.id = "a1b2c3d4e5f6".to_string();
+            ActivityEvent::DecisionRecorded(Box::new(record))
+        };
+        for _ in 0..20 {
+            handle.send(decided(DecisionAction::Keep));
+        }
+        handle.send(decided(DecisionAction::Review));
+        handle.send(decided(DecisionAction::Delete));
+        handle.send(decided(DecisionAction::Delete));
+        handle.shutdown();
+        join.join().unwrap();
+
+        let db = SqliteLogger::open(&dir.path().join("test.db")).unwrap();
+        let (latest, rows) = db.decision_by_id("a1b2c3d4e5f6").unwrap().unwrap();
+        assert_eq!(rows, 4, "1 keep + 1 review + 2 deletes, not 23 rows");
+        assert_eq!(latest.effective_action, Some(ActionRecord::Delete));
+        let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        let lines = jsonl
+            .lines()
+            .filter(|line| line.contains("a1b2c3d4e5f6"))
+            .count();
+        assert_eq!(lines, 4);
     }
 
     #[test]

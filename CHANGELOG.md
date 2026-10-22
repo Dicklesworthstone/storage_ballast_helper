@@ -8,6 +8,16 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Changed
 
+- **The evidence ledger records a repeated verdict that deletes nothing once
+  a day, not on every scan pass** (bd-jl92). Every candidate is re-evaluated
+  each pass, and each verdict was written in full to `decision_log` and the
+  JSONL log: on fmd 1.5M rows for 153k paths filled 6.3 GB inside the 30-day
+  retention, about 21 GB across the fleet. A keep, review or veto that repeats
+  the last record for the same artifact version (stable decision id: path,
+  device, inode, size) and policy mode is now skipped for 24 hours. A changed
+  verdict, a new artifact version, and every decision that may delete are
+  always recorded, so the deletion audit trail is unchanged and `sbh explain`
+  still finds the current verdict.
 - **The daemon's scan walk no longer stats every file** (bd-gh0x;
   `c858c27`). It stat-ed each file of every directory it listed to size the
   directory, though only entries that classify as candidates use the size.
@@ -30,6 +40,25 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **The ballast headroom floor honors the absolute pressure floors**
+  (bd-lxga). It was one percentage for every volume, the Orange threshold but
+  at least two points above Red, so `pressure.*_min_free_bytes` lowered a large
+  volume's pressure level but not its provisioning floor. A 1.86 TB Mac that
+  the byte floors held at Yellow refused every ballast file below about 100 GB
+  free and kept an empty reserve. The floor is now worked out per volume from
+  the thresholds in force on it. The daemon (at start and on reload),
+  `sbh ballast`, the dashboard and the `ballast.reserve` doctor check use it.
+  Without byte floors nothing changes.
+- **A special-location alert no longer releases ballast, and repeats are one
+  alert** (bd-uttn). Each alert released ballast at once, on the location's
+  mount or else on the fullest pool, which bypassed the mount's own pressure
+  level. On macOS `/tmp` is a special location on the Data volume, and its
+  "filling fast" rule fired on ordinary write bursts (about 100 alerts a
+  day), so the reserve was spent and never rebuilt. A RAM-backed location
+  such as `/dev/shm` gained nothing from freeing disk at all. The alert still
+  queues a scan. It now notifies when an episode starts or escalates, with
+  the real previous level, and an episode ends only after a whole alert
+  interval without an alert.
 - **A directory named `target` under a temp root is no longer a cargo target
   on its name alone** (bd-u9ua; `14f5b71`). Without a `Cargo.toml` beside it,
   it now needs cargo's own markers (`CACHEDIR.TAG`, `.rustc_info.json`,
