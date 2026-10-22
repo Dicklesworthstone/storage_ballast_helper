@@ -10662,7 +10662,7 @@ mod tests {
     #[test]
     fn special_location_episodes_notify_on_start_and_escalation_only() {
         let t0 = Instant::now();
-        let interval = Duration::from_secs(900);
+        let interval = Duration::from_mins(15);
 
         assert_eq!(
             special_episode_step(None, PressureLevel::Yellow),
@@ -10687,7 +10687,7 @@ mod tests {
         assert!(special_episode_over(None, t0, interval));
         assert!(!special_episode_over(
             orange,
-            t0 + Duration::from_secs(300),
+            t0 + Duration::from_mins(5),
             interval
         ));
         assert!(special_episode_over(orange, t0 + interval, interval));
@@ -10699,6 +10699,7 @@ mod tests {
     /// pool on every write burst, so a macOS Data volume never kept a reserve.
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn special_location_alert_scans_but_never_releases_ballast() {
         use crate::core::config::PathsConfig;
         use crate::monitor::special_locations::{
