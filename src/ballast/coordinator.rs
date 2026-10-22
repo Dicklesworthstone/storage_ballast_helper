@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::ballast::manager::{
-    BallastAvailability, BallastHealth, BallastManager, ProvisionReport, ReleaseReport,
-    VerifyReport, orphan_ballast_files,
+    BallastAvailability, BallastHealth, BallastManager, ProvisionFloor, ProvisionReport,
+    ReleaseReport, VerifyReport, orphan_ballast_files,
 };
 use crate::core::config::BallastConfig;
 use crate::core::errors::Result;
@@ -541,6 +541,14 @@ impl BallastPoolCoordinator {
     pub fn set_provision_floor(&mut self, floor_pct: f64) {
         for pool in self.pools.values_mut() {
             pool.manager.set_provision_floor(floor_pct);
+        }
+    }
+
+    /// Apply one headroom rule to every pool; each pool evaluates it against
+    /// the capacity of its own volume (see [`ProvisionFloor`]).
+    pub fn set_provision_floor_rule(&mut self, floor: ProvisionFloor) {
+        for pool in self.pools.values_mut() {
+            pool.manager.set_provision_floor_rule(floor);
         }
     }
 

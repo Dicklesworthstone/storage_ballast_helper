@@ -2669,12 +2669,27 @@ impl Config {
     /// Red. A reserve is worth building only while the volume is still above
     /// the level at which the daemon starts reclaiming; below Red it is
     /// releasing, not reserving.
+    ///
+    /// This is the floor before absolute byte floors apply; on a given volume
+    /// use [`Self::ballast_provision_floor`], which honors them.
     #[must_use]
     pub fn ballast_provision_floor_pct(&self) -> f64 {
         self.pressure
             .orange_min_free_pct
             .max(self.pressure.red_min_free_pct + 2.0)
             .clamp(0.0, 100.0)
+    }
+
+    /// The ballast headroom floor as a rule each volume is checked against:
+    /// [`Self::ballast_provision_floor_pct`]'s rule applied to the thresholds
+    /// in force on that volume, so `pressure.*_min_free_bytes` lower it on a
+    /// large volume exactly as they lower that volume's pressure levels.
+    #[must_use]
+    pub const fn ballast_provision_floor(&self) -> crate::ballast::manager::ProvisionFloor {
+        crate::ballast::manager::ProvisionFloor::Thresholds {
+            pct: self.pressure.free_pct_thresholds(),
+            bytes: self.pressure.min_free_bytes(),
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3654,6 +3669,41 @@ mod tests {
         cfg.pressure.orange_min_free_pct = 30.0;
         cfg.pressure.red_min_free_pct = 5.0;
         assert!((cfg.ballast_provision_floor_pct() - 30.0).abs() < f64::EPSILON);
+    }
+
+    /// With byte floors off, the per-volume rule is the percentage floor on
+    /// every volume; with them set it follows each volume's own thresholds and
+    /// never rises above the percentage floor.
+    #[test]
+    fn ballast_provision_floor_rule_follows_each_volumes_thresholds() {
+        const GIB: u64 = 1 << 30;
+        let mut cfg = Config::default();
+        cfg.pressure.green_min_free_pct = 10.0;
+        cfg.pressure.yellow_min_free_pct = 8.0;
+        cfg.pressure.orange_min_free_pct = 5.0;
+        cfg.pressure.red_min_free_pct = 3.0;
+        let pct_floor = cfg.ballast_provision_floor_pct();
+        for total in [0, 100_000_000_000, 2_000_000_000_000] {
+            assert!((cfg.ballast_provision_floor().pct_on(total) - pct_floor).abs() < 1e-12);
+        }
+
+        cfg.pressure.green_min_free_bytes = 80 * GIB;
+        cfg.pressure.yellow_min_free_bytes = 60 * GIB;
+        cfg.pressure.orange_min_free_bytes = 40 * GIB;
+        cfg.pressure.red_min_free_bytes = 25 * GIB;
+        cfg.validate().unwrap();
+        let rule = cfg.ballast_provision_floor();
+        // 2 TB: Orange in force is 40 GiB (2.15%), Red 25 GiB (1.34%), so the
+        // floor is Red + 2 points (3.34%, ~67 GB) instead of 5% (100 GB).
+        let total = 2_000_000_000_000_u64;
+        #[allow(clippy::cast_precision_loss)]
+        let expected = (25 * GIB) as f64 * 100.0 / total as f64 + 2.0;
+        assert!((rule.pct_on(total) - expected).abs() < 1e-9);
+        assert!(rule.pct_on(total) < pct_floor);
+        // 100 GB: each byte floor is above its percentage, so nothing changes.
+        assert!((rule.pct_on(100_000_000_000) - pct_floor).abs() < 1e-12);
+        // Unknown capacity falls back to the percentage floor.
+        assert!((rule.pct_on(0) - pct_floor).abs() < 1e-12);
     }
 
     #[test]

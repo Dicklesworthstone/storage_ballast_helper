@@ -6991,7 +6991,7 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
         config.ballast.clone(),
     )
     .map_err(|e| CliError::Runtime(e.to_string()))?;
-    manager.set_provision_floor(config.ballast_provision_floor_pct());
+    manager.set_provision_floor_rule(config.ballast_provision_floor());
 
     match &args.command {
         None | Some(BallastCommand::Status) => {
@@ -7491,7 +7491,7 @@ struct DashboardRuntimeRequest {
     /// `[ballast]` settings and the provisioning floor: what the cockpit
     /// needs to release or replenish a pool itself when no daemon holds it.
     ballast: storage_ballast_helper::core::config::BallastConfig,
-    provision_floor_pct: f64,
+    provision_floor: storage_ballast_helper::ballast::manager::ProvisionFloor,
     /// `--replay <file>`, `--from`, `--speed`: validated by the cockpit runtime.
     replay: Option<PathBuf>,
     replay_from: Option<String>,
@@ -7663,7 +7663,7 @@ fn run_new_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Re
         start_screen,
         ballast: Some(tui::BallastFallback {
             config: request.ballast.clone(),
-            provision_floor_pct: request.provision_floor_pct,
+            provision_floor: request.provision_floor,
         }),
         replay,
     };
@@ -7727,7 +7727,7 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
         eprintln!("[dashboard] runtime={selection:?}, reason={reason}");
     }
 
-    let provision_floor_pct = config.ballast_provision_floor_pct();
+    let provision_floor = config.ballast_provision_floor();
     let request = DashboardRuntimeRequest {
         refresh_ms: normalize_refresh_ms(args.refresh_ms),
         state_file: config.paths.state_file.clone(),
@@ -7737,7 +7737,7 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
         sqlite_db: Some(config.paths.sqlite_db.clone()),
         jsonl_log: Some(config.paths.jsonl_log),
         start_screen: args.start_screen.clone(),
-        provision_floor_pct,
+        provision_floor,
         ballast: config.ballast,
         replay: args.replay.clone(),
         replay_from: args.from.clone(),
@@ -8048,7 +8048,7 @@ fn system_doctor_checks(
 ) -> Vec<DoctorCheck> {
     let mut checks = vec![
         writeback_doctor_check(platform, config),
-        ballast_reserve_doctor_check(config),
+        ballast_reserve_doctor_check(platform, config),
         quarantine_stuck_doctor_check(config),
     ];
     checks.extend(reserve_coverage_doctor_checks(config, bursts, pools));
@@ -8383,11 +8383,17 @@ fn quarantine_stuck_doctor_check(config: &Config) -> DoctorCheck {
     )
 }
 
-fn ballast_reserve_doctor_check(config: &Config) -> DoctorCheck {
-    let availability = BallastAvailability::observe(
-        &resolve_configured_pool_alias(&config.paths.ballast_dir),
-        &config.ballast,
-    );
+fn ballast_reserve_doctor_check(platform: &dyn Platform, config: &Config) -> DoctorCheck {
+    let pool_dir = resolve_configured_pool_alias(&config.paths.ballast_dir);
+    let availability = BallastAvailability::observe(&pool_dir, &config.ballast);
+    // The floor in force on the pool's volume (absolute byte floors lower it on
+    // a large volume); the percentage floor if the volume cannot be read.
+    let floor_pct = platform
+        .fs_stats(&nearest_existing_ancestor(&pool_dir))
+        .map_or_else(
+            |_| config.ballast_provision_floor_pct(),
+            |stats| config.ballast_provision_floor().pct_on(stats.total_bytes),
+        );
     match availability.health {
         BallastHealth::Unconfigured => doctor_check(
             "ballast.reserve",
@@ -8421,8 +8427,7 @@ fn ballast_reserve_doctor_check(config: &Config) -> DoctorCheck {
             ),
             Some(format!(
                 "Run `sbh ballast replenish` (or `sbh ballast provision`); files are created \
-                 one at a time while the volume stays above the {:.1}% headroom floor.",
-                config.ballast_provision_floor_pct()
+                 one at a time while the volume stays above the {floor_pct:.1}% headroom floor."
             )),
         ),
         BallastHealth::Empty => doctor_check(
@@ -8436,10 +8441,9 @@ fn ballast_reserve_doctor_check(config: &Config) -> DoctorCheck {
             ),
             Some(format!(
                 "Run `sbh ballast provision`; files are created one at a time while the \
-                 volume stays above the {:.1}% headroom floor, so even a low volume gets a \
-                 partial reserve. Until then the daemon has no instant-release reserve for \
-                 ENOSPC recovery.",
-                config.ballast_provision_floor_pct()
+                 volume stays above the {floor_pct:.1}% headroom floor, so even a low volume \
+                 gets a partial reserve. Until then the daemon has no instant-release reserve \
+                 for ENOSPC recovery."
             )),
         ),
         // Deliberately WARN, not FAIL: we could not read the pool, so we do not

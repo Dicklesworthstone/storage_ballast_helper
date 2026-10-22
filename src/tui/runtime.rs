@@ -74,7 +74,7 @@ pub struct DashboardRuntimeConfig {
 #[derive(Debug, Clone)]
 pub struct BallastFallback {
     pub config: BallastConfig,
-    pub provision_floor_pct: f64,
+    pub provision_floor: crate::ballast::manager::ProvisionFloor,
 }
 
 impl DashboardRuntimeConfig {
@@ -849,7 +849,7 @@ fn direct_pool(
         fallback.config.clone(),
     )
     .map_err(|err| format!("ballast pool {ballast_dir}: {err}"))?;
-    manager.set_provision_floor(fallback.provision_floor_pct);
+    manager.set_provision_floor_rule(fallback.provision_floor);
     Ok(manager)
 }
 
@@ -1170,7 +1170,7 @@ mod tests {
         drop(manager);
         let fallback = BallastFallback {
             config,
-            provision_floor_pct: 0.0,
+            provision_floor: crate::ballast::manager::ProvisionFloor::Fixed(0.0),
         };
         let dir_text = dir.display().to_string();
 

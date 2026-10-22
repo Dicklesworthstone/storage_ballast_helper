@@ -2069,8 +2069,10 @@ pub struct MonitoringDaemon {
     last_notified_pressure_level: PressureLevel,
     last_pressure_notify_time: Option<Instant>,
     last_special_scan: HashMap<PathBuf, Instant>,
-    /// Per-special-location notification cooldown: tracks (highest notified level, last notify time).
-    /// Prevents the same oscillation spam that the main pressure loop suppresses.
+    /// Per-special-location alert episode: (highest level notified in it, when
+    /// its alert was last seen). See [`special_episode_step`] and
+    /// [`special_episode_over`]; prevents the oscillation spam the main
+    /// pressure loop also suppresses.
     last_special_notify: HashMap<PathBuf, (PressureLevel, Instant)>,
     last_predictive_warning: Option<Instant>,
     last_predictive_level: Option<NotificationLevel>,
@@ -2416,6 +2418,37 @@ fn path_is_same_or_descendant(candidate: &Path, ancestor: &Path) -> bool {
         return false;
     };
     candidate == ancestor || candidate.starts_with(ancestor)
+}
+
+/// One tick of a special location's alert episode. `previous` is the level
+/// notified so far in the episode and when its alert was last seen. Returns
+/// the level to notify from (`None`: stay quiet) and the episode's notified
+/// level afterwards. A new episode notifies from Green; inside one only an
+/// escalation notifies, so a level that wobbles with the write rate is one
+/// alert instead of one per wobble.
+fn special_episode_step(
+    previous: Option<(PressureLevel, Instant)>,
+    level: PressureLevel,
+) -> (Option<PressureLevel>, PressureLevel) {
+    match previous {
+        None => (Some(PressureLevel::Green), level),
+        Some((notified, _)) if level > notified => (Some(notified), level),
+        Some((notified, _)) => (None, notified),
+    }
+}
+
+/// A special location's alert episode ends once the alert has stayed clear
+/// for a whole alert interval; a burst that dips under the horizon and back
+/// within it is still the same episode.
+fn special_episode_over(
+    previous: Option<(PressureLevel, Instant)>,
+    now: Instant,
+    alert_interval: Duration,
+) -> bool {
+    previous.is_none_or(|(_, last_seen)| {
+        now.checked_duration_since(last_seen)
+            .is_none_or(|clear_for| clear_for >= alert_interval)
+    })
 }
 
 fn special_location_scan_roots(location: &Path, configured_roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -3183,7 +3216,7 @@ impl MonitoringDaemon {
             &platform,
             Some(config.paths.ballast_dir.as_path()),
         )?;
-        ballast_coordinator.set_provision_floor(config.ballast_provision_floor_pct());
+        ballast_coordinator.set_provision_floor_rule(config.ballast_provision_floor());
         // bd-rc-master-ajg1.7.4: the daemon's own files against the mounts
         // it reclaims. Not a refusal (single-volume hosts are common), but
         // said once at startup, carried in state.json, and acted on while
@@ -6365,8 +6398,11 @@ impl MonitoringDaemon {
                 }
             }
 
+            let previous = self.last_special_notify.get(&location.path).copied();
             if assessment.alert == SpecialAlert::None {
-                self.last_special_notify.remove(&location.path);
+                if special_episode_over(previous, now, alert_interval) {
+                    self.last_special_notify.remove(&location.path);
+                }
                 continue;
             }
             {
@@ -6376,62 +6412,33 @@ impl MonitoringDaemon {
                     _ if urgency >= 0.75 => PressureLevel::Orange,
                     _ => PressureLevel::Yellow,
                 };
-                // Notify on a level change for this location; the same level
-                // does not re-fire (the condition has not changed).
-                let should_notify_special = self
-                    .last_special_notify
-                    .get(&location.path)
-                    .is_none_or(|(prev_level, _)| pressure_level != *prev_level);
-
-                if should_notify_special {
+                let (notify_from, notified) = special_episode_step(previous, pressure_level);
+                if let Some(from) = notify_from {
                     self.notification_manager
                         .notify(&NotificationEvent::PressureChanged {
-                            from: "Green".to_string(),
+                            from: format!("{from:?}"),
                             to: format!("{pressure_level:?}"),
                             mount: location.path.to_string_lossy().into_owned(),
                             free_pct: stats.free_pct(),
                         });
-                    self.last_special_notify
-                        .insert(location.path.clone(), (pressure_level, now));
                 }
+                self.last_special_notify
+                    .insert(location.path.clone(), (notified, now));
 
                 // Trigger root filesystem scan: special location pressure (e.g. /dev/shm
                 // full) indicates agent swarm activity that is likely also generating root
                 // filesystem artifacts. Proactively scan to clean up before root hits capacity.
+                //
+                // No ballast is released here. A disk-backed location's own mount
+                // releases on its own pressure level; releasing on this alert bypassed
+                // that gating and drained a reserve on every write burst (a macOS /tmp
+                // on the Data volume raised ~100 "filling fast" alerts a day). A RAM-backed
+                // location (/dev/shm) gains nothing from freeing disk ballast at all.
                 let max_delete_batch = match pressure_level {
                     PressureLevel::Red | PressureLevel::Critical => 100,
                     PressureLevel::Orange => 60,
                     _ => 40,
                 };
-
-                // Try immediate ballast release for the pressured mount.
-                // If that mount has no pool (common for /dev/shm tmpfs), fall back to the
-                // non-empty pool with highest releasable bytes to buy recovery time.
-                let release_mount = if self.ballast_coordinator.has_pool(&stats.mount_point) {
-                    Some(stats.mount_point.clone())
-                } else {
-                    self.ballast_coordinator
-                        .inventory()
-                        .into_iter()
-                        .filter(|item| !item.skipped && item.files_available > 0)
-                        .max_by_key(|item| item.releasable_bytes)
-                        .map(|item| item.mount_point)
-                };
-
-                if let Some(mount) = release_mount {
-                    let release_response = crate::monitor::pid::PressureResponse {
-                        level: pressure_level,
-                        urgency,
-                        scan_interval: Duration::from_secs(0),
-                        release_ballast_files: 0,
-                        max_delete_batch,
-                        fallback_active: false,
-                        causing_mount: mount.clone(),
-                        free_pct: stats.free_pct(),
-                        predicted_seconds: None,
-                    };
-                    let _ = self.release_ballast(&mount, &release_response);
-                }
 
                 let mut scan_paths =
                     special_location_scan_roots(&location.path, &self.config.scanner.root_paths);
@@ -6573,13 +6580,16 @@ impl MonitoringDaemon {
                         Ok(coordinator) => {
                             self.ballast_coordinator = coordinator;
                             self.ballast_coordinator
-                                .set_provision_floor(new_config.ballast_provision_floor_pct());
+                                .set_provision_floor_rule(new_config.ballast_provision_floor());
                         }
                         Err(err) => {
                             eprintln!(
                                 "[SBH-DAEMON] ballast coordinator rediscovery failed during reload: {err}"
                             );
                             self.ballast_coordinator.update_config(&new_config.ballast);
+                            // The kept pools still follow the new thresholds.
+                            self.ballast_coordinator
+                                .set_provision_floor_rule(new_config.ballast_provision_floor());
                         }
                     }
 
@@ -10643,6 +10653,162 @@ mod tests {
             if let Some(logger) = self.daemon.logger_join.take() {
                 let _ = logger.join();
             }
+        }
+    }
+
+    /// A special-location alert episode notifies once when it starts and again
+    /// only when it escalates; a level that wobbles inside it stays quiet, and
+    /// the episode ends only after a whole alert interval without an alert.
+    #[test]
+    fn special_location_episodes_notify_on_start_and_escalation_only() {
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(900);
+
+        assert_eq!(
+            special_episode_step(None, PressureLevel::Yellow),
+            (Some(PressureLevel::Green), PressureLevel::Yellow)
+        );
+        let yellow = Some((PressureLevel::Yellow, t0));
+        assert_eq!(
+            special_episode_step(yellow, PressureLevel::Yellow),
+            (None, PressureLevel::Yellow)
+        );
+        assert_eq!(
+            special_episode_step(yellow, PressureLevel::Orange),
+            (Some(PressureLevel::Yellow), PressureLevel::Orange)
+        );
+        // Back down to Yellow inside an Orange episode: quiet, Orange is kept.
+        let orange = Some((PressureLevel::Orange, t0));
+        assert_eq!(
+            special_episode_step(orange, PressureLevel::Yellow),
+            (None, PressureLevel::Orange)
+        );
+
+        assert!(special_episode_over(None, t0, interval));
+        assert!(!special_episode_over(
+            orange,
+            t0 + Duration::from_secs(300),
+            interval
+        ));
+        assert!(special_episode_over(orange, t0 + interval, interval));
+    }
+
+    /// A special location under pressure queues a scan but releases no
+    /// ballast. Its own mount releases on its own pressure level; before, an
+    /// Orange "filling fast" alert on a disk-backed /tmp released the whole
+    /// pool on every write burst, so a macOS Data volume never kept a reserve.
+    #[cfg(unix)]
+    #[test]
+    fn special_location_alert_scans_but_never_releases_ballast() {
+        use crate::core::config::PathsConfig;
+        use crate::monitor::special_locations::{
+            SpecialKind, SpecialLocation, SpecialLocationRegistry,
+        };
+        use crate::platform::pal::{FsStats, MemoryInfo, MountPoint, PlatformPaths};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let paths = PathsConfig {
+            config_file: root.join("config.toml"),
+            ballast_dir: root.join("ballast"),
+            state_file: root.join("state.json"),
+            sqlite_db: root.join("activity.sqlite3"),
+            jsonl_log: root.join("activity.jsonl"),
+        };
+        let mut config = Config::with_paths(paths);
+        let tmp = root.join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        config.scanner.root_paths = vec![tmp.clone()];
+        config.ballast.auto_provision = false;
+        config.ballast.file_count = 2;
+        config.ballast.file_size_bytes = 8192;
+        config.notifications.enabled = false;
+
+        // 1 TB volume with 10 GB available: under the special-location floor.
+        let mount = PathBuf::from("/");
+        let stats = FsStats {
+            total_bytes: 1_000_000_000_000,
+            free_bytes: 10_000_000_000,
+            available_bytes: 10_000_000_000,
+            fs_type: "mockfs".to_string(),
+            mount_point: mount.clone(),
+            is_readonly: false,
+        };
+        let mut platform = MockPlatform::new(
+            vec![MountPoint {
+                path: mount.clone(),
+                device: "mockdev".to_string(),
+                fs_type: "mockfs".to_string(),
+                is_ram_backed: false,
+            }],
+            HashMap::from([(mount.clone(), stats)]),
+            MemoryInfo {
+                total_bytes: 64 << 30,
+                available_bytes: 32 << 30,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            },
+            PlatformPaths::default(),
+        )
+        .with_home(root)
+        .with_temp_dirs(Vec::new())
+        .with_cache_roots(Vec::new());
+        // MockPlatform reports no blocks unless told: 8192-byte files are 16.
+        for index in 1..=2 {
+            platform = platform.with_block_count(
+                root.join("ballast")
+                    .join(format!("SBH_BALLAST_FILE_{index:05}.dat")),
+                16,
+            );
+        }
+        let platform = Arc::new(platform);
+        let mut daemon = MonitoringDaemon::init_with_platform(
+            config,
+            &DaemonArgs::default(),
+            Arc::clone(&platform) as Arc<dyn Platform>,
+        )
+        .unwrap();
+        daemon.ballast_coordinator.set_provision_floor(0.0);
+        let provisioned = daemon
+            .ballast_coordinator
+            .provision_all(platform.as_ref())
+            .unwrap();
+        assert_eq!(provisioned.total_files_created(), 2, "{provisioned:?}");
+        let available = |daemon: &MonitoringDaemon| {
+            daemon
+                .ballast_coordinator
+                .inventory()
+                .iter()
+                .map(|item| item.files_available)
+                .sum::<usize>()
+        };
+        assert_eq!(available(&daemon), 2);
+
+        daemon.special_locations = SpecialLocationRegistry::new(vec![SpecialLocation {
+            path: tmp.clone(),
+            kind: SpecialKind::UserTmp,
+            buffer_pct: 15,
+            scan_interval: Duration::from_secs(5),
+            priority: 160,
+        }]);
+        // Filling fast: 10 GB at 100 MB/s is 100 s from full, urgency ~0.94,
+        // which the release controller answers with every file in the pool.
+        daemon.mount_rates.insert(mount, 100_000_000.0);
+        let (scan_tx, scan_rx) = crossbeam_channel::bounded(4);
+        daemon.check_special_locations(&scan_tx, &scan_rx);
+
+        assert_eq!(
+            available(&daemon),
+            2,
+            "a special-location alert must not release ballast"
+        );
+        let request = scan_rx.try_recv().expect("the alert still queues a scan");
+        assert_eq!(request.pressure_level, PressureLevel::Orange);
+        assert!(request.paths.contains(&tmp), "{:?}", request.paths);
+
+        daemon.logger_handle.shutdown();
+        if let Some(logger) = daemon.logger_join.take() {
+            logger.join().unwrap();
         }
     }
 
