@@ -376,6 +376,14 @@ pub trait Platform: Send + Sync {
         pal_not_implemented(self.name(), "mmap_regions_under")
     }
 
+    /// Mutation-boundary mapping evidence. A successful answer must come from
+    /// a process sweep started by this call, never a cached absence verdict.
+    /// Incomplete observations may be reused to bound retries; they remain
+    /// errors. Platforms without this guarantee must refuse the query.
+    fn mmap_regions_under_fresh(&self, _path: &Path) -> Result<Vec<MappedRegion>> {
+        pal_not_implemented(self.name(), "mmap_regions_under_fresh")
+    }
+
     /// Return mapped-file evidence under any candidate root. Platforms with a
     /// host-wide process sweep should override this to scan once per pass.
     /// Partial or inaccessible coverage is an error, not negative evidence.
@@ -884,6 +892,11 @@ impl Platform for MockPlatform {
             })
             .cloned()
             .collect())
+    }
+
+    fn mmap_regions_under_fresh(&self, path: &Path) -> Result<Vec<MappedRegion>> {
+        // Mock observations are supplied directly, without a process cache.
+        self.mmap_regions_under(path)
     }
 
     fn self_stats(&self) -> Result<SelfStats> {

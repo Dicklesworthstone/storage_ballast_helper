@@ -46,6 +46,12 @@ already encoded, preallocated, inline, hard-linked, NOCOW, NOCOMP, immutable,
 append-only, and unknown extent layouts are excluded. An incomplete process
 inspection is not treated as an empty result.
 
+Compression's mmap checks require a new bounded process sweep; they never
+admit a rewrite using the scanner's cached absence evidence. Concurrent refresh
+or incomplete coverage blocks admission. Recent failed observations retain a
+30-second retry backoff to avoid repeated expensive scans, while continuing to
+refuse compression.
+
 Every apply pass holds a pinned, no-symlink descriptor. The exact inspection
 file descriptor is exempt from open-file checks; other descriptors in the same
 process, including redirected standard output, are not. Cooperating compression

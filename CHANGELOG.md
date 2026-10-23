@@ -66,6 +66,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Compression requires fresh memory-map evidence before rewriting files**
+  (bd-rxq5). Successful scanner snapshots can no longer authorize compression
+  for up to 30 seconds after collection. Mutation checks start a new bounded
+  process sweep; concurrent sweep contention and incomplete coverage retain
+  the file. Failed observations keep a conservative retry backoff, while
+  ordinary scanner queries continue to share their existing cache.
 - **Target-only protection exceptions are renewed before every deletion**
   (bd-232u). A target that gains a trace directory or session log while earlier
   batch entries are being removed is retained even when its inode is unchanged.

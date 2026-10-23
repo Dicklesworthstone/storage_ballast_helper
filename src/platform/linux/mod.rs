@@ -206,6 +206,13 @@ impl Platform for LinuxPal {
         process::read_mmap_regions_under(path)
     }
 
+    fn mmap_regions_under_fresh(
+        &self,
+        path: &Path,
+    ) -> Result<Vec<crate::platform::types::MappedRegion>> {
+        process::read_mmap_regions_under_fresh(path)
+    }
+
     fn mmap_regions_under_roots(
         &self,
         roots: &[PathBuf],

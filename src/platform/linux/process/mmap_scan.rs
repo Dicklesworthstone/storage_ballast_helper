@@ -121,14 +121,21 @@ impl Snapshot {
 
     #[cfg(test)]
     fn under(&self, root: &Path) -> Result<Vec<MappedRegion>> {
+        self.under_roots(std::slice::from_ref(&root.to_path_buf()))
+    }
+
+    fn under_roots(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
         if let Some(reason) = &self.incomplete {
             return Err(incomplete_error(reason));
         }
-        let root = resolve_absolute_path(root);
+        let roots = roots
+            .iter()
+            .map(|root| resolve_absolute_path(root))
+            .collect::<Vec<_>>();
         Ok(self
             .regions
             .iter()
-            .filter(|region| region.path.starts_with(&root))
+            .filter(|region| roots.iter().any(|root| region.path.starts_with(root)))
             .cloned()
             .collect())
     }
@@ -150,6 +157,8 @@ struct Cache {
     value: Mutex<Option<Cached>>,
     refresh: Mutex<()>,
 }
+
+static CACHE: OnceLock<Cache> = OnceLock::new();
 
 impl Cache {
     fn fresh(&self, now: Instant) -> Option<Arc<Snapshot>> {
@@ -182,6 +191,40 @@ impl Cache {
         if let Some(snapshot) = self.fresh(now()) {
             return Ok(snapshot);
         }
+        Ok(self.collect_and_publish(now, collect))
+    }
+
+    fn obtain_fresh(
+        &self,
+        now: impl Fn() -> Instant,
+        collect: impl FnOnce() -> Snapshot,
+    ) -> Result<Arc<Snapshot>> {
+        // An old refusal has no absence authority. Keep its bounded backoff
+        // rather than repeat an expensive, inaccessible sweep per retry.
+        if let Some(snapshot) = self.fresh(now())
+            && snapshot.incomplete.is_some()
+        {
+            return Ok(snapshot);
+        }
+        let Some(_refresh) = self.refresh.try_lock() else {
+            return Err(incomplete_error("another snapshot refresh is in progress"));
+        };
+        if let Some(snapshot) = self.fresh(now())
+            && snapshot.incomplete.is_some()
+        {
+            return Ok(snapshot);
+        }
+        // Successful scanner observations, however recent, predate this
+        // mutation check. Only a newly started sweep may admit it.
+        Ok(self.collect_and_publish(now, collect))
+    }
+
+    // The caller holds `refresh`, so at most one process sweep runs at once.
+    fn collect_and_publish(
+        &self,
+        now: impl Fn() -> Instant,
+        collect: impl FnOnce() -> Snapshot,
+    ) -> Arc<Snapshot> {
         let started = now();
         let mut snapshot = collect();
         let finished = now();
@@ -203,7 +246,7 @@ impl Cache {
             at,
             snapshot: Arc::clone(&snapshot),
         });
-        Ok(snapshot)
+        snapshot
     }
 }
 
@@ -211,30 +254,28 @@ pub(super) fn read_under(root: &Path) -> Result<Vec<MappedRegion>> {
     read_under_roots(std::slice::from_ref(&root.to_path_buf()))
 }
 
+/// Require new, complete evidence before admitting a mutation. This shares the
+/// scanner's sweep lock and failure backoff, never its cached successful result.
+pub(super) fn read_under_fresh(root: &Path) -> Result<Vec<MappedRegion>> {
+    let snapshot = CACHE
+        .get_or_init(Cache::default)
+        .obtain_fresh(Instant::now, || {
+            collect(&Native, Path::new(PROC_ROOT), Limits::default())
+        })?;
+    snapshot.under_roots(std::slice::from_ref(&root.to_path_buf()))
+}
+
 /// Reuse one coverage-checked snapshot for an entire scanner pass. A catalog
 /// batch can have hundreds of overlapping roots; filtering the same snapshot
 /// once prevents repeated per-root result allocation and path resolution.
 pub(super) fn read_under_roots(roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
-    static CACHE: OnceLock<Cache> = OnceLock::new();
     if roots.is_empty() {
         return Ok(Vec::new());
     }
     let snapshot = CACHE.get_or_init(Cache::default).obtain(Instant::now, || {
         collect(&Native, Path::new(PROC_ROOT), Limits::default())
     })?;
-    if let Some(reason) = &snapshot.incomplete {
-        return Err(incomplete_error(reason));
-    }
-    let roots = roots
-        .iter()
-        .map(|root| resolve_absolute_path(root))
-        .collect::<Vec<_>>();
-    Ok(snapshot
-        .regions
-        .iter()
-        .filter(|region| roots.iter().any(|root| region.path.starts_with(root)))
-        .cloned()
-        .collect())
+    snapshot.under_roots(roots)
 }
 
 struct Sweep<'a, A> {
@@ -1191,6 +1232,107 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count.get(), 2, "publication time must not extend freshness");
+    }
+
+    #[test]
+    fn fresh_query_detects_a_mapping_created_after_cached_absence() {
+        let fixture = Fixture::new();
+        fixture.maps(1, b"1000-2000 rw-p 00000000 00:00 0 [heap]\n");
+        let cache = Cache::default();
+        let start = Instant::now();
+        assert!(
+            cache
+                .obtain(|| start, || fixture.scan(&Native, Limits::default()))
+                .unwrap()
+                .under(&fixture.root)
+                .unwrap()
+                .is_empty()
+        );
+
+        fixture.maps(1, &fixture.row("new-reader"));
+        let check_at = start + Duration::from_secs(1);
+        assert!(
+            cache
+                .obtain(
+                    || check_at,
+                    || panic!("ordinary queries still reuse the cache")
+                )
+                .unwrap()
+                .under(&fixture.root)
+                .unwrap()
+                .is_empty()
+        );
+        let current = cache
+            .obtain_fresh(|| check_at, || fixture.scan(&Native, Limits::default()))
+            .unwrap()
+            .under(&fixture.root)
+            .unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].path, fixture.root.join("new-reader"));
+        assert_eq!(
+            cache
+                .obtain(|| check_at, || panic!("the new snapshot is shared"))
+                .unwrap()
+                .under(&fixture.root)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn fresh_query_never_falls_back_to_cached_success_during_contention() {
+        let cache = Cache::default();
+        let start = Instant::now();
+        cache.obtain(|| start, Snapshot::default).unwrap();
+        let _refresh = cache.refresh.lock();
+        let result = cache.obtain_fresh(|| start, || panic!("parallel sweep"));
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("another snapshot refresh")
+        );
+    }
+
+    #[test]
+    fn fresh_query_keeps_failed_evidence_closed_with_bounded_retry_work() {
+        let cache = Cache::default();
+        let start = Instant::now();
+        cache.obtain(|| start, Snapshot::default).unwrap();
+        let failed_at = start + Duration::from_secs(1);
+        let failed = cache
+            .obtain_fresh(
+                || failed_at,
+                || {
+                    let mut snapshot = Snapshot::default();
+                    snapshot.fail("new process maps unavailable");
+                    snapshot
+                },
+            )
+            .unwrap();
+        assert!(failed.under(Path::new("/")).is_err());
+        for second in 1..30 {
+            assert!(
+                cache
+                    .obtain_fresh(
+                        || failed_at + Duration::from_secs(second),
+                        || panic!("failed queries must not repeat a process sweep per retry"),
+                    )
+                    .unwrap()
+                    .under(Path::new("/"))
+                    .is_err()
+            );
+        }
+        assert!(
+            cache
+                .obtain_fresh(|| failed_at + FAILURE_TTL, Snapshot::default)
+                .unwrap()
+                .under(Path::new("/"))
+                .is_ok()
+        );
     }
 
     #[test]

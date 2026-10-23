@@ -384,6 +384,10 @@ impl Platform for TestOverlayPlatform {
         self.inner.mmap_regions_under(path)
     }
 
+    fn mmap_regions_under_fresh(&self, path: &Path) -> Result<Vec<MappedRegion>> {
+        self.inner.mmap_regions_under_fresh(path)
+    }
+
     fn mmap_regions_under_roots(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
         self.inner.mmap_regions_under_roots(roots)
     }
@@ -723,6 +727,16 @@ mod tests {
             fn mmap_regions_under(&self, _: &Path) -> Result<Vec<MappedRegion>> {
                 panic!("batch mapping scope must not be split")
             }
+            fn mmap_regions_under_fresh(&self, path: &Path) -> Result<Vec<MappedRegion>> {
+                assert_eq!(path, Path::new("/one/active"));
+                self.record("fresh_mappings");
+                Err(PalError::method_failed(
+                    "fixture",
+                    "mmap_regions_under_fresh",
+                    "fresh mapped metadata refused",
+                )
+                .into())
+            }
             fn mmap_regions_under_roots(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
                 self.batch("mappings", roots);
                 Err(PalError::method_failed(
@@ -742,6 +756,21 @@ mod tests {
             assert!(!complete);
             assert_eq!(directories, vec![(42, PathBuf::from("/active"))]);
             assert_eq!(*inner.calls.lock().unwrap(), vec!["builds"]);
+        }
+
+        #[test]
+        fn fresh_mapping_queries_preserve_freshness_and_errors_through_overlays() {
+            let inner = Arc::new(StrictReferences::default());
+            let first = Arc::new(TestOverlayPlatform::new(
+                inner.clone(),
+                InjectedFsTable::default(),
+            ));
+            let outer = TestOverlayPlatform::new(first, InjectedFsTable::default());
+            let error = outer
+                .mmap_regions_under_fresh(Path::new("/one/active"))
+                .unwrap_err();
+            assert!(error.to_string().contains("fresh mapped metadata refused"));
+            assert_eq!(*inner.calls.lock().unwrap(), vec!["fresh_mappings"]);
         }
 
         #[test]

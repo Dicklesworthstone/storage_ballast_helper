@@ -24,6 +24,77 @@ fn incomplete_process_evidence_never_admits_compression() {
 }
 
 #[test]
+fn newly_mapped_files_are_refused_even_when_cached_evidence_is_empty() {
+    use crate::core::errors::Result;
+    use crate::platform::pal::{FsStats, MemoryInfo, MountPoint, PlatformPaths, ServiceManager};
+    use crate::platform::types::{ExecutablesResult, MappedRegion, OpenFilesResult};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct NewMapping {
+        fresh_queries: AtomicUsize,
+    }
+
+    impl Platform for NewMapping {
+        fn fs_stats(&self, path: &Path) -> Result<FsStats> {
+            MockPlatform::healthy().fs_stats(path)
+        }
+        fn mount_points(&self) -> Result<Vec<MountPoint>> {
+            Ok(Vec::new())
+        }
+        fn is_ram_backed(&self, _: &Path) -> Result<bool> {
+            Ok(false)
+        }
+        fn default_paths(&self) -> PlatformPaths {
+            PlatformPaths::default()
+        }
+        fn memory_info(&self) -> Result<MemoryInfo> {
+            MockPlatform::healthy().memory_info()
+        }
+        fn service_manager(&self) -> Box<dyn ServiceManager> {
+            panic!("activity checks must not control services")
+        }
+        fn open_files_under(&self, _: &Path) -> Result<OpenFilesResult> {
+            Ok(OpenFilesResult::complete(Vec::new()))
+        }
+        fn executables_under(&self, _: &Path) -> Result<ExecutablesResult> {
+            Ok(ExecutablesResult {
+                processes: Vec::new(),
+                complete: true,
+            })
+        }
+        fn build_directories_in_use_checked(&self) -> (Vec<(i32, PathBuf)>, bool) {
+            (Vec::new(), true)
+        }
+        fn mmap_regions_under(&self, _: &Path) -> Result<Vec<MappedRegion>> {
+            // The reader mapped the file after this cached empty observation.
+            Ok(Vec::new())
+        }
+        fn mmap_regions_under_fresh(&self, path: &Path) -> Result<Vec<MappedRegion>> {
+            if self.fresh_queries.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Ok(Vec::new());
+            }
+            Ok(vec![MappedRegion {
+                pid: 424_242,
+                path: path.to_path_buf(),
+                start_address: Some(0x1000),
+                end_address: Some(0x2000),
+                protection: Some("r--".into()),
+            }])
+        }
+    }
+
+    let platform = NewMapping::default();
+    let path = Path::new("/tmp/newly-mapped-input");
+    assert!(check_active(path, -1, &platform).is_ok());
+    assert!(platform.mmap_regions_under(path).unwrap().is_empty());
+    let error = check_active(path, -1, &platform).unwrap_err();
+    assert!(error.to_string().contains("active memory mappings"));
+    assert_eq!(platform.fresh_queries.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn fresh_marker_checks_do_not_reuse_negative_preflight_caches() {
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("cold.bin");

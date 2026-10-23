@@ -599,15 +599,16 @@ fn check_active(path: &Path, own_fd: i32, platform: &dyn Platform) -> io::Result
             "executable inspection incomplete or file is executing",
         ));
     }
-    // The mapping snapshot is shared with the scanner, which may be refreshing
-    // it: an incomplete answer is retried briefly before it vetoes the file.
-    let mut mapped = platform.mmap_regions_under(path);
+    // A scanner's cached absence verdict cannot admit a rewrite. A fresh
+    // query shares only sweep serialization and conservative failure backoff;
+    // contention is retried briefly before it vetoes the file.
+    let mut mapped = platform.mmap_regions_under_fresh(path);
     for _ in 0..MMAP_RETRIES {
         if mapped.is_ok() {
             break;
         }
         std::thread::sleep(MMAP_RETRY_WAIT);
-        mapped = platform.mmap_regions_under(path);
+        mapped = platform.mmap_regions_under_fresh(path);
     }
     if !mapped.map_err(other)?.is_empty() {
         return Err(io::Error::other("file has active memory mappings"));
