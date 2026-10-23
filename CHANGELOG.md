@@ -60,6 +60,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Target-only protection exceptions are renewed before every deletion**
+  (bd-232u). A target that gains a trace directory or session log while earlier
+  batch entries are being removed is retained even when its inode is unchanged.
+  The final check requires containment, recorded identity, and a complete,
+  bounded purity listing. Live policy and compression gates run after this
+  filesystem probe so changes during the probe remain effective.
 - **Evidence deduplication waits for a successful SQLite write** (bd-jl92).
   Failed inserts remain retryable, KEEP → DELETE → KEEP records the return
   to KEEP, and fallback/suspension/comparator changes remain visible. JSONL

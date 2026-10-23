@@ -185,7 +185,9 @@ struct FoundSession {
     transcript: Option<PathBuf>,
 }
 
-/// Inspect explicit scratch roots (or `claude-<uid>` roots). Transcripts are
+/// Inspect explicit scratch roots (or `claude-<uid>` roots).
+///
+/// Transcripts are
 /// resolved through the UID's home, or an explicit `.claude/projects` root.
 /// No transcript contents are read, and no deletion candidates are emitted.
 pub fn inspect(
@@ -302,6 +304,7 @@ fn display_path<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::E
     serializer.serialize_str(&path.to_string_lossy())
 }
 
+#[allow(clippy::ref_option)] // serde's serialize_with callback borrows the optional field.
 fn display_optional_path<S: Serializer>(
     path: &Option<PathBuf>,
     serializer: S,

@@ -10094,13 +10094,32 @@ fn retain_target_only_candidates(batch: &mut DeletionBatch) -> usize {
         return 0;
     };
     let before = batch.candidates.len();
-    batch.candidates.retain(|candidate| {
-        candidate.identity.is_some()
-            && candidate.path != *root
-            && candidate.path.starts_with(root)
-            && crate::daemon::target_tier::still_pure(&candidate.path)
-    });
+    batch
+        .candidates
+        .retain(|candidate| authorize_target_only_candidate(candidate, Some(root)).is_ok());
     before - batch.candidates.len()
+}
+
+/// Renew the narrowly scoped protection exception at the mutation boundary.
+/// A directory keeps its inode when an agent adds a trace or log to it, so
+/// identity revalidation alone cannot establish that it is still pure output.
+fn authorize_target_only_candidate(
+    candidate: &CandidacyScore,
+    root: Option<&Path>,
+) -> std::result::Result<(), SkipReason> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    if candidate.identity.is_none() {
+        return Err(SkipReason::IdentityUnavailable);
+    }
+    if candidate.path == root
+        || !candidate.path.starts_with(root)
+        || !crate::daemon::target_tier::still_pure(&candidate.path)
+    {
+        return Err(SkipReason::SacredStowaway);
+    }
+    Ok(())
 }
 
 /// Executor thread: receives deletion batches and safely removes artifacts.
@@ -10478,6 +10497,10 @@ fn executor_thread_main(
             // A batch planned as a dry-run cannot mutate and still owes its
             // preview counts. Real batches must obey newly restrictive policy.
             if !dry_run {
+                // Renew the filesystem exception before the cheap live gates:
+                // a large purity probe must not hide a policy change while it
+                // runs or outlive a newly published compression hold.
+                authorize_target_only_candidate(candidate, batch.target_only_root.as_deref())?;
                 shared_config.authorize_mutation(policy_mode, policy_engine.lock().mode())?;
                 shared_config.authorize_compression_first(candidate, batch.pressure_level)?;
             }
@@ -11001,7 +11024,9 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn emergency_cleanup_dispatch_precedes_compression_root_probes() {
-        use crate::platform::pal::{FsStats, MemoryInfo, MountPoint, PlatformPaths, ServiceManager};
+        use crate::platform::pal::{
+            FsStats, MemoryInfo, MountPoint, PlatformPaths, ServiceManager,
+        };
         use std::sync::atomic::AtomicUsize;
 
         struct ProbeAfterEmergency {
@@ -12718,6 +12743,99 @@ mod tests {
         );
     }
 
+    /// A target-only batch can outlive the purity observation that admitted
+    /// it. Adding user data preserves the directory inode, so the exception
+    /// must be renewed for each candidate after the expensive preflight.
+    #[cfg(unix)]
+    #[test]
+    fn target_only_batch_rechecks_purity_before_each_mutation() {
+        use std::cell::Cell;
+
+        let scratch = tempfile::tempdir_in("/tmp").unwrap();
+        let root = scratch.path().join("claude-501");
+        let first = root.join("s1/target-first");
+        let held = root.join("s2/target-held");
+        let mut candidates = Vec::new();
+        for (path, score) in [(&first, 2.0), (&held, 1.0)] {
+            std::fs::create_dir_all(path.join("debug")).unwrap();
+            std::fs::write(path.join("debug/libdemo.rlib"), [7u8; 64]).unwrap();
+            std::fs::write(path.join(".rustc_info.json"), b"{}").unwrap();
+            let mut candidate = test_candidate(&path.to_string_lossy(), score);
+            candidate.identity =
+                Some(crate::scanner::walker::identity_for_path(path, false).unwrap());
+            candidate.size_bytes = 66;
+            candidates.push(candidate);
+        }
+        let held_identity = candidates[1].identity;
+        let mut batch = DeletionBatch {
+            candidates,
+            pressure_level: PressureLevel::Critical,
+            urgency: 0.9,
+            target_bytes: None,
+            target_only_root: Some(root.clone()),
+        };
+        assert_eq!(retain_target_only_candidates(&mut batch), 0);
+        let scanner = crate::core::config::ScannerConfig {
+            protected_paths: vec![root.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let patterns = batch_protected_paths(&batch, &scanner);
+        assert!(
+            patterns.is_empty(),
+            "the batch lifts the root-wide protection"
+        );
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        let mut sacred_paths = platform.sacred_paths();
+        sacred_paths.extend(protection::sacred_paths_from_protected_patterns(&patterns));
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                dry_run: false,
+                min_score: 0.0,
+                check_open_files: true,
+                require_identity: true,
+                sacred_paths,
+                mode: DeletionMode::Unlink,
+                ..Default::default()
+            },
+            None,
+        )
+        .with_platform(platform);
+        let plan = executor.plan(std::mem::take(&mut batch.candidates));
+        assert_eq!(plan.candidates.len(), 2);
+        let authorizations = Cell::new(0);
+        let authorize = |candidate: &CandidacyScore| {
+            authorizations.set(authorizations.get() + 1);
+            authorize_target_only_candidate(candidate, batch.target_only_root.as_deref())
+        };
+        let add_user_data = |candidate: &CandidacyScore, _: Instant| {
+            assert_eq!(candidate.path, first);
+            assert!(!first.exists());
+            std::fs::create_dir(held.join("trace")).unwrap();
+            std::fs::write(held.join("trace/notes.txt"), b"operator evidence").unwrap();
+        };
+        let report =
+            executor.execute_with_hooks(&plan, None, Some(&authorize), Some(&add_user_data));
+        assert_eq!(
+            authorizations.get(),
+            2,
+            "both candidates reached the live guard"
+        );
+        assert_eq!(report.deleted_paths, vec![first]);
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.bytes_freed, 66);
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+        assert_eq!(
+            Some(crate::scanner::walker::identity_for_path(&held, false).unwrap()),
+            held_identity,
+            "the protected content appeared without replacing the directory",
+        );
+        assert_eq!(
+            std::fs::read(held.join("trace/notes.txt")).unwrap(),
+            b"operator evidence",
+        );
+        assert!(authorize_target_only_candidate(&plan.candidates[1], None).is_ok());
+    }
+
     /// bd-232u gap (b): a target dir the tier surveyed as pure that gained a
     /// non-cargo entry before its batch reached the executor (a trace dir, a
     /// log) is dropped; one that stayed pure goes on, as does an ordinary
@@ -12908,7 +13026,11 @@ mod tests {
             shared.authorize_compression_first(candidate, PressureLevel::Red)
         };
         let released = executor.execute_with_guard(&plan, None, Some(&emergency));
-        assert_eq!(released.items_deleted, 1, "{:?}", released.skipped_by_reason);
+        assert_eq!(
+            released.items_deleted, 1,
+            "{:?}",
+            released.skipped_by_reason
+        );
         assert!(!path.exists());
     }
 

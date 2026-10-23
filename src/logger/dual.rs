@@ -1474,7 +1474,10 @@ mod tests {
 
         let db = SqliteLogger::open(&dir.path().join("test.db")).unwrap();
         let (latest, rows) = db.decision_by_id("a1b2c3d4e5f6").unwrap().unwrap();
-        assert_eq!(rows, 6, "3 keeps + 1 review + 2 deletes, including the return to KEEP");
+        assert_eq!(
+            rows, 6,
+            "3 keeps + 1 review + 2 deletes, including the return to KEEP"
+        );
         assert_eq!(latest.effective_action, Some(ActionRecord::Keep));
         let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
         let lines = jsonl
@@ -1517,7 +1520,13 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(latest.timestamp, record.timestamp);
         let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
-        assert_eq!(jsonl.lines().filter(|line| line.contains(&record.id)).count(), 2);
+        assert_eq!(
+            jsonl
+                .lines()
+                .filter(|line| line.contains(&record.id))
+                .count(),
+            2
+        );
     }
 
     #[cfg(feature = "sqlite")]
@@ -1539,7 +1548,13 @@ mod tests {
         join.join().unwrap();
 
         let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
-        assert_eq!(jsonl.lines().filter(|line| line.contains(&record.id)).count(), 3);
+        assert_eq!(
+            jsonl
+                .lines()
+                .filter(|line| line.contains(&record.id))
+                .count(),
+            3
+        );
     }
 
     #[test]

@@ -560,7 +560,12 @@ mod tests {
         let first = CompressionFirst::default();
         let now = Instant::now();
         let root = status("/data", true, Some(PressureLevel::Orange));
-        first.begin(std::slice::from_ref(&root), &[], now, Duration::from_secs(30));
+        first.begin(
+            std::slice::from_ref(&root),
+            &[],
+            now,
+            Duration::from_secs(30),
+        );
         assert!(first.defers_device(1, PressureLevel::Orange, now));
         assert!(first.defers_mount(std::path::Path::new("/data"), PressureLevel::Yellow, now));
         assert!(!first.defers_device(2, PressureLevel::Orange, now));
@@ -605,7 +610,12 @@ mod tests {
         let first = Arc::new(CompressionFirst::default());
         let now = Instant::now();
         let root = status("/data", true, Some(PressureLevel::Yellow));
-        first.begin(std::slice::from_ref(&root), &[], now, Duration::from_secs(30));
+        first.begin(
+            std::slice::from_ref(&root),
+            &[],
+            now,
+            Duration::from_secs(30),
+        );
         first.update_levels(&HashMap::from([(
             PathBuf::from("/data"),
             PressureLevel::Red,
@@ -663,7 +673,12 @@ mod tests {
             status("/critical", true, Some(PressureLevel::Critical)),
             status("/unknown", true, None),
         ] {
-            first.begin(std::slice::from_ref(&root), &[], now, Duration::from_secs(30));
+            first.begin(
+                std::slice::from_ref(&root),
+                &[],
+                now,
+                Duration::from_secs(30),
+            );
             assert!(!first.defers_device(1, PressureLevel::Yellow, now));
             root.level = Some(PressureLevel::Orange);
             root.device_id = None;
@@ -683,12 +698,7 @@ mod tests {
                 device_id: Some(2),
                 ..status("/other", true, Some(PressureLevel::Orange))
             };
-            first.begin(
-                &[root, independent],
-                &[alias],
-                now,
-                Duration::from_secs(30),
-            );
+            first.begin(&[root, independent], &[alias], now, Duration::from_secs(30));
             assert!(!first.defers_device(1, PressureLevel::Orange, now));
             assert!(first.defers_device(2, PressureLevel::Orange, now));
         }
@@ -701,12 +711,7 @@ mod tests {
             device_id: Some(2),
             ..root.clone()
         };
-        first.begin(
-            &[root, subvolume],
-            &[alias],
-            now,
-            Duration::from_secs(30),
-        );
+        first.begin(&[root, subvolume], &[alias], now, Duration::from_secs(30));
         assert!(first.defers_device(1, PressureLevel::Orange, now));
         first.update_levels(&HashMap::from([
             (PathBuf::from("/data"), PressureLevel::Orange),

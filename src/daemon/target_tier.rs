@@ -265,18 +265,25 @@ fn holds_what_cargo_writes(dir: &Path, name: &str) -> std::io::Result<bool> {
 
 /// Whether `dir`'s top level still holds only what cargo writes.
 ///
-/// The executor asks again before it deletes a target-only candidate: the
-/// survey that nominated it may be minutes old, and a trace dir or log
+/// The executor asks when accepting a batch and immediately before each
+/// mutation: the survey or batch may be minutes old, and a trace dir or log
 /// written into the target since then makes it work, not output. An
-/// unreadable listing is not pure.
+/// unreadable or budget-truncated listing is not pure.
 pub fn still_pure(dir: &Path) -> bool {
-    matches!(first_impurity(dir), Ok(None))
+    matches!(first_impurity(dir, MAX_LISTING_ENTRIES), Ok(None))
 }
 
 /// The first top-level entry of `dir` that cargo did not write, or an error
-/// when the listing cannot be read (which keeps the directory).
-fn first_impurity(dir: &Path) -> std::io::Result<Option<String>> {
-    for entry in fs::read_dir(dir)? {
+/// when the listing cannot be completed within its entry budget (which
+/// keeps the directory). A live mutation guard must not walk an unbounded
+/// number of top-level entries just to renew a protection exception.
+fn first_impurity(dir: &Path, max_entries: usize) -> std::io::Result<Option<String>> {
+    for (index, entry) in fs::read_dir(dir)?.enumerate() {
+        if index >= max_entries {
+            return Err(std::io::Error::other(
+                "target purity listing exceeded its entry budget",
+            ));
+        }
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let file_type = entry.file_type()?;
@@ -577,7 +584,7 @@ fn check(
     now: SystemTime,
     deadline: Instant,
 ) -> std::result::Result<Checked, &'static str> {
-    match first_impurity(dir) {
+    match first_impurity(dir, MAX_LISTING_ENTRIES) {
         Ok(None) => {}
         Ok(Some(_)) => return Err("impure"),
         Err(_) => return Err("unreadable"),
@@ -911,6 +918,20 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn purity_requires_a_complete_readable_listing() {
+        let (_temp, root) = scratch_root();
+        let target = root.join("target");
+        cargo_target(&target);
+        assert!(still_pure(&target));
+        // Even when every entry observed so far is cargo output, an unseen
+        // suffix cannot authorize the root-wide protection exception.
+        assert!(first_impurity(&target, 1).is_err());
+        assert!(!still_pure(&root.join("missing-target")));
+        fs::write(target.join("session-notes.txt"), b"keep this evidence").unwrap();
+        assert!(!still_pure(&target));
     }
 
     #[test]

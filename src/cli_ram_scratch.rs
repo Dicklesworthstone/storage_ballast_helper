@@ -264,9 +264,9 @@ fn write_agent_scratch(
     for session in &report.sessions {
         writeln!(
             out,
-            "  {:?} {:?}: logical={} bytes, allocated={} bytes; tree={} h, transcript={} h",
+            "  {:?} \"{}\": logical={} bytes, allocated={} bytes; tree={} h, transcript={} h",
             session.state,
-            session.path.as_os_str(),
+            session.path.to_string_lossy().escape_debug(),
             session.observed_logical_bytes,
             session.observed_allocated_bytes,
             session
