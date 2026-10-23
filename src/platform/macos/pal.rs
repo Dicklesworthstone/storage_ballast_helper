@@ -6,7 +6,7 @@
 use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::core::errors::Result;
@@ -522,7 +522,7 @@ fn spawn_native_memory_pressure_subscription(
 fn memory_pressure_from_dispatch_event(event: sbh_mach::MemoryPressureEvent) -> MemoryPressure {
     let dispatch_level = memory_pressure_level_from_dispatch_event(event);
     let mut pressure = read_current_memory_pressure("subscribe_memory_pressure.dispatch")
-        .unwrap_or_else(|_| empty_dispatch_memory_pressure(dispatch_level));
+        .unwrap_or_else(|_| empty_memory_pressure(dispatch_level));
     if dispatch_level != MemoryPressureLevel::Unknown {
         pressure.level = dispatch_level;
     }
@@ -540,7 +540,7 @@ fn memory_pressure_level_from_dispatch_event(
     }
 }
 
-fn empty_dispatch_memory_pressure(level: MemoryPressureLevel) -> MemoryPressure {
+fn empty_memory_pressure(level: MemoryPressureLevel) -> MemoryPressure {
     MemoryPressure {
         level,
         free_pages: None,
@@ -562,32 +562,57 @@ fn spawn_memory_pressure_subscription<F>(
 where
     F: Fn() -> Result<MemoryPressure> + Send + 'static,
 {
-    let initial = sampler()?;
+    let initial = sampler().unwrap_or_else(|_| empty_memory_pressure(MemoryPressureLevel::Unknown));
     let liveness = Arc::new(());
     let weak_liveness = Arc::downgrade(&liveness);
     let thread_name = format!("sbh-{source}");
     let thread = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let mut last_level = initial.level;
-            loop {
-                std::thread::sleep(interval);
-                if weak_liveness.upgrade().is_none() {
-                    break;
-                }
-                let Ok(pressure) = sampler() else {
-                    continue;
-                };
-                if pressure.level != last_level {
-                    last_level = pressure.level;
-                    callback(pressure);
-                }
-            }
+            polling_subscription_loop(
+                initial,
+                &weak_liveness,
+                || std::thread::sleep(interval),
+                sampler,
+                callback,
+            );
         })
         .map_err(|error| macos_method_error("subscribe_memory_pressure", &error))?;
     drop(thread);
 
     Ok(SubscriptionHandle::active_with_liveness(source, liveness))
+}
+
+/// Publish the subscription's own seed even if the daemon's earlier sample
+/// differed. Missing evidence clears stale counters and recovers on a later
+/// sample; steady levels are delivered only once.
+fn polling_subscription_loop(
+    initial: MemoryPressure,
+    liveness: &Weak<()>,
+    mut wait: impl FnMut(),
+    mut sampler: impl FnMut() -> Result<MemoryPressure>,
+    mut callback: impl FnMut(MemoryPressure),
+) {
+    let mut last_level = initial.level;
+    if liveness.upgrade().is_some() {
+        callback(initial);
+    }
+    while liveness.upgrade().is_some() {
+        wait();
+        if liveness.upgrade().is_none() {
+            break;
+        }
+        let pressure =
+            sampler().unwrap_or_else(|_| empty_memory_pressure(MemoryPressureLevel::Unknown));
+        // Sampling may finish after shutdown. Do not publish that late result.
+        if liveness.upgrade().is_none() {
+            break;
+        }
+        if pressure.level != last_level {
+            last_level = pressure.level;
+            callback(pressure);
+        }
+    }
 }
 
 fn total_pages(total_bytes: u64, page_size_bytes: u64) -> u64 {
@@ -1411,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_pressure_subscription_reports_level_transitions() {
+    fn memory_pressure_subscription_reports_initial_state_and_level_transitions() {
         let samples = Arc::new(Mutex::new(VecDeque::from([
             test_memory_pressure(MemoryPressureLevel::Normal),
             test_memory_pressure(MemoryPressureLevel::Warn),
@@ -1442,6 +1467,11 @@ mod tests {
         assert_eq!(handle.source, "test-memory-pressure");
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(1))
+                .expect("initial normal observation"),
+            MemoryPressureLevel::Normal,
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
                 .expect("warn transition"),
             MemoryPressureLevel::Warn,
         );
@@ -1451,6 +1481,195 @@ mod tests {
             MemoryPressureLevel::Critical,
         );
         drop(handle);
+    }
+
+    fn polling_subscription_updates(
+        initial: MemoryPressure,
+        samples: Vec<super::Result<MemoryPressure>>,
+    ) -> Vec<MemoryPressure> {
+        use std::cell::RefCell;
+
+        let owner = RefCell::new(Some(Arc::new(())));
+        let liveness = Arc::downgrade(owner.borrow().as_ref().unwrap());
+        let samples = RefCell::new(VecDeque::from(samples));
+        let mut updates = Vec::new();
+        super::polling_subscription_loop(
+            initial,
+            &liveness,
+            || {
+                if samples.borrow().is_empty() {
+                    drop(owner.borrow_mut().take());
+                }
+            },
+            || samples.borrow_mut().pop_front().unwrap(),
+            |pressure| updates.push(pressure),
+        );
+        updates
+    }
+
+    fn unavailable_memory_pressure_sample() -> super::Result<MemoryPressure> {
+        Err(super::macos_method_error(
+            "memory_pressure_test",
+            &"injected memory read failure",
+        ))
+    }
+
+    #[test]
+    fn steady_polling_corrects_a_different_daemon_startup_sample_once() {
+        for (daemon_seed, subscription_seed) in [
+            (MemoryPressureLevel::Normal, MemoryPressureLevel::Critical),
+            (MemoryPressureLevel::Unknown, MemoryPressureLevel::Normal),
+            (MemoryPressureLevel::Critical, MemoryPressureLevel::Normal),
+        ] {
+            let updates = polling_subscription_updates(
+                test_memory_pressure(subscription_seed),
+                (0..3)
+                    .map(|_| Ok(test_memory_pressure(subscription_seed)))
+                    .collect(),
+            );
+            let mut observed = daemon_seed;
+            for sample in &updates {
+                observed = sample.level;
+            }
+            assert_eq!(observed, subscription_seed, "startup was {daemon_seed:?}");
+            assert_eq!(updates.len(), 1, "steady samples must not spam callbacks");
+            assert_eq!(updates[0].page_size_bytes, Some(4096));
+        }
+    }
+
+    #[test]
+    fn polling_failures_clear_stale_evidence_once_and_report_recovery() {
+        let initial = MemoryPressure {
+            free_pages: Some(10),
+            used_pages: Some(90),
+            compressor_used_bytes: Some(100),
+            swap_total_bytes: Some(200),
+            swap_used_bytes: Some(50),
+            ..test_memory_pressure(MemoryPressureLevel::Normal)
+        };
+        let updates = polling_subscription_updates(
+            initial.clone(),
+            vec![
+                unavailable_memory_pressure_sample(),
+                unavailable_memory_pressure_sample(),
+                Ok(initial.clone()),
+                Ok(initial.clone()),
+            ],
+        );
+        assert_eq!(updates.len(), 3);
+        assert_eq!(updates[0], initial);
+        assert_eq!(
+            updates[1],
+            MemoryPressure {
+                level: MemoryPressureLevel::Unknown,
+                free_pages: None,
+                used_pages: None,
+                page_size_bytes: None,
+                compressor_used_bytes: None,
+                swap_total_bytes: None,
+                swap_used_bytes: None,
+                linux_psi_avg10: None,
+            }
+        );
+        assert_eq!(updates[2], initial);
+    }
+
+    #[test]
+    fn polling_subscription_survives_an_unreadable_initial_sample() {
+        let samples = Arc::new(Mutex::new(VecDeque::from([
+            unavailable_memory_pressure_sample(),
+            Ok(test_memory_pressure(MemoryPressureLevel::Normal)),
+        ])));
+        let (tx, rx) = mpsc::channel();
+        let handle = super::spawn_memory_pressure_subscription(
+            "test-memory-pressure-recovery",
+            Duration::from_millis(1),
+            Box::new(move |pressure| {
+                let _ = tx.send(pressure.level);
+            }),
+            move || {
+                samples
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| Ok(test_memory_pressure(MemoryPressureLevel::Normal)))
+            },
+        )
+        .expect("a transient read failure must not prevent polling from starting");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            MemoryPressureLevel::Unknown
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            MemoryPressureLevel::Normal
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn polling_cancellation_before_start_discards_the_initial_sample() {
+        let owner = Arc::new(());
+        let liveness = Arc::downgrade(&owner);
+        drop(owner);
+        super::polling_subscription_loop(
+            test_memory_pressure(MemoryPressureLevel::Critical),
+            &liveness,
+            || panic!("an abandoned subscription must not wait"),
+            || panic!("an abandoned subscription must not sample"),
+            |_| panic!("an abandoned subscription must not publish its seed"),
+        );
+    }
+
+    #[test]
+    fn polling_cancellation_from_initial_callback_stops_before_waiting() {
+        let mut owner = Some(Arc::new(()));
+        let liveness = Arc::downgrade(owner.as_ref().unwrap());
+        let mut updates = Vec::new();
+        super::polling_subscription_loop(
+            test_memory_pressure(MemoryPressureLevel::Critical),
+            &liveness,
+            || panic!("initial callback ended the subscription before waiting"),
+            || panic!("initial callback ended the subscription before sampling"),
+            |pressure| {
+                updates.push(pressure.level);
+                drop(owner.take());
+            },
+        );
+        assert_eq!(updates, vec![MemoryPressureLevel::Critical]);
+    }
+
+    #[test]
+    fn polling_cancellation_during_wait_stops_before_sampling() {
+        let mut owner = Some(Arc::new(()));
+        let liveness = Arc::downgrade(owner.as_ref().unwrap());
+        let mut updates = Vec::new();
+        super::polling_subscription_loop(
+            test_memory_pressure(MemoryPressureLevel::Normal),
+            &liveness,
+            || drop(owner.take()),
+            || panic!("subscription ended while waiting"),
+            |pressure| updates.push(pressure.level),
+        );
+        assert_eq!(updates, vec![MemoryPressureLevel::Normal]);
+    }
+
+    #[test]
+    fn polling_cancellation_during_sampling_discards_the_late_result() {
+        let mut owner = Some(Arc::new(()));
+        let liveness = Arc::downgrade(owner.as_ref().unwrap());
+        let mut updates = Vec::new();
+        super::polling_subscription_loop(
+            test_memory_pressure(MemoryPressureLevel::Normal),
+            &liveness,
+            || {},
+            || {
+                drop(owner.take());
+                Ok(test_memory_pressure(MemoryPressureLevel::Critical))
+            },
+            |pressure| updates.push(pressure.level),
+        );
+        assert_eq!(updates, vec![MemoryPressureLevel::Normal]);
     }
 
     #[test]

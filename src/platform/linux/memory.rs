@@ -399,8 +399,9 @@ fn unknown_memory_pressure() -> MemoryPressure {
 
 /// Both event-backed and polling subscriptions use the same coverage/lifetime
 /// rules. Failed samples cannot leave a stale Normal verdict latched forever.
-/// Only level changes are delivered, except an initial Unknown is announced so
-/// an earlier successful daemon seed cannot hide a failed subscription seed.
+/// Always deliver the subscription's initial observation: the daemon's earlier
+/// startup sample may differ, and a steady level would otherwise never correct
+/// it. After that handoff, deliver level changes only.
 fn pressure_subscription_loop(
     initial: MemoryPressure,
     liveness: &Weak<()>,
@@ -409,7 +410,7 @@ fn pressure_subscription_loop(
     mut callback: impl FnMut(MemoryPressure),
 ) {
     let mut last_level = initial.level;
-    if last_level == MemoryPressureLevel::Unknown && liveness.upgrade().is_some() {
+    if liveness.upgrade().is_some() {
         callback(initial);
     }
     while liveness.upgrade().is_some() {
@@ -575,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_pressure_subscription_reports_level_transitions() {
+    fn memory_pressure_subscription_reports_initial_state_and_level_transitions() {
         let samples = Arc::new(Mutex::new(VecDeque::from([
             test_memory_pressure(MemoryPressureLevel::Normal),
             test_memory_pressure(MemoryPressureLevel::Warn),
@@ -602,6 +603,11 @@ mod tests {
         )
         .expect("subscription should start");
 
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .expect("subscription's initial state should arrive"),
+            MemoryPressureLevel::Normal
+        );
         assert_eq!(
             rx.recv_timeout(std::time::Duration::from_secs(1))
                 .expect("warn transition should arrive"),
@@ -734,6 +740,32 @@ mod tests {
     }
 
     #[test]
+    fn a_steady_subscription_corrects_a_different_daemon_startup_sample_once() {
+        for (daemon_seed, subscription_seed) in [
+            (MemoryPressureLevel::Normal, MemoryPressureLevel::Critical),
+            (MemoryPressureLevel::Unknown, MemoryPressureLevel::Normal),
+            (MemoryPressureLevel::Critical, MemoryPressureLevel::Normal),
+        ] {
+            let updates = subscription_updates(
+                test_memory_pressure(subscription_seed),
+                (0..3)
+                    .map(|_| Ok(test_memory_pressure(subscription_seed)))
+                    .collect(),
+            );
+            // The consumer already has its daemon startup sample. The live
+            // subscription must correct it even if every later read is steady.
+            let mut observed = daemon_seed;
+            for sample in &updates {
+                observed = sample.level;
+            }
+            assert_eq!(observed, subscription_seed, "startup was {daemon_seed:?}");
+            assert_eq!(updates.len(), 1, "steady samples must not spam callbacks");
+            assert_eq!(updates[0].free_pages, Some(10));
+            assert_eq!(updates[0].used_pages, Some(90));
+        }
+    }
+
+    #[test]
     fn idle_subscription_reports_local_only_stalls_and_banded_recovery() {
         let info = super::MemoryInfo {
             total_bytes: 100,
@@ -760,6 +792,7 @@ mod tests {
                 .map(|sample| sample.level)
                 .collect::<Vec<_>>(),
             vec![
+                MemoryPressureLevel::Normal,
                 MemoryPressureLevel::Critical,
                 MemoryPressureLevel::Warn,
                 MemoryPressureLevel::Normal,
@@ -770,7 +803,7 @@ mod tests {
                 .iter()
                 .map(|sample| sample.linux_psi_avg10)
                 .collect::<Vec<_>>(),
-            vec![Some(7350), Some(450), Some(399),]
+            vec![None, Some(7350), Some(450), Some(399),]
         );
     }
 
@@ -785,16 +818,17 @@ mod tests {
                 Ok(test_memory_pressure(MemoryPressureLevel::Normal)),
             ],
         );
-        assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0].level, MemoryPressureLevel::Unknown);
-        assert!(updates[0].free_pages.is_none());
-        assert!(updates[0].used_pages.is_none());
-        assert!(updates[0].page_size_bytes.is_none());
-        assert!(updates[0].swap_total_bytes.is_none());
-        assert!(updates[0].swap_used_bytes.is_none());
-        assert!(updates[0].linux_psi_avg10.is_none());
-        assert_eq!(updates[1].level, MemoryPressureLevel::Normal);
-        assert_eq!(updates[1].free_pages, Some(10));
+        assert_eq!(updates.len(), 3);
+        assert_eq!(updates[0].level, MemoryPressureLevel::Normal);
+        assert_eq!(updates[1].level, MemoryPressureLevel::Unknown);
+        assert!(updates[1].free_pages.is_none());
+        assert!(updates[1].used_pages.is_none());
+        assert!(updates[1].page_size_bytes.is_none());
+        assert!(updates[1].swap_total_bytes.is_none());
+        assert!(updates[1].swap_used_bytes.is_none());
+        assert!(updates[1].linux_psi_avg10.is_none());
+        assert_eq!(updates[2].level, MemoryPressureLevel::Normal);
+        assert_eq!(updates[2].free_pages, Some(10));
     }
 
     #[test]
@@ -873,6 +907,7 @@ mod tests {
     fn shutdown_during_wait_does_not_start_another_sample() {
         let mut owner = Some(Arc::new(()));
         let liveness = Arc::downgrade(owner.as_ref().unwrap());
+        let mut updates = Vec::new();
         super::pressure_subscription_loop(
             test_memory_pressure(MemoryPressureLevel::Normal),
             &liveness,
@@ -881,14 +916,16 @@ mod tests {
                 true
             },
             || panic!("subscription ended while waiting"),
-            |_| panic!("no sample may be published after the waiter saw shutdown"),
+            |pressure| updates.push(pressure.level),
         );
+        assert_eq!(updates, vec![MemoryPressureLevel::Normal]);
     }
 
     #[test]
     fn shutdown_during_sampling_discards_the_late_result() {
         let mut owner = Some(Arc::new(()));
         let liveness = Arc::downgrade(owner.as_ref().unwrap());
+        let mut updates = Vec::new();
         super::pressure_subscription_loop(
             test_memory_pressure(MemoryPressureLevel::Normal),
             &liveness,
@@ -897,8 +934,41 @@ mod tests {
                 drop(owner.take());
                 Ok(test_memory_pressure(MemoryPressureLevel::Critical))
             },
-            |_| panic!("a completed sample must recheck subscription liveness"),
+            |pressure| updates.push(pressure.level),
         );
+        assert_eq!(updates, vec![MemoryPressureLevel::Normal]);
+    }
+
+    #[test]
+    fn shutdown_before_subscription_start_discards_even_the_initial_sample() {
+        let owner = Arc::new(());
+        let liveness = Arc::downgrade(&owner);
+        drop(owner);
+        super::pressure_subscription_loop(
+            test_memory_pressure(MemoryPressureLevel::Critical),
+            &liveness,
+            || panic!("an abandoned subscription must not wait"),
+            || panic!("an abandoned subscription must not sample"),
+            |_| panic!("an abandoned subscription must not publish its seed"),
+        );
+    }
+
+    #[test]
+    fn shutdown_from_initial_callback_stops_before_waiting_or_sampling() {
+        let mut owner = Some(Arc::new(()));
+        let liveness = Arc::downgrade(owner.as_ref().unwrap());
+        let mut updates = Vec::new();
+        super::pressure_subscription_loop(
+            test_memory_pressure(MemoryPressureLevel::Critical),
+            &liveness,
+            || panic!("initial callback ended the subscription before waiting"),
+            || panic!("initial callback ended the subscription before sampling"),
+            |pressure| {
+                updates.push(pressure.level);
+                drop(owner.take());
+            },
+        );
+        assert_eq!(updates, vec![MemoryPressureLevel::Critical]);
     }
 
     #[test]

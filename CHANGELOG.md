@@ -92,6 +92,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   a host with percentage-based writeback, where tune also lists
   kernel-writeback advice, history-based recommendations were missing without
   explanation. JSON already reported `has_database`.
+- **Memory-pressure subscriptions deliver their initial observation.**
+  Linux event-backed and polling subscriptions, and the macOS polling fallback,
+  now correct the daemon's earlier startup sample even when pressure then stays
+  steady. The macOS fallback also reports failed reads as Unknown, clears stale
+  counters, and resumes observation after an unreadable first sample. Cancelled
+  subscriptions discard late samples; unchanged levels remain deduplicated.
 - **Compression requires fresh memory-map evidence before rewriting files**
   (bd-rxq5). Successful scanner snapshots can no longer authorize compression
   for up to 30 seconds after collection. Mutation checks start a new bounded
