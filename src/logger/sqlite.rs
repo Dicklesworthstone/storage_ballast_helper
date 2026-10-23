@@ -850,7 +850,7 @@ mod tests {
             .execute_batch("CREATE TABLE filler (blob BLOB);")
             .unwrap();
         let chunk = vec![0x5Au8; 1024 * 1024];
-        let chunks = WAL_SIZE_LIMIT_BYTES as usize / chunk.len() + 8;
+        let chunks = usize::try_from(WAL_SIZE_LIMIT_BYTES).unwrap() / chunk.len() + 8;
         logger.conn.execute_batch("BEGIN").unwrap();
         for _ in 0..chunks {
             logger
