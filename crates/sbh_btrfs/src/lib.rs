@@ -299,16 +299,50 @@ pub fn raw_ranges(
     Ok(ranges)
 }
 
-/// Whether any of the file's data is still stored raw (see [`raw_ranges`]).
-/// A file compressed in full has none and is not worth selecting again.
-pub fn has_raw_data(file: &File, deadline: Instant) -> io::Result<bool> {
-    let size = FileStamp::read(file)?.size;
-    if size == 0 {
-        return Ok(false);
+/// Cheap, read-only exclusions before a file spends discovery's work budget.
+///
+/// Inode flags and FIEMAP can establish a known veto without privileged tree
+/// searches. A file with no raw data, or with a no-compress/shared-data veto,
+/// must not displace later candidates every pass. `None` is only the absence
+/// of one of these cheap exclusions: the executor still requires a fresh full
+/// [`inspect`] and all application admission checks. An incomplete or changing
+/// observation returns an error, never a fabricated exclusion or eligibility.
+pub fn discovery_exclusion(file: &File, deadline: Instant) -> io::Result<Option<&'static str>> {
+    check_deadline(deadline)?;
+    let stamp = FileStamp::read(file)?;
+    let inode_flags = ioctl::inode_flags(file)?;
+    // A positive inode veto needs no mapping sweep. In particular, querying
+    // a large incompressible file must not consume another pass's deadline.
+    let mappings = if inode_flags & ioctl::EXCLUDED_INODE_FLAGS != 0 {
+        Vec::new()
+    } else {
+        ioctl::fiemap_extents(file, 0, stamp.size, deadline)?
+    };
+    if FileStamp::read(file)? != stamp {
+        return Err(io::Error::other(
+            "file changed during discovery extent inspection",
+        ));
     }
-    Ok(ioctl::fiemap_extents(file, 0, size, deadline)?
+    check_deadline(deadline)?;
+    Ok(cheap_exclusion(inode_flags, &mappings))
+}
+
+fn cheap_exclusion(inode_flags: u32, mappings: &[ioctl::MappedExtent]) -> Option<&'static str> {
+    if inode_flags & ioctl::EXCLUDED_INODE_FLAGS != 0 {
+        Some("nocow_nocompress_immutable_or_append_only")
+    } else if mappings
         .iter()
-        .any(|extent| extent.flags & ioctl::FIEMAP_EXTENT_ENCODED == 0))
+        .any(|extent| extent.flags & ioctl::FIEMAP_EXTENT_SHARED != 0)
+    {
+        Some("shared_or_reflinked_extents")
+    } else if mappings
+        .iter()
+        .all(|extent| extent.flags & ioctl::FIEMAP_EXTENT_ENCODED != 0)
+    {
+        Some("already_compressed_extents")
+    } else {
+        None
+    }
 }
 
 /// Compress a bounded range of an already-open file in place.

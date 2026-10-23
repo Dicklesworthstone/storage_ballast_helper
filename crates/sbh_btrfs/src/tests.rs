@@ -126,6 +126,69 @@ fn a_part_compressed_file_stays_eligible_and_a_compressed_one_does_not() {
 }
 
 #[test]
+fn discovery_excludes_incompressible_and_shared_files_before_work_admission() {
+    let raw = ioctl::MappedExtent {
+        logical: 0,
+        physical: 1_048_576,
+        length: 131_072,
+        flags: 0,
+    };
+    assert_eq!(cheap_exclusion(0, &[raw]), None);
+    for flag in [0x10, 0x20, ioctl::FS_NOCOMP_FL, 0x0080_0000] {
+        assert_eq!(
+            cheap_exclusion(flag, &[]),
+            Some("nocow_nocompress_immutable_or_append_only"),
+            "an inode veto does not need a mapping sweep"
+        );
+    }
+    let shared = ioctl::MappedExtent {
+        logical: raw.length,
+        physical: raw.physical + raw.length,
+        flags: ioctl::FIEMAP_EXTENT_LAST | ioctl::FIEMAP_EXTENT_SHARED,
+        ..raw
+    };
+    assert_eq!(
+        cheap_exclusion(0, &[raw, shared]),
+        Some("shared_or_reflinked_extents")
+    );
+}
+
+#[test]
+fn discovery_keeps_raw_remainders_but_never_claims_full_eligibility() {
+    let raw = ioctl::MappedExtent {
+        logical: 0,
+        physical: 1_048_576,
+        length: 131_072,
+        flags: 0,
+    };
+    let encoded = ioctl::MappedExtent {
+        logical: raw.length,
+        physical: raw.physical + raw.length,
+        flags: ioctl::FIEMAP_EXTENT_LAST | ioctl::FIEMAP_EXTENT_ENCODED,
+        ..raw
+    };
+    assert_eq!(cheap_exclusion(0, &[raw, encoded]), None);
+    assert_eq!(
+        cheap_exclusion(0, &[encoded]),
+        Some("already_compressed_extents")
+    );
+    assert_eq!(cheap_exclusion(0, &[]), Some("already_compressed_extents"));
+    // The cheap probe is not an admission check. Unsupported layout details
+    // still reach, and must be refused by, the executor's full inspection.
+    let unknown = ioctl::MappedExtent {
+        flags: raw.flags | 0x8000_0000,
+        ..raw
+    };
+    assert_eq!(cheap_exclusion(0, &[unknown]), None);
+    let mut full = eligible_map();
+    full.fiemap_flags = unknown.flags;
+    assert_eq!(
+        full.exclusion(),
+        Some("unknown_delayed_or_unsupported_extent_layout")
+    );
+}
+
+#[test]
 fn encryption_and_other_encodings_are_told_apart_from_compression() {
     let compressed = parse_file_extent(&regular_item(1_048_576, 4096, 131_072, 3)).unwrap();
     assert!(compressed.encoded && !compressed.foreign_encoding);

@@ -87,6 +87,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Compression discovery preserves progress when its byte budget fills**
+  (bd-rxq5). A file that fits a fresh pass but not the remaining allowance
+  stops discovery with a continuation before that file. Later candidates remain
+  reachable even if execution refuses every earlier selection. Files exceeding
+  the whole allowance are explicitly skipped; known NOCOMP/inode-flag, shared
+  extent and fully encoded exclusions no longer consume the selection budget.
+  The executor still requires its complete, fresh admission checks.
 - **`sbh tune` says when the activity database is missing, whatever else it
   lists.** The note appeared only when there was nothing else to report, so on
   a host with percentage-based writeback, where tune also lists

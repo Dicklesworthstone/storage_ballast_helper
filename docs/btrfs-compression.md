@@ -69,8 +69,16 @@ chunks. Logical input limits bound work, not expected savings.
 Use `--min-size-bytes`, `--min-age-secs`, `--max-files`, `--max-bytes`,
 `--timeout-secs`, and `--min-free-bytes` to select limits. Safety floors refuse
 ages below one hour, reserves below 256 MiB, zero limits, more than 4096 files,
-or deadlines above one hour. A file larger than the remaining byte budget is
-skipped rather than partly admitted.
+or deadlines above one hour. Explicit-file execution skips any file larger than
+its remaining byte budget.
+
+Directory discovery preserves progress when its logical-byte allowance fills:
+a file that fits a fresh pass but not the remaining allowance ends the current
+page with a continuation before that file. Files larger than the whole allowance
+are explicitly excluded, so they cannot stall the walk. Known NOCOMP/inode-flag
+and shared-extent vetoes are filtered before selecting work. Other refused
+candidates also cannot hide later files indefinitely: discovery remains
+resumable even when the executor accepts none of an earlier page.
 
 An in-flight kernel operation cannot be forcibly interrupted by this deadline.
 After any attempted rewrite, content verification has its own 120-second

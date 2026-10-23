@@ -46,7 +46,12 @@ deduplicates overlapping roots, enumerates each directory in native pathname
 order, refuses descendant mount crossings and symlinks, and prunes protected or
 leased trees. It reuses the existing configured protection patterns, marker
 checks and sacred-path catalog. Hard-linked files, young/future-dated files,
-small files and already-compressed suffixes are excluded.
+small files and already-compressed suffixes are excluded. A bounded native probe
+also excludes NOCOW, NOCOMP, immutable or append-only flags, shared/reflinked
+extents, and files with no raw data remaining before they consume the selection
+budget. The probe does not write back dirty data or require privileged tree
+searches. If it cannot establish an exclusion, the executor still performs its
+ordinary full, fresh inspection; selection alone never establishes eligibility.
 
 ### Git content is excluded, including untracked build outputs
 
@@ -75,8 +80,13 @@ there is no compression force override, including for ignored worktree files.
 `--min-size-bytes`, `--min-age-secs`, `--max-files`, and `--max-bytes` use the
 existing compression defaults and safety floors. Logical bytes limit selected
 work and are **not** bytes that can necessarily be reclaimed. Selection does
-not yet check live process references or physical extents; ordinary file preview
-and apply still perform those checks.
+not establish physical reclaim or check live process references; ordinary file
+preview and apply still perform those checks. A file larger than the entire
+`--max-bytes` allowance is counted under `exceeds_full_byte_budget` and skipped.
+If a file fits a fresh pass but not the remaining allowance, discovery stops
+with a continuation before that file. It does not skip ahead to smaller files
+or call the remaining tree complete. Later candidates can therefore be reached
+even when the executor refuses every file selected by an earlier page.
 
 Traversal defaults are 32 levels below each root, 100,000 directory entries,
 4096 directories and a separate 30-second cooperative discovery deadline.
@@ -104,7 +114,7 @@ is not a filesystem snapshot; files may change afterwards.
 
 When a walk stops before covering its roots, JSON includes
 `discovery.resume_after_hex`: the last selected file if `--max-files` stopped
-it, or else the last path visited to completion when an entry, directory or
+it, or else the last path visited to completion when a byte, entry, directory or
 time budget or a failed entry stopped it. Everything sorted before that path
 was examined. A directory past `--max-depth` is skipped, not a stop: the walk
 continues and reports itself incomplete. Continue after that exact native

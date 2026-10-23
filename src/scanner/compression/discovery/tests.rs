@@ -136,6 +136,162 @@ mod native_tests {
     }
 
     #[test]
+    fn byte_limited_pages_reach_later_files_even_when_execution_refuses_every_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir(root.join("b")).unwrap();
+        let paths = [
+            root.join("a.bin"),
+            root.join("b/cold.bin"),
+            root.join("c.bin"),
+        ];
+        for path in &paths {
+            cold(path);
+        }
+        let policy = CompressionPolicy {
+            max_bytes: 13,
+            ..policy()
+        };
+        let mut after = None;
+        let mut visited = Vec::new();
+        for (page, expected) in paths.iter().enumerate() {
+            let selection = scan(
+                std::slice::from_ref(&root),
+                &DiscoveryLimits {
+                    after: after.clone(),
+                    ..Default::default()
+                },
+                &policy,
+            );
+            assert_eq!(selection.paths().as_slice(), std::slice::from_ref(expected));
+            assert_eq!(selection.report().selected_bytes, policy.max_bytes);
+            // The real read-only executor refuses every selected file on the
+            // mock's unsupported filesystem. Nothing changes to make this
+            // prefix disappear automatically before the next discovery pass.
+            let execution = crate::scanner::compression::run_discovered(
+                &selection,
+                &policy,
+                crate::scanner::compression::CompressionMode::default(),
+                &Config::default(),
+                &MockPlatform::healthy(),
+                None,
+                &mut |_| {},
+            )
+            .unwrap();
+            assert!(execution.dry_run);
+            assert!(execution.journal_path.is_none());
+            assert_eq!(execution.unvisited_files, 0);
+            assert_eq!(execution.files.len(), 1);
+            assert_eq!(execution.files[0].outcome, "skipped");
+            assert!(execution.files[0].detail.contains("unsupported filesystem"));
+            assert!(!execution.files[0].mutation_attempted);
+            visited.extend(selection.paths());
+            if page < 2 {
+                assert!(!selection.report().complete);
+                assert_eq!(
+                    selection.report().stop_reason.as_deref(),
+                    Some("discovery logical-byte budget exhausted")
+                );
+                let next =
+                    continuation_path(selection.report().resume_after_hex.as_deref().unwrap())
+                        .unwrap();
+                assert!(after.as_ref().is_none_or(|previous| next > *previous));
+                if page == 0 {
+                    assert_eq!(next, root.join("b"), "resume inside the visited directory");
+                }
+                after = Some(next);
+            } else {
+                assert!(selection.report().complete);
+                assert!(selection.report().resume_after_hex.is_none());
+            }
+        }
+        assert_eq!(visited, paths);
+        for path in paths {
+            assert_eq!(fs::read(path).unwrap(), b"cold contents");
+        }
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+        assert_eq!(fs::read_dir(root.join("b")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_byte_budget_stop_keeps_a_middle_file_ahead_of_a_smaller_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for name in ["a.bin", "b.bin"] {
+            cold(&root.join(name));
+        }
+        let small = root.join("c.bin");
+        fs::write(&small, b"x").unwrap();
+        filetime::set_file_mtime(&small, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        let policy = CompressionPolicy {
+            max_bytes: 20,
+            ..policy()
+        };
+        let first = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy,
+        );
+        assert_eq!(first.paths(), [root.join("a.bin")]);
+        assert!(!first.report().complete);
+        assert!(!first.report().skipped.contains_key("logical_byte_budget"));
+        let after = continuation_path(first.report().resume_after_hex.as_deref().unwrap()).unwrap();
+        assert_eq!(after, root.join("a.bin"));
+        let second = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits {
+                after: Some(after),
+                ..Default::default()
+            },
+            &policy,
+        );
+        assert_eq!(second.paths(), [root.join("b.bin"), small]);
+        assert_eq!(second.report().selected_bytes, 14);
+        assert!(second.report().complete);
+    }
+
+    #[test]
+    fn a_file_larger_than_the_entire_byte_budget_does_not_wedge_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let oversized = root.join("a-large.bin");
+        fs::write(&oversized, b"too large for a whole pass").unwrap();
+        filetime::set_file_mtime(&oversized, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        for name in ["b.bin", "c.bin"] {
+            cold(&root.join(name));
+        }
+        let policy = CompressionPolicy {
+            max_bytes: 13,
+            ..policy()
+        };
+        let first = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy,
+        );
+        assert_eq!(first.paths(), [root.join("b.bin")]);
+        assert_eq!(
+            first.report().skipped.get("exceeds_full_byte_budget"),
+            Some(&1)
+        );
+        assert!(!first.report().complete);
+        let after = continuation_path(first.report().resume_after_hex.as_deref().unwrap()).unwrap();
+        assert_eq!(after, root.join("b.bin"));
+        let second = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits {
+                after: Some(after),
+                ..Default::default()
+            },
+            &policy,
+        );
+        assert_eq!(second.paths(), [root.join("c.bin")]);
+        assert!(second.report().complete);
+        assert!(second.report().resume_after_hex.is_none());
+        assert_eq!(fs::read(oversized).unwrap(), b"too large for a whole pass");
+    }
+
+    #[test]
     fn partial_directory_enumeration_never_claims_a_sorted_prefix() {
         let dir = tempfile::tempdir().unwrap();
         cold(&dir.path().join("a.bin"));

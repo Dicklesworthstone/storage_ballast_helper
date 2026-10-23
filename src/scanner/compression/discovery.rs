@@ -84,8 +84,8 @@ pub struct DiscoveryReport {
     pub stop_reason: Option<String>,
     /// Native bytes, as lowercase hex, of the path a stopped walk resumes
     /// after: the last selected file when the file limit stopped it, else the
-    /// last path visited to completion when a directory, entry or time budget
-    /// or a failed entry stopped it. Everything sorted before it is done.
+    /// last path visited to completion when a byte, directory, entry or time
+    /// budget or a failed entry stopped it. Everything sorted before it is done.
     /// Absent when the walk completed or stopped before visiting anything.
     /// Pass to `--after-hex` to resume.
     pub resume_after_hex: Option<String>,
@@ -516,19 +516,28 @@ mod native {
                 self.skip("young_or_future_timestamp");
             } else if super::super::already_compressed(&path) {
                 self.skip("compressed_suffix");
-            } else if !raw_data_remains(
+            } else if stamp.size > self.policy.max_bytes {
+                // This file cannot fit even an empty pass. Skipping it is
+                // necessary for a continuation to reach its smaller siblings.
+                self.skip("exceeds_full_byte_budget");
+            } else if let Some(reason) = native_exclusion(
                 &self.selection.native.roots[task.root].file,
                 relative,
+                stamp,
                 self.deadline,
-            ) {
-                self.skip("already_compressed_extents");
+            )? {
+                self.skip(reason);
             } else if stamp.size
                 > self
                     .policy
                     .max_bytes
                     .saturating_sub(self.selection.report.selected_bytes)
             {
-                self.skip("logical_byte_budget");
+                // The file fits a fresh pass, so it is unvisited work rather
+                // than an exclusion. A "complete" scan here would repeatedly
+                // select an earlier prefix even when execution refuses every
+                // file in that prefix. Stop BEFORE advancing last_visited.
+                return Err(io::Error::other("discovery logical-byte budget exhausted"));
             } else if !self.identities.insert((stamp.device, stamp.inode)) {
                 self.skip("duplicate_inode");
             } else {
@@ -546,12 +555,17 @@ mod native {
         }
     }
 
-    /// Whether the file at `relative` under `root` still holds raw data. One
-    /// an earlier pass compressed in full would only spend the byte budget and
-    /// starve the files after it, pass after pass. Anything that stops the
-    /// check keeps the file: the executor inspects it again before touching it.
-    fn raw_data_remains(root: &File, relative: &Path, deadline: Instant) -> bool {
-        let Ok(fd) = openat2(
+    /// Keep known native vetoes out of the selection budget. Probe failure is
+    /// not eligibility: the executor still performs full fresh inspection.
+    /// Discovery's own deadline, including time spent probing, still stops the
+    /// page rather than admitting more work after an uncertain late result.
+    fn native_exclusion(
+        root: &File,
+        relative: &Path,
+        expected: FileStamp,
+        deadline: Instant,
+    ) -> io::Result<Option<&'static str>> {
+        let exclusion = openat2(
             root,
             relative,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
@@ -560,10 +574,22 @@ mod native {
                 | ResolveFlags::NO_SYMLINKS
                 | ResolveFlags::NO_MAGICLINKS
                 | ResolveFlags::NO_XDEV,
-        ) else {
-            return true;
-        };
-        sbh_btrfs::has_raw_data(&File::from(fd), deadline).unwrap_or(true)
+        )
+        .map(File::from)
+        .map_err(io::Error::from)
+        .and_then(|file| {
+            if FileStamp::read(&file)? != expected {
+                return Err(io::Error::other("file changed before discovery probing"));
+            }
+            sbh_btrfs::discovery_exclusion(&file, deadline)
+        });
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "discovery deadline exhausted",
+            ));
+        }
+        Ok(exclusion.ok().flatten())
     }
 
     pub(super) fn discover(

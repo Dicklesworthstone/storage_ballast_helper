@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use sbh_btrfs::{
-    FileStamp, IdleIoPriority, ZstdConsent, compress_range, inspect, is_btrfs, reclaim_evidence,
+    FileStamp, IdleIoPriority, ZstdConsent, compress_range, discovery_exclusion, inspect, is_btrfs,
+    reclaim_evidence,
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -66,6 +67,7 @@ fn native_compression_preserves_every_byte_size_and_mtime() {
         None,
         "mount must not enable automatic compression"
     );
+    assert_eq!(discovery_exclusion(&file, deadline()).unwrap(), None);
     let priority = IdleIoPriority::enter().unwrap();
     compress_range(
         &file,
@@ -80,6 +82,10 @@ fn native_compression_preserves_every_byte_size_and_mtime() {
     let after = inspect(&file, deadline()).unwrap();
     assert!(stamp.same_contents_and_identity(after.stamp));
     assert!(after.physical_data_bytes < before.physical_data_bytes / 2);
+    assert_eq!(
+        discovery_exclusion(&file, deadline()).unwrap(),
+        Some("already_compressed_extents")
+    );
     let mut actual = Vec::new();
     File::open(&path).unwrap().read_to_end(&mut actual).unwrap();
     assert_eq!(actual, bytes);
@@ -111,6 +117,10 @@ fn reflinked_files_are_rejected_without_modifying_either_copy() {
     file.sync_all().unwrap();
     let before = inspect(&file, deadline()).unwrap();
     assert_eq!(before.exclusion(), Some("shared_or_reflinked_extents"));
+    assert_eq!(
+        discovery_exclusion(&file, deadline()).unwrap(),
+        Some("shared_or_reflinked_extents")
+    );
     assert!(
         compress_range(
             &file,
@@ -190,6 +200,10 @@ fn an_incompressible_range_marks_the_file_but_does_not_stop_the_rest() {
     // incompressible megabyte again.
     assert_eq!(
         after.exclusion(),
+        Some("nocow_nocompress_immutable_or_append_only")
+    );
+    assert_eq!(
+        discovery_exclusion(&file, deadline()).unwrap(),
         Some("nocow_nocompress_immutable_or_append_only")
     );
 }
