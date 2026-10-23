@@ -6,6 +6,19 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+### Added
+
+- **Read-only agent-session scratch inventory** (bd-jnp9).
+  `sbh check --agent-scratch [PATH]` discovers Claude session trees, reports
+  logical and allocated sizes separately, and combines tree/transcript ages
+  with live cwd, open-file and mapped-file evidence. Only complete observations
+  meeting `--min-idle-days` (7 by default) qualify as idle; active, recent and
+  uncertain sessions remain visible. Traversal is bounded, does not follow
+  descendant symlinks or cross filesystems, and reports protection markers.
+  JSON uses `sbh.agent_scratch.v1`; incomplete reports exit 4. This is an
+  operator inventory, with no retention policy, deletion, or promised reclaim
+  from shared/reflinked blocks.
+
 ### Changed
 
 - **Lossless compression gets a bounded first chance before daemon cleanup**

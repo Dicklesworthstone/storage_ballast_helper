@@ -20,14 +20,14 @@ fn cli_command() -> clap::Command {
 fn main() {
     storage_ballast_helper::daemon::service::capture_sbh_binary_path();
     let matches = cli_command().get_matches();
-    // Host RAM-scratch inspection is a read-only check, independent of daemon
-    // configuration. Ordinary disk checks continue through the existing enum.
+    // Scratch diagnostics own their read-only reports and exit statuses.
+    // Ordinary disk checks continue through the existing enum.
     match cli_ram_scratch::run(&matches) {
         Ok(Some(0)) => return,
         Ok(Some(code)) => std::process::exit(code),
         Ok(None) => {}
         Err(error) => {
-            eprintln!("sbh: could not write RAM scratch report: {error}");
+            eprintln!("sbh: could not write scratch report: {error}");
             std::process::exit(2);
         }
     }

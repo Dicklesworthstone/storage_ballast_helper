@@ -409,6 +409,7 @@ For non-interactive environments (CI, automation), `sbh install --auto` applies 
 | `sbh daemon` | Run monitoring loop and policy engine |
 | `sbh status` | Real-time health, pressure, and controller state |
 | `sbh check` | Pre-flight space check and recommendations |
+| `sbh check --agent-scratch [PATH]` | Read-only inventory of Claude session scratch, sizes, process references, and tree/transcript inactivity |
 | `sbh scan` | Manual candidate discovery and scoring report |
 | `sbh clean` | Manual cleanup with confirmation/dry-run |
 | `sbh undo` | Restore quarantined entries (`<decision-id>`, `--path`, `--all-since`, `--list`) |
@@ -729,6 +730,8 @@ Configure via command palette (`:` then type `pref`) or directly in the preferen
   `docs/configs/`
 - macOS launchd troubleshooting guide: `docs/launchd-troubleshooting.md`
 - Sacred path catalog and per-pattern safety reasoning: `docs/sacred-paths.md`
+- Agent-session scratch inventory and its uncertainty/size semantics:
+  `docs/agent-scratch.md`
 - Dashboard/status baseline contract (pre-overhaul): `docs/dashboard-status-contract-baseline.md`
 - Dashboard IA + navigation map (overhaul design baseline): `docs/dashboard-information-architecture.md`
 - TUI acceptance gates + performance/error budgets: `docs/tui-acceptance-gates-and-budgets.md`
@@ -1435,6 +1438,29 @@ A candidate that cannot be quarantined (different filesystem from the root, unus
 The tracker periodically prunes entries whose last deletion is older than `max_cooldown`, preventing unbounded memory growth in long-running daemon sessions.
 
 Source: `src/daemon/loop_main.rs`
+
+### Agent-Session Scratch Inventory
+
+`sbh check --agent-scratch [PATH]` reports Claude session directories even when
+their contents are not regenerable artifacts. It recognizes
+`<tmp>/claude-<uid>/<project>/<session-uuid>`, correlates each session with its
+transcript, and checks live process references. Both the complete tree and its
+transcript must have been unchanged for `--min-idle-days` (7 by default), with
+complete process evidence, before the report labels a session `idle`. Active,
+recent, and unknown sessions remain visible, largest observed allocations first.
+
+```bash
+sbh check --agent-scratch /data/tmp --min-idle-days 9
+sbh --json check --agent-scratch /tmp --agent-scratch-top 50
+```
+
+This command only reports evidence for manual review. It preserves protection
+markers and never emits cleanup candidates. Logical bytes and allocated blocks
+are reported separately; hardlinks are deduplicated within each session, but
+reflinks/shared blocks prevent a reclaimable-space promise. Missing transcripts,
+limited process visibility, changed trees, and exhausted scan budgets remain
+explicit uncertainty. See [the inventory guide](docs/agent-scratch.md) for roots,
+limits, JSON fields, and exit statuses.
 
 ### Lossless Reclaim Before Cleanup
 
