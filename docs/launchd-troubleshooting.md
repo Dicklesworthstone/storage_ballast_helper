@@ -79,6 +79,34 @@ tail -n 100 ~/Library/Logs/sbh/sbh.log
 
 System logs live in `/var/log/sbh/`.
 
+### Notification Events In Unified Logging
+
+The default `journal` notification channel also submits events directly to
+macOS unified logging from the daemon process. It uses subsystem
+`org.storage-ballast-helper.sbh` and category `notifications`:
+
+```bash
+log show --last 1h --style compact \
+  --predicate 'process == "sbh" AND subsystem == "org.storage-ballast-helper.sbh" AND category == "notifications"'
+```
+
+Records include `SBH_EVENT=...` and `SBH_LEVEL=...`. Warning and Orange events
+use Apple's default log level; Red and Critical events use error level.
+Info events use info level: if you lower `notifications.journal.min_level`
+from its default `warning` to `info`, add `--info` when reading the log.
+The existing notification rate limits still apply, including the default
+five-minute interval per Red/Critical event category. Desktop delivery remains
+opt-in.
+
+macOS controls filtering and retention; successful submission does not prove
+that a message was saved. Native records are capped at 1 KiB and end with
+`[truncated]` when shortened. The complete original notification summary is
+still written to stderr (`sbh.err` under launchd), independently of native
+delivery, and the configured file channel remains available. This bridge
+covers notification events, not every daemon activity record. See Apple's
+[`os_log_with_type` documentation](https://developer.apple.com/documentation/os/os_log_with_type)
+for logging and retention behavior.
+
 ## Reading `launchctl print`
 
 The most useful fields are:

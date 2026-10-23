@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use crate::monitor::pid::PressureLevel;
 use crate::scanner::deletion::FreedBasis;
 
+mod journal;
+
 const DEFAULT_NOTIFY_INTERVAL_SECS: u64 = 60;
 const DEFAULT_URGENT_NOTIFY_INTERVAL_SECS: u64 = 300;
 
@@ -439,8 +441,8 @@ impl Default for FileConfig {
 
 /// Service-log notification settings.
 ///
-/// The channel writes structured stderr lines so systemd journals and launchd
-/// stdout/stderr capture both receive the same operator-visible events.
+/// The channel preserves stderr for service-manager capture and also submits
+/// structured records to macOS unified logging under the daemon's identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct JournalConfig {
@@ -652,7 +654,7 @@ impl Channel for FileChannel {
     }
 }
 
-// ──── Journal/service log (structured stderr) ────
+// ──── Journal/service log (stderr and macOS unified logging) ────
 
 struct JournalChannel {
     min_level: NotificationLevel,
@@ -664,6 +666,26 @@ impl JournalChannel {
             min_level: config.min_level,
         }
     }
+
+    fn send_to(
+        &self,
+        event: &NotificationEvent,
+        sink: impl FnOnce(journal::JournalLevel, &str, &str),
+    ) {
+        let level = event.level();
+        if level < self.min_level {
+            return;
+        }
+
+        let journal_level = match level {
+            NotificationLevel::Info => journal::JournalLevel::Info,
+            NotificationLevel::Warning => journal::JournalLevel::Warning,
+            NotificationLevel::Orange => journal::JournalLevel::Orange,
+            NotificationLevel::Red => journal::JournalLevel::Red,
+            NotificationLevel::Critical => journal::JournalLevel::Critical,
+        };
+        sink(journal_level, event.type_key(), &event.summary());
+    }
 }
 
 impl Channel for JournalChannel {
@@ -672,25 +694,7 @@ impl Channel for JournalChannel {
     }
 
     fn send(&self, event: &NotificationEvent) {
-        if event.level() < self.min_level {
-            return;
-        }
-
-        let level = event.level();
-        let summary = event.summary();
-
-        // systemd captures stderr in the journal, while launchd captures it in
-        // the configured StandardErrorPath. Structured fields remain stable for
-        // filtering: SBH_EVENT=..., SBH_LEVEL=...
-        let priority = match level {
-            NotificationLevel::Critical => "CRIT",
-            NotificationLevel::Red => "ERR",
-            NotificationLevel::Orange => "WARNING",
-            NotificationLevel::Warning => "NOTICE",
-            NotificationLevel::Info => "INFO",
-        };
-
-        eprintln!("[SBH-NOTIFY] [{priority}] {summary}");
+        self.send_to(event, journal::send);
     }
 }
 
@@ -836,7 +840,7 @@ impl Channel for WebhookChannel {
 ///
 /// The manager is designed to be cheap to call — each channel's `send()` is
 /// fire-and-forget (spawns child processes for desktop/webhook, appends for file,
-/// and writes to stderr for journal). Notification failures never propagate.
+/// and writes to service logs for journal). Notification failures never propagate.
 pub struct NotificationManager {
     channels: Vec<Box<dyn Channel>>,
     enabled: bool,
@@ -1321,20 +1325,30 @@ mod tests {
             min_level: NotificationLevel::Orange,
         };
 
-        // Info-level event should be below the threshold.
-        // We can't easily capture stderr in a unit test, but we can verify the
-        // min_level check by ensuring no panic occurs.
         let info_event = NotificationEvent::DaemonStarted {
             version: "0.1.0".to_string(),
             volumes_monitored: 1,
         };
-        channel.send(&info_event); // Should be silently dropped.
+        channel.send_to(&info_event, |_, _, _| {
+            panic!("below-threshold event must not reach either journal sink");
+        });
 
         let red_event = NotificationEvent::Error {
             code: "SBH-TEST".to_string(),
             message: "test".to_string(),
         };
-        channel.send(&red_event); // Should output to stderr.
+        let mut delivered = None;
+        channel.send_to(&red_event, |level, event_type, summary| {
+            delivered = Some((level, event_type.to_owned(), summary.to_owned()));
+        });
+        assert_eq!(
+            delivered,
+            Some((
+                journal::JournalLevel::Red,
+                "error".to_owned(),
+                red_event.summary()
+            ))
+        );
     }
 
     #[test]

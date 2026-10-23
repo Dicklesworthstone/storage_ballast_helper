@@ -1743,7 +1743,7 @@ The daemon dispatches alerts through four notification channels, each with indep
 | Desktop | `notify-send` (Linux) / `osascript` (macOS) | Orange |
 | Webhook | HTTP POST via `curl` (5-second timeout) | Red |
 | File | JSONL append to `~/.local/share/sbh/notifications.jsonl` | Info |
-| Journal | systemd/launchd stdout and stderr capture | Warning |
+| Journal | systemd/launchd stderr capture; macOS unified logging | Warning |
 
 Default active channels are `journal` and `file`. Desktop and webhook channels are opt-in.
 On macOS, the desktop channel uses `osascript -e 'display notification ...'` as the

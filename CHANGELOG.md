@@ -8,6 +8,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Added
 
+- **macOS notifications enter unified logging under the `sbh` process**
+  (bd-z1nm). The journal channel uses Apple's public logging API with subsystem
+  `org.storage-ballast-helper.sbh`, category `notifications`, and structured
+  event/level fields. Native messages are bounded and UTF-8 safe; the full
+  stderr summary remains an independent fallback. Existing thresholds,
+  notification rate limits, and desktop opt-in settings remain in effect.
 - **Read-only agent-session scratch inventory** (bd-jnp9).
   `sbh check --agent-scratch [PATH]` discovers Claude session trees, reports
   logical and allocated sizes separately, and combines tree/transcript ages
