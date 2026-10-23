@@ -1461,7 +1461,7 @@ See [RAM-scratch headroom](docs/ram-scratch.md) for the warning rules and limits
 their contents are not regenerable artifacts. It recognizes
 `<tmp>/claude-<uid>/<project>/<session-uuid>`, correlates each session with its
 transcript, and checks live process references. Both the complete tree and its
-transcript must have been unchanged for `--min-idle-days` (7 by default), with
+transcript must have been unchanged for `--min-idle-days` (<!-- claim:constants.agent_scratch.DEFAULT_MIN_IDLE_DAYS -->7<!-- /claim --> by default), with
 complete process evidence, before the report labels a session `idle`. Active,
 recent, and unknown sessions remain visible, largest observed allocations first.
 

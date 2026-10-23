@@ -42,10 +42,14 @@ pub struct Limits {
     pub top: usize,
 }
 
+/// Days a session's tree and transcript must stay unchanged before the
+/// report calls the session idle (`--min-idle-days` overrides it).
+pub const DEFAULT_MIN_IDLE_DAYS: u32 = 7;
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            min_idle_days: 7,
+            min_idle_days: DEFAULT_MIN_IDLE_DAYS,
             timeout: Duration::from_secs(30),
             max_entries: 2_000_000,
             max_depth: 64,
@@ -872,7 +876,7 @@ mod tests {
                 transcripts,
                 // ctime cannot be backdated. Advance the observation clock
                 // instead, and use explicit future mtime for recent controls.
-                now: SystemTime::now() + Duration::from_days(9),
+                now: SystemTime::now() + Duration::from_hours(9 * 24),
             }
         }
 

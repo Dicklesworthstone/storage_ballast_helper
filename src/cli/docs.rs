@@ -1631,6 +1631,14 @@ pub fn constants() -> Vec<ConstantDoc> {
         ),
     ];
     rows.extend(daemon_constants());
+    #[cfg(unix)]
+    rows.push(constant(
+        "agent_scratch",
+        "DEFAULT_MIN_IDLE_DAYS",
+        crate::monitor::agent_scratch::DEFAULT_MIN_IDLE_DAYS,
+        "Days a session tree and transcript must be unchanged before check --agent-scratch calls it idle",
+        "src/monitor/agent_scratch.rs",
+    ));
     rows
 }
 

@@ -743,6 +743,7 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | daemon | `CATALOG_PROBE_MAX_DEPTH` | `5` | Depth of a catalog freshness probe | `src/daemon/loop_main.rs` |
 | daemon | `CANARY_REPROVE_MINUTES` | `30` | Clean minutes an automatic Canary needs to return to the intended mode | `src/daemon/policy.rs` |
 | daemon | `TARGET_TIER_PASS_MINUTES` | `10` | Shortest gap between two target-only passes | `src/daemon/target_tier.rs` |
+| agent_scratch | `DEFAULT_MIN_IDLE_DAYS` | `7` | Days a session tree and transcript must be unchanged before check --agent-scratch calls it idle | `src/monitor/agent_scratch.rs` |
 <!-- sbh-docs:end -->
 
 ---

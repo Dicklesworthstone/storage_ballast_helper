@@ -19178,7 +19178,9 @@ mod tests {
             command_docs, missing_file_references, undocumented_commands, undocumented_flags,
         };
         let root_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let cli = Cli::command();
+        // The command the binary runs (main.rs adds compress, relocate and
+        // check's RAM/agent-scratch flags to the derive-only Cli::command()).
+        let cli = crate::cli_command();
         let known: std::collections::BTreeSet<String> =
             command_docs(&cli).into_iter().map(|c| c.path).collect();
 
