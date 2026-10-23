@@ -36,6 +36,7 @@ use crate::daemon::control::{
     BallastAction as ControlBallastAction, ControlBackend, ControlCommand, ControlResponse,
     ControlServer, Peer, PolicyAction, persist_policy_mode,
 };
+use crate::daemon::coverage::{UNCOVERED_REFRESH_INTERVAL, uncovered_mount_levels};
 use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD, PassCpuGuard, paced_pct};
 use crate::daemon::mount_controller::{
     IdleReason, MountController, MountControllerConfig, MountState, MountStateRecord, MountSurface,
@@ -2080,6 +2081,11 @@ pub struct MonitoringDaemon {
     floor_limited: HashSet<PathBuf>,
     /// Once-per-epoch throttle for the "nothing to reclaim here" alert.
     reclaim_alerts: AlertThrottle,
+    /// Watchable volumes no scanner root covers, with their last level
+    /// (`coverage`), re-measured every `UNCOVERED_REFRESH_INTERVAL`. They
+    /// feed only the ReclaimUnavailable alert, never policy.
+    uncovered_levels: HashMap<PathBuf, PressureLevel>,
+    uncovered_checked_at: Option<Instant>,
     /// Derived catalog roots per mount (W1 catalog roots), refreshed every
     /// `scanner.catalog_rescan_interval_secs`.
     catalog_root_cache: HashMap<PathBuf, (Instant, Vec<ExpandedCatalogRoot>)>,
@@ -3485,6 +3491,8 @@ impl MonitoringDaemon {
             policy_transitions_seen: 0,
             floor_limited: HashSet::new(),
             reclaim_alerts: AlertThrottle::default(),
+            uncovered_levels: HashMap::new(),
+            uncovered_checked_at: None,
             catalog_root_cache: HashMap::new(),
             catalog_epochs: HashMap::new(),
             emergency_mounts: HashSet::new(),
@@ -5692,6 +5700,12 @@ impl MonitoringDaemon {
                     .send(ActivityEvent::Info { message: msg });
             }
         }
+        self.refresh_uncovered_levels(now);
+        for (mount, level) in &self.uncovered_levels {
+            if *level != PressureLevel::Green {
+                unprotected_mounts.insert(mount.clone(), *level);
+            }
+        }
         self.emit_reclaim_unavailable(&unprotected_mounts, now);
         self.report_unreclaimable_growth(now);
         if !self.config.scanner.target_only_roots.is_empty() {
@@ -5792,6 +5806,53 @@ impl MonitoringDaemon {
     /// reclaim surface, repeated at the special-location alert interval,
     /// escalated at once when the level rises, and cleared (logged once)
     /// when the mount recovers or gains a surface.
+    /// Re-measure the volumes no scanner root covers (bounded and cached; see
+    /// `coverage`). Linux only: macOS APFS volumes share their container's
+    /// free space, so every system volume would echo the Data volume's level.
+    fn refresh_uncovered_levels(&mut self, now: Instant) {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let first = self.uncovered_checked_at.is_none();
+        if self
+            .uncovered_checked_at
+            .is_some_and(|at| now.duration_since(at) < UNCOVERED_REFRESH_INTERVAL)
+        {
+            return;
+        }
+        self.uncovered_checked_at = Some(now);
+        let Ok(mounts) = self.platform.mount_points() else {
+            return;
+        };
+        let monitored: HashSet<PathBuf> = self
+            .mount_controllers
+            .keys()
+            .chain(self.mount_monitors.keys())
+            .cloned()
+            .collect();
+        let levels = uncovered_mount_levels(
+            &mounts,
+            &monitored,
+            |path| self.fs_collector.collect(path).ok(),
+            &self.config.pressure,
+        );
+        self.uncovered_levels = levels;
+        if first && !self.uncovered_levels.is_empty() {
+            let mut listed: Vec<String> = self
+                .uncovered_levels
+                .keys()
+                .map(|mount| mount.display().to_string())
+                .collect();
+            listed.sort();
+            let message = format!(
+                "no scanner root covers {}: sbh alerts when they fill but cannot reclaim there",
+                listed.join(", ")
+            );
+            eprintln!("[SBH-DAEMON] {message}");
+            self.logger_handle.send(ActivityEvent::Info { message });
+        }
+    }
+
     fn emit_reclaim_unavailable(
         &mut self,
         unprotected: &HashMap<PathBuf, PressureLevel>,
@@ -5803,7 +5864,12 @@ impl MonitoringDaemon {
                 .alert_interval_minutes
                 .saturating_mul(60),
         );
-        let mounts: Vec<PathBuf> = self.mount_controllers.keys().cloned().collect();
+        let mounts: Vec<PathBuf> = self
+            .mount_controllers
+            .keys()
+            .chain(self.uncovered_levels.keys())
+            .cloned()
+            .collect();
         for mount in mounts {
             let level = unprotected.get(&mount).copied();
             let severity = match level {
