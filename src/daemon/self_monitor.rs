@@ -291,8 +291,13 @@ pub enum DaemonLockProbe {
 #[must_use]
 pub fn probe_daemon_lock(state_file: &Path) -> DaemonLockProbe {
     let path = daemon_lock_path(state_file);
-    if !path.exists() {
-        return DaemonLockProbe::Absent;
+    // `Path::exists` is false when a parent directory cannot be searched: a
+    // root daemon's lock under 0700 /root, probed by an unprivileged
+    // `sbh status`, read as "no lock" and the running daemon as stopped.
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return DaemonLockProbe::Absent,
+        Err(e) => return DaemonLockProbe::Unreadable(e.to_string()),
     }
     let file = match fs::File::open(&path) {
         Ok(file) => file,
@@ -480,6 +485,39 @@ mod daemon_lock_tests {
         let v = detect_daemon_liveness(&state_file, Some(true));
         assert!(!v.running);
         assert_eq!(v.reason, "lock_released");
+    }
+
+    /// A root daemon's lock under an unsearchable directory (0700 /root seen
+    /// by an unprivileged `sbh status`) is unreadable, not absent, so the
+    /// service manager's view decides. Root ignores directory modes, so the
+    /// check is skipped there.
+    #[test]
+    fn lock_under_unsearchable_dir_defers_to_the_unit() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("private");
+        fs::create_dir(&private).unwrap();
+        let state_file = private.join("state.json");
+        let lock = DaemonLock::acquire(&state_file).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let probe = probe_daemon_lock(&state_file);
+        let active = detect_daemon_liveness(&state_file, Some(true));
+        let inactive = detect_daemon_liveness(&state_file, Some(false));
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+        drop(lock);
+
+        assert!(
+            matches!(probe, DaemonLockProbe::Unreadable(_)),
+            "got {probe:?}"
+        );
+        assert!(active.running);
+        assert_eq!(active.reason, "lock_unreadable_unit_active");
+        assert!(!inactive.running);
+        assert_eq!(inactive.reason, "lock_unreadable_unit_inactive");
     }
 }
 
