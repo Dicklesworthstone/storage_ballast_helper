@@ -93,9 +93,26 @@ file's parent directory must already exist. The journal directory is private
 (mode 0700) and files are created exclusively (mode 0600); existing permissions
 are never widened. The new file, its directory, and the parent directory are
 synchronized before an intent can authorize a rewrite. Files are capped at
-32 MiB and individual records at 128 KiB. This feature does not automatically
-rotate, delete or prune audit history. Preview and no-eligible-input passes
+32 MiB and individual records at 128 KiB. Preview and no-eligible-input passes
 create no journal files or directories.
+
+A new run is admitted only when its full 32 MiB allowance fits within a 1 GiB
+store budget and the new file fits within a 4,096-file limit. Each existing file
+is charged by the larger of its logical length and allocated bytes; unfinished
+and unrecognized history counts too. A directory lock holds that budget
+reservation for the whole pass and serializes cooperating current-version
+writers. An existing journal with a live writer also blocks admission.
+Inspection uses descriptor-relative metadata without following symlinks, has a
+two-second cooperative budget, and refuses non-regular, non-private, foreign,
+multi-link or uninspectable entries. Filesystem operations themselves can take
+longer than the cooperative budget.
+
+At capacity, apply refuses before rewriting any input and asks the operator to
+archive reviewed completed journals. Existing audit history is never
+automatically rotated, deleted or pruned; interrupted-run evidence remains
+available for recovery. The reservation is an application admission limit,
+not disk-space preallocation or a filesystem quota against external writers
+or older binaries that do not honor the directory lock.
 
 The apply report includes `journal_path`, and each prepared file report includes
 an `operation_id`. To inspect a recorded or interrupted pass, as the same effective

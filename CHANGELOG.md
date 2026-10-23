@@ -27,6 +27,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Changed
 
+- **Compression audit history has a bounded admission budget** (bd-rxq5).
+  Each apply pass reserves its full 32 MiB journal allowance within a 1 GiB,
+  4,096-file store budget. A directory lock serializes cooperating writers;
+  existing live journals, unsafe entries, capacity exhaustion, and incomplete
+  inspections refuse a new run before mutation. Logical and allocated bytes
+  both count. All history is preserved; the operator can archive reviewed
+  completed journals before retrying.
 - **Ordinary `sbh check PATH` surfaces RAM-scratch pressure** (bd-paeg).
   Linux tmpfs/ramfs targets now require a fresh, bounded host assessment after
   filesystem space checks pass. A complete RAM-scratch warning exits 1;

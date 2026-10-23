@@ -564,12 +564,18 @@ mod writer {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use rustix::fs::{Mode, OFlags, mkdirat, openat};
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, mkdirat, openat, statat};
 
     #[allow(clippy::wildcard_imports)] // the parent module's journal grammar
     use super::*;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    // Reserve the largest possible run before admitting its first mutation.
+    // History is never removed here: a full store needs operator archival.
+    pub(super) const MAX_STORE_BYTES: u64 = 1024 * 1024 * 1024;
+    pub(super) const MAX_STORE_FILES: usize = 4096;
+    const STORE_SCAN_BUDGET: Duration = Duration::from_secs(2);
 
     pub(in crate::scanner::compression) struct AuditSession {
         root: PathBuf,
@@ -610,6 +616,13 @@ mod writer {
             self.writer
                 .as_ref()
                 .map(|writer| writer.file.try_clone().unwrap())
+        }
+
+        #[cfg(test)]
+        pub(in crate::scanner::compression) fn directory_descriptor_copy(&self) -> Option<File> {
+            self.writer
+                .as_ref()
+                .map(|writer| writer.directory.file.try_clone().unwrap())
         }
 
         pub(in crate::scanner::compression) fn prepare(
@@ -721,12 +734,134 @@ mod writer {
         }
     }
 
+    /// Explicitly release locks even while a child being spawned holds an
+    /// inherited descriptor. This guard also covers initialization failures
+    /// before the writer exists; only the acquiring process may unlock it.
+    struct HeldLock {
+        file: File,
+        owner_pid: u32,
+    }
+
+    impl HeldLock {
+        fn new(file: File) -> Self {
+            Self {
+                file,
+                owner_pid: std::process::id(),
+            }
+        }
+    }
+
+    impl Drop for HeldLock {
+        fn drop(&mut self) {
+            if self.owner_pid == std::process::id() {
+                let _ = self.file.unlock();
+            }
+        }
+    }
+
+    fn live_writer(error: std::fs::TryLockError) -> io::Error {
+        match error {
+            std::fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "compression audit store has a live writer; retry after the pass finishes",
+            ),
+            std::fs::TryLockError::Error(error) => error,
+        }
+    }
+
+    pub(super) fn require_store_capacity(files: usize, bytes: u64) -> io::Result<()> {
+        if files >= MAX_STORE_FILES {
+            return Err(invalid(
+                "compression audit store reached its 4096-file limit; archive reviewed completed journals before retrying; existing history was preserved",
+            ));
+        }
+        bytes
+            .checked_add(MAX_JOURNAL_BYTES)
+            .filter(|total| *total <= MAX_STORE_BYTES)
+            .ok_or_else(|| {
+                invalid(
+                    "compression audit store cannot reserve a 32 MiB run within its 1 GiB limit; archive reviewed completed journals before retrying; existing history was preserved",
+                )
+            })?;
+        Ok(())
+    }
+
+    fn store_budget(deadline: Instant) -> io::Result<()> {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "compression audit store inspection exceeded its 2-second cooperative budget; mutation refused",
+            ));
+        }
+        Ok(())
+    }
+
+    fn reserve_store(directory: &File) -> io::Result<()> {
+        let deadline = Instant::now() + STORE_SCAN_BUDGET;
+        let device = directory.metadata()?.dev();
+        let uid = nix::unistd::geteuid().as_raw();
+        let mut entries = Dir::read_from(directory)?;
+        let mut files = 0;
+        let mut bytes = 0_u64;
+        loop {
+            store_budget(deadline)?;
+            let Some(entry) = entries.next() else {
+                break;
+            };
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            files += 1;
+            require_store_capacity(files, bytes)?;
+            // Do not open an observed device or FIFO just to measure it.
+            // NOFOLLOW/NONBLOCK also close the symlink/blocking race after stat.
+            let observed = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            if FileType::from_raw_mode(observed.st_mode) != FileType::RegularFile {
+                return Err(invalid(
+                    "compression audit store contains a non-regular entry; mutation refused",
+                ));
+            }
+            let file = File::from(openat(
+                directory,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?);
+            // Older writers only lock individual journals. Check that lock too,
+            // and measure AFTER acquiring it so their final append is counted.
+            file.try_lock_shared().map_err(live_writer)?;
+            let held = HeldLock::new(file);
+            let metadata = held.file.metadata()?;
+            if !metadata.is_file()
+                || metadata.dev() != device
+                || metadata.uid() != uid
+                || metadata.mode() & 0o077 != 0
+                || metadata.nlink() != 1
+            {
+                return Err(invalid(
+                    "compression audit store entries must be private, single-link regular files owned by the current effective user on the same filesystem",
+                ));
+            }
+            // Count every regular file, including unfinished or unrecognized
+            // history. Sparse files cannot bypass the logical-byte allowance,
+            // and preallocation cannot bypass its allocated-byte counterpart.
+            let charged = metadata.len().max(metadata.blocks().saturating_mul(512));
+            bytes = bytes
+                .checked_add(charged)
+                .ok_or_else(|| invalid("compression audit store byte accounting overflowed"))?;
+            require_store_capacity(files, bytes)?;
+        }
+        store_budget(deadline)
+    }
+
     struct Writer {
         file: File,
         path: PathBuf,
-        // Keep the directory pinned until the pass ends. Both the journal file
-        // and the directory entry are synchronized before any intent is used.
-        directory: File,
+        // Keep the directory pinned and exclusively locked until the pass ends,
+        // so another cooperating writer cannot spend this run's reservation.
+        directory: HeldLock,
         run_id: String,
         sequence: u64,
         bytes: u64,
@@ -788,6 +923,9 @@ mod writer {
                     "compression journal directory must be private and owned by the current effective user; existing permissions were not changed",
                 ));
             }
+            directory.try_lock().map_err(live_writer)?;
+            let directory = HeldLock::new(directory);
+            reserve_store(&directory.file)?;
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| invalid("clock precedes the journal epoch"))?
@@ -802,7 +940,7 @@ mod writer {
             // follow a final symlink, overwrite, append to an older run, or
             // rotate/delete an operator's audit history.
             let file = File::from(openat(
-                &directory,
+                &directory.file,
                 name.as_str(),
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::RUSR | Mode::WUSR,
@@ -823,7 +961,7 @@ mod writer {
                 input_files,
                 policy: policy.clone(),
             })?;
-            writer.directory.sync_all()?;
+            writer.directory.file.sync_all()?;
             parent.sync_all()?;
             Ok(writer)
         }
