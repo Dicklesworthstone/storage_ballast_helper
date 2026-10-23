@@ -1406,6 +1406,11 @@ Quarantined space is reclaimable on demand:
 | Orange, Red, Critical | The mount's quarantines are drained oldest-first on the tick, ahead of any new deletion: that space was decided already and costs no scoring. New candidates are removed for good (`Unlink`). |
 | `sbh emergency` | Drains every quarantine under the scan roots before it scans anything. |
 
+Daemon quarantine sweeps respect the live policy and dry-run setting. Observe,
+FallbackSafe, and dry-run retain quarantined payloads while still reporting
+their held bytes. Normal TTL/cap and pressure-driven purges resume only when
+the daemon is allowed to delete.
+
 Restore with `sbh undo <decision-id>` (the id is on the `[SBH-QUARANTINE]` line, in `sbh explain`, and in `sbh undo --list`), `sbh undo --path <original>`, or `sbh undo --all-since 2h`. A restore is a rename back, byte-identical; it refuses when the original path exists again unless `--force-suffix`, which restores beside it as `<name>.restored-<decision-id>`. The ledger marks the decision `restored`.
 
 A candidate that cannot be quarantined (different filesystem from the root, unusable store) is removed for good and the fallback is logged as `quarantine_unavailable` with its reason. `status` shows the bytes held per mount in the Reserve column; `stats` reports `quarantined_count` and `quarantined_bytes` and excludes held bytes from `total_bytes_freed`.

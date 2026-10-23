@@ -6840,6 +6840,7 @@ impl MonitoringDaemon {
         let now_unix = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
+        let mut attempted_sweep = false;
         for tick in responses {
             let mount = &tick.response.causing_mount;
             let level = tick.response.level;
@@ -6860,11 +6861,23 @@ impl MonitoringDaemon {
                     continue;
                 }
                 let store = QuarantineStore::under(root);
+                // A prior quarantine decision does not authorize irreversible
+                // cleanup after the operator selects observe/dry-run or the
+                // policy falls back. Inventory stays available in those modes.
+                if self.config.scanner.dry_run
+                    || !self.policy_engine.lock().mode().allows_deletion()
+                {
+                    if let Ok(bytes) = store.held_bytes() {
+                        held = held.saturating_add(bytes);
+                    }
+                    continue;
+                }
                 let mode = if pressured {
                     QuarantineSweepMode::Pressure
                 } else {
                     QuarantineSweepMode::Maintenance { cap_bytes }
                 };
+                attempted_sweep = true;
                 match store.sweep(now_unix, mode) {
                     Ok(swept) => {
                         held = held.saturating_add(swept.held_bytes);
@@ -6908,7 +6921,7 @@ impl MonitoringDaemon {
             }
             self.quarantine_held.insert(mount.clone(), held);
         }
-        if sweep_due {
+        if sweep_due && attempted_sweep {
             self.last_quarantine_sweep = Some(now);
         }
     }
@@ -10653,6 +10666,82 @@ mod tests {
             if let Some(logger) = self.daemon.logger_join.take() {
                 let _ = logger.join();
             }
+        }
+    }
+
+    #[cfg(unix)]
+    fn quarantine_tick(level: PressureLevel, mount: &Path) -> MountTickResponse {
+        MountTickResponse {
+            response: crate::monitor::pid::PressureResponse {
+                level,
+                urgency: 0.7,
+                scan_interval: Duration::from_secs(1),
+                release_ballast_files: 0,
+                max_delete_batch: 10,
+                fallback_active: false,
+                causing_mount: mount.to_path_buf(),
+                free_pct: 12.0,
+                predicted_seconds: None,
+            },
+            seconds_to_red: None,
+            prediction_confident: false,
+            rate: MountRateState::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_sweeps_preserve_payloads_in_observe_fallback_and_dry_run() {
+        use crate::daemon::policy::PolicyConfig;
+
+        for level in [
+            PressureLevel::Green,
+            PressureLevel::Orange,
+            PressureLevel::Critical,
+        ] {
+            let mut fixture = RegretDaemonFixture::new();
+            let root = fixture.directory.path().join("project");
+            let candidate = root.join("target");
+            std::fs::create_dir(&candidate).unwrap();
+            std::fs::write(candidate.join("artifact.o"), b"recoverable").unwrap();
+            let store = QuarantineStore::under(&root);
+            let record = store
+                .quarantine(&candidate, "held", 11, Duration::ZERO, None)
+                .unwrap();
+            let mount = PathBuf::from("/");
+            let roots = vec![(root, Some(mount.clone()))];
+            let ticks = vec![quarantine_tick(level, &mount)];
+            for (mode, dry_run) in [
+                (ActiveMode::Observe, false),
+                (ActiveMode::FallbackSafe, false),
+                (ActiveMode::Enforce, true),
+            ] {
+                let daemon = &mut fixture.daemon;
+                *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+                    initial_mode: mode,
+                    ..PolicyConfig::default()
+                });
+                daemon.config.scanner.dry_run = dry_run;
+                daemon.sweep_quarantines(&ticks, &roots, Instant::now());
+                assert_eq!(
+                    std::fs::read(record.quarantine_path.join("artifact.o")).unwrap(),
+                    b"recoverable",
+                    "{level:?} {mode:?} dry_run={dry_run}",
+                );
+                assert!(store.record("held").unwrap().is_some());
+                assert_eq!(daemon.quarantine_held.get(&mount), Some(&11));
+                assert!(daemon.last_quarantine_sweep.is_none());
+            }
+
+            // Positive control: the expired same entry is purged immediately
+            // when live policy permits it, including maintenance at Green.
+            let daemon = &mut fixture.daemon;
+            daemon.config.scanner.dry_run = false;
+            daemon.sweep_quarantines(&ticks, &roots, Instant::now());
+            assert!(!record.quarantine_path.exists());
+            assert!(store.record("held").unwrap().is_none());
+            assert_eq!(daemon.quarantine_held.get(&mount), Some(&0));
+            assert!(daemon.last_quarantine_sweep.is_some());
         }
     }
 

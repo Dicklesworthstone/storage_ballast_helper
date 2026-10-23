@@ -40,6 +40,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Daemon quarantine sweeps now respect Observe, FallbackSafe, and dry-run.**
+  These modes retain quarantined payloads while continuing to report held
+  inventory. Previously, TTL/cap sweeps and pressure-driven purges could
+  permanently remove data even while ordinary candidate deletion was disabled.
 - **macOS desktop notifications from the daemon reach the person at the
   screen** (bd-z1nm). The daemon runs as a root LaunchDaemon, where a bare
   `osascript display notification` reaches no one's Notification Center, so
