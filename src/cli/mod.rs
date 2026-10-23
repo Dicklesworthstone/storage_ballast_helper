@@ -2303,7 +2303,7 @@ mod tests {
         let notifications = include_str!("../daemon/notifications.rs");
 
         for required in [
-            "systemd/launchd stdout and stderr capture",
+            "systemd/launchd stderr capture; macOS unified logging",
             "The registry asks the active Platform Abstraction Layer (PAL) for mount inventory.",
             "Linux reads `/proc/mounts`; macOS uses its PAL mount inventory from `statfs`/`getmntinfo` and APFS metadata.",
             "The daemon samples its own RSS through the PAL `self_stats()` method on each state file write.",

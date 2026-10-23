@@ -639,7 +639,10 @@ fn json_flag_accepted_by_status() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn isolated_config_exercises_safe_operational_commands() {
-    let temp = tempfile::tempdir().expect("create isolated smoke fixture");
+    // On the build volume: `check` on a tmpfs path also requires a clean
+    // host RAM-scratch assessment, which a busy tmpfs `/tmp` would fail.
+    let temp =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create isolated smoke fixture");
     let smoke_root = temp.path().join("smoke-root");
     let smoke_state = temp.path().join("smoke-state");
     let sample_target = smoke_root.join("sample_target").join("debug");

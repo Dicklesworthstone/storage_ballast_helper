@@ -1020,6 +1020,7 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_EXECUTABLE_REPLACEMENT_PROBE` | test | Binary the Linux self-replacement test rewrites in place to check the service restart path (#35) |
 | `SBH_UPDATE_HANDOFF_CONTEXT_PROBE` | test | Mode (`update` or another value) the update-handoff test runs its child process in, to check that a command's install-path intent is captured once (#35) |
 | `SBH_TUI_ARTIFACT_FRAMES` | test | Include rendered frame text in the TUI test artifacts |
+| `SBH_TEST_AGENT_SCRATCH_FIFO_CHILD` | test | Set in the child process the agent-scratch FIFO-marker test re-runs itself in, so a marker read that blocks cannot hang the suite |
 <!-- sbh-docs:end -->
 
 ## Architecture
@@ -1449,8 +1450,9 @@ Source: `src/daemon/loop_main.rs`
 
 On Linux, `sbh check /tmp --need 5G` also checks current host RAM-scratch
 pressure when the path is on tmpfs or ramfs. Plenty of free tmpfs blocks does
-not establish swap headroom. A complete warning exits 1; incomplete evidence
-exits 4. JSON includes the fresh `ram_scratch` report. Disk-backed checks skip
+not establish swap headroom. A complete warning exits as a pressure condition,
+incomplete evidence as a partial success ([Exit Codes](#exit-codes)). JSON
+includes the fresh `ram_scratch` report. Disk-backed checks skip
 the host collection, and the check does not authorize cleanup or relocation.
 Use `sbh check --ram-scratch` for the fuller report and top-entry attribution.
 See [RAM-scratch headroom](docs/ram-scratch.md) for the warning rules and limits.

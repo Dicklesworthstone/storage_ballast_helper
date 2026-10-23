@@ -441,8 +441,10 @@ impl Default for FileConfig {
 
 /// Service-log notification settings.
 ///
-/// The channel preserves stderr for service-manager capture and also submits
-/// structured records to macOS unified logging under the daemon's identity.
+/// The channel writes structured stderr lines so systemd journals and launchd
+/// stdout/stderr capture both receive the same operator-visible events, and on
+/// macOS also submits structured records to unified logging under the
+/// daemon's identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct JournalConfig {
@@ -654,7 +656,7 @@ impl Channel for FileChannel {
     }
 }
 
-// ──── Journal/service log (stderr and macOS unified logging) ────
+// ──── Journal/service log (structured stderr) and macOS unified logging ────
 
 struct JournalChannel {
     min_level: NotificationLevel,
@@ -694,6 +696,9 @@ impl Channel for JournalChannel {
     }
 
     fn send(&self, event: &NotificationEvent) {
+        // systemd captures stderr in the journal, while launchd captures it in
+        // the configured StandardErrorPath; macOS also gets a unified-logging
+        // record with SBH_EVENT=... and SBH_LEVEL=... fields.
         self.send_to(event, journal::send);
     }
 }

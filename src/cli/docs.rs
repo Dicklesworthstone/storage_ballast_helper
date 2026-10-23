@@ -395,6 +395,11 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
         EnvArea::Test,
         "Include rendered frame text in the TUI test artifacts",
     ),
+    var(
+        "SBH_TEST_AGENT_SCRATCH_FIFO_CHILD",
+        EnvArea::Test,
+        "Set in the child process the agent-scratch FIFO-marker test re-runs itself in, so a marker read that blocks cannot hang the suite",
+    ),
 ];
 
 /// `SBH_*` string literals in the source that are not environment

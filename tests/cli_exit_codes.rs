@@ -42,6 +42,13 @@ fn config_in(dir: &Path) -> std::path::PathBuf {
     path
 }
 
+/// A directory on the build volume. `check` on a tmpfs or ramfs path also
+/// requires a clean host RAM-scratch assessment (bd-paeg), so a threshold
+/// test on a tempdir under a busy tmpfs `/tmp` would test the host instead.
+fn disk_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -54,7 +61,7 @@ fn stderr(output: &Output) -> String {
 /// (not the I/O class), and the report is on stdout.
 #[test]
 fn check_unmet_need_is_exit_one_with_the_report_on_stdout() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = disk_tempdir();
     let config = config_in(dir.path());
     let need = u64::MAX / 2;
     let output = sbh(
@@ -94,7 +101,7 @@ fn check_unmet_need_is_exit_one_with_the_report_on_stdout() {
 /// `check` on a volume above its threshold is exit 0 and prints nothing.
 #[test]
 fn check_above_threshold_is_exit_zero() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = disk_tempdir();
     let config = config_in(dir.path());
     let output = sbh(
         &config,
@@ -114,7 +121,7 @@ fn check_above_threshold_is_exit_zero() {
 /// pressure just because its free share is below the percentage.
 #[test]
 fn check_honours_the_absolute_free_floors() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = disk_tempdir();
     let config = config_in(dir.path());
     let base = fs::read_to_string(&config).unwrap();
     let percentages = "[pressure]\ngreen_min_free_pct = 99.9\nyellow_min_free_pct = 99.8\n\
