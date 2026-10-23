@@ -1081,7 +1081,7 @@ mod tests {
         fs::hard_link(path.join("work.bin"), path.join("same-data")).unwrap();
         let outside = fixture.root.join("outside");
         fs::create_dir(&outside).unwrap();
-        fs::write(outside.join("private"), [99_u8; 65_536]).unwrap();
+        fs::write(outside.join("private"), vec![99_u8; 65_536]).unwrap();
         symlink(&outside, path.join("outside-link")).unwrap();
         let report = fixture.run(MockPlatform::healthy(), Limits::default());
         assert_eq!(report.sessions[0].observed_logical_bytes, 8192);
@@ -1372,7 +1372,7 @@ mod tests {
         let preserved = fixture.root.join("original-session");
         fs::rename(&path, &preserved).unwrap();
         fs::create_dir(&path).unwrap();
-        fs::write(path.join("replacement.bin"), [99_u8; 65_536]).unwrap();
+        fs::write(path.join("replacement.bin"), vec![99_u8; 65_536]).unwrap();
 
         let mut session = survey(
             found.pop().unwrap(),
