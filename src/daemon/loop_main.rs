@@ -10769,20 +10769,35 @@ mod tests {
             Arc::clone(&platform) as Arc<dyn Platform>,
         )
         .unwrap();
+        // What the daemon itself counts as releasable on this mount, stranded
+        // files included: release_ballast spends those first.
+        let available = |daemon: &MonitoringDaemon| {
+            daemon
+                .ballast_coordinator
+                .pool_for_mount(&mount)
+                .map_or(0, crate::ballast::coordinator::BallastPool::available_count)
+        };
+        // The mock mount is "/", and stranded-reserve discovery reads the real
+        // legacy locations (/root, /home/*, /Users/*, /var/lib/sbh) on that
+        // device. A host with a reserve there would put real files in this
+        // pool, and the control below would release them. Skip on such a host.
+        let foreign = available(&daemon);
+        if foreign > 0 {
+            eprintln!(
+                "skipped: {foreign} ballast file(s) from a real reserve on this device are visible to the fixture's pool"
+            );
+            daemon.logger_handle.shutdown();
+            if let Some(logger) = daemon.logger_join.take() {
+                logger.join().unwrap();
+            }
+            return;
+        }
         daemon.ballast_coordinator.set_provision_floor(0.0);
         let provisioned = daemon
             .ballast_coordinator
             .provision_all(platform.as_ref())
             .unwrap();
         assert_eq!(provisioned.total_files_created(), 2, "{provisioned:?}");
-        let available = |daemon: &MonitoringDaemon| {
-            daemon
-                .ballast_coordinator
-                .inventory()
-                .iter()
-                .map(|item| item.files_available)
-                .sum::<usize>()
-        };
         assert_eq!(available(&daemon), 2);
 
         daemon.special_locations = SpecialLocationRegistry::new(vec![SpecialLocation {
