@@ -40,6 +40,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Evidence deduplication waits for a successful SQLite write** (bd-jl92).
+  Failed inserts remain retryable, KEEP → DELETE → KEEP records the return
+  to KEEP, and fallback/suspension/comparator changes remain visible. JSONL
+  logging and SQLite recovery continue while the database is unavailable;
+  suppressed duplicate traffic still services the JSONL durability timer.
 - **Queued deletions recheck live policy and dry-run before each mutation.**
   Observe, FallbackSafe, dry-run, and Enforce-to-Canary transitions defer
   candidates for fresh evaluation. These deferrals do not apply per-path

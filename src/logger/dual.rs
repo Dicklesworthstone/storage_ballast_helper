@@ -478,7 +478,8 @@ fn logger_thread_main(
     let mut last_drop_report = Instant::now();
     let mut last_diagnostic_check = Instant::now();
     let mut stopping = false;
-    // bd-jl92: what the evidence ledger has already said about each artifact.
+    // bd-jl92: verdicts acknowledged by SQLite, not merely admitted to the writer.
+    #[cfg(feature = "sqlite")]
     let mut decisions = crate::logger::decision_dedupe::DecisionDedupe::default();
     loop {
         // Heartbeat for the daemon's thread health: once a second while
@@ -536,12 +537,19 @@ fn logger_thread_main(
             jsonl.set_mirror(on);
             continue;
         }
-        // bd-jl92: a verdict that cannot delete anything and repeats the last
-        // one recorded for the same artifact is recorded once per refresh,
-        // not on every scan pass (JSONL and SQLite alike).
-        if let ActivityEvent::DecisionRecorded(record) = &event
+        // Only an acknowledged SQLite record can suppress a later observation.
+        // JSONL-only traffic must still reach the periodic SQLite recovery path.
+        #[cfg(feature = "sqlite")]
+        if sqlite.is_some()
+            && let ActivityEvent::DecisionRecorded(record) = &event
             && !decisions.should_record(record, now)
         {
+            // Duplicate traffic can prevent both ordinary writes and the
+            // receive timeout from servicing the JSONL durability timer.
+            jsonl.tick(SystemTime::now());
+            if rx.is_empty() {
+                jsonl.flush();
+            }
             continue;
         }
 
@@ -565,7 +573,11 @@ fn logger_thread_main(
                     .map(|row| db.log_pressure(row).is_ok());
                 let decision_ok = match &event {
                     ActivityEvent::DecisionRecorded(record) => {
-                        Some(db.log_decision(record).is_ok())
+                        let ok = db.log_decision(record).is_ok();
+                        if ok {
+                            decisions.acknowledge(record, Instant::now());
+                        }
+                        Some(ok)
                     }
                     ActivityEvent::DecisionOutcome(outcome) => {
                         Some(db.log_outcome(outcome).is_ok())
@@ -619,6 +631,9 @@ fn logger_thread_main(
                         eprintln!("[SBH-DUAL] SQLite recovered at {}", p.display());
                         sqlite = Some(db);
                         sqlite_failures = 0;
+                        // Reopening may create a replacement database. Its
+                        // first observation must be persisted before dedupe.
+                        decisions = crate::logger::decision_dedupe::DecisionDedupe::default();
                     }
                 }
             }
@@ -1450,21 +1465,81 @@ mod tests {
             handle.send(decided(DecisionAction::Keep));
         }
         handle.send(decided(DecisionAction::Review));
+        handle.send(decided(DecisionAction::Keep));
         handle.send(decided(DecisionAction::Delete));
         handle.send(decided(DecisionAction::Delete));
+        handle.send(decided(DecisionAction::Keep));
         handle.shutdown();
         join.join().unwrap();
 
         let db = SqliteLogger::open(&dir.path().join("test.db")).unwrap();
         let (latest, rows) = db.decision_by_id("a1b2c3d4e5f6").unwrap().unwrap();
-        assert_eq!(rows, 4, "1 keep + 1 review + 2 deletes, not 23 rows");
-        assert_eq!(latest.effective_action, Some(ActionRecord::Delete));
+        assert_eq!(rows, 6, "3 keeps + 1 review + 2 deletes, including the return to KEEP");
+        assert_eq!(latest.effective_action, Some(ActionRecord::Keep));
         let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
         let lines = jsonl
             .lines()
             .filter(|line| line.contains("a1b2c3d4e5f6"))
             .count();
-        assert_eq!(lines, 4);
+        assert_eq!(lines, 6);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn failed_decision_write_is_retried_before_deduplication() {
+        use crate::scanner::decision_record::{PolicyMode, sample_record_for_tests};
+        use crate::scanner::scoring::DecisionAction;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        drop(SqliteLogger::open(&db_path).unwrap());
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER reject_first_decision BEFORE INSERT ON decision_log
+             WHEN NEW.timestamp = '2026-10-01T00:00:00.000Z'
+             BEGIN SELECT RAISE(FAIL, 'injected decision write failure'); END;",
+        )
+        .unwrap();
+        drop(db);
+        let (handle, join) = spawn_logger(test_config(dir.path())).unwrap();
+        let mut record = sample_record_for_tests(PolicyMode::Live, Some(DecisionAction::Keep));
+        record.id = "112233445566".to_string();
+        record.timestamp = "2026-10-01T00:00:00.000Z".to_string();
+        handle.send(ActivityEvent::DecisionRecorded(Box::new(record.clone())));
+        record.timestamp = "2026-10-01T00:01:00.000Z".to_string();
+        handle.send(ActivityEvent::DecisionRecorded(Box::new(record.clone())));
+        handle.send(ActivityEvent::DecisionRecorded(Box::new(record.clone())));
+        handle.shutdown();
+        join.join().unwrap();
+
+        let db = SqliteLogger::open(&db_path).unwrap();
+        let (latest, count) = db.decision_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(latest.timestamp, record.timestamp);
+        let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        assert_eq!(jsonl.lines().filter(|line| line.contains(&record.id)).count(), 2);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn jsonl_only_decisions_are_not_deduplicated_without_acknowledgement() {
+        use crate::scanner::decision_record::{PolicyMode, sample_record_for_tests};
+        use crate::scanner::scoring::DecisionAction;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.sqlite_path = None;
+        let (handle, join) = spawn_logger(config).unwrap();
+        let mut record = sample_record_for_tests(PolicyMode::Live, Some(DecisionAction::Keep));
+        record.id = "665544332211".to_string();
+        for _ in 0..3 {
+            handle.send(ActivityEvent::DecisionRecorded(Box::new(record.clone())));
+        }
+        handle.shutdown();
+        join.join().unwrap();
+
+        let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        assert_eq!(jsonl.lines().filter(|line| line.contains(&record.id)).count(), 3);
     }
 
     #[test]

@@ -683,6 +683,12 @@ Use `j`/`k` to navigate entries and `Enter` to jump to the target screen.
 
 **Explainability reads the decision ledger.** The Explainability screen lists the daemon's recent decisions from the SQLite `decision_log` (every keep, delete, review and veto with its factor breakdown, veto reason, policy mode and the ledger id `sbh explain --id` takes; a keep, review or veto that repeats the last verdict for the same artifact is recorded once a day, every delete each time); a database from before the ledger falls back to the deletions in the activity log and is marked `PARTIAL` with the reason. On the Timeline, an `artifact_delete` row names the decision that approved it (`→ decision <id>`, joined from the ledger for SQLite rows or carried by the JSONL line), and `Enter` on it opens that decision on the Explainability screen with its detail pane expanded.
 
+Repeated-verdict suppression starts only after a successful SQLite decision
+write. Failed writes remain eligible for retry, and an intervening delete or
+changed verdict clears the older cached verdict. JSONL-only operation retains
+every observation so evidence and database recovery continue while SQLite is
+unavailable.
+
 **Quick-release** (`x` key): One-keystroke shortcut that navigates to the Ballast screen and opens a release confirmation dialog. Reduces the typical pressure-triage path from 8 steps (legacy) to 1 keystroke.
 
 ### Degraded Mode

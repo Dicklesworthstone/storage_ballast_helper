@@ -27,7 +27,7 @@ pub const DECISION_REFRESH: Duration = Duration::from_hours(24);
 /// dropped first, then everything: the cost is one repeated record each.
 const MAX_REMEMBERED: usize = 1 << 18;
 
-/// Remembers the last recorded verdict per artifact version.
+/// Remembers the last acknowledged verdict per artifact version.
 #[derive(Debug, Default)]
 pub struct DecisionDedupe {
     last: HashMap<u64, (u64, Instant)>,
@@ -35,19 +35,34 @@ pub struct DecisionDedupe {
 
 impl DecisionDedupe {
     /// Whether `record` must be written to the evidence ledger at `now`.
+    /// Admission invalidates the previous verdict; only `acknowledge` can
+    /// suppress later observations after a successful persistence attempt.
     pub fn should_record(&mut self, record: &DecisionRecord, now: Instant) -> bool {
-        if may_delete(record) {
-            return true;
-        }
         let artifact = artifact_key(record);
-        let verdict = verdict_key(record);
-        if let Some((seen, at)) = self.last.get(&artifact)
-            && *seen == verdict
-            && now
-                .checked_duration_since(*at)
-                .is_some_and(|age| age < DECISION_REFRESH)
-        {
-            return false;
+        if !may_delete(record) {
+            let verdict = verdict_key(record);
+            if let Some((seen, at)) = self.last.get(&artifact)
+                && *seen == verdict
+                && now
+                    .checked_duration_since(*at)
+                    .is_some_and(|age| age < DECISION_REFRESH)
+            {
+                return false;
+            }
+        }
+        // An intervening decision may reach JSONL even if SQLite fails.
+        // It must not leave an older acknowledged verdict suppressing retries.
+        self.last.remove(&artifact);
+        true
+    }
+
+    /// Remember a decision only after the caller confirms its SQLite write.
+    /// Buffered JSONL output and producer admission are not acknowledgements.
+    pub fn acknowledge(&mut self, record: &DecisionRecord, now: Instant) {
+        let artifact = artifact_key(record);
+        if may_delete(record) {
+            self.last.remove(&artifact);
+            return;
         }
         if self.last.len() >= MAX_REMEMBERED {
             self.last.retain(|_, (_, at)| {
@@ -58,8 +73,7 @@ impl DecisionDedupe {
                 self.last.clear();
             }
         }
-        self.last.insert(artifact, (verdict, now));
-        true
+        self.last.insert(artifact, (verdict_key(record), now));
     }
 
     /// Artifacts currently remembered.
@@ -100,12 +114,15 @@ fn artifact_key(record: &DecisionRecord) -> u64 {
 fn verdict_key(record: &DecisionRecord) -> u64 {
     let mut hasher = DefaultHasher::new();
     format!(
-        "{:?}|{:?}|{}|{:?}|{:?}",
+        "{:?}|{:?}|{}|{:?}|{:?}|{}|{}|{:?}",
         record.action,
         record.effective_action,
         record.vetoed,
         record.veto_reason,
-        record.policy_mode
+        record.policy_mode,
+        record.fallback_active,
+        record.category_suspended,
+        record.comparator_action
     )
     .hash(&mut hasher);
     hasher.finish()
@@ -135,12 +152,14 @@ mod tests {
         let t0 = Instant::now();
         let kept = kept("aaaaaaaaaaaa");
         assert!(dedupe.should_record(&kept, t0));
+        dedupe.acknowledge(&kept, t0);
         // Every 10 minutes for most of a day: nothing new to say.
         let repeats = (1..=140)
             .filter(|i| dedupe.should_record(&kept, t0 + Duration::from_mins(i * 10)))
             .count();
         assert_eq!(repeats, 0);
         assert!(dedupe.should_record(&kept, t0 + DECISION_REFRESH));
+        dedupe.acknowledge(&kept, t0 + DECISION_REFRESH);
         assert!(!dedupe.should_record(&kept, t0 + DECISION_REFRESH + Duration::from_mins(10)));
     }
 
@@ -151,17 +170,82 @@ mod tests {
         let t0 = Instant::now();
         let id = "bbbbbbbbbbbb";
         assert!(dedupe.should_record(&kept(id), t0));
+        dedupe.acknowledge(&kept(id), t0);
         let review = record(id, Some(DecisionAction::Review), PolicyMode::Live);
         assert!(dedupe.should_record(&review, t0 + Duration::from_secs(1)));
+        dedupe.acknowledge(&review, t0 + Duration::from_secs(1));
         assert!(!dedupe.should_record(&review, t0 + Duration::from_secs(2)));
         let mut vetoed = kept(id);
         vetoed.vetoed = true;
         vetoed.veto_reason = Some("open file".to_string());
         assert!(dedupe.should_record(&vetoed, t0 + Duration::from_secs(3)));
+        dedupe.acknowledge(&vetoed, t0 + Duration::from_secs(3));
         let shadow = record(id, Some(DecisionAction::Keep), PolicyMode::Shadow);
         assert!(dedupe.should_record(&shadow, t0 + Duration::from_secs(4)));
+        dedupe.acknowledge(&shadow, t0 + Duration::from_secs(4));
         // Back to the first verdict: it differs from the last one recorded.
         assert!(dedupe.should_record(&kept(id), t0 + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn failed_attempts_never_suppress_retries_or_restore_an_older_verdict() {
+        let mut dedupe = DecisionDedupe::default();
+        let now = Instant::now();
+        let kept = kept("aaaaaaaaaaaa");
+        assert!(dedupe.should_record(&kept, now));
+        assert!(dedupe.should_record(&kept, now));
+        assert!(dedupe.is_empty());
+        dedupe.acknowledge(&kept, now);
+        assert!(!dedupe.should_record(&kept, now));
+
+        let review = record(
+            "aaaaaaaaaaaa",
+            Some(DecisionAction::Review),
+            PolicyMode::Live,
+        );
+        assert!(dedupe.should_record(&review, now));
+        // The changed attempt failed to persist: returning to the old KEEP
+        // still needs a record, even if the failed attempt reached JSONL.
+        assert!(dedupe.should_record(&kept, now));
+        dedupe.acknowledge(&kept, now);
+        let delete = record(
+            "aaaaaaaaaaaa",
+            Some(DecisionAction::Delete),
+            PolicyMode::Live,
+        );
+        assert!(dedupe.should_record(&delete, now));
+        dedupe.acknowledge(&delete, now);
+        assert!(dedupe.should_record(&kept, now));
+    }
+
+    #[test]
+    fn changed_fallback_and_comparator_verdicts_are_recorded() {
+        let now = Instant::now();
+        let kept = kept("bbbbbbbbbbbb");
+        let mut fallback = kept.clone();
+        fallback.fallback_active = !kept.fallback_active;
+        let mut suspended = kept.clone();
+        suspended.category_suspended = !kept.category_suspended;
+        let mut comparator = kept.clone();
+        comparator.comparator_action = if kept.comparator_action == Some(ActionRecord::Review) {
+            Some(ActionRecord::Keep)
+        } else {
+            Some(ActionRecord::Review)
+        };
+        for changed in [fallback, suspended, comparator] {
+            let mut dedupe = DecisionDedupe::default();
+            dedupe.acknowledge(&kept, now);
+            assert!(dedupe.should_record(&changed, now));
+            dedupe.acknowledge(&changed, now);
+            assert!(!dedupe.should_record(&changed, now));
+        }
+        let mut rescored = kept.clone();
+        rescored.age_secs += 60;
+        rescored.total_score += 0.01;
+        rescored.calibration_score += 0.01;
+        let mut dedupe = DecisionDedupe::default();
+        dedupe.acknowledge(&kept, now);
+        assert!(!dedupe.should_record(&rescored, now));
     }
 
     /// The deletion audit trail is unconditional, and a new artifact version
@@ -185,9 +269,12 @@ mod tests {
         assert!(dedupe.should_record(&legacy_delete, t0 + Duration::from_secs(1)));
 
         assert!(dedupe.should_record(&kept("eeeeeeeeeeee"), t0));
+        dedupe.acknowledge(&kept("eeeeeeeeeeee"), t0);
         assert!(dedupe.should_record(&kept("ffffffffffff"), t0));
+        dedupe.acknowledge(&kept("ffffffffffff"), t0);
         let mut unversioned = kept("");
         assert!(dedupe.should_record(&unversioned, t0));
+        dedupe.acknowledge(&unversioned, t0);
         assert!(!dedupe.should_record(&unversioned, t0 + Duration::from_secs(1)));
         unversioned.path = unversioned.path.join("other");
         assert!(dedupe.should_record(&unversioned, t0 + Duration::from_secs(2)));
