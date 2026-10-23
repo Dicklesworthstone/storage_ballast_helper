@@ -498,6 +498,50 @@ fn macos_display_notification_script(summary: &str) -> String {
     )
 }
 
+/// The command that shows a macOS notification to the person at the console.
+///
+/// The daemon runs as a root LaunchDaemon in the system bootstrap context,
+/// where a bare `osascript display notification` reaches no one's
+/// Notification Center (bd-z1nm: on 2026-10-22 a Mac's daemon logged a memory
+/// and disk emergency 40 minutes before a kernel panic, and nobody saw it).
+/// As root it runs in the console user's GUI session (`launchctl asuser`) as
+/// that user (`sudo -u #uid`). With nobody at the console (no owner, or uid 0
+/// at the login window) there is no one to show it to: `None`.
+#[cfg(any(target_os = "macos", test))]
+fn macos_notification_argv(
+    script: &str,
+    euid: u32,
+    console_uid: Option<u32>,
+) -> Option<Vec<String>> {
+    let osascript = [
+        "/usr/bin/osascript".to_string(),
+        "-e".to_string(),
+        script.to_string(),
+    ];
+    if euid != 0 {
+        return Some(osascript.to_vec());
+    }
+    let uid = console_uid.filter(|uid| *uid != 0)?;
+    let mut argv = vec![
+        "/bin/launchctl".to_string(),
+        "asuser".to_string(),
+        uid.to_string(),
+        "/usr/bin/sudo".to_string(),
+        "-u".to_string(),
+        format!("#{uid}"),
+    ];
+    argv.extend(osascript);
+    Some(argv)
+}
+
+/// Owner of `/dev/console`: the user at the Mac's screen (root at the login
+/// window).
+#[cfg(target_os = "macos")]
+fn macos_console_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata("/dev/console").ok().map(|meta| meta.uid())
+}
+
 impl Channel for DesktopChannel {
     fn name(&self) -> &'static str {
         "desktop"
@@ -536,7 +580,10 @@ impl Channel for DesktopChannel {
         #[cfg(target_os = "macos")]
         {
             let script = macos_display_notification_script(&summary);
-            if let Ok(child) = Command::new("osascript").arg("-e").arg(&script).spawn() {
+            let euid = nix::unistd::geteuid().as_raw();
+            if let Some(argv) = macos_notification_argv(&script, euid, macos_console_uid())
+                && let Ok(child) = Command::new(&argv[0]).args(&argv[1..]).spawn()
+            {
                 std::thread::spawn(move || {
                     let mut c = child;
                     let _ = c.wait();
@@ -1489,5 +1536,32 @@ mod tests {
         let parsed: NotificationEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.level(), NotificationLevel::Critical);
         assert!(parsed.summary().contains("critical"));
+    }
+    /// bd-z1nm: as root the notification goes through the console user's GUI
+    /// session as that user; as a user it is a plain osascript; with nobody at
+    /// the console nothing is spawned.
+    #[test]
+    fn macos_notifications_from_root_run_in_the_console_users_session() {
+        let script = macos_display_notification_script("disk critical");
+        assert_eq!(
+            macos_notification_argv(&script, 501, Some(501)).unwrap(),
+            ["/usr/bin/osascript", "-e", script.as_str()]
+        );
+        assert_eq!(
+            macos_notification_argv(&script, 0, Some(501)).unwrap(),
+            [
+                "/bin/launchctl",
+                "asuser",
+                "501",
+                "/usr/bin/sudo",
+                "-u",
+                "#501",
+                "/usr/bin/osascript",
+                "-e",
+                script.as_str()
+            ]
+        );
+        assert_eq!(macos_notification_argv(&script, 0, Some(0)), None);
+        assert_eq!(macos_notification_argv(&script, 0, None), None);
     }
 }

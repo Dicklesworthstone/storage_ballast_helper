@@ -40,6 +40,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **macOS desktop notifications from the daemon reach the person at the
+  screen** (bd-z1nm). The daemon runs as a root LaunchDaemon, where a bare
+  `osascript display notification` reaches no one's Notification Center, so
+  the desktop channel was silent on every Mac (on 2026-10-22 a memory and disk
+  emergency was logged 40 minutes before a kernel panic, and nobody saw it).
+  As root it now runs in the console user's GUI session as that user
+  (`launchctl asuser`, `sudo -u`), and with nobody at the console it does
+  nothing. The channel is still off by default.
 - **The ballast headroom floor honors the absolute pressure floors**
   (bd-lxga). It was one percentage for every volume, the Orange threshold but
   at least two points above Red, so `pressure.*_min_free_bytes` lowered a large
