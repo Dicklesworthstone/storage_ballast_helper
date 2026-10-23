@@ -78,7 +78,8 @@ use crate::monitor::voi_scheduler::VoiScheduler;
 use crate::platform::cleanup_catalog::{self, ExpandedCatalogRoot};
 use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
 use crate::platform::types::{
-    FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
+    FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureCallback,
+    MemoryPressureLevel,
 };
 use crate::scanner::deletion::{
     DeletionConfig, DeletionExecutor, DeletionMode, FreedBasis, SkipReason,
@@ -1289,6 +1290,35 @@ struct ScannerIndexFeedback {
 struct MemoryPressureEvent {
     pressure: MemoryPressure,
     received_at: Instant,
+}
+
+/// Keep the newest observed pressure even when the monitor cannot drain its
+/// bounded queue. Subscriptions report changes only: dropping the final change
+/// could otherwise leave the daemon in the wrong behavior mode indefinitely.
+fn memory_pressure_event_callback(
+    tx: Sender<MemoryPressureEvent>,
+    overflow_rx: Receiver<MemoryPressureEvent>,
+) -> MemoryPressureCallback {
+    // Own the sole sender here and serialize concurrent platform callbacks.
+    // The monitor never takes this lock; it can only free queue slots.
+    let publisher = Mutex::new((tx, overflow_rx));
+    Box::new(move |pressure| {
+        let publisher = publisher.lock();
+        let (tx, overflow_rx) = &*publisher;
+        let event = MemoryPressureEvent {
+            pressure,
+            received_at: Instant::now(),
+        };
+        if let Err(TrySendError::Full(event)) = tx.try_send(event) {
+            // Preserve ordinary FIFO delivery until capacity is exhausted.
+            // If the monitor wins this receive race, it has already freed a
+            // slot. No other sender can refill it while this lock is held, so
+            // retrying once keeps the latest event without blocking on space.
+            let _ = overflow_rx.try_recv();
+            let _ = tx.try_send(event);
+        }
+        drop(publisher);
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3668,14 +3698,9 @@ impl MonitoringDaemon {
     fn start_memory_pressure_subscription(
         &self,
         tx: Sender<MemoryPressureEvent>,
+        rx: &Receiver<MemoryPressureEvent>,
     ) -> Option<crate::platform::types::SubscriptionHandle> {
-        let callback = Box::new(move |pressure: MemoryPressure| {
-            let event = MemoryPressureEvent {
-                pressure,
-                received_at: Instant::now(),
-            };
-            let _ = tx.try_send(event);
-        });
+        let callback = memory_pressure_event_callback(tx, rx.clone());
 
         match self.platform.subscribe_memory_pressure(callback) {
             Ok(handle) => {
@@ -4440,7 +4465,7 @@ impl MonitoringDaemon {
             bounded::<MemoryPressureEvent>(MEMORY_PRESSURE_CHANNEL_CAP);
         self.seed_memory_pressure_behavior(initial_response.level);
         let _memory_pressure_subscription =
-            self.start_memory_pressure_subscription(memory_pressure_tx);
+            self.start_memory_pressure_subscription(memory_pressure_tx, &memory_pressure_rx);
 
         // Create inter-thread channels.
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
@@ -15429,6 +15454,116 @@ mod tests {
             swap_used_bytes: None,
             linux_psi_avg10: None,
         }
+    }
+
+    #[test]
+    fn memory_pressure_callback_preserves_fifo_when_the_queue_has_room() {
+        let (tx, rx) = bounded(MEMORY_PRESSURE_CHANNEL_CAP);
+        let callback = memory_pressure_event_callback(tx, rx.clone());
+        let levels = [
+            MemoryPressureLevel::Normal,
+            MemoryPressureLevel::Warn,
+            MemoryPressureLevel::Critical,
+        ];
+        for (free_pages, level) in (1..).zip(levels) {
+            callback(MemoryPressure {
+                free_pages: Some(free_pages),
+                ..mock_memory_pressure(level)
+            });
+        }
+        let events: Vec<_> = rx.try_iter().collect();
+        assert_eq!(events.len(), levels.len());
+        for ((event, level), free_pages) in events.iter().zip(levels).zip(1..) {
+            assert_eq!(event.pressure.level, level);
+            assert_eq!(event.pressure.free_pages, Some(free_pages));
+        }
+    }
+
+    #[test]
+    fn full_memory_queue_keeps_the_final_escalation_recovery_or_unknown() {
+        for final_level in [
+            MemoryPressureLevel::Critical,
+            MemoryPressureLevel::Normal,
+            MemoryPressureLevel::Unknown,
+        ] {
+            let (tx, rx) = bounded(MEMORY_PRESSURE_CHANNEL_CAP);
+            let callback = memory_pressure_event_callback(tx, rx.clone());
+            let previous_level = if final_level == MemoryPressureLevel::Critical {
+                MemoryPressureLevel::Normal
+            } else {
+                MemoryPressureLevel::Critical
+            };
+            // No monitor reads while a burst fills the queue. Its old tail is
+            // deliberately different from the final, now steady observation.
+            for index in 0..MEMORY_PRESSURE_CHANNEL_CAP {
+                callback(mock_memory_pressure(if index.is_multiple_of(2) {
+                    MemoryPressureLevel::Warn
+                } else {
+                    previous_level
+                }));
+            }
+            callback(mock_memory_pressure(final_level));
+            assert_eq!(rx.len(), MEMORY_PRESSURE_CHANNEL_CAP);
+
+            let mut state = PressureBehaviorState::new(
+                BehaviorDispatchTable::default(),
+                MemoryPressureLevel::Normal,
+                PressureLevel::Green,
+            );
+            let events: Vec<_> = rx.try_iter().collect();
+            assert_eq!(events[0].pressure.level, previous_level);
+            for event in events {
+                let _ = state.update(event.pressure.level, PressureLevel::Green);
+            }
+            assert_eq!(state.latest_memory_level(), final_level);
+            assert_eq!(state.memory_level, final_level);
+        }
+    }
+
+    #[test]
+    fn concurrent_memory_callbacks_remain_ordered_bounded_and_keep_the_latest() {
+        let (tx, rx) = bounded(MEMORY_PRESSURE_CHANNEL_CAP);
+        let callback = Arc::new(memory_pressure_event_callback(tx, rx.clone()));
+        thread::scope(|scope| {
+            for level in [MemoryPressureLevel::Normal, MemoryPressureLevel::Warn] {
+                let callback = Arc::clone(&callback);
+                scope.spawn(move || {
+                    for _ in 0..64 {
+                        callback(mock_memory_pressure(level));
+                    }
+                });
+            }
+        });
+        callback(mock_memory_pressure(MemoryPressureLevel::Critical));
+        let events: Vec<_> = rx.try_iter().collect();
+        assert_eq!(events.len(), MEMORY_PRESSURE_CHANNEL_CAP);
+        assert!(
+            events
+                .windows(2)
+                .all(|pair| pair[0].received_at <= pair[1].received_at)
+        );
+        assert_eq!(
+            events.last().unwrap().pressure.level,
+            MemoryPressureLevel::Critical
+        );
+    }
+
+    #[test]
+    fn memory_callback_does_not_wait_for_an_abandoned_monitor() {
+        let (tx, rx) = bounded(MEMORY_PRESSURE_CHANNEL_CAP);
+        let callback = memory_pressure_event_callback(tx, rx.clone());
+        drop(rx);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let producer = thread::spawn(move || {
+            for _ in 0..MEMORY_PRESSURE_CHANNEL_CAP * 2 {
+                callback(mock_memory_pressure(MemoryPressureLevel::Critical));
+            }
+            let _ = finished_tx.send(());
+        });
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a pressure callback must never wait for queue capacity");
+        producer.join().unwrap();
     }
 
     struct MockMatrixCase {

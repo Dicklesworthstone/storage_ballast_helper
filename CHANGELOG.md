@@ -87,6 +87,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **A full memory-pressure queue retains the newest observation.** A busy
+  monitor previously lost callbacks once its bounded queue filled, and a steady
+  final pressure level produced no replacement event. Overflow now evicts the
+  oldest queued observation while preserving normal FIFO delivery. Concurrent
+  callbacks are serialized; publishing never waits for queue capacity, even
+  after the monitor stops.
 - **Compression discovery preserves progress when its byte budget fills**
   (bd-rxq5). A file that fits a fresh pass but not the remaining allowance
   stops discovery with a continuation before that file. Later candidates remain
