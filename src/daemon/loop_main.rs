@@ -283,6 +283,22 @@ impl SharedExecutorConfig {
         self.min_score_bits.store(val.to_bits(), Ordering::Relaxed);
     }
 
+    fn authorize_mutation(
+        &self,
+        approved_mode: ActiveMode,
+        current_mode: ActiveMode,
+    ) -> std::result::Result<(), SkipReason> {
+        if self.dry_run.load(Ordering::Relaxed)
+            || !current_mode.allows_deletion()
+            // An Enforce-approved batch has not passed Canary's quota.
+            // Leave it for fresh policy evaluation after this restriction.
+            || (approved_mode == ActiveMode::Enforce && current_mode == ActiveMode::Canary)
+        {
+            return Err(SkipReason::PolicyChanged);
+        }
+        Ok(())
+    }
+
     fn repeat_base_cooldown_secs(&self) -> u64 {
         self.repeat_base_cooldown_secs.load(Ordering::Relaxed)
     }
@@ -10362,8 +10378,14 @@ fn executor_thread_main(
             HashMap::new()
         };
 
-        let authorize_candidate =
-            |candidate: &CandidacyScore| regret.authorize_deletion(candidate, logger);
+        let authorize_candidate = |candidate: &CandidacyScore| {
+            // A batch planned as a dry-run cannot mutate and still owes its
+            // preview counts. Real batches must obey newly restrictive policy.
+            if !dry_run {
+                shared_config.authorize_mutation(policy_mode, policy_engine.lock().mode())?;
+            }
+            regret.authorize_deletion(candidate, logger)
+        };
         let on_unlinked = |candidate: &CandidacyScore, completed_at: Instant| {
             if let Some(identity) = watch_identities.get(&candidate.path) {
                 regret.watch_unlinked(candidate, identity, completed_at);
@@ -10742,6 +10764,86 @@ mod tests {
             assert!(store.record("held").unwrap().is_none());
             assert_eq!(daemon.quarantine_held.get(&mount), Some(&0));
             assert!(daemon.last_quarantine_sweep.is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_live_policy_stops_a_previously_approved_batch_without_backoff() {
+        use crate::daemon::policy::PolicyConfig;
+
+        for (mode, dry_run) in [
+            (ActiveMode::Observe, false),
+            (ActiveMode::FallbackSafe, false),
+            (ActiveMode::Canary, false),
+            (ActiveMode::Enforce, true),
+        ] {
+            let fixture = RegretDaemonFixture::new();
+            let candidates_dir = tempfile::tempdir_in("/tmp").unwrap();
+            let project = candidates_dir.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let first = project.join("target");
+            let held = project.join("node_modules");
+            let mut candidates = Vec::new();
+            for (path, score) in [(&first, 2.0), (&held, 1.0)] {
+                std::fs::create_dir(path).unwrap();
+                std::fs::write(path.join("artifact.o"), [7_u8; 16]).unwrap();
+                let mut candidate = test_candidate(&path.to_string_lossy(), score);
+                candidate.identity =
+                    Some(crate::scanner::walker::identity_for_path(path, false).unwrap());
+                candidate.size_bytes = 16;
+                candidates.push(candidate);
+            }
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    dry_run: false,
+                    min_score: 0.0,
+                    check_open_files: true,
+                    require_identity: true,
+                    ..Default::default()
+                },
+                Some(fixture.daemon.logger_handle.clone()),
+            )
+            .with_platform(Arc::clone(&fixture.daemon.platform));
+            let plan = executor.plan(candidates);
+            assert_eq!(plan.candidates.len(), 2);
+            let shared = &fixture.daemon.shared_executor_config;
+            let policy = &fixture.daemon.policy_engine;
+            let authorize = |_candidate: &CandidacyScore| {
+                // Previously approved work must obey a live operator pause
+                // or fallback before its next mutation.
+                shared.authorize_mutation(ActiveMode::Enforce, policy.lock().mode())
+            };
+            let pause_after_unlink = |candidate: &CandidacyScore, _: Instant| {
+                assert_eq!(candidate.path, first);
+                assert!(!first.exists());
+                *policy.lock() = PolicyEngine::new(PolicyConfig {
+                    initial_mode: mode,
+                    ..PolicyConfig::default()
+                });
+                shared.dry_run.store(dry_run, Ordering::Relaxed);
+            };
+            let report = executor.execute_with_hooks(
+                &plan,
+                None,
+                Some(&authorize),
+                Some(&pause_after_unlink),
+            );
+            assert_eq!(report.deleted_paths, vec![first.clone()]);
+            assert_eq!(report.skipped_by_reason.get("policy_changed"), Some(&1));
+            assert_eq!(report.items_failed, 0);
+            assert!(report.backoff_candidates.is_empty());
+            assert_eq!(std::fs::read(held.join("artifact.o")).unwrap(), [7_u8; 16]);
+
+            *policy.lock() = PolicyEngine::new(PolicyConfig {
+                initial_mode: ActiveMode::Enforce,
+                ..PolicyConfig::default()
+            });
+            shared.dry_run.store(false, Ordering::Relaxed);
+            let retry = executor.plan(vec![plan.candidates[1].clone()]);
+            let released = executor.execute_with_guard(&retry, None, Some(&authorize));
+            assert_eq!(released.items_deleted, 1, "{mode:?} dry_run={dry_run}");
+            assert!(!held.exists());
         }
     }
 

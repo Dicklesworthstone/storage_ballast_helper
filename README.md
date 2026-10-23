@@ -1411,6 +1411,11 @@ FallbackSafe, and dry-run retain quarantined payloads while still reporting
 their held bytes. Normal TTL/cap and pressure-driven purges resume only when
 the daemon is allowed to delete.
 
+Queued deletion batches also recheck policy and dry-run before each candidate
+mutation. Enforce-to-Canary transitions defer the remaining candidates for
+fresh quota evaluation. Temporary policy refusals do not create per-path
+backoff, and batches already planned as dry-runs retain their preview counts.
+
 Restore with `sbh undo <decision-id>` (the id is on the `[SBH-QUARANTINE]` line, in `sbh explain`, and in `sbh undo --list`), `sbh undo --path <original>`, or `sbh undo --all-since 2h`. A restore is a rename back, byte-identical; it refuses when the original path exists again unless `--force-suffix`, which restores beside it as `<name>.restored-<decision-id>`. The ledger marks the decision `restored`.
 
 A candidate that cannot be quarantined (different filesystem from the root, unusable store) is removed for good and the fallback is logged as `quarantine_unavailable` with its reason. `status` shows the bytes held per mount in the Reserve column; `stats` reports `quarantined_count` and `quarantined_bytes` and excludes held bytes from `total_bytes_freed`.

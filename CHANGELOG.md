@@ -40,6 +40,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Queued deletions recheck live policy and dry-run before each mutation.**
+  Observe, FallbackSafe, dry-run, and Enforce-to-Canary transitions defer
+  candidates for fresh evaluation. These deferrals do not apply per-path
+  failure backoff.
+
 - **Daemon quarantine sweeps now respect Observe, FallbackSafe, and dry-run.**
   These modes retain quarantined payloads while continuing to report held
   inventory. Previously, TTL/cap sweeps and pressure-driven purges could

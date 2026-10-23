@@ -611,6 +611,9 @@ pub enum SkipReason {
     /// The daemon began shutting down mid-batch; the rest of the batch is
     /// left for the next run, with no per-path backoff.
     ShuttingDown,
+    /// Live policy or dry-run settings no longer authorize a queued mutation.
+    /// Resuming policy must not leave candidates in per-path backoff.
+    PolicyChanged,
 }
 
 impl SkipReason {
@@ -620,7 +623,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -642,6 +645,7 @@ impl SkipReason {
         Self::CategorySuspended,
         Self::SourceRootDenied,
         Self::ShuttingDown,
+        Self::PolicyChanged,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -677,6 +681,7 @@ impl SkipReason {
             Self::CategorySuspended => "category_suspended",
             Self::SourceRootDenied => "source_root_denied",
             Self::ShuttingDown => "shutting_down",
+            Self::PolicyChanged => "policy_changed",
         }
     }
 
@@ -724,6 +729,7 @@ impl SkipReason {
                  root_paths or explicitly authorize scanner.allow_source_tree_roots"
             }
             Self::ShuttingDown => "the daemon was shutting down — left for the next run",
+            Self::PolicyChanged => "live policy or dry-run settings no longer permit changes",
         }
     }
 }
@@ -770,6 +776,7 @@ fn should_backoff_skip(reason: SkipReason) -> bool {
             | SkipReason::CategorySuspended
             | SkipReason::SourceRootDenied
             | SkipReason::ShuttingDown
+            | SkipReason::PolicyChanged
     )
 }
 
@@ -2577,6 +2584,7 @@ mod tests {
     fn mount_incidents_get_no_per_path_backoff() {
         assert!(!should_backoff_skip(SkipReason::FilesystemReadOnly));
         assert!(!should_backoff_skip(SkipReason::CategorySuspended));
+        assert!(!should_backoff_skip(SkipReason::PolicyChanged));
         assert!(!should_backoff_skip(SkipReason::SourceRootDenied));
         assert!(should_backoff_skip(SkipReason::Symlink));
         assert!(!should_backoff_skip(SkipReason::PathGone));
@@ -2611,6 +2619,7 @@ mod tests {
                 SkipReason::CategorySuspended => 18,
                 SkipReason::SourceRootDenied => 19,
                 SkipReason::ShuttingDown => 20,
+                SkipReason::PolicyChanged => 21,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];
