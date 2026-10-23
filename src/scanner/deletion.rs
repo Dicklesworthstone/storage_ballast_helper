@@ -614,6 +614,9 @@ pub enum SkipReason {
     /// Live policy or dry-run settings no longer authorize a queued mutation.
     /// Resuming policy must not leave candidates in per-path backoff.
     PolicyChanged,
+    /// Lossless compression has a bounded first chance on this filesystem.
+    /// This live scheduling hold must not create a per-path refusal backoff.
+    CompressionFirst,
 }
 
 impl SkipReason {
@@ -623,7 +626,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -646,6 +649,7 @@ impl SkipReason {
         Self::SourceRootDenied,
         Self::ShuttingDown,
         Self::PolicyChanged,
+        Self::CompressionFirst,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -682,6 +686,7 @@ impl SkipReason {
             Self::SourceRootDenied => "source_root_denied",
             Self::ShuttingDown => "shutting_down",
             Self::PolicyChanged => "policy_changed",
+            Self::CompressionFirst => "compression_first",
         }
     }
 
@@ -730,6 +735,7 @@ impl SkipReason {
             }
             Self::ShuttingDown => "the daemon was shutting down — left for the next run",
             Self::PolicyChanged => "live policy or dry-run settings no longer permit changes",
+            Self::CompressionFirst => "lossless compression is running before permanent cleanup",
         }
     }
 }
@@ -777,6 +783,7 @@ fn should_backoff_skip(reason: SkipReason) -> bool {
             | SkipReason::SourceRootDenied
             | SkipReason::ShuttingDown
             | SkipReason::PolicyChanged
+            | SkipReason::CompressionFirst
     )
 }
 
@@ -2585,6 +2592,7 @@ mod tests {
         assert!(!should_backoff_skip(SkipReason::FilesystemReadOnly));
         assert!(!should_backoff_skip(SkipReason::CategorySuspended));
         assert!(!should_backoff_skip(SkipReason::PolicyChanged));
+        assert!(!should_backoff_skip(SkipReason::CompressionFirst));
         assert!(!should_backoff_skip(SkipReason::SourceRootDenied));
         assert!(should_backoff_skip(SkipReason::Symlink));
         assert!(!should_backoff_skip(SkipReason::PathGone));
@@ -2620,6 +2628,7 @@ mod tests {
                 SkipReason::SourceRootDenied => 19,
                 SkipReason::ShuttingDown => 20,
                 SkipReason::PolicyChanged => 21,
+                SkipReason::CompressionFirst => 22,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];

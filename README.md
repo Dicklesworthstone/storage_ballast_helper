@@ -1436,6 +1436,30 @@ The tracker periodically prunes entries whose last deletion is older than `max_c
 
 Source: `src/daemon/loop_main.rs`
 
+### Lossless Reclaim Before Cleanup
+
+When the optional compression tier starts a pass on a supported btrfs mount
+at Yellow or Orange pressure, that filesystem gets one bounded opportunity
+to reclaim space losslessly before cleanup. The daemon publishes the hold
+before dispatching its pressure scans, and checks it again before executing
+already queued deletions or draining quarantine. Unrelated filesystems
+continue working. The compression tier remains off by default.
+
+The hold ends when the pass finishes or its wall-clock allowance expires:
+the 60-second discovery budget plus `compress.policy.timeout_secs`, measured
+from the scheduling tick. A cancellation asks the worker to stop and retains
+the hold until it exits or the original deadline expires. Repeated passes
+cannot renew the hold within the same eligible pressure episode.
+
+Red and Critical pressure bypass the hold, including older batches scored
+before a known alias of their device escalated. Emergency quarantine cleanup
+and scan requests run before the daemon probes roots for a new compression
+pass; configured Red/Critical compression start thresholds remain supported.
+Ballast release retains its priority. Temporarily deferred candidates stay
+eligible for retry without per-path failure backoff.
+
+Source: `src/daemon/compress_tier.rs`, `src/daemon/loop_main.rs`
+
 ### The Ballast System in Depth
 
 Ballast files are pre-allocated sacrificial space that can be released instantly when disk pressure spikes, buying time for the scanner to find and delete actual artifacts.

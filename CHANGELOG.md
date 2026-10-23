@@ -8,6 +8,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Changed
 
+- **Lossless compression gets a bounded first chance before daemon cleanup**
+  (bd-rxq5). Eligible btrfs filesystems at Yellow/Orange defer pressure scans,
+  already queued deletions, and quarantine purges until the first compression
+  pass finishes or its discovery-plus-apply deadline expires. Red/Critical
+  pressure, including a known device alias's escalation, bypasses the wait.
+  Emergency cleanup is dispatched before new compression-root probes; repeated
+  passes cannot keep renewing a hold.
 - **The evidence ledger records a repeated verdict that deletes nothing once
   a day, not on every scan pass** (bd-jl92). Every candidate is re-evaluated
   each pass, and each verdict was written in full to `decision_log` and the

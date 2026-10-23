@@ -31,7 +31,7 @@ use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::{Config, ScannerConfig, ScannerEngineMode};
 use crate::core::errors::{Result, SbhError};
-use crate::daemon::compress_tier::CompressTier;
+use crate::daemon::compress_tier::{CompressTier, CompressionFirst};
 use crate::daemon::control::{
     BallastAction as ControlBallastAction, ControlBackend, ControlCommand, ControlResponse,
     ControlServer, Peer, PolicyAction, persist_policy_mode,
@@ -221,6 +221,8 @@ struct SharedExecutorConfig {
     reclaim_events: AtomicU64,
     /// W1 planner: the risk budget table and one false-positive loss.
     planner: RwLock<(RiskBudgetByLevel, f64)>,
+    /// A live, bounded first chance for lossless reclaim on a pressured mount.
+    compression_first: Arc<CompressionFirst>,
 }
 
 impl SharedExecutorConfig {
@@ -244,6 +246,7 @@ impl SharedExecutorConfig {
             quarantine_ttl_secs: AtomicU64::new(quarantine_ttl_secs),
             reclaim_events: AtomicU64::new(0),
             planner: RwLock::new((RiskBudgetByLevel::default(), 50.0)),
+            compression_first: Arc::new(CompressionFirst::default()),
         }
     }
 
@@ -297,6 +300,24 @@ impl SharedExecutorConfig {
             return Err(SkipReason::PolicyChanged);
         }
         Ok(())
+    }
+
+    fn authorize_compression_first(
+        &self,
+        candidate: &CandidacyScore,
+        level: PressureLevel,
+    ) -> std::result::Result<(), SkipReason> {
+        let identity = candidate
+            .identity
+            .or_else(|| crate::scanner::walker::identity_for_path(&candidate.path, false).ok());
+        if identity.is_some_and(|identity| {
+            self.compression_first
+                .defers_device(identity.device_id, level, Instant::now())
+        }) {
+            Err(SkipReason::CompressionFirst)
+        } else {
+            Ok(())
+        }
     }
 
     fn repeat_base_cooldown_secs(&self) -> u64 {
@@ -3357,6 +3378,8 @@ impl MonitoringDaemon {
             config.scoring.batch_risk_budget_by_level,
             config.scoring.false_positive_loss,
         );
+        let compress_tier =
+            CompressTier::with_first(Arc::clone(&shared_executor_config.compression_first));
 
         let shared_scoring_config = Arc::new(RwLock::new(config.scoring.clone()));
         let shared_scanner_config = Arc::new(RwLock::new(config.scanner.clone()));
@@ -3476,7 +3499,7 @@ impl MonitoringDaemon {
             last_device_affinity_warn: None,
             attribution_reported: HashMap::new(),
             attribution_pressured_since: HashMap::new(),
-            compress_tier: CompressTier::default(),
+            compress_tier,
             target_tier: TargetTier::default(),
             last_summary_report: Instant::now(),
             summary_scans: 0,
@@ -5359,8 +5382,6 @@ impl MonitoringDaemon {
                             );
                             let previous = self.catalog_epochs.get(&mount).copied();
                             if catalog_epoch_due(previous, tick.response.level, now, rescan) {
-                                self.catalog_epochs
-                                    .insert(mount.clone(), (tick.response.level, now));
                                 pending_scans.push((&tick.response, Vec::new(), Some(catalog)));
                             }
                         } else {
@@ -5432,13 +5453,80 @@ impl MonitoringDaemon {
             }
         }
 
-        // Release ballast with its existing priority, then drain already-
-        // decided quarantine space before enqueuing any new pressure scan.
-        // The scanner runs concurrently with this tick, so draining after
-        // enqueue would race both its completion and its deletion batches.
-        self.sweep_quarantines(&responses, &root_mounts, now);
-        for (response, paths, catalog) in pending_scans {
+        // Ballast has already had first priority. Refresh existing holds even
+        // when compression is disabled or stopping, so live emergencies also
+        // release older batches scored at a lower pressure level.
+        let mount_levels: HashMap<PathBuf, PressureLevel> = self
+            .mount_controllers
+            .iter()
+            .map(|(mount, controller)| (mount.clone(), controller.level()))
+            .collect();
+        self.shared_executor_config
+            .compression_first
+            .update_levels(&mount_levels);
+
+        // Root probes for a new compression pass can block in native I/O.
+        // Drain and enqueue emergency work before those probes, including
+        // when the operator configured compression to start at Red/Critical.
+        // Both sweep phases share the same maintenance cadence decision.
+        let sweep_due = self.quarantine_sweep_due(now);
+        let attempted_emergency_sweep = self.sweep_quarantine_entries(
+            responses
+                .iter()
+                .filter(|tick| tick.response.level >= PressureLevel::Red),
+            &root_mounts,
+            sweep_due,
+        );
+        let (emergency_scans, pending_scans): (Vec<_>, Vec<_>) = pending_scans
+            .into_iter()
+            .partition(|(response, _, _)| response.level >= PressureLevel::Red);
+        for (response, paths, catalog) in emergency_scans {
             if let Some(catalog) = catalog {
+                self.catalog_epochs
+                    .insert(response.causing_mount.clone(), (response.level, now));
+                self.send_catalog_scan_request(scan_tx, scan_rx, response, catalog);
+            } else {
+                self.send_scan_request(scan_tx, scan_rx, response, paths);
+            }
+            self.last_tick_cleanup_ran = true;
+        }
+
+        // Publish Yellow/Orange holds before dispatching their cleanup. The
+        // executor shares these holds, including for already queued work.
+        if compress_tier_may_run(&self.config, self.policy_engine.lock().mode()) {
+            self.compress_tier.tick(
+                now,
+                &self.config,
+                &self.platform,
+                &mount_levels,
+                &self.logger_handle,
+            );
+        } else {
+            self.compress_tier.stop_running_pass();
+        }
+
+        self.sweep_quarantines(
+            responses
+                .iter()
+                .filter(|tick| tick.response.level < PressureLevel::Red),
+            &root_mounts,
+            now,
+        );
+        if sweep_due && attempted_emergency_sweep {
+            self.last_quarantine_sweep = Some(now);
+        }
+        for (response, paths, catalog) in pending_scans {
+            if self.shared_executor_config.compression_first.defers_mount(
+                &response.causing_mount,
+                response.level,
+                Instant::now(),
+            ) {
+                continue;
+            }
+            if let Some(catalog) = catalog {
+                // A held scan has not run. Leave its epoch due until dispatch.
+                self.catalog_epochs
+                    .insert(response.causing_mount.clone(), (response.level, now));
                 self.send_catalog_scan_request(scan_tx, scan_rx, response, catalog);
             } else {
                 self.send_scan_request(scan_tx, scan_rx, response, paths);
@@ -5581,26 +5669,17 @@ impl MonitoringDaemon {
         }
         self.emit_reclaim_unavailable(&unprotected_mounts, now);
         self.report_unreclaimable_growth(now);
-        if compress_tier_may_run(&self.config, self.policy_engine.lock().mode()) {
-            let mount_levels: HashMap<PathBuf, PressureLevel> = self
-                .mount_controllers
-                .iter()
-                .map(|(mount, controller)| (mount.clone(), controller.level()))
-                .collect();
-            self.compress_tier.tick(
-                now,
-                &self.config,
-                &self.platform,
-                &mount_levels,
-                &self.logger_handle,
-            );
-        } else {
-            self.compress_tier.stop_running_pass();
-        }
         if !self.config.scanner.target_only_roots.is_empty() {
             let mounts: HashMap<PathBuf, (PressureLevel, f64)> = self
                 .mount_controllers
                 .iter()
+                .filter(|(mount, controller)| {
+                    !self.shared_executor_config.compression_first.defers_mount(
+                        mount,
+                        controller.level(),
+                        Instant::now(),
+                    )
+                })
                 .map(|(mount, controller)| {
                     (mount.clone(), (controller.level(), controller.urgency()))
                 })
@@ -6837,22 +6916,35 @@ impl MonitoringDaemon {
         }
     }
 
-    /// Layer 7 sweep. At Orange and above every quarantine on the pressured
-    /// mount is drained oldest-first, ahead of the scan the same tick
-    /// dispatches: that space was decided already and costs no scoring. On
-    /// calmer mounts, once per `QUARANTINE_SWEEP_INTERVAL`, expired entries
-    /// are removed and the store is capped at
-    /// `scanner.quarantine_max_bytes_pct` of the volume. The bytes still
-    /// held per mount feed `state.json`.
-    fn sweep_quarantines(
+    fn quarantine_sweep_due(&self, now: Instant) -> bool {
+        self.last_quarantine_sweep
+            .is_none_or(|last| now.saturating_duration_since(last) >= QUARANTINE_SWEEP_INTERVAL)
+    }
+
+    /// Layer 7 sweep, subject to live policy and lossless-reclaim holds.
+    /// At Orange and above, quarantine drains oldest-first before the scan
+    /// dispatched on that mount. On calmer mounts, once per maintenance
+    /// interval, expired entries are removed and the store is capped at
+    /// `scanner.quarantine_max_bytes_pct` of the volume. Held bytes feed
+    /// `state.json` even when cleanup is deferred.
+    fn sweep_quarantines<'a>(
         &mut self,
-        responses: &[MountTickResponse],
+        responses: impl IntoIterator<Item = &'a MountTickResponse>,
         root_mounts: &[(PathBuf, Option<PathBuf>)],
         now: Instant,
     ) {
-        let sweep_due = self
-            .last_quarantine_sweep
-            .is_none_or(|last| now.saturating_duration_since(last) >= QUARANTINE_SWEEP_INTERVAL);
+        let sweep_due = self.quarantine_sweep_due(now);
+        if self.sweep_quarantine_entries(responses, root_mounts, sweep_due) && sweep_due {
+            self.last_quarantine_sweep = Some(now);
+        }
+    }
+
+    fn sweep_quarantine_entries<'a>(
+        &mut self,
+        responses: impl IntoIterator<Item = &'a MountTickResponse>,
+        root_mounts: &[(PathBuf, Option<PathBuf>)],
+        sweep_due: bool,
+    ) -> bool {
         let now_unix = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -6882,6 +6974,11 @@ impl MonitoringDaemon {
                 // policy falls back. Inventory stays available in those modes.
                 if self.config.scanner.dry_run
                     || !self.policy_engine.lock().mode().allows_deletion()
+                    || self.shared_executor_config.compression_first.defers_mount(
+                        mount,
+                        level,
+                        Instant::now(),
+                    )
                 {
                     if let Ok(bytes) = store.held_bytes() {
                         held = held.saturating_add(bytes);
@@ -6937,9 +7034,7 @@ impl MonitoringDaemon {
             }
             self.quarantine_held.insert(mount.clone(), held);
         }
-        if sweep_due && attempted_sweep {
-            self.last_quarantine_sweep = Some(now);
-        }
+        attempted_sweep
     }
 
     fn spawn_executor_thread(
@@ -7009,6 +7104,7 @@ impl MonitoringDaemon {
 
         // 1. Broadcast cancellation, then drop channel senders to signal worker threads to exit.
         self.signal_handler.request_shutdown();
+        self.compress_tier.stop_running_pass();
         drop(scan_tx);
         drop(del_tx);
 
@@ -10383,6 +10479,7 @@ fn executor_thread_main(
             // preview counts. Real batches must obey newly restrictive policy.
             if !dry_run {
                 shared_config.authorize_mutation(policy_mode, policy_engine.lock().mode())?;
+                shared_config.authorize_compression_first(candidate, batch.pressure_level)?;
             }
             regret.authorize_deletion(candidate, logger)
         };
@@ -10845,6 +10942,169 @@ mod tests {
             assert_eq!(released.items_deleted, 1, "{mode:?} dry_run={dry_run}");
             assert!(!held.exists());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_waits_for_lossless_first_chance_but_never_for_emergency() {
+        use crate::daemon::compress_tier::RootStatus;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let root = fixture.directory.path().join("project");
+        let candidate = root.join("target");
+        std::fs::create_dir(&candidate).unwrap();
+        std::fs::write(candidate.join("artifact.o"), b"recoverable").unwrap();
+        let store = QuarantineStore::under(&root);
+        let record = store
+            .quarantine(&candidate, "held", 11, Duration::from_hours(24), None)
+            .unwrap();
+        let mount = PathBuf::from("/");
+        fixture
+            .daemon
+            .shared_executor_config
+            .compression_first
+            .begin(
+                &[RootStatus {
+                    root: root.clone(),
+                    btrfs: true,
+                    level: Some(PressureLevel::Orange),
+                    mount_point: Some(mount.clone()),
+                    device_id: Some(record.device_id),
+                }],
+                &[],
+                Instant::now(),
+                Duration::from_secs(30),
+            );
+        let roots = vec![(root, Some(mount.clone()))];
+        fixture.daemon.sweep_quarantines(
+            &[quarantine_tick(PressureLevel::Orange, &mount)],
+            &roots,
+            Instant::now(),
+        );
+        assert_eq!(
+            std::fs::read(record.quarantine_path.join("artifact.o")).unwrap(),
+            b"recoverable",
+        );
+        assert_eq!(fixture.daemon.quarantine_held.get(&mount), Some(&11));
+        assert_eq!(fixture.daemon.last_quarantine_sweep, None);
+        fixture.daemon.sweep_quarantines(
+            &[quarantine_tick(PressureLevel::Critical, &mount)],
+            &roots,
+            Instant::now(),
+        );
+        assert!(!record.quarantine_path.exists());
+        assert_eq!(fixture.daemon.quarantine_held.get(&mount), Some(&0));
+        assert!(fixture.daemon.last_quarantine_sweep.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn emergency_cleanup_dispatch_precedes_compression_root_probes() {
+        use crate::platform::pal::{FsStats, MemoryInfo, MountPoint, PlatformPaths, ServiceManager};
+        use std::sync::atomic::AtomicUsize;
+
+        struct ProbeAfterEmergency {
+            base: Arc<dyn Platform>,
+            probe_root: PathBuf,
+            scan_root: PathBuf,
+            quarantine_path: PathBuf,
+            scans: Receiver<ScanRequest>,
+            probes: Arc<AtomicUsize>,
+        }
+
+        impl Platform for ProbeAfterEmergency {
+            fn fs_stats(&self, path: &Path) -> crate::core::errors::Result<FsStats> {
+                if path == self.probe_root.as_path() {
+                    assert!(
+                        !self.quarantine_path.exists(),
+                        "emergency quarantine must drain before compression root I/O",
+                    );
+                    let scan = self
+                        .scans
+                        .try_recv()
+                        .expect("emergency scan must be queued before compression root I/O");
+                    assert_eq!(scan.pressure_level, PressureLevel::Critical);
+                    assert!(scan.paths.contains(&self.scan_root));
+                    self.probes.fetch_add(1, Ordering::Relaxed);
+                }
+                let mut stats = self.base.fs_stats(path)?;
+                // Exercise startup admission without launching a native worker.
+                stats.fs_type = "ext4".into();
+                Ok(stats)
+            }
+
+            fn mount_points(&self) -> crate::core::errors::Result<Vec<MountPoint>> {
+                self.base.mount_points()
+            }
+
+            fn is_ram_backed(&self, path: &Path) -> crate::core::errors::Result<bool> {
+                self.base.is_ram_backed(path)
+            }
+
+            fn default_paths(&self) -> PlatformPaths {
+                self.base.default_paths()
+            }
+
+            fn memory_info(&self) -> crate::core::errors::Result<MemoryInfo> {
+                self.base.memory_info()
+            }
+
+            fn service_manager(&self) -> Box<dyn ServiceManager> {
+                self.base.service_manager()
+            }
+        }
+
+        let mut fixture = RegretDaemonFixture::new();
+        let root = fixture.directory.path().join("project");
+        let candidate = root.join("target");
+        std::fs::create_dir(&candidate).unwrap();
+        std::fs::write(candidate.join("artifact.o"), b"recoverable").unwrap();
+        let store = QuarantineStore::under(&root);
+        let record = store
+            .quarantine(&candidate, "held", 11, Duration::from_hours(24), None)
+            .unwrap();
+        assert!(record.quarantine_path.exists());
+        let probe_root = fixture.directory.path().join("compression-probe");
+        std::fs::create_dir(&probe_root).unwrap();
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(4);
+        let (del_tx, _del_rx) = bounded::<DeletionBatch>(4);
+        let probes = Arc::new(AtomicUsize::new(0));
+        let daemon = &mut fixture.daemon;
+        daemon.config.compress.enabled = true;
+        daemon.config.compress.start_level = "critical".into();
+        daemon.config.compress.roots = vec![probe_root.clone()];
+        // A fake "/" mount can discover foreign ballast. Disable ballast
+        // actions explicitly while retaining real emergency scan dispatch.
+        daemon.behavior_state.mode = mock_behavior_mode(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::None,
+            NotificationPriority::Low,
+        );
+        // Keep the collector's original mock; only compression's direct root
+        // probe observes the queue, after ordinary monitor stats collection.
+        daemon.platform = Arc::new(ProbeAfterEmergency {
+            base: Arc::clone(&daemon.platform),
+            probe_root,
+            scan_root: root,
+            quarantine_path: record.quarantine_path.clone(),
+            scans: scan_rx.clone(),
+            probes: Arc::clone(&probes),
+        });
+        let tick = quarantine_tick(PressureLevel::Critical, Path::new("/"));
+        let response = tick.response.clone();
+        daemon.mount_responses = vec![tick];
+
+        daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            1,
+            "Critical start levels must still reach compression admission",
+        );
+        assert!(!record.quarantine_path.exists());
+        assert!(store.record("held").unwrap().is_none());
     }
 
     /// A special-location alert episode notifies once when it starts and again
@@ -12589,6 +12849,67 @@ mod tests {
             "the one outside never does"
         );
         assert!(outside.join("debug/libdemo.rlib").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_compression_guard_holds_queued_work_without_poisoning_its_retry() {
+        use crate::daemon::compress_tier::RootStatus;
+
+        let fixture = RegretDaemonFixture::new();
+        let candidates_dir = tempfile::tempdir_in("/tmp").unwrap();
+        let project = candidates_dir.path().join("project");
+        let path = project.join("target");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("artifact.o"), [7_u8; 16]).unwrap();
+        let mut candidate = test_candidate(&path.to_string_lossy(), 1.0);
+        candidate.identity = Some(crate::scanner::walker::identity_for_path(&path, false).unwrap());
+        candidate.size_bytes = 16;
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                dry_run: false,
+                min_score: 0.0,
+                check_open_files: true,
+                require_identity: true,
+                ..Default::default()
+            },
+            Some(fixture.daemon.logger_handle.clone()),
+        )
+        .with_platform(Arc::clone(&fixture.daemon.platform));
+        // The plan already exists before the lossless pass publishes its hold.
+        let plan = executor.plan(vec![candidate.clone()]);
+        assert_eq!(plan.candidates.len(), 1);
+        let shared = &fixture.daemon.shared_executor_config;
+        shared.compression_first.begin(
+            &[RootStatus {
+                root: project,
+                btrfs: true,
+                level: Some(PressureLevel::Orange),
+                mount_point: Some(PathBuf::from("/")),
+                device_id: candidate.identity.map(|identity| identity.device_id),
+            }],
+            &[],
+            Instant::now(),
+            Duration::from_secs(30),
+        );
+        let authorize = |candidate: &CandidacyScore| {
+            shared.authorize_compression_first(candidate, PressureLevel::Orange)
+        };
+        let held = executor.execute_with_guard(&plan, None, Some(&authorize));
+        assert_eq!(held.items_deleted, 0);
+        assert_eq!(held.items_failed, 0);
+        assert_eq!(held.skipped_by_reason.get("compression_first"), Some(&1));
+        assert!(
+            held.backoff_candidates.is_empty(),
+            "a temporary hold is not a path fault"
+        );
+        assert_eq!(std::fs::read(path.join("artifact.o")).unwrap(), [7_u8; 16]);
+        let emergency = |candidate: &CandidacyScore| {
+            shared.authorize_compression_first(candidate, PressureLevel::Red)
+        };
+        let released = executor.execute_with_guard(&plan, None, Some(&emergency));
+        assert_eq!(released.items_deleted, 1, "{:?}", released.skipped_by_reason);
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]

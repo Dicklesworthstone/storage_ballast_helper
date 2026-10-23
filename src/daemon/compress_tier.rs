@@ -15,7 +15,7 @@
 //! method, run by hand, freed several hundred GB from idle scratch while the
 //! deletion scanner freed megabytes per hour.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +31,7 @@ use crate::scanner::compression::{
     self, CompressionMode, CompressionObservation, CompressionReport, ConcurrencyAcknowledgement,
     discovery,
 };
+use crate::scanner::walker::identity_for_path;
 use crate::tuning::writeback::human_bytes;
 
 /// A configured root as the monitor sees it this tick.
@@ -42,6 +43,141 @@ pub struct RootStatus {
     pub btrfs: bool,
     /// Pressure of the mount holding it, if the daemon monitors that mount.
     pub level: Option<PressureLevel>,
+    /// Mount whose pressure governs this root, when it could be resolved.
+    pub mount_point: Option<PathBuf>,
+    /// Device identity used to hold only cleanup on this filesystem.
+    pub device_id: Option<u64>,
+}
+
+/// A bounded first chance for lossless reclaim, shared with the executor.
+/// Only the first pass in a Yellow/Orange pressure episode can delay cleanup.
+/// Completion or failure releases its holds; cancellation waits for worker exit.
+/// Red/Critical pressure and the deadline bypass a hold even during native I/O.
+#[derive(Debug, Default)]
+pub(super) struct CompressionFirst {
+    state: parking_lot::Mutex<FirstState>,
+}
+
+#[derive(Debug, Default)]
+struct FirstState {
+    holds: HashMap<u64, MountHold>,
+    attempted: HashSet<PathBuf>,
+}
+
+#[derive(Debug)]
+struct MountHold {
+    mounts: HashSet<PathBuf>,
+    until: Instant,
+}
+
+impl CompressionFirst {
+    pub(super) fn update_levels(&self, levels: &HashMap<PathBuf, PressureLevel>) {
+        let eligible = |mount: &PathBuf| {
+            matches!(
+                levels.get(mount),
+                Some(PressureLevel::Yellow | PressureLevel::Orange)
+            )
+        };
+        let mut state = self.state.lock();
+        state.holds.retain(|_, hold| {
+            // Keep every known alias while this device is held. A Green alias
+            // may turn Red before the originally pressured alias does.
+            !hold.mounts.iter().any(|mount| {
+                matches!(
+                    levels.get(mount),
+                    Some(PressureLevel::Red | PressureLevel::Critical)
+                )
+            }) && hold.mounts.iter().any(eligible)
+        });
+        state.attempted.retain(eligible);
+    }
+
+    /// Publish before spawning the pass or dispatching non-emergency cleanup.
+    pub(super) fn begin(
+        &self,
+        roots: &[RootStatus],
+        known_roots: &[RootStatus],
+        now: Instant,
+        allowance: Duration,
+    ) -> usize {
+        let Some(until) = now.checked_add(allowance) else {
+            return 0;
+        };
+        let emergency_devices: HashSet<_> = roots
+            .iter()
+            .chain(known_roots)
+            .filter(|root| root.level.is_some_and(|level| level >= PressureLevel::Red))
+            .filter_map(|root| root.device_id)
+            .collect();
+        let mut state = self.state.lock();
+        state
+            .holds
+            .retain(|device, _| !emergency_devices.contains(device));
+        // Several roots may share a mount. Mark the episode after considering
+        // all its devices (btrfs subvolumes can have distinct st_dev values).
+        let mut attempted = HashSet::new();
+        for root in roots {
+            let (Some(mount), Some(device)) = (&root.mount_point, root.device_id) else {
+                continue;
+            };
+            if root.btrfs
+                && matches!(
+                    root.level,
+                    Some(PressureLevel::Yellow | PressureLevel::Orange)
+                )
+                && !state.attempted.contains(mount)
+                && !emergency_devices.contains(&device)
+            {
+                let hold = state.holds.entry(device).or_insert_with(|| MountHold {
+                    mounts: HashSet::new(),
+                    until,
+                });
+                hold.mounts.insert(mount.clone());
+                hold.mounts.extend(
+                    roots
+                        .iter()
+                        .chain(known_roots)
+                        .filter(|alias| alias.device_id == Some(device))
+                        .filter_map(|alias| alias.mount_point.clone()),
+                );
+                attempted.insert(mount.clone());
+            }
+        }
+        let mounts = attempted.len();
+        state.attempted.extend(attempted);
+        mounts
+    }
+
+    fn finish(&self) {
+        self.state.lock().holds.clear();
+    }
+
+    /// Check at the mutation boundary as well as before a scan: a queued
+    /// candidate may have been scored before the compression pass started.
+    pub(super) fn defers_device(&self, device: u64, level: PressureLevel, now: Instant) -> bool {
+        level < PressureLevel::Red
+            && self
+                .state
+                .lock()
+                .holds
+                .get(&device)
+                .is_some_and(|hold| now < hold.until)
+    }
+
+    pub(super) fn defers_mount(
+        &self,
+        mount: &std::path::Path,
+        level: PressureLevel,
+        now: Instant,
+    ) -> bool {
+        level < PressureLevel::Red
+            && self
+                .state
+                .lock()
+                .holds
+                .values()
+                .any(|hold| hold.mounts.contains(mount) && now < hold.until)
+    }
 }
 
 /// The roots a pass should cover now; empty when no pass is due. Pure: it
@@ -96,9 +232,17 @@ pub struct CompressTier {
     /// have been considered, discovery's own frontier takes over.
     /// `None` starts from the top. This is not a durable completion ledger.
     resume_after: Arc<Mutex<Option<PathBuf>>>,
+    first: Arc<CompressionFirst>,
 }
 
 impl CompressTier {
+    pub(super) fn with_first(first: Arc<CompressionFirst>) -> Self {
+        Self {
+            first,
+            ..Self::default()
+        }
+    }
+
     /// Start a pass on its own thread when one is due.
     pub fn tick(
         &mut self,
@@ -108,6 +252,7 @@ impl CompressTier {
         mount_levels: &HashMap<PathBuf, PressureLevel>,
         logger: &ActivityLoggerHandle,
     ) {
+        self.first.update_levels(mount_levels);
         let running = self.running.load(Ordering::Acquire);
         if due_start_level(&config.compress, running, self.last_start, now).is_none() {
             return;
@@ -121,7 +266,30 @@ impl CompressTier {
         // No pass is running (due_roots checked), so no stop is pending.
         self.stop.store(false, Ordering::Release);
         self.running.store(true, Ordering::Release);
-        let guard = RunningGuard(Arc::clone(&self.running));
+        let selected: Vec<_> = statuses
+            .iter()
+            .filter(|status| roots.contains(&status.root))
+            .cloned()
+            .collect();
+        // Discovery has a 60-second cooperative budget; apply has the operator's
+        // bounded policy deadline. The hold itself uses monotonic wall time, so
+        // a stuck syscall cannot postpone deletion indefinitely.
+        let allowance = Duration::from_secs(60)
+            .saturating_add(Duration::from_secs(config.compress.policy.timeout_secs));
+        let held_mounts = self.first.begin(&selected, &statuses, now, allowance);
+        let guard = RunningGuard {
+            running: Arc::clone(&self.running),
+            first: Arc::clone(&self.first),
+        };
+        if held_mounts > 0 {
+            let message = format!(
+                "lossless reclaim first on {held_mounts} mount(s): permanent cleanup waits \
+                 until this pass finishes or {} seconds elapse; Red/Critical never wait",
+                allowance.as_secs(),
+            );
+            eprintln!("[SBH-COMPRESS] {message}");
+            logger.send(ActivityEvent::Info { message });
+        }
         let stop = Arc::clone(&self.stop);
         let resume_after = Arc::clone(&self.resume_after);
         let config = config.clone();
@@ -149,25 +317,31 @@ impl CompressTier {
     }
 
     /// Tell a running pass to stop: the daemon's policy no longer allows
-    /// changes (observe or fallback-safe mode, the kill switch, dry-run, or
-    /// the tier was switched off). It stops before its next file, or before
+    /// changes (observe or fallback-safe mode, the kill switch, dry-run, the
+    /// tier was switched off, or shutdown). It stops before its next file, or before
     /// the next chunk of the file it is rewriting, whose raw remainder a
     /// later pass picks up. Does nothing when no pass is running.
     pub fn stop_running_pass(&self) {
-        if self.running.load(Ordering::Acquire) && !self.stop.swap(true, Ordering::AcqRel) {
-            eprintln!(
-                "[SBH-COMPRESS] stopping the running pass: the policy no longer allows changes"
-            );
+        if self.running.load(Ordering::Acquire) {
+            if !self.stop.swap(true, Ordering::AcqRel) {
+                eprintln!("[SBH-COMPRESS] stopping the running pass");
+            }
+        } else {
+            self.first.finish();
         }
     }
 }
 
 /// Clears `running` when the pass ends, however it ends.
-struct RunningGuard(Arc<AtomicBool>);
+struct RunningGuard {
+    running: Arc<AtomicBool>,
+    first: Arc<CompressionFirst>,
+}
 
 impl Drop for RunningGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.first.finish();
+        self.running.store(false, Ordering::Release);
     }
 }
 
@@ -183,7 +357,15 @@ fn root_statuses(
             RootStatus {
                 root: root.clone(),
                 btrfs: stats.as_ref().is_some_and(|stats| stats.fs_type == "btrfs"),
-                level: stats.and_then(|stats| mount_levels.get(&stats.mount_point).copied()),
+                level: stats
+                    .as_ref()
+                    .and_then(|stats| mount_levels.get(&stats.mount_point).copied()),
+                mount_point: stats.as_ref().map(|stats| stats.mount_point.clone()),
+                device_id: stats
+                    .as_ref()
+                    .filter(|stats| stats.fs_type == "btrfs")
+                    .and_then(|_| identity_for_path(root, true).ok())
+                    .map(|identity| identity.device_id),
             }
         })
         .collect()
@@ -372,6 +554,201 @@ fn summarize(report: &CompressionReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_chance_is_per_device_bounded_and_does_not_repeat_within_an_episode() {
+        let first = CompressionFirst::default();
+        let now = Instant::now();
+        let root = status("/data", true, Some(PressureLevel::Orange));
+        first.begin(std::slice::from_ref(&root), &[], now, Duration::from_secs(30));
+        assert!(first.defers_device(1, PressureLevel::Orange, now));
+        assert!(first.defers_mount(std::path::Path::new("/data"), PressureLevel::Yellow, now));
+        assert!(!first.defers_device(2, PressureLevel::Orange, now));
+        assert!(!first.defers_mount(std::path::Path::new("/other"), PressureLevel::Orange, now));
+        assert!(!first.defers_device(1, PressureLevel::Red, now));
+        assert!(!first.defers_device(1, PressureLevel::Critical, now));
+        assert!(!first.defers_device(1, PressureLevel::Orange, now + Duration::from_secs(30)));
+
+        // The pass can still be in an uninterruptible syscall, or another
+        // pass can become due. Neither extends this pressure episode's hold.
+        first.begin(
+            std::slice::from_ref(&root),
+            &[],
+            now + Duration::from_secs(31),
+            Duration::from_secs(30),
+        );
+        assert!(!first.defers_device(1, PressureLevel::Orange, now + Duration::from_secs(31)));
+        first.finish();
+        first.begin(
+            std::slice::from_ref(&root),
+            &[],
+            now + Duration::from_secs(60),
+            Duration::from_secs(30),
+        );
+        assert!(!first.defers_device(1, PressureLevel::Orange, now + Duration::from_secs(60)));
+
+        first.update_levels(&HashMap::from([(
+            PathBuf::from("/data"),
+            PressureLevel::Green,
+        )]));
+        first.begin(
+            &[root],
+            &[],
+            now + Duration::from_secs(90),
+            Duration::from_secs(30),
+        );
+        assert!(first.defers_device(1, PressureLevel::Orange, now + Duration::from_secs(90)));
+    }
+
+    #[test]
+    fn live_emergency_or_completion_releases_even_an_older_queued_batch() {
+        let first = Arc::new(CompressionFirst::default());
+        let now = Instant::now();
+        let root = status("/data", true, Some(PressureLevel::Yellow));
+        first.begin(std::slice::from_ref(&root), &[], now, Duration::from_secs(30));
+        first.update_levels(&HashMap::from([(
+            PathBuf::from("/data"),
+            PressureLevel::Red,
+        )]));
+        assert!(!first.defers_device(1, PressureLevel::Yellow, now));
+
+        first.begin(&[root], &[], now, Duration::from_secs(30));
+        let running = Arc::new(AtomicBool::new(true));
+        let guard = RunningGuard {
+            running: Arc::clone(&running),
+            first: Arc::clone(&first),
+        };
+        assert!(first.defers_device(1, PressureLevel::Yellow, now));
+        drop(guard);
+        assert!(!running.load(Ordering::Acquire));
+        assert!(!first.defers_device(1, PressureLevel::Yellow, now));
+    }
+
+    #[test]
+    fn aliases_and_btrfs_subvolume_devices_share_the_mounts_first_chance() {
+        let first = CompressionFirst::default();
+        let now = Instant::now();
+        let a = status("/data", true, Some(PressureLevel::Orange));
+        let alias = status("/alias", true, Some(PressureLevel::Orange));
+        let subvolume = RootStatus {
+            root: PathBuf::from("/data/subvolume"),
+            device_id: Some(2),
+            ..a.clone()
+        };
+        first.begin(&[a, alias, subvolume], &[], now, Duration::from_secs(30));
+        for mount in ["/data", "/alias"] {
+            assert!(first.defers_mount(std::path::Path::new(mount), PressureLevel::Orange, now));
+        }
+        for device in [1, 2] {
+            assert!(first.defers_device(device, PressureLevel::Orange, now));
+        }
+        first.update_levels(&HashMap::from([
+            (PathBuf::from("/data"), PressureLevel::Green),
+            (PathBuf::from("/alias"), PressureLevel::Orange),
+        ]));
+        assert!(first.defers_mount(std::path::Path::new("/alias"), PressureLevel::Orange, now));
+        // The alias shares device 1, so its cleanup shares the same hold.
+        assert!(first.defers_mount(std::path::Path::new("/data"), PressureLevel::Green, now));
+        assert!(!first.defers_device(2, PressureLevel::Orange, now));
+    }
+
+    #[test]
+    fn unsupported_unresolved_and_emergency_roots_never_hold_cleanup() {
+        let first = CompressionFirst::default();
+        let now = Instant::now();
+        for mut root in [
+            status("/ext4", false, Some(PressureLevel::Orange)),
+            status("/green", true, Some(PressureLevel::Green)),
+            status("/red", true, Some(PressureLevel::Red)),
+            status("/critical", true, Some(PressureLevel::Critical)),
+            status("/unknown", true, None),
+        ] {
+            first.begin(std::slice::from_ref(&root), &[], now, Duration::from_secs(30));
+            assert!(!first.defers_device(1, PressureLevel::Yellow, now));
+            root.level = Some(PressureLevel::Orange);
+            root.device_id = None;
+            first.begin(&[root], &[], now, Duration::from_secs(30));
+            assert!(!first.defers_device(1, PressureLevel::Orange, now));
+        }
+    }
+
+    #[test]
+    fn emergency_aliases_prevent_new_holds_and_release_older_queued_work() {
+        let now = Instant::now();
+        for emergency in [PressureLevel::Red, PressureLevel::Critical] {
+            let first = CompressionFirst::default();
+            let root = status("/data", true, Some(PressureLevel::Orange));
+            let alias = status("/alias", true, Some(emergency));
+            let independent = RootStatus {
+                device_id: Some(2),
+                ..status("/other", true, Some(PressureLevel::Orange))
+            };
+            first.begin(
+                &[root, independent],
+                &[alias],
+                now,
+                Duration::from_secs(30),
+            );
+            assert!(!first.defers_device(1, PressureLevel::Orange, now));
+            assert!(first.defers_device(2, PressureLevel::Orange, now));
+        }
+
+        let first = CompressionFirst::default();
+        let root = status("/data", true, Some(PressureLevel::Orange));
+        let alias = status("/alias", true, Some(PressureLevel::Green));
+        let subvolume = RootStatus {
+            root: PathBuf::from("/data/subvolume"),
+            device_id: Some(2),
+            ..root.clone()
+        };
+        first.begin(
+            &[root, subvolume],
+            &[alias],
+            now,
+            Duration::from_secs(30),
+        );
+        assert!(first.defers_device(1, PressureLevel::Orange, now));
+        first.update_levels(&HashMap::from([
+            (PathBuf::from("/data"), PressureLevel::Orange),
+            (PathBuf::from("/alias"), PressureLevel::Green),
+        ]));
+        first.update_levels(&HashMap::from([
+            (PathBuf::from("/data"), PressureLevel::Orange),
+            (PathBuf::from("/alias"), PressureLevel::Red),
+        ]));
+        assert!(!first.defers_device(1, PressureLevel::Orange, now));
+        assert!(first.defers_device(2, PressureLevel::Orange, now));
+        first.update_levels(&HashMap::from([(
+            PathBuf::from("/data"),
+            PressureLevel::Critical,
+        )]));
+        assert!(!first.defers_device(2, PressureLevel::Orange, now));
+    }
+
+    #[test]
+    fn cancellation_holds_cleanup_until_worker_exit_or_the_original_deadline() {
+        let first = Arc::new(CompressionFirst::default());
+        let now = Instant::now();
+        first.begin(
+            &[status("/data", true, Some(PressureLevel::Orange))],
+            &[],
+            now,
+            Duration::from_secs(30),
+        );
+        let tier = CompressTier::with_first(Arc::clone(&first));
+        tier.running.store(true, Ordering::Release);
+        let guard = RunningGuard {
+            running: Arc::clone(&tier.running),
+            first: Arc::clone(&first),
+        };
+        tier.stop_running_pass();
+        assert!(tier.stop.load(Ordering::Acquire));
+        assert!(first.defers_device(1, PressureLevel::Orange, now));
+        assert!(!first.defers_device(1, PressureLevel::Orange, now + Duration::from_secs(30)));
+        drop(guard);
+        assert!(!first.defers_device(1, PressureLevel::Orange, now));
+        assert!(!tier.running.load(Ordering::Acquire));
+    }
 
     fn paths() -> Vec<PathBuf> {
         ["/cache/a.bin", "/cache/b.bin", "/cache/c.bin"]
@@ -657,6 +1034,8 @@ mod tests {
             root: PathBuf::from(root),
             btrfs,
             level,
+            mount_point: Some(PathBuf::from(root)),
+            device_id: Some(1),
         }
     }
 
