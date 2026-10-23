@@ -87,6 +87,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **`sbh tune` says when the activity database is missing, whatever else it
+  lists.** The note appeared only when there was nothing else to report, so on
+  a host with percentage-based writeback, where tune also lists
+  kernel-writeback advice, history-based recommendations were missing without
+  explanation. JSON already reported `has_database`.
 - **Compression requires fresh memory-map evidence before rewriting files**
   (bd-rxq5). Successful scanner snapshots can no longer authorize compression
   for up to 30 seconds after collection. Mutation checks start a new bounded

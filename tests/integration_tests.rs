@@ -818,6 +818,54 @@ file_size_bytes = 1048576
     );
 }
 
+/// Without an activity database `sbh tune` still reports kernel-writeback and
+/// burst-reserve advice on hosts that need it (a vmi worker with
+/// `vm.dirty_ratio=10`); the note that history-based advice is missing must
+/// appear either way, not only when the list is empty.
+#[test]
+fn tune_without_activity_database_says_so() {
+    let temp = tempfile::tempdir().expect("create tune fixture");
+    let state = temp.path().join("state");
+    fs::create_dir_all(state.join("ballast")).expect("create ballast directory");
+    let config_path = state.join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"[paths]
+config_file = "{}"
+state_file = "{}"
+sqlite_db = "{}"
+jsonl_log = "{}"
+ballast_dir = "{}"
+"#,
+            toml_path(&config_path),
+            toml_path(&state.join("state.json")),
+            toml_path(&state.join("missing-activity.sqlite3")),
+            toml_path(&state.join("activity.jsonl")),
+            toml_path(&state.join("ballast")),
+        ),
+    )
+    .expect("write tune config");
+    let config = config_path.to_string_lossy().into_owned();
+
+    let human = run_owned_cli_case("tune_no_db_human", &["--config", &config, "tune"]);
+    assert_cli_success(&human, "tune without activity database");
+    assert!(
+        human.stdout.contains("No activity database found"),
+        "stdout={:?}; log={}",
+        human.stdout,
+        human.log_path.display()
+    );
+
+    let json = run_owned_cli_case("tune_no_db_json", &["--config", &config, "--json", "tune"]);
+    assert_cli_success(&json, "tune --json without activity database");
+    assert_eq!(parse_json_stdout(&json)["has_database"], Value::Bool(false));
+    assert!(
+        !state.join("missing-activity.sqlite3").exists(),
+        "tune must not create the activity database"
+    );
+}
+
 fn run_owned_cli_case(case_name: &str, args: &[&str]) -> common::CmdResult {
     common::run_cli_case(case_name, args)
 }

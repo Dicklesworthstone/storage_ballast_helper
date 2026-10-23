@@ -6255,6 +6255,14 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
                         println!();
                     }
                     println!("  Run `sbh tune --apply` to apply these changes.");
+                    // Kernel and burst-reserve advice needs no history, so say
+                    // when the activity-based recommendations are missing.
+                    if db.is_none() {
+                        println!();
+                        println!(
+                            "  No activity database found, so none of these use scan or deletion history. Run the daemon to collect data."
+                        );
+                    }
                 }
             }
             OutputMode::Json => {
