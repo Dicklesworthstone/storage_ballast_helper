@@ -47,6 +47,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   pressure, including a known device alias's escalation, bypasses the wait.
   Emergency cleanup is dispatched before new compression-root probes; repeated
   passes cannot keep renewing a hold.
+- **The executor drops candidates with nothing to reclaim before the policy
+  engine.** The planner never chooses an item that frees no bytes, yet each pass
+  evaluated them and recorded an approved delete that was never executed: on
+  ts2, 99 hardlinked bun trees were "approved 99/99 ... planner chose none"
+  pass after pass, which kept the decision ledger growing even with the
+  bd-jl92 dedupe (every decision that may delete is always recorded). They are
+  now dropped first and counted in one activity line at most every 10
+  minutes. No deletion changes: such items were never chosen.
 - **The evidence ledger records a repeated verdict that deletes nothing once
   a day, not on every scan pass** (bd-jl92). Every candidate is re-evaluated
   each pass, and each verdict was written in full to `decision_log` and the

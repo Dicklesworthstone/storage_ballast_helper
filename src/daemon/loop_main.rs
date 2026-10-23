@@ -10122,6 +10122,25 @@ fn authorize_target_only_candidate(
     Ok(())
 }
 
+/// Drop candidates with nothing to reclaim. The planner never chooses an
+/// item that frees no bytes (an empty mktemp target of a live remote build
+/// was taken at Critical on ts2, 2026-10-15), so evaluating them only re-ran
+/// the policy engine every pass and wrote an approved, never-executed delete
+/// to the decision ledger each time: on ts2 99 hardlinked bun trees were
+/// "approved 99/99 ... planner chose none" pass after pass. Returns how many
+/// were dropped.
+fn drop_zero_byte_candidates(batch: &mut DeletionBatch) -> usize {
+    let before = batch.candidates.len();
+    batch
+        .candidates
+        .retain(|candidate| candidate.size_bytes > 0);
+    before - batch.candidates.len()
+}
+
+/// How often the executor reports the zero-byte candidates it dropped: one
+/// line with the running count, not one per batch.
+const ZERO_BYTE_DROP_LOG_EVERY: Duration = Duration::from_mins(10);
+
 /// Executor thread: receives deletion batches and safely removes artifacts.
 ///
 /// Gates all deletions through the `PolicyEngine` before execution. In Observe
@@ -10156,6 +10175,8 @@ fn executor_thread_main(
     let max_circuit_breaker_cooldown = Duration::from_mins(5); // 5 minutes cap
     let mut last_policy_reject_log: Option<Instant> = None;
     let mut last_cb_cooldown_log: Option<Instant> = None;
+    let mut zero_byte_dropped: usize = 0;
+    let mut last_zero_byte_log: Option<Instant> = None;
     // Rate-limit the NotWritable systemd-misconfig warning to once per hour
     // per executor thread. The condition is persistent until the operator
     // fixes the unit file, so logging on every batch would flood journals.
@@ -10199,6 +10220,24 @@ fn executor_thread_main(
             );
             eprintln!("[SBH-EXECUTOR] {message}");
             logger.send(ActivityEvent::Info { message });
+            if batch.candidates.is_empty() {
+                continue;
+            }
+        }
+
+        let empty = drop_zero_byte_candidates(&mut batch);
+        if empty > 0 {
+            zero_byte_dropped = zero_byte_dropped.saturating_add(empty);
+            if last_zero_byte_log.is_none_or(|at| at.elapsed() >= ZERO_BYTE_DROP_LOG_EVERY) {
+                let message = format!(
+                    "dropped {zero_byte_dropped} zero-byte candidate(s) before the policy \
+                     engine: nothing to reclaim, so the planner would never choose them"
+                );
+                eprintln!("[SBH-EXECUTOR] {message}");
+                logger.send(ActivityEvent::Info { message });
+                zero_byte_dropped = 0;
+                last_zero_byte_log = Some(Instant::now());
+            }
             if batch.candidates.is_empty() {
                 continue;
             }
@@ -12967,6 +13006,91 @@ mod tests {
             "the one outside never does"
         );
         assert!(outside.join("debug/libdemo.rlib").exists());
+    }
+
+    /// Through the executor thread itself: a candidate with nothing to
+    /// reclaim is dropped before the policy engine, so no decision is recorded
+    /// for it and its tree is untouched, while a sized sibling in the same
+    /// batch reaches the ledger as before.
+    #[cfg(unix)]
+    #[test]
+    fn executor_thread_drops_zero_byte_candidates_before_the_policy_engine() {
+        let mut fixture = RegretDaemonFixture::new();
+        let base = fixture.directory.path().join("project");
+        let sized = base.join("sized/target");
+        let empty = base.join("hardlinked/node_modules");
+        let candidates = [(&sized, 64_u64), (&empty, 0)]
+            .into_iter()
+            .map(|(path, bytes)| {
+                std::fs::create_dir_all(path).unwrap();
+                std::fs::write(path.join("payload"), [7u8; 64]).unwrap();
+                let mut candidate = test_candidate(&path.to_string_lossy(), 3.0);
+                candidate.size_bytes = bytes;
+                candidate
+            })
+            .collect();
+        let (del_tx, del_rx) = crossbeam_channel::bounded(1);
+        let (report_tx, _report_rx) = crossbeam_channel::bounded(16);
+        let (index_tx, _index_rx) = crossbeam_channel::bounded(16);
+        let executor = fixture
+            .daemon
+            .spawn_executor_thread(
+                del_rx,
+                fixture.daemon.logger_handle.clone(),
+                ThreadHeartbeat::new("sbh-executor"),
+                report_tx,
+                index_tx,
+            )
+            .unwrap();
+        del_tx
+            .send(DeletionBatch {
+                candidates,
+                pressure_level: PressureLevel::Critical,
+                urgency: 0.9,
+                target_bytes: None,
+                target_only_root: None,
+            })
+            .unwrap();
+        drop(del_tx);
+        executor.join().unwrap();
+        fixture.flush_logger();
+
+        let log = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
+        assert!(
+            log.contains("dropped 1 zero-byte candidate(s) before the policy engine"),
+            "{log}"
+        );
+        assert!(
+            log.contains(sized.to_string_lossy().as_ref()),
+            "the sized candidate reaches the ledger: {log}"
+        );
+        assert!(
+            !log.contains(empty.to_string_lossy().as_ref()),
+            "the zero-byte one never does"
+        );
+        assert!(empty.join("payload").exists());
+    }
+
+    #[test]
+    fn zero_byte_candidates_are_dropped_and_counted() {
+        let mut batch = DeletionBatch {
+            candidates: vec![
+                test_candidate("/data/tmp/a/node_modules", 2.0),
+                test_candidate("/data/tmp/b/target", 2.5),
+                test_candidate("/data/tmp/c/node_modules", 1.5),
+            ],
+            pressure_level: PressureLevel::Critical,
+            urgency: 0.9,
+            target_bytes: None,
+            target_only_root: None,
+        };
+        batch.candidates[0].size_bytes = 0;
+        batch.candidates[1].size_bytes = 4096;
+        batch.candidates[2].size_bytes = 0;
+        assert_eq!(drop_zero_byte_candidates(&mut batch), 2);
+        assert_eq!(batch.candidates.len(), 1);
+        assert_eq!(batch.candidates[0].path, Path::new("/data/tmp/b/target"));
+        assert_eq!(drop_zero_byte_candidates(&mut batch), 0);
     }
 
     #[cfg(unix)]
