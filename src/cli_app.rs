@@ -885,7 +885,8 @@ struct TuneArgs {
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
 struct CheckArgs {
-    /// Path to evaluate (defaults to cwd).
+    /// Path to evaluate (defaults to cwd). Linux RAM-backed paths also require
+    /// a fresh, complete host RAM-scratch assessment without warnings.
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
     /// Desired minimum free percentage.
@@ -14329,6 +14330,72 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         }
     }
 
+    // bd-paeg: tmpfs free blocks are a size limit, not available RAM or swap.
+    // Reuse the live report-only assessment rather than a stale daemon notice.
+    // No attribution walk is needed, and disk-backed checks do no extra I/O.
+    let ram_scratch = crate::cli_ram_scratch::preflight(
+        platform.as_ref(),
+        &capacity.fs_type,
+        &capacity.mount_point,
+    );
+    if let Some(report) = &ram_scratch
+        && report.exit_code != 0
+    {
+        let incomplete = report.exit_code == 4;
+        let reason = if incomplete {
+            "ram_scratch_incomplete"
+        } else {
+            "ram_scratch_pressure"
+        };
+        match output_mode(cli) {
+            OutputMode::Human => {
+                println!(
+                    "sbh: {} is RAM-backed; {}. Inspect: sbh check --ram-scratch",
+                    capacity.mount_point.display(),
+                    if incomplete {
+                        "host RAM-scratch evidence is incomplete"
+                    } else {
+                        "host RAM-scratch pressure prevents a successful preflight"
+                    },
+                );
+                if let Some(assessment) = &report.assessment {
+                    println!(
+                        "  tmpfs occupied: {}; RAM available: {}; swap free: {}/{}; reasons: [{}]",
+                        format_bytes(assessment.tmpfs_used_bytes),
+                        format_bytes(assessment.memory.available_bytes),
+                        format_bytes(assessment.memory.swap_free_bytes),
+                        format_bytes(assessment.memory.swap_total_bytes),
+                        assessment.reasons.join(", "),
+                    );
+                }
+                for issue in report.issues.iter().take(5) {
+                    println!("  {issue}");
+                }
+            }
+            OutputMode::Json => {
+                write_json_line(&json!({
+                    "command": "check",
+                    "schema_version": 2,
+                    "status": if incomplete { "incomplete" } else { "warning" },
+                    "reason": reason,
+                    "path": check_path.to_string_lossy(),
+                    "mount_point": capacity.mount_point.to_string_lossy(),
+                    "free_bytes": capacity.available_bytes,
+                    "total_bytes": capacity.total_bytes,
+                    "free_pct": free_pct,
+                    "platform": capacity_platform_json(&capacity),
+                    "ram_scratch": report,
+                    "exit_code": report.exit_code,
+                }))?;
+            }
+        }
+        return Err(if incomplete {
+            CliError::Partial(reason.to_string())
+        } else {
+            CliError::User(reason.to_string())
+        });
+    }
+
     // Check 2.5: warn if state.json is stale (daemon may not be running).
     if let Ok(meta) = std::fs::metadata(&config.paths.state_file)
         && let Ok(modified) = meta.modified()
@@ -14433,6 +14500,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                                 "volume_role": capacity.volume_role.as_deref(),
                                 "free_excludes_purgeable": true,
                                 "platform": capacity_platform_json(&capacity),
+                                "ram_scratch": ram_scratch,
                                 "exit_code": 1,
                             });
                             write_json_line(&payload)?;
@@ -14474,6 +14542,8 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             "volume_role": capacity.volume_role.as_deref(),
             "free_excludes_purgeable": true,
             "platform": capacity_platform_json(&capacity),
+            // Fresh host evidence only for Linux RAM-backed check targets.
+            "ram_scratch": ram_scratch,
             // The daemon's forecast when `--predict` asked for one: the rate
             // object, or a string saying why none was usable.
             "forecast": forecast_json,

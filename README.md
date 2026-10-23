@@ -1445,6 +1445,16 @@ The tracker periodically prunes entries whose last deletion is older than `max_c
 
 Source: `src/daemon/loop_main.rs`
 
+### RAM-Backed Scratch Preflight
+
+On Linux, `sbh check /tmp --need 5G` also checks current host RAM-scratch
+pressure when the path is on tmpfs or ramfs. Plenty of free tmpfs blocks does
+not establish swap headroom. A complete warning exits 1; incomplete evidence
+exits 4. JSON includes the fresh `ram_scratch` report. Disk-backed checks skip
+the host collection, and the check does not authorize cleanup or relocation.
+Use `sbh check --ram-scratch` for the fuller report and top-entry attribution.
+See [RAM-scratch headroom](docs/ram-scratch.md) for the warning rules and limits.
+
 ### Agent-Session Scratch Inventory
 
 `sbh check --agent-scratch [PATH]` reports Claude session directories even when

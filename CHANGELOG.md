@@ -21,6 +21,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Changed
 
+- **Ordinary `sbh check PATH` surfaces RAM-scratch pressure** (bd-paeg).
+  Linux tmpfs/ramfs targets now require a fresh, bounded host assessment after
+  filesystem space checks pass. A complete RAM-scratch warning exits 1;
+  incomplete evidence exits 4 instead of reporting success. JSON includes the
+  assessment. Disk-backed checks avoid this collection, and no cleanup or
+  relocation policy changes.
 - **Lossless compression gets a bounded first chance before daemon cleanup**
   (bd-rxq5). Eligible btrfs filesystems at Yellow/Orange defer pressure scans,
   already queued deletions, and quarantine purges until the first compression

@@ -1,6 +1,7 @@
 //! Read-only RAM and agent-session scratch diagnostics through `sbh check`.
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
@@ -11,7 +12,7 @@ use storage_ballast_helper::monitor::ram_scratch::attribution::{
 use storage_ballast_helper::monitor::ram_scratch::{self, ScratchLimits, ScratchReport};
 use storage_ballast_helper::platform::pal::Platform;
 
-/// Extend the existing check command without changing ordinary disk checks.
+/// Extend the existing check command with explicit scratch inventory modes.
 pub fn augment(command: Command) -> Command {
     command
         .arg(Arg::new("ram_scratch").long("ram-scratch").action(ArgAction::SetTrue)
@@ -55,6 +56,74 @@ struct Report {
     host: ScratchReport,
     attribution_requested: bool,
     attribution: Vec<MountAttribution>,
+}
+
+/// Fresh, bounded host evidence for an ordinary check of a RAM-backed target.
+/// Disk-backed targets do not enumerate mounts or processes. This never walks
+/// scratch trees, changes daemon policy, or treats tmpfs capacity as RAM.
+pub fn preflight(
+    platform: &dyn Platform,
+    fs_type: &str,
+    mount_point: &Path,
+) -> Option<ScratchReport> {
+    #[cfg(target_os = "linux")]
+    {
+        preflight_with(fs_type, mount_point, || {
+            ram_scratch::inspect(platform, ScratchLimits::default())
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (platform, fs_type, mount_point);
+        None
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn preflight_with(
+    fs_type: &str,
+    mount_point: &Path,
+    collect: impl FnOnce() -> io::Result<ScratchReport>,
+) -> Option<ScratchReport> {
+    if !fs_type.eq_ignore_ascii_case("tmpfs") && !fs_type.eq_ignore_ascii_case("ramfs") {
+        return None;
+    }
+    let mut report = collect().unwrap_or_else(|error| ScratchReport {
+        schema: "sbh.ram_scratch.v1",
+        read_only: true,
+        supported: true,
+        complete: false,
+        scope: "visible mount and process namespaces; host meminfo; not cgroup headroom or swap attribution",
+        assessment: None,
+        issues: vec![format!("RAM scratch collection failed: {error}")],
+        exit_code: 4,
+    });
+    // A disappearing/changed mount must not turn an empty inventory into a
+    // healthy verdict for the path the caller actually asked about.
+    let target_observed = report.assessment.as_ref().is_some_and(|assessment| {
+        assessment
+            .mounts
+            .iter()
+            .any(|mount| Path::new(&mount.path) == mount_point)
+    });
+    if !target_observed {
+        report.issues.push(format!(
+            "checked RAM-backed mount {} was not observed in the host assessment",
+            mount_point.display()
+        ));
+    }
+    report.complete &= report.supported && target_observed && report.issues.is_empty();
+    report.exit_code = if report.complete {
+        i32::from(
+            report
+                .assessment
+                .as_ref()
+                .is_some_and(ram_scratch::ScratchAssessment::warning),
+        )
+    } else {
+        4
+    };
+    Some(report)
 }
 
 /// Dispatch only the explicit read-only scratch-report modes.
@@ -394,6 +463,135 @@ mod tests {
     use super::*;
     use storage_ballast_helper::monitor::ram_scratch::{ProcessSwap, ScratchMount, assess};
     use storage_ballast_helper::platform::pal::MemoryInfo;
+
+    fn preflight_fixture(swap_free: u64) -> ScratchReport {
+        let assessment = assess(
+            MemoryInfo {
+                total_bytes: 128 << 30,
+                available_bytes: 64 << 30,
+                swap_total_bytes: 64 << 30,
+                swap_free_bytes: swap_free,
+            },
+            vec![ScratchMount {
+                path: "/tmp".into(),
+                filesystem_id: 1,
+                total_bytes: 64 << 30,
+                used_bytes: 8 << 30,
+                available_bytes: 56 << 30,
+            }],
+            ProcessSwap {
+                bytes: 1 << 30,
+                inspected: 10,
+                unreadable: 0,
+                complete: true,
+            },
+        )
+        .unwrap();
+        ScratchReport {
+            schema: "sbh.ram_scratch.v1",
+            read_only: true,
+            supported: true,
+            complete: true,
+            scope: "fixture",
+            exit_code: i32::from(assessment.warning()),
+            assessment: Some(assessment),
+            issues: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn disk_preflight_never_collects_ram_or_process_evidence() {
+        for fs_type in ["ext4", "btrfs", "apfs", "overlay", "unknown"] {
+            assert!(
+                preflight_with(fs_type, Path::new("/tmp"), || {
+                    panic!("disk check must not enumerate host processes")
+                })
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn spacious_tmpfs_with_exhausted_swap_fails_preflight() {
+        let report =
+            preflight_with("tmpfs", Path::new("/tmp"), || Ok(preflight_fixture(0))).unwrap();
+        assert_eq!(report.exit_code, 1);
+        assert!(report.complete);
+        let assessment = report.assessment.as_ref().unwrap();
+        assert_eq!(assessment.mounts[0].available_bytes, 56 << 30);
+        assert_eq!(assessment.reasons, ["low_swap_tmpfs_exceeds_process_swap"]);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["exit_code"], 1);
+        assert_eq!(json["read_only"], true);
+        assert_eq!(json["assessment"]["memory"]["swap_free_bytes"], 0);
+    }
+
+    #[test]
+    fn healthy_tmpfs_preflight_uses_a_fresh_collector_result() {
+        let calls = std::cell::Cell::new(0);
+        for fs_type in ["tmpfs", "TMPFS"] {
+            let report = preflight_with(fs_type, Path::new("/tmp"), || {
+                calls.set(calls.get() + 1);
+                Ok(preflight_fixture(64 << 30))
+            })
+            .unwrap();
+            assert_eq!(report.exit_code, 0);
+            assert!(report.complete);
+            assert!(!report.assessment.unwrap().warning());
+        }
+        assert_eq!(calls.get(), 2, "preflight does not cache old observations");
+    }
+
+    #[test]
+    fn partial_ram_preflight_keeps_warning_and_never_reports_success() {
+        for swap_free in [0, 64 << 30] {
+            let report = preflight_with("tmpfs", Path::new("/tmp"), || {
+                let mut report = preflight_fixture(swap_free);
+                report.complete = false;
+                report
+                    .issues
+                    .push("process enumeration budget exhausted".into());
+                Ok(report)
+            })
+            .unwrap();
+            assert_eq!(report.exit_code, 4);
+            assert!(!report.complete);
+            assert_eq!(report.assessment.unwrap().warning(), swap_free == 0);
+        }
+    }
+
+    #[test]
+    fn failed_ram_collection_is_unknown_instead_of_a_healthy_check() {
+        let report = preflight_with("tmpfs", Path::new("/tmp"), || {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "meminfo denied",
+            ))
+        })
+        .unwrap();
+        assert_eq!(report.exit_code, 4);
+        assert!(report.assessment.is_none());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.contains("meminfo denied"))
+        );
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn absent_checked_mount_and_unmeasurable_ramfs_cannot_pass() {
+        for fs_type in ["tmpfs", "ramfs"] {
+            let report = preflight_with(fs_type, Path::new("/scratch"), || {
+                Ok(preflight_fixture(64 << 30))
+            })
+            .unwrap();
+            assert_eq!(report.exit_code, 4);
+            assert!(!report.complete);
+            assert!(report.issues.iter().any(|issue| issue.contains("/scratch")));
+        }
+    }
 
     #[cfg(unix)]
     #[test]

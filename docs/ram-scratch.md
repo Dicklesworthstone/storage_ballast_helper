@@ -15,6 +15,35 @@ start services, modify process state, create activity logs or compression
 journals, or change existing cleanup policy. Ordinary path/space/prediction
 checks are separate and cannot be combined with `--ram-scratch`.
 
+## Ordinary path preflight checks
+
+On Linux, `sbh check PATH` automatically collects a fresh host RAM-scratch
+assessment when PATH is on tmpfs or ramfs and its ordinary space checks pass.
+A tmpfs size limit can leave plenty of free blocks while the host has exhausted
+swap; that condition now prevents a successful preflight. Disk-backed paths do
+not trigger host mount or process collection.
+
+```sh
+sbh check /tmp --need 5G
+sbh --json check /dev/shm --target-free 15
+```
+
+The same warning predicates described below apply. A complete warning exits 1
+with reason `ram_scratch_pressure`; missing, inaccessible, or bounded-out
+evidence exits 4 with reason `ram_scratch_incomplete`. A disappeared target
+mount or unmeasurable ramfs occupancy is incomplete, never healthy. JSON includes
+the fresh `ram_scratch` report; a complete healthy RAM-backed check exits 0 and
+remains silent in human mode. `--allow-unprotected` applies only to the daemon's
+reclaim capability and does not bypass this host assessment.
+
+This preflight reads host counters and process status files, with a cooperative
+10-second deadline, at most 16,384 processes and 256 RAM-backed mount paths.
+It does not walk scratch directories, consult an old daemon warning, delete or
+relocate files, or raise a mount's daemon pressure level. `--need` still describes
+filesystem free space: a successful check is not a memory reservation or proof
+of cgroup headroom. Use `--ram-scratch` separately for the fuller report and
+optional top-entry attribution.
+
 ## What is measured
 
 The report sums **occupied filesystem blocks**, not the configured sizes of
