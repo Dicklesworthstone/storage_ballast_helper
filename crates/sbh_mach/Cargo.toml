@@ -13,6 +13,9 @@ libc = "0.2"
 mach2 = "0.7.0"
 proc_pidinfo = "0.1.4"
 
+[build-dependencies]
+cc = "1.8"
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"

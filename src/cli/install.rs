@@ -183,12 +183,19 @@ pub fn run_install_sequence_with_bundle(
         }
     }
 
-    // Step 2: Write config file.
+    // Step 2: Write config file. The ballast this install provisions is the
+    // ballast the daemon keeps: `--ballast-count`/`--ballast-size` go into the
+    // written config, not only into the one-off provisioning below. Before,
+    // the daemon provisioned the default 10 x 1 GiB per pool on its first
+    // start whatever the install was told (bd-ncxh).
     let config_path = &paths.config_file;
+    let mut config = opts.config.clone();
+    config.ballast.file_count = opts.ballast_count;
+    config.ballast.file_size_bytes = opts.ballast_size_bytes;
     if opts.dry_run {
         report.step_plan(format!("Write config: {}", config_path.display()));
     } else {
-        match write_config(&opts.config, config_path) {
+        match write_config(&config, config_path) {
             Ok(()) => {
                 report.step_ok(format!("Wrote config: {}", config_path.display()));
                 report.config_path = Some(config_path.clone());
@@ -631,6 +638,32 @@ mod tests {
                 .contains("Verified offline bundle artifact")),
             "report should include bundle integrity verification step"
         );
+    }
+
+    /// bd-ncxh: the ballast an install is told to provision is the ballast
+    /// the written config tells the daemon to keep.
+    #[test]
+    fn install_writes_the_requested_ballast_into_the_config() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.paths.config_file = tmp.path().join("config").join("config.toml");
+        config.paths.state_file = tmp.path().join("data").join("state.json");
+        config.paths.ballast_dir = tmp.path().join("ballast");
+        assert_ne!(config.ballast.file_count, 2);
+        let opts = InstallOptions {
+            config: config.clone(),
+            ballast_count: 2,
+            ballast_size_bytes: 1024 * 1024,
+            ballast_path: None,
+            dry_run: false,
+        };
+
+        let report = run_install_sequence(&opts);
+        assert!(report.success, "{report:?}");
+        let written: Config =
+            toml::from_str(&std::fs::read_to_string(&config.paths.config_file).unwrap()).unwrap();
+        assert_eq!(written.ballast.file_count, 2);
+        assert_eq!(written.ballast.file_size_bytes, 1024 * 1024);
     }
 
     #[test]

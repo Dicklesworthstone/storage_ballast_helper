@@ -50,6 +50,8 @@ pub enum EnvArea {
     Dashboard,
     /// Service integration.
     Service,
+    /// What the platform layer asks the operating system.
+    Platform,
     /// Release and update plumbing.
     Release,
     /// Test and CI hooks (honored only under `SBH_TEST_MODE=1` where noted).
@@ -64,6 +66,7 @@ impl EnvArea {
             Self::Output => "output",
             Self::Dashboard => "dashboard",
             Self::Service => "service",
+            Self::Platform => "platform",
             Self::Release => "release",
             Self::Test => "test",
         }
@@ -146,9 +149,10 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
         EnvArea::Service,
         "Leased target `sbh lease run` hands the leased command (default for `lease status`/`renew`)",
     ),
-    cfg(
+    var(
         "SBH_MACOS_QUERY_FOUNDATION_PURGEABLE",
-        "`platform.macos.query_foundation_purgeable`",
+        EnvArea::Platform,
+        "`0`/`false`/`no`/`off` stops the macOS purgeable-space query to Foundation; the estimate then comes from the APFS container inventory",
     ),
     cfg("SBH_BEHAVIOR_PRESET", "`pressure.behavior_preset`"),
     cfg("SBH_POLICY_KILL_SWITCH", "`policy.kill_switch`"),
@@ -197,6 +201,10 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
     cfg(
         "SBH_PRESSURE_BEHAVIOR_HYSTERESIS_SECS",
         "`pressure.behavior_hysteresis_secs`",
+    ),
+    cfg(
+        "SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS",
+        "`scanner.allow_source_tree_roots` (opt in to scan roots that contain Git work trees)",
     ),
     cfg("SBH_SCANNER_ENGINE", "`scanner.engine`"),
     cfg("SBH_SCANNER_EVENT_SOURCE", "`scanner.event_source`"),
@@ -328,11 +336,11 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
         "`telemetry.daemon_rss_hard_limit_bytes`",
     ),
     cfg("SBH_UPDATE_ENABLED", "`update.enabled`"),
-    cfg(
-        "SBH_UPDATE_BACKGROUND_REFRESH",
-        "`update.background_refresh`",
+    var(
+        "SBH_UPDATE_OPT_OUT",
+        EnvArea::Release,
+        "A true value turns `update.enabled` and `update.notices_enabled` off",
     ),
-    cfg("SBH_UPDATE_OPT_OUT", "`update.opt_out`"),
     cfg(
         "SBH_UPDATE_METADATA_CACHE_TTL_SECONDS",
         "`update.metadata_cache_ttl_seconds`",
@@ -373,9 +381,24 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
         "Where the TUI test artifacts are written",
     ),
     var(
+        "SBH_EXECUTABLE_REPLACEMENT_PROBE",
+        EnvArea::Test,
+        "Binary the Linux self-replacement test rewrites in place to check the service restart path (#35)",
+    ),
+    var(
+        "SBH_UPDATE_HANDOFF_CONTEXT_PROBE",
+        EnvArea::Test,
+        "Mode (`update` or another value) the update-handoff test runs its child process in, to check that a command's install-path intent is captured once (#35)",
+    ),
+    var(
         "SBH_TUI_ARTIFACT_FRAMES",
         EnvArea::Test,
         "Include rendered frame text in the TUI test artifacts",
+    ),
+    var(
+        "SBH_TEST_AGENT_SCRATCH_FIFO_CHILD",
+        EnvArea::Test,
+        "Set in the child process the agent-scratch FIFO-marker test re-runs itself in, so a marker read that blocks cannot hang the suite",
     ),
 ];
 
@@ -1135,6 +1158,13 @@ pub fn constants() -> Vec<ConstantDoc> {
         ),
         constant(
             "scanner",
+            "target_only_idle_hours",
+            scanner.target_only_idle_hours,
+            "Idle hours before a pure cargo target in a target-only root may go",
+            CONFIG,
+        ),
+        constant(
+            "scanner",
             "active_reference_cache_ttl_secs",
             scanner.active_reference_cache_ttl_secs,
             "Active-reference (open file) cache lifetime",
@@ -1156,6 +1186,13 @@ pub fn constants() -> Vec<ConstantDoc> {
         ),
         constant(
             "walker",
+            "WALK_BATCH_ENTRIES",
+            walker::WALK_BATCH_ENTRIES,
+            "Entries a worker sends the collector at once",
+            "src/scanner/walker.rs",
+        ),
+        constant(
+            "walker",
             "WORK_RECV_TIMEOUT",
             fmt_duration(walker::WORK_RECV_TIMEOUT),
             "Idle wait before a worker re-checks shutdown",
@@ -1165,14 +1202,21 @@ pub fn constants() -> Vec<ConstantDoc> {
             "walker",
             "SEND_TIMEOUT",
             fmt_duration(walker::SEND_TIMEOUT),
-            "Wait on a full channel before dropping the entry",
+            "Wait on a full channel between cancellation checks",
             "src/scanner/walker.rs",
         ),
         constant(
             "walker",
             "MAX_ENTRIES_PER_DIR",
             walker::MAX_ENTRIES_PER_DIR,
-            "Entries read per directory before it is cut off",
+            "Entries of one directory processed per pass; the window moves on each pass",
+            "src/scanner/walker.rs",
+        ),
+        constant(
+            "walker",
+            "MAX_NAMES_READ_PER_DIR",
+            walker::MAX_NAMES_READ_PER_DIR,
+            "Names read per directory per pass (marker and signal checks)",
             "src/scanner/walker.rs",
         ),
         constant(
@@ -1592,6 +1636,14 @@ pub fn constants() -> Vec<ConstantDoc> {
         ),
     ];
     rows.extend(daemon_constants());
+    #[cfg(unix)]
+    rows.push(constant(
+        "agent_scratch",
+        "DEFAULT_MIN_IDLE_DAYS",
+        crate::monitor::agent_scratch::DEFAULT_MIN_IDLE_DAYS,
+        "Days a session tree and transcript must be unchanged before check --agent-scratch calls it idle",
+        "src/monitor/agent_scratch.rs",
+    ));
     rows
 }
 
@@ -1683,6 +1735,13 @@ fn daemon_constants() -> Vec<ConstantDoc> {
             crate::daemon::policy::CANARY_REPROVE_SECS / 60,
             "Clean minutes an automatic Canary needs to return to the intended mode",
             "src/daemon/policy.rs",
+        ),
+        constant(
+            "daemon",
+            "TARGET_TIER_PASS_MINUTES",
+            crate::daemon::target_tier::PASS_INTERVAL.as_secs() / 60,
+            "Shortest gap between two target-only passes",
+            "src/daemon/target_tier.rs",
         ),
     ]
 }

@@ -434,28 +434,26 @@ pub fn watch(target: &Path, expected_process_group_id: i32, policy: LeasePolicy)
         let Some(inspection) = inspect_exact_target(target) else {
             return Ok(());
         };
-        let state = if inspection
+        let (state, reason) = if inspection
             .metadata
             .as_ref()
             .is_some_and(|metadata| metadata.process_group_id != expected_process_group_id)
         {
-            ActiveLeaseState::Invalid
+            (
+                ActiveLeaseState::Invalid,
+                "invalid: lease names another process group".to_string(),
+            )
         } else {
-            inspection.state
+            (inspection.state, inspection.detail)
         };
-        match state {
-            ActiveLeaseState::Active => thread::sleep(policy.watch_interval),
-            state => {
-                terminate_process_group(expected_process_group_id, target, state, policy)?;
-                return Err(SbhError::Runtime {
-                    details: format!(
-                        "active lease cancelled for {}: {}",
-                        target.display(),
-                        state_label(state)
-                    ),
-                });
-            }
+        if state == ActiveLeaseState::Active {
+            thread::sleep(policy.watch_interval);
+            continue;
         }
+        terminate_process_group(expected_process_group_id, target, &reason, policy)?;
+        return Err(SbhError::Runtime {
+            details: format!("active lease cancelled for {}: {reason}", target.display()),
+        });
     }
 }
 
@@ -463,14 +461,13 @@ pub fn watch(target: &Path, expected_process_group_id: i32, policy: LeasePolicy)
 fn terminate_process_group(
     process_group_id: i32,
     target: &Path,
-    state: ActiveLeaseState,
+    reason: &str,
     policy: LeasePolicy,
 ) -> Result<()> {
     let pgid = Pid::from_raw(process_group_id);
     eprintln!(
-        "[SBH-ACTIVE-LEASE] cancelling process group {process_group_id} for {}: {}",
+        "[SBH-ACTIVE-LEASE] cancelling process group {process_group_id} for {}: {reason}",
         target.display(),
-        state_label(state)
     );
     if let Err(error) = killpg(pgid, Signal::SIGTERM)
         && error != nix::errno::Errno::ESRCH
@@ -554,13 +551,26 @@ fn inspect_exact_target(target: &Path) -> Option<ActiveLeaseInspection> {
         });
     }
 
-    let state = current_state(&metadata).unwrap_or(ActiveLeaseState::Invalid);
+    let (state, detail) = state_with_detail(current_state(&metadata));
     Some(ActiveLeaseInspection {
         leased_target: target.to_path_buf(),
         state,
         metadata: Some(metadata),
-        detail: state_label(state).to_string(),
+        detail,
     })
+}
+
+/// A failed inspection is Invalid, and keeps its error: "invalid" alone
+/// cannot say why the watchdog stopped a live build.
+#[cfg(unix)]
+fn state_with_detail(state: Result<ActiveLeaseState>) -> (ActiveLeaseState, String) {
+    match state {
+        Ok(state) => (state, state_label(state).to_string()),
+        Err(error) => (
+            ActiveLeaseState::Invalid,
+            format!("invalid: target inspection failed: {error}"),
+        ),
+    }
 }
 
 #[cfg(unix)]
@@ -878,9 +888,7 @@ fn walk_allocated_bytes(
         observe(&path, AllocationWalkStage::BeforeMetadata);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(error) if path != root && error.kind() == std::io::ErrorKind::NotFound => {
-                continue;
-            }
+            Err(error) if path != root && unmeasurable_descendant(&error) => continue,
             Err(error) => return Err(SbhError::io(&path, error)),
         };
         if metadata.file_type().is_symlink() {
@@ -891,9 +899,7 @@ fn walk_allocated_bytes(
             observe(&path, AllocationWalkStage::BeforeReadDir);
             let children = match fs::read_dir(&path) {
                 Ok(children) => children,
-                Err(error) if path != root && error.kind() == std::io::ErrorKind::NotFound => {
-                    continue;
-                }
+                Err(error) if path != root && unmeasurable_descendant(&error) => continue,
                 Err(error) => return Err(SbhError::io(&path, error)),
             };
             for entry in children {
@@ -906,6 +912,25 @@ fn walk_allocated_bytes(
         }
     }
     Ok(total)
+}
+
+/// A descendant the allocation walk cannot measure, which is not evidence that
+/// the lease is invalid (bd-am3p): it vanished (bd-n71n), changed type under
+/// the walk (a directory replaced by a file, or an ancestor replaced), or
+/// cannot be read (permission tests leave mode-000 directories under
+/// `target/tmp`). Its bytes go uncounted this round. Only a change of the
+/// target's own identity invalidates a lease, and that is checked before and
+/// after the walk; the emergency-reserve check does not depend on the walk.
+/// Every other error still stops the measurement, as does any error on the
+/// target itself.
+#[cfg(unix)]
+fn unmeasurable_descendant(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::PermissionDenied
+    )
 }
 
 fn unix_seconds() -> Result<u64> {
@@ -1072,30 +1097,127 @@ mod tests {
         assert!(allocated_bytes(&root).is_err());
     }
 
+    /// bd-am3p: a directory replaced by a file between stat and open
+    /// (ENOTDIR) is a change under the walk, not an invalid lease.
     #[test]
-    fn allocation_walk_does_not_swallow_other_io_errors() {
+    fn a_directory_replaced_by_a_file_does_not_invalidate_allocation_walks() {
         let fixture = tempfile::tempdir().unwrap();
-        let child = fixture.path().join("changing-directory");
+        let root = fixture.path().canonicalize().unwrap();
+        let target = root.join("leased");
+        let lease = ActiveLease::acquire_with_policy(
+            std::slice::from_ref(&root),
+            &target,
+            Duration::from_secs(30),
+            1024 * 1024,
+            test_policy(),
+        )
+        .unwrap();
+        let child = target.join("changing-directory");
         fs::create_dir(&child).unwrap();
         fs::write(child.join("payload.o"), b"preserved payload").unwrap();
-        let retained = fixture.path().join("retained-directory");
+        let retained = root.join("retained-directory");
         assert!(!retained.exists());
         let mut changed = false;
-        let result = walk_allocated_bytes(fixture.path(), |path, stage| {
-            if path == child && stage == AllocationWalkStage::BeforeReadDir {
-                fs::rename(&child, &retained).unwrap();
-                fs::write(&child, b"now a file").unwrap();
-                changed = true;
-            }
-        });
-        assert!(changed);
-        let SbhError::Io { source, .. } = result.unwrap_err() else {
-            panic!("the real directory-open failure must remain an I/O error");
-        };
-        assert_ne!(source.kind(), std::io::ErrorKind::NotFound);
+        let state = state_with_allocation_walk(lease.metadata(), |target| {
+            walk_allocated_bytes(target, |path, stage| {
+                if path == child && stage == AllocationWalkStage::BeforeReadDir {
+                    fs::rename(&child, &retained).unwrap();
+                    fs::write(&child, b"now a file").unwrap();
+                    changed = true;
+                }
+            })
+        })
+        .expect("a descendant that changed type must not fail the walk");
+        assert!(changed, "the interleaving must actually execute");
+        assert_eq!(state, ActiveLeaseState::Active);
         assert_eq!(
             fs::read(retained.join("payload.o")).unwrap(),
             b"preserved payload"
+        );
+    }
+
+    /// bd-am3p: permission tests leave mode-000 directories in the build's
+    /// own target; a part the walk cannot read is not an invalid lease.
+    #[test]
+    fn an_unreadable_descendant_does_not_invalidate_allocation_walks() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let target = root.join("leased");
+        let lease = ActiveLease::acquire_with_policy(
+            std::slice::from_ref(&root),
+            &target,
+            Duration::from_secs(30),
+            1024 * 1024,
+            test_policy(),
+        )
+        .unwrap();
+        let stable = target.join("stable.o");
+        fs::write(&stable, vec![3_u8; 64 * 1024]).unwrap();
+        let locked = target.join("tmp/permission-test");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("inside.o"), b"unreadable to the walk").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let measured = allocated_bytes(&target);
+        let state = current_state(lease.metadata());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Root reads a mode-000 directory anyway; either way the walk succeeds.
+        let measured = measured.expect("an unreadable descendant must not fail the walk");
+        assert!(measured >= fs::metadata(&stable).unwrap().blocks() * 512);
+        assert_eq!(state.unwrap(), ActiveLeaseState::Active);
+        assert_eq!(
+            fs::read(locked.join("inside.o")).unwrap(),
+            b"unreadable to the walk"
+        );
+    }
+
+    /// Only vanish, change-of-type and permission errors on descendants are
+    /// tolerated; anything else (EIO, a stale handle, ...) still stops the
+    /// measurement, and so does any error on the target itself.
+    #[test]
+    fn other_descendant_errors_still_stop_the_allocation_walk() {
+        use nix::errno::Errno;
+        for errno in [Errno::ENOENT, Errno::ENOTDIR, Errno::EACCES, Errno::EPERM] {
+            assert!(
+                unmeasurable_descendant(&std::io::Error::from_raw_os_error(errno as i32)),
+                "{errno} is a part the walk cannot measure"
+            );
+        }
+        for errno in [Errno::EIO, Errno::ESTALE, Errno::ELOOP, Errno::ENAMETOOLONG] {
+            assert!(
+                !unmeasurable_descendant(&std::io::Error::from_raw_os_error(errno as i32)),
+                "{errno} must still stop the walk"
+            );
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let file_target = fixture.path().join("not-a-directory");
+        fs::write(&file_target, b"x").unwrap();
+        assert!(allocated_bytes(&fixture.path().join("missing")).is_err());
+        assert!(walk_allocated_bytes(&file_target.join("child"), |_, _| {}).is_err());
+    }
+
+    #[test]
+    fn a_failed_inspection_is_invalid_and_keeps_its_error_for_the_kill_log() {
+        let failed = state_with_detail(Err(SbhError::io(
+            Path::new("/leased/target/debug/obj"),
+            std::io::Error::new(std::io::ErrorKind::NotADirectory, "not a directory"),
+        )));
+        assert_eq!(failed.0, ActiveLeaseState::Invalid);
+        assert!(failed.1.starts_with("invalid"), "{}", failed.1);
+        assert!(
+            failed.1.contains("/leased/target/debug/obj"),
+            "{}",
+            failed.1
+        );
+        assert!(failed.1.contains("not a directory"), "{}", failed.1);
+        assert_eq!(
+            state_with_detail(Ok(ActiveLeaseState::Active)),
+            (
+                ActiveLeaseState::Active,
+                state_label(ActiveLeaseState::Active).to_string()
+            )
         );
     }
 

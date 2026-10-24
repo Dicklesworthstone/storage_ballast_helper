@@ -140,6 +140,12 @@ pub struct ScenarioConfig {
     pub thresholds: (f64, f64, f64, f64),
     pub ballast_files: usize,
     pub ballast_file_bytes: u64,
+    /// Extra lines for the `[ballast]` table (e.g. `auto_provision = false`).
+    pub ballast_toml: String,
+    /// Extra lines for the `[scanner]` table.
+    pub scanner_toml: String,
+    /// Extra lines for the `[telemetry]` table.
+    pub telemetry_toml: String,
     /// Scanner engine: `v2` (default) or the `v1` rollback engine.
     pub engine: &'static str,
     /// `scanner.dry_run`: plan deletions without removing anything.
@@ -172,6 +178,9 @@ impl Default for ScenarioConfig {
             // smallest reserve the daemon accepts.
             ballast_files: 1,
             ballast_file_bytes: 1_048_576,
+            ballast_toml: String::new(),
+            scanner_toml: String::new(),
+            telemetry_toml: String::new(),
             engine: "v2",
             dry_run: false,
             metrics_enabled: true,
@@ -211,7 +220,7 @@ state_file = {state:?}
 [ballast]
 file_count = {ballast_files}
 file_size_bytes = {ballast_bytes}
-[pressure]
+{ballast_extra}[pressure]
 poll_interval_ms = {poll}
 maintenance_interval_secs = {maint}
 green_min_free_pct = {green}
@@ -219,6 +228,7 @@ yellow_min_free_pct = {yellow}
 orange_min_free_pct = {orange}
 red_min_free_pct = {red}
 [scanner]
+include_user_temp_dir = false
 engine = {engine:?}
 dry_run = {dry_run}
 cross_devices = {cross}
@@ -229,16 +239,19 @@ min_rescan_interval_secs = {rescan}
 max_scan_duty_cycle_pct = {duty}
 max_depth = 6
 parallelism = 2
-[telemetry]
+{scanner_extra}[telemetry]
 cpu_budget_pct = {budget}
 metrics_enabled = {metrics}
-{notifications}{extra}",
+{telemetry_extra}{notifications}{extra}",
         ballast = data.join("ballast").display().to_string(),
         jsonl = data.join("activity.jsonl").display().to_string(),
         sqlite = data.join("activity.sqlite3").display().to_string(),
         state = data.join("state.json").display().to_string(),
         ballast_files = scenario.ballast_files,
         ballast_bytes = scenario.ballast_file_bytes,
+        ballast_extra = scenario.ballast_toml,
+        scanner_extra = scenario.scanner_toml,
+        telemetry_extra = scenario.telemetry_toml,
         poll = scenario.poll_interval_ms,
         maint = scenario.maintenance_interval_secs,
         engine = scenario.engine,
@@ -310,6 +323,9 @@ impl DaemonRun {
         if let Some(table) = injected {
             command
                 .env("SBH_TEST_MODE", "1")
+                // macOS GUI terminals export XPC_SERVICE_NAME to every child; the
+                // daemon would read it as launchd and refuse injected statistics.
+                .env_remove("XPC_SERVICE_NAME")
                 .env("SBH_TEST_FS_STATS", table);
         }
         let child = command.spawn().expect("spawn sbh daemon");
@@ -386,6 +402,7 @@ impl DaemonRun {
 
     /// The daemon's CPU time right now from the kernel (user + system), so
     /// a budget assertion does not depend on the 30 s state-write cadence.
+    #[cfg(target_os = "linux")]
     #[allow(clippy::cast_precision_loss)]
     pub fn proc_cpu_secs(&self) -> f64 {
         let stat = fs::read_to_string(format!("/proc/{}/stat", self.child.id())).unwrap();
@@ -397,6 +414,25 @@ impl DaemonRun {
             .flatten()
             .unwrap_or(100);
         ticks as f64 / hz as f64
+    }
+
+    /// No `/proc` on macOS: `ps` reports user + system CPU time as
+    /// `[[dd-]hh:]mm:ss.cc`.
+    #[cfg(not(target_os = "linux"))]
+    pub fn proc_cpu_secs(&self) -> f64 {
+        let output = Command::new("ps")
+            .args(["-o", "cputime=", "-p", &self.child.id().to_string()])
+            .output()
+            .expect("run ps for the daemon's CPU time");
+        let text = String::from_utf8_lossy(&output.stdout);
+        let text = text.trim();
+        let (days, clock) = text.split_once('-').map_or((0.0, text), |(days, clock)| {
+            (days.parse::<f64>().expect("ps cputime days"), clock)
+        });
+        let clock_secs = clock.split(':').fold(0.0, |total: f64, part| {
+            total.mul_add(60.0, part.parse::<f64>().expect("ps cputime field"))
+        });
+        days.mul_add(86_400.0, clock_secs)
     }
 
     pub fn wall_secs(&self) -> f64 {
@@ -745,6 +781,7 @@ fn test_mode_daemon_refuses_to_start_under_a_service_manager() {
         .arg(&config_path)
         .arg("daemon")
         .env("SBH_TEST_MODE", "1")
+        .env_remove("XPC_SERVICE_NAME")
         .env("SBH_TEST_FS_STATS", r#"{"mounts":[]}"#)
         .env("INVOCATION_ID", "e2e-fake-unit")
         .output()
@@ -771,6 +808,9 @@ fn test_mode_daemon_refuses_to_start_under_a_service_manager() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn injected_orange_mount_reclaims_only_the_stale_target() {
+    if !common::sees_every_process() {
+        return;
+    }
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
     // The daemon polls its configured roots plus `/`, so the rootless
@@ -873,6 +913,7 @@ fn injected_orange_mount_reclaims_only_the_stale_target() {
             .arg(&run.config_path)
             .args(args)
             .env("SBH_TEST_MODE", "1")
+            .env_remove("XPC_SERVICE_NAME")
             .env("SBH_TEST_FS_STATS", &table)
             .env("SBH_OUTPUT_FORMAT", "human")
             .output()
@@ -1317,17 +1358,22 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
     // bd-rc-master-ajg1.7.4: the daemon's own files sit on the fixture mount,
     // which is a scan root's mount at injected Orange: state.json says so,
     // the JSONL is mirrored to the RAM fallback while it stays pressured,
-    // and the mirror carries this run's lines.
+    // and the mirror carries this run's lines. A test host whose own RAM is
+    // short (swap nearly full, or /dev/shm under a fifth free) keeps the
+    // mirror off and says why instead (bd-ffjj).
     run.wait_until(
         "the logging placement in state.json",
         Duration::from_secs(40),
         |run| {
-            run.state()
-                .and_then(|state| state.get("logging").cloned())
-                .is_some_and(|logging| logging["mirroring"] == Value::Bool(true))
+            run.stderr_count("(not mirroring:") > 0
+                || run
+                    .state()
+                    .and_then(|state| state.get("logging").cloned())
+                    .is_some_and(|logging| logging["mirroring"] == Value::Bool(true))
         },
     )
     .unwrap_or_else(|e| panic!("[{engine}] {e}"));
+    let ram_short = run.stderr_count("(not mirroring:") > 0;
     let state = run.state().unwrap();
     let logging = &state["logging"];
     assert_eq!(
@@ -1351,21 +1397,30 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
         "{}",
         run.stderr()
     );
-    assert!(
-        run.stderr_count("mirror_to_ram=true") >= 1,
-        "{}",
-        run.stderr()
-    );
-    let run_id = state["run_id"].as_str().unwrap().to_string();
-    let mirror = storage_ballast_helper::logger::jsonl::ram_fallback_path();
-    let mirrored = fs::read_to_string(&mirror).unwrap_or_default();
-    assert!(
-        mirrored
-            .lines()
-            .any(|line| line.contains(&run_id) && line.contains("artifact_delete")),
-        "[{engine}] no mirrored artifact_delete line for run {run_id} in {}",
-        mirror.display()
-    );
+    if ram_short {
+        assert_eq!(
+            logging["mirroring"],
+            Value::Bool(false),
+            "[{engine}] {logging}"
+        );
+        eprintln!("[{engine}] this host's RAM is short, so the log mirror stayed off");
+    } else {
+        assert!(
+            run.stderr_count("mirror_to_ram=true") >= 1,
+            "{}",
+            run.stderr()
+        );
+        let run_id = state["run_id"].as_str().unwrap().to_string();
+        let mirror = storage_ballast_helper::logger::jsonl::ram_fallback_path();
+        let mirrored = fs::read_to_string(&mirror).unwrap_or_default();
+        assert!(
+            mirrored
+                .lines()
+                .any(|line| line.contains(&run_id) && line.contains("artifact_delete")),
+            "[{engine}] no mirrored artifact_delete line for run {run_id} in {}",
+            mirror.display()
+        );
+    }
 
     let status = run.stop();
     assert!(status.success(), "[{engine}] {status}");
@@ -1394,6 +1449,9 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
 /// Scenario `orange-reclaim` on the default v2 engine.
 #[test]
 fn orange_reclaim_deletes_the_stale_target_and_keeps_the_guarded_siblings() {
+    if !common::sees_every_process() {
+        return;
+    }
     let deleted = run_orange_reclaim("v2");
     assert!(
         deleted.iter().any(|n| n == "stale-proj/target"),
@@ -1401,10 +1459,73 @@ fn orange_reclaim_deletes_the_stale_target_and_keeps_the_guarded_siblings() {
     );
 }
 
+/// bd-1ouz: a user-scoped macOS daemon cannot see other users' processes, so
+/// the v2 engine reclaims nothing, as v1 does: the stale target that
+/// `orange_reclaim_deletes_the_stale_target_and_keeps_the_guarded_siblings`
+/// deletes as root survives a forced pass at Orange here. Only a non-root
+/// macOS run has the gap; elsewhere this skips and says so.
+#[test]
+fn a_user_scope_daemon_without_full_visibility_reclaims_nothing_in_v2() {
+    if !common::other_users_hidden() {
+        eprintln!("skipped: needs a non-root macOS run, where the visibility gap is real");
+        return;
+    }
+    let dir = scratch();
+    let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
+    let created = Instant::now();
+    let table = injected_table(&[
+        (dir.path(), 1_000_000_000_000, 110_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![fixtures.root.clone()],
+        min_file_age_minutes: 1,
+        engine: "v2",
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    let gate = created + Duration::from_secs(66);
+    run.wait_until("the age gate", Duration::from_secs(80), |_| {
+        fixtures.touch_fresh();
+        Instant::now() >= gate
+    })
+    .unwrap();
+    let passes = run.stderr_count("[SBH-SCANNER] scan complete");
+    run.signal("-USR1");
+    run.wait_until(
+        "a pass after the age gate",
+        Duration::from_secs(60),
+        |run| {
+            fixtures.touch_fresh();
+            run.stderr_count("[SBH-SCANNER] scan complete") > passes
+        },
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_secs(10));
+    assert!(run.deleted_paths().is_empty(), "{:?}", run.deleted_paths());
+    assert!(
+        fixtures.stale_target.exists(),
+        "the stale target was reclaimed"
+    );
+    // The pass ran at Orange and found nothing it may reclaim: the veto, not
+    // the age gate or the pressure level, kept the target (with the gap
+    // ignored, this same scenario deletes it).
+    assert!(
+        run.stderr_count("no reclaimable progress this pass") > 0,
+        "{}",
+        run.stderr()
+    );
+    let status = run.stop();
+    assert!(status.success(), "{status}");
+}
+
 /// Scenario `engines`: the v1 rollback engine reclaims exactly what v2
 /// reclaims on the same fixtures (both daemons run concurrently).
 #[test]
 fn engine_v1_reclaims_the_same_set_as_v2_at_orange() {
+    if !common::sees_every_process() {
+        return;
+    }
     let v2 = std::thread::spawn(|| run_orange_reclaim("v2"));
     let v1 = run_orange_reclaim("v1");
     let v2 = v2.join().expect("v2 run");
@@ -1628,6 +1749,210 @@ fn daemon_restart_retains_observed_credit_and_absent_history_releases_partial_re
     assert!(unobserved.stop().success());
 }
 
+/// A mount on the same filesystem as the ballast pool's mount is folded onto
+/// it. When that alias is the pressured mount, release credit must be kept
+/// under the pool's own mount: the key the state file saves and a restart
+/// restores. Keyed by the alias instead, each state write reset the credit
+/// and a restart released the same shortfall again.
+#[test]
+fn alias_mount_release_credit_survives_state_writes_and_restart() {
+    let dir = scratch();
+    let keeper = dir.path();
+    let alias = keeper.join("alias-mount");
+    let scan_root = alias.join("scan-root");
+    fs::create_dir_all(&scan_root).unwrap();
+    let (root, total, free, readonly) = quiet_root_mount();
+    let after_release = 80_000_000_000 + 5 * 1_048_576;
+    // One filesystem seen at two mount points: both report the same space.
+    let shared = |free: u64, series: &[(u64, u64)]| {
+        [keeper, alias.as_path()].map(|mount| {
+            mount_entry(mount, 1_000_000_000_000, free, false, series).replacen(
+                '{',
+                r#"{"device":"/dev/sbh-e2e-shared","#,
+                1,
+            )
+        })
+    };
+    let [keeper_first, alias_first] = shared(
+        500_000_000_000,
+        &[(12, 80_000_000_000), (13, after_release)],
+    );
+    let first_pressure = table_of(&[
+        keeper_first,
+        alias_first,
+        mount_entry(root, total, free, readonly, &[]),
+    ]);
+    let [keeper_sustained, alias_sustained] = shared(after_release, &[]);
+    let sustained_pressure = table_of(&[
+        keeper_sustained,
+        alias_sustained,
+        mount_entry(root, total, free, readonly, &[]),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![scan_root],
+        ballast_files: 5,
+        extra_toml: "[pressure.controller]\nkp = 0.01\nki = 0.0\nkd = 0.0\nkf = 0.0\n[pressure.prediction]\nenabled = false\n".to_string(),
+        ..ScenarioConfig::default()
+    };
+    let mut original = DaemonRun::spawn(dir.path(), &scenario, Some(&first_pressure));
+    wait_for_pool_history(&mut original, keeper, 2, 3);
+    original
+        .wait_until(
+            "twenty seconds of Red on both mounts across several state writes",
+            Duration::from_secs(30),
+            |run| run.wall_secs() >= 20.0,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(original.events_of("ballast_release").len(), 3);
+    assert!(original.stop().success());
+
+    let mut restarted = DaemonRun::spawn(dir.path(), &scenario, Some(&sustained_pressure));
+    wait_for_pool_history(&mut restarted, keeper, 2, 3);
+    restarted
+        .wait_until(
+            "eight seconds of sustained Red without extra release",
+            Duration::from_secs(15),
+            |run| run.wall_secs() >= 8.0,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(restarted.events_of("ballast_release").len(), 3);
+    assert_eq!(ballast_files_in(&restarted.data_dir.join("ballast")), 2);
+    assert!(restarted.stop().success());
+}
+
+/// bd-7spb: after a release a large volume can sit at Yellow for days with
+/// nothing left to reclaim. Replenishing only after a Green cooldown left its
+/// reserve empty for good; an idle Yellow mount now rebuilds it (provisioning
+/// still keeps free space above the Orange floor).
+#[test]
+fn an_idle_yellow_mount_rebuilds_an_empty_reserve() {
+    let dir = scratch();
+    let scan_root = dir.path().join("scan-root");
+    fs::create_dir(&scan_root).unwrap();
+    let mount = dir.path();
+    // 1 TB at 16% free: Yellow (green 20, yellow 14), far above Orange (10).
+    let table = injected_table(&[
+        (mount, 1_000_000_000_000, 160_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![scan_root],
+        ballast_files: 3,
+        // An empty pool from the start; the refill is all the daemon's doing.
+        ballast_toml: "auto_provision = false\nreplenish_cooldown_minutes = 0\n".to_string(),
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    let pool = run.data_dir.join("ballast");
+    assert_eq!(
+        ballast_files_in(&pool),
+        0,
+        "auto_provision = false starts empty"
+    );
+    run.wait_until(
+        "a ballast file replenished at Yellow",
+        Duration::from_secs(90),
+        |_| ballast_files_in(&pool) >= 1,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        run.stderr().contains("idle -> ") || run.stderr().contains("reclaim -> idle"),
+        "the mount went idle before refilling"
+    );
+    assert!(run.stop().success());
+}
+
+/// bd-os02: a pass cut short in the priority pre-scan skipped the pass
+/// accounting, so the empty-pass cooldown never armed and a large, busy root
+/// was rescanned back to back at the CPU-budget ceiling with nothing to
+/// reclaim. Such passes are now paced by `min_rescan_interval_secs`.
+///
+/// Since bd-6ydh the pre-scan stops at its share of the pass's CPU and the
+/// walk spends the rest, so a budget-cut pass usually ends in the walk
+/// (`(timed out)`) rather than in the pre-scan (`(timed out in the priority
+/// pre-scan)`). Both kinds count: every budget-cut pass must be paced.
+#[test]
+fn prescan_timeouts_on_a_busy_root_are_paced_by_the_rescan_interval() {
+    if common::other_users_hidden() {
+        // Vetoed candidates never pay for a size probe, so the pre-scan has
+        // nothing slow to time out on.
+        eprintln!("skipped: this user cannot see every process");
+        return;
+    }
+    let dir = scratch();
+    let root = dir.path().join("busy-root");
+    fs::create_dir(&root).unwrap();
+    // Far more than one CPU-second of pre-scan can visit: like the test and
+    // agent directories in a busy $TMPDIR, each entry has a small tree the
+    // pre-scan's depth-2/3 sweep must read.
+    for i in 0..8_000 {
+        for j in 0..4 {
+            for k in 0..3 {
+                fs::create_dir_all(root.join(format!("d{i:05}/s{j}/t{k}"))).unwrap();
+            }
+        }
+    }
+    let table = injected_table(&[
+        (dir.path(), 1_000_000_000_000, 500_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![root.clone()],
+        maintenance_interval_secs: 3600,
+        min_rescan_interval_secs: 20,
+        duty_cycle_pct: 50,
+        // As on mac-studio: the daemon CPU bucket, not the wall clock, cuts
+        // each pass short inside the pre-scan.
+        cpu_budget_pct: 25,
+        telemetry_toml: "cpu_budget_burst_secs = 1.0\n".to_string(),
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    // Keep the root dirty, as agents writing to $TMPDIR do.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut n = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = fs::write(root.join("churn.txt"), n.to_string());
+                n += 1;
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        })
+    };
+    let budget_cut_passes = |run: &DaemonRun| {
+        run.stderr()
+            .lines()
+            .filter(|line| line.contains("scan complete:") && line.contains("(timed out"))
+            .count()
+    };
+    run.wait_until(
+        "the first budget-cut pass",
+        Duration::from_secs(60),
+        |run| budget_cut_passes(run) >= 1,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let first = budget_cut_passes(&run);
+    let window_start = run.wall_secs();
+    run.wait_until("a 60 s window", Duration::from_secs(80), |run| {
+        run.wall_secs() >= window_start + 60.0
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    let in_window = budget_cut_passes(&run) - first;
+    eprintln!("budget-cut passes in the 60 s window: {in_window}");
+    // A 20 s interval allows at most four in 60 s. Unpaced, the passes are
+    // limited only by the CPU bucket refilling one CPU-second (~6.5 s at 25%),
+    // about nine in 60 s.
+    assert!(
+        in_window <= 4,
+        "{in_window} budget-cut passes in 60 s; expected pacing by the 20 s interval"
+    );
+    assert!(run.stop().success());
+}
+
 /// Scenario `forced-scan`: SIGUSR1 at Green produces a forced
 /// `scan_complete` within two seconds and deletes nothing behind the
 /// default age gate.
@@ -1642,6 +1967,9 @@ fn sigusr1_forces_a_green_scan_within_two_seconds() {
     ]);
     let scenario = ScenarioConfig {
         root_paths: vec![fixtures.root],
+        // Gate above the fixtures' 5 h mtimes: APFS moves the birth time back
+        // with the mtime, so it cannot be relied on to keep them young.
+        min_file_age_minutes: 6 * 60,
         ..ScenarioConfig::default()
     };
     let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
@@ -1792,6 +2120,9 @@ fn green_event_scopes_the_pass_to_the_changed_project() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn green_quarantine_holds_the_stale_target_and_orange_drains_it_first() {
+    if !common::sees_every_process() {
+        return;
+    }
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
     let fixture_mount = dir.path().to_path_buf();
@@ -1983,6 +2314,9 @@ fn green_quarantine_holds_the_stale_target_and_orange_drains_it_first() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn recreating_a_deleted_target_under_a_live_process_is_labelled_regret() {
+    if !common::sees_every_process() {
+        return;
+    }
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
     let fixture_mount = dir.path().to_path_buf();
@@ -2070,6 +2404,7 @@ fn recreating_a_deleted_target_under_a_live_process_is_labelled_regret() {
         .arg(&run.config_path)
         .args(["--json", "explain", "--id", &decision_id])
         .env("SBH_TEST_MODE", "1")
+        .env_remove("XPC_SERVICE_NAME")
         .env("SBH_TEST_FS_STATS", &table)
         .output()
         .expect("run sbh explain");
@@ -2117,6 +2452,7 @@ fn recreating_a_deleted_target_under_a_live_process_is_labelled_regret() {
         .arg(&stale_path)
         .args(["--level", "2"])
         .env("SBH_TEST_MODE", "1")
+        .env_remove("XPC_SERVICE_NAME")
         .env("SBH_TEST_FS_STATS", &table)
         .output()
         .expect("run sbh explain --why-not");
@@ -2143,6 +2479,9 @@ fn recreating_a_deleted_target_under_a_live_process_is_labelled_regret() {
 /// the next maintenance pass.
 #[test]
 fn sighup_reload_scans_the_new_root_and_relogs_the_matrix() {
+    if !common::sees_every_process() {
+        return;
+    }
     let dir = scratch();
     let root_a = dir.path().join("root");
     fs::create_dir_all(&root_a).unwrap();
@@ -2779,14 +3118,19 @@ fn cpu_budget_bounds_an_expensive_scanner_at_green() {
 /// check exits 0 and reports the forecast as unknown instead of reusing
 /// the stale number.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn check_predict_reads_the_daemon_forecast_and_refuses_stale_state() {
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 4096);
     let fixture_mount = dir.path().to_path_buf();
-    // 1 TB volume: 50% free, falling 2.5% every 4 s (6.25 GB/s) from t=4 s
-    // down to 5% (below red) at t=72 s, then holding there.
-    let series: Vec<(u64, u64)> = (1..=18)
-        .map(|i| (i * 4, 500_000_000_000u64.saturating_sub(i * 25_000_000_000)))
+    // 1 TB volume: 50% free, falling 0.8% every 4 s (2 GB/s) from t=4 s
+    // down to 5.2% (below the 6% red) at t=224 s, then holding there. The
+    // fall must outlast the 150 s wait below: once the mount is past red there
+    // is no horizon left to publish, and under a loaded e2e run the old
+    // series (red at ~70 s) passed red before the daemon's forecast had warmed
+    // up (bd-zvmn).
+    let series: Vec<(u64, u64)> = (1..=56)
+        .map(|i| (i * 4, 500_000_000_000u64.saturating_sub(i * 8_000_000_000)))
         .collect();
     let (root, root_total, root_free, root_ro) = quiet_root_mount();
     let table = table_of(&[
@@ -2828,6 +3172,7 @@ fn check_predict_reads_the_daemon_forecast_and_refuses_stale_state() {
             .arg(&run.config_path)
             .args(args)
             .env("SBH_TEST_MODE", "1")
+            .env_remove("XPC_SERVICE_NAME")
             .env("SBH_TEST_FS_STATS", &table)
             .env("SBH_OUTPUT_FORMAT", "human")
             .output()
@@ -2873,6 +3218,7 @@ fn check_predict_reads_the_daemon_forecast_and_refuses_stale_state() {
         .arg(dir.path().join("config.toml"))
         .args(["--json", "check", "--predict", "30", &path])
         .env("SBH_TEST_MODE", "1")
+        .env_remove("XPC_SERVICE_NAME")
         .env("SBH_TEST_FS_STATS", &table)
         .output()
         .expect("run sbh check");
@@ -2978,6 +3324,9 @@ fn orange_pressure_with_only_unclear_candidates_backs_off_instead_of_replaying()
 /// paces an unconfirmed one like an empty pass.
 #[test]
 fn dry_run_orange_pressure_backs_off_after_the_first_dispatch() {
+    if !common::sees_every_process() {
+        return;
+    }
     let scratch_base = non_temp_scratch_base();
     fs::create_dir_all(&scratch_base).unwrap();
     let dir = tempfile::tempdir_in(&scratch_base).unwrap();
@@ -2999,25 +3348,30 @@ fn dry_run_orange_pressure_backs_off_after_the_first_dispatch() {
         run.stderr_count("dry-run would_delete=") >= 1
     })
     .unwrap_or_else(|e| panic!("{e}"));
+    // Count only the passes after the first dispatch (#36): on a loaded host
+    // the empty passes before it vary and say nothing about the pacing.
+    let passes_before = run.events_of("scan_complete").len();
     let observed = Duration::from_secs(30);
     std::thread::sleep(observed);
 
-    let passes = run.events_of("scan_complete").len();
+    let passes = run.events_of("scan_complete").len() - passes_before;
     let stderr = run.stderr();
     assert!(
         run.deleted_paths().is_empty(),
         "dry-run removes nothing: {stderr}"
     );
     assert!(fixtures.stale_target.exists());
+    // Each dispatch that reclaimed nothing grows the streak, even though the
+    // pass that notices it dispatches again (#36: it stayed at 1).
     assert!(
-        run.stderr_count("pacing it as an empty pass") >= 1,
-        "an unconfirmed dispatch is paced as empty: {stderr}"
+        stderr.contains("pacing it as an empty pass (consecutive=2)"),
+        "the empty-pass streak grows past one: {stderr}"
     );
-    // Base cooldown 5 s doubling per unconfirmed pass: 0, 5, 15, 35 s, plus
-    // one pass to notice; the unpaced daemon produced about sixty in 30 s.
+    // Base cooldown 5 s doubling per unconfirmed pass: passes about 5 and 15 s
+    // after the first; a streak stuck at one rescans every 5 s.
     assert!(
-        passes <= 7,
-        "{passes} scan passes in {observed:?}: dry-run dispatches still count as progress: {stderr}"
+        passes <= 3,
+        "{passes} scan passes in {observed:?} after the first dispatch: dry-run dispatches still count as progress: {stderr}"
     );
     let status = run.stop();
     assert!(status.success(), "{status}");
@@ -3070,6 +3424,7 @@ fn metrics_export_is_written_with_state_and_validates() {
             .arg(&config_path)
             .args(args)
             .env("SBH_TEST_MODE", "1")
+            .env_remove("XPC_SERVICE_NAME")
             .env("SBH_TEST_FS_STATS", &table)
             .output()
             .expect("run sbh")
@@ -3080,6 +3435,7 @@ fn metrics_export_is_written_with_state_and_validates() {
         .arg(&config_path)
         .arg("metrics")
         .env("SBH_TEST_MODE", "1")
+        .env_remove("XPC_SERVICE_NAME")
         .env("SBH_TEST_FS_STATS", &table)
         .env("SBH_OUTPUT_FORMAT", "human")
         .output()
@@ -3242,6 +3598,7 @@ fn control_socket_serves_ping_scan_now_policy_and_shutdown() {
             .arg(&config_path)
             .args(args)
             .env("SBH_TEST_MODE", "1")
+            .env_remove("XPC_SERVICE_NAME")
             .env("SBH_TEST_FS_STATS", &table)
             .output()
             .expect("run sbh")

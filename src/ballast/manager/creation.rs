@@ -13,6 +13,29 @@
 use super::BallastManager;
 use crate::core::errors::{Result, SbhError};
 
+/// A new slot of the full length whose blocks do not cover it. Whatever the
+/// filesystem did to this slot it will do to the next one, so the caller ends
+/// its batch rather than repeat the write for every remaining slot.
+#[derive(Debug)]
+struct Underallocated;
+
+impl std::fmt::Display for Underallocated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("new ballast file is not fully allocated")
+    }
+}
+
+impl std::error::Error for Underallocated {}
+
+pub(super) fn is_underallocated(error: &SbhError) -> bool {
+    if let SbhError::Io { source, .. } = error
+        && let Some(inner) = source.get_ref()
+    {
+        return inner.is::<Underallocated>();
+    }
+    false
+}
+
 pub(super) fn create(manager: &BallastManager, index: u32) -> Result<()> {
     #[cfg(unix)]
     {
@@ -59,6 +82,15 @@ mod unix {
                 .blocks()
                 .checked_mul(512)
                 .is_some_and(|bytes| bytes >= size)
+    }
+
+    /// How `prepare` put storage behind a new slot.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Reserve {
+        /// The filesystem reserved the blocks and its block count showed it.
+        Preallocated,
+        /// Every payload byte was written through the slot's descriptor.
+        Written,
     }
 
     struct NewSlot {
@@ -156,7 +188,7 @@ mod unix {
     pub(super) fn create_with(
         manager: &BallastManager,
         index: u32,
-        prepare: impl FnOnce(&BallastManager, &mut File, &Path, u64) -> Result<()>,
+        prepare: impl FnOnce(&BallastManager, &mut File, &Path, u64) -> Result<Reserve>,
     ) -> Result<()> {
         let size = manager.config.file_size_bytes;
         if size < HEADER_SIZE as u64 {
@@ -171,7 +203,7 @@ mod unix {
         // Persist the ordinary slot name before allocation. An interrupted
         // process leaves discoverable reserve, never a hidden staging pool.
         slot.pool.sync_all().map_err(io)?;
-        prepare(manager, &mut slot.file, &path, size)?;
+        let reserve = prepare(manager, &mut slot.file, &path, size)?;
         slot.current().map_err(io)?;
         slot.file.seek(SeekFrom::Start(0)).map_err(io)?;
         slot.file.write_all(&header).map_err(io)?;
@@ -179,8 +211,18 @@ mod unix {
         slot.file.sync_all().map_err(io)?;
         slot.current().map_err(io)?;
         let metadata = slot.file.metadata().map_err(io)?;
-        if metadata.len() != size || !allocated(&metadata, size) {
-            return Err(io(invalid("new ballast file is not fully allocated")));
+        // ZFS charges a file's blocks when its transaction group syncs, which
+        // can be seconds after fsync returns. A block count read here is then
+        // short for a slot that was written in full, and requiring it unlinked
+        // every new slot on ZFS. A payload written through this descriptor is
+        // its own evidence once the write is complete and synced; `verify`
+        // checks block coverage on each later pass.
+        let covered = reserve == Reserve::Written || allocated(&metadata, size);
+        if metadata.len() != size || !covered {
+            return Err(io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                super::Underallocated,
+            )));
         }
         slot.pool.sync_all().map_err(io)?;
         slot.current().map_err(io)?;
@@ -225,7 +267,7 @@ mod unix {
         file: &mut File,
         path: &Path,
         size: u64,
-    ) -> Result<()> {
+    ) -> Result<Reserve> {
         if !manager.skip_fallocate {
             match manager.platform.preallocate_open_file(file, path, size) {
                 Ok(()) => {
@@ -233,7 +275,7 @@ mod unix {
                         &file.metadata().map_err(|error| SbhError::io(path, error))?,
                         size,
                     ) {
-                        return Ok(());
+                        return Ok(Reserve::Preallocated);
                     }
                     // A nominal success (including a mock) does not establish
                     // actual block allocation. Fill the holes below.
@@ -244,7 +286,8 @@ mod unix {
         }
         file.seek(SeekFrom::Start(HEADER_SIZE as u64))
             .map_err(|error| SbhError::io(path, error))?;
-        manager.write_random_data(file, size - HEADER_SIZE as u64, path)
+        manager.write_random_data(file, size - HEADER_SIZE as u64, path)?;
+        Ok(Reserve::Written)
     }
 
     #[cfg(test)]
@@ -289,6 +332,99 @@ mod unix {
                 assert_eq!(manager.verify().unwrap().files_ok, 1);
                 assert_eq!(manager.release(1).unwrap().bytes_freed, SIZE);
             }
+        }
+
+        /// Give a slot its full length with a block count that does not cover
+        /// it, the reading ZFS returns for a freshly synced slot until its
+        /// transaction group syncs. Truncating and re-extending leaves a hole
+        /// on the filesystems that support holes.
+        fn drop_blocks(file: &File, path: &Path, size: u64) -> Result<()> {
+            file.set_len(0)
+                .and_then(|()| file.set_len(size))
+                .map_err(|error| SbhError::io(path, error))
+        }
+
+        #[test]
+        fn a_written_slot_is_kept_when_its_block_count_lags_the_write() {
+            // With and without the coordinator's flag: `sbh ballast provision`
+            // and `sbh install` build their managers without it.
+            for random in [false, true] {
+                let (_temp, mut manager) = fixture();
+                manager.set_skip_fallocate(random);
+                create_with(&manager, 1, |manager, file, path, size| {
+                    file.seek(SeekFrom::Start(HEADER_SIZE as u64))
+                        .map_err(|error| SbhError::io(path, error))?;
+                    manager.write_random_data(file, size - HEADER_SIZE as u64, path)?;
+                    drop_blocks(file, path, size)?;
+                    Ok(Reserve::Written)
+                })
+                .unwrap();
+                let metadata = fs::metadata(manager.file_path(1)).unwrap();
+                assert_eq!(metadata.len(), SIZE);
+                assert_eq!(metadata.nlink(), 1);
+            }
+        }
+
+        #[test]
+        fn the_random_data_strategy_reports_a_written_payload() {
+            let (_temp, mut manager) = fixture();
+            manager.set_skip_fallocate(true);
+            create_with(&manager, 1, |manager, file, path, size| {
+                let reserve = prepare(manager, file, path, size)?;
+                assert_eq!(reserve, Reserve::Written);
+                Ok(reserve)
+            })
+            .unwrap();
+            assert!(allocated(
+                &fs::metadata(manager.file_path(1)).unwrap(),
+                SIZE
+            ));
+        }
+
+        #[test]
+        fn a_preallocation_its_block_count_does_not_cover_is_removed_and_ends_the_batch() {
+            let (_temp, manager) = fixture();
+            let path = manager.file_path(1);
+            let result = create_with(&manager, 1, |_, file, path, size| {
+                drop_blocks(file, path, size)?;
+                Ok(Reserve::Preallocated)
+            });
+            let Err(error) = result else {
+                // This filesystem allocated the extension eagerly, which is a
+                // real, fully covered reserve and not the case under test.
+                assert!(allocated(&fs::metadata(&path).unwrap(), SIZE));
+                return;
+            };
+            assert!(super::super::is_underallocated(&error), "{error}");
+            assert!(error.to_string().contains("not fully allocated"), "{error}");
+            assert!(fs::symlink_metadata(&path).is_err());
+
+            let mut report = super::super::super::ProvisionReport {
+                files_created: 0,
+                files_skipped: 0,
+                total_bytes: 0,
+                errors: Vec::new(),
+                skipped_for_floor: 0,
+                floor_pct: 0.0,
+                free_pct_after: None,
+                created: Vec::new(),
+            };
+            assert!(super::super::super::record_create_error(
+                &mut report,
+                1,
+                &path,
+                &error
+            ));
+            assert_eq!(report.errors.len(), 1, "{report:?}");
+            // An ordinary per-slot failure still lets the batch continue.
+            let collision = SbhError::io(&path, io::Error::from_raw_os_error(libc::EEXIST));
+            assert!(!super::super::is_underallocated(&collision));
+            assert!(!super::super::super::record_create_error(
+                &mut report,
+                2,
+                &path,
+                &collision
+            ));
         }
 
         #[test]
@@ -382,10 +518,10 @@ mod unix {
             let ours = temp.path().join("retired");
             assert!(
                 create_with(&manager, 1, |manager, file, path, size| {
-                    prepare(manager, file, path, size)?;
+                    let reserve = prepare(manager, file, path, size)?;
                     fs::rename(path, &ours).unwrap();
                     fs::write(path, b"do not finalize this").unwrap();
-                    Ok(())
+                    Ok(reserve)
                 })
                 .is_err()
             );
@@ -404,7 +540,7 @@ mod unix {
                     fs::rename(path, &ours).unwrap();
                     symlink(&outside, path).unwrap();
                     file.write_all(b"our partial write").unwrap();
-                    Ok(())
+                    Ok(Reserve::Preallocated)
                 })
                 .is_err()
             );
@@ -444,7 +580,7 @@ mod unix {
                 create_with(&manager, 1, |_, file, path, _| {
                     file.write_all(b"shared inode").unwrap();
                     fs::hard_link(path, &linked).unwrap();
-                    Ok(())
+                    Ok(Reserve::Preallocated)
                 })
                 .is_err()
             );

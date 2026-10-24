@@ -12,6 +12,7 @@
 //! 6. Candidate identity still matches the object observed by the scanner
 //! 7. Candidate is not covered by a kernel-held active-target lease
 //! 8. Scoring vetoes, decision eligibility, and numeric evidence are still valid
+//! 9. The configured scanner root permits reclamation under the live source-root policy
 //!
 //! Quarantine is a recoverability requirement, not a best-effort hint: a failed
 //! quarantine never falls through to irreversible removal.
@@ -36,14 +37,18 @@ use crate::platform::sacred_catalog::cross_platform_sacred_paths;
 use crate::platform::types::SacredPath;
 use crate::scanner::active_lease;
 use crate::scanner::patterns::{
-    ArtifactCategory, ArtifactClassification, StructuralSignals, is_obvious_build_artifact_basename,
+    ArtifactCategory, ArtifactClassification, StructuralSignals,
+    is_obvious_build_artifact_basename_given,
 };
 use crate::scanner::protection::{self, StowawayScanConfig};
 use crate::scanner::quarantine::{self, QuarantineStore, QuarantineUnavailable};
 use crate::scanner::scoring::{CandidacyScore, DecisionAction, ScoreFactors};
+use crate::scanner::source_roots::SourceRootPolicy;
 use crate::scanner::walker;
 
 mod eligibility;
+#[cfg(test)]
+mod source_root_tests;
 
 // ──────────────────── configuration ────────────────────
 
@@ -112,6 +117,12 @@ pub struct DeletionConfig {
     /// them (longest prefix wins); a candidate under none of them is
     /// quarantined under its mount point.
     pub quarantine_roots: Vec<PathBuf>,
+    /// Root-level reclamation policy shared with startup/reload and scanner
+    /// admission. Cloning this config shares live policy, not a stale snapshot.
+    /// Install every configured scanner root, including roots excluded from
+    /// the current scan pass. This can only veto; opt-in never bypasses the
+    /// candidate checks. Ballast operations do not use this executor.
+    pub source_roots: SourceRootPolicy,
 }
 
 impl Default for DeletionConfig {
@@ -130,6 +141,7 @@ impl Default for DeletionConfig {
             mode: DeletionMode::Unlink,
             quarantine_ttl: Duration::from_secs(quarantine::DEFAULT_TTL_HOURS * 3600),
             quarantine_roots: Vec::new(),
+            source_roots: SourceRootPolicy::default(),
         }
     }
 }
@@ -276,6 +288,15 @@ pub struct DeletionReport {
     /// holding the blocks correctly shows 0. `None` when any removal could
     /// not be measured, so a partial sum never poses as the whole.
     pub bytes_freed_observed: Option<u64>,
+    /// The part of `bytes_freed` on filesystems that return an unlinked
+    /// file's blocks only at their next commit (ext4 ~5 s, btrfs ~30 s), so
+    /// the delta measured right after the unlink reads ~0 (bd-oj33).
+    pub bytes_freed_at_commit: u64,
+    /// The measured delta for those same removals (logging only).
+    pub bytes_freed_at_commit_observed: u64,
+    /// Some of those removals were on btrfs, where extents a snapshot or
+    /// reflink shares free nothing: their estimate is only an upper bound.
+    pub freed_at_commit_on_btrfs: bool,
     /// Bytes that would have been reclaimed in dry-run mode.
     pub bytes_would_free: u64,
     pub duration: Duration,
@@ -326,6 +347,119 @@ impl DeletionReport {
             .iter()
             .chain(self.no_space_paths.iter())
     }
+
+    /// The freed bytes to report, and how they are known: the measured gain
+    /// where the filesystem frees blocks at once, the scanner's estimate
+    /// where it frees them at commit or a removal went unmeasured (bd-oj33).
+    /// Reporting only; no control decision reads it.
+    #[must_use]
+    pub fn reported_freed(&self) -> (u64, FreedBasis) {
+        let estimated_now = self.bytes_freed.saturating_sub(self.bytes_freed_at_commit);
+        let observed_now = self
+            .bytes_freed_observed
+            .map(|observed| observed.saturating_sub(self.bytes_freed_at_commit_observed));
+        let bytes = observed_now
+            .unwrap_or(estimated_now)
+            .saturating_add(self.bytes_freed_at_commit);
+        let basis = if self.freed_at_commit_on_btrfs {
+            FreedBasis::EstimatedUpperBound
+        } else if self.bytes_freed_at_commit > 0 || observed_now.is_none() {
+            FreedBasis::Estimated
+        } else {
+            FreedBasis::Observed
+        };
+        (bytes, basis)
+    }
+}
+
+/// How a reported freed-bytes figure is known (bd-oj33).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum FreedBasis {
+    /// The free space measured around each removal.
+    #[default]
+    #[serde(rename = "observed")]
+    Observed,
+    /// The removed trees' allocated size: the filesystem returns blocks only
+    /// at its next commit (ext4), or a removal was not measured.
+    #[serde(rename = "estimated_allocated")]
+    Estimated,
+    /// The allocated size on btrfs, an upper bound: extents a snapshot or
+    /// reflink shares free nothing.
+    #[serde(rename = "estimated_upper_bound")]
+    EstimatedUpperBound,
+}
+
+impl FreedBasis {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::Estimated => "estimated_allocated",
+            Self::EstimatedUpperBound => "estimated_upper_bound",
+        }
+    }
+
+    /// The basis of a total over several figures: the weakest of them.
+    #[must_use]
+    pub fn combine(self, other: Self) -> Self {
+        self.max(other)
+    }
+
+    /// `2.0 GB freed`, `~2.0 GB freed, estimated` or `up to 2.0 GB freed,
+    /// estimated`, so an estimate never reads as a measurement.
+    #[must_use]
+    pub fn freed_phrase(self, bytes: u64) -> String {
+        #[allow(clippy::cast_precision_loss)]
+        let gb = bytes as f64 / 1_073_741_824.0;
+        match self {
+            Self::Observed => format!("{gb:.1} GB freed"),
+            Self::Estimated => format!("~{gb:.1} GB freed, estimated"),
+            Self::EstimatedUpperBound => format!("up to {gb:.1} GB freed, estimated"),
+        }
+    }
+}
+
+/// Filesystems that return an unlinked file's blocks only at their next
+/// journal or transaction commit, so free space read right after an unlink
+/// has not grown yet (bd-oj33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum CommitFreeing {
+    Ext4,
+    Btrfs,
+}
+
+/// How the filesystem holding `path` frees blocks, from its parent's
+/// `statfs` magic. `None` when it frees them at once or cannot be read.
+#[cfg(target_os = "linux")]
+fn commit_freeing_beside(path: &Path) -> Option<CommitFreeing> {
+    const EXT4_SUPER_MAGIC: u32 = 0xEF53;
+    const BTRFS_SUPER_MAGIC: u32 = 0x9123_683E;
+    let f_type = rustix::fs::statfs(path.parent()?).ok()?.f_type;
+    // The field is signed and word-sized on most targets; the magic is 32 bits.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let magic = f_type as u32;
+    match magic {
+        EXT4_SUPER_MAGIC => Some(CommitFreeing::Ext4),
+        BTRFS_SUPER_MAGIC => Some(CommitFreeing::Btrfs),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn commit_freeing_beside(_path: &Path) -> Option<CommitFreeing> {
+    None
 }
 
 /// Per-batch bookkeeping for the pre-flight sacred containment check.
@@ -467,6 +601,22 @@ pub enum SkipReason {
     /// Open file or process scan could not complete within the 5s deadline or
     /// 50,000 PID cap; the executor fails conservative (bd-rc-master-ajg1.10.2).
     OpenScanIncomplete,
+    /// The category's live regret guard currently suspends deletion. This
+    /// transient category decision must not create a per-path backoff.
+    CategorySuspended,
+    /// A configured root contains source without explicit authorization, could
+    /// not be fully inspected, or was removed/retargeted after this candidate
+    /// was queued. Root diagnostics identify the offending path/repository.
+    SourceRootDenied,
+    /// The daemon began shutting down mid-batch; the rest of the batch is
+    /// left for the next run, with no per-path backoff.
+    ShuttingDown,
+    /// Live policy or dry-run settings no longer authorize a queued mutation.
+    /// Resuming policy must not leave candidates in per-path backoff.
+    PolicyChanged,
+    /// Lossless compression has a bounded first chance on this filesystem.
+    /// This live scheduling hold must not create a per-path refusal backoff.
+    CompressionFirst,
 }
 
 impl SkipReason {
@@ -476,7 +626,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 23] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -495,6 +645,11 @@ impl SkipReason {
         Self::SacredStowaway,
         Self::FilesystemReadOnly,
         Self::OpenScanIncomplete,
+        Self::CategorySuspended,
+        Self::SourceRootDenied,
+        Self::ShuttingDown,
+        Self::PolicyChanged,
+        Self::CompressionFirst,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -527,6 +682,11 @@ impl SkipReason {
             Self::SacredStowaway => "sacred_stowaway",
             Self::FilesystemReadOnly => "filesystem_read_only",
             Self::OpenScanIncomplete => "open_scan_incomplete",
+            Self::CategorySuspended => "category_suspended",
+            Self::SourceRootDenied => "source_root_denied",
+            Self::ShuttingDown => "shutting_down",
+            Self::PolicyChanged => "policy_changed",
+            Self::CompressionFirst => "compression_first",
         }
     }
 
@@ -565,9 +725,17 @@ impl SkipReason {
                  the daemon pauses deletions on it until a probe write succeeds"
             }
             Self::OpenScanIncomplete => {
-                "open file or process scan incomplete due to system load (deadline/budget exceeded) — \
-                 aborted batch for safety"
+                "open file or process scan incomplete (scan budget exceeded, or other users' \
+                 processes cannot be inspected without root) — aborted batch for safety"
             }
+            Self::CategorySuspended => "category deletion temporarily suspended after regrets",
+            Self::SourceRootDenied => {
+                "scanner root is blocked by source-tree policy; inspect doctor/status, narrow \
+                 root_paths or explicitly authorize scanner.allow_source_tree_roots"
+            }
+            Self::ShuttingDown => "the daemon was shutting down — left for the next run",
+            Self::PolicyChanged => "live policy or dry-run settings no longer permit changes",
+            Self::CompressionFirst => "lossless compression is running before permanent cleanup",
         }
     }
 }
@@ -602,8 +770,8 @@ pub fn error_recovery_cause(error: &SbhError) -> Option<RecoveryCause> {
 }
 
 /// Whether a skipped candidate earns a per-path repeat-deletion backoff. A
-/// read-only filesystem is a mount incident handled by mount recovery, not a
-/// fault of the path, so it gets none.
+/// read-only filesystem is a mount incident handled by mount recovery, and a
+/// category or source-root restriction is live policy, not a fault in the path.
 fn should_backoff_skip(reason: SkipReason) -> bool {
     !matches!(
         reason,
@@ -611,6 +779,11 @@ fn should_backoff_skip(reason: SkipReason) -> bool {
             | SkipReason::BelowThreshold
             | SkipReason::UserDeclined
             | SkipReason::FilesystemReadOnly
+            | SkipReason::CategorySuspended
+            | SkipReason::SourceRootDenied
+            | SkipReason::ShuttingDown
+            | SkipReason::PolicyChanged
+            | SkipReason::CompressionFirst
     )
 }
 
@@ -630,11 +803,48 @@ pub enum CheckedDeletion {
 
 // ──────────────────── executor ────────────────────
 
+type AuthorizationCheck<'a> = &'a dyn Fn(&CandidacyScore) -> std::result::Result<(), SkipReason>;
+type UnlinkObserver<'a> = &'a dyn Fn(&CandidacyScore, Instant);
+/// A caller's per-candidate check run before preflight: the reason to leave
+/// this path alone now (target free space reached, a protection refusal, a
+/// shutdown), or `None` to continue.
+pub type SkipCheck<'a> = &'a dyn Fn(&Path) -> Option<SkipReason>;
+
 /// The deletion executor: takes scored candidates and deletes them safely.
 pub struct DeletionExecutor {
     config: DeletionConfig,
     logger: Option<ActivityLoggerHandle>,
     platform: Option<Arc<dyn Platform>>,
+}
+
+/// Activity-log code for a deletion batch aborted because the open-file or
+/// process scan was incomplete. It used to be logged as SBH-3003, which the
+/// error catalog gives to a closed daemon channel.
+const INCOMPLETE_SCAN_CODE: &str = "SBH-3005";
+
+/// The aborted-batch event, naming the cause. Without root the scan cannot
+/// read other users' processes, so it is incomplete on every pass; with root
+/// it ran into one of its limits or an unreadable process.
+fn incomplete_scan_event(without_root: bool) -> ActivityEvent {
+    let cause = if without_root {
+        "other users' processes cannot be inspected without root"
+    } else {
+        "the scan could not read every process within its limits"
+    };
+    ActivityEvent::Error {
+        code: INCOMPLETE_SCAN_CODE.to_string(),
+        message: format!("open file scan incomplete ({cause}) - aborting batch for safety"),
+    }
+}
+
+#[cfg(unix)]
+fn scans_without_root() -> bool {
+    !nix::unistd::Uid::effective().is_root()
+}
+
+#[cfg(not(unix))]
+fn scans_without_root() -> bool {
+    false
 }
 
 impl DeletionExecutor {
@@ -708,12 +918,48 @@ impl DeletionExecutor {
     /// Execute a deletion plan, deleting up to `max_batch_size` candidates.
     ///
     /// Returns a report summarizing what was deleted, skipped, or failed.
-    /// If `should_skip` returns `true` for a candidate path, it is skipped.
-    #[allow(clippy::too_many_lines)]
+    /// A candidate for which `should_skip` returns a reason is skipped with
+    /// that reason.
     pub fn execute(
         &self,
         plan: &DeletionPlan,
-        should_skip: Option<&dyn Fn(&Path) -> bool>,
+        should_skip: Option<SkipCheck<'_>>,
+    ) -> DeletionReport {
+        self.execute_with_guard(plan, should_skip, None)
+    }
+
+    /// Execute with a live per-candidate authorization check. The guard runs
+    /// after expensive preflight and free-space observations, before either
+    /// mutation backend or dry-run admission. It may refuse an otherwise
+    /// eligible candidate, but cannot override any earlier safety veto.
+    ///
+    /// A refusal is a typed skip, never a failed deletion or reclaimed bytes.
+    /// Mutation backends retain their final lease and filesystem identity
+    /// checks after authorization; an already-started removal is not cancelled.
+    pub fn execute_with_guard(
+        &self,
+        plan: &DeletionPlan,
+        should_skip: Option<SkipCheck<'_>>,
+        authorize: Option<AuthorizationCheck<'_>>,
+    ) -> DeletionReport {
+        self.execute_with_hooks(plan, should_skip, authorize, None)
+    }
+
+    /// Execute with live authorization and an immediate unlink observer.
+    /// `on_unlinked` receives each successful permanent removal and the
+    /// monotonic time its backend completed, before post-delete free-space
+    /// observation, logging, or work on the next candidate. This lets a
+    /// caller watch early removals while a long batch is still running.
+    ///
+    /// Dry-runs, quarantines, refusals, and failed removals never notify the
+    /// observer. It cannot change whether a completed removal succeeded.
+    #[allow(clippy::too_many_lines)]
+    pub fn execute_with_hooks(
+        &self,
+        plan: &DeletionPlan,
+        should_skip: Option<SkipCheck<'_>>,
+        authorize: Option<AuthorizationCheck<'_>>,
+        on_unlinked: Option<UnlinkObserver<'_>>,
     ) -> DeletionReport {
         let start = Instant::now();
         let mut report = DeletionReport {
@@ -723,6 +969,9 @@ impl DeletionExecutor {
             items_would_delete: 0,
             bytes_freed: 0,
             bytes_freed_observed: Some(0),
+            bytes_freed_at_commit: 0,
+            bytes_freed_at_commit_observed: 0,
+            freed_at_commit_on_btrfs: false,
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -767,10 +1016,7 @@ impl DeletionExecutor {
                     #[cfg(target_os = "linux")]
                     {
                         let (targets, complete) = open_targets_for_batch(&roots);
-                        (
-                            walker::open_path_ancestors_for_roots(&targets, &roots),
-                            complete,
-                        )
+                        walker::checked_open_path_ancestors_for_roots(&targets, complete, &roots)
                     }
                     #[cfg(not(target_os = "linux"))]
                     {
@@ -783,12 +1029,7 @@ impl DeletionExecutor {
             );
 
             if !complete {
-                self.log_event(ActivityEvent::Error {
-                    code: "SBH-3003".to_string(),
-                    message:
-                        "open file scan incomplete due to system load - aborting batch for safety"
-                            .to_string(),
-                });
+                self.log_event(incomplete_scan_event(scans_without_root()));
                 // Fail safe: abort the entire batch because we cannot guarantee
                 // that any candidate is safe to delete. Every candidate is a
                 // skip, not a failure, and is not backed off: the missing
@@ -822,12 +1063,13 @@ impl DeletionExecutor {
                 break;
             }
 
-            // Dynamic skip check (e.g. target free space met).
-            if let Some(skip) = should_skip
-                && skip(&candidate.path)
-            {
-                report.record_skip(SkipReason::TargetFreeReached);
-                report.backoff_candidates.push(candidate.clone());
+            // Dynamic skip check: target free space met, a live protection
+            // refusal, or a shutdown. Each is recorded under its own reason.
+            if let Some(reason) = should_skip.and_then(|skip| skip(&candidate.path)) {
+                report.record_skip(reason);
+                if should_backoff_skip(reason) {
+                    report.backoff_candidates.push(candidate.clone());
+                }
                 continue;
             }
 
@@ -843,7 +1085,7 @@ impl DeletionExecutor {
                     consecutive_failures = 0;
                     // NotWritable goes into a dedicated bucket so the daemon can
                     // emit one actionable warning per batch (systemd unit fix)
-                    // instead of one log line per candidate.
+                    // instead of one log line per skip.
                     if matches!(skip, SkipReason::NotWritable) {
                         report.not_writable_paths.push(candidate.path.clone());
                     }
@@ -866,6 +1108,7 @@ impl DeletionExecutor {
                             | SkipReason::LooksLikeSourceCode
                             | SkipReason::UserDeclined
                             | SkipReason::SacredStowaway
+                            | SkipReason::SourceRootDenied
                     ) {
                         eprintln!(
                             "[SBH-EXECUTOR] skip: {} ({:?})",
@@ -882,6 +1125,32 @@ impl DeletionExecutor {
                 }
             }
 
+            // Measure space before the live guard: an observation on a slow
+            // filesystem must not leave authorization stale before mutation.
+            let del_start = Instant::now();
+            let free_before = (!self.config.dry_run && plan.mode == DeletionMode::Unlink)
+                .then(|| available_bytes_beside(&candidate.path))
+                .flatten();
+            if let Some(authorize) = authorize
+                && let Err(reason) = authorize(candidate)
+            {
+                report.record_skip(reason);
+                consecutive_failures = 0;
+                if should_backoff_skip(reason) {
+                    report.backoff_candidates.push(candidate.clone());
+                }
+                continue;
+            }
+
+            // Configuration may have changed, or a sibling repository may
+            // have appeared, while preflight/observer hooks were running.
+            // Never report such a refusal as reclaimed (including dry-run).
+            if self.config.source_roots.authorize(&candidate.path).is_err() {
+                report.record_skip(SkipReason::SourceRootDenied);
+                consecutive_failures = 0;
+                continue;
+            }
+
             if self.config.dry_run {
                 report.items_would_delete += 1;
                 report.bytes_would_free =
@@ -892,18 +1161,18 @@ impl DeletionExecutor {
 
             // Actual deletion, or quarantine (Layer 7). Quarantine has no
             // successful-unlink outcome: failure cannot widen this plan.
-            let del_start = Instant::now();
-            let free_before = (plan.mode == DeletionMode::Unlink)
-                .then(|| available_bytes_beside(&candidate.path))
-                .flatten();
             let outcome = match plan.mode {
                 DeletionMode::Unlink => self.delete_path(candidate).map(|()| false),
                 DeletionMode::Quarantine => self.quarantine_path(candidate).map(|()| true),
             };
+            let completed_at = Instant::now();
             match outcome {
                 Ok(quarantined) => {
+                    if !quarantined && let Some(on_unlinked) = on_unlinked {
+                        on_unlinked(candidate, completed_at);
+                    }
                     #[allow(clippy::cast_possible_truncation)]
-                    let duration_ms = del_start.elapsed().as_millis() as u64;
+                    let duration_ms = completed_at.duration_since(del_start).as_millis() as u64;
                     report.items_deleted += 1;
                     report.deleted_paths.push(candidate.path.clone());
                     if quarantined {
@@ -921,6 +1190,15 @@ impl DeletionExecutor {
                             .bytes_freed_observed
                             .zip(gained)
                             .map(|(sum, bytes)| sum.saturating_add(bytes));
+                        if let Some(freeing) = commit_freeing_beside(&candidate.path) {
+                            report.bytes_freed_at_commit = report
+                                .bytes_freed_at_commit
+                                .saturating_add(candidate.size_bytes);
+                            report.bytes_freed_at_commit_observed = report
+                                .bytes_freed_at_commit_observed
+                                .saturating_add(gained.unwrap_or(0));
+                            report.freed_at_commit_on_btrfs |= freeing == CommitFreeing::Btrfs;
+                        }
                     }
                     consecutive_failures = 0;
 
@@ -977,7 +1255,7 @@ impl DeletionExecutor {
     /// complete `preflight_check` veto suite (hardcoded source-tree floor,
     /// scoring eligibility, active lease, symlink, identity, source markers,
     /// open-file index) followed by `delete_path`'s lease/symlink/identity
-    /// rechecks at the mutation point.
+    /// and live configured-root rechecks at the mutation point.
     ///
     /// Interactive flows MUST route accepted candidates through this instead
     /// of deleting directly: operator confirmation widens *consent*, never the
@@ -1077,8 +1355,16 @@ impl DeletionExecutor {
             return Err(SkipReason::Symlink);
         }
 
+        // Root policy is independent of the candidate's score, tracking state
+        // or artifact name. An untracked sibling of a nested repository is
+        // protected just as a target directory inside the repository is.
+        self.config
+            .source_roots
+            .authorize(path)
+            .map_err(|_| SkipReason::SourceRootDenied)?;
+
         // 3. Scanner-observed identity must still refer to this same entry.
-        self.verify_candidate_identity(candidate)?;
+        self.verify_candidate_identity(candidate, &meta)?;
 
         // 4. Parent directory is writable (effective permission for this
         //    process). A read-only filesystem is classified apart from a
@@ -1092,9 +1378,17 @@ impl DeletionExecutor {
             }
         }
 
-        // 5. Does not contain .git (safety net — checks 3 levels deep).
-        if meta.is_dir() && contains_nested_git(path, 3) {
-            return Err(SkipReason::ContainsGit);
+        // 5. Does not contain a Git repository or a `.sbh-protect` marker at
+        //    any depth (bd-jydu). The sacred walk in 6c stops at depth 3, so a
+        //    clone deeper inside an agent's temp tree reached remove_dir_all.
+        if meta.is_dir() {
+            match deep_containment(path, DEEP_CONTAINMENT_MAX_DIRS) {
+                DeepContainment::Clear => {}
+                DeepContainment::Repository => return Err(SkipReason::ContainsGit),
+                DeepContainment::ProtectMarker | DeepContainment::Truncated => {
+                    return Err(SkipReason::SacredStowaway);
+                }
+            }
         }
 
         // A deep source subtree need not contain its repository's .git marker.
@@ -1156,6 +1450,7 @@ impl DeletionExecutor {
     fn verify_candidate_identity(
         &self,
         candidate: &CandidacyScore,
+        metadata: &fs::Metadata,
     ) -> std::result::Result<(), SkipReason> {
         let Some(expected) = candidate.identity else {
             return if self.config.require_identity {
@@ -1168,8 +1463,7 @@ impl DeletionExecutor {
             return Err(SkipReason::IdentityUnavailable);
         }
 
-        let current =
-            walker::identity_for_path(&candidate.path, false).map_err(|_| SkipReason::PathGone)?;
+        let current = walker::entry_metadata(metadata).identity();
         if !identity_is_supported(current) {
             return Err(SkipReason::IdentityUnavailable);
         }
@@ -1182,13 +1476,21 @@ impl DeletionExecutor {
 
     #[allow(clippy::unused_self)]
     /// The last-moment checks shared by removal and quarantine, run right
-    /// before the mutation: eligibility, lease, symlink and identity re-checks.
+    /// before the mutation: source-root policy, eligibility, lease, symlink
+    /// and identity re-checks. A cached plan cannot authorize a revoked root.
     fn recheck_before_mutation(&self, candidate: &CandidacyScore) -> Result<fs::Metadata> {
         let path = &candidate.path;
         eligibility::check(candidate, &self.config).map_err(|reason| SbhError::SafetyVeto {
             path: path.clone(),
             reason: reason.explanation().to_string(),
         })?;
+        self.config
+            .source_roots
+            .authorize(path)
+            .map_err(|reason| SbhError::SafetyVeto {
+                path: path.clone(),
+                reason,
+            })?;
         // Recheck immediately before mutation. A lease can begin after the
         // earlier preflight, and deleting despite the newly held lock would
         // recreate the exact scan/reap race this protection exists to close.
@@ -1206,7 +1508,7 @@ impl DeletionExecutor {
                 details: format!("path became a symlink before deletion: {}", path.display()),
             });
         }
-        self.verify_candidate_identity(candidate)
+        self.verify_candidate_identity(candidate, &meta)
             .map_err(|skip| SbhError::Runtime {
                 details: format!(
                     "path identity changed before deletion: {} ({skip:?})",
@@ -1220,22 +1522,16 @@ impl DeletionExecutor {
         let path = &candidate.path;
         let meta = self.recheck_before_mutation(candidate)?;
 
-        if meta.is_dir() {
-            // Read-only regenerable caches (Go GOCACHE/GOMODCACHE, cargo
-            // registry/git caches) are written 0555/0444 by their toolchains,
-            // which makes a plain `remove_dir_all` fail partway with EACCES and
-            // leave the disk space behind. For those — and only those — defeat
-            // the read-only bits within the (already preflight-approved)
-            // subtree. Every other candidate uses conservative removal, where a
-            // read-only directory acts as a natural brake.
-            if classification_allows_force_remove(&candidate.classification) {
-                remove_dir_all_force(path).map_err(|e| SbhError::io(path, e))?;
-            } else {
-                fs::remove_dir_all(path).map_err(|e| SbhError::io(path, e))?;
-            }
-        } else {
-            fs::remove_file(path).map_err(|e| SbhError::io(path, e))?;
-        }
+        // Reuse the confined quarantine traversal without creating a store or
+        // recovery record: emergency removal must work at ENOSPC. The exact
+        // metadata checked above remains the expected root identity. Only
+        // recognized regenerable caches may widen directory permissions.
+        quarantine::remove_direct(
+            path,
+            &meta,
+            classification_allows_force_remove(&candidate.classification),
+        )
+        .map_err(|e| SbhError::io(path, e))?;
 
         // Post-deletion verification (symlink_metadata to avoid following dangling symlinks).
         if fs::symlink_metadata(path).is_ok() {
@@ -1462,95 +1758,130 @@ fn available_bytes_beside(path: &Path) -> Option<u64> {
     Some(blocks.saturating_mul(fragment))
 }
 
-/// `fs::remove_dir_all` that defeats read-only directory/file permission bits.
-///
-/// Standard `remove_dir_all` cannot unlink an entry inside a `0555` directory —
-/// removing a child requires *write* permission on the parent directory — so on
-/// a Go module cache (every module dir `0555`) it fails partway with `EACCES`
-/// and leaves the tree, and its disk space, behind. We try the fast path first;
-/// only on a permission error do we walk the subtree granting `u+rwx` to
-/// directories (and `u+w` to files) and retry. Permission widening is confined
-/// to the candidate subtree the executor already approved for deletion, and the
-/// walk never follows symlinks, so it can never affect paths outside it.
-fn remove_dir_all_force(path: &Path) -> std::io::Result<()> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            chmod_tree_writable(path);
-            fs::remove_dir_all(path)
-        }
-        Err(e) => Err(e),
-    }
+/// Levels below a candidate within which any `.git` entry vetoes it, as the
+/// executor always has. Deeper, only a real repository does (see
+/// [`deep_containment`]).
+const NESTED_GIT_ANY_DEPTH: usize = 3;
+
+/// Directory budget of [`deep_containment`]. Measured on real candidates
+/// (2026-10): the largest cargo `target/` opened 18.5k directories, a
+/// node_modules 11.3k, the cargo registry 35.7k and a Go module cache 54.3k.
+/// Exhausting it fails closed.
+const DEEP_CONTAINMENT_MAX_DIRS: usize = 250_000;
+
+/// What [`deep_containment`] found inside a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeepContainment {
+    Clear,
+    Repository,
+    ProtectMarker,
+    /// The directory budget ran out before the subtree was proven clear.
+    Truncated,
 }
 
-/// Recursively grant the owner the traversal/write permission needed to remove
-/// a subtree. Best-effort: individual `set_permissions` failures are ignored so
-/// one odd entry can't abort the whole reclaim — the subsequent
-/// `remove_dir_all` is the real success/failure signal. Operates on
-/// `symlink_metadata` and never recurses through a symlink, so it cannot chmod
-/// anything outside the subtree.
-#[cfg(unix)]
-fn chmod_tree_writable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return;
-    };
-    let file_type = meta.file_type();
-    if file_type.is_symlink() {
-        return;
-    }
-    let mode = meta.permissions().mode();
-    if file_type.is_dir() {
-        // u+rwx so we can list, traverse, and unlink children. Chmod before
-        // descending so a `0000`/`0555` dir becomes readable for `read_dir`.
-        if mode & 0o700 != 0o700 {
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700));
+/// Whether a candidate holds a Git repository or a `.sbh-protect` marker at
+/// any depth, breadth-first and bounded by `max_dirs` opened directories.
+///
+/// Within [`NESTED_GIT_ANY_DEPTH`] levels every `.git` entry counts. Below
+/// that only a real repository does: a `.git` directory or symlink, or a
+/// `.git` file that points at one (`gitdir:`, a linked worktree or a
+/// submodule). Two deep `.git` entries are not repositories with work in
+/// them: uv's empty `.git` bucket marker, and a cargo git checkout
+/// (`git/checkouts/<name>/<rev>/` with `.cargo-ok`), which rch and temporary
+/// `CARGO_HOME`s hold four levels down and which the force-remove carve-out
+/// exists for. An agent's clone deep inside a temp tree is what this finds.
+fn deep_containment(path: &Path, max_dirs: usize) -> DeepContainment {
+    let mut queue = std::collections::VecDeque::from([(path.to_path_buf(), 0usize)]);
+    let mut opened = 0usize;
+    while let Some((dir, depth)) = queue.pop_front() {
+        if opened >= max_dirs {
+            return DeepContainment::Truncated;
         }
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                chmod_tree_writable(&entry.path());
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        opened += 1;
+        let child_depth = depth + 1;
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            if name == ".git" {
+                if child_depth <= NESTED_GIT_ANY_DEPTH
+                    || (is_repository_link(&entry.path(), file_type)
+                        && !is_cargo_git_checkout(&dir))
+                {
+                    return DeepContainment::Repository;
+                }
+                continue;
+            }
+            if name == protection::MARKER_FILENAME {
+                return DeepContainment::ProtectMarker;
+            }
+            if file_type.is_dir() && !file_type.is_symlink() {
+                queue.push_back((entry.path(), child_depth));
             }
         }
-    } else if mode & 0o200 == 0 {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o200));
     }
+    DeepContainment::Clear
 }
 
-/// Non-Unix fallback: clear the read-only attribute on the directory itself.
-#[cfg(not(unix))]
-fn chmod_tree_writable(path: &Path) {
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        let mut perms = meta.permissions();
-        if perms.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(path, perms);
-        }
+/// A `.git` entry that is, or points at, a repository: any directory or
+/// symlink, or a file starting with `gitdir:`.
+fn is_repository_link(path: &Path, file_type: fs::FileType) -> bool {
+    if !file_type.is_file() {
+        return true;
     }
+    let mut head = [0u8; 7];
+    fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut head))
+        .is_ok_and(|()| &head == b"gitdir:")
 }
 
-/// Shallow recursive check for `.git` directories within `path`.
-///
-/// Walks at most `max_depth` levels to catch nested git repositories
-/// that the immediate `path.join(".git").exists()` check would miss.
-fn contains_nested_git(path: &Path, max_depth: usize) -> bool {
-    if max_depth == 0 {
-        return false;
+/// `dir` is a cargo git checkout: `<CARGO_HOME>/git/checkouts/<name>/<rev>`,
+/// with the `.cargo-ok` cargo writes once the checkout is complete.
+fn is_cargo_git_checkout(dir: &Path) -> bool {
+    let checkouts = dir.parent().and_then(Path::parent);
+    checkouts.and_then(Path::file_name) == Some("checkouts".as_ref())
+        && checkouts.and_then(Path::parent).and_then(Path::file_name) == Some("git".as_ref())
+        && dir.join(".cargo-ok").exists()
+}
+
+/// Fixed search paths for the tracked-content query: the daemon's inherited
+/// PATH never chooses which `git` runs. A root daemon searches only
+/// root-controlled directories (Homebrew prefixes belong to a regular user);
+/// a non-root daemon may also use the usual package-manager prefixes.
+#[cfg(target_os = "macos")]
+const GIT_QUERY_PATH_ROOT: &str = "/usr/bin:/bin";
+#[cfg(target_os = "macos")]
+const GIT_QUERY_PATH_USER: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+#[cfg(not(target_os = "macos"))]
+const GIT_QUERY_PATH_ROOT: &str = "/usr/bin:/bin:/usr/local/bin:/run/current-system/sw/bin";
+#[cfg(not(target_os = "macos"))]
+const GIT_QUERY_PATH_USER: &str =
+    "/usr/bin:/bin:/usr/local/bin:/run/current-system/sw/bin:/home/linuxbrew/.linuxbrew/bin";
+
+/// Git's own wording (under `LC_ALL=C`) for a pathspec it does not track.
+/// Exit status 1 alone is not enough: a broken `git` shim can exit 1 too.
+const GIT_UNMATCHED_PATHSPEC: &str = "did not match any file(s) known to git";
+
+/// Git runs as a repository's owner, who also controls what it reads (a FIFO
+/// in `.git`, an index that makes it print without end): bound both its run
+/// time and how much of its stderr is kept. Hitting either keeps the candidate.
+const GIT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+const GIT_QUERY_MAX_STDERR_BYTES: u64 = 8192;
+
+/// A gitfile is one `gitdir: <path>` line; anything larger is not one.
+#[cfg(unix)]
+const MAX_GITFILE_BYTES: u64 = 4096;
+
+const fn git_query_path(euid_is_root: bool) -> &'static str {
+    if euid_is_root {
+        GIT_QUERY_PATH_ROOT
+    } else {
+        GIT_QUERY_PATH_USER
     }
-    let Ok(entries) = fs::read_dir(path) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        if entry.file_name() == ".git" {
-            return true;
-        }
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() && !ft.is_symlink() && contains_nested_git(&entry.path(), max_depth - 1) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Veto tracked subtrees independently of source extensions and artifact names.
@@ -1562,46 +1893,184 @@ fn contains_tracked_git_content(path: &Path) -> bool {
         return true;
     };
     for root in path.ancestors().skip(1) {
-        match fs::symlink_metadata(root.join(".git")) {
+        let dot_git = root.join(".git");
+        let marker = match fs::symlink_metadata(&dot_git) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => return true,
             Ok(marker) if marker.file_type().is_symlink() => return true,
-            Ok(_) => {}
-        }
+            Ok(marker) => marker,
+        };
         let Ok(relative) = path.strip_prefix(root) else {
             return true;
         };
-        let status = std::process::Command::new("git")
-            .args([
-                "--no-optional-locks",
-                "--literal-pathspecs",
-                "-c",
-                "core.fsmonitor=false",
-                "-C",
-            ])
+        #[cfg(unix)]
+        let euid = nix::unistd::geteuid().as_raw();
+        #[cfg(not(unix))]
+        let euid = u32::MAX;
+        // Match the path literally but without regard to case. On a
+        // case-insensitive volume (macOS APFS by default) a tracked `Build/`
+        // renamed on disk to `build/` is still tracked as far as Git is
+        // concerned, yet a case-sensitive query would call it unmatched. On a
+        // case-sensitive volume this can keep an untracked `build/` beside a
+        // tracked `Build/`, which errs toward keeping.
+        let mut pathspec = std::ffi::OsString::from(":(literal,icase)");
+        pathspec.push(relative);
+        let mut git = std::process::Command::new("git");
+        git.args(["--no-optional-locks", "-c", "core.fsmonitor=false", "-C"])
             .arg(root)
             .args(["ls-files", "--cached", "--error-unmatch", "--"])
-            .arg(relative)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_COMMON_DIR")
-            .env_remove("GIT_NAMESPACE")
-            .env_remove("GIT_CONFIG")
-            .env_remove("GIT_CONFIG_COUNT")
-            .env_remove("GIT_CONFIG_PARAMETERS")
+            .arg(pathspec)
+            // Nothing from the daemon's environment reaches Git.
+            .env_clear()
+            .env("PATH", git_query_path(euid == 0))
+            .env("HOME", "/nonexistent")
+            .env("LC_ALL", "C")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        match status.map(|status| status.code()) {
-            // Only Git's explicit unmatched-path result permits continuing.
-            Ok(Some(1)) => {}
-            _ => return true,
+            .stderr(std::process::Stdio::piped());
+        // If `root/.git` cannot be validated, Git must not fall back to an
+        // enclosing repository and answer "untracked" for this one.
+        if let Some(parent) = root.parent() {
+            git.env("GIT_CEILING_DIRECTORIES", parent);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            match git_query_identity(euid, &dot_git, &marker) {
+                Ok(Some((uid, gid))) => {
+                    git.uid(uid).gid(gid);
+                }
+                Ok(None) => {}
+                Err(()) => return true,
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = marker;
+        // Only Git's explicit unmatched-path result permits continuing.
+        if !git_reports_unmatched(&mut git) {
+            return true;
         }
     }
     false
+}
+
+/// Run the tracked-content query with a deadline and report whether Git
+/// answered "unmatched" (exit 1 with its own message). Git's stderr stays in
+/// the pipe until it exits and only the first bytes are read, so a Git that
+/// writes without end blocks on the pipe and is killed at the deadline.
+fn git_reports_unmatched(git: &mut std::process::Command) -> bool {
+    use std::io::Read as _;
+    let Ok(mut child) = git.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + GIT_QUERY_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    };
+    let mut stderr = Vec::new();
+    let Some(pipe) = child.stderr.take() else {
+        return false;
+    };
+    if pipe
+        .take(GIT_QUERY_MAX_STDERR_BYTES)
+        .read_to_end(&mut stderr)
+        .is_err()
+    {
+        return false;
+    }
+    status.code() == Some(1) && String::from_utf8_lossy(&stderr).contains(GIT_UNMATCHED_PATHSPEC)
+}
+
+/// Who runs the tracked-content query. A root daemon never runs Git as root on
+/// a repository another user owns: Git refuses that as "dubious ownership"
+/// (exit 128, which kept every candidate in users' repositories), and trusting
+/// the repository instead would let user-controlled configuration run with
+/// root's privileges. Git runs as the owner of the repository's real Git
+/// directory, with that user's primary group from the user database; std's
+/// `CommandExt::uid` also clears root's supplementary groups
+/// (`setgroups(0, NULL)` before `setuid`), so a repository reachable only
+/// through a supplementary group is kept. `Ok(None)` runs Git as the current
+/// user; `Err(())` means the owner cannot be established, so the candidate is
+/// kept.
+#[cfg(unix)]
+fn git_query_identity(
+    euid: u32,
+    dot_git: &Path,
+    marker: &fs::Metadata,
+) -> std::result::Result<Option<(u32, u32)>, ()> {
+    if euid != 0 {
+        return Ok(None);
+    }
+    let uid = git_dir_owner(dot_git, marker).ok_or(())?;
+    if uid == 0 {
+        return Ok(None);
+    }
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .ok_or(())?;
+    Ok(Some((uid, user.gid.as_raw())))
+}
+
+/// Owner uid of the Git directory that a `.git` marker names: the directory
+/// itself, or the `gitdir:` target of a linked worktree's or submodule's
+/// `.git` file. `None` for a symlinked marker, a gitfile that is unreadable,
+/// malformed or replaced since `marker` was taken, a target that is not a
+/// directory, or a gitfile and target with different owners (Git refuses
+/// that mix for every user).
+#[cfg(unix)]
+fn git_dir_owner(dot_git: &Path, marker: &fs::Metadata) -> Option<u32> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let file_type = marker.file_type();
+    if file_type.is_dir() {
+        return Some(marker.uid());
+    }
+    if !file_type.is_file() || marker.len() > MAX_GITFILE_BYTES {
+        return None;
+    }
+    // The worktree's owner can swap `.git` after the lstat: never follow a
+    // link, never block on a FIFO, and read only the file that was observed.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(dot_git)
+        .ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.is_file()
+        || opened.dev() != marker.dev()
+        || opened.ino() != marker.ino()
+        || opened.uid() != marker.uid()
+    {
+        return None;
+    }
+    let mut contents = String::new();
+    let read = file
+        .take(MAX_GITFILE_BYTES + 1)
+        .read_to_string(&mut contents)
+        .ok()?;
+    if read as u64 > MAX_GITFILE_BYTES {
+        return None;
+    }
+    let target = contents.strip_prefix("gitdir:")?.trim();
+    if target.is_empty() || target.contains('\n') {
+        return None;
+    }
+    let git_dir = fs::canonicalize(dot_git.parent()?.join(target)).ok()?;
+    let git_dir_meta = fs::symlink_metadata(&git_dir).ok()?;
+    (git_dir_meta.is_dir() && git_dir_meta.uid() == marker.uid()).then_some(git_dir_meta.uid())
 }
 
 /// Hardcoded refusal: paths inside well-known source-tree locations must
@@ -1631,6 +2100,13 @@ fn contains_tracked_git_content(path: &Path) -> bool {
 /// (`C:\Users\...`) are not currently covered — sbh's target deployments
 /// are Linux and macOS only.
 pub(crate) fn is_hardcoded_source_tree(path: &Path) -> bool {
+    is_hardcoded_source_tree_given(path, false)
+}
+
+/// [`is_hardcoded_source_tree`] for the scorer, which holds the walker's
+/// structural signals: `cargo_evidence` corroborates a suffix-only artifact
+/// name (`<x>-target`, `<x>_target`) without another read of its root.
+pub(crate) fn is_hardcoded_source_tree_given(path: &Path, cargo_evidence: bool) -> bool {
     let s = path.to_string_lossy();
 
     // Determine whether the candidate sits under a protected source-tree root.
@@ -1648,7 +2124,7 @@ pub(crate) fn is_hardcoded_source_tree(path: &Path) -> bool {
         // inside operator-configured source roots. Arbitrary unknown
         // basenames (e.g., `src`, `docs`, or a misclassified crate name)
         // stay vetoed — that's the carnage-prevention guarantee.
-        if !is_obvious_build_artifact_basename(path) {
+        if !is_obvious_build_artifact_basename_given(path, cargo_evidence) {
             return true;
         }
     }
@@ -1658,7 +2134,7 @@ pub(crate) fn is_hardcoded_source_tree(path: &Path) -> bool {
     // and the leaf case (`/repo/.git` as the deletion target itself). It
     // runs UNCONDITIONALLY — there is no artifact carve-out for `.git`
     // metadata, even if the basename happens to look like an artifact.
-    // (`contains_nested_git` only inspects CHILDREN of the candidate, so a
+    // (`deep_containment` only inspects DESCENDANTS of the candidate, so a
     // `.git` directory passed in directly would not be caught without this
     // loop checking the path itself.)
     for ancestor in path.ancestors() {
@@ -1726,9 +2202,12 @@ pub(crate) fn source_marker_within(path: &Path, max_entries: usize) -> bool {
     ];
 
     // Source-file extensions — any one direct-child source file vetos.
+    // `mjs`/`cjs`/`mts`/`cts` too: a tracked scripts/build holding only
+    // `.mjs` passed this veto and was deleted (ts2, 2026-10-16, bd-8nol).
     const SOURCE_EXTS: &[&str] = &[
-        "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "kt", "rb", "ex", "exs", "ml", "hs",
-        "cpp", "cc", "c", "h", "hpp", "swift", "scala", "clj", "cljs", "lua", "jl", "lean",
+        "rs", "py", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "go", "java", "kt", "rb",
+        "ex", "exs", "ml", "hs", "cpp", "cc", "c", "h", "hpp", "swift", "scala", "clj", "cljs",
+        "lua", "jl", "lean",
     ];
 
     let Ok(entries) = fs::read_dir(path) else {
@@ -1813,9 +2292,21 @@ fn factors_to_record(f: &ScoreFactors) -> ScoreFactorsRecord {
 mod tests {
     use super::*;
     use crate::scanner::active_lease::{ActiveLease, LeasePolicy};
+    use crate::scanner::patterns::is_obvious_build_artifact_basename;
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
     use crate::scanner::scoring::{DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::borrow::Cow;
+
+    /// For tests about planning and execution, not live process evidence. The
+    /// live sweep reads every process on the machine and holds the batch when
+    /// one is unreadable. In a container root lacks CAP_SYS_PTRACE and cannot
+    /// read a concurrent test's child that runs under another uid.
+    fn offline_config() -> DeletionConfig {
+        DeletionConfig {
+            check_open_files: false,
+            ..Default::default()
+        }
+    }
 
     /// Fixture root for deletion tests, guaranteed to sit OUTSIDE the
     /// hardcoded source-tree roots (`/data/projects`, `/home/<u>/projects`,
@@ -2051,6 +2542,7 @@ mod tests {
 
         let executor = DeletionExecutor::new(
             DeletionConfig {
+                check_open_files: false,
                 include_review: true,
                 ..Default::default()
             },
@@ -2098,6 +2590,10 @@ mod tests {
     #[test]
     fn mount_incidents_get_no_per_path_backoff() {
         assert!(!should_backoff_skip(SkipReason::FilesystemReadOnly));
+        assert!(!should_backoff_skip(SkipReason::CategorySuspended));
+        assert!(!should_backoff_skip(SkipReason::PolicyChanged));
+        assert!(!should_backoff_skip(SkipReason::CompressionFirst));
+        assert!(!should_backoff_skip(SkipReason::SourceRootDenied));
         assert!(should_backoff_skip(SkipReason::Symlink));
         assert!(!should_backoff_skip(SkipReason::PathGone));
     }
@@ -2128,6 +2624,11 @@ mod tests {
                 SkipReason::SacredStowaway => 15,
                 SkipReason::FilesystemReadOnly => 16,
                 SkipReason::OpenScanIncomplete => 17,
+                SkipReason::CategorySuspended => 18,
+                SkipReason::SourceRootDenied => 19,
+                SkipReason::ShuttingDown => 20,
+                SkipReason::PolicyChanged => 21,
+                SkipReason::CompressionFirst => 22,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];
@@ -2162,6 +2663,9 @@ mod tests {
             items_would_delete: 0,
             bytes_freed: 0,
             bytes_freed_observed: None,
+            bytes_freed_at_commit: 0,
+            bytes_freed_at_commit_observed: 0,
+            freed_at_commit_on_btrfs: false,
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -2238,6 +2742,9 @@ mod tests {
             items_would_delete: 0,
             bytes_freed: 0,
             bytes_freed_observed: None,
+            bytes_freed_at_commit: 0,
+            bytes_freed_at_commit_observed: 0,
+            freed_at_commit_on_btrfs: false,
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -2271,6 +2778,60 @@ mod tests {
         dry.dry_run = true;
         dry.items_skipped = 5;
         assert!(!dry.stalled());
+    }
+
+    /// Where a filesystem frees blocks at commit the measured gain reads ~0,
+    /// so the report carries the estimate and says so; btrfs's estimate is
+    /// an upper bound (bd-oj33).
+    #[test]
+    fn reported_freed_says_how_each_part_is_known() {
+        let mut report = executor_report_template();
+        report.bytes_freed = 300;
+        report.bytes_freed_observed = Some(180);
+        assert_eq!(report.reported_freed(), (180, FreedBasis::Observed));
+        // An unmeasured removal falls back to the estimate.
+        report.bytes_freed_observed = None;
+        assert_eq!(report.reported_freed(), (300, FreedBasis::Estimated));
+        // 200 of the 300 estimated bytes went on ext4, measured as 0: the
+        // rest stays measured (180 - 0), the ext4 part is the estimate.
+        report.bytes_freed_observed = Some(180);
+        report.bytes_freed_at_commit = 200;
+        report.bytes_freed_at_commit_observed = 0;
+        assert_eq!(report.reported_freed(), (380, FreedBasis::Estimated));
+        report.freed_at_commit_on_btrfs = true;
+        assert_eq!(
+            report.reported_freed(),
+            (380, FreedBasis::EstimatedUpperBound)
+        );
+        // Totals take the weakest basis; phrases never pass an estimate off
+        // as a measurement.
+        assert_eq!(
+            FreedBasis::Observed.combine(FreedBasis::Estimated),
+            FreedBasis::Estimated
+        );
+        assert_eq!(
+            FreedBasis::EstimatedUpperBound.combine(FreedBasis::Observed),
+            FreedBasis::EstimatedUpperBound
+        );
+        let gib = 2 * 1_073_741_824;
+        assert_eq!(FreedBasis::Observed.freed_phrase(gib), "2.0 GB freed");
+        assert_eq!(
+            FreedBasis::Estimated.freed_phrase(gib),
+            "~2.0 GB freed, estimated"
+        );
+        assert_eq!(
+            FreedBasis::EstimatedUpperBound.freed_phrase(gib),
+            "up to 2.0 GB freed, estimated"
+        );
+        assert_eq!(
+            serde_json::to_string(&FreedBasis::Estimated).unwrap(),
+            "\"estimated_allocated\""
+        );
+    }
+
+    fn executor_report_template() -> DeletionReport {
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        executor.execute(&executor.plan(Vec::new()), None)
     }
 
     #[test]
@@ -2310,7 +2871,7 @@ mod tests {
         let c1 = make_candidate(&file_path, 13, 0.85);
         let c2 = make_candidate(&dir_path, 100, 0.90);
 
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c1, c2]);
         let report = executor.execute(&plan, None);
 
@@ -2327,12 +2888,6 @@ mod tests {
     #[test]
     fn observed_freed_bytes_are_measured_not_estimated() {
         let dir = scratch_dir();
-        let blob = dir.path().join("blob.bin");
-        let mut file = fs::File::create(&blob).unwrap();
-        std::io::Write::write_all(&mut file, &vec![0x5a_u8; 64 * 1024 * 1024]).unwrap();
-        file.sync_all().unwrap();
-        drop(file);
-
         let executor = DeletionExecutor::new(
             DeletionConfig {
                 check_open_files: false,
@@ -2341,20 +2896,60 @@ mod tests {
             None,
         );
         let estimate = 100 * 1024 * 1024;
-        let report = executor.execute(
-            &executor.plan(vec![make_candidate(&blob, estimate, 0.9)]),
-            None,
-        );
-        assert_eq!(report.items_deleted, 1);
-        assert_eq!(report.bytes_freed, estimate);
-        let observed = report
-            .bytes_freed_observed
-            .expect("an unlink on a local volume is measured");
-        assert!(
-            observed >= 16 * 1024 * 1024,
-            "removing 64 MiB should free most of it, observed {observed}"
-        );
-        assert_ne!(observed, estimate);
+        // The observation is a free-space difference on a volume that the
+        // tests running in parallel write to as well; one of them filling it
+        // during the unlink can hide the 64 MiB. Retry a disturbed attempt.
+        let mut observations = Vec::new();
+        for attempt in 0..5 {
+            let blob = dir.path().join(format!("blob-{attempt}.bin"));
+            let mut file = fs::File::create(&blob).unwrap();
+            std::io::Write::write_all(&mut file, &vec![0x5a_u8; 64 * 1024 * 1024]).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            let report = executor.execute(
+                &executor.plan(vec![make_candidate(&blob, estimate, 0.9)]),
+                None,
+            );
+            assert_eq!(report.items_deleted, 1);
+            assert_eq!(report.bytes_freed, estimate);
+            let observed = report
+                .bytes_freed_observed
+                .expect("an unlink on a local volume is measured");
+            assert_ne!(observed, estimate);
+            // A filesystem that frees at commit reports the estimate, marked
+            // as one; elsewhere the measurement stands (bd-oj33).
+            let (reported, basis) = report.reported_freed();
+            if commit_freeing_beside(&blob).is_some() {
+                assert_eq!(reported, estimate);
+                assert_ne!(basis, FreedBasis::Observed);
+            } else {
+                assert_eq!((reported, basis), (observed, FreedBasis::Observed));
+            }
+            if observed >= 16 * 1024 * 1024 {
+                return;
+            }
+            observations.push(observed);
+        }
+        // ext4 and btrfs return freed blocks when the journal or transaction
+        // commits, not at unlink, so the executor's immediate measurement can
+        // miss them. Accept that only if the space does come back later.
+        let available = || available_bytes_beside(dir.path()).unwrap_or(0);
+        let blob = dir.path().join("deferred.bin");
+        let mut file = fs::File::create(&blob).unwrap();
+        std::io::Write::write_all(&mut file, &vec![0x5a_u8; 64 * 1024 * 1024]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let before = available();
+        fs::remove_file(&blob).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        while std::time::Instant::now() < deadline {
+            if available().saturating_sub(before) >= 16 * 1024 * 1024 {
+                eprintln!("this filesystem frees space at commit, not at unlink: {observations:?}");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        panic!("removing 64 MiB never freed most of it: observed {observations:?}");
     }
 
     /// A quarantine rename frees nothing, and is not counted as freed.
@@ -2628,13 +3223,145 @@ mod tests {
         fs::write(git_dir.join("Cargo.toml"), "[package]").unwrap();
 
         let c = make_candidate(&git_dir, 5000, 0.95);
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c]);
         let report = executor.execute(&plan, None);
 
         assert_eq!(report.items_deleted, 0);
         assert_eq!(report.items_skipped, 1);
         assert!(git_dir.exists());
+    }
+
+    /// bd-jydu: a clone four or more levels inside a candidate (an agent's
+    /// temp tree) reached remove_dir_all, because every containment walk
+    /// stopped at depth 3.
+    #[test]
+    fn skips_a_candidate_holding_a_repository_below_depth_three() {
+        for depth in [4_usize, 9] {
+            let dir = scratch_dir();
+            let candidate = dir.path().join("stale_target");
+            let repo = (1..depth).fold(candidate.clone(), |path, level| {
+                path.join(format!("level{level}"))
+            });
+            fs::create_dir_all(repo.join(".git/objects")).unwrap();
+            fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+            fs::write(repo.join("notes.txt"), "unpushed work").unwrap();
+
+            // The open-file scan is not under test; under a loaded parallel
+            // run it can skip first as open_scan_incomplete.
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    check_open_files: false,
+                    ..Default::default()
+                },
+                None,
+            );
+            let plan = executor.plan(vec![make_candidate(&candidate, 13, 0.95)]);
+            let report = executor.execute(&plan, None);
+
+            assert_eq!(report.items_deleted, 0, ".git at depth {depth}");
+            assert_eq!(
+                report.skipped_by_reason.get("contains_git"),
+                Some(&1),
+                ".git at depth {depth}: {:?}",
+                report.skipped_by_reason
+            );
+            assert!(repo.join("notes.txt").exists());
+        }
+    }
+
+    #[test]
+    fn skips_a_candidate_holding_a_protect_marker_below_depth_three() {
+        let dir = scratch_dir();
+        let candidate = dir.path().join("stale_target");
+        let kept = candidate.join("a/b/c/d/keep");
+        fs::create_dir_all(&kept).unwrap();
+        fs::write(kept.join(protection::MARKER_FILENAME), "").unwrap();
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![make_candidate(&candidate, 1, 0.95)]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(
+            report.skipped_by_reason.get("sacred_stowaway"),
+            Some(&1),
+            "{:?}",
+            report.skipped_by_reason
+        );
+        assert!(kept.exists());
+    }
+
+    /// The deep search must not turn regenerable caches into vetoes, nor
+    /// loosen the shallow rule.
+    #[test]
+    fn deep_containment_tells_repositories_from_cache_git_entries() {
+        let dir = scratch_dir();
+        let tree = |name: &str| {
+            let root = dir.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            root
+        };
+
+        // A cargo git checkout in a temporary CARGO_HOME, `.git` at depth 5.
+        let cargo_home = tree("tmp-cargo-home");
+        let checkout = cargo_home.join("git/checkouts/dep-0123abcd/c48399f");
+        fs::create_dir_all(checkout.join(".git/objects")).unwrap();
+        fs::write(checkout.join(".git/HEAD"), "c48399f\n").unwrap();
+        fs::write(checkout.join(".cargo-ok"), "").unwrap();
+        assert_eq!(
+            deep_containment(&cargo_home, DEEP_CONTAINMENT_MAX_DIRS),
+            DeepContainment::Clear
+        );
+        // The same layout before cargo marked the checkout complete is kept.
+        fs::remove_file(checkout.join(".cargo-ok")).unwrap();
+        assert_eq!(
+            deep_containment(&cargo_home, DEEP_CONTAINMENT_MAX_DIRS),
+            DeepContainment::Repository
+        );
+
+        // uv's empty `.git` bucket marker at depth 4 is not a repository...
+        let uv = tree("uv-cache");
+        let bucket = uv.join("a/b/sdists-v10");
+        fs::create_dir_all(&bucket).unwrap();
+        fs::write(bucket.join(".git"), "").unwrap();
+        assert_eq!(
+            deep_containment(&uv, DEEP_CONTAINMENT_MAX_DIRS),
+            DeepContainment::Clear
+        );
+        // ...but a `.git` file pointing at one (a linked worktree) is.
+        fs::write(bucket.join(".git"), "gitdir: /src/repo/.git/worktrees/x\n").unwrap();
+        assert_eq!(
+            deep_containment(&uv, DEEP_CONTAINMENT_MAX_DIRS),
+            DeepContainment::Repository
+        );
+
+        // Within depth 3 any `.git` entry still vetoes, as before.
+        let shallow = tree("shallow");
+        fs::create_dir_all(shallow.join("a/b")).unwrap();
+        fs::write(shallow.join("a/b/.git"), "").unwrap();
+        assert_eq!(
+            deep_containment(&shallow, DEEP_CONTAINMENT_MAX_DIRS),
+            DeepContainment::Repository
+        );
+    }
+
+    #[test]
+    fn deep_containment_fails_closed_when_the_budget_runs_out() {
+        let dir = scratch_dir();
+        let root = dir.path().join("wide");
+        for branch in 0..4 {
+            fs::create_dir_all(root.join(format!("b{branch}/leaf"))).unwrap();
+        }
+        // 1 + 4 + 4 directories to open.
+        assert_eq!(deep_containment(&root, 9), DeepContainment::Clear);
+        assert_eq!(deep_containment(&root, 8), DeepContainment::Truncated);
     }
 
     /// EROFS is a mount incident, everything else a refusal: the two must
@@ -2866,7 +3593,7 @@ mod tests {
         let gone = dir.path().join("already_gone");
 
         let c = make_candidate(&gone, 1000, 0.85);
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c]);
         let report = executor.execute(&plan, None);
 
@@ -2931,6 +3658,7 @@ mod tests {
 
         let executor = DeletionExecutor::new(
             DeletionConfig {
+                check_open_files: false,
                 max_batch_size: 3,
                 ..Default::default()
             },
@@ -2955,7 +3683,7 @@ mod tests {
             candidates.push(make_candidate(&p, 100, 0.8));
         }
 
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(candidates);
 
         // Pressure check: resolved after first deletion.
@@ -2964,12 +3692,46 @@ mod tests {
             &plan,
             Some(&|_path| {
                 let count = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                count >= 1 // Resolved after first
+                // Resolved after first
+                (count >= 1).then_some(SkipReason::TargetFreeReached)
             }),
         );
 
         // Should delete 1, then stop.
         assert_eq!(report.items_deleted, 1);
+        assert_eq!(
+            report.skipped_by_reason.get("target_free_reached"),
+            Some(&4)
+        );
+        assert_eq!(report.backoff_candidates.len(), 4);
+    }
+
+    /// A hook's refusal is recorded under the hook's own reason, and a
+    /// shutdown leaves the rest of the batch without per-path backoff
+    /// (bd-drua: protection refusals were reported as target free reached).
+    #[test]
+    fn hook_skips_keep_their_reason_and_shutdown_has_no_backoff() {
+        let dir = scratch_dir();
+        let candidates = (0..3)
+            .map(|i| {
+                let p = dir.path().join(format!("hook_{i}.txt"));
+                fs::write(&p, "x").unwrap();
+                make_candidate(&p, 10, 0.8)
+            })
+            .collect::<Vec<_>>();
+        let executor = DeletionExecutor::new(offline_config(), None);
+        let plan = executor.plan(candidates);
+
+        let protected = executor.execute(&plan, Some(&|_| Some(SkipReason::SacredStowaway)));
+        assert_eq!(protected.items_deleted, 0);
+        assert_eq!(protected.skipped_by_reason.get("sacred_stowaway"), Some(&3));
+        assert_eq!(protected.skipped_by_reason.get("target_free_reached"), None);
+        assert_eq!(protected.backoff_candidates.len(), 3);
+
+        let stopping = executor.execute(&plan, Some(&|_| Some(SkipReason::ShuttingDown)));
+        assert_eq!(stopping.items_deleted, 0);
+        assert_eq!(stopping.skipped_by_reason.get("shutting_down"), Some(&3));
+        assert!(stopping.backoff_candidates.is_empty());
     }
 
     #[test]
@@ -2988,6 +3750,7 @@ mod tests {
         // With a valid setup, all should succeed.
         let executor = DeletionExecutor::new(
             DeletionConfig {
+                check_open_files: false,
                 circuit_breaker_threshold: 3,
                 circuit_breaker_cooldown: Duration::from_millis(10),
                 ..Default::default()
@@ -3014,7 +3777,7 @@ mod tests {
         let c1 = make_candidate(&good, 2, 0.85);
         let c2 = make_candidate(&gone, 3, 0.80);
 
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c1, c2]);
 
         // Remove the file before execution to trigger skip.
@@ -3153,7 +3916,7 @@ mod tests {
         let c2 = make_candidate(&file2, 5, 0.80);
         let c3 = make_candidate(&file3, 5, 0.75);
 
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c1, c2, c3]);
         let report = executor.execute(&plan, None);
 
@@ -3301,6 +4064,17 @@ mod tests {
         let dir = scratch_dir();
         fs::write(dir.path().join("main.py"), "x = 1").unwrap();
         assert!(looks_like_source_code(dir.path()));
+    }
+
+    /// midas_edge's tracked scripts/build holds only `.mjs` files; it passed
+    /// this veto and was deleted from repo copies on ts2 (bd-8nol).
+    #[test]
+    fn looks_like_source_code_detects_esm_and_commonjs_modules() {
+        for name in ["cjs-shim.mjs", "loader.cjs", "types.mts", "config.cts"] {
+            let dir = scratch_dir();
+            fs::write(dir.path().join(name), "export {};\n").unwrap();
+            assert!(looks_like_source_code(dir.path()), "{name}");
+        }
     }
 
     #[test]
@@ -3462,6 +4236,267 @@ mod tests {
     }
 
     #[test]
+    fn an_aborted_batch_has_its_own_code_and_names_its_cause() {
+        for (without_root, cause) in [
+            (true, "cannot be inspected without root"),
+            (false, "within its limits"),
+        ] {
+            let ActivityEvent::Error { code, message } = incomplete_scan_event(without_root) else {
+                panic!("an aborted batch is logged as an error");
+            };
+            assert_eq!(code, "SBH-3005");
+            assert!(message.contains(cause), "{message}");
+            assert!(message.ends_with("aborting batch for safety"), "{message}");
+        }
+    }
+
+    #[test]
+    fn tracked_content_check_ignores_case_drift_between_disk_and_index() {
+        // A case-only rename on disk (`Build/` to `build/`) leaves the files
+        // tracked, and on case-insensitive APFS `git status` stays clean. A
+        // case-sensitive query called the renamed subtree unmatched, so an
+        // artifact-looking `build/` full of tracked files was reclaimable.
+        let dir = scratch_dir();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("vendor/Build")).unwrap();
+        fs::write(repo.join("vendor/Build/spec.payload"), "useful source").unwrap();
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&["add", "vendor"]);
+        git(&[
+            "-c",
+            "user.name=SBH regression",
+            "-c",
+            "user.email=sbh-regression@example.invalid",
+            "commit",
+            "-m",
+            "tracked source control",
+        ]);
+        fs::rename(repo.join("vendor/Build"), repo.join("vendor/build")).unwrap();
+        assert!(contains_tracked_git_content(&repo.join("vendor/build")));
+        assert!(contains_tracked_git_content(
+            &repo.join("vendor/build/spec.payload")
+        ));
+        // Untracked output in the same repository stays reclaimable.
+        let artifact = repo.join("target/debug");
+        fs::create_dir_all(&artifact).unwrap();
+        fs::write(artifact.join("generated.o"), "object bytes").unwrap();
+        assert!(!contains_tracked_git_content(&artifact));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_query_identity_switches_root_to_a_non_root_owner() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = scratch_dir();
+        let dot_git = dir.path().join(".git");
+        fs::create_dir(&dot_git).unwrap();
+        let running_as_root = nix::unistd::geteuid().is_root();
+        if running_as_root {
+            // The suite itself runs as root on some hosts: give the fixture
+            // the non-root owner this case is about, and a group that is not
+            // that owner's primary group.
+            std::os::unix::fs::chown(&dot_git, Some(65534), Some(12345)).unwrap();
+        }
+        let marker = fs::symlink_metadata(&dot_git).unwrap();
+        let uid = marker.uid();
+        assert_ne!(uid, 0);
+        // The owner's primary group comes from the user database, not from
+        // the directory's group.
+        let primary_gid = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+            .ok()
+            .flatten()
+            .map(|user| user.gid.as_raw());
+        if running_as_root && let Some(gid) = primary_gid {
+            assert_ne!(gid, marker.gid());
+        }
+        let expected = primary_gid.map(|gid| Some((uid, gid))).ok_or(());
+        assert_eq!(git_query_identity(0, &dot_git, &marker), expected);
+        // A non-root daemon always runs Git as itself.
+        assert_eq!(git_query_identity(uid, &dot_git, &marker), Ok(None));
+        assert_eq!(git_query_identity(1, &dot_git, &marker), Ok(None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_query_identity_keeps_root_for_a_root_owned_repository() {
+        // `/` is root-owned on every host this suite runs on.
+        let root = Path::new("/");
+        let marker = fs::symlink_metadata(root).unwrap();
+        assert_eq!(git_dir_owner(root, &marker), Some(0));
+        assert_eq!(git_query_identity(0, root, &marker), Ok(None));
+    }
+
+    #[test]
+    fn git_query_path_for_root_names_only_root_controlled_directories() {
+        let root = git_query_path(true);
+        assert!(
+            !root.contains("homebrew") && !root.contains("linuxbrew"),
+            "{root}"
+        );
+        assert!(
+            git_query_path(false)
+                .split(':')
+                .any(|dir| dir == "/usr/bin")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_query_identity_follows_a_gitfile_to_its_git_dir() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = scratch_dir();
+        let git_dir = dir.path().join("main/.git/worktrees/linked");
+        fs::create_dir_all(&git_dir).unwrap();
+        let worktree = dir.path().join("linked");
+        fs::create_dir(&worktree).unwrap();
+        let dot_git = worktree.join(".git");
+        let owner = Some(fs::metadata(&git_dir).unwrap().uid());
+        // Git resolves a relative gitdir against the gitfile's directory.
+        fs::write(&dot_git, "gitdir: ../main/.git/worktrees/linked\n").unwrap();
+        let marker = fs::symlink_metadata(&dot_git).unwrap();
+        assert_eq!(git_dir_owner(&dot_git, &marker), owner);
+        fs::write(&dot_git, format!("gitdir: {}\n", git_dir.display())).unwrap();
+        let marker = fs::symlink_metadata(&dot_git).unwrap();
+        assert_eq!(git_dir_owner(&dot_git, &marker), owner);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_query_identity_refuses_when_the_owner_cannot_be_established() {
+        let dir = scratch_dir();
+        let real = dir.path().join("real-git-dir");
+        fs::create_dir(&real).unwrap();
+        let plain_file = dir.path().join("plain-file");
+        fs::write(&plain_file, "x").unwrap();
+        let check = |name: &str, setup: &dyn Fn(&Path)| {
+            let worktree = dir.path().join(name);
+            fs::create_dir(&worktree).unwrap();
+            let dot_git = worktree.join(".git");
+            setup(&dot_git);
+            let marker = fs::symlink_metadata(&dot_git).unwrap();
+            assert_eq!(git_dir_owner(&dot_git, &marker), None, "{name}");
+            assert_eq!(git_query_identity(0, &dot_git, &marker), Err(()), "{name}");
+        };
+        check("symlinked", &|dot_git: &Path| {
+            std::os::unix::fs::symlink(&real, dot_git).unwrap();
+        });
+        check("not-a-gitfile", &|dot_git: &Path| {
+            fs::write(dot_git, "nonsense\n").unwrap();
+        });
+        check("empty-gitdir", &|dot_git: &Path| {
+            fs::write(dot_git, "gitdir:   \n").unwrap();
+        });
+        check("two-lines", &|dot_git: &Path| {
+            fs::write(dot_git, format!("gitdir: {}\nextra\n", real.display())).unwrap();
+        });
+        check("missing-target", &|dot_git: &Path| {
+            fs::write(dot_git, "gitdir: ../does-not-exist\n").unwrap();
+        });
+        check("file-target", &|dot_git: &Path| {
+            fs::write(dot_git, format!("gitdir: {}\n", plain_file.display())).unwrap();
+        });
+        check("oversized", &|dot_git: &Path| {
+            let padding = " ".repeat(5000);
+            fs::write(dot_git, format!("gitdir: {}{padding}\n", real.display())).unwrap();
+        });
+        // `/` is root-owned: a gitfile with any other owner must not borrow it.
+        check("owner-mismatch", &|dot_git: &Path| {
+            fs::write(dot_git, "gitdir: /\n").unwrap();
+            if nix::unistd::geteuid().is_root() {
+                std::os::unix::fs::chown(dot_git, Some(65534), Some(65534)).unwrap();
+            }
+        });
+    }
+
+    /// Root only (skipped otherwise; run the test binary under sudo): a root
+    /// daemon gets Git's answer for a repository another user owns, so
+    /// untracked build output there is eligible again while tracked content
+    /// stays protected.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_queries_a_user_owned_repository_as_its_owner() {
+        if !nix::unistd::geteuid().is_root() {
+            eprintln!("skipped: needs root");
+            return;
+        }
+        // Directly under /tmp, so every ancestor is traversable by nobody.
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("vendor/assets/build")).unwrap();
+        fs::write(
+            repo.join("vendor/assets/build/spec.payload"),
+            "useful source",
+        )
+        .unwrap();
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&["add", "vendor"]);
+        git(&[
+            "-c",
+            "user.name=SBH regression",
+            "-c",
+            "user.email=sbh-regression@example.invalid",
+            "commit",
+            "-m",
+            "tracked source control",
+        ]);
+        let artifact = repo.join("target/debug/build");
+        fs::create_dir_all(&artifact).unwrap();
+        fs::write(artifact.join("generated.o"), "object bytes").unwrap();
+        // Hand the whole fixture to an unprivileged owner (nobody:nogroup).
+        let chown = std::process::Command::new("chown")
+            .args(["-R", "65534:65534"])
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        assert!(chown.success());
+
+        assert!(
+            !contains_tracked_git_content(&artifact),
+            "untracked build output in a user-owned repository must be eligible"
+        );
+        let tracked = repo.join("vendor/assets/build");
+        assert!(
+            contains_tracked_git_content(&tracked),
+            "tracked content must stay protected"
+        );
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        assert_eq!(
+            executor.explain_preflight(&make_candidate(&artifact, 1, 1.0), None),
+            Ok(())
+        );
+        assert_eq!(
+            executor.explain_preflight(&make_candidate(&tracked, 1, 1.0), None),
+            Err(SkipReason::ContainsGit)
+        );
+    }
+
+    #[test]
     fn preflight_keeps_content_when_ancestor_git_evidence_is_broken() {
         let dir = scratch_dir();
         fs::write(
@@ -3556,10 +4591,12 @@ mod tests {
 
     #[test]
     fn obvious_build_artifact_basename_suffix_matches() {
-        // Descriptive `CARGO_TARGET_DIR` names: `<prefix>-target` /
-        // `<prefix>_target` with a non-empty prefix. This is the rule that lets
-        // the stranded `/root/cass-ft-target` (241 GB) be reclaimed, and it
-        // also newly covers `my-target` (previously start-anchored-only).
+        // Descriptive `CARGO_TARGET_DIR` names (`<prefix>-target` /
+        // `<prefix>_target`) count when the directory carries cargo's root
+        // markers: that keeps a stranded `/root/cass-ft-target` (241 GB)
+        // reclaimable. Without them the name alone proves nothing (issue
+        // #34: `invalid_target` / `ambient-target` evidence fixtures on ts2).
+        let base = tempfile::tempdir().unwrap();
         for name in [
             "cass-ft-target",
             "cass_ft_target",
@@ -3568,10 +4605,27 @@ mod tests {
             "my-target",
             "my_target",
         ] {
-            let p = PathBuf::from(format!("/root/{name}"));
+            let p = base.path().join(name);
+            fs::create_dir_all(&p).unwrap();
+            assert!(
+                !is_obvious_build_artifact_basename(&p),
+                "`{name}` without cargo markers must not pass on its name"
+            );
+            fs::write(p.join(".rustc_info.json"), "{}").unwrap();
             assert!(
                 is_obvious_build_artifact_basename(&p),
-                "expected `{name}` to be recognized as a build artifact"
+                "expected `{name}` with cargo markers to be a build artifact"
+            );
+        }
+        // Inside a project root the floor refuses the evidence shapes outright.
+        for path in [
+            "/data/projects/hfdt-release-v0.3.15/publish-gates-v1/sanitizer-wrapper-controls-v1/invalid_target",
+            "/data/projects/hfdt-fon4nq/baseline/ambient-target",
+        ] {
+            assert!(is_hardcoded_source_tree(Path::new(path)), "{path}");
+            assert!(
+                !is_hardcoded_source_tree_given(Path::new(path), true),
+                "{path}"
             );
         }
     }
@@ -3849,7 +4903,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn remove_dir_all_force_defeats_readonly_module_cache_tree() {
+    fn confined_removal_defeats_readonly_module_cache_tree() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = scratch_dir();
@@ -3869,7 +4923,7 @@ mod tests {
         // Root bypasses mode bits, so skip the negative assertion there.
         if crate::platform::running_as_root() {
             eprintln!(
-                "SKIP: running as root (remove_dir_all_force_defeats_readonly_module_cache_tree: negative half only)"
+                "SKIP: running as root (confined_removal_defeats_readonly_module_cache_tree: negative half only)"
             );
         } else {
             assert!(
@@ -3879,8 +4933,9 @@ mod tests {
             assert!(root.exists());
         }
 
-        // The force variant chmods the subtree writable and succeeds.
-        remove_dir_all_force(&root).expect("force remove should defeat read-only bits");
+        // Only verified directory handles gain the permission needed to unlink.
+        quarantine::remove_direct(&root, &fs::symlink_metadata(&root).unwrap(), true)
+            .expect("confined cache removal should defeat read-only directory bits");
         assert!(!root.exists());
     }
 
@@ -4035,14 +5090,30 @@ mod tests {
 
         // Batch 1 takes (or reuses) a sweep and deletes `first`.
         let report = executor.execute(&executor.plan(vec![make_candidate(&first, 6, 0.95)]), None);
+        if report
+            .skipped_by_reason
+            .contains_key("open_scan_incomplete")
+        {
+            // A user who cannot read other users' processes never gets a
+            // complete sweep, so every batch is held: nothing to prove here.
+            eprintln!("skipped: this user cannot see every process");
+            return;
+        }
         assert_eq!(report.items_deleted, 1, "{report:?}");
 
-        // A build starts in `second` after that sweep: its root changes and
-        // a file under it is held open by this process.
-        std::thread::sleep(Duration::from_millis(20));
+        // A build starts in `second` after that sweep: a file under it is
+        // held open by this process, and only then does the root change. The
+        // last sweep is process-wide, so another test's executor may sweep at
+        // any moment; marking the root changed after the open means a sweep
+        // that missed the descriptor started before the change and cannot be
+        // reused for `second`.
         let live = second.join("build.lock");
-        fs::write(&live, b"lock").unwrap();
-        let handle = fs::File::open(&live).unwrap();
+        let mut handle = fs::File::create(&live).unwrap();
+        std::io::Write::write_all(&mut handle, b"lock").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let marker = second.join("started");
+        fs::write(&marker, b"").unwrap();
+        fs::remove_file(&marker).unwrap();
         let (visible, _) = walker::collect_open_path_ancestors(std::slice::from_ref(&second));
         if !visible.contains(&live) {
             // /proc hides our own fds here (hidepid, containers): nothing to prove.

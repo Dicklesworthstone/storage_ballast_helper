@@ -21,24 +21,37 @@ use crossbeam_channel as channel;
 use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::Platform;
 use crate::scanner::patterns::{
-    OpaqueTreeClassification, OpaqueTreeContext, OpaqueTreeDisposition, StructuralSignals,
-    classify_opaque_tree,
+    ArtifactClassification, ArtifactPatternRegistry, OpaqueTreeClassification, OpaqueTreeContext,
+    OpaqueTreeDisposition, StructuralSignals, classify_opaque_tree,
 };
 use crate::scanner::protection::ProtectionRegistry;
 use crate::scanner::scoring::ActiveReferenceSummary;
 
+mod build_scopes;
+use build_scopes::BuildDirectoryScopes;
+mod code_sign_clones;
+use code_sign_clones::AppInstance;
+
 pub const DEFAULT_ACTIVE_REFERENCE_CACHE_TTL_SECS: u64 = 30;
 pub const DEFAULT_ACTIVE_REFERENCE_MIN_SIZE_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Bound of the worker → collector result channel; a full channel makes a
-/// worker wait `SEND_TIMEOUT` and then drop the entry rather than deadlock.
+/// Most entries buffered in the worker → collector result channel.
+///
+/// The channel holds `RESULT_CHANNEL_CAP / WALK_BATCH_ENTRIES` batches. A
+/// worker facing a full channel waits, re-checking cancellation every
+/// `SEND_TIMEOUT`.
 pub const RESULT_CHANNEL_CAP: usize = 10_000;
+
+/// Most entries a worker sends the collector in one message. One message
+/// per entry made the collector's receive spin and yield once per
+/// directory, most of a busy Mac daemon's scan CPU (bd-vf9z).
+pub const WALK_BATCH_ENTRIES: usize = 64;
 
 /// How long a worker waits for work before re-checking the shutdown flag.
 pub const WORK_RECV_TIMEOUT: Duration = Duration::from_millis(50);
 
-/// How long a worker waits on a full work or result channel before giving
-/// up on that send (the walk then counts the entry as skipped).
+/// How long a worker waits on a full work or result channel before checking
+/// whether the walk was cancelled; it keeps sending until it is.
 pub const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 pub const MACOS_USER_SCOPE_ACTIVE_REFERENCE_WARNING: &str =
     "fd check incomplete: other-user processes not visible";
@@ -73,6 +86,24 @@ impl ActiveReferenceScanConfig {
     #[must_use]
     pub fn should_probe(self, candidate_size_bytes: u64) -> bool {
         self.min_candidate_size_bytes == 0 || candidate_size_bytes >= self.min_candidate_size_bytes
+    }
+
+    /// Whether a candidate gets the in-use probe. Caches are probed at any
+    /// size: a build reads its cargo home and package caches without holding
+    /// them open, and in a real-build proof a fresh 15 MB default `~/.cargo`
+    /// under a running build was approved for deletion because only
+    /// candidates over the size floor were probed (2026-10-14).
+    #[must_use]
+    pub fn should_probe_candidate(
+        self,
+        candidate_size_bytes: u64,
+        category: crate::scanner::patterns::ArtifactCategory,
+    ) -> bool {
+        use crate::scanner::patterns::ArtifactCategory;
+        matches!(
+            category,
+            ArtifactCategory::CacheDir | ArtifactCategory::GoCache
+        ) || self.should_probe(candidate_size_bytes)
     }
 }
 
@@ -182,6 +213,201 @@ struct WorkItem {
     opaque_tree: Option<OpaqueTreeClassification>,
 }
 
+/// Entries of a running walk, one at a time.
+///
+/// The workers send them in batches of up to [`WALK_BATCH_ENTRIES`]; the
+/// stream ends when every worker has finished or been cancelled. Dropping
+/// the stream cancels the walk.
+#[derive(Debug)]
+pub struct WalkStream {
+    rx: channel::Receiver<Vec<WalkEntry>>,
+    pending: std::vec::IntoIter<WalkEntry>,
+    /// The walk's work queue: what is still in it was never listed.
+    work: Option<channel::Receiver<WorkItem>>,
+    /// Paths the workers recorded as unfinished (see [`ResultBatch`]).
+    unfinished: Arc<parking_lot::Mutex<Vec<PathBuf>>>,
+    /// The walk's cancel flag (the walker's [`DirectoryWalker::cancel_token`]).
+    cancel: Arc<AtomicBool>,
+}
+
+impl WalkStream {
+    fn new(
+        rx: channel::Receiver<Vec<WalkEntry>>,
+        work: Option<channel::Receiver<WorkItem>>,
+        unfinished: Arc<parking_lot::Mutex<Vec<PathBuf>>>,
+        cancel: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            rx,
+            pending: Vec::new().into_iter(),
+            work,
+            unfinished,
+            cancel,
+        }
+    }
+
+    /// A stream of entries already in hand, such as a catalog scan's units.
+    #[must_use]
+    pub fn from_entries(entries: Vec<WalkEntry>) -> Self {
+        let (tx, rx) = channel::bounded(1);
+        // Room for exactly this batch, and the receiver is alive.
+        let _ = tx.send(entries);
+        Self::new(rx, None, Arc::default(), Arc::default())
+    }
+
+    /// For a consumer that stopped early and set the walker's cancel flag:
+    /// the paths whose subtrees it has not seen. Each returned path and every
+    /// directory above it is unfinished, so a directory listed before the
+    /// stop is complete only if nothing returned lies at or below it. They
+    /// are the entries still in this stream, the parents of directories still
+    /// queued, directories a worker was listing or dispatching when it
+    /// stopped, entries it had not sent, and directories longer than one
+    /// processing window. Waits up to `wait` for the workers to stop, and is
+    /// `None` if they have not: until then the answer is not final.
+    pub fn unfinished_after_cancel(mut self, wait: Duration) -> Option<Vec<PathBuf>> {
+        let deadline = Instant::now() + wait;
+        let mut unfinished: HashSet<PathBuf> =
+            self.pending.by_ref().map(|entry| entry.path).collect();
+        loop {
+            match self
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(batch) => unfinished.extend(batch.into_iter().map(|entry| entry.path)),
+                Err(channel::RecvTimeoutError::Disconnected) => break,
+                Err(channel::RecvTimeoutError::Timeout) => return None,
+            }
+        }
+        // Every worker has exited, so the queue and the record are final.
+        // A wide queue holds many siblings: their parent stands for them.
+        if let Some(work) = &self.work {
+            unfinished.extend(
+                work.try_iter()
+                    .filter_map(|item| item.path.parent().map(Path::to_path_buf)),
+            );
+        }
+        unfinished.extend(self.unfinished.lock().drain(..));
+        Some(unfinished.into_iter().collect())
+    }
+
+    /// The next entry, waiting up to `timeout` for the workers to send more.
+    pub fn recv_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> std::result::Result<WalkEntry, channel::RecvTimeoutError> {
+        loop {
+            if let Some(entry) = self.pending.next() {
+                return Ok(entry);
+            }
+            self.pending = self.rx.recv_timeout(timeout)?.into_iter();
+        }
+    }
+}
+
+impl Drop for WalkStream {
+    /// Nobody reads what the workers would send. Without this a consumer that
+    /// went away without cancelling (a scanner thread that panicked and was
+    /// respawned) left its walk listing the rest of the tree in the
+    /// background, every batch lost.
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Iterator for WalkStream {
+    type Item = WalkEntry;
+
+    fn next(&mut self) -> Option<WalkEntry> {
+        loop {
+            if let Some(entry) = self.pending.next() {
+                return Some(entry);
+            }
+            self.pending = self.rx.recv().ok()?.into_iter();
+        }
+    }
+}
+
+/// A worker's results not yet sent to the collector, and its record of what
+/// the collector will not see: entries lost to a cancelled or abandoned send
+/// (or still held when the worker stops), and directories the worker left
+/// part-done. [`WalkStream::unfinished_after_cancel`] reports them.
+struct ResultBatch<'a> {
+    tx: &'a channel::Sender<Vec<WalkEntry>>,
+    pending: Vec<WalkEntry>,
+    capacity: usize,
+    unfinished: &'a parking_lot::Mutex<Vec<PathBuf>>,
+}
+
+impl<'a> ResultBatch<'a> {
+    fn new(
+        tx: &'a channel::Sender<Vec<WalkEntry>>,
+        capacity: usize,
+        unfinished: &'a parking_lot::Mutex<Vec<PathBuf>>,
+    ) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            tx,
+            pending: Vec::with_capacity(capacity),
+            capacity,
+            unfinished,
+        }
+    }
+
+    /// Record that the collector will not see all of `dir`'s subtree.
+    fn mark_unfinished(&self, dir: &Path) {
+        self.unfinished.lock().push(dir.to_path_buf());
+    }
+
+    fn lose(&self, batch: Vec<WalkEntry>) {
+        self.unfinished
+            .lock()
+            .extend(batch.into_iter().map(|entry| entry.path));
+    }
+
+    /// Queue `entry`, sending the batch once it is full. False when the walk
+    /// was cancelled or the collector is gone.
+    fn push(&mut self, entry: WalkEntry, cancel: &AtomicBool) -> bool {
+        self.pending.push(entry);
+        self.pending.len() < self.capacity || self.flush(cancel)
+    }
+
+    /// Send the queued entries, waiting while the channel is full. False,
+    /// with the entries recorded as lost, when the walk was cancelled or the
+    /// collector is gone.
+    fn flush(&mut self, cancel: &AtomicBool) -> bool {
+        if self.pending.is_empty() {
+            return true;
+        }
+        let mut batch = std::mem::replace(&mut self.pending, Vec::with_capacity(self.capacity));
+        loop {
+            match self.tx.send_timeout(batch, SEND_TIMEOUT) {
+                Ok(()) => return true,
+                Err(channel::SendTimeoutError::Timeout(unsent)) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        self.lose(unsent);
+                        return false;
+                    }
+                    batch = unsent;
+                }
+                Err(channel::SendTimeoutError::Disconnected(unsent)) => {
+                    self.lose(unsent);
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ResultBatch<'_> {
+    /// A worker that stops on cancellation holds entries it never sent.
+    fn drop(&mut self) {
+        if !self.pending.is_empty() {
+            let held = std::mem::take(&mut self.pending);
+            self.lose(held);
+        }
+    }
+}
+
 pub const OPAQUE_CANDIDATE_SIZE_FLOOR: u64 = 100 * 1_048_576;
 
 /// Entry budget for [`opaque_tree_allocated_size`].
@@ -276,6 +502,7 @@ fn note_opaque_signal(
                     signals.has_cachedir_tag = true;
                 }
             }
+            "pyvenv.cfg" => signals.has_pyvenv_cfg = true,
             "Cargo.toml" => signals.has_cargo_toml = true,
             _ => {}
         }
@@ -503,6 +730,60 @@ impl WalkEntry {
         );
         probe.newest_mtime.map_or(base, |newest| newest.max(base))
     }
+
+    /// Give a walked directory the size a measuring walk would have given it
+    /// (its immediate files, when they hold any bytes). Opaque trees, already
+    /// measured by their probe, and non-directories are left alone.
+    pub fn measure_immediate_files(&mut self) {
+        if !self.metadata.is_dir || self.opaque_tree.is_some() {
+            return;
+        }
+        let bytes = immediate_file_bytes(&self.path);
+        if bytes > 0 {
+            self.metadata.content_size_bytes = bytes;
+        }
+    }
+
+    /// The class the daemon's walk scores this entry with: an opaque
+    /// candidate's own (structural) classification, nothing for a tree the
+    /// walker only descends into or protects, and the name registry where
+    /// it made no opaque verdict. `sbh scan`, `clean` and `emergency` all
+    /// classify through this, so they agree on what is a candidate.
+    #[must_use]
+    pub fn walk_classification(
+        &self,
+        registry: &ArtifactPatternRegistry,
+    ) -> Option<ArtifactClassification> {
+        self.opaque_tree.as_ref().map_or_else(
+            || Some(registry.classify(&self.path, self.structural_signals)),
+            |opaque| {
+                (opaque.disposition == OpaqueTreeDisposition::CandidateOpaque)
+                    .then(|| opaque.classification.clone())
+            },
+        )
+    }
+}
+
+/// [`WalkEntry::walk_classification`] for a directory looked at outside a
+/// walk (the daemon's priority pre-scan and index replay).
+///
+/// The opaque verdict the walker would give it, from its name and its
+/// parent's manifests, comes before the name registry. Without this the
+/// pre-scan nominated on the name alone directories the walk declines (a
+/// plain `target` with no cargo markers inside an hfdt store, bd-u9ua;
+/// `build` without a manifest, bd-8nol), and missed ones only the structure
+/// identifies (bd-10yj).
+#[must_use]
+pub fn classify_dir_as_walked(
+    registry: &ArtifactPatternRegistry,
+    path: &Path,
+    signals: StructuralSignals,
+) -> Option<ArtifactClassification> {
+    match classify_opaque_tree(path, opaque_context_for_path(path)) {
+        Some(opaque) => (opaque.disposition == OpaqueTreeDisposition::CandidateOpaque)
+            .then_some(opaque.classification),
+        None => Some(registry.classify(path, signals)),
+    }
 }
 
 /// Identity of a multiply-linked file, for counting its blocks exactly once.
@@ -541,6 +822,10 @@ pub struct DirectoryWalker {
     /// instead of blocking on full channels. This prevents thread leaks when the
     /// scanner times out a scan pass.
     cancel: Arc<AtomicBool>,
+    /// Entries of one directory processed per pass.
+    dir_window: u32,
+    /// Whether a walked directory's entry carries its immediate files' size.
+    measure_files: bool,
 }
 
 impl DirectoryWalker {
@@ -550,7 +835,29 @@ impl DirectoryWalker {
             protection: Arc::new(parking_lot::RwLock::new(protection)),
             heartbeat: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            dir_window: MAX_ENTRIES_PER_DIR,
+            measure_files: true,
         }
+    }
+
+    /// Walk without stat-ing files: a walked directory's entry then carries
+    /// only its own inode's size, and a consumer that needs the size of a
+    /// directory it scores reads it with [`immediate_file_bytes`]. Stat-ing
+    /// every file of every listed directory was most of a daemon pass's
+    /// syscalls, and on a single-subvolume btrfs each cold one spins on the
+    /// root's inode lock (ts2: 84% of the daemon's samples, bd-gh0x), while
+    /// only the few entries that classify as candidates ever use the size.
+    /// Opaque trees are still measured by their probe.
+    #[must_use]
+    pub fn without_file_sizes(mut self) -> Self {
+        self.measure_files = false;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_dir_window(mut self, entries: u32) -> Self {
+        self.dir_window = entries.max(1);
+        self
     }
 
     /// Return a handle to the cancellation flag.
@@ -578,13 +885,14 @@ impl DirectoryWalker {
     /// score them. Open-file set should be collected separately and matched
     /// against results afterward.
     pub fn walk(&self) -> Result<Vec<WalkEntry>> {
-        Ok(self.stream()?.into_iter().collect())
+        Ok(self.stream()?.collect())
     }
 
     /// Stream entries as they are discovered.
     ///
-    /// Returns a receiver that yields entries. The walk runs in background threads.
-    pub fn stream(&self) -> Result<channel::Receiver<WalkEntry>> {
+    /// The walk runs in background threads. Dropping the stream sets the
+    /// walker's cancel flag, so one walker serves one stream.
+    pub fn stream(&self) -> Result<WalkStream> {
         let parallelism = self.config.parallelism.max(1);
 
         // Channels: work items (unbounded) and results (bounded for memory safety).
@@ -595,10 +903,11 @@ impl DirectoryWalker {
         //
         // Per-directory iteration cap (MAX_ENTRIES_PER_DIR) prevents any single huge
         // directory (e.g. /data/tmp with 60K+ children) from monopolizing traversal.
-        // Result channel bounded to 10,000 entries to prevent unbounded memory growth
-        // on large trees (previously unbounded, causing 14GB+ RSS on trj).
+        // Result channel bounded to 10,000 entries, in batches, to prevent unbounded
+        // memory growth on large trees (previously unbounded, causing 14GB+ RSS on trj).
         let (work_tx, work_rx) = channel::unbounded::<WorkItem>();
-        let (result_tx, result_rx) = channel::bounded::<WalkEntry>(RESULT_CHANNEL_CAP);
+        let (result_tx, result_rx) =
+            channel::bounded::<Vec<WalkEntry>>(RESULT_CHANNEL_CAP / WALK_BATCH_ENTRIES);
 
         // Track in-flight work items so workers know when to stop.
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -635,6 +944,12 @@ impl DirectoryWalker {
             });
         }
 
+        let windows = Arc::new(DirWindows {
+            size: self.dir_window,
+            starts: oversized_window_starts().lock().clone(),
+        });
+        let unfinished = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
         // Clone sender for workers; drop original so channel closes when workers finish.
         for _ in 0..parallelism {
             let work_rx = work_rx.clone();
@@ -645,6 +960,9 @@ impl DirectoryWalker {
             let protection = Arc::clone(&self.protection);
             let heartbeat = self.heartbeat.clone();
             let cancel = Arc::clone(&self.cancel);
+            let windows = Arc::clone(&windows);
+            let unfinished = Arc::clone(&unfinished);
+            let measure_files = self.measure_files;
 
             thread::spawn(move || {
                 walker_thread(
@@ -653,14 +971,24 @@ impl DirectoryWalker {
                     &result_tx,
                     &in_flight,
                     &config,
+                    &windows,
                     &protection,
                     heartbeat.as_ref(),
                     &cancel,
+                    &unfinished,
+                    measure_files,
                 );
             });
         }
 
-        Ok(result_rx)
+        // The stream keeps a receiver of the work queue, so what a cancelled
+        // walk never listed can still be read once the workers are gone.
+        Ok(WalkStream::new(
+            result_rx,
+            Some(work_rx),
+            unfinished,
+            Arc::clone(&self.cancel),
+        ))
     }
 
     /// Access the protection registry (e.g. to list discovered markers).
@@ -675,13 +1003,17 @@ impl DirectoryWalker {
 fn walker_thread(
     work_rx: &channel::Receiver<WorkItem>,
     work_tx: &channel::Sender<WorkItem>,
-    result_tx: &channel::Sender<WalkEntry>,
+    result_tx: &channel::Sender<Vec<WalkEntry>>,
     in_flight: &AtomicUsize,
     config: &WalkerConfig,
+    windows: &DirWindows,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
     heartbeat: Option<&Arc<dyn Fn() + Send + Sync>>,
     cancel: &AtomicBool,
+    unfinished: &parking_lot::Mutex<Vec<PathBuf>>,
+    measure_files: bool,
 ) {
+    let mut results = ResultBatch::new(result_tx, WALK_BATCH_ENTRIES, unfinished);
     loop {
         // Check cancellation flag before doing any work.
         if cancel.load(Ordering::Relaxed) {
@@ -693,6 +1025,12 @@ fn walker_thread(
             hb();
         }
 
+        // Send what this worker holds before waiting for work, so the
+        // collector never waits on entries an idle worker is sitting on.
+        if work_rx.is_empty() && !results.flush(cancel) {
+            return;
+        }
+
         match work_rx.recv_timeout(WORK_RECV_TIMEOUT) {
             Ok(item) => {
                 process_directory(
@@ -701,12 +1039,14 @@ fn walker_thread(
                     item.root_device_id,
                     item.opaque_tree,
                     work_tx,
-                    result_tx,
+                    &mut results,
                     in_flight,
                     config,
+                    windows,
                     protection,
                     heartbeat,
                     cancel,
+                    measure_files,
                 );
                 // Mark this work item as completed.
                 let remaining = in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -717,29 +1057,20 @@ fn walker_thread(
             }
             Err(channel::RecvTimeoutError::Timeout) => {
                 // Check cancel on timeout too, so threads don't linger waiting for work.
-                if cancel.load(Ordering::Relaxed) || in_flight.load(Ordering::Acquire) == 0 {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                // Another worker may have taken the item this one saw queued,
+                // so entries can still be held here when the walk finishes.
+                if in_flight.load(Ordering::Acquire) == 0 {
+                    results.flush(cancel);
                     return;
                 }
             }
-            Err(channel::RecvTimeoutError::Disconnected) => return,
-        }
-    }
-}
-
-fn send_walk_entry(
-    result_tx: &channel::Sender<WalkEntry>,
-    walk_entry: &WalkEntry,
-    cancel: &AtomicBool,
-) -> bool {
-    loop {
-        match result_tx.send_timeout(walk_entry.clone(), SEND_TIMEOUT) {
-            Ok(()) => return true,
-            Err(channel::SendTimeoutError::Timeout(_)) => {
-                if cancel.load(Ordering::Relaxed) {
-                    return false;
-                }
+            Err(channel::RecvTimeoutError::Disconnected) => {
+                results.flush(cancel);
+                return;
             }
-            Err(channel::SendTimeoutError::Disconnected(_)) => return false,
         }
     }
 }
@@ -758,12 +1089,14 @@ fn process_directory(
     root_dev: u64,
     opaque_tree: Option<OpaqueTreeClassification>,
     work_tx: &channel::Sender<WorkItem>,
-    result_tx: &channel::Sender<WalkEntry>,
+    results: &mut ResultBatch<'_>,
     in_flight: &AtomicUsize,
     config: &WalkerConfig,
+    windows: &DirWindows,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
     heartbeat: Option<&Arc<dyn Fn() + Send + Sync>>,
     cancel: &AtomicBool,
+    measure_files: bool,
 ) {
     // Check exclusion list.
     if config.excluded_paths.contains(dir_path) {
@@ -819,12 +1152,17 @@ fn process_directory(
     // thread before we discover a .sbh-protect marker later in the listing.
     let mut pending_children: Vec<PathBuf> = Vec::new();
 
+    // The entries this pass processes; every name is still checked.
+    let window_start = windows.starts.get(dir_path).copied().unwrap_or(0);
+    let window = window_start..window_start.saturating_add(windows.size);
+
     for entry_result in entries {
         // Large flat directories can take a long time to iterate. Honor
         // cancellation during the hot loop so the daemon can stop promptly
         // when a scan budget expires instead of waiting for the entire
         // directory to finish.
         if cancel.load(Ordering::Relaxed) {
+            results.mark_unfinished(dir_path);
             return;
         }
 
@@ -839,70 +1177,74 @@ fn process_directory(
             continue;
         };
 
-        let child_path = entry.path();
+        // Per-directory budget: names are cheap to read, so every one is
+        // checked (up to MAX_NAMES_READ_PER_DIR), and a `.sbh-protect` marker
+        // anywhere in the listing protects the directory. Stats and queueing
+        // are bounded to this pass's window; later passes move it on.
+        let index = total_count;
+        if index >= MAX_NAMES_READ_PER_DIR {
+            break;
+        }
+        total_count += 1;
 
         // ─── Incremental Signal Collection ───
         // We can check signals purely from the name without stat-ing the file.
-        if let Some(name_os) = child_path.file_name() {
-            let name = name_os.to_string_lossy();
-            total_count += 1;
-
-            // Per-directory iteration budget: avoid spending seconds iterating
-            // directories with tens of thousands of entries. Structural markers
-            // appear early; MAX_ENTRIES_PER_DIR (65 536) is generous.
-            if total_count >= MAX_ENTRIES_PER_DIR {
-                break;
+        let name_os = entry.file_name();
+        let name = name_os.to_string_lossy();
+        match name.as_ref() {
+            // Detect .sbh-protect marker during iteration. If found,
+            // register the marker and bail — no children get queued.
+            ".sbh-protect" => {
+                protection.write().register_marker(dir_path);
+                return; // Skip rest of directory — protected subtree.
             }
-
-            match name.as_ref() {
-                // Detect .sbh-protect marker during iteration. If found,
-                // register the marker and bail — no children get queued.
-                ".sbh-protect" => {
-                    protection.write().register_marker(dir_path);
-                    return; // Skip rest of directory — protected subtree.
+            "incremental" => signals.has_incremental = true,
+            "deps" => signals.has_deps = true,
+            "build" => signals.has_build = true,
+            ".fingerprint" => signals.has_fingerprint = true,
+            ".git" => signals.has_git = true,
+            // Root-level cache-directory tag (Cache Directory Tagging
+            // Standard, case-sensitive uppercase per the spec). This is the
+            // one signal that identifies an arbitrarily-named build cache —
+            // whose deps/incremental/.fingerprint markers live one level
+            // deeper under debug/ and release/ — without a name match.
+            // Validate the signature line so an unrelated file that merely
+            // shares the name cannot mark a directory reclaimable.
+            "CACHEDIR.TAG" => {
+                if is_valid_cachedir_tag(&entry.path()) {
+                    signals.has_cachedir_tag = true;
                 }
-                "incremental" => signals.has_incremental = true,
-                "deps" => signals.has_deps = true,
-                "build" => signals.has_build = true,
-                ".fingerprint" => signals.has_fingerprint = true,
-                ".git" => signals.has_git = true,
-                // Root-level cache-directory tag (Cache Directory Tagging
-                // Standard, case-sensitive uppercase per the spec). This is the
-                // one signal that identifies an arbitrarily-named build cache —
-                // whose deps/incremental/.fingerprint markers live one level
-                // deeper under debug/ and release/ — without a name match.
-                // Validate the signature line so an unrelated file that merely
-                // shares the name cannot mark a directory reclaimable.
-                "CACHEDIR.TAG" => {
-                    if is_valid_cachedir_tag(&child_path) {
-                        signals.has_cachedir_tag = true;
-                    }
-                }
-                "cargo.toml" | "Cargo.toml" => signals.has_cargo_toml = true,
-                "package.json"
-                | "package-lock.json"
-                | "npm-shrinkwrap.json"
-                | "pnpm-lock.yaml"
-                | "yarn.lock"
-                | "bun.lock"
-                | "bun.lockb" => {
-                    parent_has_node_manifest = true;
-                }
-                _ => {}
             }
+            "pyvenv.cfg" => signals.has_pyvenv_cfg = true,
+            "cargo.toml" | "Cargo.toml" => signals.has_cargo_toml = true,
+            "package.json"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lock"
+            | "bun.lockb" => {
+                parent_has_node_manifest = true;
+            }
+            _ => {}
+        }
 
-            // Check extension for object file heuristics.
-            if let Some(ext) = Path::new(name_os).extension() {
-                let ext_str = ext.to_string_lossy();
-                if ext_str.eq_ignore_ascii_case("o")
-                    || ext_str.eq_ignore_ascii_case("rlib")
-                    || ext_str.eq_ignore_ascii_case("rmeta")
-                    || ext_str.eq_ignore_ascii_case("d")
-                {
-                    object_count += 1;
-                }
+        // Check extension for object file heuristics.
+        if let Some(ext) = Path::new(&name_os).extension() {
+            let ext_str = ext.to_string_lossy();
+            if ext_str.eq_ignore_ascii_case("o")
+                || ext_str.eq_ignore_ascii_case("rlib")
+                || ext_str.eq_ignore_ascii_case("rmeta")
+                || ext_str.eq_ignore_ascii_case("d")
+            {
+                object_count += 1;
             }
         }
+
+        if !window.contains(&index) {
+            continue;
+        }
+        let child_path = entry.path();
 
         // ─── Type Check & Symlink Handling ───
         // Use file_type() which is often free (cached in directory entry).
@@ -929,8 +1271,12 @@ fn process_directory(
         // For files: lstat to get actual size. On ext4 this is ~1μs per call,
         // so 2000 children ≈ 2ms — acceptable for accurate scoring.
         // For child dirs: skip (their recursive size will be computed when they
-        // are processed as their own WalkEntry).
-        if !is_dir && let Ok(child_meta) = entry.metadata() {
+        // are processed as their own WalkEntry). A walk without file sizes
+        // skips this (see `DirectoryWalker::without_file_sizes`).
+        if measure_files
+            && !is_dir
+            && let Ok(child_meta) = entry.metadata()
+        {
             // Allocated blocks, not apparent length (see `allocated_size`):
             // sparse files must not inflate the directory's reclaim estimate.
             content_size = content_size.saturating_add(allocated_size(&child_meta));
@@ -945,15 +1291,30 @@ fn process_directory(
         }
     }
 
+    // A listing longer than one window: the next pass takes the next window.
+    let next_start = next_window_start(window_start, total_count, windows.size);
+    if next_start.is_some() {
+        // This pass leaves the rest of the listing unexamined.
+        results.mark_unfinished(dir_path);
+    }
+    if next_start.is_some() || window_start > 0 {
+        let mut starts = oversized_window_starts().lock();
+        match next_start {
+            Some(start) => starts.insert(dir_path.to_path_buf(), start),
+            None => starts.remove(dir_path),
+        };
+    }
+
     // ─── Deferred Recursion Dispatch ───
-    // Now that we've confirmed no .sbh-protect marker exists (we would have
-    // returned above), queue collected child dirs for worker threads.
+    // No .sbh-protect marker was in the listing (we would have returned
+    // above), so queue collected child dirs for worker threads.
     //
     // Use send_timeout + cancel check instead of blocking send to prevent
     // thread leaks: when the scanner times out and sets the cancel flag,
     // threads stuck on a full work channel will notice within 100ms and exit.
     for child_path in pending_children {
         if cancel.load(Ordering::Relaxed) {
+            results.mark_unfinished(dir_path);
             return;
         }
         let opaque_tree = if config.opaque_pruning {
@@ -1015,7 +1376,8 @@ fn process_directory(
                         is_open: false,
                         opaque_tree: Some(opaque),
                     };
-                    if !send_walk_entry(result_tx, &walk_entry, cancel) {
+                    if !results.push(walk_entry, cancel) {
+                        results.mark_unfinished(dir_path);
                         return;
                     }
                     continue;
@@ -1040,11 +1402,13 @@ fn process_directory(
                     // Channel full — check cancel before retrying.
                     if cancel.load(Ordering::Relaxed) {
                         in_flight.fetch_sub(1, Ordering::Release);
+                        results.mark_unfinished(dir_path);
                         return;
                     }
                 }
                 Err(channel::SendTimeoutError::Disconnected(_)) => {
                     in_flight.fetch_sub(1, Ordering::Release);
+                    results.mark_unfinished(dir_path);
                     return;
                 }
             }
@@ -1077,7 +1441,7 @@ fn process_directory(
             opaque_tree,
         };
 
-        let _ = send_walk_entry(result_tx, &walk_entry, cancel);
+        results.push(walk_entry, cancel);
     }
 }
 
@@ -1109,6 +1473,28 @@ pub fn opaque_context_for_path(path: &Path) -> OpaqueTreeContext {
     context
 }
 
+/// Allocated bytes of `dir`'s immediate regular files.
+///
+/// Read much as a measuring walk reads them: up to [`MAX_ENTRIES_PER_DIR`]
+/// entries (the first ones; the walk reads its current window of a longer
+/// listing), with subdirectories and symlinks adding nothing. For a consumer
+/// of a walk
+/// [without file sizes](DirectoryWalker::without_file_sizes). An unreadable
+/// directory yields 0.
+#[must_use]
+pub fn immediate_file_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .take(MAX_ENTRIES_PER_DIR as usize)
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|ft| ft.is_file()))
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|meta| allocated_size(&meta))
+        .fold(0u64, u64::saturating_add)
+}
+
 /// Structural signals for one directory from its immediate children, for
 /// callers that re-examine a single path outside a walk (index replay).
 /// A non-directory or unreadable path yields no signals.
@@ -1117,11 +1503,21 @@ pub fn structural_signals_for_path(path: &Path) -> StructuralSignals {
     let Ok(entries) = fs::read_dir(path) else {
         return StructuralSignals::default();
     };
+    let mut has_tag_name = false;
     let names: Vec<String> = entries
         .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().to_lowercase())
+        .map(|entry| {
+            let name = entry.file_name();
+            // Keep the actual spelling before lowercasing heuristic markers.
+            // A case-insensitive filesystem must not make replay accept a
+            // lowercase tag that the live walker would ignore.
+            has_tag_name |= name == "CACHEDIR.TAG";
+            name.to_string_lossy().to_lowercase()
+        })
         .collect();
-    signals_from_children(&names)
+    let mut signals = signals_from_children(&names);
+    signals.has_cachedir_tag = has_tag_name && is_valid_cachedir_tag(&path.join("CACHEDIR.TAG"));
+    signals
 }
 
 /// Build `StructuralSignals` by checking presence of well-known child names.
@@ -1139,10 +1535,9 @@ fn signals_from_children(child_names: &[String]) -> StructuralSignals {
             ".fingerprint" => signals.has_fingerprint = true,
             ".git" => signals.has_git = true,
             "cargo.toml" => signals.has_cargo_toml = true,
-            // Presence-only in this name-list helper (the live walker validates
-            // the tag's signature). The spec name is uppercase CACHEDIR.TAG;
-            // this helper receives already-lowercased names.
-            "cachedir.tag" => signals.has_cachedir_tag = true,
+            "pyvenv.cfg" => signals.has_pyvenv_cfg = true,
+            // A name list cannot establish cache-tag contents or file type.
+            // Live collection and replay both validate that evidence on disk.
             _ => {}
         }
         // Names are already lowercased, so case-insensitive matching is not needed.
@@ -1174,16 +1569,62 @@ const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806b
 pub(crate) fn is_valid_cachedir_tag(path: &Path) -> bool {
     use std::io::Read;
 
-    let Ok(mut file) = fs::File::open(path) else {
+    // A cache tag is an ordinary file, never a link or special file. Precheck
+    // to avoid opening devices, then check the opened descriptor as well: the
+    // pathname can change between the two observations.
+    let Ok(before) = fs::symlink_metadata(path) else {
         return false;
     };
-    let mut buf = [0u8; CACHEDIR_TAG_SIGNATURE.len()];
-    // `read_exact` fills the whole buffer or fails; a file shorter than the
-    // signature cannot be a valid tag, so a short read is a clean rejection.
-    if file.read_exact(&mut buf).is_err() {
+    if !before.is_file() {
         return false;
     }
-    buf == CACHEDIR_TAG_SIGNATURE
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // NONBLOCK also covers replacement by a FIFO after the precheck.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let Ok(mut file) = options.open(path) else {
+        return false;
+    };
+    let Ok(opened) = file.metadata() else {
+        return false;
+    };
+    if !same_tag_observation(&before, &opened) {
+        return false;
+    }
+    let mut buf = [0u8; CACHEDIR_TAG_SIGNATURE.len()];
+    if file.read_exact(&mut buf).is_err() || buf != CACHEDIR_TAG_SIGNATURE {
+        return false;
+    }
+    // Do not publish positive evidence for a tag that was replaced or changed
+    // while its signature was read. This is observation, not a deletion lease.
+    file.metadata()
+        .is_ok_and(|after| same_tag_observation(&opened, &after))
+        && fs::symlink_metadata(path).is_ok_and(|current| same_tag_observation(&opened, &current))
+}
+
+fn same_tag_observation(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    if !after.is_file()
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        before.created().ok() == after.created().ok()
+    }
 }
 
 /// Allocated on-disk size of an entry in bytes.
@@ -1348,12 +1789,48 @@ fn collect_open_files_linux() -> HashSet<(u64, u64)> {
     open
 }
 
-/// Maximum child entries iterated per directory for signal collection.
+/// Maximum child entries of one directory a pass processes (stats, queues).
 ///
 /// Large enough to cover big project directories in full (node_modules,
-/// flat object directories): iteration is reasonably cheap, and missing
-/// entries cause permanent blind spots.
+/// flat object directories). A directory listing more is processed one
+/// window of this many entries per pass, the window moving on each pass, so
+/// a huge temp root has no permanent blind spot.
 pub const MAX_ENTRIES_PER_DIR: u32 = 65_536;
+
+/// Maximum names read from one directory per pass. Past the processing
+/// window only names are checked, for a `.sbh-protect` marker and structural
+/// signals; this bounds even that.
+pub const MAX_NAMES_READ_PER_DIR: u32 = 16 * MAX_ENTRIES_PER_DIR;
+
+/// The next pass's window start, per directory that listed more entries than
+/// its window. Process-wide, so the daemon's successive passes take turns
+/// through a large directory; a one-shot CLI walk starts at the top.
+static OVERSIZED_WINDOW_STARTS: OnceLock<parking_lot::Mutex<HashMap<PathBuf, u32>>> =
+    OnceLock::new();
+
+fn oversized_window_starts() -> &'static parking_lot::Mutex<HashMap<PathBuf, u32>> {
+    OVERSIZED_WINDOW_STARTS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// Which entries of each directory listing a walk processes.
+struct DirWindows {
+    /// Entries processed per directory per pass.
+    size: u32,
+    /// Window starts as of the walk's start, read without locking.
+    starts: HashMap<PathBuf, u32>,
+}
+
+/// Where the next pass's window starts, after a pass that processed
+/// `start..start + size` of a listing of `read` names; `None` when the whole
+/// listing fits one window. Windows run to the end of the listing, then
+/// start over from the top.
+fn next_window_start(start: u32, read: u32, size: u32) -> Option<u32> {
+    if read <= size {
+        return None;
+    }
+    let next = start.saturating_add(size);
+    Some(if next >= read { 0 } else { next })
+}
 
 /// Maximum wall time to spend scanning /proc for open file ancestors.
 ///
@@ -1361,7 +1838,8 @@ pub const MAX_ENTRIES_PER_DIR: u32 = 65_536;
 /// unit's `CPUQuota=10%`: it gets at most 0.1 CPU-second per wall second,
 /// less on a loaded host. At 5 s the sweep had ~0.5 CPU-s, which a busy agent
 /// host (1,600 processes, 40k fds, load 64) could not fit, so every deletion
-/// batch failed closed with SBH-3003 while the disk sat at 100% (css,
+/// batch failed closed (logged then as SBH-3003, now SBH-3005) while the disk
+/// sat at 100% (css,
 /// 2026-09-24). 30 s keeps the sweep bounded and fail-closed with room to
 /// finish under the quota.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1505,66 +1983,20 @@ fn add_open_path_ancestor_chain(
 #[cfg(target_os = "linux")]
 fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
     let (targets, complete) = collect_open_file_targets_linux();
-    (
-        open_path_ancestors_for_roots(&targets, root_paths),
-        complete,
-    )
+    checked_open_path_ancestors_for_roots(&targets, complete, root_paths)
 }
 
 /// Every absolute path some process holds open, from one walk of
-/// `/proc/*/fd`, plus whether the walk finished within its budget.
+/// `/proc/*/fd`, plus whether its visible scope was completely inspected.
+/// Permission, I/O and budget failures all revoke complete coverage.
 ///
 /// This is the expensive part of an open-file check and does not depend on
 /// which candidates are being checked, so one walk can serve several batches
 /// (see `deletion::OPEN_SWEEP_REUSE_WINDOW`).
 #[cfg(target_os = "linux")]
 pub(crate) fn collect_open_file_targets_linux() -> (Vec<PathBuf>, bool) {
-    use std::os::unix::ffi::OsStrExt;
-    use std::time::Instant;
-
-    let mut targets: HashSet<PathBuf> = HashSet::with_capacity(4096);
-    let Ok(proc_dir) = fs::read_dir("/proc") else {
-        return (Vec::new(), true);
-    };
-
-    let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
-    let mut pids_scanned: usize = 0;
-    let mut incomplete = false;
-
-    for proc_entry in proc_dir.flatten() {
-        // Budget checks: stop if we've exceeded time or PID limits.
-        if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
-            incomplete = true;
-            break;
-        }
-
-        let pid_name = proc_entry.file_name();
-        let pid_bytes = pid_name.as_bytes();
-        if pid_bytes.is_empty() || !pid_bytes.iter().all(u8::is_ascii_digit) {
-            continue;
-        }
-
-        pids_scanned += 1;
-
-        let Ok(fd_entries) = fs::read_dir(proc_entry.path().join("fd")) else {
-            continue;
-        };
-
-        for fd_entry in fd_entries.flatten() {
-            let Ok(mut target) = fs::read_link(fd_entry.path()) else {
-                continue;
-            };
-            if !target.is_absolute() {
-                continue;
-            }
-            if let Some(stripped) = target.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
-                target = PathBuf::from(stripped);
-            }
-            targets.insert(target);
-        }
-    }
-
-    (targets.into_iter().collect(), !incomplete)
+    crate::platform::linux::process::read_open_file_targets()
+        .unwrap_or_else(|_| (Vec::new(), false))
 }
 
 /// The open-path ancestor index for `root_paths`, built from a list of open
@@ -1585,6 +2017,42 @@ pub(crate) fn open_path_ancestors_for_roots(
     ancestors
 }
 
+/// Refresh build declarations independently of a reusable descriptor snapshot.
+/// Incomplete fresh discovery must never inherit a cached complete verdict.
+#[cfg(target_os = "linux")]
+pub(crate) fn checked_open_path_ancestors_for_roots(
+    targets: &[PathBuf],
+    descriptor_complete: bool,
+    root_paths: &[PathBuf],
+) -> (HashSet<PathBuf>, bool) {
+    checked_open_path_ancestors_with_builds(
+        targets,
+        descriptor_complete,
+        root_paths,
+        crate::platform::linux::process::read_build_directory_snapshot,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn checked_open_path_ancestors_with_builds(
+    targets: &[PathBuf],
+    descriptor_complete: bool,
+    root_paths: &[PathBuf],
+    build_snapshot: impl FnOnce() -> (Vec<(i32, PathBuf)>, bool),
+) -> (HashSet<PathBuf>, bool) {
+    let mut ancestors = open_path_ancestors_for_roots(targets, root_paths);
+    if root_paths.is_empty() {
+        return (ancestors, descriptor_complete);
+    }
+    let (directories, build_complete) = build_snapshot();
+    build_scopes::add_candidate_scopes(
+        directories,
+        &normalized_open_roots(root_paths),
+        &mut ancestors,
+    );
+    (ancestors, descriptor_complete && build_complete)
+}
+
 /// Collect open path ancestors using a specific platform implementation.
 pub fn collect_open_path_ancestors_with_platform(
     platform: &dyn crate::platform::pal::Platform,
@@ -1596,7 +2064,11 @@ pub fn collect_open_path_ancestors_with_platform(
     }
 
     let mut ancestors = HashSet::with_capacity(4096);
-    let mut incomplete = false;
+    // Preserve positive build-scope evidence even when its own observation or
+    // a later fd query is incomplete. Either missing source revokes coverage.
+    let (build_directories, build_complete) = platform.build_directories_in_use_checked();
+    build_scopes::add_candidate_scopes(build_directories, &normalized_roots, &mut ancestors);
+    let mut incomplete = !build_complete;
     let probe_roots = common_open_file_probe_root(&normalized_roots).map_or_else(
         || {
             normalized_roots
@@ -1606,16 +2078,17 @@ pub fn collect_open_path_ancestors_with_platform(
         },
         |root| vec![root],
     );
-    for root in &probe_roots {
-        let Ok(result) = platform.open_files_under(root) else {
-            return (ancestors, false);
-        };
-        if !result.complete {
-            incomplete = true;
+    let Ok(result) = platform.open_files_under_roots(&probe_roots) else {
+        return (ancestors, false);
+    };
+    if !result.complete {
+        incomplete = true;
+    }
+    for open_file in result.files {
+        if own_directory_handle(&open_file) {
+            continue;
         }
-        for open_file in result.files {
-            add_open_path_ancestor_chain(&mut ancestors, &open_file.path, &normalized_roots);
-        }
+        add_open_path_ancestor_chain(&mut ancestors, &open_file.path, &normalized_roots);
     }
 
     (ancestors, !incomplete)
@@ -1630,6 +2103,9 @@ fn collect_open_path_ancestors_platform(root_paths: &[PathBuf]) -> (HashSet<Path
 struct CachedActiveReferenceIndex {
     platform_name: &'static str,
     roots: Vec<PathBuf>,
+    // A scope snapshot binds the supplied aliases too. Equal resolved roots
+    // must not reuse a snapshot that only knows a different input spelling.
+    input_roots: Vec<PathBuf>,
     collected_at: Instant,
     index: ActiveReferenceIndex,
 }
@@ -1652,6 +2128,7 @@ fn normalized_root_cache_key(root_paths: &[PathBuf]) -> Vec<PathBuf> {
 pub struct ActiveReferenceIndex {
     references: HashMap<PathBuf, ActiveReferenceSummary>,
     references_by_identity: HashMap<FsIdentity, ActiveReferenceSummary>,
+    build_scopes: BuildDirectoryScopes,
     complete: bool,
     incomplete_reason: Option<String>,
 }
@@ -1668,6 +2145,7 @@ impl ActiveReferenceIndex {
         Self {
             references: HashMap::new(),
             references_by_identity: HashMap::new(),
+            build_scopes: BuildDirectoryScopes::default(),
             complete: true,
             incomplete_reason: None,
         }
@@ -1678,6 +2156,7 @@ impl ActiveReferenceIndex {
         Self {
             references: HashMap::new(),
             references_by_identity: HashMap::new(),
+            build_scopes: BuildDirectoryScopes::default(),
             complete: false,
             incomplete_reason: Some(reason.into()),
         }
@@ -1690,14 +2169,18 @@ impl ActiveReferenceIndex {
 
     #[must_use]
     pub fn incomplete_reason(&self) -> Option<&str> {
-        self.incomplete_reason.as_deref()
+        self.incomplete_reason.as_deref().or_else(|| {
+            (!self.complete)
+                .then_some("active-reference inspection did not cover every visible process")
+        })
     }
 
     #[must_use]
     pub fn summary_for(&self, path: &Path) -> ActiveReferenceSummary {
         let mut summary = self.references.get(path).cloned().unwrap_or_default();
-        if let Some(reason) = &self.incomplete_reason {
-            summary.mark_incomplete(reason.clone());
+        self.build_scopes.extend_summary(path, &mut summary);
+        if let Some(reason) = self.incomplete_reason() {
+            summary.mark_incomplete(reason.to_string());
         }
         summary
     }
@@ -1709,8 +2192,8 @@ impl ActiveReferenceIndex {
             .get(&identity)
             .cloned()
             .unwrap_or_default();
-        if let Some(reason) = &self.incomplete_reason {
-            summary.mark_incomplete(reason.clone());
+        if let Some(reason) = self.incomplete_reason() {
+            summary.mark_incomplete(reason.to_string());
         }
         summary
     }
@@ -1772,6 +2255,7 @@ pub fn collect_active_reference_index(
     let mut index = ActiveReferenceIndex {
         references: HashMap::new(),
         references_by_identity: HashMap::new(),
+        build_scopes: BuildDirectoryScopes::new(root_paths),
         complete: true,
         incomplete_reason: active_reference_visibility_warning(platform).map(str::to_string),
     };
@@ -1779,65 +2263,124 @@ pub fn collect_active_reference_index(
         index.complete = false;
     }
     let mut process_names = HashMap::new();
-    match platform.process_list() {
+    let mut app_instances = Vec::new();
+    // Names and working directories only: an argv read can block behind a
+    // process wedged in mmap, and that would hold the scan with it.
+    match platform.process_list_without_command_lines() {
         Ok(processes) => {
+            let own = i32::try_from(std::process::id()).ok();
             for process in processes {
+                // A process working inside a tree is using it, whatever it
+                // holds open at this instant (bd-d1kt). sbh's own working
+                // directory is no more a reference than its own handles.
+                if Some(process.pid) != own
+                    && let Some(cwd) = &process.cwd
+                {
+                    let name = Some(process.name.clone());
+                    index.add_reference(&roots, cwd, |summary| {
+                        summary.add_working_directory(process.pid, name.clone());
+                    });
+                }
+                app_instances.extend(AppInstance::of_process(&process));
                 process_names.insert(process.pid, process.name);
             }
         }
         Err(_) => index.complete = false,
     }
 
-    for root in &roots {
-        match platform.open_files_under(root) {
-            Ok(result) => {
-                if !result.complete {
-                    index.complete = false;
+    code_sign_clones::add_owners(&mut index, &roots, &app_instances);
+
+    // The cargo home and target directory a live build names are in use for
+    // as long as it runs, whatever it holds open (bd-d1kt). Coverage matters:
+    // missing build metadata is unknown use, not proof that a path is idle.
+    let (build_directories, build_complete) = platform.build_directories_in_use_checked();
+    if !build_complete {
+        index.complete = false;
+    }
+    for (pid, directory) in build_directories {
+        let name = process_names.get(&pid).cloned();
+        index.add_reference(&roots, &directory, |summary| {
+            summary.add_build_directory(pid, name.clone());
+        });
+        // Unlike an open-file point, a cache declaration also protects every
+        // candidate below it, even when the scan root is itself inside it.
+        index.build_scopes.insert(pid, &directory, name);
+    }
+
+    // One query for all roots: a catalog pass hands over ~170 of them, and
+    // asking per root swept every process once per root (bd-om52).
+    match platform.open_files_under_roots(&roots) {
+        Ok(result) => {
+            if !result.complete {
+                index.complete = false;
+                if index.incomplete_reason.is_none() {
+                    index.incomplete_reason = result
+                        .incomplete_reason
+                        .map(|reason| format!("open-file sweep incomplete: {reason}"));
                 }
-                for open_file in result.files {
-                    let name = process_names.get(&open_file.pid).cloned();
-                    index.add_reference(&roots, &open_file.path, |summary| {
-                        summary.add_open_file_descriptor(open_file.pid, name.clone());
+            }
+            for open_file in result.files {
+                if own_directory_handle(&open_file) {
+                    continue;
+                }
+                let name = process_names.get(&open_file.pid).cloned();
+                index.add_reference(&roots, &open_file.path, |summary| {
+                    summary.add_open_file_descriptor(open_file.pid, name.clone());
+                });
+            }
+        }
+        Err(_) => index.complete = false,
+    }
+
+    match platform.executables_under_roots(&roots) {
+        Ok(result) => {
+            if !result.complete {
+                index.complete = false;
+            }
+            for process in result.processes {
+                if let Some(executable) = process.executable.as_deref() {
+                    let name = Some(process.name.clone());
+                    index.add_reference(&roots, executable, |summary| {
+                        summary.add_running_executable(process.pid, name.clone());
                     });
                 }
             }
-            Err(_) => index.complete = false,
         }
+        Err(_) => index.complete = false,
+    }
 
-        match platform.executables_under(root) {
-            Ok(result) => {
-                if !result.complete {
-                    index.complete = false;
-                }
-                for process in result.processes {
-                    if let Some(executable) = process.executable.as_deref() {
-                        let name = Some(process.name.clone());
-                        index.add_reference(&roots, executable, |summary| {
-                            summary.add_running_executable(process.pid, name.clone());
-                        });
-                    }
-                }
+    match platform.mmap_regions_under_roots(&roots) {
+        Ok(regions) => {
+            for region in regions {
+                let name = process_names.get(&region.pid).cloned();
+                index.add_reference(&roots, &region.path, |summary| {
+                    summary.add_mmap_region(region.pid, name.clone());
+                });
             }
-            Err(_) => index.complete = false,
         }
-
-        match platform.mmap_regions_under(root) {
-            Ok(regions) => {
-                for region in regions {
-                    let name = process_names.get(&region.pid).cloned();
-                    index.add_reference(&roots, &region.path, |summary| {
-                        summary.add_mmap_region(region.pid, name.clone());
-                    });
-                }
-            }
-            Err(_) => index.complete = false,
-        }
+        Err(_) => index.complete = false,
     }
 
     index
 }
 
-fn active_reference_visibility_warning(platform: &dyn Platform) -> Option<&'static str> {
+/// sbh's own directory handles are its scanner walking a tree (or the
+/// executor and quarantine at work), not a user of what is below them.
+/// Counting them made a candidate look in use to the very pass that was
+/// examining it: scoring vetoed it as open, or the executor skipped it as
+/// FileOpen, and the mount could then sit idle for a rescan interval. sbh's
+/// own regular files (logs, databases) and every other process's handles
+/// still count. The Linux executor sweep applies the same rule in
+/// `reference_scan::open_targets_with`.
+fn own_directory_handle(open_file: &crate::platform::types::OpenFile) -> bool {
+    open_file.kind == crate::platform::types::OpenFileKind::Directory
+        && i32::try_from(std::process::id()).is_ok_and(|own| own == open_file.pid)
+}
+
+/// Why this process cannot see every process's references, if it cannot:
+/// a user-scoped macOS daemon is not shown other users' file handles.
+#[must_use]
+pub fn active_reference_visibility_warning(platform: &dyn Platform) -> Option<&'static str> {
     if platform.name() == "macos" && !process_can_inspect_all_users() {
         Some(MACOS_USER_SCOPE_ACTIVE_REFERENCE_WARNING)
     } else {
@@ -1879,15 +2422,17 @@ pub fn collect_active_reference_index_cached(
     if let Some(cached) = cache.lock().as_ref()
         && cached.platform_name == platform_name
         && cached.roots == roots
+        && cached.input_roots.as_slice() == root_paths
         && now.duration_since(cached.collected_at) <= cache_ttl
     {
         return cached.index.clone();
     }
 
-    let index = collect_active_reference_index(platform, &roots);
+    let index = collect_active_reference_index(platform, root_paths);
     *cache.lock() = Some(CachedActiveReferenceIndex {
         platform_name,
         roots,
+        input_roots: root_paths.to_vec(),
         collected_at: now,
         index: index.clone(),
     });
@@ -2083,23 +2628,29 @@ mod tests {
     #[test]
     fn open_path_ancestors_uses_platform_collector_on_macos() {
         let dir = tempfile::tempdir().unwrap();
-        let active_dir = dir.path().join("active-target");
+        // The kernel reports /private/var/..., not the /var symlink.
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let active_dir = root.join("active-target");
         fs::create_dir(&active_dir).unwrap();
         let active_file = active_dir.join("in-use.bin");
         fs::write(&active_file, "payload").unwrap();
         let handle = fs::File::open(&active_file).unwrap();
 
-        let (ancestors, complete) = collect_open_path_ancestors(&[dir.path().to_path_buf()]);
-        assert!(
-            complete,
-            "macOS PAL open-file preflight should complete for a temp root"
-        );
-
-        if !ancestors.contains(&active_file) {
-            drop(handle);
-            return;
+        let (ancestors, complete) = collect_open_path_ancestors(std::slice::from_ref(&root));
+        // Only root can read every process's descriptors: as a user, other
+        // users' processes fail with EPERM, which correctly leaves coverage
+        // incomplete (the same rule as a non-root daemon on Linux).
+        if nix::unistd::geteuid().is_root() {
+            assert!(
+                complete,
+                "macOS PAL open-file preflight should complete for a temp root"
+            );
         }
-
+        // This process's own descriptor is readable either way.
+        assert!(
+            ancestors.contains(&active_file),
+            "the open file was not found: {ancestors:?}"
+        );
         assert!(ancestors.contains(&active_dir));
         assert!(is_path_open_by_ancestor(&active_dir, &ancestors));
         drop(handle);
@@ -2111,6 +2662,7 @@ mod tests {
         open_files: Vec<crate::platform::types::OpenFile>,
         executables: Vec<crate::platform::types::ProcessInfo>,
         mmap_regions: Vec<crate::platform::types::MappedRegion>,
+        build_directories: Vec<(i32, PathBuf)>,
         probe_calls: AtomicUsize,
     }
 
@@ -2169,6 +2721,10 @@ mod tests {
             ))
         }
 
+        fn build_directories_in_use(&self) -> Vec<(i32, PathBuf)> {
+            self.build_directories.clone()
+        }
+
         fn executables_under(
             &self,
             _path: &Path,
@@ -2203,6 +2759,204 @@ mod tests {
             resident_memory_bytes: None,
             cpu_user_micros: None,
             cpu_system_micros: None,
+        }
+    }
+
+    struct PartialActiveRefPlatform {
+        inner: TestActiveRefPlatform,
+        failed_source: usize,
+    }
+
+    impl Platform for PartialActiveRefPlatform {
+        fn name(&self) -> &'static str {
+            "partial-active-ref-test"
+        }
+
+        fn fs_stats(&self, path: &Path) -> Result<crate::platform::pal::FsStats> {
+            self.inner.fs_stats(path)
+        }
+
+        fn mount_points(&self) -> Result<Vec<crate::platform::pal::MountPoint>> {
+            self.inner.mount_points()
+        }
+
+        fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+            self.inner.is_ram_backed(path)
+        }
+
+        fn default_paths(&self) -> crate::platform::pal::PlatformPaths {
+            self.inner.default_paths()
+        }
+
+        fn memory_info(&self) -> Result<crate::platform::pal::MemoryInfo> {
+            self.inner.memory_info()
+        }
+
+        fn service_manager(&self) -> Box<dyn crate::platform::pal::ServiceManager> {
+            self.inner.service_manager()
+        }
+
+        fn process_list(&self) -> Result<Vec<crate::platform::types::ProcessInfo>> {
+            if self.failed_source == 0 {
+                return Err(crate::core::errors::SbhError::Runtime {
+                    details: "injected process enumeration failure".to_string(),
+                });
+            }
+            self.inner.process_list()
+        }
+
+        fn open_files_under(&self, path: &Path) -> Result<crate::platform::types::OpenFilesResult> {
+            let mut result = self.inner.open_files_under(path)?;
+            result.complete = self.failed_source != 1;
+            Ok(result)
+        }
+
+        fn executables_under(
+            &self,
+            path: &Path,
+        ) -> Result<crate::platform::types::ExecutablesResult> {
+            let mut result = self.inner.executables_under(path)?;
+            result.complete = self.failed_source != 2;
+            Ok(result)
+        }
+
+        fn mmap_regions_under(
+            &self,
+            path: &Path,
+        ) -> Result<Vec<crate::platform::types::MappedRegion>> {
+            if self.failed_source == 3 {
+                return Err(crate::core::errors::SbhError::Runtime {
+                    details: "injected maps access failure".to_string(),
+                });
+            }
+            self.inner.mmap_regions_under(path)
+        }
+    }
+
+    #[test]
+    fn partial_pal_coverage_reaches_both_candidate_summary_projections() {
+        let dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let active = root.join("active");
+        let unobserved = root.join("unobserved");
+        fs::create_dir(&active).unwrap();
+        fs::create_dir(&unobserved).unwrap();
+        let held = active.join("object");
+        fs::write(&held, b"keep").unwrap();
+        for failed_source in 0..4 {
+            let platform = PartialActiveRefPlatform {
+                failed_source,
+                inner: TestActiveRefPlatform {
+                    open_files: vec![crate::platform::types::OpenFile {
+                        pid: 42,
+                        path: held.clone(),
+                        fd: Some(7),
+                        kind: crate::platform::types::OpenFileKind::Regular,
+                        mode: crate::platform::types::OpenFileMode::Read,
+                    }],
+                    ..Default::default()
+                },
+            };
+            let index = collect_active_reference_index(&platform, std::slice::from_ref(&root));
+            assert!(!index.is_complete(), "source {failed_source}");
+            assert!(index.incomplete_reason().is_some());
+            for path in [&active, &unobserved] {
+                let identity = identity_for_path(path, false).unwrap();
+                for summary in [
+                    index.summary_for(path),
+                    index.summary_for_identity(identity),
+                ] {
+                    assert!(
+                        summary.incomplete_reason.is_some(),
+                        "source {failed_source}"
+                    );
+                    assert!(summary.safe_reclaim_reason().is_some());
+                    assert!(!summary.is_empty());
+                    if path == &active {
+                        assert!(summary.processes.iter().any(|process| {
+                            process.pid == 42 && process.open_file_descriptors == 1
+                        }));
+                    } else {
+                        assert!(summary.processes.is_empty());
+                    }
+                }
+            }
+        }
+        assert_eq!(fs::read(held).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn complete_reference_coverage_does_not_manufacture_a_veto() {
+        let dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let index = collect_active_reference_index(
+            &TestActiveRefPlatform::default(),
+            std::slice::from_ref(&root),
+        );
+        assert!(index.is_complete());
+        assert!(index.incomplete_reason().is_none());
+        let identity = identity_for_path(&root, false).unwrap();
+        for summary in [
+            index.summary_for(&root),
+            index.summary_for_identity(identity),
+        ] {
+            assert!(summary.is_empty());
+            assert!(summary.safe_reclaim_reason().is_none());
+        }
+    }
+
+    #[test]
+    fn specific_reference_coverage_reason_is_not_replaced_by_generic_fallback() {
+        let dir = TempDir::new().unwrap();
+        let identity = identity_for_path(dir.path(), false).unwrap();
+        let index = ActiveReferenceIndex::incomplete("process visibility limited by policy");
+        assert_eq!(
+            index.incomplete_reason(),
+            Some("process visibility limited by policy")
+        );
+        for summary in [
+            index.summary_for(dir.path()),
+            index.summary_for_identity(identity),
+        ] {
+            assert_eq!(
+                summary.incomplete_reason.as_deref(),
+                index.incomplete_reason()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_cleanup_veto_keeps_a_live_directory_with_a_literal_deleted_suffix() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        for name in [
+            std::ffi::OsString::from("target (deleted)"),
+            std::ffi::OsString::from_vec(b"target-\xff (deleted)".to_vec()),
+        ] {
+            let candidate = root.join(name);
+            fs::create_dir(&candidate).unwrap();
+            fs::write(candidate.join("retained"), b"keep").unwrap();
+            // Another process holds the directory. sbh's own directory
+            // handles are its scanner at work and are not counted.
+            let mut holder = std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(fs::File::open(&candidate).unwrap())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let (ancestors, _) = collect_open_path_ancestors(std::slice::from_ref(&root));
+            let held = is_path_open_by_ancestor(&candidate, &ancestors);
+            let unrelated = is_path_open_by_ancestor(&root.join("unrelated"), &ancestors);
+            holder.kill().unwrap();
+            holder.wait().unwrap();
+            // Other PIDs may be unreadable; positive evidence must survive
+            // irrespective of completeness of the host-wide observation.
+            assert!(held);
+            assert!(!unrelated);
+            assert_eq!(fs::read(candidate.join("retained")).unwrap(), b"keep");
         }
     }
 
@@ -2275,6 +3029,191 @@ mod tests {
             dir_entry.metadata.content_size_bytes,
             APPARENT
         );
+        assert!(immediate_file_bytes(&dir) < ALLOCATED_CEILING);
+    }
+
+    /// bd-gh0x: a walk without file sizes stats no files, so its directory
+    /// entries carry only their own inode's size; a consumer that measures an
+    /// entry gets exactly what a measuring walk reported. Subdirectories and
+    /// symlinks add nothing either way.
+    #[test]
+    fn a_walk_without_file_sizes_leaves_the_size_to_the_consumer_and_it_matches() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("build-out");
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        for (name, len) in [("a.o", 70_000usize), ("b.o", 9_000), ("c.log", 1)] {
+            fs::write(dir.join(name), vec![7u8; len]).unwrap();
+        }
+        fs::write(dir.join("nested").join("deep.bin"), vec![1u8; 300_000]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("a.o"), dir.join("link.o")).unwrap();
+
+        let entry_for = |walker: DirectoryWalker| {
+            walker
+                .walk()
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.path == dir)
+                .unwrap()
+        };
+        let measured = entry_for(DirectoryWalker::new(
+            test_config(tmp.path()),
+            ProtectionRegistry::marker_only(),
+        ));
+        let mut unmeasured = entry_for(
+            DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only())
+                .without_file_sizes(),
+        );
+
+        let files: u64 = ["a.o", "b.o", "c.log"]
+            .iter()
+            .map(|name| allocated_size(&fs::symlink_metadata(dir.join(name)).unwrap()))
+            .sum();
+        assert!(files >= 79_001, "the fixture allocated its files: {files}");
+        assert_eq!(measured.metadata.content_size_bytes, files);
+        assert_eq!(immediate_file_bytes(&dir), files);
+        let inode_only = entry_metadata(&fs::metadata(&dir).unwrap()).content_size_bytes;
+        assert_eq!(unmeasured.metadata.content_size_bytes, inode_only);
+        assert!(inode_only < files);
+        // The rest of the entry is the same walk.
+        assert_eq!(unmeasured.structural_signals, measured.structural_signals);
+        assert_eq!(unmeasured.depth, measured.depth);
+
+        unmeasured.measure_immediate_files();
+        assert_eq!(unmeasured.metadata.content_size_bytes, files);
+    }
+
+    /// bd-d1kt: every rustc on an rch worker names the shared cargo cache as
+    /// its CARGO_HOME and works from the workspace, holding nothing open in
+    /// the cache. sbh deleted that cache's registry/ under running builds.
+    #[test]
+    fn a_live_builds_cargo_home_and_target_are_active_references() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let home = root.join("rch-cargo-cache");
+        let target = root.join("pooled-target");
+        let idle = root.join("idle-cargo-home/registry");
+        for dir in [
+            &home.join("registry/src"),
+            &home.join("git/db"),
+            &target,
+            &idle,
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let platform = TestActiveRefPlatform {
+            processes: vec![process(42, "rustc", None)],
+            build_directories: vec![
+                (42, home.join("registry/src")),
+                (42, home.join("git/db")),
+                (42, target.clone()),
+            ],
+            ..Default::default()
+        };
+
+        let index = collect_active_reference_index(&platform, std::slice::from_ref(&root));
+        let resolve = |path: &Path| crate::core::paths::resolve_absolute_path(path);
+        for in_use in [&home.join("registry"), &home.join("git"), &home, &target] {
+            let summary = index.summary_for(&resolve(in_use));
+            assert!(!summary.is_empty(), "{}", in_use.display());
+            let reason = summary.safe_reclaim_reason().unwrap();
+            assert!(
+                reason.contains("pid 42 (rustc) has its cargo home or target directory here"),
+                "{reason}"
+            );
+        }
+        assert!(index.summary_for(&resolve(&idle)).is_empty());
+    }
+
+    /// sbh's own directory handles are its scanner mid-walk: a candidate must
+    /// not look in use to the pass that is examining it. Its own regular
+    /// files, and another process's directory handle, still count.
+    #[test]
+    fn own_directory_handles_are_not_active_references() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let walked = root.join("walked/target");
+        let logged = root.join("state/sbh.jsonl");
+        let used = root.join("used/target");
+        for dir in [&walked, &used, &logged.parent().unwrap().to_path_buf()] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(&logged, b"log").unwrap();
+        let own = i32::try_from(std::process::id()).unwrap();
+        let open = |pid, path: &Path, kind| crate::platform::types::OpenFile {
+            pid,
+            path: path.to_path_buf(),
+            fd: Some(7),
+            kind,
+            mode: crate::platform::types::OpenFileMode::Read,
+        };
+        let platform = TestActiveRefPlatform {
+            processes: vec![process(own, "sbh", None), process(42, "rustc", None)],
+            open_files: vec![
+                open(
+                    own,
+                    &walked,
+                    crate::platform::types::OpenFileKind::Directory,
+                ),
+                open(own, &logged, crate::platform::types::OpenFileKind::Regular),
+                open(42, &used, crate::platform::types::OpenFileKind::Directory),
+            ],
+            ..Default::default()
+        };
+
+        let index = collect_active_reference_index(&platform, std::slice::from_ref(&root));
+        let resolve = |path: &Path| crate::core::paths::resolve_absolute_path(path);
+        assert!(index.summary_for(&resolve(&walked)).is_empty());
+        assert!(!index.summary_for(&resolve(&logged)).is_empty());
+        assert!(!index.summary_for(&resolve(&used)).is_empty());
+
+        let (ancestors, complete) =
+            collect_open_path_ancestors_with_platform(&platform, std::slice::from_ref(&root));
+        assert!(complete);
+        assert!(!is_path_open_by_ancestor(&walked, &ancestors));
+        assert!(is_path_open_by_ancestor(&used, &ancestors));
+        assert!(is_path_open_by_ancestor(
+            logged.parent().unwrap(),
+            &ancestors
+        ));
+    }
+
+    /// bd-d1kt: rustc compiles a registry crate from that crate's source
+    /// directory and holds no descriptor there between reads. The cargo home
+    /// it is building from is in use.
+    #[test]
+    fn a_process_working_inside_a_tree_is_an_active_reference() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let registry = root.join("job/cargo-home/registry");
+        let crate_dir = registry.join("src/index.crates.io-0000/serde-1.0.0");
+        let idle = root.join("idle/cargo-home/registry");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::create_dir_all(&idle).unwrap();
+        let own = i32::try_from(std::process::id()).unwrap();
+        let working_in = |pid, name: &str, cwd: &Path| crate::platform::types::ProcessInfo {
+            cwd: Some(cwd.to_path_buf()),
+            ..process(pid, name, None)
+        };
+        let platform = TestActiveRefPlatform {
+            processes: vec![
+                working_in(42, "rustc", &crate_dir),
+                // sbh's own working directory is not a reference.
+                working_in(own, "sbh", &idle),
+            ],
+            ..Default::default()
+        };
+
+        let index = collect_active_reference_index(&platform, std::slice::from_ref(&root));
+        let resolve = |path: &Path| crate::core::paths::resolve_absolute_path(path);
+        let summary = index.summary_for(&resolve(&registry));
+        assert!(!summary.is_empty());
+        let reason = summary.safe_reclaim_reason().unwrap();
+        assert!(
+            reason.contains("pid 42 (rustc) has its working directory here"),
+            "{reason}"
+        );
+        assert!(index.summary_for(&resolve(&idle)).is_empty());
     }
 
     #[test]
@@ -2360,11 +3299,48 @@ mod tests {
 
     #[test]
     fn active_reference_scan_config_gates_small_candidates() {
+        use crate::scanner::patterns::ArtifactCategory;
         let config = ActiveReferenceScanConfig::new(Duration::from_secs(30), 100 * 1024 * 1024);
 
         assert!(!config.should_probe(100 * 1024 * 1024 - 1));
         assert!(config.should_probe(100 * 1024 * 1024));
         assert!(ActiveReferenceScanConfig::new(Duration::ZERO, 0).should_probe(1));
+        // Caches are probed whatever their size; build output keeps the floor.
+        assert!(config.should_probe_candidate(15 * 1024 * 1024, ArtifactCategory::CacheDir));
+        assert!(config.should_probe_candidate(1, ArtifactCategory::GoCache));
+        assert!(!config.should_probe_candidate(15 * 1024 * 1024, ArtifactCategory::RustTarget));
+        assert!(config.should_probe_candidate(100 * 1024 * 1024, ArtifactCategory::RustTarget));
+    }
+
+    /// The release proof's shape on a real Mac: a live process whose working
+    /// directory is inside a cache holds that cache in the active-reference
+    /// index the scanner and `sbh explain` read.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_live_process_working_in_a_cache_holds_it_on_macos() {
+        let dir = TempDir::new().unwrap();
+        let registry = dir.path().join("home/.cargo/registry");
+        let package = registry.join("src/index.crates.io-x/quote-1.0.47");
+        fs::create_dir_all(&package).unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .current_dir(&package)
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let platform = crate::platform::macos::MacOsPal::new();
+        let index = collect_active_reference_index(&platform, std::slice::from_ref(&registry));
+        let summary =
+            index.summary_for_identity(identity_for_path(&registry.join("src"), false).unwrap());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            summary
+                .processes
+                .iter()
+                .any(|process| process.pid == pid && process.working_directory),
+            "{summary:?}"
+        );
     }
 
     #[test]
@@ -2388,21 +3364,34 @@ mod tests {
             ..Default::default()
         };
 
-        let first = collect_active_reference_index_cached(
-            &platform,
-            std::slice::from_ref(&root),
-            Duration::from_secs(30),
-        );
-        let second = collect_active_reference_index_cached(
-            &platform,
-            std::slice::from_ref(&root),
-            Duration::from_secs(30),
-        );
-
         let candidate_identity = identity_for_path(&candidate, false).unwrap();
-        assert!(!first.summary_for_identity(candidate_identity).is_empty());
-        assert!(!second.summary_for_identity(candidate_identity).is_empty());
-        assert_eq!(platform.probe_calls.load(Ordering::SeqCst), 1);
+        // The cache is one process-wide slot, and tests running in parallel
+        // replace it between two calls. A disturbed pair proves nothing, so
+        // try again; without the cache every pair would probe twice.
+        let mut shared = false;
+        for _ in 0..20 {
+            platform.probe_calls.store(0, Ordering::SeqCst);
+            let first = collect_active_reference_index_cached(
+                &platform,
+                std::slice::from_ref(&root),
+                Duration::from_secs(30),
+            );
+            let second = collect_active_reference_index_cached(
+                &platform,
+                std::slice::from_ref(&root),
+                Duration::from_secs(30),
+            );
+            assert!(!first.summary_for_identity(candidate_identity).is_empty());
+            assert!(!second.summary_for_identity(candidate_identity).is_empty());
+            if platform.probe_calls.load(Ordering::SeqCst) <= 1 {
+                shared = true;
+                break;
+            }
+        }
+        assert!(
+            shared,
+            "two collections within the TTL never shared a probe"
+        );
     }
 
     #[cfg(unix)]
@@ -2589,6 +3578,44 @@ mod tests {
     }
 
     const VALID_CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n# For information about cache directory tags see https://bford.info/cachedir/\n";
+
+    /// A uv venv (`pyvenv.cfg` beside uv's `CACHEDIR.TAG`) is seen as a venv
+    /// by the walk, the opaque probe and the single-path replay alike.
+    #[test]
+    fn a_uv_venv_records_its_pyvenv_cfg_beside_the_tag() {
+        let tmp = TempDir::new().unwrap();
+        let venv = tmp.path().join("venv-tools");
+        fs::create_dir_all(venv.join("lib").join("python3.13").join("site-packages")).unwrap();
+        fs::create_dir_all(venv.join("bin")).unwrap();
+        fs::write(venv.join("CACHEDIR.TAG"), VALID_CACHEDIR_TAG).unwrap();
+        fs::write(
+            venv.join("pyvenv.cfg"),
+            "home = /usr/bin\nimplementation = CPython\nuv = 0.9.0\nversion_info = 3.13.0\n",
+        )
+        .unwrap();
+
+        let walker =
+            DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only());
+        let entries = walker.walk().unwrap();
+        let entry = entries.iter().find(|e| e.path == venv).unwrap();
+        assert!(entry.structural_signals.has_pyvenv_cfg);
+        assert!(!entry.structural_signals.regenerable_cache_tag());
+
+        let replayed = structural_signals_for_path(&venv);
+        assert!(replayed.has_cachedir_tag && replayed.has_pyvenv_cfg);
+        assert!(!replayed.regenerable_cache_tag());
+
+        let root_dev = device_id(&fs::metadata(&venv).unwrap());
+        let probe = opaque_tree_probe(
+            &venv,
+            false,
+            root_dev,
+            OPAQUE_SIZE_PROBE_BUDGET,
+            &AtomicBool::new(false),
+        );
+        assert!(probe.signals.has_pyvenv_cfg, "{:?}", probe.signals);
+        assert!(!probe.signals.regenerable_cache_tag());
+    }
 
     #[test]
     fn collects_cachedir_tag_signal_on_arbitrarily_named_dir() {
@@ -3442,7 +4469,7 @@ mod tests {
             .find(|entry| entry.path == target_dir)
             .expect("v2 should emit opaque target candidate");
 
-        let (open_ancestors, complete) = collect_open_path_ancestors(&[tmp.path().to_path_buf()]);
+        let (open_ancestors, _complete) = collect_open_path_ancestors(&[tmp.path().to_path_buf()]);
 
         // Containers or hidepid settings can hide even our own fd. Keep the
         // fixture non-flaky there; normal Linux workers exercise the assertion.
@@ -3451,7 +4478,8 @@ mod tests {
             return;
         }
 
-        assert!(complete, "open-file ancestor scan should complete");
+        // The open file was found. Whether every other user's process was
+        // readable (`complete`) does not bear on the veto under test.
         assert!(
             is_path_open_by_ancestor(&target_dir, &open_ancestors),
             "an open descendant must mark the opaque candidate root busy"
@@ -3497,14 +4525,15 @@ mod tests {
             .join("src")
             .join("lib.rs");
         let open_handle = fs::File::open(&open_file).unwrap();
-        let (open_ancestors, complete) = collect_open_path_ancestors(&[tmp.path().to_path_buf()]);
+        let (open_ancestors, _complete) = collect_open_path_ancestors(&[tmp.path().to_path_buf()]);
 
         if !open_ancestors.contains(&open_file) {
             drop(open_handle);
             return;
         }
 
-        assert!(complete, "open-file ancestor scan should complete");
+        // The open file was found. Whether every other user's process was
+        // readable (`complete`) does not bear on the vetoes compared here.
         let v1 = scanner_validation_report(tmp.path(), false, &open_ancestors);
         let v2 = scanner_validation_report(tmp.path(), true, &open_ancestors);
 
@@ -3718,12 +4747,12 @@ mod tests {
         fs::write(dir.join("file.bin"), b"payload").unwrap();
 
         let (work_tx, work_rx) = channel::bounded::<WorkItem>(1);
-        let (result_tx, result_rx) = channel::bounded::<WalkEntry>(1);
+        let (result_tx, result_rx) = channel::bounded::<Vec<WalkEntry>>(1);
         drop(work_rx);
 
         // Fill the result channel so the directory emitter must wait.
         result_tx
-            .send(WalkEntry {
+            .send(vec![WalkEntry {
                 path: tmp.path().join("placeholder"),
                 metadata: EntryMetadata {
                     size_bytes: 0,
@@ -3741,7 +4770,7 @@ mod tests {
                 structural_signals: StructuralSignals::default(),
                 is_open: false,
                 opaque_tree: None,
-            })
+            }])
             .unwrap();
 
         let in_flight = AtomicUsize::new(0);
@@ -3758,21 +4787,35 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
 
-        let dir_clone = dir;
+        let unfinished = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let worker_unfinished = Arc::clone(&unfinished);
+
+        // The directory's own device: with any other, the cross-device guard
+        // returns before the listing and nothing below is exercised.
+        let root_dev = device_id(&fs::metadata(&dir).unwrap());
+        let dir_clone = dir.clone();
         let start = Instant::now();
         let join = thread::spawn(move || {
+            // A one-entry batch sends on every push, so the emitter blocks.
+            let mut results = ResultBatch::new(&result_tx, 1, &worker_unfinished);
+            let windows = DirWindows {
+                size: MAX_ENTRIES_PER_DIR,
+                starts: HashMap::new(),
+            };
             process_directory(
                 &dir_clone,
                 1,
-                0,
+                root_dev,
                 None,
                 &work_tx,
-                &result_tx,
+                &mut results,
                 &in_flight,
                 &config,
+                &windows,
                 &protection,
                 None,
                 &worker_cancel,
+                true,
             );
         });
 
@@ -3785,6 +4828,384 @@ mod tests {
             "process_directory should stop promptly when cancellation is requested",
         );
         assert_eq!(result_rx.len(), 1, "no extra entries should be emitted");
+        assert_eq!(
+            *unfinished.lock(),
+            [dir],
+            "the entry the cancel kept from the collector is recorded as unfinished"
+        );
+    }
+
+    fn bare_entry(path: &str) -> WalkEntry {
+        WalkEntry {
+            path: PathBuf::from(path),
+            metadata: EntryMetadata {
+                size_bytes: 0,
+                content_size_bytes: 0,
+                modified: SystemTime::UNIX_EPOCH,
+                created: None,
+                tree_last_modified: None,
+                is_dir: true,
+                inode: 0,
+                device_id: 0,
+                kind: FsEntryKind::Directory,
+                permissions: 0,
+            },
+            depth: 1,
+            structural_signals: StructuralSignals::default(),
+            is_open: false,
+            opaque_tree: None,
+        }
+    }
+
+    /// bd-vf9z: a worker sends full batches as it goes and the rest when it
+    /// flushes; an empty flush sends nothing.
+    #[test]
+    fn result_batches_send_full_batches_then_the_remainder_on_flush() {
+        use crossbeam_channel as channel;
+
+        let (tx, rx) = channel::unbounded::<Vec<WalkEntry>>();
+        let cancel = AtomicBool::new(false);
+        let unfinished = parking_lot::Mutex::new(Vec::new());
+        let mut results = ResultBatch::new(&tx, 4, &unfinished);
+        for i in 0..10 {
+            assert!(results.push(bare_entry(&format!("/d{i}")), &cancel));
+        }
+        let sizes = |rx: &channel::Receiver<Vec<WalkEntry>>| {
+            rx.try_iter().map(|batch| batch.len()).collect::<Vec<_>>()
+        };
+        assert_eq!(sizes(&rx), [4, 4]);
+        assert!(results.flush(&cancel));
+        assert_eq!(sizes(&rx), [2]);
+        assert!(results.flush(&cancel));
+        assert_eq!(sizes(&rx), [0; 0]);
+    }
+
+    /// bd-vf9z: the stream hands out batched entries one at a time, in order,
+    /// and ends when the senders are gone; a catalog stream works the same.
+    #[test]
+    fn a_walk_stream_yields_batched_entries_one_at_a_time_then_ends() {
+        use crossbeam_channel as channel;
+
+        let (tx, rx) = channel::unbounded::<Vec<WalkEntry>>();
+        tx.send(vec![bare_entry("/a"), bare_entry("/b")]).unwrap();
+        tx.send(vec![bare_entry("/c")]).unwrap();
+        drop(tx);
+        let mut stream = WalkStream::new(rx, None, Arc::default(), Arc::default());
+        let wait = Duration::from_secs(1);
+        assert_eq!(stream.recv_timeout(wait).unwrap().path, Path::new("/a"));
+        assert_eq!(stream.next().unwrap().path, Path::new("/b"));
+        assert_eq!(stream.recv_timeout(wait).unwrap().path, Path::new("/c"));
+        assert!(matches!(
+            stream.recv_timeout(wait),
+            Err(channel::RecvTimeoutError::Disconnected)
+        ));
+
+        let catalog: Vec<_> = WalkStream::from_entries(vec![bare_entry("/x"), bare_entry("/y")])
+            .map(|entry| entry.path)
+            .collect();
+        assert_eq!(catalog, [PathBuf::from("/x"), PathBuf::from("/y")]);
+    }
+
+    /// bd-vf9z: batching loses nothing and duplicates nothing, including the
+    /// partial batches workers still hold when the walk runs out of work.
+    #[test]
+    fn a_batched_walk_delivers_every_directory_exactly_once() {
+        let tmp = TempDir::new().unwrap();
+        // 13 + 13 * 23 = 312 directories: not a multiple of the batch size.
+        let mut expected = HashSet::new();
+        for parent in 0..13 {
+            let parent_dir = tmp.path().join(format!("p{parent}"));
+            for child in 0..23 {
+                let dir = parent_dir.join(format!("c{child}"));
+                fs::create_dir_all(&dir).unwrap();
+                expected.insert(dir);
+            }
+            expected.insert(parent_dir);
+        }
+        for parallelism in [1, 4, 16] {
+            for _ in 0..5 {
+                let mut config = test_config(tmp.path());
+                config.parallelism = parallelism;
+                let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+                let paths: Vec<PathBuf> = walker
+                    .walk()
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| entry.path)
+                    .collect();
+                let unique: HashSet<PathBuf> = paths.iter().cloned().collect();
+                assert_eq!(
+                    paths.len(),
+                    unique.len(),
+                    "an entry arrived twice with parallelism {parallelism}"
+                );
+                assert_eq!(unique, expected, "parallelism {parallelism}");
+            }
+        }
+    }
+
+    /// bd-y70k: whenever a consumer stops early, every directory it took
+    /// that has unseen directories below it lies at or above a path the
+    /// stream reports unfinished, however the stop falls against the workers.
+    /// A walk the consumer saw to the end reports nothing.
+    #[test]
+    fn a_cancelled_walk_reports_every_subtree_its_consumer_did_not_finish() {
+        let tmp = TempDir::new().unwrap();
+        // Fan-out 5, depth 4: 5 + 25 + 125 + 625 = 780 directories.
+        let mut tree = HashSet::new();
+        for a in 0..5 {
+            for b in 0..5 {
+                for c in 0..5 {
+                    for d in 0..5 {
+                        let leaf = tmp.path().join(format!("a{a}/b{b}/c{c}/d{d}"));
+                        fs::create_dir_all(&leaf).unwrap();
+                        tree.extend(
+                            leaf.ancestors()
+                                .take_while(|dir| *dir != tmp.path())
+                                .map(Path::to_path_buf),
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(tree.len(), 780);
+
+        for parallelism in [1, 4] {
+            for take in [1, 7, 60, 400, 779, 780] {
+                let mut config = test_config(tmp.path());
+                config.parallelism = parallelism;
+                let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+                let cancel = walker.cancel_token();
+                let mut stream = walker.stream().unwrap();
+                let seen: HashSet<PathBuf> =
+                    stream.by_ref().take(take).map(|entry| entry.path).collect();
+                cancel.store(true, Ordering::Relaxed);
+                let unfinished = stream
+                    .unfinished_after_cancel(Duration::from_secs(10))
+                    .expect("cancelled workers stop well inside the wait");
+
+                let marked: HashSet<&Path> = unfinished
+                    .iter()
+                    .flat_map(|path| path.ancestors())
+                    .collect();
+                let incomplete: HashSet<&Path> = tree
+                    .iter()
+                    .filter(|dir| !seen.contains(*dir))
+                    .flat_map(|dir| dir.ancestors().skip(1))
+                    .collect();
+                for dir in seen.iter().filter(|dir| incomplete.contains(dir.as_path())) {
+                    assert!(
+                        marked.contains(dir.as_path()),
+                        "parallelism {parallelism}, took {take}: {} has unseen directories \
+                         below it but no unfinished path at or below it",
+                        dir.display()
+                    );
+                }
+                if take == tree.len() {
+                    assert_eq!(seen, tree);
+                    assert_eq!(unfinished, Vec::<PathBuf>::new(), "a finished walk");
+                }
+            }
+        }
+    }
+
+    /// bd-10yj: a directory looked at outside a walk classifies as the walk
+    /// would: by its structure when the walker would prune it as an opaque
+    /// candidate (a Go build cache under any name), not at all when the
+    /// walker only descends into it (an hfdt store's own `target/`), and by
+    /// name otherwise.
+    #[test]
+    fn a_directory_outside_a_walk_classifies_as_the_walk_would() {
+        use crate::scanner::patterns::ArtifactCategory;
+        let tmp = TempDir::new().unwrap();
+        let registry = ArtifactPatternRegistry::default();
+
+        let cache = tmp.path().join("ci-gocache-1");
+        fs::create_dir_all(cache.join("a1")).unwrap();
+        fs::write(cache.join("trim.txt"), "x").unwrap();
+        assert_eq!(
+            registry
+                .classify(&cache, StructuralSignals::default())
+                .category,
+            ArtifactCategory::Unknown,
+            "the name alone says nothing"
+        );
+        let class = classify_dir_as_walked(&registry, &cache, StructuralSignals::default())
+            .expect("an opaque candidate");
+        assert_eq!(class.category, ArtifactCategory::GoCache);
+
+        let store_target = tmp.path().join("store-a/target");
+        fs::create_dir_all(store_target.join("doctor-undo")).unwrap();
+        fs::write(tmp.path().join("store-a/hfdt.sqlite"), "x").unwrap();
+        assert!(
+            classify_dir_as_walked(&registry, &store_target, StructuralSignals::default())
+                .is_none(),
+            "the walk only descends into a target without cargo markers"
+        );
+
+        let plain = tmp.path().join("pkg/notes");
+        fs::create_dir_all(&plain).unwrap();
+        assert!(classify_opaque_tree(&plain, opaque_context_for_path(&plain)).is_none());
+        assert_eq!(
+            classify_dir_as_walked(&registry, &plain, StructuralSignals::default()),
+            Some(registry.classify(&plain, StructuralSignals::default())),
+            "no opaque verdict: the name registry decides"
+        );
+
+        // The same rule for an entry the walk emitted.
+        let mut entry = bare_entry("/x/ci-gocache-1");
+        entry.opaque_tree = classify_opaque_tree(&cache, OpaqueTreeContext::default());
+        assert_eq!(
+            entry.walk_classification(&registry).map(|c| c.category),
+            Some(ArtifactCategory::GoCache)
+        );
+        entry.opaque_tree =
+            classify_opaque_tree(&store_target, opaque_context_for_path(&store_target));
+        assert!(entry.walk_classification(&registry).is_none());
+    }
+
+    /// A consumer that goes away without cancelling stops the walk. Before,
+    /// the workers listed the rest of the tree with nobody reading, each
+    /// listing beating the heart.
+    #[test]
+    fn dropping_the_stream_stops_the_walk() {
+        let tmp = TempDir::new().unwrap();
+        // 40 + 40 * 40 = 1,640 directories.
+        for a in 0..40 {
+            for b in 0..40 {
+                fs::create_dir_all(tmp.path().join(format!("a{a}/b{b}"))).unwrap();
+            }
+        }
+        let beats = Arc::new(AtomicUsize::new(0));
+        let walker =
+            DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only())
+                .with_heartbeat({
+                    let beats = Arc::clone(&beats);
+                    move || {
+                        beats.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+        let stream = walker.stream().unwrap();
+        // Every worker holds this until it exits.
+        let workers = Arc::clone(&stream.unfinished);
+        drop(stream);
+        let at_drop = beats.load(Ordering::Relaxed);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&workers) > 1 {
+            assert!(Instant::now() < deadline, "the workers did not stop");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let after_drop = beats.load(Ordering::Relaxed) - at_drop;
+        assert!(
+            after_drop < 64,
+            "{after_drop} heartbeats after the stream was dropped"
+        );
+    }
+
+    /// A directory longer than one processing window is unfinished even when
+    /// the walk runs to the end: the rest of its listing waits for later passes.
+    #[test]
+    fn a_directory_longer_than_its_window_is_reported_unfinished() {
+        let tmp = TempDir::new().unwrap();
+        let wide = tmp.path().join("wide");
+        let narrow = tmp.path().join("narrow");
+        for index in 0..6 {
+            fs::create_dir_all(wide.join(format!("c{index}"))).unwrap();
+        }
+        fs::create_dir_all(narrow.join("only")).unwrap();
+
+        let walker =
+            DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only())
+                .with_dir_window(4);
+        let mut stream = walker.stream().unwrap();
+        let entries = stream.by_ref().count();
+        assert!(entries > 0);
+        let unfinished = stream
+            .unfinished_after_cancel(Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(unfinished, [wide]);
+    }
+
+    #[test]
+    fn window_starts_run_to_the_end_of_the_listing_then_start_over() {
+        assert_eq!(next_window_start(0, 4, 4), None, "fits one window");
+        assert_eq!(next_window_start(0, 10, 4), Some(4));
+        assert_eq!(next_window_start(4, 10, 4), Some(8));
+        assert_eq!(next_window_start(8, 10, 4), Some(0));
+        // A listing that shrank below its window start starts over.
+        assert_eq!(next_window_start(8, 6, 4), Some(0));
+        // ts2's /data/tmp: 68,519 entries take two passes.
+        assert_eq!(
+            next_window_start(0, 68_519, MAX_ENTRIES_PER_DIR),
+            Some(MAX_ENTRIES_PER_DIR)
+        );
+        assert_eq!(
+            next_window_start(MAX_ENTRIES_PER_DIR, 68_519, MAX_ENTRIES_PER_DIR),
+            Some(0)
+        );
+    }
+
+    /// A directory listing more entries than one window is processed a
+    /// window per pass, so every child is visited within a few passes. The
+    /// cap used to stop at the same entries every pass: on btrfs, which lists
+    /// in creation order, the newest ~3,000 of ts2's 68,519 /data/tmp entries
+    /// (40 GiB) were never visited.
+    #[test]
+    fn an_oversized_directory_is_covered_by_successive_passes() {
+        let tmp = TempDir::new().unwrap();
+        let big = tmp.path().join("big");
+        let mut expected = HashSet::new();
+        for index in 0..10 {
+            let child = big.join(format!("c{index:02}"));
+            fs::create_dir_all(&child).unwrap();
+            expected.insert(child);
+        }
+
+        let mut seen = HashSet::new();
+        let mut per_pass = Vec::new();
+        for _ in 0..4 {
+            let walker =
+                DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only())
+                    .with_dir_window(4);
+            let children: Vec<PathBuf> = walker
+                .walk()
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.path)
+                .filter(|path| path.parent() == Some(big.as_path()))
+                .collect();
+            per_pass.push(children.len());
+            seen.extend(children);
+        }
+        // Windows of 4 over 10 entries: 4, 4, the last 2, then from the top.
+        assert_eq!(per_pass, [4, 4, 2, 4]);
+        assert_eq!(seen, expected);
+    }
+
+    /// Every name is read, so a `.sbh-protect` marker outside the processing
+    /// window still keeps the walker out of the directory.
+    #[test]
+    fn a_protect_marker_outside_the_window_still_protects_the_directory() {
+        let tmp = TempDir::new().unwrap();
+        let guarded = tmp.path().join("guarded");
+        for index in 0..10 {
+            fs::create_dir_all(guarded.join(format!("c{index:02}"))).unwrap();
+        }
+        fs::write(guarded.join(".sbh-protect"), b"").unwrap();
+
+        let walker =
+            DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only())
+                .with_dir_window(1);
+        let inside: Vec<PathBuf> = walker
+            .walk()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .filter(|path| path.starts_with(&guarded))
+            .collect();
+        assert_eq!(inside, Vec::<PathBuf>::new());
+        assert!(walker.protection().read().is_protected(&guarded));
     }
 
     #[test]
@@ -4000,5 +5421,310 @@ mod tests {
             proj_entry.structural_signals.has_git,
             "should detect symlinked .git"
         );
+    }
+
+    #[test]
+    fn build_scope_references_cover_nested_candidates_and_narrow_roots() {
+        let tmp = TempDir::new().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let cache = root.join("shared-cache");
+        let child = cache.join("objects/deep");
+        let idle = root.join("shared-cache-other");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&idle).unwrap();
+        let platform = TestActiveRefPlatform {
+            processes: vec![process(42, "go", None)],
+            build_directories: vec![(42, cache)],
+            ..Default::default()
+        };
+        for scan_root in [&root, &child] {
+            let index = collect_active_reference_index(&platform, std::slice::from_ref(scan_root));
+            assert!(index.is_complete());
+            for path in [&child, &child.join("object.o")] {
+                // These paths were not individually declared or held open.
+                assert!(!index.references.contains_key(path));
+                let summary = index.summary_for(path);
+                assert_eq!(summary.processes.len(), 1);
+                assert_eq!(summary.processes[0].pid, 42);
+                assert!(summary.processes[0].build_directory);
+                assert_eq!(summary.processes[0].open_file_descriptors, 0);
+                assert!(summary.safe_reclaim_reason().is_some());
+            }
+            assert!(index.summary_for(&idle).is_empty());
+        }
+        let roots = vec![child.clone(), idle.clone()];
+        let (ancestors, complete) = collect_open_path_ancestors_with_platform(&platform, &roots);
+        assert!(complete);
+        assert!(is_path_open_by_ancestor(&child, &ancestors));
+        assert!(!is_path_open_by_ancestor(&idle, &ancestors));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn per_item_artifact(path: &Path) -> crate::scanner::scoring::CandidacyScore {
+        use crate::scanner::patterns::ArtifactClassification;
+
+        let input = CandidateInput {
+            path: path.to_path_buf(),
+            size_bytes: 18,
+            age: Duration::from_hours(48),
+            classification: ArtifactClassification::unknown(),
+            signals: StructuralSignals::default(),
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+        let mut score =
+            ScoringEngine::from_config(&ScoringConfig::default(), 0).score_candidate(&input, 0.9);
+        score.identity = Some(identity_for_path(path, false).unwrap());
+        score.total_score = 0.99;
+        score.vetoed = false;
+        score.veto_reason = None;
+        score.decision.action = DecisionAction::Delete;
+        score
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn per_item_native_collector_keeps_declared_build_without_target_descriptors() {
+        use crate::scanner::deletion::{DeletionConfig, DeletionExecutor, SkipReason};
+        use std::os::unix::fs::symlink;
+        use std::process::{Command, Stdio};
+
+        struct Holder(std::process::Child);
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        // Re-execute this exact test through our cargo alias as an idle
+        // process fixture, without adding a production environment variable.
+        // The parent observes real /proc metadata; the child does no cleanup.
+        if std::env::args_os().next().is_some_and(|arg| {
+            Path::new(&arg)
+                .file_name()
+                .is_some_and(|name| name == "cargo")
+        }) {
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
+
+        let tmp = tempfile::tempdir_in("/tmp").unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let cache = root.join("cache");
+        let target = cache.join("objects/target");
+        let idle = root.join("idle/target");
+        for path in [&target, &idle] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("artifact.o"), b"active build bytes").unwrap();
+        }
+        // A real, idle Linux process supplies comm/argv/environment to the
+        // production /proc observer. This is not a Cargo build or a PAL mock.
+        let executable = root.join("cargo");
+        symlink(std::env::current_exe().unwrap(), &executable).unwrap();
+        let holder = Holder(
+            Command::new(&executable)
+                .arg("--exact")
+                .arg("scanner::walker::tests::per_item_native_collector_keeps_declared_build_without_target_descriptors")
+                .arg("--test-threads=1")
+                .env_clear()
+                .env("CARGO_TARGET_DIR", &cache)
+                .current_dir(&root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let process = PathBuf::from(format!("/proc/{}", holder.0.id()));
+        assert_eq!(
+            fs::read_to_string(process.join("comm")).unwrap().trim(),
+            "cargo"
+        );
+        assert!(
+            !fs::read_link(process.join("cwd"))
+                .unwrap()
+                .starts_with(&target)
+        );
+        // The child is still starting and closes descriptors as we list
+        // them: a link that vanished is not one into the target.
+        for fd in fs::read_dir(process.join("fd")).unwrap() {
+            let Ok(link) = fs::read_link(fd.unwrap().path()) else {
+                continue;
+            };
+            assert!(!link.starts_with(&target));
+        }
+
+        let (paths, _) = collect_open_path_ancestors(&[target.clone(), idle.clone()]);
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        assert_eq!(
+            executor.explain_preflight(&per_item_artifact(&target), Some(&paths)),
+            Err(SkipReason::FileOpen)
+        );
+        assert_eq!(
+            executor.explain_preflight(&per_item_artifact(&idle), Some(&paths)),
+            Ok(())
+        );
+        assert_eq!(
+            fs::read(target.join("artifact.o")).unwrap(),
+            b"active build bytes"
+        );
+        // Other host processes can make the global scan incomplete. The test
+        // proves retained positive scope evidence, not exhaustive host coverage.
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn per_item_build_snapshot_never_upgrades_incomplete_coverage() {
+        use crate::scanner::deletion::{
+            CheckedDeletion, DeletionConfig, DeletionExecutor, SkipReason,
+        };
+
+        let tmp = tempfile::tempdir_in("/tmp").unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let target = root.join("cache/objects/target");
+        let idle = root.join("idle/target");
+        for path in [&target, &idle] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("artifact.o"), b"active build bytes").unwrap();
+        }
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        for descriptor_complete in [false, true] {
+            for build_complete in [false, true] {
+                let (paths, complete) = checked_open_path_ancestors_with_builds(
+                    &[],
+                    descriptor_complete,
+                    &[target.clone(), idle.clone()],
+                    || (vec![(42, root.join("cache"))], build_complete),
+                );
+                assert_eq!(complete, descriptor_complete && build_complete);
+                assert_eq!(
+                    executor.explain_preflight(&per_item_artifact(&target), Some(&paths)),
+                    Err(SkipReason::FileOpen)
+                );
+                assert_eq!(
+                    executor.explain_preflight(&per_item_artifact(&idle), Some(&paths)),
+                    Ok(())
+                );
+                if !complete {
+                    assert!(matches!(
+                        executor
+                            .delete_candidate_checked(&per_item_artifact(&idle), None)
+                            .unwrap(),
+                        CheckedDeletion::Skipped(SkipReason::OpenScanIncomplete)
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            fs::read(idle.join("artifact.o")).unwrap(),
+            b"active build bytes"
+        );
+        let (paths, complete) =
+            checked_open_path_ancestors_with_builds(&[], true, std::slice::from_ref(&idle), || {
+                (vec![], true)
+            });
+        assert!(complete);
+        assert_eq!(
+            executor.explain_preflight(&per_item_artifact(&idle), Some(&paths)),
+            Ok(())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_build_scopes_follow_the_current_configured_alias_spelling() {
+        let tmp = TempDir::new().unwrap();
+        let real = fs::canonicalize(tmp.path()).unwrap().join("real");
+        fs::create_dir_all(real.join("cache/objects")).unwrap();
+        let first_alias = tmp.path().join("first");
+        let second_alias = tmp.path().join("second");
+        std::os::unix::fs::symlink(&real, &first_alias).unwrap();
+        std::os::unix::fs::symlink(&real, &second_alias).unwrap();
+        let platform = TestActiveRefPlatform {
+            build_directories: vec![(42, real.join("cache"))],
+            ..Default::default()
+        };
+        for root in [&first_alias, &second_alias, &first_alias] {
+            let index = collect_active_reference_index_cached(
+                &platform,
+                std::slice::from_ref(root),
+                Duration::from_secs(30),
+            );
+            assert!(!index.summary_for(&root.join("cache/objects")).is_empty());
+            assert!(index.summary_for(&root.join("idle")).is_empty());
+        }
+    }
+
+    #[test]
+    fn executor_refuses_nested_live_cache_files_and_directories_in_both_modes() {
+        use crate::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionMode};
+        use crate::scanner::patterns::ArtifactClassification;
+
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for directory in [false, true] {
+                let tmp = tempfile::tempdir_in("/tmp").unwrap();
+                let root = fs::canonicalize(tmp.path()).unwrap();
+                let cache = root.join("cache");
+                let candidate = cache.join("objects/target");
+                fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+                let payload = if directory {
+                    fs::create_dir(&candidate).unwrap();
+                    candidate.join("artifact.o")
+                } else {
+                    candidate.clone()
+                };
+                fs::write(&payload, b"active build bytes").unwrap();
+                let input = CandidateInput {
+                    path: candidate.clone(),
+                    size_bytes: 18,
+                    age: Duration::from_hours(48),
+                    classification: ArtifactClassification::unknown(),
+                    signals: StructuralSignals::default(),
+                    active_references: ActiveReferenceSummary::default(),
+                    is_open: false,
+                    excluded: false,
+                };
+                // A queued/public score is deliberately optimistic. The live
+                // executor must refuse independently of score-time evidence.
+                let mut score = ScoringEngine::from_config(&ScoringConfig::default(), 0)
+                    .score_candidate(&input, 0.9);
+                score.identity = Some(identity_for_path(&candidate, false).unwrap());
+                score.total_score = 0.99;
+                score.vetoed = false;
+                score.veto_reason = None;
+                score.decision.action = DecisionAction::Delete;
+                let platform = TestActiveRefPlatform {
+                    build_directories: vec![(42, cache)],
+                    ..Default::default()
+                };
+                let executor = DeletionExecutor::new(
+                    DeletionConfig {
+                        mode,
+                        require_identity: true,
+                        quarantine_roots: vec![root.clone()],
+                        ..DeletionConfig::default()
+                    },
+                    None,
+                )
+                .with_platform(Arc::new(platform));
+                let plan = executor.plan(vec![score]);
+                assert_eq!(plan.estimated_items, 1);
+                let report = executor.execute(&plan, None);
+                assert_eq!(report.items_deleted, 0);
+                assert_eq!(report.items_failed, 0);
+                assert_eq!(report.items_skipped, 1);
+                assert_eq!(report.skipped_by_reason.get("file_open"), Some(&1));
+                assert_eq!(report.bytes_freed, 0);
+                assert_eq!(report.bytes_quarantined, 0);
+                assert_eq!(fs::read(payload).unwrap(), b"active build bytes");
+                assert!(
+                    !crate::scanner::quarantine::QuarantineStore::under(&root)
+                        .root()
+                        .exists()
+                );
+            }
+        }
     }
 }

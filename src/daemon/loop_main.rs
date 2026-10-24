@@ -21,7 +21,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
+use crossbeam_channel::{
+    Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError, TrySendError, bounded,
+};
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
@@ -29,10 +31,12 @@ use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::{Config, ScannerConfig, ScannerEngineMode};
 use crate::core::errors::{Result, SbhError};
+use crate::daemon::compress_tier::{CompressTier, CompressionFirst};
 use crate::daemon::control::{
     BallastAction as ControlBallastAction, ControlBackend, ControlCommand, ControlResponse,
     ControlServer, Peer, PolicyAction, persist_policy_mode,
 };
+use crate::daemon::coverage::{UNCOVERED_REFRESH_INTERVAL, uncovered_mount_levels};
 use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD, PassCpuGuard, paced_pct};
 use crate::daemon::mount_controller::{
     IdleReason, MountController, MountControllerConfig, MountState, MountStateRecord, MountSurface,
@@ -50,6 +54,7 @@ use crate::daemon::self_monitor::{
     assess_logging_placement, nearest_existing_ancestor,
 };
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat, resolve_watchdog_sec};
+use crate::daemon::target_tier::TargetTier;
 use crate::logger::dual::{
     ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, ScanCompletionTelemetry, spawn_logger,
 };
@@ -74,9 +79,12 @@ use crate::monitor::voi_scheduler::VoiScheduler;
 use crate::platform::cleanup_catalog::{self, ExpandedCatalogRoot};
 use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
 use crate::platform::types::{
-    FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
+    FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureCallback,
+    MemoryPressureLevel,
 };
-use crate::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionMode};
+use crate::scanner::deletion::{
+    DeletionConfig, DeletionExecutor, DeletionMode, FreedBasis, SkipReason,
+};
 use crate::scanner::engine::{ScannerEngine, SelectedScannerEngine};
 use crate::scanner::events::{
     EventInvalidation, EventSourceConfig, EventSourceStats, ScannerEventSource,
@@ -92,17 +100,17 @@ use crate::scanner::patterns::{
 use crate::scanner::planner::{PlanRequest, RiskBudgetByLevel, plan_batch};
 use crate::scanner::prescan_cursor::PrescanCursor;
 use crate::scanner::protection::{self, ProtectionRegistry};
-use crate::scanner::quarantine::{DrainOutcome as QuarantineDrainOutcome, QuarantineStore};
+use crate::scanner::quarantine::{QuarantineStore, SweepMode as QuarantineSweepMode};
 use crate::scanner::regret::{
-    EntryIdentity, Outcome, RegretCalibrator, RegretConfig, RegretDetector, Sighting, Watch,
+    EntryIdentity, Outcome, RegretCalibrator, RegretConfig, RegretDetector, Watch,
     certainty_from_name,
 };
 use crate::scanner::scoring::{
     ActiveReferenceSummary, ArtifactCertainty, CandidacyScore, ScoringEngine,
 };
 use crate::scanner::walker::{
-    ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkEntry, WalkerConfig,
-    collect_active_reference_index_cached, collect_open_path_ancestors_cached,
+    ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkEntry, WalkStream,
+    WalkerConfig, collect_active_reference_index_cached, collect_open_path_ancestors_cached,
 };
 
 // ──────────────────── channel capacities ────────────────────
@@ -146,6 +154,9 @@ const DEVICE_AFFINITY_WARN_INTERVAL: Duration = Duration::from_mins(15);
 const ATTRIBUTION_REPORT_INTERVAL: Duration = Duration::from_hours(1);
 /// How long a mount must stay at Red or worse before it is attributed.
 const ATTRIBUTION_SUSTAINED_PRESSURE: Duration = Duration::from_mins(10);
+/// bd-ffjj: how often the RAM fallback's headroom is re-checked while the
+/// logging mount stays pressured (the check reads the mount table).
+const LOGGING_RAM_RECHECK: Duration = Duration::from_secs(30);
 /// Swap usage threshold that indicates probable paging thrash.
 const SWAP_THRASH_USED_PCT_THRESHOLD: f64 = 70.0;
 /// Minimum free RAM for high swap use to indicate thrash (anomalous paging
@@ -212,6 +223,8 @@ struct SharedExecutorConfig {
     reclaim_events: AtomicU64,
     /// W1 planner: the risk budget table and one false-positive loss.
     planner: RwLock<(RiskBudgetByLevel, f64)>,
+    /// A live, bounded first chance for lossless reclaim on a pressured mount.
+    compression_first: Arc<CompressionFirst>,
 }
 
 impl SharedExecutorConfig {
@@ -235,6 +248,7 @@ impl SharedExecutorConfig {
             quarantine_ttl_secs: AtomicU64::new(quarantine_ttl_secs),
             reclaim_events: AtomicU64::new(0),
             planner: RwLock::new((RiskBudgetByLevel::default(), 50.0)),
+            compression_first: Arc::new(CompressionFirst::default()),
         }
     }
 
@@ -274,6 +288,40 @@ impl SharedExecutorConfig {
         self.min_score_bits.store(val.to_bits(), Ordering::Relaxed);
     }
 
+    fn authorize_mutation(
+        &self,
+        approved_mode: ActiveMode,
+        current_mode: ActiveMode,
+    ) -> std::result::Result<(), SkipReason> {
+        if self.dry_run.load(Ordering::Relaxed)
+            || !current_mode.allows_deletion()
+            // An Enforce-approved batch has not passed Canary's quota.
+            // Leave it for fresh policy evaluation after this restriction.
+            || (approved_mode == ActiveMode::Enforce && current_mode == ActiveMode::Canary)
+        {
+            return Err(SkipReason::PolicyChanged);
+        }
+        Ok(())
+    }
+
+    fn authorize_compression_first(
+        &self,
+        candidate: &CandidacyScore,
+        level: PressureLevel,
+    ) -> std::result::Result<(), SkipReason> {
+        let identity = candidate
+            .identity
+            .or_else(|| crate::scanner::walker::identity_for_path(&candidate.path, false).ok());
+        if identity.is_some_and(|identity| {
+            self.compression_first
+                .defers_device(identity.device_id, level, Instant::now())
+        }) {
+            Err(SkipReason::CompressionFirst)
+        } else {
+            Ok(())
+        }
+    }
+
     fn repeat_base_cooldown_secs(&self) -> u64 {
         self.repeat_base_cooldown_secs.load(Ordering::Relaxed)
     }
@@ -301,6 +349,19 @@ impl SharedRegret {
         }
     }
 
+    /// Reconfigure both feedback components while retaining pending
+    /// observation deadlines and the category evidence already collected.
+    fn update_config(&self, config: &Config) {
+        let regret = regret_config(config);
+        let mut detector = self.detector.lock();
+        let mut calibrator = self.calibrator.lock();
+        detector.set_window(regret.window);
+        calibrator.update_config(regret);
+        // Publish the paired update before releasing either guard. Retain the
+        // original reverse acquisition order while making the release explicit.
+        drop((calibrator, detector));
+    }
+
     /// The scoring engine's view: a calibration factor per category and
     /// the categories whose deletions are suspended right now.
     fn scoring_view(&self, now: Instant) -> (HashMap<String, f64>, HashSet<String>) {
@@ -312,6 +373,55 @@ impl SharedRegret {
             .map(|summary| summary.category)
             .collect();
         (calibrator.calibrations(), suspended)
+    }
+
+    /// Recheck queued work at the execution boundary: its scoring snapshot
+    /// may predate a category alarm raised during the scan or this batch.
+    fn authorize_deletion(
+        &self,
+        candidate: &CandidacyScore,
+        logger: &ActivityLoggerHandle,
+    ) -> std::result::Result<(), SkipReason> {
+        let category = format!("{:?}", candidate.classification.category);
+        let suspended = {
+            let calibrator = self.calibrator.lock();
+            calibrator.suspended(&category, Instant::now())
+        };
+        if suspended {
+            // Release the evidence lock before logging or filesystem work.
+            logger.send(ActivityEvent::Info {
+                message: format!(
+                    "regret category {category} is suspended; skipped {}",
+                    candidate.path.display()
+                ),
+            });
+            Err(SkipReason::CategorySuspended)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Begin observation at the unlink's completion, without moving the
+    /// deadline if acquiring the detector lock takes time.
+    fn watch_unlinked(
+        &self,
+        candidate: &CandidacyScore,
+        identity: &EntryIdentity,
+        completed_at: Instant,
+    ) {
+        let watch = Watch {
+            decision_id: crate::scanner::decision_record::stable_decision_id(
+                &candidate.path,
+                candidate.identity,
+                candidate.size_bytes,
+            ),
+            path: candidate.path.clone(),
+            identity: identity.clone(),
+            category: format!("{:?}", candidate.classification.category),
+            certainty: candidate.decision.certainty,
+            deleted_at: completed_at,
+        };
+        self.detector.lock().watch(watch);
     }
 }
 
@@ -364,14 +474,18 @@ fn parent_in_use(platform: &dyn Platform, parent: &Path) -> bool {
     {
         return true;
     }
-    platform.process_list().is_ok_and(|processes| {
-        processes.iter().any(|process| {
-            process
-                .cwd
-                .as_deref()
-                .is_some_and(|cwd| cwd.starts_with(parent))
+    // Runs on the monitor thread and needs only cwd: no argv reads, which
+    // can block behind another process's memory-map lock.
+    platform
+        .process_list_without_command_lines()
+        .is_ok_and(|processes| {
+            processes.iter().any(|process| {
+                process
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|cwd| cwd.starts_with(parent))
+            })
         })
-    })
 }
 
 // ──────────────────── thread panic tracking ────────────────────
@@ -521,6 +635,58 @@ pub struct ScanRequest {
     pub target_bytes: Option<u64>,
 }
 
+/// How a long startup step keeps a `Type=notify` unit from timing out.
+#[derive(Debug, Clone, Copy)]
+struct StartupExtension {
+    /// Each request makes the start timeout at least this far from now.
+    extend_by: Duration,
+    /// How often the request is repeated while the step runs.
+    every: Duration,
+    /// Stop asking after this long, so a step that hangs still lets the
+    /// service manager's timeout fail the start.
+    max: Duration,
+}
+
+impl StartupExtension {
+    const DEFAULT: Self = Self {
+        extend_by: Duration::from_secs(30),
+        every: Duration::from_secs(10),
+        max: Duration::from_mins(15),
+    };
+}
+
+/// Run `work` while repeatedly asking the service manager for more startup
+/// time; the requests stop when `work` returns, after `extension.max`, or
+/// once `stop` is set. systemd applies `EXTEND_TIMEOUT_USEC` to whichever
+/// timeout is running, so extending after a stop request would also hold off
+/// the stop timeout: a `systemctl stop` during provisioning waited minutes.
+fn with_startup_extension<T>(
+    service_manager: Box<dyn crate::platform::pal::ServiceManager>,
+    status: &str,
+    extension: StartupExtension,
+    stop: &AtomicBool,
+    work: impl FnOnce() -> T,
+) -> T {
+    let (done_tx, done_rx) = bounded::<()>(0);
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            let started = Instant::now();
+            while started.elapsed() < extension.max && !stop.load(Ordering::Relaxed) {
+                let _ = service_manager.notify_extend_startup(extension.extend_by, status);
+                if !matches!(
+                    done_rx.recv_timeout(extension.every),
+                    Err(RecvTimeoutError::Timeout)
+                ) {
+                    break;
+                }
+            }
+        });
+        let result = work();
+        drop(done_tx);
+        result
+    })
+}
+
 /// B6: consecutive no-progress passes after which even Red/Critical pressure
 /// stops bypassing the empty-pass cooldown ("terminal idle"). Re-walking a
 /// tree whose every candidate is protected cannot free bytes no matter how
@@ -599,6 +765,45 @@ fn empty_pass_cooldown_active(
 fn pressure_escalated(last_pass_level: Option<PressureLevel>, request: &ScanRequest) -> bool {
     !request.maintenance
         && last_pass_level.is_some_and(|previous| request.pressure_level > previous)
+}
+
+/// How long an empty pass at a level keeps a return to that level from
+/// counting as an escalation. A host whose free space hovers at a threshold
+/// crosses it every minute or two: each return to Red after an Orange event
+/// pass looked like new information and cleared the backoff, so Red never
+/// reached terminal idle and rescanned the same tree back-to-back (hz1 on
+/// 2026-10-13: 365 resets and 816 passes in 6 h, 723 of them finding nothing).
+/// The window equals the terminal-idle wake, so a flapping host is re-checked
+/// as often as one that stays put.
+const ESCALATION_HYSTERESIS: Duration = TERMINAL_IDLE_PRESSURED_RESCAN_CAP;
+
+/// Remember the highest level a recent pass found nothing at. A lower-level
+/// empty pass does not erase a higher one still inside the window; a pass at
+/// the same or a higher level refreshes it.
+fn note_empty_pass_level(
+    peak: &mut Option<(PressureLevel, Instant)>,
+    level: PressureLevel,
+    now: Instant,
+) {
+    let keep = peak.is_some_and(|(peak_level, at)| {
+        peak_level > level && now.saturating_duration_since(at) < ESCALATION_HYSTERESIS
+    });
+    if !keep {
+        *peak = Some((level, now));
+    }
+}
+
+/// Whether a pass at `level` or above came back empty within the hysteresis
+/// window: a rise to `level` is then the threshold flapping, not new
+/// information, and keeps the empty-pass streak.
+fn rise_already_scanned_empty(
+    peak: Option<(PressureLevel, Instant)>,
+    level: PressureLevel,
+    now: Instant,
+) -> bool {
+    peak.is_some_and(|(peak_level, at)| {
+        peak_level >= level && now.saturating_duration_since(at) < ESCALATION_HYSTERESIS
+    })
 }
 
 /// Absolute floor between pressure-driven scan passes when the duty-cycle
@@ -719,6 +924,53 @@ fn effective_empty_pass_cooldown(base_secs: u64, consecutive_empty_passes: u32) 
     Duration::from_secs(base_secs.saturating_mul(multiplier))
 }
 
+/// bd-qxrh: fold a pass that dispatched nothing into the empty-pass streak.
+///
+/// One *timed-out* empty pass is inconclusive: its budget may have run out
+/// before the walk reached anything reclaimable. A run of them is not. When
+/// every pass is cut short (by `scan_time_budget_secs` or, more often, by the
+/// daemon CPU bucket), counting none of them meant the streak never grew, so
+/// Red/Critical never reached terminal idle and re-scanned as fast as the duty
+/// cycle allowed, for hours, with nothing to reclaim (mac-mini-max on
+/// 2026-10-12: a `red_pressure` pass every ~20 s, all `timed_out=true`,
+/// 0 candidates, 0 bytes freed). Every [`TERMINAL_IDLE_EMPTY_PASSES`]
+/// consecutive timed-out empty passes therefore count as one conclusive one.
+fn record_empty_pass(
+    consecutive_empty_passes: &mut u32,
+    inconclusive_empty_passes: &mut u32,
+    timed_out: bool,
+) {
+    if timed_out {
+        *inconclusive_empty_passes = inconclusive_empty_passes.saturating_add(1);
+        if *inconclusive_empty_passes < TERMINAL_IDLE_EMPTY_PASSES {
+            return;
+        }
+    }
+    *inconclusive_empty_passes = 0;
+    *consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
+}
+
+/// A pass that dispatched candidates. Its dispatch is unconfirmed until the
+/// next pass sees the executor's reclaim counter move, so it resets the
+/// empty-pass streak only when the previous dispatch did reclaim something.
+/// Resetting on every dispatch capped the streak at one (#36): a host whose
+/// dispatches never reclaim (dry-run, observe, every candidate failing)
+/// rescanned at the base interval forever instead of backing off toward
+/// terminal idle.
+fn record_dispatching_pass(
+    previous_dispatch_reclaimed_nothing: bool,
+    consecutive_empty_passes: &mut u32,
+    inconclusive_empty_passes: &mut u32,
+    last_empty_pass_at: &mut Option<Instant>,
+) {
+    if previous_dispatch_reclaimed_nothing {
+        return;
+    }
+    *consecutive_empty_passes = 0;
+    *inconclusive_empty_passes = 0;
+    *last_empty_pass_at = None;
+}
+
 /// Process CPU (user+system) this process has consumed so far, in micros.
 fn current_scan_cpu_micros() -> Option<u64> {
     let stats = crate::platform::current().self_stats().ok()?;
@@ -770,6 +1022,13 @@ pub struct DeletionBatch {
     pub urgency: f64,
     /// W1 planner: the byte target of the pass that produced the batch.
     pub target_bytes: Option<u64>,
+    /// Set by the target-only tier alone (bd-232u): the resolved
+    /// `scanner.target_only_roots` root whose pure, idle cargo target dirs
+    /// the batch holds. The executor drops any candidate that is not strictly
+    /// inside it or carries no identity, and lifts only the `protected_paths`
+    /// patterns that cover the root as a whole; patterns naming something
+    /// inside it, `.sbh-protect` markers and every other check still apply.
+    pub target_only_root: Option<PathBuf>,
 }
 
 /// Results reported from worker threads back to the main monitoring loop.
@@ -793,11 +1052,22 @@ enum WorkerReport {
         duration: Duration,
         root_stats: Vec<RootScanResult>,
         timed_out: bool,
+        /// Pressure examined by this pass, before any newer monitor tick.
+        pressure_level: PressureLevel,
+        /// A Green maintenance walk or an event-scoped pass: run on the
+        /// scanner's own schedule, not for any mount's pressure or prediction
+        /// (bd-lihi). Its empty result cannot park a mount in Reclaim.
+        background: bool,
     },
     /// Executor completed a deletion batch.
     DeletionCompleted {
         deleted: u64,
+        /// What to report as freed; `freed_basis` says how it is known.
+        /// Reporting only: no control decision reads it (bd-oj33).
         bytes_freed: u64,
+        freed_basis: FreedBasis,
+        /// The free space measured around the removals, when every one was.
+        bytes_freed_observed: Option<u64>,
         failed: u64,
         /// Candidates whose filesystem answered EROFS or ENOSPC: their
         /// mounts need recovery, not another attempt.
@@ -1023,6 +1293,35 @@ struct MemoryPressureEvent {
     received_at: Instant,
 }
 
+/// Keep the newest observed pressure even when the monitor cannot drain its
+/// bounded queue. Subscriptions report changes only: dropping the final change
+/// could otherwise leave the daemon in the wrong behavior mode indefinitely.
+fn memory_pressure_event_callback(
+    tx: Sender<MemoryPressureEvent>,
+    overflow_rx: Receiver<MemoryPressureEvent>,
+) -> MemoryPressureCallback {
+    // Own the sole sender here and serialize concurrent platform callbacks.
+    // The monitor never takes this lock; it can only free queue slots.
+    let publisher = Mutex::new((tx, overflow_rx));
+    Box::new(move |pressure| {
+        let publisher = publisher.lock();
+        let (tx, overflow_rx) = &*publisher;
+        let event = MemoryPressureEvent {
+            pressure,
+            received_at: Instant::now(),
+        };
+        if let Err(TrySendError::Full(event)) = tx.try_send(event) {
+            // Preserve ordinary FIFO delivery until capacity is exhausted.
+            // If the monitor wins this receive race, it has already freed a
+            // slot. No other sender can refill it while this lock is held, so
+            // retrying once keeps the latest event without blocking on space.
+            let _ = overflow_rx.try_recv();
+            let _ = tx.try_send(event);
+        }
+        drop(publisher);
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BehaviorTransition {
     from_memory: MemoryPressureLevel,
@@ -1053,6 +1352,8 @@ enum BehaviorUpdate {
     Deferred {
         direction: BehaviorTransitionDirection,
         remaining: Duration,
+        /// The same target was already waiting; the daemon logs a deferral once.
+        repeated: bool,
     },
 }
 
@@ -1086,10 +1387,11 @@ impl PressureBehaviorState {
     }
 
     /// Swap in a reloaded matrix and re-resolve the current cell without
-    /// hysteresis (the pressure levels did not change; the policy did).
+    /// hysteresis (the pressure levels did not change; the policy did). A
+    /// deferred target stays: it holds the latest memory reading, and the
+    /// next evaluation re-resolves its mode against the new matrix.
     fn replace_table(&mut self, table: BehaviorDispatchTable) -> Option<BehaviorTransition> {
         self.table = table;
-        self.pending_target = None;
         let next_mode = self.table.mode_for(self.memory_level, self.disk_level);
         if next_mode == self.mode {
             return None;
@@ -1099,6 +1401,20 @@ impl PressureBehaviorState {
 
     fn table(&self) -> &BehaviorDispatchTable {
         &self.table
+    }
+
+    /// The memory level to evaluate next: a deferred target's while one waits
+    /// out its hysteresis window, else the applied one. The subscription
+    /// reports a level once, when it changes, so a deferred target is the
+    /// daemon's only record of it; evaluating the applied level instead would
+    /// cancel the target and run the wrong mode until the next change.
+    fn latest_memory_level(&self) -> MemoryPressureLevel {
+        self.pending_target
+            .map_or(self.memory_level, |pending| pending.memory_level)
+    }
+
+    const fn has_pending_target(&self) -> bool {
+        self.pending_target.is_some()
     }
 
     #[cfg(test)]
@@ -1144,6 +1460,8 @@ impl PressureBehaviorState {
         };
 
         if let Some(remaining) = self.hysteresis_remaining(direction, now, min_interval) {
+            // A differing target was cleared above, so one still here is this one.
+            let repeated = self.pending_target.is_some();
             self.pending_target = Some(PendingBehaviorTarget {
                 memory_level,
                 disk_level,
@@ -1152,6 +1470,7 @@ impl PressureBehaviorState {
             return BehaviorUpdate::Deferred {
                 direction,
                 remaining,
+                repeated,
             };
         }
 
@@ -1762,6 +2081,11 @@ pub struct MonitoringDaemon {
     floor_limited: HashSet<PathBuf>,
     /// Once-per-epoch throttle for the "nothing to reclaim here" alert.
     reclaim_alerts: AlertThrottle,
+    /// Watchable volumes no scanner root covers, with their last level
+    /// (`coverage`), re-measured every `UNCOVERED_REFRESH_INTERVAL`. They
+    /// feed only the ReclaimUnavailable alert, never policy.
+    uncovered_levels: HashMap<PathBuf, PressureLevel>,
+    uncovered_checked_at: Option<Instant>,
     /// Derived catalog roots per mount (W1 catalog roots), refreshed every
     /// `scanner.catalog_rescan_interval_secs`.
     catalog_root_cache: HashMap<PathBuf, (Instant, Vec<ExpandedCatalogRoot>)>,
@@ -1781,6 +2105,9 @@ pub struct MonitoringDaemon {
     /// The level last reported for the logging mount, so the log line and
     /// the mirror switch happen per level change, never per tick.
     logging_level_logged: Option<PressureLevel>,
+    /// When the RAM fallback's headroom was last checked while the logging
+    /// mount was pressured (bd-ffjj).
+    logging_ram_checked_at: Option<Instant>,
     /// Per-location alert throttle for the special-location horizon rule.
     special_alerts: AlertThrottle,
     /// When the last Green maintenance pass was dispatched.
@@ -1815,8 +2142,10 @@ pub struct MonitoringDaemon {
     last_notified_pressure_level: PressureLevel,
     last_pressure_notify_time: Option<Instant>,
     last_special_scan: HashMap<PathBuf, Instant>,
-    /// Per-special-location notification cooldown: tracks (highest notified level, last notify time).
-    /// Prevents the same oscillation spam that the main pressure loop suppresses.
+    /// Per-special-location alert episode: (highest level notified in it, when
+    /// its alert was last seen). See [`special_episode_step`] and
+    /// [`special_episode_over`]; prevents the oscillation spam the main
+    /// pressure loop also suppresses.
     last_special_notify: HashMap<PathBuf, (PressureLevel, Instant)>,
     last_predictive_warning: Option<Instant>,
     last_predictive_level: Option<NotificationLevel>,
@@ -1830,6 +2159,9 @@ pub struct MonitoringDaemon {
     swap_thrash_active: bool,
     last_scan_channel_warn: Option<Instant>,
     scan_channel_warn_suppressed: u64,
+    /// When a SIGUSR1 scan the full scan queue could not take yet arrived;
+    /// it is retried every tick until queued.
+    forced_scan_pending_since: Option<Instant>,
     /// Rate-limit for the B5 "pressured device has no root_path" warning so the
     /// back-off path does not spam logs on every tick.
     last_device_affinity_warn: Option<Instant>,
@@ -1837,6 +2169,10 @@ pub struct MonitoringDaemon {
     attribution_reported: HashMap<PathBuf, Instant>,
     /// Since when each mount has been continuously at Red or worse.
     attribution_pressured_since: HashMap<PathBuf, Instant>,
+    /// Opt-in lossless compression passes on btrfs (`[compress]`, bd-rxq5).
+    compress_tier: CompressTier,
+    /// Pure idle cargo targets inside `scanner.target_only_roots` (bd-232u).
+    target_tier: TargetTier,
     last_summary_report: Instant,
     summary_scans: u64,
     summary_scan_timeouts: u64,
@@ -1844,6 +2180,9 @@ pub struct MonitoringDaemon {
     summary_deleted: u64,
     summary_failed: u64,
     summary_bytes_freed: u64,
+    /// How `summary_bytes_freed` is known, and what was measured beside it.
+    summary_freed_basis: FreedBasis,
+    summary_bytes_freed_observed: Option<u64>,
     last_full_disk_access_check: Option<Instant>,
     last_full_disk_access_state: Option<FullDiskAccessState>,
     full_disk_access_granted_logged: bool,
@@ -1964,6 +2303,14 @@ fn is_named_in_tree_rch_target(classification: &ArtifactClassification) -> bool 
     )
 }
 
+/// Patterns that name a whole cargo home; they classify as temp directories.
+fn is_cargo_home_pattern(classification: &ArtifactClassification) -> bool {
+    matches!(
+        classification.pattern_name.as_ref(),
+        "cargo-home-prefix" | "tmp-cargo-home" | "rch-cargo-home" | "dot-cargo-prefix"
+    )
+}
+
 fn should_fast_track_temp_age(
     pressure_level: PressureLevel,
     path: &Path,
@@ -1973,6 +2320,20 @@ fn should_fast_track_temp_age(
         return false;
     }
     if classification.category == ArtifactCategory::Unknown {
+        return false;
+    }
+    // A cache proves "regenerable", not "abandoned". Fast-tracking one gave
+    // a live cargo home's stores, minutes old and being compiled from, the
+    // configured minimum age: first the CACHEDIR.TAG'd registry/ and git/
+    // (bd-d1kt), then, in a real-build proof on macOS, a default ~/.cargo's
+    // registry/src classified as an opaque cargo cache, 174 s old, deleted at
+    // "age 300 s" under the running build. No cache of any kind, and no cargo
+    // home by name, is fast-tracked.
+    if matches!(
+        classification.category,
+        ArtifactCategory::CacheDir | ArtifactCategory::GoCache
+    ) || is_cargo_home_pattern(classification)
+    {
         return false;
     }
     // Restrict fast-track to tmp-like roots, with one carved-out exception:
@@ -2048,6 +2409,32 @@ fn adjusted_candidate_age(
     path: &Path,
     classification: &ArtifactClassification,
 ) -> Duration {
+    adjusted_candidate_age_after_arrival(
+        observed_age,
+        min_file_age_minutes,
+        pressure_level,
+        path,
+        classification,
+        || candidate_arrival_age(path),
+    )
+}
+
+/// The fast-track shortens the wait for an old tree whose contents were
+/// recently touched, not for a tree that has just arrived. JE's policy
+/// (bd-macg, 2026-10-14): a candidate whose root arrived less than the
+/// minimum age ago keeps its real age. On fmd a JE-approved copy of idle
+/// tmpfs scratch into /data/tmp was deleted five minutes after the copy,
+/// recorded at the 600 s minimum, and hz2 lost a 1.9 GB copied
+/// `node_modules` the same way. `arrival` is asked only when the fast-track
+/// would apply; an unknown arrival keeps the real age.
+fn adjusted_candidate_age_after_arrival(
+    observed_age: Duration,
+    min_file_age_minutes: u64,
+    pressure_level: PressureLevel,
+    path: &Path,
+    classification: &ArtifactClassification,
+    arrival: impl FnOnce() -> Option<Duration>,
+) -> Duration {
     if !should_fast_track_temp_age(pressure_level, path, classification) {
         return observed_age;
     }
@@ -2056,7 +2443,37 @@ fn adjusted_candidate_age(
     }
 
     let min_age = Duration::from_secs(min_file_age_minutes.saturating_mul(60));
+    if arrival().is_none_or(|arrived| arrived < min_age) {
+        return observed_age;
+    }
     observed_age.max(min_age)
+}
+
+/// How long ago a candidate's root came to be where it is: the newer of its
+/// birth time and its status-change time. A copy is born when it is copied;
+/// a tree moved into place keeps its birth time and mtime but gets a new
+/// ctime; an extracted archive is born when it is extracted. Writes deep
+/// inside a build tree change neither. A time in the future counts as now.
+fn candidate_arrival_age(path: &Path) -> Option<Duration> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt as _;
+        u64::try_from(metadata.ctime())
+            .ok()
+            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+    };
+    #[cfg(not(unix))]
+    let changed = None;
+    let arrived = [metadata.created().ok(), changed]
+        .into_iter()
+        .flatten()
+        .max()?;
+    Some(
+        SystemTime::now()
+            .duration_since(arrived)
+            .unwrap_or(Duration::ZERO),
+    )
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
@@ -2074,6 +2491,37 @@ fn path_is_same_or_descendant(candidate: &Path, ancestor: &Path) -> bool {
         return false;
     };
     candidate == ancestor || candidate.starts_with(ancestor)
+}
+
+/// One tick of a special location's alert episode. `previous` is the level
+/// notified so far in the episode and when its alert was last seen. Returns
+/// the level to notify from (`None`: stay quiet) and the episode's notified
+/// level afterwards. A new episode notifies from Green; inside one only an
+/// escalation notifies, so a level that wobbles with the write rate is one
+/// alert instead of one per wobble.
+fn special_episode_step(
+    previous: Option<(PressureLevel, Instant)>,
+    level: PressureLevel,
+) -> (Option<PressureLevel>, PressureLevel) {
+    match previous {
+        None => (Some(PressureLevel::Green), level),
+        Some((notified, _)) if level > notified => (Some(notified), level),
+        Some((notified, _)) => (None, notified),
+    }
+}
+
+/// A special location's alert episode ends once the alert has stayed clear
+/// for a whole alert interval; a burst that dips under the horizon and back
+/// within it is still the same episode.
+fn special_episode_over(
+    previous: Option<(PressureLevel, Instant)>,
+    now: Instant,
+    alert_interval: Duration,
+) -> bool {
+    previous.is_none_or(|(_, last_seen)| {
+        now.checked_duration_since(last_seen)
+            .is_none_or(|clear_for| clear_for >= alert_interval)
+    })
 }
 
 fn special_location_scan_roots(location: &Path, configured_roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -2237,6 +2685,15 @@ fn v2_effective_parallelism(config: &ScannerConfig, pressure_level: PressureLeve
     }
 }
 
+/// Whether the Btrfs compression tier (bd-rxq5) may start a pass. It rewrites
+/// files in place, so it runs only where the policy lets the daemon change the
+/// filesystem: not in observe or fallback-safe mode (the kill switch forces
+/// the latter), and not under `scanner.dry_run`. When it may not, a pass
+/// already running is told to stop (`CompressTier::stop_running_pass`).
+fn compress_tier_may_run(config: &Config, mode: ActiveMode) -> bool {
+    config.compress.enabled && !config.scanner.dry_run && mode.allows_deletion()
+}
+
 fn fallback_log_truncation_free_pct(pressure_level: PressureLevel) -> f64 {
     match pressure_level {
         PressureLevel::Green | PressureLevel::Yellow => 100.0,
@@ -2258,6 +2715,9 @@ enum PassStop {
     /// `scanner.prescan_time_budget_secs` — the *phase* is over, but the pass
     /// continues into the general walker.
     PrescanPhase,
+    /// The pre-scan spent [`PRESCAN_CPU_SHARE`] of the pass's CPU allowance;
+    /// like [`Self::PrescanPhase`] it ends only the phase.
+    PrescanCpuShare,
     /// `scanner.scan_time_budget_secs` — the pass's wall ceiling.
     Wall,
     /// The daemon's measured CPU allowance for this pass (Q7).
@@ -2269,6 +2729,7 @@ impl PassStop {
     const fn label(self) -> &'static str {
         match self {
             Self::PrescanPhase => "prescan wall budget",
+            Self::PrescanCpuShare => "prescan cpu share",
             Self::Wall => "scan wall budget",
             Self::Cpu => "daemon cpu budget",
         }
@@ -2334,7 +2795,13 @@ impl PassLimits {
         if self.cpu.exhausted(now) {
             return Some(PassStop::Cpu);
         }
-        (now >= self.prescan_deadline).then_some(PassStop::PrescanPhase)
+        if now >= self.prescan_deadline {
+            return Some(PassStop::PrescanPhase);
+        }
+        self.cpu
+            .allowance_secs()
+            .is_some_and(|allowance| self.cpu.spent_secs() >= allowance * PRESCAN_CPU_SHARE)
+            .then_some(PassStop::PrescanCpuShare)
     }
 
     /// Whether the general walk must stop now, and which limit says so.
@@ -2351,6 +2818,15 @@ impl PassLimits {
         self.scan_start.elapsed()
     }
 }
+
+/// Share of a pass's CPU allowance the priority pre-scan may spend before the
+/// general walk takes over.
+///
+/// Since the CPU budget binds at Critical (41ad7f5), a pre-scan that probes
+/// each nominee's tree spent the whole allowance on its own: on ts2
+/// (2026-10-21) every pass after the restart's sixth stopped inside it after
+/// 38-1,041 of /data/tmp's 23,301 top-level entries, and the walk never ran.
+const PRESCAN_CPU_SHARE: f64 = 0.5;
 
 /// Shortest gap between two operator-facing `SBH-2007` budget warnings.
 const BUDGET_WARNING_INTERVAL: Duration = Duration::from_mins(5);
@@ -2570,9 +3046,13 @@ struct StatusDumpCounters {
     window_deleted: u64,
     window_failed: u64,
     window_bytes_freed: u64,
+    window_freed_basis: FreedBasis,
+    window_bytes_freed_observed: Option<u64>,
     scans_total: u64,
     deletions_total: u64,
     bytes_freed_total: u64,
+    freed_basis_total: FreedBasis,
+    bytes_freed_observed_total: Option<u64>,
     errors_total: u64,
     dropped_log_events: u64,
 }
@@ -2713,11 +3193,15 @@ fn build_status_dump_payload(input: &StatusDumpPayloadInput<'_>) -> Value {
                 "deleted": counters.window_deleted,
                 "failed": counters.window_failed,
                 "bytes_freed": counters.window_bytes_freed,
+                "freed_basis": counters.window_freed_basis.label(),
+                "bytes_freed_observed": counters.window_bytes_freed_observed,
             },
             "total": {
                 "scans": counters.scans_total,
                 "deletions": counters.deletions_total,
                 "bytes_freed": counters.bytes_freed_total,
+                "freed_basis": counters.freed_basis_total.label(),
+                "bytes_freed_observed": counters.bytes_freed_observed_total,
                 "errors": counters.errors_total,
                 "dropped_log_events": counters.dropped_log_events,
             },
@@ -2732,9 +3216,16 @@ fn build_status_dump_payload(input: &StatusDumpPayloadInput<'_>) -> Value {
 
 impl MonitoringDaemon {
     /// Build and initialize the daemon from configuration.
-    #[allow(clippy::too_many_lines)]
     pub fn init(config: Config, args: &DaemonArgs) -> Result<Self> {
-        let platform = detect_platform()?;
+        Self::init_with_platform(config, args, detect_platform()?)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn init_with_platform(
+        config: Config,
+        args: &DaemonArgs,
+        platform: Arc<dyn Platform>,
+    ) -> Result<Self> {
         let start_time = Instant::now();
 
         // 0. Liveness lock. Taken before anything else so a second daemon on
@@ -2798,7 +3289,7 @@ impl MonitoringDaemon {
             &platform,
             Some(config.paths.ballast_dir.as_path()),
         )?;
-        ballast_coordinator.set_provision_floor(config.ballast_provision_floor_pct());
+        ballast_coordinator.set_provision_floor_rule(config.ballast_provision_floor());
         // bd-rc-master-ajg1.7.4: the daemon's own files against the mounts
         // it reclaims. Not a refusal (single-volume hosts are common), but
         // said once at startup, carried in state.json, and acted on while
@@ -2867,6 +3358,15 @@ impl MonitoringDaemon {
                 inv.ballast_dir.display(),
                 if inv.skipped { " (skipped)" } else { "" }
             );
+            for dir in &inv.unreachable_reserve {
+                eprintln!(
+                    "[SBH-DAEMON] ballast reserve at {} is read-only to this service and \
+                     cannot be released for {} (systemd ProtectSystem=strict without it in \
+                     ReadWritePaths=): grant it there, or release those files by hand",
+                    dir.display(),
+                    inv.mount_point.display()
+                );
+            }
         }
 
         // 7. Release controller.
@@ -2914,6 +3414,8 @@ impl MonitoringDaemon {
             config.scoring.batch_risk_budget_by_level,
             config.scoring.false_positive_loss,
         );
+        let compress_tier =
+            CompressTier::with_first(Arc::clone(&shared_executor_config.compression_first));
 
         let shared_scoring_config = Arc::new(RwLock::new(config.scoring.clone()));
         let shared_scanner_config = Arc::new(RwLock::new(config.scanner.clone()));
@@ -2989,12 +3491,15 @@ impl MonitoringDaemon {
             policy_transitions_seen: 0,
             floor_limited: HashSet::new(),
             reclaim_alerts: AlertThrottle::default(),
+            uncovered_levels: HashMap::new(),
+            uncovered_checked_at: None,
             catalog_root_cache: HashMap::new(),
             catalog_epochs: HashMap::new(),
             emergency_mounts: HashSet::new(),
             mount_rates: HashMap::new(),
             logging_placement,
             logging_level_logged: None,
+            logging_ram_checked_at: None,
             special_alerts: AlertThrottle::default(),
             last_maintenance_scan: None,
             last_quarantine_sweep: None,
@@ -3027,10 +3532,13 @@ impl MonitoringDaemon {
             last_swap_thrash_warning: None,
             swap_thrash_active: false,
             last_scan_channel_warn: None,
+            forced_scan_pending_since: None,
             scan_channel_warn_suppressed: 0,
             last_device_affinity_warn: None,
             attribution_reported: HashMap::new(),
             attribution_pressured_since: HashMap::new(),
+            compress_tier,
+            target_tier: TargetTier::default(),
             last_summary_report: Instant::now(),
             summary_scans: 0,
             summary_scan_timeouts: 0,
@@ -3038,6 +3546,8 @@ impl MonitoringDaemon {
             summary_deleted: 0,
             summary_failed: 0,
             summary_bytes_freed: 0,
+            summary_freed_basis: FreedBasis::Observed,
+            summary_bytes_freed_observed: Some(0),
             last_full_disk_access_check: None,
             last_full_disk_access_state: None,
             full_disk_access_granted_logged: false,
@@ -3097,31 +3607,61 @@ impl MonitoringDaemon {
 
     /// bd-rc-master-ajg1.7.4: when the mount carrying the daemon's own files
     /// is a reclaim target, its level drives the JSONL mirror. Orange or
-    /// worse turns the RAM mirror on; Yellow or better turns it off. One log
-    /// line per level change, never per tick.
+    /// worse turns the RAM mirror on, unless that RAM is itself short
+    /// (bd-ffjj); Yellow or better turns it off. While pressured, the RAM
+    /// headroom is re-checked every [`LOGGING_RAM_RECHECK`], so a mirror stops
+    /// when swap fills and a refused one starts once RAM recovers. One log
+    /// line per level or mirror change, never per tick.
     fn note_logging_mount_level(&mut self, mount: &Path, level: PressureLevel) {
         if !self.logging_placement.on_monitored_fs
             || mount.to_string_lossy() != self.logging_placement.device
         {
             return;
         }
-        if self.logging_level_logged == Some(level) {
-            return;
-        }
-        self.logging_level_logged = Some(level);
         let pressured = matches!(
             level,
             PressureLevel::Orange | PressureLevel::Red | PressureLevel::Critical
         );
+        let level_changed = self.logging_level_logged != Some(level);
+        let now = Instant::now();
+        if !level_changed && !logging_ram_recheck_due(pressured, self.logging_ram_checked_at, now) {
+            return;
+        }
+        self.logging_level_logged = Some(level);
+        let refusal = if pressured {
+            self.logging_ram_checked_at = Some(now);
+            // A margin to start, the plain floors to keep: no flapping at a
+            // threshold (bd-sz85).
+            let headroom = if self.logging_placement.mirroring {
+                crate::monitor::ram_scratch::RamLogHeadroom::Keep
+            } else {
+                crate::monitor::ram_scratch::RamLogHeadroom::Start
+            };
+            crate::monitor::ram_scratch::ram_log_mirror_refusal_for(
+                self.platform.as_ref(),
+                &crate::logger::jsonl::ram_fallback_path(),
+                headroom,
+            )
+        } else {
+            self.logging_ram_checked_at = None;
+            None
+        };
+        let mirror = pressured && refusal.is_none();
+        let mirror_changed = mirror != self.logging_placement.mirroring;
+        if !level_changed && !mirror_changed {
+            return;
+        }
         let level_name = format!("{level:?}").to_lowercase();
         self.logging_placement.level = Some(level_name.clone());
-        if pressured != self.logging_placement.mirroring {
-            self.logging_placement.mirroring = pressured;
-            self.logger_handle.mirror_jsonl(pressured);
+        if mirror_changed {
+            self.logging_placement.mirroring = mirror;
+            self.logger_handle.mirror_jsonl(mirror);
         }
         eprintln!(
-            "[SBH-DAEMON] logging.on_monitored_fs=true device={} level={level_name} mirror_to_ram={}",
-            self.logging_placement.device, self.logging_placement.mirroring
+            "[SBH-DAEMON] logging.on_monitored_fs=true device={} level={level_name} mirror_to_ram={}{}",
+            self.logging_placement.device,
+            self.logging_placement.mirroring,
+            refusal.map_or_else(String::new, |reason| format!(" (not mirroring: {reason})"))
         );
         self.self_monitor
             .set_logging_snapshot(self.logging_placement.clone());
@@ -3166,14 +3706,9 @@ impl MonitoringDaemon {
     fn start_memory_pressure_subscription(
         &self,
         tx: Sender<MemoryPressureEvent>,
+        rx: &Receiver<MemoryPressureEvent>,
     ) -> Option<crate::platform::types::SubscriptionHandle> {
-        let callback = Box::new(move |pressure: MemoryPressure| {
-            let event = MemoryPressureEvent {
-                pressure,
-                received_at: Instant::now(),
-            };
-            let _ = tx.try_send(event);
-        });
+        let callback = memory_pressure_event_callback(tx, rx.clone());
 
         match self.platform.subscribe_memory_pressure(callback) {
             Ok(handle) => {
@@ -3262,6 +3797,7 @@ impl MonitoringDaemon {
             BehaviorUpdate::Deferred {
                 direction,
                 remaining,
+                repeated: false,
             } => {
                 let message = format!(
                     "behavior mode transition deferred source={source} direction={direction:?} \
@@ -3270,7 +3806,7 @@ impl MonitoringDaemon {
                 );
                 eprintln!("[SBH-DAEMON] {message}");
             }
-            BehaviorUpdate::Unchanged => {}
+            BehaviorUpdate::Deferred { repeated: true, .. } | BehaviorUpdate::Unchanged => {}
         }
     }
 
@@ -3415,7 +3951,18 @@ impl MonitoringDaemon {
                     }
                     break;
                 }
-                default(wait) => {}
+                // No new event will come for a deferred target; retry it
+                // so it applies when its hysteresis window ends.
+                default(wait) => {
+                    if self.behavior_state.has_pending_target() {
+                        self.update_behavior_mode(
+                            self.behavior_state.latest_memory_level(),
+                            disk_level,
+                            "deferred",
+                            Duration::ZERO,
+                        );
+                    }
+                }
             }
         }
     }
@@ -3501,8 +4048,10 @@ impl MonitoringDaemon {
         }
         let mut pools = Vec::new();
         for mount in mounts {
+            let pool_mount = self.pool_mount(&mount);
             if let Some(pool) = self.ballast_coordinator.pool_for_mount(&mount) {
-                self.release_controller.bind_pool(&mount, &pool.ballast_dir);
+                self.release_controller
+                    .bind_pool(&pool_mount, &pool.ballast_dir);
             }
             // Operator-driven changes are logged like the daemon's own so the
             // Timeline and `sbh stats` see them; the release controller is
@@ -3512,7 +4061,7 @@ impl MonitoringDaemon {
                     match self.ballast_coordinator.release_for_mount(&mount, *count) {
                         Ok(Some(report)) => {
                             self.release_controller
-                                .on_released(&mount, report.files_released);
+                                .on_released(&pool_mount, report.files_released);
                             self.log_control_ballast_release(&mount, &report.released);
                             Ok(json!({
                                 "mount": mount,
@@ -3533,7 +4082,7 @@ impl MonitoringDaemon {
                         Ok(Some(report)) => {
                             if report.files_created > 0 {
                                 self.release_controller
-                                    .on_replenished(&mount, report.files_created);
+                                    .on_replenished(&pool_mount, report.files_created);
                             }
                             for (path, size_bytes) in &report.created {
                                 self.logger_handle.send(ActivityEvent::BallastReplenished {
@@ -3630,9 +4179,13 @@ impl MonitoringDaemon {
                 window_deleted: self.summary_deleted,
                 window_failed: self.summary_failed,
                 window_bytes_freed: self.summary_bytes_freed,
+                window_freed_basis: self.summary_freed_basis,
+                window_bytes_freed_observed: self.summary_bytes_freed_observed,
                 scans_total: self.self_monitor.scan_count,
                 deletions_total: self.self_monitor.deletions_total,
                 bytes_freed_total: self.self_monitor.bytes_freed_total,
+                freed_basis_total: self.self_monitor.freed_basis,
+                bytes_freed_observed_total: self.self_monitor.bytes_freed_observed_total,
                 errors_total: self.self_monitor.errors_total,
                 dropped_log_events: self.logger_handle.dropped_events(),
             },
@@ -3677,11 +4230,18 @@ impl MonitoringDaemon {
             .map(|pool| {
                 // Bind/reset the physical observation before serializing its
                 // efficiency, so a replacement cannot inherit the old eta.
-                let release_history = self.release_controller.pool_history(
-                    &pool.mount_point,
-                    &pool.ballast_dir,
-                    pool.files_available,
-                );
+                // A skipped row (an alias or excluded mount) names no pool of
+                // its own; binding it would reset the history kept under the
+                // pool's mount.
+                let release_history = if pool.skipped {
+                    None
+                } else {
+                    self.release_controller.pool_history(
+                        &pool.mount_point,
+                        &pool.ballast_dir,
+                        pool.files_available,
+                    )
+                };
                 super::self_monitor::BallastPoolState {
                     mount: pool.mount_point.display().to_string(),
                     ballast_dir: pool.ballast_dir.display().to_string(),
@@ -3884,8 +4444,17 @@ impl MonitoringDaemon {
                 volumes_monitored: self.ballast_coordinator.pool_count(),
             });
 
-        // Provision ballast files (idempotent).
-        self.provision_ballast()?;
+        // Provision ballast files (idempotent). This precedes READY=1, and on
+        // a fresh install it writes every pool (random data on CoW
+        // filesystems) at disk speed: 20 GiB took 45 s in a systemd container
+        // and the unit was killed at TimeoutStartSec=30, then restarted.
+        with_startup_extension(
+            self.platform.service_manager(),
+            "provisioning ballast",
+            StartupExtension::DEFAULT,
+            &self.signal_handler.shutdown_token(),
+            || self.provision_ballast(),
+        )?;
 
         // Initial pressure check.
         let initial_response = self.check_pressure()?;
@@ -3904,7 +4473,7 @@ impl MonitoringDaemon {
             bounded::<MemoryPressureEvent>(MEMORY_PRESSURE_CHANNEL_CAP);
         self.seed_memory_pressure_behavior(initial_response.level);
         let _memory_pressure_subscription =
-            self.start_memory_pressure_subscription(memory_pressure_tx);
+            self.start_memory_pressure_subscription(memory_pressure_tx, &memory_pressure_rx);
 
         // Create inter-thread channels.
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
@@ -4016,7 +4585,7 @@ impl MonitoringDaemon {
             }
 
             self.update_behavior_mode(
-                self.behavior_state.memory_level,
+                self.behavior_state.latest_memory_level(),
                 response.level,
                 "disk_pressure",
                 Duration::ZERO,
@@ -4049,7 +4618,7 @@ impl MonitoringDaemon {
 
             // 5. Handle pressure response per mount; the tick follows the
             //    tightest mount sbh is actually working on.
-            let requested_tick = self.handle_pressure(&response, &scan_tx, &scan_rx);
+            let requested_tick = self.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
             self.watchdog.maybe_notify("pressure handled");
 
             // 5b. Policy mode changes since the last tick (the engine runs
@@ -4076,6 +4645,8 @@ impl MonitoringDaemon {
                         duration,
                         root_stats,
                         timed_out,
+                        pressure_level,
+                        background,
                     } => {
                         self.summary_scans += 1;
                         if timed_out {
@@ -4101,12 +4672,19 @@ impl MonitoringDaemon {
                         // A completed (not timed-out) pass with nothing found
                         // on a mount parks that mount's controller in Idle.
                         if !timed_out {
-                            self.note_scan_pass_per_mount(&root_stats, now);
+                            self.note_scan_pass_per_mount(
+                                &root_stats,
+                                pressure_level,
+                                background,
+                                now,
+                            );
                         }
                     }
                     WorkerReport::DeletionCompleted {
                         deleted,
                         bytes_freed,
+                        freed_basis,
+                        bytes_freed_observed,
                         failed,
                         recovery_paths,
                         failure_alarm,
@@ -4114,7 +4692,14 @@ impl MonitoringDaemon {
                         self.summary_deleted += deleted;
                         self.summary_failed += failed;
                         self.summary_bytes_freed += bytes_freed;
+                        self.summary_freed_basis = self.summary_freed_basis.combine(freed_basis);
+                        self.summary_bytes_freed_observed = self
+                            .summary_bytes_freed_observed
+                            .zip(bytes_freed_observed)
+                            .map(|(sum, bytes)| sum.saturating_add(bytes));
                         self.self_monitor.record_deletions(deleted, bytes_freed);
+                        self.self_monitor
+                            .record_freed_basis(freed_basis, bytes_freed_observed);
                         // One reaction cycle: poll, scan, then the reclaim
                         // that followed it; it sizes the burst windows.
                         if let Some((scan_completed_at, scan_duration)) =
@@ -4154,6 +4739,7 @@ impl MonitoringDaemon {
                                 &NotificationEvent::CleanupCompleted {
                                     items_deleted,
                                     bytes_freed,
+                                    freed_basis,
                                     mount: "various".to_string(),
                                 },
                             );
@@ -4166,9 +4752,30 @@ impl MonitoringDaemon {
             }
 
             // 9. Forced scan signal (SIGUSR1). Also wakes idle mounts next tick.
+            // A full scan queue defers it to the next tick instead of
+            // dropping it.
             if self.signal_handler.should_scan() {
-                self.trigger_forced_scan(&scan_tx, &response);
+                if self.forced_scan_pending_since.is_none()
+                    && !Self::trigger_forced_scan(
+                        &self.config.scanner.root_paths,
+                        &scan_tx,
+                        &response,
+                    )
+                {
+                    self.forced_scan_pending_since = Some(Instant::now());
+                    eprintln!(
+                        "[SBH-DAEMON] forced scan deferred (SIGUSR1): scan queue full, retrying every tick"
+                    );
+                }
                 self.wake_next_tick.forced_scan = true;
+            } else if let Some(since) = self.forced_scan_pending_since
+                && Self::trigger_forced_scan(&self.config.scanner.root_paths, &scan_tx, &response)
+            {
+                self.forced_scan_pending_since = None;
+                eprintln!(
+                    "[SBH-DAEMON] deferred forced scan queued after {:.1}s",
+                    since.elapsed().as_secs_f64()
+                );
             }
 
             // 10. Thread health check.
@@ -4279,13 +4886,17 @@ impl MonitoringDaemon {
                 let mode_str = self.policy_engine.lock().mode();
                 eprintln!(
                     "[SBH-SUMMARY] scans={} timeouts={} candidates={} deleted={} \
-                     failed={} freed={}B pressure={:?} guard={} mode={} rss={}MB uptime={}s",
+                     failed={} freed={}B freed_basis={} observed_freed={} pressure={:?} \
+                     guard={} mode={} rss={}MB uptime={}s",
                     self.summary_scans,
                     self.summary_scan_timeouts,
                     self.summary_candidates,
                     self.summary_deleted,
                     self.summary_failed,
                     self.summary_bytes_freed,
+                    self.summary_freed_basis.label(),
+                    self.summary_bytes_freed_observed
+                        .map_or_else(|| "unknown".to_string(), |bytes| format!("{bytes}B")),
                     response.level,
                     guard_str,
                     mode_str,
@@ -4298,6 +4909,8 @@ impl MonitoringDaemon {
                 self.summary_deleted = 0;
                 self.summary_failed = 0;
                 self.summary_bytes_freed = 0;
+                self.summary_freed_basis = FreedBasis::Observed;
+                self.summary_bytes_freed_observed = Some(0);
                 self.last_summary_report = Instant::now();
             }
 
@@ -4655,6 +5268,7 @@ impl MonitoringDaemon {
         response: &crate::monitor::pid::PressureResponse,
         scan_tx: &Sender<ScanRequest>,
         scan_rx: &Receiver<ScanRequest>,
+        del_tx: &Sender<DeletionBatch>,
     ) -> Duration {
         // Reset min_score to config default at the start of each tick;
         // PreemptiveCleanup may lower it below.
@@ -4686,6 +5300,7 @@ impl MonitoringDaemon {
         let cross_device_fallback = self.config.scanner.cross_devices && !root_paths.is_empty();
 
         let responses = std::mem::take(&mut self.mount_responses);
+        let mut pending_scans = Vec::new();
         let mut cadence = Vec::with_capacity(responses.len());
         let mut replenished_this_tick = false;
         let mut pressured_without_surface: Option<(PathBuf, PressureLevel)> = None;
@@ -4747,6 +5362,8 @@ impl MonitoringDaemon {
                 now,
             });
             cadence.push(controller.cadence(base_poll, tick.response.scan_interval));
+            let idle_with_nothing_to_reclaim = decision.state == MountState::Idle
+                && controller.idle_reason() == Some(IdleReason::NothingToReclaim);
             if let Some((from, to)) = decision.transition {
                 let message = format!(
                     "mount {} {from} -> {to} (level={:?} urgency={:.2} surface={} idle_reason={})",
@@ -4768,8 +5385,19 @@ impl MonitoringDaemon {
 
             // The replenish cooldown watches every tick, whatever the mount
             // is doing: an Orange excursion while reclaiming restarts it.
+            // A mount idle at Yellow with nothing left to reclaim counts as
+            // Green here (bd-7spb): after a release a large volume can sit at
+            // Yellow for days, and a Green-only gate never rebuilt its
+            // reserve. Provisioning still keeps free space above the Orange
+            // floor, so a refill cannot push the mount into a release.
+            let replenish_level =
+                if tick.response.level == PressureLevel::Yellow && idle_with_nothing_to_reclaim {
+                    PressureLevel::Green
+                } else {
+                    tick.response.level
+                };
             self.release_controller
-                .observe_level(&mount, tick.response.level);
+                .observe_level(&mount, replenish_level);
 
             let mut files_released = 0;
             match decision.state {
@@ -4787,15 +5415,7 @@ impl MonitoringDaemon {
                             );
                             let previous = self.catalog_epochs.get(&mount).copied();
                             if catalog_epoch_due(previous, tick.response.level, now, rescan) {
-                                self.catalog_epochs
-                                    .insert(mount.clone(), (tick.response.level, now));
-                                self.send_catalog_scan_request(
-                                    scan_tx,
-                                    scan_rx,
-                                    &tick.response,
-                                    catalog,
-                                );
-                                self.last_tick_cleanup_ran = true;
+                                pending_scans.push((&tick.response, Vec::new(), Some(catalog)));
                             }
                         } else {
                             // A mount with no root of its own only gets here
@@ -4810,8 +5430,7 @@ impl MonitoringDaemon {
                             // level's; the scheduler only orders the roots
                             // (dirty first, then by hazard index).
                             let paths = self.voi_scheduler.rank_paths(&paths, now);
-                            self.send_scan_request(scan_tx, scan_rx, &tick.response, paths);
-                            self.last_tick_cleanup_ran = true;
+                            pending_scans.push((&tick.response, paths, None));
                         }
                     }
                 }
@@ -4833,6 +5452,12 @@ impl MonitoringDaemon {
                         {
                             pressured_without_surface = Some((mount.clone(), tick.response.level));
                         }
+                    }
+                }
+                MountState::Idle if replenish_level == PressureLevel::Green => {
+                    if !replenished_this_tick && self.maybe_replenish_pool(&mount, replenish_level)
+                    {
+                        replenished_this_tick = true;
                     }
                 }
                 MountState::Recovery | MountState::Idle => {}
@@ -4861,10 +5486,87 @@ impl MonitoringDaemon {
             }
         }
 
-        // Layer 7: the quarantine is already-decided space. Pressure drains
-        // it before any new deletion; calm ticks expire and cap it.
-        self.sweep_quarantines(&responses, &root_mounts, now);
-        self.resolve_regrets(now);
+        // Ballast has already had first priority. Refresh existing holds even
+        // when compression is disabled or stopping, so live emergencies also
+        // release older batches scored at a lower pressure level.
+        let mount_levels: HashMap<PathBuf, PressureLevel> = self
+            .mount_controllers
+            .iter()
+            .map(|(mount, controller)| (mount.clone(), controller.level()))
+            .collect();
+        self.shared_executor_config
+            .compression_first
+            .update_levels(&mount_levels);
+
+        // Root probes for a new compression pass can block in native I/O.
+        // Drain and enqueue emergency work before those probes, including
+        // when the operator configured compression to start at Red/Critical.
+        // Both sweep phases share the same maintenance cadence decision.
+        let sweep_due = self.quarantine_sweep_due(now);
+        let attempted_emergency_sweep = self.sweep_quarantine_entries(
+            responses
+                .iter()
+                .filter(|tick| tick.response.level >= PressureLevel::Red),
+            &root_mounts,
+            sweep_due,
+        );
+        let (emergency_scans, pending_scans): (Vec<_>, Vec<_>) = pending_scans
+            .into_iter()
+            .partition(|(response, _, _)| response.level >= PressureLevel::Red);
+        for (response, paths, catalog) in emergency_scans {
+            if let Some(catalog) = catalog {
+                self.catalog_epochs
+                    .insert(response.causing_mount.clone(), (response.level, now));
+                self.send_catalog_scan_request(scan_tx, scan_rx, response, catalog);
+            } else {
+                self.send_scan_request(scan_tx, scan_rx, response, paths);
+            }
+            self.last_tick_cleanup_ran = true;
+        }
+
+        // Publish Yellow/Orange holds before dispatching their cleanup. The
+        // executor shares these holds, including for already queued work.
+        if compress_tier_may_run(&self.config, self.policy_engine.lock().mode()) {
+            self.compress_tier.tick(
+                now,
+                &self.config,
+                &self.platform,
+                &mount_levels,
+                &self.logger_handle,
+            );
+        } else {
+            self.compress_tier.stop_running_pass();
+        }
+
+        self.sweep_quarantines(
+            responses
+                .iter()
+                .filter(|tick| tick.response.level < PressureLevel::Red),
+            &root_mounts,
+            now,
+        );
+        if sweep_due && attempted_emergency_sweep {
+            self.last_quarantine_sweep = Some(now);
+        }
+        for (response, paths, catalog) in pending_scans {
+            if self.shared_executor_config.compression_first.defers_mount(
+                &response.causing_mount,
+                response.level,
+                Instant::now(),
+            ) {
+                continue;
+            }
+            if let Some(catalog) = catalog {
+                // A held scan has not run. Leave its epoch due until dispatch.
+                self.catalog_epochs
+                    .insert(response.causing_mount.clone(), (response.level, now));
+                self.send_catalog_scan_request(scan_tx, scan_rx, response, catalog);
+            } else {
+                self.send_scan_request(scan_tx, scan_rx, response, paths);
+            }
+            self.last_tick_cleanup_ran = true;
+        }
+        self.resolve_regrets();
 
         // Green maintenance (Q6): once per maintenance interval, a routine
         // pass over the roots the hazard-driven scheduler picks within its
@@ -4998,8 +5700,38 @@ impl MonitoringDaemon {
                     .send(ActivityEvent::Info { message: msg });
             }
         }
+        self.refresh_uncovered_levels(now);
+        for (mount, level) in &self.uncovered_levels {
+            if *level != PressureLevel::Green {
+                unprotected_mounts.insert(mount.clone(), *level);
+            }
+        }
         self.emit_reclaim_unavailable(&unprotected_mounts, now);
         self.report_unreclaimable_growth(now);
+        if !self.config.scanner.target_only_roots.is_empty() {
+            let mounts: HashMap<PathBuf, (PressureLevel, f64)> = self
+                .mount_controllers
+                .iter()
+                .filter(|(mount, controller)| {
+                    !self.shared_executor_config.compression_first.defers_mount(
+                        mount,
+                        controller.level(),
+                        Instant::now(),
+                    )
+                })
+                .map(|(mount, controller)| {
+                    (mount.clone(), (controller.level(), controller.urgency()))
+                })
+                .collect();
+            self.target_tier.tick(
+                now,
+                &self.config,
+                &self.platform,
+                &mounts,
+                del_tx,
+                &self.logger_handle,
+            );
+        }
 
         global_tick(cadence, base_poll)
     }
@@ -5074,6 +5806,53 @@ impl MonitoringDaemon {
     /// reclaim surface, repeated at the special-location alert interval,
     /// escalated at once when the level rises, and cleared (logged once)
     /// when the mount recovers or gains a surface.
+    /// Re-measure the volumes no scanner root covers (bounded and cached; see
+    /// `coverage`). Linux only: macOS APFS volumes share their container's
+    /// free space, so every system volume would echo the Data volume's level.
+    fn refresh_uncovered_levels(&mut self, now: Instant) {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let first = self.uncovered_checked_at.is_none();
+        if self
+            .uncovered_checked_at
+            .is_some_and(|at| now.duration_since(at) < UNCOVERED_REFRESH_INTERVAL)
+        {
+            return;
+        }
+        self.uncovered_checked_at = Some(now);
+        let Ok(mounts) = self.platform.mount_points() else {
+            return;
+        };
+        let monitored: HashSet<PathBuf> = self
+            .mount_controllers
+            .keys()
+            .chain(self.mount_monitors.keys())
+            .cloned()
+            .collect();
+        let levels = uncovered_mount_levels(
+            &mounts,
+            &monitored,
+            |path| self.fs_collector.collect(path).ok(),
+            &self.config.pressure,
+        );
+        self.uncovered_levels = levels;
+        if first && !self.uncovered_levels.is_empty() {
+            let mut listed: Vec<String> = self
+                .uncovered_levels
+                .keys()
+                .map(|mount| mount.display().to_string())
+                .collect();
+            listed.sort();
+            let message = format!(
+                "no scanner root covers {}: sbh alerts when they fill but cannot reclaim there",
+                listed.join(", ")
+            );
+            eprintln!("[SBH-DAEMON] {message}");
+            self.logger_handle.send(ActivityEvent::Info { message });
+        }
+    }
+
     fn emit_reclaim_unavailable(
         &mut self,
         unprotected: &HashMap<PathBuf, PressureLevel>,
@@ -5085,7 +5864,12 @@ impl MonitoringDaemon {
                 .alert_interval_minutes
                 .saturating_mul(60),
         );
-        let mounts: Vec<PathBuf> = self.mount_controllers.keys().cloned().collect();
+        let mounts: Vec<PathBuf> = self
+            .mount_controllers
+            .keys()
+            .chain(self.uncovered_levels.keys())
+            .cloned()
+            .collect();
         for mount in mounts {
             let level = unprotected.get(&mount).copied();
             let severity = match level {
@@ -5154,8 +5938,10 @@ impl MonitoringDaemon {
         mount: &Path,
         response: &crate::monitor::pid::PressureResponse,
     ) {
+        let pool_mount = self.pool_mount(mount);
         if let Some(pool) = self.ballast_coordinator.pool_for_mount(mount) {
-            self.release_controller.bind_pool(mount, &pool.ballast_dir);
+            self.release_controller
+                .bind_pool(&pool_mount, &pool.ballast_dir);
         }
         let fs_type = self
             .fs_collector
@@ -5187,7 +5973,7 @@ impl MonitoringDaemon {
         {
             released = report.files_released;
             self.release_controller
-                .on_released(mount, report.files_released);
+                .on_released(&pool_mount, report.files_released);
             self.log_ballast_releases(&report.released, response);
         }
 
@@ -5221,7 +6007,13 @@ impl MonitoringDaemon {
     /// Feed a completed scan pass to the per-mount controllers: a mount whose
     /// roots all came back empty, with nothing left to release, goes idle
     /// with an exponential rescan backoff.
-    fn note_scan_pass_per_mount(&mut self, root_stats: &[RootScanResult], now: Instant) {
+    fn note_scan_pass_per_mount(
+        &mut self,
+        root_stats: &[RootScanResult],
+        pressure_level: PressureLevel,
+        background: bool,
+        now: Instant,
+    ) {
         let mut found_by_mount: HashMap<PathBuf, usize> = HashMap::new();
         for stat in root_stats {
             let Ok(stats) = self.fs_collector.collect(&stat.path) else {
@@ -5237,7 +6029,9 @@ impl MonitoringDaemon {
             let Some(controller) = self.mount_controllers.get_mut(&mount) else {
                 continue;
             };
-            if let Some((from, to)) = controller.note_pass(found, releasable, now) {
+            if let Some((from, to)) =
+                controller.note_pass_at_level(pressure_level, background, found, releasable, now)
+            {
                 let message = format!(
                     "mount {} {from} -> {to} (empty_passes={} rescan_in={}s idle_reason={})",
                     mount.display(),
@@ -5253,22 +6047,34 @@ impl MonitoringDaemon {
         }
     }
 
+    /// The mount whose pool serves `mount` (itself unless it is a
+    /// same-filesystem alias). Release history, cooldowns and the floor flag
+    /// are kept under this key, which is also what the state file saves.
+    fn pool_mount(&self, mount: &Path) -> PathBuf {
+        self.ballast_coordinator
+            .pool_for_mount(mount)
+            .map_or_else(|| mount.to_path_buf(), |pool| pool.mount_point.clone())
+    }
+
     /// Replenish one released ballast file on `mount` if its pool is short and
     /// the release controller's cooldown allows it. Returns whether a file was
     /// created.
     fn maybe_replenish_pool(&mut self, mount: &Path, level: PressureLevel) -> bool {
+        // An alias mount's inventory row is skipped and names its keeper's
+        // default directory: pace the pool under its own mount instead.
+        let pool_mount = self.pool_mount(mount);
         let Some(pool_info) = self
             .ballast_coordinator
             .inventory()
             .into_iter()
-            .find(|item| item.mount_point == mount)
+            .find(|item| item.mount_point == pool_mount && !item.skipped)
         else {
             return false;
         };
         self.release_controller
-            .bind_pool(mount, &pool_info.ballast_dir);
+            .bind_pool(&pool_mount, &pool_info.ballast_dir);
         if !self.release_controller.is_ready_for_replenish(
-            mount,
+            &pool_mount,
             level,
             pool_info.files_available,
             pool_info.files_total,
@@ -5284,9 +6090,9 @@ impl MonitoringDaemon {
             return false;
         };
         if report.skipped_for_floor > 0 {
-            self.floor_limited.insert(mount.to_path_buf());
+            self.floor_limited.insert(pool_mount.clone());
         } else if report.files_created > 0 {
-            self.floor_limited.remove(mount);
+            self.floor_limited.remove(&pool_mount);
         }
         if report.files_created == 0 {
             return false;
@@ -5298,7 +6104,7 @@ impl MonitoringDaemon {
             });
         }
         self.release_controller
-            .on_replenished(mount, report.files_created);
+            .on_replenished(&pool_mount, report.files_created);
         self.notification_manager
             .notify(&NotificationEvent::BallastReplenished {
                 mount: mount.to_string_lossy().to_string(),
@@ -5318,10 +6124,15 @@ impl MonitoringDaemon {
         };
         let available = pool.available_count();
         let expected = pool.expected_count();
-        self.release_controller.bind_pool(mount, &pool.ballast_dir);
-        let count = self
-            .release_controller
-            .files_to_release(mount, response, available, expected);
+        // A same-filesystem alias mount shares its keeper's pool; release
+        // history lives under the pool's own mount, the key it is saved and
+        // restored under across restarts.
+        let pool_mount = pool.mount_point.clone();
+        self.release_controller
+            .bind_pool(&pool_mount, &pool.ballast_dir);
+        let count =
+            self.release_controller
+                .files_to_release(&pool_mount, response, available, expected);
 
         let mut released = 0;
         if count > 0 {
@@ -5336,9 +6147,9 @@ impl MonitoringDaemon {
 
                 released = report.files_released;
                 self.release_controller
-                    .on_released(mount, report.files_released);
+                    .on_released(&pool_mount, report.files_released);
                 self.release_controller.record_release(
-                    mount,
+                    &pool_mount,
                     report.bytes_freed,
                     free_before,
                     Instant::now(),
@@ -5524,14 +6335,15 @@ impl MonitoringDaemon {
         }
     }
 
+    /// Queue the SIGUSR1 scan. `false` means the scan queue is full and the
+    /// caller retries next tick; a disconnected queue is logged and given up.
     fn trigger_forced_scan(
-        &self,
+        root_paths: &[PathBuf],
         scan_tx: &Sender<ScanRequest>,
         response: &crate::monitor::pid::PressureResponse,
-    ) {
-        eprintln!("[SBH-DAEMON] forced scan triggered (SIGUSR1)");
+    ) -> bool {
         let request = ScanRequest {
-            paths: self.config.scanner.root_paths.clone(),
+            paths: root_paths.to_vec(),
             urgency: response.urgency.max(0.5), // at least moderate urgency for forced scans
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
@@ -5542,8 +6354,18 @@ impl MonitoringDaemon {
             maintenance: false,
             target_bytes: None,
         };
-        // For forced scans, block briefly to ensure delivery.
-        let _ = scan_tx.send_timeout(request, Duration::from_millis(100));
+        // Block briefly: the scanner may be about to take the next request.
+        match scan_tx.send_timeout(request, Duration::from_millis(100)) {
+            Ok(()) => {
+                eprintln!("[SBH-DAEMON] forced scan triggered (SIGUSR1)");
+                true
+            }
+            Err(SendTimeoutError::Timeout(_)) => false,
+            Err(SendTimeoutError::Disconnected(_)) => {
+                eprintln!("[SBH-DAEMON] forced scan dropped (SIGUSR1): scan channel disconnected");
+                true
+            }
+        }
     }
 
     fn check_predictive_warning(&mut self, response: &crate::monitor::pid::PressureResponse) {
@@ -5762,8 +6584,11 @@ impl MonitoringDaemon {
                 }
             }
 
+            let previous = self.last_special_notify.get(&location.path).copied();
             if assessment.alert == SpecialAlert::None {
-                self.last_special_notify.remove(&location.path);
+                if special_episode_over(previous, now, alert_interval) {
+                    self.last_special_notify.remove(&location.path);
+                }
                 continue;
             }
             {
@@ -5773,62 +6598,33 @@ impl MonitoringDaemon {
                     _ if urgency >= 0.75 => PressureLevel::Orange,
                     _ => PressureLevel::Yellow,
                 };
-                // Notify on a level change for this location; the same level
-                // does not re-fire (the condition has not changed).
-                let should_notify_special = self
-                    .last_special_notify
-                    .get(&location.path)
-                    .is_none_or(|(prev_level, _)| pressure_level != *prev_level);
-
-                if should_notify_special {
+                let (notify_from, notified) = special_episode_step(previous, pressure_level);
+                if let Some(from) = notify_from {
                     self.notification_manager
                         .notify(&NotificationEvent::PressureChanged {
-                            from: "Green".to_string(),
+                            from: format!("{from:?}"),
                             to: format!("{pressure_level:?}"),
                             mount: location.path.to_string_lossy().into_owned(),
                             free_pct: stats.free_pct(),
                         });
-                    self.last_special_notify
-                        .insert(location.path.clone(), (pressure_level, now));
                 }
+                self.last_special_notify
+                    .insert(location.path.clone(), (notified, now));
 
                 // Trigger root filesystem scan: special location pressure (e.g. /dev/shm
                 // full) indicates agent swarm activity that is likely also generating root
                 // filesystem artifacts. Proactively scan to clean up before root hits capacity.
+                //
+                // No ballast is released here. A disk-backed location's own mount
+                // releases on its own pressure level; releasing on this alert bypassed
+                // that gating and drained a reserve on every write burst (a macOS /tmp
+                // on the Data volume raised ~100 "filling fast" alerts a day). A RAM-backed
+                // location (/dev/shm) gains nothing from freeing disk ballast at all.
                 let max_delete_batch = match pressure_level {
                     PressureLevel::Red | PressureLevel::Critical => 100,
                     PressureLevel::Orange => 60,
                     _ => 40,
                 };
-
-                // Try immediate ballast release for the pressured mount.
-                // If that mount has no pool (common for /dev/shm tmpfs), fall back to the
-                // non-empty pool with highest releasable bytes to buy recovery time.
-                let release_mount = if self.ballast_coordinator.has_pool(&stats.mount_point) {
-                    Some(stats.mount_point.clone())
-                } else {
-                    self.ballast_coordinator
-                        .inventory()
-                        .into_iter()
-                        .filter(|item| !item.skipped && item.files_available > 0)
-                        .max_by_key(|item| item.releasable_bytes)
-                        .map(|item| item.mount_point)
-                };
-
-                if let Some(mount) = release_mount {
-                    let release_response = crate::monitor::pid::PressureResponse {
-                        level: pressure_level,
-                        urgency,
-                        scan_interval: Duration::from_secs(0),
-                        release_ballast_files: 0,
-                        max_delete_batch,
-                        fallback_active: false,
-                        causing_mount: mount.clone(),
-                        free_pct: stats.free_pct(),
-                        predicted_seconds: None,
-                    };
-                    let _ = self.release_ballast(&mount, &release_response);
-                }
 
                 let mut scan_paths =
                     special_location_scan_roots(&location.path, &self.config.scanner.root_paths);
@@ -5876,9 +6672,11 @@ impl MonitoringDaemon {
             );
             return Ok(());
         }
+        // A stop requested mid-provisioning ends it at the next file.
+        let shutdown = self.signal_handler.shutdown_token();
         let report = self
             .ballast_coordinator
-            .provision_all(self.platform.as_ref())?;
+            .provision_all_until(self.platform.as_ref(), &shutdown)?;
 
         let total_files = report.total_files_created();
         let total_bytes = report.total_bytes();
@@ -5968,13 +6766,16 @@ impl MonitoringDaemon {
                         Ok(coordinator) => {
                             self.ballast_coordinator = coordinator;
                             self.ballast_coordinator
-                                .set_provision_floor(new_config.ballast_provision_floor_pct());
+                                .set_provision_floor_rule(new_config.ballast_provision_floor());
                         }
                         Err(err) => {
                             eprintln!(
                                 "[SBH-DAEMON] ballast coordinator rediscovery failed during reload: {err}"
                             );
                             self.ballast_coordinator.update_config(&new_config.ballast);
+                            // The kept pools still follow the new thresholds.
+                            self.ballast_coordinator
+                                .set_provision_floor_rule(new_config.ballast_provision_floor());
                         }
                     }
 
@@ -6024,6 +6825,7 @@ impl MonitoringDaemon {
                     }
 
                     // Update shared configs for scanner thread.
+                    self.regret.update_config(&new_config);
                     *self.shared_scoring_config.write() = new_config.scoring.clone();
                     *self.shared_scanner_config.write() = new_config.scanner.clone();
 
@@ -6143,22 +6945,22 @@ impl MonitoringDaemon {
     /// Regret labels (Q4): resolve watched deletions against the filesystem
     /// and the process table, store each outcome, and feed the category
     /// calibrator the scanner reads before its next pass.
-    fn resolve_regrets(&self, now: Instant) {
+    fn resolve_regrets(&self) {
+        self.resolve_regrets_with_clock(Instant::now);
+    }
+
+    /// Sample time around each observation and again when its evidence is
+    /// applied. Ballast work, quarantine sweeps, and earlier observations
+    /// must not backdate a later sighting or its suspension deadline.
+    fn resolve_regrets_with_clock(&self, mut clock: impl FnMut() -> Instant) {
         let platform = Arc::clone(&self.platform);
-        let outcomes = self.regret.detector.lock().check(now, |watch| {
-            let recreated = std::fs::symlink_metadata(&watch.path).is_ok()
-                && EntryIdentity::of(&watch.path)
-                    .is_some_and(|identity| identity == watch.identity);
-            let parent_in_use = recreated
-                && watch
-                    .path
-                    .parent()
-                    .is_some_and(|parent| parent_in_use(platform.as_ref(), parent));
-            Sighting {
-                recreated,
-                parent_in_use,
-            }
-        });
+        let outcomes = self
+            .regret
+            .detector
+            .lock()
+            .check_with_clock(&mut clock, |watch| {
+                watch.observe(|parent| parent_in_use(platform.as_ref(), parent))
+            });
         if outcomes.is_empty() {
             return;
         }
@@ -6169,6 +6971,7 @@ impl MonitoringDaemon {
             outcomes
                 .iter()
                 .map(|outcome| {
+                    let now = clock();
                     calibrator.record(
                         &outcome.category,
                         certainty_from_name(&outcome.certainty),
@@ -6204,25 +7007,39 @@ impl MonitoringDaemon {
         }
     }
 
-    /// Layer 7 sweep. At Orange and above every quarantine on the pressured
-    /// mount is drained oldest-first, ahead of the scan the same tick
-    /// dispatches: that space was decided already and costs no scoring. On
-    /// calmer mounts, once per `QUARANTINE_SWEEP_INTERVAL`, expired entries
-    /// are removed and the store is capped at
-    /// `scanner.quarantine_max_bytes_pct` of the volume. The bytes still
-    /// held per mount feed `state.json`.
-    fn sweep_quarantines(
+    fn quarantine_sweep_due(&self, now: Instant) -> bool {
+        self.last_quarantine_sweep
+            .is_none_or(|last| now.saturating_duration_since(last) >= QUARANTINE_SWEEP_INTERVAL)
+    }
+
+    /// Layer 7 sweep, subject to live policy and lossless-reclaim holds.
+    /// At Orange and above, quarantine drains oldest-first before the scan
+    /// dispatched on that mount. On calmer mounts, once per maintenance
+    /// interval, expired entries are removed and the store is capped at
+    /// `scanner.quarantine_max_bytes_pct` of the volume. Held bytes feed
+    /// `state.json` even when cleanup is deferred.
+    fn sweep_quarantines<'a>(
         &mut self,
-        responses: &[MountTickResponse],
+        responses: impl IntoIterator<Item = &'a MountTickResponse>,
         root_mounts: &[(PathBuf, Option<PathBuf>)],
         now: Instant,
     ) {
-        let sweep_due = self
-            .last_quarantine_sweep
-            .is_none_or(|last| now.saturating_duration_since(last) >= QUARANTINE_SWEEP_INTERVAL);
+        let sweep_due = self.quarantine_sweep_due(now);
+        if self.sweep_quarantine_entries(responses, root_mounts, sweep_due) && sweep_due {
+            self.last_quarantine_sweep = Some(now);
+        }
+    }
+
+    fn sweep_quarantine_entries<'a>(
+        &mut self,
+        responses: impl IntoIterator<Item = &'a MountTickResponse>,
+        root_mounts: &[(PathBuf, Option<PathBuf>)],
+        sweep_due: bool,
+    ) -> bool {
         let now_unix = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
+        let mut attempted_sweep = false;
         for tick in responses {
             let mount = &tick.response.causing_mount;
             let level = tick.response.level;
@@ -6243,24 +7060,32 @@ impl MonitoringDaemon {
                     continue;
                 }
                 let store = QuarantineStore::under(root);
-                let outcome = if pressured {
-                    store.drain_all().map(|drained| ("pressure", drained))
+                // A prior quarantine decision does not authorize irreversible
+                // cleanup after the operator selects observe/dry-run or the
+                // policy falls back. Inventory stays available in those modes.
+                if self.config.scanner.dry_run
+                    || !self.policy_engine.lock().mode().allows_deletion()
+                    || self.shared_executor_config.compression_first.defers_mount(
+                        mount,
+                        level,
+                        Instant::now(),
+                    )
+                {
+                    if let Ok(bytes) = store.held_bytes() {
+                        held = held.saturating_add(bytes);
+                    }
+                    continue;
+                }
+                let mode = if pressured {
+                    QuarantineSweepMode::Pressure
                 } else {
-                    store.drain_expired(now_unix).and_then(|expired| {
-                        let capped = match cap_bytes {
-                            Some(cap) => store.enforce_cap(cap)?,
-                            None => QuarantineDrainOutcome::default(),
-                        };
-                        let why = if capped.entries > 0 {
-                            "size cap"
-                        } else {
-                            "ttl"
-                        };
-                        Ok((why, expired.merged(capped)))
-                    })
+                    QuarantineSweepMode::Maintenance { cap_bytes }
                 };
-                match outcome {
-                    Ok((why, drained)) => {
+                attempted_sweep = true;
+                match store.sweep(now_unix, mode) {
+                    Ok(swept) => {
+                        held = held.saturating_add(swept.held_bytes);
+                        let (why, drained) = (swept.reason, swept.drained);
                         if drained.entries > 0 {
                             let count = drained.entries;
                             let bytes = drained.bytes;
@@ -6297,13 +7122,10 @@ impl MonitoringDaemon {
                         );
                     }
                 }
-                held = held.saturating_add(store.held_bytes().unwrap_or(0));
             }
             self.quarantine_held.insert(mount.clone(), held);
         }
-        if sweep_due {
-            self.last_quarantine_sweep = Some(now);
-        }
+        attempted_sweep
     }
 
     fn spawn_executor_thread(
@@ -6373,6 +7195,7 @@ impl MonitoringDaemon {
 
         // 1. Broadcast cancellation, then drop channel senders to signal worker threads to exit.
         self.signal_handler.request_shutdown();
+        self.compress_tier.stop_running_pass();
         drop(scan_tx);
         drop(del_tx);
 
@@ -6470,11 +7293,18 @@ fn dispatch_top_candidates(
     // Neither a path under a dispatched tree nor one containing it: deleting
     // an ancestor would take a subtree rebuilt since its own deletion. The
     // ancestor waits for the next pass.
+    // A candidate that frees nothing is never chosen by the planner (once an
+    // empty mktemp target of a live build was: ts2 2026-10-15), so it is not
+    // dispatched either. Each still cost a policy evaluation, a plan and a
+    // decision_log row on every pass: on ts2 at Critical (2026-10-17) that was
+    // 3,479 empty bun-workspace node_modules and target dirs in 20 minutes,
+    // ~250,000 rows (~0.6 GB) a day kept for 30 days.
     scored.retain(|candidate| {
-        !dispatched
-            .paths
-            .iter()
-            .any(|sent| candidate.path.starts_with(sent) || sent.starts_with(&candidate.path))
+        candidate.size_bytes > 0
+            && !dispatched
+                .paths
+                .iter()
+                .any(|sent| candidate.path.starts_with(sent) || sent.starts_with(&candidate.path))
     });
     if scored.is_empty() {
         return true;
@@ -6501,6 +7331,7 @@ fn dispatch_top_candidates(
         pressure_level: request.pressure_level,
         urgency: request.urgency,
         target_bytes: request.target_bytes,
+        target_only_root: None,
     };
     let batch_len = batch.candidates.len();
     let batch_paths: Vec<PathBuf> = batch.candidates.iter().map(|c| c.path.clone()).collect();
@@ -6564,6 +7395,7 @@ fn persist_scanner_index_records(
     for record in records.drain(..) {
         index.upsert(record);
     }
+    index.evict_stale(SystemTime::now());
     if let Err(err) = index.save_checkpoint(scanner_index_path) {
         logger.send(ActivityEvent::Error {
             code: err.code().to_string(),
@@ -6647,6 +7479,16 @@ impl ReplayDrop {
     }
 }
 
+/// bd-1ouz: a daemon that cannot see every process (a user-scoped macOS
+/// daemon) cannot know what other users' processes hold, so every candidate's
+/// references are unknown, not absent, and scoring vetoes it: in v2, whose
+/// opaque candidates may skip the reference probe, as in v1.
+fn mark_visibility_gap(input: &mut crate::scanner::scoring::CandidateInput, gap: Option<&str>) {
+    if let Some(reason) = gap {
+        input.active_references.mark_incomplete(reason);
+    }
+}
+
 /// Re-examine one persisted index record with fresh evidence and return the
 /// candidate to dispatch, or why it must not be.
 ///
@@ -6666,6 +7508,7 @@ fn replay_indexed_record(
     protection: &mut ProtectionRegistry,
     sacred_paths: &[crate::platform::types::SacredPath],
     open_files: &HashSet<PathBuf>,
+    visibility_gap: Option<&str>,
     logger: &ActivityLoggerHandle,
 ) -> std::result::Result<CandidacyScore, ReplayDrop> {
     use crate::scanner::active_lease::{ActiveLeaseState, inspect_path};
@@ -6729,7 +7572,12 @@ fn replay_indexed_record(
             signals = record.structural_signals;
             opaque.classification
         }
-        None => registry.classify(path, signals),
+        // As the walk would classify it now (bd-10yj): a tree it only
+        // descends into or protects is not replayed on its name.
+        None => crate::scanner::walker::classify_dir_as_walked(registry, path, signals)
+            .ok_or_else(|| {
+                ReplayDrop::Vetoed("the walk declines it (opaque verdict)".to_string())
+            })?,
     };
     if classification.category == ArtifactCategory::Unknown {
         return Err(ReplayDrop::Vetoed(
@@ -6771,7 +7619,7 @@ fn replay_indexed_record(
     } else {
         record.size_estimate_bytes
     };
-    let input = CandidateInput {
+    let mut input = CandidateInput {
         path: path.clone(),
         size_bytes: size_estimate.max(allocated),
         age: adjusted_candidate_age(
@@ -6787,6 +7635,7 @@ fn replay_indexed_record(
         is_open: is_path_open_by_ancestor(path, open_files),
         excluded: false,
     };
+    mark_visibility_gap(&mut input, visibility_gap);
     let mut score = engine.score_candidate(&input, request.urgency);
     if !score.vetoed && score.decision.action == DecisionAction::Delete {
         let overlaps = protection::find_sacred_overlaps(path, sacred_paths)
@@ -6936,7 +7785,8 @@ impl ScanCursor {
     /// Update the cache after a scan pass.
     ///
     /// `visited_dirs` — all directories the walker emitted entries for.
-    /// `dirs_with_candidates` — directories that had at least one classified child.
+    /// `non_barren_dirs` — directories at or above a classified entry, or at
+    /// or above ground the pass left unseen (see [`mark_non_barren`]).
     /// `timed_out` — whether the scan hit its time/entry budget.
     ///
     /// Only caches barren dirs when the scan timed out (no point caching if the
@@ -6945,7 +7795,7 @@ impl ScanCursor {
     fn update(
         &mut self,
         visited_dirs: &HashSet<PathBuf>,
-        dirs_with_candidates: &HashSet<PathBuf>,
+        non_barren_dirs: &HashSet<PathBuf>,
         timed_out: bool,
     ) {
         if !timed_out {
@@ -6956,16 +7806,9 @@ impl ScanCursor {
 
         let now = Instant::now();
 
-        // Add newly discovered barren dirs.
-        for dir in visited_dirs {
-            if !dirs_with_candidates.contains(dir) {
-                self.barren_dirs.entry(dir.clone()).or_insert(now);
-            }
-        }
-
         // Remove dirs that turned out to have candidates (they may have been
         // cached as barren from a prior pass but gained artifacts since).
-        for dir in dirs_with_candidates {
+        for dir in non_barren_dirs {
             self.barren_dirs.remove(dir);
         }
 
@@ -6973,13 +7816,84 @@ impl ScanCursor {
         self.barren_dirs
             .retain(|_, ts| now.duration_since(*ts) < self.ttl);
 
-        // Cap size: if over limit, drop oldest entries.
-        if self.barren_dirs.len() > self.max_entries {
-            let mut entries: Vec<_> = self.barren_dirs.drain().collect();
-            entries.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
-            entries.truncate(self.max_entries);
-            self.barren_dirs = entries.into_iter().collect();
+        // Newly discovered barren dirs. They are newer than every cached one,
+        // so the cap keeps them first; take no more than fit. Copying every
+        // barren dir and truncating afterwards cloned ~450k paths per pass on
+        // a host whose passes stop at the entry budget, the daemon's largest
+        // allocation burst (ts2, 2026-10-18). A dir already cached keeps its
+        // older timestamp.
+        let fresh: Vec<&PathBuf> = visited_dirs
+            .iter()
+            .filter(|dir| !non_barren_dirs.contains(*dir) && !self.barren_dirs.contains_key(*dir))
+            .take(self.max_entries)
+            .collect();
+
+        // Cap size: the newest older entries fill whatever room is left.
+        let room = self.max_entries - fresh.len();
+        if self.barren_dirs.len() > room {
+            let mut older: Vec<_> = self.barren_dirs.drain().collect();
+            older.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+            older.truncate(room);
+            self.barren_dirs = older.into_iter().collect();
         }
+        for dir in fresh {
+            self.barren_dirs.insert(dir.clone(), now);
+        }
+    }
+}
+
+/// Record that `path` and every directory above it must not be cached as
+/// barren: `path` is a classified entry, or ground a budget-stopped pass left
+/// unseen ([`WalkStream::unfinished_after_cancel`]). Marking only a
+/// candidate's direct parent let a pass cache `/r/a` as barren for a
+/// candidate at `/r/a/b/target`, and the candidate directory itself; and a
+/// listed directory whose children were still queued at the stop was cached
+/// with them unseen. The next pass skipped all of them for 30 minutes
+/// (bd-y70k). Stops at the first ancestor already marked: its own ancestors
+/// were marked with it.
+fn mark_non_barren(non_barren_dirs: &mut HashSet<PathBuf>, path: &Path) {
+    for dir in path.ancestors() {
+        if dir.as_os_str().is_empty() || !non_barren_dirs.insert(dir.to_path_buf()) {
+            break;
+        }
+    }
+}
+
+/// How long a budget-stopped pass waits for its walker threads to stop
+/// before it gives up on knowing what they left unseen.
+const WALK_STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// How often an unchanged "maintenance keep" verdict for one path is repeated.
+const MAINTENANCE_KEEP_REPEAT: Duration = Duration::from_hours(1);
+/// Paths whose last keep line is remembered; past this, older ones are dropped.
+const MAINTENANCE_KEEP_TRACKED: usize = 65_536;
+
+/// Rate limit for the maintenance pass's "why was this kept" lines. The same
+/// entries recur on every pass: on ts1 (2026-10-15) that was 100,000 identical
+/// lines a day, 95% of sbh's journal, on a host at 95% disk. A path is logged
+/// when first seen, when its verdict changes, and otherwise hourly.
+#[derive(Default)]
+struct MaintenanceKeepLog {
+    logged: HashMap<PathBuf, (String, Instant)>,
+}
+
+impl MaintenanceKeepLog {
+    fn should_log(&mut self, path: &Path, verdict: String, now: Instant) -> bool {
+        if let Some((last, at)) = self.logged.get(path)
+            && *last == verdict
+            && now.saturating_duration_since(*at) < MAINTENANCE_KEEP_REPEAT
+        {
+            return false;
+        }
+        if self.logged.len() >= MAINTENANCE_KEEP_TRACKED {
+            self.logged
+                .retain(|_, (_, at)| now.saturating_duration_since(*at) < MAINTENANCE_KEEP_REPEAT);
+            if self.logged.len() >= MAINTENANCE_KEEP_TRACKED {
+                self.logged.clear();
+            }
+        }
+        self.logged.insert(path.to_path_buf(), (verdict, now));
+        true
     }
 }
 
@@ -7010,6 +7924,8 @@ fn scanner_thread_main(
 
     // Initialize pattern registry (default built-ins).
     let pattern_registry = ArtifactPatternRegistry::default();
+    let visibility_gap =
+        crate::scanner::walker::active_reference_visibility_warning(platform.as_ref());
 
     // Incremental scan cursor — persists across scan iterations to skip
     // barren directory subtrees that yielded no candidates on a prior pass.
@@ -7041,6 +7957,7 @@ fn scanner_thread_main(
     // avoid re-discovering and re-rejecting the same paths every 10 minutes
     // (previously caused thousands of ContainsGit log entries per hour).
     let mut known_git_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut maintenance_keeps = MaintenanceKeepLog::default();
     let mut last_scanner_engine_mode: Option<ScannerEngineMode> = None;
 
     // B6: inter-pass cooldown. When a pass dispatches nothing reclaimable,
@@ -7051,15 +7968,23 @@ fn scanner_thread_main(
     // stays pressured with nothing to reclaim, and resets on a productive pass.
     let mut last_empty_pass_at: Option<Instant> = None;
     let mut consecutive_empty_passes: u32 = 0;
+    // Timed-out empty passes since the last conclusive one (`record_empty_pass`).
+    let mut inconclusive_empty_passes: u32 = 0;
     // bd-8aeq: the executor's reclaim counter as it stood when the last
     // dispatching pass started. Confirmed at the next pass start: if the
     // counter has not moved, those dispatches reclaimed nothing (dry-run,
     // observe mode, every candidate dampened or failed) and the pass is paced
     // like an empty one instead of rescanning every tick.
     let mut unconfirmed_dispatch: Option<u64> = None;
+    // Whether the last confirmed dispatch reclaimed nothing (#36). Kept across
+    // requests: the request that notices arms the cooldown and is itself
+    // skipped, so the verdict must reach the pass that eventually runs.
+    let mut last_dispatch_reclaimed_nothing = false;
     // The level of the last completed pass: a rise since then is new
     // information and clears the pacing (`pressure_escalated`).
     let mut last_pass_level: Option<PressureLevel> = None;
+    // The highest level a recent pass found nothing at (`note_empty_pass_level`).
+    let mut empty_level_peak: Option<(PressureLevel, Instant)> = None;
 
     // #15: duty-cycle limiter. The empty-pass cooldown above only paces passes
     // that reclaimed nothing; a chronically-full host reclaims a trickle every
@@ -7111,11 +8036,32 @@ fn scanner_thread_main(
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
 
-        if let Some(reclaim_before) = unconfirmed_dispatch.take()
-            && executor_config.reclaim_events() == reclaim_before
-        {
-            consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
+        let mut dispatch_confirmed_empty = false;
+        if let Some(reclaim_before) = unconfirmed_dispatch.take() {
+            dispatch_confirmed_empty = executor_config.reclaim_events() == reclaim_before;
+            last_dispatch_reclaimed_nothing = dispatch_confirmed_empty;
+            if !dispatch_confirmed_empty {
+                // A confirmed reclaim ends the streak that earlier fruitless
+                // dispatches built; the empty passes that follow it start
+                // from the base interval again.
+                record_dispatching_pass(
+                    false,
+                    &mut consecutive_empty_passes,
+                    &mut inconclusive_empty_passes,
+                    &mut last_empty_pass_at,
+                );
+            }
+        }
+        if dispatch_confirmed_empty {
+            record_empty_pass(
+                &mut consecutive_empty_passes,
+                &mut inconclusive_empty_passes,
+                false,
+            );
             last_empty_pass_at = Some(Instant::now());
+            if let Some(level) = last_pass_level {
+                note_empty_pass_level(&mut empty_level_peak, level, Instant::now());
+            }
             eprintln!(
                 "[SBH-SCANNER] the last pass dispatched candidates but nothing was reclaimed (dry-run, observe, dampened or failed); pacing it as an empty pass (consecutive={consecutive_empty_passes})"
             );
@@ -7125,15 +8071,20 @@ fn scanner_thread_main(
         // pacing built up by routine empty passes on a calm mount (routine
         // maintenance on a healthy host saturates the backoff within hours)
         // must not hold the first Orange scan for the backed-off interval.
-        if pressure_escalated(last_pass_level, &request) && last_empty_pass_at.is_some() {
+        if pressure_escalated(last_pass_level, &request)
+            && last_empty_pass_at.is_some()
+            && !rise_already_scanned_empty(empty_level_peak, request.pressure_level, Instant::now())
+        {
             eprintln!(
                 "[SBH-SCANNER] pressure rose to {:?} since the last pass; empty-pass backoff reset (was consecutive={consecutive_empty_passes})",
                 request.pressure_level
             );
             last_empty_pass_at = None;
             consecutive_empty_passes = 0;
+            inconclusive_empty_passes = 0;
         }
         let request_level = request.pressure_level;
+        let request_background = request.maintenance || request_from_events;
 
         // B6: skip this pressure-driven pass if recent passes dispatched
         // nothing reclaimable and the (backed-off) cooldown has not elapsed.
@@ -7197,8 +8148,16 @@ fn scanner_thread_main(
         let mut scanner_event_dirty_roots = BTreeSet::new();
         let mut scanner_event_stats = EventSourceStats::default();
         let scanner_index_event_generation = if scanner_index_enabled {
-            let context =
-                ScannerIndexContext::from_roots_and_config(&request.paths, &current_scanner_config);
+            // Keyed on the configured roots, not this pass's: maintenance,
+            // per-mount and special-location passes each walk a different
+            // subset, and a per-pass key rebuilt the index on about half the
+            // passes on hz1 (2026-10-14), discarding every failure backoff, so
+            // a candidate the preflight always refuses was re-planned every
+            // pass. Replay is scoped to the pass's roots instead.
+            let context = ScannerIndexContext::from_roots_and_config(
+                &current_scanner_config.root_paths,
+                &current_scanner_config,
+            );
             let needs_load = scanner_index
                 .as_ref()
                 .is_none_or(|index| index.context() != &context);
@@ -7404,6 +8363,8 @@ fn scanner_thread_main(
                 duration: Duration::ZERO,
                 root_stats,
                 timed_out: false,
+                pressure_level: request.pressure_level,
+                background: request_background,
             });
             continue;
         }
@@ -7519,7 +8480,8 @@ fn scanner_thread_main(
             // classification and age) before it may be dispatched. Anything
             // the fresh evidence rejects is backed off in the index.
             let replay_now = SystemTime::now();
-            let records = index.ranked_records(replay_now, request.max_delete_batch);
+            let records =
+                index.ranked_records_within(&request.paths, replay_now, request.max_delete_batch);
             let index_generation = index.event_generation();
             let mut indexed_candidates: Vec<CandidacyScore> = Vec::with_capacity(records.len());
             let mut revetoed = 0usize;
@@ -7561,6 +8523,7 @@ fn scanner_thread_main(
                         &mut replay_protection,
                         &replay_sacred,
                         &replay_open_files,
+                        visibility_gap,
                         logger,
                     ) {
                         Ok(score) => {
@@ -7596,7 +8559,11 @@ fn scanner_thread_main(
                                 record.event_generation,
                                 drop.label()
                             );
-                            if drop != ReplayDrop::GenerationAdvanced {
+                            if matches!(drop, ReplayDrop::Missing | ReplayDrop::IdentityChanged) {
+                                // Deleted (often by this daemon) or replaced:
+                                // there is nothing left to back off.
+                                index.forget(record.identity);
+                            } else if drop != ReplayDrop::GenerationAdvanced {
                                 index.record_failure(
                                     record.identity,
                                     replay_now,
@@ -7666,6 +8633,8 @@ fn scanner_thread_main(
                         duration: Duration::ZERO,
                         root_stats,
                         timed_out: false,
+                        pressure_level: request.pressure_level,
+                        background: request_background,
                     });
                     if held_by_certainty > 0 {
                         logger.send(ActivityEvent::Info {
@@ -7933,8 +8902,17 @@ fn scanner_thread_main(
                         // nominated and left the dispatch to the walk).
                         let candidate_signals =
                             crate::scanner::walker::structural_signals_for_path(&candidate_path);
-                        let candidate_class =
-                            pattern_registry.classify(&candidate_path, candidate_signals);
+                        // As the walk would classify it (bd-10yj): the
+                        // walker's opaque verdict first, so a tree it only
+                        // descends into or protects is not nominated here on
+                        // its name (a plain `target` inside an hfdt store).
+                        let Some(candidate_class) = crate::scanner::walker::classify_dir_as_walked(
+                            &pattern_registry,
+                            &candidate_path,
+                            candidate_signals,
+                        ) else {
+                            continue;
+                        };
                         if candidate_class.category
                             == crate::scanner::patterns::ArtifactCategory::Unknown
                         {
@@ -7970,6 +8948,7 @@ fn scanner_thread_main(
                             is_open: false,
                             excluded: false,
                         };
+                        mark_visibility_gap(&mut input, visibility_gap);
                         let mut score = prescan_engine.score_candidate(&input, request.urgency);
                         // Nomination keeps the floor in the size factor; only a
                         // directory that would be deleted pays for a real size
@@ -7988,7 +8967,8 @@ fn scanner_thread_main(
                         });
                         if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
                             && !score.vetoed
-                            && active_reference_scan.should_probe(size)
+                            && active_reference_scan
+                                .should_probe_candidate(size, score.classification.category)
                         {
                             if has_active_reference_scan_budget(
                                 scan_deadline,
@@ -8243,6 +9223,8 @@ fn scanner_thread_main(
                 duration,
                 root_stats,
                 timed_out: true,
+                pressure_level: request.pressure_level,
+                background: request_background,
             });
             eprintln!(
                 "[SBH-SCANNER] scan complete: {prescan_entries} entries, \
@@ -8272,6 +9254,33 @@ fn scanner_thread_main(
                     process_cpu_micros,
                 ),
             });
+            // bd-os02: a pass cut short in the priority pre-scan is a
+            // timed-out pass like any other. Skipping the accounting below
+            // left the empty-pass cooldown unarmed and the duty cycle blind, so
+            // a large $TMPDIR, walked one ~4,000-entry cursor slice per pass,
+            // was rescanned every ~20 s at the CPU-budget ceiling for as long
+            // as anything under it changed (mac-studio: 36 of the daemon's 60
+            // CPU-minutes in 6.4 h, nothing to reclaim).
+            if dispatched_this_pass.count == 0 {
+                record_empty_pass(
+                    &mut consecutive_empty_passes,
+                    &mut inconclusive_empty_passes,
+                    true,
+                );
+                last_empty_pass_at = Some(Instant::now());
+                note_empty_pass_level(&mut empty_level_peak, request_level, Instant::now());
+            } else {
+                record_dispatching_pass(
+                    last_dispatch_reclaimed_nothing,
+                    &mut consecutive_empty_passes,
+                    &mut inconclusive_empty_passes,
+                    &mut last_empty_pass_at,
+                );
+                unconfirmed_dispatch = Some(reclaim_at_pass_start);
+            }
+            last_pass_duration = pass_started_at.elapsed();
+            last_pass_finished_at = Some(Instant::now());
+            last_pass_level = Some(request_level);
             continue;
         }
         if let Some(target_bytes) = v2_candidate_byte_target
@@ -8322,6 +9331,8 @@ fn scanner_thread_main(
                 duration,
                 root_stats,
                 timed_out: false,
+                pressure_level: request.pressure_level,
+                background: request_background,
             });
             if held_by_certainty > 0 {
                 logger.send(ActivityEvent::Info {
@@ -8331,7 +9342,18 @@ fn scanner_thread_main(
                     ),
                 });
             }
+            // The pre-scan alone met the byte target: a productive pass, which
+            // still owes the duty cycle its cost (bd-os02).
+            record_dispatching_pass(
+                last_dispatch_reclaimed_nothing,
+                &mut consecutive_empty_passes,
+                &mut inconclusive_empty_passes,
+                &mut last_empty_pass_at,
+            );
             unconfirmed_dispatch = Some(reclaim_at_pass_start);
+            last_pass_duration = pass_started_at.elapsed();
+            last_pass_finished_at = Some(Instant::now());
+            last_pass_level = Some(request_level);
             continue;
         }
 
@@ -8374,11 +9396,15 @@ fn scanner_thread_main(
         // Catalog-only requests do not walk: each derived root is one opaque
         // candidate unit, sized and dated by a bounded probe, and flows
         // through the same classification, scoring, vetoes and dispatch below.
-        let (rx, cancel_token) = if request.catalog_roots.is_empty() {
-            let walker = DirectoryWalker::new(walker_config, protection).with_heartbeat({
-                let hb = Arc::clone(heartbeat);
-                move || hb.beat()
-            });
+        let (mut rx, cancel_token) = if request.catalog_roots.is_empty() {
+            // Only classified entries use a walked directory's size, and they
+            // read it below (bd-gh0x).
+            let walker = DirectoryWalker::new(walker_config, protection)
+                .without_file_sizes()
+                .with_heartbeat({
+                    let hb = Arc::clone(heartbeat);
+                    move || hb.beat()
+                });
             let cancel_token = walker.cancel_token();
 
             // Perform the walk (streaming).
@@ -8409,12 +9435,10 @@ fn scanner_thread_main(
             );
             eprintln!("[SBH-SCANNER] {message}");
             logger.send(ActivityEvent::Info { message });
-            let (tx, rx) = crossbeam_channel::unbounded::<WalkEntry>();
-            for entry in entries {
-                let _ = tx.send(entry);
-            }
-            drop(tx);
-            (rx, Arc::new(AtomicBool::new(false)))
+            (
+                WalkStream::from_entries(entries),
+                Arc::new(AtomicBool::new(false)),
+            )
         };
 
         let mut paths_scanned = 0;
@@ -8425,7 +9449,7 @@ fn scanner_thread_main(
 
         // Track directories for the incremental scan cursor.
         let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
-        let mut dirs_with_candidates: HashSet<PathBuf> = HashSet::new();
+        let mut non_barren_dirs: HashSet<PathBuf> = HashSet::new();
         let dispatch_threshold = request
             .max_delete_batch
             .max(1)
@@ -8458,7 +9482,7 @@ fn scanner_thread_main(
                 scanner_should_exit = true;
                 break;
             }
-            let entry = match rx.recv_timeout(Duration::from_secs(2)) {
+            let mut entry = match rx.recv_timeout(Duration::from_secs(2)) {
                 Ok(entry) => entry,
                 Err(RecvTimeoutError::Timeout) => {
                     if shutdown.load(Ordering::Relaxed) {
@@ -8565,10 +9589,14 @@ fn scanner_thread_main(
                 continue;
             }
 
-            // This entry is classified — mark its parent as having candidates
-            // so the scan cursor knows NOT to cache it as barren.
-            if let Some(parent) = entry.path.parent() {
-                dirs_with_candidates.insert(parent.to_path_buf());
+            // This entry is classified: the scan cursor must not cache it or
+            // any directory above it as barren.
+            mark_non_barren(&mut non_barren_dirs, &entry.path);
+            // The walk did not stat files (bd-gh0x); a classified walked
+            // directory reads its own now. Catalog units carry their probe's
+            // whole-tree size and are left alone.
+            if request.catalog_roots.is_empty() {
+                entry.measure_immediate_files();
             }
 
             let mut input = crate::scanner::scoring::CandidateInput {
@@ -8587,12 +9615,25 @@ fn scanner_thread_main(
                 is_open: false,
                 excluded: false, // Walker already filters excluded paths.
             };
+            mark_visibility_gap(&mut input, visibility_gap);
 
             let mut score = engine.score_candidate(&input, request.urgency);
-            // A maintenance pass is rare and its point is to reclaim what is
-            // definitely stale, so say why a classified entry was not.
+            // A maintenance pass's point is to reclaim what is definitely
+            // stale, so say why a classified entry was not: once per verdict,
+            // then hourly, since the same entries recur on every pass.
             if request.maintenance
                 && score.decision.action != crate::scanner::scoring::DecisionAction::Delete
+                && maintenance_keeps.should_log(
+                    &entry.path,
+                    format!(
+                        "{:?} {} {} {}",
+                        score.decision.action,
+                        score.decision.certainty.label(),
+                        score.vetoed,
+                        score.veto_reason.as_deref().unwrap_or("-"),
+                    ),
+                    Instant::now(),
+                )
             {
                 eprintln!(
                     "[SBH-SCANNER] maintenance keep: {} action={:?} total={:.2} posterior={:.2} \
@@ -8619,7 +9660,8 @@ fn scanner_thread_main(
             };
             if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
                 && !score.vetoed
-                && active_reference_scan.should_probe(probe_size)
+                && active_reference_scan
+                    .should_probe_candidate(probe_size, input.classification.category)
             {
                 if has_active_reference_scan_budget(scan_deadline, active_reference_probe_budget) {
                     let open_files = open_files_joined.get_or_insert_with(|| {
@@ -8673,6 +9715,23 @@ fn scanner_thread_main(
                 );
             }
 
+            // A walked (not opaque-measured) directory carries only its
+            // immediate files' size. Measure one that is about to be recorded
+            // and dispatched, as the pre-scan does (bd-3rlm): on hz2 two such
+            // candidates, 4 KiB each on paper, freed 2.5 GB, and a byte target
+            // counted in paper bytes is never met, so the pass kept choosing.
+            if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
+                && !score.vetoed
+                && entry.metadata.is_dir
+                && entry.opaque_tree.is_none()
+            {
+                score.size_bytes = score.size_bytes.max(prescan_dir_size(
+                    &entry.path,
+                    current_scanner_config.cross_devices,
+                    shutdown,
+                ));
+            }
+
             score.identity = Some(entry.metadata.identity());
             let mut scanner_index_backoff_active = false;
             if scanner_index_enabled {
@@ -8720,13 +9779,14 @@ fn scanner_thread_main(
                 }
             } else if deletable {
                 candidates_found += 1;
-                v2_candidate_bytes_seen = v2_candidate_bytes_seen.saturating_add(score.size_bytes);
+                let potential_bytes = score.size_bytes;
+                v2_candidate_bytes_seen = v2_candidate_bytes_seen.saturating_add(potential_bytes);
                 scored.push(score);
                 if let Some(root) = root_path
                     && let Some(stat) = root_stats_map.get_mut(root)
                 {
                     stat.candidates_found += 1;
-                    stat.potential_bytes += input.size_bytes;
+                    stat.potential_bytes += potential_bytes;
                 }
             } else if score.vetoed
                 && let Some(root) = root_path
@@ -8765,6 +9825,25 @@ fn scanner_thread_main(
                 }
                 cancel_token.store(true, Ordering::Relaxed);
                 break;
+            }
+        }
+
+        // A pass stopped by its budget left part of the tree unseen: nothing
+        // at or above that ground may be cached as barren (bd-y70k). If the
+        // walker threads do not stop in time, what they left is unknown, and
+        // the pass caches nothing new.
+        if scan_timed_out {
+            let unfinished = rx.unfinished_after_cancel(WALK_STOP_WAIT);
+            for path in unfinished.iter().flatten() {
+                mark_non_barren(&mut non_barren_dirs, path);
+            }
+            if unfinished.is_none() {
+                eprintln!(
+                    "[SBH-SCANNER] walker threads still running {}s after the stop; \
+                     the scan cursor caches nothing from this pass",
+                    WALK_STOP_WAIT.as_secs()
+                );
+                visited_dirs.clear();
             }
         }
 
@@ -8813,7 +9892,7 @@ fn scanner_thread_main(
         // Update the incremental scan cursor. On timeout, barren dirs are
         // cached so the next pass skips them. On full completion, cache is
         // cleared for a fresh scan.
-        scan_cursor.update(&visited_dirs, &dirs_with_candidates, scan_timed_out);
+        scan_cursor.update(&visited_dirs, &non_barren_dirs, scan_timed_out);
 
         // Persist v2 candidate-index state before reporting completion.
         if scanner_index_enabled && let Some(index) = scanner_index.as_mut() {
@@ -8849,6 +9928,8 @@ fn scanner_thread_main(
             duration: total_scan_duration,
             root_stats: root_stats_map.into_values().collect(),
             timed_out: scan_timed_out,
+            pressure_level: request.pressure_level,
+            background: request_background,
         });
 
         // Flush remaining candidates in bounded batches.
@@ -8894,13 +9975,15 @@ fn scanner_thread_main(
         // before the flush would misclassify it as empty and wrongly arm the
         // backoff (#15).
         //
-        // A *timed-out* pass with nothing dispatched is inconclusive for the
-        // exponential streak (the budget may simply have expired before the
-        // walker reached reclaimable files), so it does not grow the counter —
-        // but it still arms the base cooldown timestamp. The old behavior of
-        // fully resetting on timeout meant a tree big enough to exhaust the
-        // scan budget on every pass could never back off at all and re-walked
-        // back-to-back forever (~95% CPU at 82% disk, #15 case 1).
+        // A single *timed-out* pass with nothing dispatched is inconclusive for
+        // the exponential streak (the budget may simply have expired before
+        // the walker reached reclaimable files), but it still arms the base
+        // cooldown timestamp, and every TERMINAL_IDLE_EMPTY_PASSES of them in
+        // a row count as one empty pass (`record_empty_pass`, bd-qxrh). The
+        // old behavior of fully resetting on timeout meant a tree big enough
+        // to exhaust the scan budget on every pass could never back off at all
+        // and re-walked back-to-back forever (~95% CPU at 82% disk, #15 case
+        // 1); never counting timeouts kept Red/Critical out of terminal idle.
         //
         // NOTE: keying on dispatched-count, not candidates_found, is the fix for
         // the perpetual-Yellow hot-loop where every candidate is a sacred-marker
@@ -8916,10 +9999,13 @@ fn scanner_thread_main(
             });
         }
         if dispatched_this_pass.count == 0 {
-            if !scan_timed_out {
-                consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
-            }
+            record_empty_pass(
+                &mut consecutive_empty_passes,
+                &mut inconclusive_empty_passes,
+                scan_timed_out,
+            );
             last_empty_pass_at = Some(Instant::now());
+            note_empty_pass_level(&mut empty_level_peak, request_level, Instant::now());
             let next_secs = effective_empty_pass_cooldown(
                 current_scanner_config.min_rescan_interval_secs,
                 consecutive_empty_passes,
@@ -8931,8 +10017,12 @@ fn scanner_thread_main(
                 );
             }
         } else {
-            consecutive_empty_passes = 0;
-            last_empty_pass_at = None;
+            record_dispatching_pass(
+                last_dispatch_reclaimed_nothing,
+                &mut consecutive_empty_passes,
+                &mut inconclusive_empty_passes,
+                &mut last_empty_pass_at,
+            );
             unconfirmed_dispatch = Some(reclaim_at_pass_start);
         }
 
@@ -9064,6 +10154,84 @@ impl RepeatDeletionTracker {
 
 // ──────────────────── executor thread ────────────────────
 
+/// The operator's `protected_paths` as the executor applies them to a batch.
+/// A target-only batch (bd-232u) goes without the patterns that protect its
+/// root as a whole, which is why the tier exists; one naming something inside
+/// the root still applies. `.sbh-protect` markers are checked separately and
+/// always apply.
+fn batch_protected_paths(
+    batch: &DeletionBatch,
+    scanner: &crate::core::config::ScannerConfig,
+) -> Vec<String> {
+    batch.target_only_root.as_deref().map_or_else(
+        || scanner.protected_paths.clone(),
+        |root| {
+            scanner
+                .protected_paths
+                .iter()
+                .filter(|pattern| !protection::pattern_covers_subtree(pattern, root))
+                .cloned()
+                .collect()
+        },
+    )
+}
+
+/// Keep only the candidates a target-only batch may hold: strictly inside its
+/// root, with the identity the tier recorded when it surveyed them, and
+/// still pure now (`target_tier::still_pure`). Returns how many were dropped;
+/// an ordinary batch is left as it is.
+fn retain_target_only_candidates(batch: &mut DeletionBatch) -> usize {
+    let Some(root) = &batch.target_only_root else {
+        return 0;
+    };
+    let before = batch.candidates.len();
+    batch
+        .candidates
+        .retain(|candidate| authorize_target_only_candidate(candidate, Some(root)).is_ok());
+    before - batch.candidates.len()
+}
+
+/// Renew the narrowly scoped protection exception at the mutation boundary.
+/// A directory keeps its inode when an agent adds a trace or log to it, so
+/// identity revalidation alone cannot establish that it is still pure output.
+fn authorize_target_only_candidate(
+    candidate: &CandidacyScore,
+    root: Option<&Path>,
+) -> std::result::Result<(), SkipReason> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    if candidate.identity.is_none() {
+        return Err(SkipReason::IdentityUnavailable);
+    }
+    if candidate.path == root
+        || !candidate.path.starts_with(root)
+        || !crate::daemon::target_tier::still_pure(&candidate.path)
+    {
+        return Err(SkipReason::SacredStowaway);
+    }
+    Ok(())
+}
+
+/// Drop candidates with nothing to reclaim. The planner never chooses an
+/// item that frees no bytes (an empty mktemp target of a live remote build
+/// was taken at Critical on ts2, 2026-10-15), so evaluating them only re-ran
+/// the policy engine every pass and wrote an approved, never-executed delete
+/// to the decision ledger each time: on ts2 99 hardlinked bun trees were
+/// "approved 99/99 ... planner chose none" pass after pass. Returns how many
+/// were dropped.
+fn drop_zero_byte_candidates(batch: &mut DeletionBatch) -> usize {
+    let before = batch.candidates.len();
+    batch
+        .candidates
+        .retain(|candidate| candidate.size_bytes > 0);
+    before - batch.candidates.len()
+}
+
+/// How often the executor reports the zero-byte candidates it dropped: one
+/// line with the running count, not one per batch.
+const ZERO_BYTE_DROP_LOG_EVERY: Duration = Duration::from_mins(10);
+
 /// Executor thread: receives deletion batches and safely removes artifacts.
 ///
 /// Gates all deletions through the `PolicyEngine` before execution. In Observe
@@ -9098,6 +10266,8 @@ fn executor_thread_main(
     let max_circuit_breaker_cooldown = Duration::from_mins(5); // 5 minutes cap
     let mut last_policy_reject_log: Option<Instant> = None;
     let mut last_cb_cooldown_log: Option<Instant> = None;
+    let mut zero_byte_dropped: usize = 0;
+    let mut last_zero_byte_log: Option<Instant> = None;
     // Rate-limit the NotWritable systemd-misconfig warning to once per hour
     // per executor thread. The condition is persistent until the operator
     // fixes the unit file, so logging on every batch would flood journals.
@@ -9111,7 +10281,7 @@ fn executor_thread_main(
             break;
         }
 
-        let batch = match del_rx.recv_timeout(WORKER_SHUTDOWN_POLL_INTERVAL) {
+        let mut batch = match del_rx.recv_timeout(WORKER_SHUTDOWN_POLL_INTERVAL) {
             Ok(batch) => batch,
             Err(RecvTimeoutError::Timeout) => {
                 // Idle is alive: "stalled" must mean stuck inside a batch,
@@ -9127,6 +10297,42 @@ fn executor_thread_main(
 
         heartbeat.beat();
         batch_count += 1;
+
+        let outside = retain_target_only_candidates(&mut batch);
+        if outside > 0 {
+            let message = format!(
+                "dropped {outside} target-only candidate(s) outside {}, without an identity, \
+                 or no longer pure",
+                batch
+                    .target_only_root
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("?"))
+                    .display()
+            );
+            eprintln!("[SBH-EXECUTOR] {message}");
+            logger.send(ActivityEvent::Info { message });
+            if batch.candidates.is_empty() {
+                continue;
+            }
+        }
+
+        let empty = drop_zero_byte_candidates(&mut batch);
+        if empty > 0 {
+            zero_byte_dropped = zero_byte_dropped.saturating_add(empty);
+            if last_zero_byte_log.is_none_or(|at| at.elapsed() >= ZERO_BYTE_DROP_LOG_EVERY) {
+                let message = format!(
+                    "dropped {zero_byte_dropped} zero-byte candidate(s) before the policy \
+                     engine: nothing to reclaim, so the planner would never choose them"
+                );
+                eprintln!("[SBH-EXECUTOR] {message}");
+                logger.send(ActivityEvent::Info { message });
+                zero_byte_dropped = 0;
+                last_zero_byte_log = Some(Instant::now());
+            }
+            if batch.candidates.is_empty() {
+                continue;
+            }
+        }
 
         // Enforce circuit breaker cooldown from a previous trip. If the breaker
         // tripped recently, skip this batch entirely and drain the channel.
@@ -9290,10 +10496,11 @@ fn executor_thread_main(
         }
         // The executor's pre-flight sacred rail sees the same catalog the
         // scoring stage does: platform builtins plus operator patterns.
+        let operator_protected_paths = batch_protected_paths(&batch, &shared_scanner_config.read());
         let executor_sacred_paths = {
             let mut catalog = platform_sacred_paths.to_vec();
             catalog.extend(protection::sacred_paths_from_protected_patterns(
-                &shared_scanner_config.read().protected_paths,
+                &operator_protected_paths,
             ));
             catalog
         };
@@ -9303,10 +10510,10 @@ fn executor_thread_main(
                 dry_run,
                 min_score,
                 check_open_files: true,
-                require_identity: matches!(
-                    shared_scanner_config.read().engine,
-                    ScannerEngineMode::V2
-                ),
+                // A target-only batch is pinned to the inodes the tier
+                // surveyed, whatever the engine.
+                require_identity: batch.target_only_root.is_some()
+                    || matches!(shared_scanner_config.read().engine, ScannerEngineMode::V2),
                 sacred_paths: executor_sacred_paths,
                 // Layer 7: at Green there is time to keep the bytes around,
                 // so the batch quarantines; from Yellow up the space is
@@ -9362,7 +10569,9 @@ fn executor_thread_main(
         }
 
         let scanner_config = shared_scanner_config.read().clone();
-        let protection = match ProtectionRegistry::new(Some(&scanner_config.protected_paths)) {
+        // Markers always protect; the operator's patterns, as above, not for
+        // a target-only batch.
+        let protection = match ProtectionRegistry::new(Some(&operator_protected_paths)) {
             Ok(registry) => Mutex::new(registry),
             Err(err) => {
                 eprintln!(
@@ -9378,14 +10587,15 @@ fn executor_thread_main(
             }
         };
         let sacred_paths =
-            protection::sacred_paths_from_protected_patterns(&scanner_config.protected_paths);
+            protection::sacred_paths_from_protected_patterns(&operator_protected_paths);
         let skip_protected = |path: &Path| {
             if shutdown.load(Ordering::Relaxed) {
-                return true;
+                return Some(SkipReason::ShuttingDown);
             }
             // Runs once per candidate: a long batch keeps beating.
             heartbeat.beat();
             let mut protection = protection.lock();
+            // A proved or unprovable (fail-closed) protection refusal.
             should_skip_protected_daemon_candidate(
                 &mut protection,
                 path,
@@ -9393,6 +10603,7 @@ fn executor_thread_main(
                 logger,
                 "executor preflight",
             )
+            .then_some(SkipReason::SacredStowaway)
         };
 
         // Regret labels (Q4): the entry identity (parent device and inode,
@@ -9412,7 +10623,30 @@ fn executor_thread_main(
             HashMap::new()
         };
 
-        let report = executor.execute(&plan, Some(&skip_protected));
+        let authorize_candidate = |candidate: &CandidacyScore| {
+            // A batch planned as a dry-run cannot mutate and still owes its
+            // preview counts. Real batches must obey newly restrictive policy.
+            if !dry_run {
+                // Renew the filesystem exception before the cheap live gates:
+                // a large purity probe must not hide a policy change while it
+                // runs or outlive a newly published compression hold.
+                authorize_target_only_candidate(candidate, batch.target_only_root.as_deref())?;
+                shared_config.authorize_mutation(policy_mode, policy_engine.lock().mode())?;
+                shared_config.authorize_compression_first(candidate, batch.pressure_level)?;
+            }
+            regret.authorize_deletion(candidate, logger)
+        };
+        let on_unlinked = |candidate: &CandidacyScore, completed_at: Instant| {
+            if let Some(identity) = watch_identities.get(&candidate.path) {
+                regret.watch_unlinked(candidate, identity, completed_at);
+            }
+        };
+        let report = executor.execute_with_hooks(
+            &plan,
+            Some(&skip_protected),
+            Some(&authorize_candidate),
+            Some(&on_unlinked),
+        );
 
         if scanner_config.engine == ScannerEngineMode::V2 {
             for candidate in &report.backoff_candidates {
@@ -9474,34 +10708,6 @@ fn executor_thread_main(
 
         // Record deletions for repeat-deletion dampening.
         tracker.record_deletions(&report.deleted_paths);
-        if !report.dry_run {
-            let watches: Vec<Watch> = report
-                .deleted_paths
-                .iter()
-                .filter_map(|path| {
-                    let identity = watch_identities.get(path)?;
-                    let candidate = plan.candidates.iter().find(|c| &c.path == path)?;
-                    Some(Watch {
-                        decision_id: crate::scanner::decision_record::stable_decision_id(
-                            &candidate.path,
-                            candidate.identity,
-                            candidate.size_bytes,
-                        ),
-                        path: path.clone(),
-                        identity: identity.clone(),
-                        category: format!("{:?}", candidate.classification.category),
-                        certainty: candidate.decision.certainty,
-                        deleted_at: Instant::now(),
-                    })
-                })
-                .collect();
-            if !watches.is_empty() {
-                let mut detector = regret.detector.lock();
-                for watch in watches {
-                    detector.watch(watch);
-                }
-            }
-        }
         if !report.dry_run && report.items_deleted > 0 {
             shared_config.note_reclaim();
         }
@@ -9519,7 +10725,7 @@ fn executor_thread_main(
             }
         } else if report.items_deleted > 0 || report.items_failed > 0 {
             eprintln!(
-                "[SBH-EXECUTOR] deleted={} failed={} skipped={} freed={}B observed_freed={} sacred_scans={} sacred_ms={} ({:?})",
+                "[SBH-EXECUTOR] deleted={} failed={} skipped={} freed={}B observed_freed={} sacred_scans={} sacred_ms={} ({:?}) freed_at_commit={}B{}",
                 report.items_deleted,
                 report.items_failed,
                 report.items_skipped,
@@ -9530,6 +10736,12 @@ fn executor_thread_main(
                 report.sacred_scans,
                 report.sacred_scan_ms,
                 report.duration,
+                report.bytes_freed_at_commit,
+                if report.freed_at_commit_on_btrfs {
+                    " (btrfs: upper bound)"
+                } else {
+                    ""
+                },
             );
         }
 
@@ -9594,12 +10806,16 @@ fn executor_thread_main(
         };
 
         // Report deletion stats back to main loop for SelfMonitor counters.
+        // What the filesystem gained where every removal was measured and it
+        // frees blocks at once; the scanner's estimate (a lower bound for
+        // truncated probes, or a 100 MiB floor) where it frees them at commit
+        // or a removal could not be measured, marked as such (bd-oj33).
+        let (bytes_freed, freed_basis) = report.reported_freed();
         let _ = report_tx.try_send(WorkerReport::DeletionCompleted {
             deleted: report.items_deleted as u64,
-            // What the filesystem gained when every removal was measured;
-            // the scanner's estimate (a lower bound for truncated probes, or
-            // a 100 MiB floor) only when some removal could not be.
-            bytes_freed: report.bytes_freed_observed.unwrap_or(report.bytes_freed),
+            bytes_freed,
+            freed_basis,
+            bytes_freed_observed: report.bytes_freed_observed,
             failed: report.items_failed as u64,
             recovery_paths: report.recovery_paths().cloned().collect(),
             failure_alarm,
@@ -9633,6 +10849,14 @@ fn executor_thread_main(
 
 // ──────────────────── tests ────────────────────
 
+/// bd-ffjj: whether the logging mount's RAM headroom is due for a re-check at
+/// an unchanged level. Only while pressured, and at most every
+/// [`LOGGING_RAM_RECHECK`].
+fn logging_ram_recheck_due(pressured: bool, last_check: Option<Instant>, now: Instant) -> bool {
+    pressured
+        && last_check.is_none_or(|at| now.saturating_duration_since(at) >= LOGGING_RAM_RECHECK)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9648,6 +10872,895 @@ mod tests {
     use crate::scanner::scoring::{DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::path::Path;
     use std::time::Duration;
+
+    /// An initialized daemon with all writes under a temporary directory
+    /// and platform observations supplied by the regular mock PAL. No
+    /// monitoring, scanner, or executor thread is started.
+    #[cfg(unix)]
+    struct RegretDaemonFixture {
+        daemon: MonitoringDaemon,
+        directory: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl RegretDaemonFixture {
+        fn new() -> Self {
+            use crate::core::config::PathsConfig;
+            use crate::platform::types::{OpenFile, OpenFileKind, OpenFileMode};
+
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let paths = PathsConfig {
+                config_file: root.join("config.toml"),
+                ballast_dir: root.join("ballast"),
+                state_file: root.join("state.json"),
+                sqlite_db: root.join("activity.sqlite3"),
+                jsonl_log: root.join("activity.jsonl"),
+            };
+            let mut config = Config::with_paths(paths);
+            let project = root.join("project");
+            std::fs::create_dir(&project).unwrap();
+            config.scanner.root_paths = vec![project.clone()];
+            config.ballast.auto_provision = false;
+            config.scoring.regret_window_minutes = 1;
+            let platform = MockPlatform::healthy()
+                .with_home(root)
+                .with_temp_dirs(Vec::new())
+                .with_cache_roots(Vec::new())
+                .with_open_file(OpenFile {
+                    pid: 42,
+                    path: project.join("Cargo.toml"),
+                    fd: Some(3),
+                    kind: OpenFileKind::Regular,
+                    mode: OpenFileMode::Read,
+                });
+            let daemon = MonitoringDaemon::init_with_platform(
+                config,
+                &DaemonArgs::default(),
+                Arc::new(platform),
+            )
+            .unwrap();
+            Self { daemon, directory }
+        }
+
+        fn flush_logger(&mut self) {
+            self.daemon.logger_handle.shutdown();
+            if let Some(logger) = self.daemon.logger_join.take() {
+                logger.join().unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RegretDaemonFixture {
+        fn drop(&mut self) {
+            self.daemon.logger_handle.shutdown();
+            if let Some(logger) = self.daemon.logger_join.take() {
+                let _ = logger.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn quarantine_tick(level: PressureLevel, mount: &Path) -> MountTickResponse {
+        MountTickResponse {
+            response: crate::monitor::pid::PressureResponse {
+                level,
+                urgency: 0.7,
+                scan_interval: Duration::from_secs(1),
+                release_ballast_files: 0,
+                max_delete_batch: 10,
+                fallback_active: false,
+                causing_mount: mount.to_path_buf(),
+                free_pct: 12.0,
+                predicted_seconds: None,
+            },
+            seconds_to_red: None,
+            prediction_confident: false,
+            rate: MountRateState::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_sweeps_preserve_payloads_in_observe_fallback_and_dry_run() {
+        use crate::daemon::policy::PolicyConfig;
+
+        for level in [
+            PressureLevel::Green,
+            PressureLevel::Orange,
+            PressureLevel::Critical,
+        ] {
+            let mut fixture = RegretDaemonFixture::new();
+            let root = fixture.directory.path().join("project");
+            let candidate = root.join("target");
+            std::fs::create_dir(&candidate).unwrap();
+            std::fs::write(candidate.join("artifact.o"), b"recoverable").unwrap();
+            let store = QuarantineStore::under(&root);
+            let record = store
+                .quarantine(&candidate, "held", 11, Duration::ZERO, None)
+                .unwrap();
+            let mount = PathBuf::from("/");
+            let roots = vec![(root, Some(mount.clone()))];
+            let ticks = vec![quarantine_tick(level, &mount)];
+            for (mode, dry_run) in [
+                (ActiveMode::Observe, false),
+                (ActiveMode::FallbackSafe, false),
+                (ActiveMode::Enforce, true),
+            ] {
+                let daemon = &mut fixture.daemon;
+                *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+                    initial_mode: mode,
+                    ..PolicyConfig::default()
+                });
+                daemon.config.scanner.dry_run = dry_run;
+                daemon.sweep_quarantines(&ticks, &roots, Instant::now());
+                assert_eq!(
+                    std::fs::read(record.quarantine_path.join("artifact.o")).unwrap(),
+                    b"recoverable",
+                    "{level:?} {mode:?} dry_run={dry_run}",
+                );
+                assert!(store.record("held").unwrap().is_some());
+                assert_eq!(daemon.quarantine_held.get(&mount), Some(&11));
+                assert!(daemon.last_quarantine_sweep.is_none());
+            }
+
+            // Positive control: the expired same entry is purged immediately
+            // when live policy permits it, including maintenance at Green.
+            let daemon = &mut fixture.daemon;
+            daemon.config.scanner.dry_run = false;
+            daemon.sweep_quarantines(&ticks, &roots, Instant::now());
+            assert!(!record.quarantine_path.exists());
+            assert!(store.record("held").unwrap().is_none());
+            assert_eq!(daemon.quarantine_held.get(&mount), Some(&0));
+            assert!(daemon.last_quarantine_sweep.is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_live_policy_stops_a_previously_approved_batch_without_backoff() {
+        use crate::daemon::policy::PolicyConfig;
+
+        for (mode, dry_run) in [
+            (ActiveMode::Observe, false),
+            (ActiveMode::FallbackSafe, false),
+            (ActiveMode::Canary, false),
+            (ActiveMode::Enforce, true),
+        ] {
+            let fixture = RegretDaemonFixture::new();
+            let candidates_dir = tempfile::tempdir_in("/tmp").unwrap();
+            let project = candidates_dir.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let first = project.join("target");
+            let held = project.join("node_modules");
+            let mut candidates = Vec::new();
+            for (path, score) in [(&first, 2.0), (&held, 1.0)] {
+                std::fs::create_dir(path).unwrap();
+                std::fs::write(path.join("artifact.o"), [7_u8; 16]).unwrap();
+                let mut candidate = test_candidate(&path.to_string_lossy(), score);
+                candidate.identity =
+                    Some(crate::scanner::walker::identity_for_path(path, false).unwrap());
+                candidate.size_bytes = 16;
+                candidates.push(candidate);
+            }
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    dry_run: false,
+                    min_score: 0.0,
+                    check_open_files: true,
+                    require_identity: true,
+                    ..Default::default()
+                },
+                Some(fixture.daemon.logger_handle.clone()),
+            )
+            .with_platform(Arc::clone(&fixture.daemon.platform));
+            let plan = executor.plan(candidates);
+            assert_eq!(plan.candidates.len(), 2);
+            let shared = &fixture.daemon.shared_executor_config;
+            let policy = &fixture.daemon.policy_engine;
+            let authorize = |_candidate: &CandidacyScore| {
+                // Previously approved work must obey a live operator pause
+                // or fallback before its next mutation.
+                shared.authorize_mutation(ActiveMode::Enforce, policy.lock().mode())
+            };
+            let pause_after_unlink = |candidate: &CandidacyScore, _: Instant| {
+                assert_eq!(candidate.path, first);
+                assert!(!first.exists());
+                *policy.lock() = PolicyEngine::new(PolicyConfig {
+                    initial_mode: mode,
+                    ..PolicyConfig::default()
+                });
+                shared.dry_run.store(dry_run, Ordering::Relaxed);
+            };
+            let report = executor.execute_with_hooks(
+                &plan,
+                None,
+                Some(&authorize),
+                Some(&pause_after_unlink),
+            );
+            assert_eq!(report.deleted_paths, vec![first.clone()]);
+            assert_eq!(report.skipped_by_reason.get("policy_changed"), Some(&1));
+            assert_eq!(report.items_failed, 0);
+            assert!(report.backoff_candidates.is_empty());
+            assert_eq!(std::fs::read(held.join("artifact.o")).unwrap(), [7_u8; 16]);
+
+            *policy.lock() = PolicyEngine::new(PolicyConfig {
+                initial_mode: ActiveMode::Enforce,
+                ..PolicyConfig::default()
+            });
+            shared.dry_run.store(false, Ordering::Relaxed);
+            let retry = executor.plan(vec![plan.candidates[1].clone()]);
+            let released = executor.execute_with_guard(&retry, None, Some(&authorize));
+            assert_eq!(released.items_deleted, 1, "{mode:?} dry_run={dry_run}");
+            assert!(!held.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_waits_for_lossless_first_chance_but_never_for_emergency() {
+        use crate::daemon::compress_tier::RootStatus;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let root = fixture.directory.path().join("project");
+        let candidate = root.join("target");
+        std::fs::create_dir(&candidate).unwrap();
+        std::fs::write(candidate.join("artifact.o"), b"recoverable").unwrap();
+        let store = QuarantineStore::under(&root);
+        let record = store
+            .quarantine(&candidate, "held", 11, Duration::from_hours(24), None)
+            .unwrap();
+        let mount = PathBuf::from("/");
+        fixture
+            .daemon
+            .shared_executor_config
+            .compression_first
+            .begin(
+                &[RootStatus {
+                    root: root.clone(),
+                    btrfs: true,
+                    level: Some(PressureLevel::Orange),
+                    mount_point: Some(mount.clone()),
+                    device_id: Some(record.device_id),
+                }],
+                &[],
+                Instant::now(),
+                Duration::from_secs(30),
+            );
+        let roots = vec![(root, Some(mount.clone()))];
+        fixture.daemon.sweep_quarantines(
+            &[quarantine_tick(PressureLevel::Orange, &mount)],
+            &roots,
+            Instant::now(),
+        );
+        assert_eq!(
+            std::fs::read(record.quarantine_path.join("artifact.o")).unwrap(),
+            b"recoverable",
+        );
+        assert_eq!(fixture.daemon.quarantine_held.get(&mount), Some(&11));
+        assert_eq!(fixture.daemon.last_quarantine_sweep, None);
+        fixture.daemon.sweep_quarantines(
+            &[quarantine_tick(PressureLevel::Critical, &mount)],
+            &roots,
+            Instant::now(),
+        );
+        assert!(!record.quarantine_path.exists());
+        assert_eq!(fixture.daemon.quarantine_held.get(&mount), Some(&0));
+        assert!(fixture.daemon.last_quarantine_sweep.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn emergency_cleanup_dispatch_precedes_compression_root_probes() {
+        use crate::platform::pal::{
+            FsStats, MemoryInfo, MountPoint, PlatformPaths, ServiceManager,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        struct ProbeAfterEmergency {
+            base: Arc<dyn Platform>,
+            probe_root: PathBuf,
+            scan_root: PathBuf,
+            quarantine_path: PathBuf,
+            scans: Receiver<ScanRequest>,
+            probes: Arc<AtomicUsize>,
+        }
+
+        impl Platform for ProbeAfterEmergency {
+            fn fs_stats(&self, path: &Path) -> crate::core::errors::Result<FsStats> {
+                if path == self.probe_root.as_path() {
+                    assert!(
+                        !self.quarantine_path.exists(),
+                        "emergency quarantine must drain before compression root I/O",
+                    );
+                    let scan = self
+                        .scans
+                        .try_recv()
+                        .expect("emergency scan must be queued before compression root I/O");
+                    assert_eq!(scan.pressure_level, PressureLevel::Critical);
+                    assert!(scan.paths.contains(&self.scan_root));
+                    self.probes.fetch_add(1, Ordering::Relaxed);
+                }
+                let mut stats = self.base.fs_stats(path)?;
+                // Exercise startup admission without launching a native worker.
+                stats.fs_type = "ext4".into();
+                Ok(stats)
+            }
+
+            fn mount_points(&self) -> crate::core::errors::Result<Vec<MountPoint>> {
+                self.base.mount_points()
+            }
+
+            fn is_ram_backed(&self, path: &Path) -> crate::core::errors::Result<bool> {
+                self.base.is_ram_backed(path)
+            }
+
+            fn default_paths(&self) -> PlatformPaths {
+                self.base.default_paths()
+            }
+
+            fn memory_info(&self) -> crate::core::errors::Result<MemoryInfo> {
+                self.base.memory_info()
+            }
+
+            fn service_manager(&self) -> Box<dyn ServiceManager> {
+                self.base.service_manager()
+            }
+        }
+
+        let mut fixture = RegretDaemonFixture::new();
+        let root = fixture.directory.path().join("project");
+        let candidate = root.join("target");
+        std::fs::create_dir(&candidate).unwrap();
+        std::fs::write(candidate.join("artifact.o"), b"recoverable").unwrap();
+        let store = QuarantineStore::under(&root);
+        let record = store
+            .quarantine(&candidate, "held", 11, Duration::from_hours(24), None)
+            .unwrap();
+        assert!(record.quarantine_path.exists());
+        let probe_root = fixture.directory.path().join("compression-probe");
+        std::fs::create_dir(&probe_root).unwrap();
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(4);
+        let (del_tx, _del_rx) = bounded::<DeletionBatch>(4);
+        let probes = Arc::new(AtomicUsize::new(0));
+        let daemon = &mut fixture.daemon;
+        daemon.config.compress.enabled = true;
+        daemon.config.compress.start_level = "critical".into();
+        daemon.config.compress.roots = vec![probe_root.clone()];
+        // A fake "/" mount can discover foreign ballast. Disable ballast
+        // actions explicitly while retaining real emergency scan dispatch.
+        daemon.behavior_state.mode = mock_behavior_mode(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::None,
+            NotificationPriority::Low,
+        );
+        // Keep the collector's original mock; only compression's direct root
+        // probe observes the queue, after ordinary monitor stats collection.
+        daemon.platform = Arc::new(ProbeAfterEmergency {
+            base: Arc::clone(&daemon.platform),
+            probe_root,
+            scan_root: root,
+            quarantine_path: record.quarantine_path.clone(),
+            scans: scan_rx.clone(),
+            probes: Arc::clone(&probes),
+        });
+        let tick = quarantine_tick(PressureLevel::Critical, Path::new("/"));
+        let response = tick.response.clone();
+        daemon.mount_responses = vec![tick];
+
+        daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            1,
+            "Critical start levels must still reach compression admission",
+        );
+        assert!(!record.quarantine_path.exists());
+        assert!(store.record("held").unwrap().is_none());
+    }
+
+    /// A special-location alert episode notifies once when it starts and again
+    /// only when it escalates; a level that wobbles inside it stays quiet, and
+    /// the episode ends only after a whole alert interval without an alert.
+    #[test]
+    fn special_location_episodes_notify_on_start_and_escalation_only() {
+        let t0 = Instant::now();
+        let interval = Duration::from_mins(15);
+
+        assert_eq!(
+            special_episode_step(None, PressureLevel::Yellow),
+            (Some(PressureLevel::Green), PressureLevel::Yellow)
+        );
+        let yellow = Some((PressureLevel::Yellow, t0));
+        assert_eq!(
+            special_episode_step(yellow, PressureLevel::Yellow),
+            (None, PressureLevel::Yellow)
+        );
+        assert_eq!(
+            special_episode_step(yellow, PressureLevel::Orange),
+            (Some(PressureLevel::Yellow), PressureLevel::Orange)
+        );
+        // Back down to Yellow inside an Orange episode: quiet, Orange is kept.
+        let orange = Some((PressureLevel::Orange, t0));
+        assert_eq!(
+            special_episode_step(orange, PressureLevel::Yellow),
+            (None, PressureLevel::Orange)
+        );
+
+        assert!(special_episode_over(None, t0, interval));
+        assert!(!special_episode_over(
+            orange,
+            t0 + Duration::from_mins(5),
+            interval
+        ));
+        assert!(special_episode_over(orange, t0 + interval, interval));
+    }
+
+    /// A special location under pressure queues a scan but releases no
+    /// ballast. Its own mount releases on its own pressure level; before, an
+    /// Orange "filling fast" alert on a disk-backed /tmp released the whole
+    /// pool on every write burst, so a macOS Data volume never kept a reserve.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn special_location_alert_scans_but_never_releases_ballast() {
+        use crate::core::config::PathsConfig;
+        use crate::monitor::special_locations::{
+            SpecialKind, SpecialLocation, SpecialLocationRegistry,
+        };
+        use crate::platform::pal::{FsStats, MemoryInfo, MountPoint, PlatformPaths};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let paths = PathsConfig {
+            config_file: root.join("config.toml"),
+            ballast_dir: root.join("ballast"),
+            state_file: root.join("state.json"),
+            sqlite_db: root.join("activity.sqlite3"),
+            jsonl_log: root.join("activity.jsonl"),
+        };
+        let mut config = Config::with_paths(paths);
+        let tmp = root.join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        config.scanner.root_paths = vec![tmp.clone()];
+        config.ballast.auto_provision = false;
+        config.ballast.file_count = 2;
+        config.ballast.file_size_bytes = 8192;
+        config.notifications.enabled = false;
+
+        // 1 TB volume with 10 GB available: under the special-location floor.
+        let mount = PathBuf::from("/");
+        let stats = FsStats {
+            total_bytes: 1_000_000_000_000,
+            free_bytes: 10_000_000_000,
+            available_bytes: 10_000_000_000,
+            fs_type: "mockfs".to_string(),
+            mount_point: mount.clone(),
+            is_readonly: false,
+        };
+        let mut platform = MockPlatform::new(
+            vec![MountPoint {
+                path: mount.clone(),
+                device: "mockdev".to_string(),
+                fs_type: "mockfs".to_string(),
+                is_ram_backed: false,
+            }],
+            HashMap::from([(mount.clone(), stats)]),
+            MemoryInfo {
+                total_bytes: 64 << 30,
+                available_bytes: 32 << 30,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            },
+            PlatformPaths::default(),
+        )
+        .with_home(root)
+        .with_temp_dirs(Vec::new())
+        .with_cache_roots(Vec::new());
+        // MockPlatform reports no blocks unless told: 8192-byte files are 16.
+        for index in 1..=2 {
+            platform = platform.with_block_count(
+                root.join("ballast")
+                    .join(format!("SBH_BALLAST_FILE_{index:05}.dat")),
+                16,
+            );
+        }
+        let platform = Arc::new(platform);
+        let mut daemon = MonitoringDaemon::init_with_platform(
+            config,
+            &DaemonArgs::default(),
+            Arc::clone(&platform) as Arc<dyn Platform>,
+        )
+        .unwrap();
+        // What the daemon itself counts as releasable on this mount, stranded
+        // files included: release_ballast spends those first.
+        let available = |daemon: &MonitoringDaemon| {
+            daemon
+                .ballast_coordinator
+                .pool_for_mount(&mount)
+                .map_or(0, crate::ballast::coordinator::BallastPool::available_count)
+        };
+        // The mock mount is "/", and stranded-reserve discovery reads the real
+        // legacy locations (/root, /home/*, /Users/*, /var/lib/sbh) on that
+        // device. A host with a reserve there would put real files in this
+        // pool, and the control below would release them. Skip on such a host.
+        let foreign = available(&daemon);
+        if foreign > 0 {
+            eprintln!(
+                "skipped: {foreign} ballast file(s) from a real reserve on this device are visible to the fixture's pool"
+            );
+            daemon.logger_handle.shutdown();
+            if let Some(logger) = daemon.logger_join.take() {
+                logger.join().unwrap();
+            }
+            return;
+        }
+        daemon.ballast_coordinator.set_provision_floor(0.0);
+        let provisioned = daemon
+            .ballast_coordinator
+            .provision_all(platform.as_ref())
+            .unwrap();
+        assert_eq!(provisioned.total_files_created(), 2, "{provisioned:?}");
+        assert_eq!(available(&daemon), 2);
+
+        daemon.special_locations = SpecialLocationRegistry::new(vec![SpecialLocation {
+            path: tmp.clone(),
+            kind: SpecialKind::UserTmp,
+            buffer_pct: 15,
+            scan_interval: Duration::from_secs(5),
+            priority: 160,
+        }]);
+        // Filling fast: 10 GB at 100 MB/s is 100 s from full, urgency ~0.94,
+        // which the release controller answers with every file in the pool.
+        daemon.mount_rates.insert(mount.clone(), 100_000_000.0);
+        let (scan_tx, scan_rx) = crossbeam_channel::bounded(4);
+        daemon.check_special_locations(&scan_tx, &scan_rx);
+
+        assert_eq!(
+            available(&daemon),
+            2,
+            "a special-location alert must not release ballast"
+        );
+        let request = scan_rx.try_recv().expect("the alert still queues a scan");
+        assert_eq!(request.pressure_level, PressureLevel::Orange);
+        assert!(request.paths.contains(&tmp), "{:?}", request.paths);
+
+        // Control: the call this path used to make, with the alert's Orange
+        // response at urgency ~0.94, empties this very pool, so the kept files
+        // above are not an artifact of the fixture.
+        let old_alert_response = crate::monitor::pid::PressureResponse {
+            level: PressureLevel::Orange,
+            urgency: 0.94,
+            scan_interval: Duration::from_secs(0),
+            release_ballast_files: 0,
+            max_delete_batch: 60,
+            fallback_active: false,
+            causing_mount: mount.clone(),
+            free_pct: 1.0,
+            predicted_seconds: None,
+        };
+        assert_eq!(
+            daemon.release_ballast(&mount, &old_alert_response).unwrap(),
+            2
+        );
+        assert_eq!(available(&daemon), 0);
+
+        daemon.logger_handle.shutdown();
+        if let Some(logger) = daemon.logger_join.take() {
+            logger.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn regret_watch_for_test(id: &str, path: &Path, category: &str, now: Instant) -> Watch {
+        Watch {
+            decision_id: id.to_string(),
+            path: path.to_path_buf(),
+            identity: EntryIdentity::of(path).unwrap(),
+            category: category.to_string(),
+            certainty: ArtifactCertainty::Definite,
+            deleted_at: now,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_regret_observation_keeps_failed_and_replaced_parents_out_of_evidence() {
+        let mut fixture = RegretDaemonFixture::new();
+        let root = fixture.directory.path();
+        let live = root.join("project/target");
+        let absent = root.join("project/absent");
+        let replaced_parent = root.join("replaced");
+        let unreadable_parent = root.join("unreadable");
+        std::fs::create_dir(&replaced_parent).unwrap();
+        std::fs::create_dir(&unreadable_parent).unwrap();
+        let replaced = replaced_parent.join("target");
+        let unreadable = unreadable_parent.join("target");
+        let now = Instant::now();
+        for (id, path, category) in [
+            ("live", &live, "live"),
+            ("absent", &absent, "absent"),
+            ("replaced", &replaced, "unknown"),
+            ("unreadable", &unreadable, "unknown"),
+        ] {
+            fixture
+                .daemon
+                .regret
+                .detector
+                .lock()
+                .watch(regret_watch_for_test(id, path, category, now));
+        }
+        std::fs::create_dir(&live).unwrap();
+        std::fs::rename(&replaced_parent, root.join("original-replaced")).unwrap();
+        std::fs::create_dir(&replaced_parent).unwrap();
+        std::fs::rename(&unreadable_parent, root.join("original-unreadable")).unwrap();
+        std::fs::write(&unreadable_parent, b"parent is no longer a directory").unwrap();
+
+        fixture
+            .daemon
+            .resolve_regrets_with_clock(|| now + Duration::from_secs(30));
+        assert_eq!(fixture.daemon.regret.detector.lock().pending(), 3);
+        assert_eq!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("live")
+                .unwrap()
+                .regrets,
+            1
+        );
+        assert!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("unknown")
+                .is_none()
+        );
+
+        fixture
+            .daemon
+            .resolve_regrets_with_clock(|| now + Duration::from_secs(60));
+        assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
+        assert_eq!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("absent")
+                .unwrap()
+                .decisions,
+            1
+        );
+        assert!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("unknown")
+                .is_none()
+        );
+        fixture.flush_logger();
+        let ledger = crate::logger::sqlite::SqliteLogger::open_read_only(
+            &fixture.daemon.config.paths.sqlite_db,
+        )
+        .unwrap();
+        for (id, expected) in [
+            ("live", "regret"),
+            ("absent", "clean"),
+            ("replaced", "unknown"),
+            ("unreadable", "unknown"),
+        ] {
+            let outcomes = ledger.outcomes_for_decision(id).unwrap();
+            assert_eq!(outcomes.len(), 1, "{id}");
+            assert_eq!(outcomes[0].outcome, expected, "{id}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_regret_observation_uses_completion_time_for_each_watched_path() {
+        let mut fixture = RegretDaemonFixture::new();
+        let now = Instant::now();
+        let project = fixture.directory.path().join("project");
+        for id in ["first", "later"] {
+            let path = project.join(id);
+            fixture
+                .daemon
+                .regret
+                .detector
+                .lock()
+                .watch(regret_watch_for_test(id, &path, "timed", now));
+            std::fs::create_dir(&path).unwrap();
+        }
+        // Each pair brackets a real filesystem/process observation. The
+        // first begins before expiry but completes after it; the second
+        // begins later still. The last two samples timestamp calibration.
+        let mut seconds = [59, 61, 61, 63, 64, 65].into_iter();
+        fixture.daemon.resolve_regrets_with_clock(|| {
+            now + Duration::from_secs(seconds.next().expect("bounded clock samples"))
+        });
+        assert!(seconds.next().is_none());
+        assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
+        assert!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("timed")
+                .is_none()
+        );
+        fixture.flush_logger();
+        let ledger = crate::logger::sqlite::SqliteLogger::open_read_only(
+            &fixture.daemon.config.paths.sqlite_db,
+        )
+        .unwrap();
+        for (id, after_secs) in [("first", 61), ("later", 63)] {
+            let outcomes = ledger.outcomes_for_decision(id).unwrap();
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].outcome, "unknown");
+            assert_eq!(outcomes[0].after_secs, after_secs);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_regret_alarm_uses_fresh_calibration_time_for_its_full_suspension() {
+        let fixture = RegretDaemonFixture::new();
+        let now = Instant::now();
+        let project = fixture.directory.path().join("project");
+        let mut config = fixture.daemon.config.clone();
+        config.scoring.regret_suspend_minutes = 1;
+        fixture.daemon.regret.update_config(&config);
+        for id in ["first", "second", "third"] {
+            let path = project.join(id);
+            fixture
+                .daemon
+                .regret
+                .detector
+                .lock()
+                .watch(regret_watch_for_test(id, &path, "timed", now));
+            std::fs::create_dir(&path).unwrap();
+        }
+        // All three recreations are observed inside the 60-second window.
+        // Applying their evidence happens later, with the third raising the
+        // alarm at +50s. Its 60-second suspension must last until +110s.
+        let mut seconds = [1, 2, 3, 4, 5, 6, 40, 45, 50].into_iter();
+        fixture.daemon.resolve_regrets_with_clock(|| {
+            now + Duration::from_secs(seconds.next().expect("bounded clock samples"))
+        });
+        assert!(seconds.next().is_none());
+        let calibrator = fixture.daemon.regret.calibrator.lock();
+        let summary = calibrator.summary("timed").unwrap();
+        assert_eq!(summary.decisions, 3);
+        assert_eq!(summary.regrets, 3);
+        assert!(calibrator.suspended("timed", now + Duration::from_secs(109)));
+        assert!(!calibrator.suspended("timed", now + Duration::from_secs(110)));
+        drop(calibrator);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn daemon_config_reload_updates_regret_settings_and_preserves_pending_deadlines() {
+        let mut fixture = RegretDaemonFixture::new();
+        let now = Instant::now();
+        let project = fixture.directory.path().join("project");
+        let daemon = &mut fixture.daemon;
+        daemon.regret.detector.lock().watch(regret_watch_for_test(
+            "old-window",
+            &project.join("old"),
+            "old-window",
+            now,
+        ));
+        {
+            let mut calibrator = daemon.regret.calibrator.lock();
+            calibrator.record(
+                "definite",
+                ArtifactCertainty::Definite,
+                Outcome::Regret,
+                now,
+            );
+            calibrator.record("likely", ArtifactCertainty::Likely, Outcome::Regret, now);
+            for _ in 0..3 {
+                calibrator.record(
+                    "suspended",
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    now,
+                );
+            }
+        }
+        let mut updated = daemon.config.clone();
+        updated.scoring.regret_window_minutes = 3;
+        updated.scoring.regret_alpha_definite = 0.04;
+        updated.scoring.regret_alpha_likely = 0.01;
+        updated.scoring.regret_suspend_minutes = 2;
+        std::fs::write(
+            &updated.paths.config_file,
+            toml::to_string(&updated).unwrap(),
+        )
+        .unwrap();
+        let (scan_tx, _scan_rx) = bounded(1);
+        daemon.handle_config_reload(&scan_tx);
+        assert!(daemon.wake_next_tick.reload);
+        assert_eq!(daemon.config.scoring.regret_window_minutes, 3);
+        {
+            let calibrator = daemon.regret.calibrator.lock();
+            assert_eq!(calibrator.config(), &regret_config(&updated));
+            for (category, alpha, decisions) in [
+                ("definite", 0.04, 1),
+                ("likely", 0.01, 1),
+                ("suspended", 0.04, 3),
+            ] {
+                let summary = calibrator.summary(category).unwrap();
+                assert_eq!(summary.alpha, alpha);
+                assert_eq!(summary.decisions, decisions);
+                assert_eq!(summary.regrets, decisions);
+                assert_eq!(summary.e_value, 1.0);
+            }
+            assert!(calibrator.suspended("suspended", now + Duration::from_mins(3)));
+            drop(calibrator);
+        }
+        daemon.regret.detector.lock().watch(regret_watch_for_test(
+            "new-window",
+            &project.join("new"),
+            "new-window",
+            now,
+        ));
+
+        // A rejected reload must leave the live feedback settings and the
+        // two existing watches untouched.
+        std::fs::write(&updated.paths.config_file, "[scoring\n").unwrap();
+        daemon.handle_config_reload(&scan_tx);
+        assert_eq!(
+            daemon.regret.calibrator.lock().config(),
+            &regret_config(&updated)
+        );
+        assert_eq!(daemon.regret.detector.lock().pending(), 2);
+
+        daemon.resolve_regrets_with_clock(|| now + Duration::from_secs(60));
+        assert_eq!(daemon.regret.detector.lock().pending(), 1);
+        assert_eq!(
+            daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("old-window")
+                .unwrap()
+                .decisions,
+            1
+        );
+        assert!(
+            daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("new-window")
+                .is_none()
+        );
+        daemon.resolve_regrets_with_clock(|| now + Duration::from_secs(180));
+        assert_eq!(daemon.regret.detector.lock().pending(), 0);
+        assert_eq!(
+            daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("new-window")
+                .unwrap()
+                .decisions,
+            1
+        );
+    }
 
     /// A fresh heartbeat for a `scanner_thread_main` test.
     fn heartbeat_for_test() -> Arc<ThreadHeartbeat> {
@@ -9679,6 +11792,21 @@ mod tests {
         tempfile::tempdir_in(&scratch_base).unwrap()
     }
 
+    /// A scratch dir inside a temp root, wherever the runner's `TMPDIR`
+    /// points: the counterpart of `non_temp_scratch_dir`. A scanner test whose
+    /// fixture is an artifact only because it sits in temp storage must not
+    /// inherit `TMPDIR`. The rch workers set it to `<project>/.rch-tmp`, a
+    /// temp root only when the project was synced under `/data/tmp` and not
+    /// when it runs from `/data/projects`, so the same test passed on one
+    /// worker and failed every time on the next (#31).
+    fn temp_root_scratch_dir() -> tempfile::TempDir {
+        if is_tmp_like_path(&std::env::temp_dir()) {
+            tempfile::tempdir().unwrap()
+        } else {
+            tempfile::tempdir_in("/tmp").unwrap()
+        }
+    }
+
     /// The `CACHEDIR.TAG` cargo writes into every target dir. Without it a
     /// fixture target has no structural evidence, and whether it scores
     /// `Delete` or `Review` then depends on where the test runs (it passed on
@@ -9690,6 +11818,239 @@ mod tests {
              # This file is a cache directory tag created by cargo.\n",
         )
         .unwrap();
+    }
+
+    /// bd-3rlm: a directory the walk recognises only by its CACHEDIR.TAG is
+    /// not pruned and measured as an opaque tree, so it carried just its
+    /// immediate files' size: on hz2 two candidates of 4 KiB each on paper
+    /// freed 2.5 GB. The size the planner and the executor see is measured.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_walked_directory_candidate_is_measured_before_dispatch() {
+        let temp = temp_root_scratch_dir();
+        let root = temp.path().join("scan-root");
+        let cache = root.join("srw");
+        let deep = cache.join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        write_cargo_cachedir_tag(&cache);
+        let payload = vec![7_u8; 512 * 1024];
+        std::fs::write(deep.join("blob.bin"), &payload).unwrap();
+        // Old enough to be abandoned by its real age.
+        let old = SystemTime::now() - Duration::from_hours(6);
+        for path in [
+            deep.join("blob.bin"),
+            cache.join("CACHEDIR.TAG"),
+            deep.clone(),
+            cache.join("a"),
+            cache.clone(),
+        ] {
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![root.clone()];
+        config.scanner.min_file_age_minutes = 0;
+        config.scanner.active_reference_min_size_bytes = u64::MAX;
+        config.validate().expect("the tuned config stays valid");
+        let (scanner_index_path, prescan_cursor_path) = scanner_state_paths(temp.path());
+        let scoring = Arc::new(RwLock::new(config.scoring.clone()));
+        let scanner_cfg = Arc::new(RwLock::new(config.scanner));
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: temp.path().join("activity.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 1024,
+            run_id: None,
+        })
+        .unwrap();
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(64);
+        let (report_tx, _report_rx) = bounded::<WorkerReport>(64);
+        let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        scan_tx
+            .send(ScanRequest {
+                paths: vec![root],
+                urgency: 0.9,
+                pressure_level: PressureLevel::Orange,
+                free_pct: Some(9.0),
+                max_delete_batch: 10,
+                force_full_scan: false,
+                config_update: None,
+                catalog_roots: Vec::new(),
+                maintenance: false,
+                target_bytes: None,
+            })
+            .unwrap();
+        drop(scan_tx);
+        scanner_thread_main(
+            &scan_rx,
+            &del_tx,
+            &logger,
+            &scoring,
+            &scanner_cfg,
+            &platform,
+            &heartbeat_for_test(),
+            &report_tx,
+            &shutdown,
+            &scanner_index_path,
+            &prescan_cursor_path,
+            &feedback_rx,
+            &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+            &Arc::new(SharedExecutorConfig::new(
+                false, 10, 0.0, 60, 3600, false, 0,
+            )),
+            &Arc::new(SharedRegret::new(&Config::default())),
+        );
+        logger.shutdown();
+        logger_join.join().unwrap();
+
+        let mut dispatched = Vec::new();
+        while let Ok(batch) = del_rx.try_recv() {
+            dispatched.extend(batch.candidates);
+        }
+        let candidate = dispatched
+            .iter()
+            .find(|candidate| candidate.path == cache)
+            .unwrap_or_else(|| panic!("the tagged cache is dispatched: {dispatched:?}"));
+        assert_eq!(
+            candidate.classification.pattern_name, "cachedir-tagged-cache",
+            "{candidate:?}"
+        );
+        assert!(
+            candidate.size_bytes >= payload.len() as u64,
+            "measured, not the directory's own entries: {} bytes",
+            candidate.size_bytes
+        );
+    }
+
+    /// A cache is probed for in-use evidence whatever its size. A small cache
+    /// under a live build was approved because only candidates over
+    /// `active_reference_min_size_bytes` (100 MiB) were probed; the same
+    /// cache with nobody in it is still dispatched.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_small_cache_in_use_is_held_and_an_idle_one_is_dispatched() {
+        let run = |busy: bool| -> Vec<PathBuf> {
+            let temp = temp_root_scratch_dir();
+            let root = temp.path().join("scan-root");
+            let cache = root.join("srw");
+            let deep = cache.join("a").join("b");
+            std::fs::create_dir_all(&deep).unwrap();
+            write_cargo_cachedir_tag(&cache);
+            std::fs::write(deep.join("blob.bin"), vec![7_u8; 512 * 1024]).unwrap();
+            let old = SystemTime::now() - Duration::from_hours(6);
+            for path in [
+                deep.join("blob.bin"),
+                cache.join("CACHEDIR.TAG"),
+                deep.clone(),
+                cache.join("a"),
+                cache.clone(),
+            ] {
+                std::fs::File::open(&path)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+            let mut config = Config::default();
+            config.scanner.root_paths = vec![root.clone()];
+            config.scanner.min_file_age_minutes = 0;
+            // The default size floor: the cache is far below it.
+            assert!(config.scanner.active_reference_min_size_bytes > 512 * 1024);
+            config.validate().expect("the tuned config stays valid");
+            let (scanner_index_path, prescan_cursor_path) = scanner_state_paths(temp.path());
+            let mut mock = MockPlatform::healthy();
+            if busy {
+                // rustc compiling from inside the cache, nothing held open.
+                mock = mock.with_process(crate::platform::types::ProcessInfo {
+                    pid: 4242,
+                    parent_pid: None,
+                    name: "rustc".to_string(),
+                    command_line: Vec::new(),
+                    executable: None,
+                    cwd: Some(deep),
+                    start_time_unix_ms: None,
+                    virtual_memory_bytes: None,
+                    resident_memory_bytes: None,
+                    cpu_user_micros: None,
+                    cpu_system_micros: None,
+                });
+            }
+            let platform: Arc<dyn Platform> = Arc::new(mock);
+            let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+                sqlite_path: None,
+                jsonl_config: crate::logger::jsonl::JsonlConfig {
+                    path: temp.path().join("activity.jsonl"),
+                    fallback_path: None,
+                    max_size_bytes: 1_048_576,
+                    max_rotated_files: 0,
+                    fsync_interval_secs: 0,
+                },
+                channel_capacity: 1024,
+                run_id: None,
+            })
+            .unwrap();
+            let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+            let (del_tx, del_rx) = bounded::<DeletionBatch>(64);
+            let (report_tx, _report_rx) = bounded::<WorkerReport>(64);
+            let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+            scan_tx
+                .send(ScanRequest {
+                    paths: vec![root],
+                    urgency: 0.9,
+                    pressure_level: PressureLevel::Orange,
+                    free_pct: Some(9.0),
+                    max_delete_batch: 10,
+                    force_full_scan: false,
+                    config_update: None,
+                    catalog_roots: Vec::new(),
+                    maintenance: false,
+                    target_bytes: None,
+                })
+                .unwrap();
+            drop(scan_tx);
+            scanner_thread_main(
+                &scan_rx,
+                &del_tx,
+                &logger,
+                &Arc::new(RwLock::new(config.scoring.clone())),
+                &Arc::new(RwLock::new(config.scanner)),
+                &platform,
+                &heartbeat_for_test(),
+                &report_tx,
+                &Arc::new(AtomicBool::new(false)),
+                &scanner_index_path,
+                &prescan_cursor_path,
+                &feedback_rx,
+                &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+                &Arc::new(SharedExecutorConfig::new(
+                    false, 10, 0.0, 60, 3600, false, 0,
+                )),
+                &Arc::new(SharedRegret::new(&Config::default())),
+            );
+            logger.shutdown();
+            logger_join.join().unwrap();
+            let mut dispatched = Vec::new();
+            while let Ok(batch) = del_rx.try_recv() {
+                dispatched.extend(batch.candidates.into_iter().map(|c| c.path));
+            }
+            dispatched.retain(|path| path == &cache);
+            dispatched
+        };
+        assert!(
+            run(true).is_empty(),
+            "a cache a live build works in is held"
+        );
+        assert_eq!(run(false).len(), 1, "an idle cache is still dispatched");
     }
 
     fn scanner_state_paths(dir: &Path) -> (PathBuf, PathBuf) {
@@ -9735,6 +12096,14 @@ mod tests {
             std::fs::create_dir_all(target.join(sub)).unwrap();
         }
         std::fs::write(target.join("debug/deps/libfoo.rlib"), vec![0u8; 8192]).unwrap();
+        // Beside its manifest, as a project's target is: replay classifies
+        // it as the walk does (bd-10yj), and the walk takes a target whole
+        // there or under a temp root (TMPDIR may be neither).
+        std::fs::write(
+            temp.path().join("proj/Cargo.toml"),
+            "[package]\nname = \"p\"\n",
+        )
+        .unwrap();
 
         let mut config = Config::default();
         config.scanner.min_file_age_minutes = 0;
@@ -9787,6 +12156,7 @@ mod tests {
                 protection,
                 &sacred,
                 &open_files,
+                None,
                 &logger,
             )
         };
@@ -9808,6 +12178,24 @@ mod tests {
             replay(&record(2), 3, &mut protection).unwrap_err(),
             ReplayDrop::GenerationAdvanced
         );
+
+        // bd-1ouz: a daemon that cannot see every process vetoes the same
+        // intact artifact; its references are unknown, not absent.
+        let gap = crate::scanner::walker::MACOS_USER_SCOPE_ACTIVE_REFERENCE_WARNING;
+        let blind = replay_indexed_record(
+            &record(3),
+            3,
+            &registry,
+            &engine,
+            &config.scanner,
+            &request,
+            &mut protection,
+            &sacred,
+            &open_files,
+            Some(gap),
+            &logger,
+        );
+        assert_eq!(blind.unwrap_err(), ReplayDrop::Vetoed(gap.to_string()));
 
         // Planted after the checkpoint: a .git, then a Cargo.toml.
         std::fs::create_dir_all(target.join(".git")).unwrap();
@@ -10112,8 +12500,196 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_keep_lines_repeat_only_on_change_or_hourly() {
+        let mut log = MaintenanceKeepLog::default();
+        let start = Instant::now();
+        let path = Path::new("/tmp/project/target");
+        let keep = || "Keep likely false -".to_string();
+        assert!(log.should_log(path, keep(), start));
+        // Every later pass within the hour stays quiet...
+        assert!(!log.should_log(path, keep(), start + Duration::from_mins(5)));
+        assert!(!log.should_log(path, keep(), start + Duration::from_mins(59)));
+        // ...unless the verdict changes, which restarts the hour.
+        let review = "Review possible false -".to_string();
+        assert!(log.should_log(path, review.clone(), start + Duration::from_mins(59)));
+        assert!(!log.should_log(path, review, start + Duration::from_mins(60)));
+        // Other paths are independent, and an unchanged verdict repeats hourly.
+        assert!(log.should_log(
+            Path::new("/tmp/other"),
+            keep(),
+            start + Duration::from_mins(60)
+        ));
+        assert!(log.should_log(path, keep(), start + Duration::from_mins(60)));
+        assert!(log.should_log(path, keep(), start + Duration::from_mins(121)));
+    }
+
+    fn scan_cursor(max_entries: usize, cached: &[(&str, u64)]) -> ScanCursor {
+        let now = Instant::now();
+        ScanCursor {
+            barren_dirs: cached
+                .iter()
+                .map(|&(path, age_mins)| {
+                    let at = now.checked_sub(Duration::from_mins(age_mins)).unwrap();
+                    (PathBuf::from(path), at)
+                })
+                .collect(),
+            ttl: Duration::from_mins(30),
+            max_entries,
+        }
+    }
+
+    fn path_set(paths: &[&str]) -> HashSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn a_candidate_keeps_itself_and_every_ancestor_out_of_the_barren_cache() {
+        let mut cursor = scan_cursor(100, &[("/r/a", 1)]);
+        let visited = path_set(&["/r/a", "/r/a/b", "/r/a/b/target", "/r/x", "/r/x/y"]);
+        let mut candidates = HashSet::new();
+        mark_non_barren(&mut candidates, Path::new("/r/a/b/target"));
+        // A second candidate under the same tree stops at the marked parent.
+        mark_non_barren(&mut candidates, Path::new("/r/a/b/node_modules"));
+
+        cursor.update(&visited, &candidates, true);
+
+        let mut kept: Vec<&str> = cursor
+            .barren_dirs
+            .keys()
+            .map(|dir| dir.to_str().unwrap())
+            .collect();
+        kept.sort_unstable();
+        // /r/a was cached by an earlier pass and gained a candidate below it.
+        assert_eq!(kept, ["/r/x", "/r/x/y"]);
+        for marked in ["/r/a/b/target", "/r/a/b", "/r/a", "/r", "/"] {
+            assert!(candidates.contains(Path::new(marked)), "{marked}");
+        }
+        assert!(candidates.contains(Path::new("/r/a/b/node_modules")));
+    }
+
+    /// bd-y70k: a pass that stops on its budget must not cache a listed
+    /// directory as barren while ground below it is unseen. One worker walks
+    /// breadth-first, so a pass that stops after the top level has listed
+    /// every top-level directory and seen nothing below; the next pass must
+    /// still reach a directory two levels down. The old rule (visited minus
+    /// candidates) cached every top-level directory and never reached it.
+    #[test]
+    fn the_pass_after_a_budget_stop_reaches_ground_the_stopped_pass_never_saw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for top in 0..8 {
+            for mid in 0..3 {
+                std::fs::create_dir_all(root.join(format!("t{top}/m{mid}"))).unwrap();
+            }
+        }
+        let deep = root.join("t5/m1/target");
+        std::fs::create_dir_all(&deep).unwrap();
+        let config = |excluded: HashSet<PathBuf>| WalkerConfig {
+            root_paths: vec![root.to_path_buf()],
+            max_depth: 10,
+            follow_symlinks: false,
+            cross_devices: false,
+            parallelism: 1,
+            excluded_paths: excluded,
+            opaque_pruning: false,
+        };
+
+        // Pass 1 stops after the eight top-level directories.
+        let walker =
+            DirectoryWalker::new(config(HashSet::new()), ProtectionRegistry::marker_only());
+        let cancel = walker.cancel_token();
+        let mut stream = walker.stream().unwrap();
+        let visited: HashSet<PathBuf> = stream.by_ref().take(8).map(|entry| entry.path).collect();
+        cancel.store(true, Ordering::Relaxed);
+        assert!(visited.iter().all(|dir| dir.parent() == Some(root)));
+        let mut non_barren = HashSet::new();
+        for path in stream.unfinished_after_cancel(WALK_STOP_WAIT).unwrap() {
+            mark_non_barren(&mut non_barren, &path);
+        }
+        let mut cursor = ScanCursor::new();
+        cursor.update(&visited, &non_barren, true);
+        let mut old_rule = ScanCursor::new();
+        old_rule.update(&visited, &HashSet::new(), true);
+
+        let second_pass = |cursor: &ScanCursor| -> Vec<PathBuf> {
+            DirectoryWalker::new(
+                config(cursor.barren_exclusions()),
+                ProtectionRegistry::marker_only(),
+            )
+            .walk()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect()
+        };
+        assert!(second_pass(&cursor).contains(&deep));
+        assert!(!second_pass(&old_rule).contains(&deep));
+    }
+
+    #[test]
+    fn scan_cursor_keeps_only_fresh_barren_dirs_when_they_fill_the_cap() {
+        let mut cursor = scan_cursor(3, &[("/old/a", 1), ("/old/b", 2)]);
+        let visited: HashSet<PathBuf> = (1..=10)
+            .map(|n| PathBuf::from(format!("/new/{n}")))
+            .collect();
+
+        cursor.update(&visited, &path_set(&["/new/1"]), true);
+
+        assert_eq!(cursor.barren_dirs.len(), 3);
+        for dir in cursor.barren_dirs.keys() {
+            assert!(
+                dir.starts_with("/new"),
+                "older entry kept: {}",
+                dir.display()
+            );
+            assert_ne!(
+                dir,
+                Path::new("/new/1"),
+                "a dir with candidates is never barren"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_cursor_fills_spare_room_with_the_newest_cached_dirs() {
+        let mut cursor = scan_cursor(
+            4,
+            &[
+                ("/old/1", 1),
+                ("/old/2", 2),
+                ("/old/3", 3),
+                ("/old/4", 4),
+                ("/old/expired", 40),
+            ],
+        );
+        // /old/2 was walked again and is still barren; /old/3 gained candidates.
+        let visited = path_set(&["/new/a", "/new/b", "/old/2", "/cand"]);
+
+        cursor.update(&visited, &path_set(&["/cand", "/old/3"]), true);
+
+        let mut kept: Vec<&str> = cursor
+            .barren_dirs
+            .keys()
+            .map(|dir| dir.to_str().unwrap())
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["/new/a", "/new/b", "/old/1", "/old/2"]);
+        assert!(
+            cursor.barren_dirs[Path::new("/old/2")] < cursor.barren_dirs[Path::new("/new/a")],
+            "a dir already cached keeps its older timestamp"
+        );
+
+        // A pass that completes forgets everything.
+        cursor.update(&visited, &HashSet::new(), false);
+        assert!(cursor.barren_dirs.is_empty());
+    }
+
+    #[test]
     fn executor_preflight_skips_config_protected_daemon_candidate() {
-        let temp = tempfile::tempdir().unwrap();
+        // Under /tmp, never the default temp dir: on rch workers that sits
+        // inside the synced /data/projects tree, where the earlier
+        // hardcoded-source-tree veto skips the candidate first (bd-c47s).
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
         let protected = temp
             .path()
             .join("asupersync_ansi_c")
@@ -10128,7 +12704,7 @@ mod tests {
             let mut protection = protection.lock();
             daemon_protection_reason(&mut protection, path, &sacred_paths)
                 .unwrap()
-                .is_some()
+                .map(|_| SkipReason::SacredStowaway)
         };
 
         let executor = DeletionExecutor::new(
@@ -10146,10 +12722,788 @@ mod tests {
 
         assert_eq!(report.items_deleted, 0);
         assert_eq!(report.items_skipped, 1);
+        assert_eq!(
+            report.skipped_by_reason.get("sacred_stowaway"),
+            Some(&1),
+            "skipped for another reason first: {:?}",
+            report.skipped_by_reason
+        );
         assert!(
             protected.exists(),
             "protected candidate must remain present after executor preflight"
         );
+    }
+
+    /// bd-232u: a pattern protecting the whole root stops an ordinary batch
+    /// but not a target-only one; a pattern naming a dir inside the root and
+    /// a `.sbh-protect` marker above the target stop both; a target-only batch never reaches
+    /// outside its root or deletes a candidate without an identity. The
+    /// executor is composed in the test as `executor_thread_main` composes it
+    /// (`retain_target_only_candidates`, `batch_protected_paths`), not run on
+    /// its thread, and with the mock platform's open-file evidence: in a
+    /// non-root test the real /proc sweep is incomplete and holds every
+    /// candidate, whatever its protection.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn executor_lifts_only_root_wide_protection_for_target_only_batches() {
+        use crate::scanner::walker::{FsEntryKind, FsIdentity};
+        use std::os::unix::fs::MetadataExt;
+
+        // Under /tmp, as above (bd-c47s).
+        let scratch = tempfile::tempdir_in("/tmp").unwrap();
+        let root = scratch.path().join("claude-501");
+        let ordinary = root.join("a/target-ordinary");
+        let target_only = root.join("b/target-only");
+        let marked = root.join("c/target-marked");
+        let named = root.join("d/target-named");
+        let no_identity = root.join("e/target-no-identity");
+        let outside = scratch.path().join("elsewhere/target-outside");
+        for dir in [
+            &ordinary,
+            &target_only,
+            &marked,
+            &named,
+            &no_identity,
+            &outside,
+        ] {
+            std::fs::create_dir_all(dir.join("debug")).unwrap();
+            std::fs::write(dir.join("debug/libdemo.rlib"), [7u8; 64]).unwrap();
+        }
+        // On the target's parent, inside the root: the target itself stays
+        // pure (a marker at its own top level would make it impure, and the
+        // purity re-check would drop it before the marker check ran).
+        protection::create_marker(marked.parent().unwrap(), None).unwrap();
+        let scanner = crate::core::config::ScannerConfig {
+            protected_paths: vec![
+                root.to_string_lossy().into_owned(),
+                named.to_string_lossy().into_owned(),
+            ],
+            ..Default::default()
+        };
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+
+        let candidate = |path: &PathBuf| {
+            let meta = std::fs::symlink_metadata(path).unwrap();
+            let mut candidate = test_candidate(&path.to_string_lossy(), 3.0);
+            candidate.size_bytes = 64;
+            candidate.identity = Some(FsIdentity {
+                device_id: meta.dev(),
+                inode: meta.ino(),
+                kind: FsEntryKind::Directory,
+            });
+            candidate
+        };
+        let run = |paths: &[&PathBuf], target_only_root: Option<&Path>| {
+            let mut batch = DeletionBatch {
+                candidates: paths
+                    .iter()
+                    .map(|path| {
+                        let mut candidate = candidate(path);
+                        if *path == &no_identity {
+                            candidate.identity = None;
+                        }
+                        candidate
+                    })
+                    .collect(),
+                pressure_level: PressureLevel::Critical,
+                urgency: 0.9,
+                target_bytes: None,
+                target_only_root: target_only_root.map(Path::to_path_buf),
+            };
+            let dropped = retain_target_only_candidates(&mut batch);
+            let patterns = batch_protected_paths(&batch, &scanner);
+            let skip_sacred = protection::sacred_paths_from_protected_patterns(&patterns);
+            let mut catalog = platform.sacred_paths();
+            catalog.extend(skip_sacred.iter().cloned());
+            let registry = Mutex::new(ProtectionRegistry::new(Some(&patterns)).unwrap());
+            let skip_protected = |path: &Path| {
+                let mut registry = registry.lock();
+                daemon_protection_reason(&mut registry, path, &skip_sacred)
+                    .unwrap()
+                    .map(|_| SkipReason::SacredStowaway)
+            };
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    dry_run: false,
+                    min_score: 0.0,
+                    check_open_files: true,
+                    require_identity: true,
+                    sacred_paths: catalog,
+                    mode: DeletionMode::Unlink,
+                    ..Default::default()
+                },
+                None,
+            )
+            .with_platform(Arc::clone(&platform));
+            let plan = executor.plan(batch.candidates);
+            (dropped, executor.execute(&plan, Some(&skip_protected)))
+        };
+
+        let (dropped, report) = run(&[&ordinary], None);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            report.skipped_by_reason.get("sacred_stowaway"),
+            Some(&1),
+            "{:?}",
+            report.skipped_by_reason
+        );
+        assert!(ordinary.exists(), "protected_paths stop an ordinary batch");
+
+        let (dropped, report) = run(
+            &[&target_only, &marked, &named, &no_identity, &outside],
+            Some(&root),
+        );
+        assert_eq!(dropped, 2, "outside the root, and without an identity");
+        assert_eq!(report.items_deleted, 1, "{:?}", report.skipped_by_reason);
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&2));
+        assert!(
+            !target_only.exists(),
+            "a target-only batch is not stopped by a pattern covering its root"
+        );
+        assert!(marked.exists(), "a marker stops a target-only batch");
+        assert!(
+            named.exists(),
+            "a pattern naming a dir inside the root still applies"
+        );
+        assert!(no_identity.exists());
+        assert!(
+            outside.exists(),
+            "a target-only batch stays inside its root"
+        );
+    }
+
+    /// A target-only batch can outlive the purity observation that admitted
+    /// it. Adding user data preserves the directory inode, so the exception
+    /// must be renewed for each candidate after the expensive preflight.
+    #[cfg(unix)]
+    #[test]
+    fn target_only_batch_rechecks_purity_before_each_mutation() {
+        use std::cell::Cell;
+
+        let scratch = tempfile::tempdir_in("/tmp").unwrap();
+        let root = scratch.path().join("claude-501");
+        let first = root.join("s1/target-first");
+        let held = root.join("s2/target-held");
+        let mut candidates = Vec::new();
+        for (path, score) in [(&first, 2.0), (&held, 1.0)] {
+            std::fs::create_dir_all(path.join("debug")).unwrap();
+            std::fs::write(path.join("debug/libdemo.rlib"), [7u8; 64]).unwrap();
+            std::fs::write(path.join(".rustc_info.json"), b"{}").unwrap();
+            let mut candidate = test_candidate(&path.to_string_lossy(), score);
+            candidate.identity =
+                Some(crate::scanner::walker::identity_for_path(path, false).unwrap());
+            candidate.size_bytes = 66;
+            candidates.push(candidate);
+        }
+        let held_identity = candidates[1].identity;
+        let mut batch = DeletionBatch {
+            candidates,
+            pressure_level: PressureLevel::Critical,
+            urgency: 0.9,
+            target_bytes: None,
+            target_only_root: Some(root.clone()),
+        };
+        assert_eq!(retain_target_only_candidates(&mut batch), 0);
+        let scanner = crate::core::config::ScannerConfig {
+            protected_paths: vec![root.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let patterns = batch_protected_paths(&batch, &scanner);
+        assert!(
+            patterns.is_empty(),
+            "the batch lifts the root-wide protection"
+        );
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        let mut sacred_paths = platform.sacred_paths();
+        sacred_paths.extend(protection::sacred_paths_from_protected_patterns(&patterns));
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                dry_run: false,
+                min_score: 0.0,
+                check_open_files: true,
+                require_identity: true,
+                sacred_paths,
+                mode: DeletionMode::Unlink,
+                ..Default::default()
+            },
+            None,
+        )
+        .with_platform(platform);
+        let plan = executor.plan(std::mem::take(&mut batch.candidates));
+        assert_eq!(plan.candidates.len(), 2);
+        let authorizations = Cell::new(0);
+        let authorize = |candidate: &CandidacyScore| {
+            authorizations.set(authorizations.get() + 1);
+            authorize_target_only_candidate(candidate, batch.target_only_root.as_deref())
+        };
+        let add_user_data = |candidate: &CandidacyScore, _: Instant| {
+            assert_eq!(candidate.path, first);
+            assert!(!first.exists());
+            std::fs::create_dir(held.join("trace")).unwrap();
+            std::fs::write(held.join("trace/notes.txt"), b"operator evidence").unwrap();
+        };
+        let report =
+            executor.execute_with_hooks(&plan, None, Some(&authorize), Some(&add_user_data));
+        assert_eq!(
+            authorizations.get(),
+            2,
+            "both candidates reached the live guard"
+        );
+        assert_eq!(report.deleted_paths, vec![first]);
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.bytes_freed, 66);
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+        assert_eq!(
+            Some(crate::scanner::walker::identity_for_path(&held, false).unwrap()),
+            held_identity,
+            "the protected content appeared without replacing the directory",
+        );
+        assert_eq!(
+            std::fs::read(held.join("trace/notes.txt")).unwrap(),
+            b"operator evidence",
+        );
+        assert!(authorize_target_only_candidate(&plan.candidates[1], None).is_ok());
+    }
+
+    /// bd-232u gap (b): a target dir the tier surveyed as pure that gained a
+    /// non-cargo entry before its batch reached the executor (a trace dir, a
+    /// log) is dropped; one that stayed pure goes on, as does an ordinary
+    /// batch, which this re-check does not touch.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_only_candidate_that_turned_impure_since_its_survey_is_dropped() {
+        use crate::scanner::walker::{FsEntryKind, FsIdentity};
+        use std::os::unix::fs::MetadataExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().join("claude-501");
+        let still_pure = root.join("s1/target-a");
+        let turned = root.join("s2/target-b");
+        for dir in [&still_pure, &turned] {
+            std::fs::create_dir_all(dir.join("debug")).unwrap();
+            std::fs::write(dir.join("debug/libdemo.rlib"), [7u8; 64]).unwrap();
+            std::fs::write(dir.join(".rustc_info.json"), b"{}").unwrap();
+        }
+        let candidates = || {
+            [&still_pure, &turned]
+                .into_iter()
+                .map(|path| {
+                    let meta = std::fs::symlink_metadata(path).unwrap();
+                    let mut candidate = test_candidate(&path.to_string_lossy(), 3.0);
+                    candidate.identity = Some(FsIdentity {
+                        device_id: meta.dev(),
+                        inode: meta.ino(),
+                        kind: FsEntryKind::Directory,
+                    });
+                    candidate
+                })
+                .collect::<Vec<_>>()
+        };
+        let batch = |target_only_root: Option<PathBuf>| DeletionBatch {
+            candidates: candidates(),
+            pressure_level: PressureLevel::Critical,
+            urgency: 0.9,
+            target_bytes: None,
+            target_only_root,
+        };
+
+        let mut before = batch(Some(root.clone()));
+        assert_eq!(retain_target_only_candidates(&mut before), 0, "both pure");
+
+        // Written into the target after the survey: the same inode, now work.
+        std::fs::create_dir(turned.join("trace")).unwrap();
+        let mut after = batch(Some(root));
+        assert_eq!(retain_target_only_candidates(&mut after), 1);
+        let kept: Vec<&Path> = after.candidates.iter().map(|c| c.path.as_path()).collect();
+        assert_eq!(kept, [still_pure.as_path()]);
+
+        let mut ordinary = batch(None);
+        assert_eq!(retain_target_only_candidates(&mut ordinary), 0);
+        assert_eq!(ordinary.candidates.len(), 2);
+    }
+
+    /// bd-232u, through the executor thread itself (`spawn_executor_thread`):
+    /// a target-only batch's candidate outside its root is dropped before the
+    /// policy engine, so it never reaches the decision ledger, while the one
+    /// inside does. What the thread then deletes depends on the host's /proc
+    /// sweep (incomplete without root, which holds everything), so deletion
+    /// is not asserted.
+    #[cfg(unix)]
+    #[test]
+    fn executor_thread_drops_target_only_candidates_outside_their_root() {
+        use crate::scanner::walker::{FsEntryKind, FsIdentity};
+        use std::os::unix::fs::MetadataExt;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let base = fixture.directory.path().to_path_buf();
+        let root = base.join("claude-501");
+        let inside = root.join("s1/target-inside");
+        let outside = base.join("elsewhere/target-outside");
+        let candidates = [&inside, &outside]
+            .into_iter()
+            .map(|path| {
+                std::fs::create_dir_all(path.join("debug")).unwrap();
+                std::fs::write(path.join("debug/libdemo.rlib"), [7u8; 64]).unwrap();
+                let meta = std::fs::symlink_metadata(path).unwrap();
+                let mut candidate = test_candidate(&path.to_string_lossy(), 3.0);
+                candidate.size_bytes = 64;
+                candidate.identity = Some(FsIdentity {
+                    device_id: meta.dev(),
+                    inode: meta.ino(),
+                    kind: FsEntryKind::Directory,
+                });
+                candidate
+            })
+            .collect();
+        let (del_tx, del_rx) = crossbeam_channel::bounded(1);
+        let (report_tx, _report_rx) = crossbeam_channel::bounded(16);
+        let (index_tx, _index_rx) = crossbeam_channel::bounded(16);
+        let executor = fixture
+            .daemon
+            .spawn_executor_thread(
+                del_rx,
+                fixture.daemon.logger_handle.clone(),
+                ThreadHeartbeat::new("sbh-executor"),
+                report_tx,
+                index_tx,
+            )
+            .unwrap();
+        del_tx
+            .send(DeletionBatch {
+                candidates,
+                pressure_level: PressureLevel::Critical,
+                urgency: 0.9,
+                target_bytes: None,
+                target_only_root: Some(root),
+            })
+            .unwrap();
+        // The thread handles the batch, then stops on the closed channel.
+        drop(del_tx);
+        executor.join().unwrap();
+        fixture.flush_logger();
+
+        let log = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
+        assert!(
+            log.contains("dropped 1 target-only candidate(s) outside"),
+            "{log}"
+        );
+        assert!(
+            log.contains(inside.to_string_lossy().as_ref()),
+            "the candidate inside the root reaches the ledger: {log}"
+        );
+        assert!(
+            !log.contains(outside.to_string_lossy().as_ref()),
+            "the one outside never does"
+        );
+        assert!(outside.join("debug/libdemo.rlib").exists());
+    }
+
+    /// Through the executor thread itself: a candidate with nothing to
+    /// reclaim is dropped before the policy engine, so no decision is recorded
+    /// for it and its tree is untouched, while a sized sibling in the same
+    /// batch reaches the ledger as before.
+    #[cfg(unix)]
+    #[test]
+    fn executor_thread_drops_zero_byte_candidates_before_the_policy_engine() {
+        let mut fixture = RegretDaemonFixture::new();
+        let base = fixture.directory.path().join("project");
+        let sized = base.join("sized/target");
+        let empty = base.join("hardlinked/node_modules");
+        let candidates = [(&sized, 64_u64), (&empty, 0)]
+            .into_iter()
+            .map(|(path, bytes)| {
+                std::fs::create_dir_all(path).unwrap();
+                std::fs::write(path.join("payload"), [7u8; 64]).unwrap();
+                let mut candidate = test_candidate(&path.to_string_lossy(), 3.0);
+                candidate.size_bytes = bytes;
+                candidate
+            })
+            .collect();
+        let (del_tx, del_rx) = crossbeam_channel::bounded(1);
+        let (report_tx, _report_rx) = crossbeam_channel::bounded(16);
+        let (index_tx, _index_rx) = crossbeam_channel::bounded(16);
+        let executor = fixture
+            .daemon
+            .spawn_executor_thread(
+                del_rx,
+                fixture.daemon.logger_handle.clone(),
+                ThreadHeartbeat::new("sbh-executor"),
+                report_tx,
+                index_tx,
+            )
+            .unwrap();
+        del_tx
+            .send(DeletionBatch {
+                candidates,
+                pressure_level: PressureLevel::Critical,
+                urgency: 0.9,
+                target_bytes: None,
+                target_only_root: None,
+            })
+            .unwrap();
+        drop(del_tx);
+        executor.join().unwrap();
+        fixture.flush_logger();
+
+        let log = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
+        assert!(
+            log.contains("dropped 1 zero-byte candidate(s) before the policy engine"),
+            "{log}"
+        );
+        assert!(
+            log.contains(sized.to_string_lossy().as_ref()),
+            "the sized candidate reaches the ledger: {log}"
+        );
+        assert!(
+            !log.contains(empty.to_string_lossy().as_ref()),
+            "the zero-byte one never does"
+        );
+        assert!(empty.join("payload").exists());
+    }
+
+    #[test]
+    fn zero_byte_candidates_are_dropped_and_counted() {
+        let mut batch = DeletionBatch {
+            candidates: vec![
+                test_candidate("/data/tmp/a/node_modules", 2.0),
+                test_candidate("/data/tmp/b/target", 2.5),
+                test_candidate("/data/tmp/c/node_modules", 1.5),
+            ],
+            pressure_level: PressureLevel::Critical,
+            urgency: 0.9,
+            target_bytes: None,
+            target_only_root: None,
+        };
+        batch.candidates[0].size_bytes = 0;
+        batch.candidates[1].size_bytes = 4096;
+        batch.candidates[2].size_bytes = 0;
+        assert_eq!(drop_zero_byte_candidates(&mut batch), 2);
+        assert_eq!(batch.candidates.len(), 1);
+        assert_eq!(batch.candidates[0].path, Path::new("/data/tmp/b/target"));
+        assert_eq!(drop_zero_byte_candidates(&mut batch), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_compression_guard_holds_queued_work_without_poisoning_its_retry() {
+        use crate::daemon::compress_tier::RootStatus;
+
+        let fixture = RegretDaemonFixture::new();
+        let candidates_dir = tempfile::tempdir_in("/tmp").unwrap();
+        let project = candidates_dir.path().join("project");
+        let path = project.join("target");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("artifact.o"), [7_u8; 16]).unwrap();
+        let mut candidate = test_candidate(&path.to_string_lossy(), 1.0);
+        candidate.identity = Some(crate::scanner::walker::identity_for_path(&path, false).unwrap());
+        candidate.size_bytes = 16;
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                dry_run: false,
+                min_score: 0.0,
+                check_open_files: true,
+                require_identity: true,
+                ..Default::default()
+            },
+            Some(fixture.daemon.logger_handle.clone()),
+        )
+        .with_platform(Arc::clone(&fixture.daemon.platform));
+        // The plan already exists before the lossless pass publishes its hold.
+        let plan = executor.plan(vec![candidate.clone()]);
+        assert_eq!(plan.candidates.len(), 1);
+        let shared = &fixture.daemon.shared_executor_config;
+        shared.compression_first.begin(
+            &[RootStatus {
+                root: project,
+                btrfs: true,
+                level: Some(PressureLevel::Orange),
+                mount_point: Some(PathBuf::from("/")),
+                device_id: candidate.identity.map(|identity| identity.device_id),
+            }],
+            &[],
+            Instant::now(),
+            Duration::from_secs(30),
+        );
+        let authorize = |candidate: &CandidacyScore| {
+            shared.authorize_compression_first(candidate, PressureLevel::Orange)
+        };
+        let held = executor.execute_with_guard(&plan, None, Some(&authorize));
+        assert_eq!(held.items_deleted, 0);
+        assert_eq!(held.items_failed, 0);
+        assert_eq!(held.skipped_by_reason.get("compression_first"), Some(&1));
+        assert!(
+            held.backoff_candidates.is_empty(),
+            "a temporary hold is not a path fault"
+        );
+        assert_eq!(std::fs::read(path.join("artifact.o")).unwrap(), [7_u8; 16]);
+        let emergency = |candidate: &CandidacyScore| {
+            shared.authorize_compression_first(candidate, PressureLevel::Red)
+        };
+        let released = executor.execute_with_guard(&plan, None, Some(&emergency));
+        assert_eq!(
+            released.items_deleted, 1,
+            "{:?}",
+            released.skipped_by_reason
+        );
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_regret_guard_stops_queued_category_after_a_midbatch_alarm() {
+        use std::cell::Cell;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let project = fixture.directory.path().join("project");
+        let first = project.join("first/target");
+        let held = project.join("held/target");
+        let other = project.join("other/node_modules");
+        let mut candidates = Vec::new();
+        for (path, category, score) in [
+            (&first, ArtifactCategory::RustTarget, 3.0),
+            (&held, ArtifactCategory::RustTarget, 2.0),
+            (&other, ArtifactCategory::NodeModules, 1.0),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("artifact.o"), [0u8; 16]).unwrap();
+            let mut candidate = test_candidate(&path.to_string_lossy(), score);
+            candidate.classification.category = category;
+            candidate.size_bytes = 16;
+            assert!(!candidate.decision.category_suspended);
+            candidates.push(candidate);
+        }
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                dry_run: false,
+                min_score: 0.0,
+                check_open_files: true,
+                ..Default::default()
+            },
+            Some(fixture.daemon.logger_handle.clone()),
+        )
+        .with_platform(Arc::clone(&fixture.daemon.platform));
+        let plan = executor.plan(candidates);
+        assert_eq!(plan.candidates.len(), 3);
+        let checks = Cell::new(0);
+        let authorize = |candidate: &CandidacyScore| {
+            checks.set(checks.get() + 1);
+            if candidate.path == held {
+                // The queued scores were all made before this alarm. Raise
+                // it only after a real deletion in this batch has completed.
+                assert!(!first.exists());
+                assert!(other.exists());
+                let mut calibrator = fixture.daemon.regret.calibrator.lock();
+                for _ in 0..3 {
+                    calibrator.record(
+                        "RustTarget",
+                        ArtifactCertainty::Definite,
+                        Outcome::Regret,
+                        Instant::now(),
+                    );
+                }
+            }
+            fixture
+                .daemon
+                .regret
+                .authorize_deletion(candidate, &fixture.daemon.logger_handle)
+        };
+        let report = executor.execute_with_guard(&plan, None, Some(&authorize));
+
+        assert_eq!(checks.get(), 3);
+        assert_eq!(report.items_deleted, 2);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.bytes_freed, 32);
+        assert_eq!(report.deleted_paths, vec![first.clone(), other.clone()]);
+        assert_eq!(report.skipped_by_reason.get("category_suspended"), Some(&1));
+        assert!(report.backoff_candidates.is_empty());
+        assert!(report.errors.is_empty());
+        assert!(!report.circuit_breaker_tripped);
+        assert!(!first.exists());
+        assert!(held.join("artifact.o").exists());
+        assert!(!other.exists());
+        fixture.flush_logger();
+        let log = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
+        assert!(log.contains("regret category RustTarget is suspended; skipped "));
+        assert!(log.contains(held.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_regret_guard_allows_an_expired_category_suspension() {
+        let fixture = RegretDaemonFixture::new();
+        let path = fixture.directory.path().join("project/target");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("artifact.o"), [0u8; 16]).unwrap();
+        // A zero-duration suspension expires at its alarm timestamp, so
+        // this exercises expiry without a sleep or wall-clock tolerance.
+        let mut config = fixture.daemon.config.clone();
+        config.scoring.regret_suspend_minutes = 0;
+        fixture.daemon.regret.update_config(&config);
+        {
+            let mut calibrator = fixture.daemon.regret.calibrator.lock();
+            for _ in 0..3 {
+                calibrator.record(
+                    "RustTarget",
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    Instant::now(),
+                );
+            }
+            let summary = calibrator.summary("RustTarget").unwrap();
+            assert_eq!(summary.regrets, 3);
+            assert_eq!(summary.e_value, 1.0, "the alarm resets its likelihood");
+            assert!(!calibrator.suspended("RustTarget", Instant::now()));
+            drop(calibrator);
+        }
+        let mut candidate = test_candidate(&path.to_string_lossy(), 1.0);
+        candidate.classification.category = ArtifactCategory::RustTarget;
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                dry_run: false,
+                min_score: 0.0,
+                check_open_files: true,
+                ..Default::default()
+            },
+            Some(fixture.daemon.logger_handle.clone()),
+        )
+        .with_platform(Arc::clone(&fixture.daemon.platform));
+        let plan = executor.plan(vec![candidate]);
+        let authorize = |candidate: &CandidacyScore| {
+            fixture
+                .daemon
+                .regret
+                .authorize_deletion(candidate, &fixture.daemon.logger_handle)
+        };
+        let report = executor.execute_with_guard(&plan, None, Some(&authorize));
+        assert_eq!(report.items_deleted, 1);
+        assert_eq!(report.items_skipped, 0);
+        assert_eq!(report.items_failed, 0);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn executor_watches_each_unlink_before_the_next_candidate_and_keeps_its_deadline() {
+        use std::cell::Cell;
+
+        for (after_secs, expected_outcome) in [(59, "regret"), (60, "unknown")] {
+            let mut fixture = RegretDaemonFixture::new();
+            let project = fixture.directory.path().join("project");
+            let first = project.join("target");
+            let later = project.join("node_modules");
+            let mut candidates = Vec::new();
+            for (path, category, score) in [
+                (&first, ArtifactCategory::RustTarget, 2.0),
+                (&later, ArtifactCategory::NodeModules, 1.0),
+            ] {
+                std::fs::create_dir(path).unwrap();
+                std::fs::write(path.join("artifact.o"), [0u8; 16]).unwrap();
+                let mut candidate = test_candidate(&path.to_string_lossy(), score);
+                candidate.classification.category = category;
+                candidate.size_bytes = 16;
+                candidates.push(candidate);
+            }
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    dry_run: false,
+                    min_score: 0.0,
+                    check_open_files: true,
+                    ..Default::default()
+                },
+                Some(fixture.daemon.logger_handle.clone()),
+            )
+            .with_platform(Arc::clone(&fixture.daemon.platform));
+            let plan = executor.plan(candidates);
+            assert_eq!(plan.candidates.len(), 2);
+            let identities: HashMap<_, _> = plan
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.path.clone(),
+                        EntryIdentity::of(&candidate.path).unwrap(),
+                    )
+                })
+                .collect();
+            let first_completed = Cell::new(None);
+            let later_completed = Cell::new(None);
+            let authorize = |candidate: &CandidacyScore| {
+                if candidate.path == later {
+                    let completed_at = first_completed
+                        .get()
+                        .expect("first unlink completes before the next authorization");
+                    assert_eq!(fixture.daemon.regret.detector.lock().pending(), 1);
+                    assert!(!first.exists());
+                    assert!(later.exists());
+                    // A recreation is observable while the same batch is
+                    // still running. Resolve it against the actual first
+                    // unlink timestamp, including the exact 60s boundary.
+                    std::fs::create_dir(&first).unwrap();
+                    fixture.daemon.resolve_regrets_with_clock(|| {
+                        completed_at + Duration::from_secs(after_secs)
+                    });
+                    assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
+                }
+                fixture
+                    .daemon
+                    .regret
+                    .authorize_deletion(candidate, &fixture.daemon.logger_handle)
+            };
+            let on_unlinked = |candidate: &CandidacyScore, completed_at: Instant| {
+                assert!(!candidate.path.exists());
+                fixture.daemon.regret.watch_unlinked(
+                    candidate,
+                    &identities[&candidate.path],
+                    completed_at,
+                );
+                if candidate.path == first {
+                    first_completed.set(Some(completed_at));
+                } else {
+                    assert_eq!(candidate.path, later);
+                    later_completed.set(Some(completed_at));
+                }
+            };
+            let report =
+                executor.execute_with_hooks(&plan, None, Some(&authorize), Some(&on_unlinked));
+
+            assert_eq!(report.items_deleted, 2);
+            assert_eq!(report.items_skipped, 0);
+            assert_eq!(report.items_failed, 0);
+            assert!(
+                first.exists(),
+                "the first path was recreated during the batch"
+            );
+            assert!(!later.exists());
+            assert_eq!(fixture.daemon.regret.detector.lock().pending(), 1);
+            let completed_at = later_completed.get().expect("later unlink observed");
+            fixture
+                .daemon
+                .resolve_regrets_with_clock(|| completed_at + Duration::from_secs(60));
+            assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
+
+            fixture.flush_logger();
+            let ledger = crate::logger::sqlite::SqliteLogger::open_read_only(
+                &fixture.daemon.config.paths.sqlite_db,
+            )
+            .unwrap();
+            for (candidate, expected, age) in [
+                (&plan.candidates[0], expected_outcome, after_secs),
+                (&plan.candidates[1], "clean", 60),
+            ] {
+                let id = crate::scanner::decision_record::stable_decision_id(
+                    &candidate.path,
+                    candidate.identity,
+                    candidate.size_bytes,
+                );
+                let outcomes = ledger.outcomes_for_decision(&id).unwrap();
+                assert_eq!(outcomes.len(), 1);
+                assert_eq!(outcomes[0].outcome, expected);
+                assert_eq!(outcomes[0].after_secs, age);
+            }
+        }
     }
 
     #[test]
@@ -10296,6 +13650,41 @@ mod tests {
         assert!(PassStop::Wall.ends_pass() && PassStop::Cpu.ends_pass());
     }
 
+    /// The pre-scan stops at its share of the pass's CPU allowance and hands
+    /// the rest to the walk; with the budget off it has no CPU share at all.
+    #[test]
+    fn prescan_spends_only_its_share_of_the_pass_cpu() {
+        let start = Instant::now();
+        let cpu = Arc::new(Mutex::new(0.0_f64));
+        let handle = Arc::clone(&cpu);
+        let guard = PassCpuGuard::new(Some(4.0), start, move || Some(*handle.lock()))
+            .with_sample_interval(Duration::ZERO);
+        let mut limits = PassLimits::new(
+            start,
+            start + Duration::from_mins(15),
+            Duration::from_mins(15),
+            guard,
+        );
+        *cpu.lock() = 1.9;
+        assert_eq!(limits.prescan_stop(), None);
+        *cpu.lock() = 2.0;
+        let stop = limits.prescan_stop().expect("half the allowance is spent");
+        assert_eq!(stop, PassStop::PrescanCpuShare);
+        assert!(!stop.ends_pass(), "the walk gets the other half");
+        assert_eq!(limits.walk_stop(), None);
+        *cpu.lock() = 4.0;
+        assert_eq!(limits.walk_stop(), Some(PassStop::Cpu));
+        assert_eq!(limits.prescan_stop(), Some(PassStop::Cpu));
+
+        let mut unlimited = PassLimits::new(
+            start,
+            start + Duration::from_mins(15),
+            Duration::from_mins(15),
+            PassCpuGuard::unlimited(start),
+        );
+        assert_eq!(unlimited.prescan_stop(), None);
+    }
+
     /// A spent CPU allowance ends the pass; an unspent one does not, however
     /// long the pass has been running in wall time. This is the invariant the
     /// old `cpu_secs / parallelism` wall conversion got backwards.
@@ -10403,12 +13792,17 @@ mod tests {
     /// re-examined the same leading directories on every pass and logged
     /// `0 entries, 0 candidates` forever while the disk filled.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn prescan_resumes_from_the_persisted_cursor_instead_of_restarting() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("scan-root");
         for name in ["aaa_repo", "zzz_repo"] {
             let repo = root.join(name);
             std::fs::create_dir_all(repo.join(".git")).unwrap();
+            // A Rust repo: the pre-scan classifies its target as the walk
+            // does, and the walk takes a marked target whole only beside its
+            // manifest or under a temp root (TMPDIR may be neither).
+            std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"r\"\n").unwrap();
             let debug = repo.join("target").join("debug");
             std::fs::create_dir_all(debug.join("deps")).unwrap();
             std::fs::write(debug.join("artifact.o"), b"mock object file").unwrap();
@@ -10539,7 +13933,7 @@ mod tests {
             walker_targets: usize,
             replayed: usize,
         }
-        let temp = tempfile::tempdir().unwrap();
+        let temp = temp_root_scratch_dir();
         let root = temp.path().join("scan-root");
         // 600 repositories, each with a nested `target/debug` the pre-scan
         // must classify: several thousand directories in total.
@@ -10787,7 +14181,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // one end-to-end scanner pass
     fn scanner_prescan_discovers_target_in_repo_with_beads_tracker() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = temp_root_scratch_dir();
         let root = temp.path().join("scan-root");
         let repo = root.join("my_beads_project");
         let beads_dir = repo.join(".beads");
@@ -11137,6 +14531,236 @@ mod tests {
         }
     }
 
+    /// A slow startup step keeps asking for more time and stops once it
+    /// returns; a hung step stops being extended at `max`, so the service
+    /// manager's own timeout still fails the start.
+    #[test]
+    fn startup_extension_repeats_while_the_step_runs_and_stops_after() {
+        use crate::platform::pal::ServiceManager;
+
+        #[derive(Clone, Default)]
+        struct Recorder(Arc<Mutex<Vec<(Duration, String)>>>);
+        impl ServiceManager for Recorder {
+            fn install(&self) -> Result<()> {
+                Ok(())
+            }
+            fn uninstall(&self) -> Result<()> {
+                Ok(())
+            }
+            fn status(&self) -> Result<String> {
+                Ok("active".to_string())
+            }
+            fn notify_extend_startup(&self, extend_by: Duration, status: &str) -> Result<()> {
+                self.0.lock().push((extend_by, status.to_string()));
+                Ok(())
+            }
+        }
+
+        let extension = StartupExtension {
+            extend_by: Duration::from_secs(30),
+            every: Duration::from_millis(20),
+            max: Duration::from_mins(1),
+        };
+        let recorder = Recorder::default();
+        let never = AtomicBool::new(false);
+        let value = with_startup_extension(
+            Box::new(recorder.clone()),
+            "provisioning ballast",
+            extension,
+            &never,
+            || {
+                std::thread::sleep(Duration::from_millis(110));
+                7
+            },
+        );
+        assert_eq!(value, 7);
+        let calls = recorder.0.lock().len();
+        assert!(calls >= 2, "extensions while the step ran: {calls}");
+        assert!(
+            recorder
+                .0
+                .lock()
+                .iter()
+                .all(|(by, status)| *by == Duration::from_secs(30)
+                    && status == "provisioning ballast")
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            recorder.0.lock().len(),
+            calls,
+            "none after the step returned"
+        );
+
+        let hung = Recorder::default();
+        with_startup_extension(
+            Box::new(hung.clone()),
+            "hung",
+            StartupExtension {
+                max: Duration::from_millis(50),
+                ..extension
+            },
+            &never,
+            || std::thread::sleep(Duration::from_millis(200)),
+        );
+        let calls = hung.0.lock().len();
+        assert!(
+            (1..=4).contains(&calls),
+            "extensions for a hung step: {calls}"
+        );
+
+        // A stop request ends the extensions while the step still runs, so
+        // the service manager's stop timeout applies again.
+        let stopping = Recorder::default();
+        let stop = AtomicBool::new(false);
+        with_startup_extension(
+            Box::new(stopping.clone()),
+            "provisioning ballast",
+            extension,
+            &stop,
+            || {
+                std::thread::sleep(Duration::from_millis(50));
+                stop.store(true, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(40));
+                let at_stop = stopping.0.lock().len();
+                std::thread::sleep(Duration::from_millis(150));
+                assert!(
+                    stopping.0.lock().len() <= at_stop + 1,
+                    "extensions continued after the stop request"
+                );
+            },
+        );
+    }
+
+    /// A failure backoff outlives a pass over other roots. hz1, 2026-10-14:
+    /// maintenance, per-mount and special-location passes each walk a
+    /// different subset of the configured roots, the index was keyed on the
+    /// subset and rebuilt on about half the passes, and `~/.cache/uv` (always
+    /// refused by the deletion preflight: it holds git checkouts) was planned
+    /// 40 times in two hours.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn failure_backoff_survives_a_pass_over_other_roots() {
+        use crate::scanner::walker::identity_for_path;
+
+        fn run_pass(
+            temp: &Path,
+            roots: &[PathBuf],
+            pass_root: &Path,
+            feedback: Option<ScannerIndexFeedback>,
+            label: &str,
+        ) -> bool {
+            let mut config = Config::default();
+            config.scanner.root_paths = roots.to_vec();
+            config.scanner.min_file_age_minutes = 0;
+            config.scanner.active_reference_min_size_bytes = u64::MAX;
+
+            let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+                sqlite_path: None,
+                jsonl_config: crate::logger::jsonl::JsonlConfig {
+                    path: temp.join(format!("activity-{label}.jsonl")),
+                    fallback_path: None,
+                    max_size_bytes: 1_048_576,
+                    max_rotated_files: 0,
+                    fsync_interval_secs: 0,
+                },
+                channel_capacity: 64,
+                run_id: None,
+            })
+            .unwrap();
+            let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+            let (del_tx, del_rx) = bounded::<DeletionBatch>(4);
+            let (report_tx, _report_rx) = bounded::<WorkerReport>(4);
+            let (index_feedback_tx, index_feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+            if let Some(feedback) = feedback {
+                index_feedback_tx.send(feedback).unwrap();
+            }
+            let executor_config = Arc::new(SharedExecutorConfig::new(
+                false, 10, 0.0, 60, 3600, false, 0,
+            ));
+            executor_config.set_min_certainty(ArtifactCertainty::Likely);
+            scan_tx
+                .send(ScanRequest {
+                    paths: vec![pass_root.to_path_buf()],
+                    urgency: 0.9,
+                    pressure_level: PressureLevel::Orange,
+                    free_pct: Some(9.0),
+                    max_delete_batch: 10,
+                    force_full_scan: false,
+                    config_update: None,
+                    catalog_roots: Vec::new(),
+                    maintenance: false,
+                    target_bytes: None,
+                })
+                .unwrap();
+            drop(scan_tx);
+
+            scanner_thread_main(
+                &scan_rx,
+                &del_tx,
+                &logger,
+                &Arc::new(RwLock::new(config.scoring)),
+                &Arc::new(RwLock::new(config.scanner)),
+                &(Arc::new(MockPlatform::healthy()) as Arc<dyn Platform>),
+                &ThreadHeartbeat::new("test-scanner"),
+                &report_tx,
+                &Arc::new(AtomicBool::new(false)),
+                &temp.join("scanner-index.json"),
+                &temp.join("prescan-cursor.json"),
+                &index_feedback_rx,
+                &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+                &executor_config,
+                &Arc::new(SharedRegret::new(&Config::default())),
+            );
+            logger.shutdown();
+            logger_join.join().unwrap();
+            del_rx.try_recv().is_ok()
+        }
+
+        let temp = non_temp_scratch_dir();
+        let root_a = temp.path().join("root-a");
+        let root_b = temp.path().join("root-b");
+        std::fs::create_dir_all(&root_b).unwrap();
+        // A definite cargo target: dispatched at Orange on its first walk.
+        let project = root_a.join("crate");
+        let debug = project.join("target").join("debug");
+        for sub in ["deps", "incremental", ".fingerprint"] {
+            std::fs::create_dir_all(debug.join(sub)).unwrap();
+        }
+        std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"crate\"\n").unwrap();
+        std::fs::write(
+            project.join("target").join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n",
+        )
+        .unwrap();
+        std::fs::write(debug.join("deps").join("libcrate.rlib"), vec![0xA5u8; 8192]).unwrap();
+        std::fs::write(debug.join("incremental").join("unit-0"), b"x").unwrap();
+        std::fs::write(debug.join(".fingerprint").join("lib-crate"), b"x").unwrap();
+        let roots = vec![root_a.clone(), root_b.clone()];
+
+        assert!(
+            run_pass(temp.path(), &roots, &root_a, None, "first"),
+            "precondition: the target is dispatched on its first walk"
+        );
+        // The executor refused it (e.g. a preflight veto); the feedback lands
+        // while the daemon is relieving a different root.
+        let identity = identity_for_path(&project.join("target"), false).unwrap();
+        let feedback = ScannerIndexFeedback {
+            identity: identity.into(),
+            path: project.join("target"),
+        };
+        assert!(!run_pass(
+            temp.path(),
+            &roots,
+            &root_b,
+            Some(feedback),
+            "other-root"
+        ));
+        assert!(
+            !run_pass(temp.path(), &roots, &root_a, None, "again"),
+            "a refused candidate is not re-dispatched while its backoff runs"
+        );
+    }
+
     /// bd-8aeq: a `Delete` verdict below the behavior cell's certainty gate is
     /// not dispatched by the scanner, does not count as a candidate, and leaves
     /// the pass unproductive so the empty-pass cooldown arms. Measured before
@@ -11309,8 +14933,8 @@ mod tests {
             held.log
         );
 
-        // The record persisted by the open run is replayed from the index on
-        // the next pass and held there too, without a walk.
+        // The next daemon holds the same tree too. Its event source revokes
+        // the record the open run persisted, so the root is reconciled.
         let replayed = run_scan(
             temp.path(),
             &root,
@@ -11324,7 +14948,7 @@ mod tests {
             replayed.log.contains(
                 "scanner certainty gate held 1 candidate(s) below likely (pressure=Orange)"
             ),
-            "the replayed record, the pre-scan and the walk hold one path: {}",
+            "the pre-scan and the walk hold one path: {}",
             replayed.log
         );
 
@@ -11373,20 +14997,22 @@ mod tests {
             1,
             "index-cargo.json",
         );
-        // On macOS the FSEvents backend's startup replan marks the roots
-        // dirty, so a fresh daemon reconciles instead of replaying (by
-        // design, see README "What feeds the index"); the certainty
+        // A fresh event source revokes the evidence saved before it started
+        // (`BackendRestart` on Linux, the FSEvents startup replan on macOS;
+        // by design, see README "What feeds the index"), so a new daemon
+        // reconciles the root instead of replaying the record. The certainty
         // assertions below hold either way.
         if cfg!(target_os = "linux") {
             assert!(
-                replayed_target.log.contains("replayed_records=1"),
-                "the second pass replays the persisted record: {}",
+                replayed_target.log.contains("replayed_records=0")
+                    && replayed_target.log.contains("reason=BackendRestart"),
+                "a fresh daemon revokes evidence saved before it started instead of replaying it: {}",
                 replayed_target.log
             );
         }
         assert!(
             replayed_target.dispatched,
-            "the replayed target keeps its definite certainty and is dispatched again: {}",
+            "the target keeps its definite certainty on the next daemon's pass and is dispatched again: {}",
             replayed_target.log
         );
         assert!(
@@ -11503,12 +15129,14 @@ mod tests {
         let report = report_rx
             .try_recv()
             .expect("forced v2 scan should report completion");
-        match report {
-            WorkerReport::ScanCompleted { root_stats, .. } => {
-                assert_eq!(root_stats.len(), 1);
-            }
-            WorkerReport::DeletionCompleted { .. } => panic!("expected scanner completion report"),
-        }
+        assert!(
+            matches!(&report, WorkerReport::ScanCompleted {
+                root_stats,
+                pressure_level: PressureLevel::Green,
+                ..
+            } if root_stats.len() == 1),
+            "forced Green scan reports one root at Green: {report:?}"
+        );
 
         logger.shutdown();
         logger_join.join().unwrap();
@@ -11621,9 +15249,11 @@ mod tests {
             BehaviorUpdate::Deferred {
                 direction,
                 remaining,
+                repeated,
             } => {
                 assert_eq!(direction, BehaviorTransitionDirection::Escalating);
                 assert_eq!(remaining, Duration::from_secs(4));
+                assert!(!repeated, "a new target's deferral is logged");
             }
             other => panic!("second escalation should be deferred: {other:?}"),
         }
@@ -11676,9 +15306,11 @@ mod tests {
             BehaviorUpdate::Deferred {
                 direction,
                 remaining,
+                repeated,
             } => {
                 assert_eq!(direction, BehaviorTransitionDirection::Recovering);
                 assert_eq!(remaining, Duration::from_secs(4));
+                assert!(!repeated, "a new target's deferral is logged");
             }
             other => panic!("second recovery should be deferred: {other:?}"),
         }
@@ -11731,9 +15363,11 @@ mod tests {
             BehaviorUpdate::Deferred {
                 direction,
                 remaining,
+                repeated,
             } => {
                 assert_eq!(direction, BehaviorTransitionDirection::Escalating);
                 assert_eq!(remaining, Duration::from_secs(4));
+                assert!(!repeated, "a new target's deferral is logged");
             }
             other => panic!("second escalation should be deferred: {other:?}"),
         }
@@ -11764,6 +15398,117 @@ mod tests {
         assert_eq!(state.memory_level, MemoryPressureLevel::Warn);
     }
 
+    #[test]
+    fn a_deferred_memory_target_survives_disk_ticks_until_its_window_ends() {
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
+        let mut state = PressureBehaviorState::new(
+            BehaviorDispatchTable::default(),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+        );
+        assert!(matches!(
+            state.update_with_hysteresis(
+                MemoryPressureLevel::Warn,
+                PressureLevel::Green,
+                t0,
+                hysteresis,
+            ),
+            BehaviorUpdate::Applied(_)
+        ));
+        assert!(matches!(
+            state.update_with_hysteresis(
+                MemoryPressureLevel::Critical,
+                PressureLevel::Green,
+                t0 + Duration::from_secs(1),
+                hysteresis,
+            ),
+            BehaviorUpdate::Deferred {
+                repeated: false,
+                ..
+            }
+        ));
+        assert_eq!(state.latest_memory_level(), MemoryPressureLevel::Critical);
+
+        // A disk tick inside the window re-defers without logging again and
+        // keeps the target the subscription will not report a second time.
+        assert!(matches!(
+            state.update_with_hysteresis(
+                state.latest_memory_level(),
+                PressureLevel::Green,
+                t0 + Duration::from_secs(2),
+                hysteresis,
+            ),
+            BehaviorUpdate::Deferred { repeated: true, .. }
+        ));
+        assert_eq!(state.memory_level, MemoryPressureLevel::Warn);
+        assert_eq!(state.latest_memory_level(), MemoryPressureLevel::Critical);
+
+        // So does a matrix reload.
+        assert!(
+            state
+                .replace_table(BehaviorDispatchTable::default())
+                .is_none()
+        );
+        assert_eq!(state.latest_memory_level(), MemoryPressureLevel::Critical);
+
+        match state.update_with_hysteresis(
+            state.latest_memory_level(),
+            PressureLevel::Green,
+            t0 + hysteresis,
+            hysteresis,
+        ) {
+            BehaviorUpdate::Applied(transition) => {
+                assert_eq!(transition.from_memory, MemoryPressureLevel::Warn);
+                assert_eq!(transition.to_memory, MemoryPressureLevel::Critical);
+            }
+            other => panic!("the first tick after the window should apply it: {other:?}"),
+        }
+        assert!(!state.has_pending_target());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sleep_loop_applies_a_deferred_memory_transition_without_a_new_event() {
+        // A signal raised by another test would end the sleep early.
+        let _serial = crate::daemon::signals::process_signal_test_guard();
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        daemon.config.pressure.behavior_hysteresis_secs = 1;
+        daemon.behavior_state = PressureBehaviorState::new(
+            behavior_table_from_config(&daemon.config),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+        );
+        let disk = PressureLevel::Green;
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Warn,
+            disk,
+            "memory_pressure",
+            Duration::ZERO,
+        );
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            disk,
+            "memory_pressure",
+            Duration::ZERO,
+        );
+        assert_eq!(
+            daemon.behavior_state.memory_level,
+            MemoryPressureLevel::Warn,
+            "a second escalation inside the window waits"
+        );
+
+        // The subscription reports a level once, so no event follows.
+        let (_tx, rx) = bounded::<MemoryPressureEvent>(1);
+        daemon.sleep_with_memory_pressure_events(&rx, disk, Duration::from_millis(1_500));
+        assert_eq!(
+            daemon.behavior_state.memory_level,
+            MemoryPressureLevel::Critical
+        );
+        assert!(!daemon.behavior_state.has_pending_target());
+    }
+
     fn mock_memory_pressure(level: MemoryPressureLevel) -> MemoryPressure {
         MemoryPressure {
             level,
@@ -11775,6 +15520,116 @@ mod tests {
             swap_used_bytes: None,
             linux_psi_avg10: None,
         }
+    }
+
+    #[test]
+    fn memory_pressure_callback_preserves_fifo_when_the_queue_has_room() {
+        let (tx, rx) = bounded(MEMORY_PRESSURE_CHANNEL_CAP);
+        let callback = memory_pressure_event_callback(tx, rx.clone());
+        let levels = [
+            MemoryPressureLevel::Normal,
+            MemoryPressureLevel::Warn,
+            MemoryPressureLevel::Critical,
+        ];
+        for (free_pages, level) in (1..).zip(levels) {
+            callback(MemoryPressure {
+                free_pages: Some(free_pages),
+                ..mock_memory_pressure(level)
+            });
+        }
+        let events: Vec<_> = rx.try_iter().collect();
+        assert_eq!(events.len(), levels.len());
+        for ((event, level), free_pages) in events.iter().zip(levels).zip(1..) {
+            assert_eq!(event.pressure.level, level);
+            assert_eq!(event.pressure.free_pages, Some(free_pages));
+        }
+    }
+
+    #[test]
+    fn full_memory_queue_keeps_the_final_escalation_recovery_or_unknown() {
+        for final_level in [
+            MemoryPressureLevel::Critical,
+            MemoryPressureLevel::Normal,
+            MemoryPressureLevel::Unknown,
+        ] {
+            let (tx, rx) = bounded(MEMORY_PRESSURE_CHANNEL_CAP);
+            let callback = memory_pressure_event_callback(tx, rx.clone());
+            let previous_level = if final_level == MemoryPressureLevel::Critical {
+                MemoryPressureLevel::Normal
+            } else {
+                MemoryPressureLevel::Critical
+            };
+            // No monitor reads while a burst fills the queue. Its old tail is
+            // deliberately different from the final, now steady observation.
+            for index in 0..MEMORY_PRESSURE_CHANNEL_CAP {
+                callback(mock_memory_pressure(if index.is_multiple_of(2) {
+                    MemoryPressureLevel::Warn
+                } else {
+                    previous_level
+                }));
+            }
+            callback(mock_memory_pressure(final_level));
+            assert_eq!(rx.len(), MEMORY_PRESSURE_CHANNEL_CAP);
+
+            let mut state = PressureBehaviorState::new(
+                BehaviorDispatchTable::default(),
+                MemoryPressureLevel::Normal,
+                PressureLevel::Green,
+            );
+            let events: Vec<_> = rx.try_iter().collect();
+            assert_eq!(events[0].pressure.level, previous_level);
+            for event in events {
+                let _ = state.update(event.pressure.level, PressureLevel::Green);
+            }
+            assert_eq!(state.latest_memory_level(), final_level);
+            assert_eq!(state.memory_level, final_level);
+        }
+    }
+
+    #[test]
+    fn concurrent_memory_callbacks_remain_ordered_bounded_and_keep_the_latest() {
+        let (tx, rx) = bounded(MEMORY_PRESSURE_CHANNEL_CAP);
+        let callback = Arc::new(memory_pressure_event_callback(tx, rx.clone()));
+        thread::scope(|scope| {
+            for level in [MemoryPressureLevel::Normal, MemoryPressureLevel::Warn] {
+                let callback = Arc::clone(&callback);
+                scope.spawn(move || {
+                    for _ in 0..64 {
+                        callback(mock_memory_pressure(level));
+                    }
+                });
+            }
+        });
+        callback(mock_memory_pressure(MemoryPressureLevel::Critical));
+        let events: Vec<_> = rx.try_iter().collect();
+        assert_eq!(events.len(), MEMORY_PRESSURE_CHANNEL_CAP);
+        assert!(
+            events
+                .windows(2)
+                .all(|pair| pair[0].received_at <= pair[1].received_at)
+        );
+        assert_eq!(
+            events.last().unwrap().pressure.level,
+            MemoryPressureLevel::Critical
+        );
+    }
+
+    #[test]
+    fn memory_callback_does_not_wait_for_an_abandoned_monitor() {
+        let (tx, rx) = bounded(MEMORY_PRESSURE_CHANNEL_CAP);
+        let callback = memory_pressure_event_callback(tx, rx.clone());
+        drop(rx);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let producer = thread::spawn(move || {
+            for _ in 0..MEMORY_PRESSURE_CHANNEL_CAP * 2 {
+                callback(mock_memory_pressure(MemoryPressureLevel::Critical));
+            }
+            let _ = finished_tx.send(());
+        });
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a pressure callback must never wait for queue capacity");
+        producer.join().unwrap();
     }
 
     struct MockMatrixCase {
@@ -12028,6 +15883,54 @@ mod tests {
         assert!(del_rx.try_recv().is_err());
     }
 
+    /// Empty candidates are never sent to the executor: the planner never
+    /// chooses them, and each one cost a policy evaluation and a decision_log
+    /// row per pass (ts2 2026-10-17: ~250,000 rows a day at Critical).
+    #[test]
+    fn dispatch_top_candidates_drops_candidates_that_free_nothing() {
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(2);
+        let request = ScanRequest {
+            paths: vec![PathBuf::from("/tmp")],
+            urgency: 1.0,
+            pressure_level: PressureLevel::Critical,
+            free_pct: None,
+            max_delete_batch: 10,
+            force_full_scan: false,
+            config_update: None,
+            catalog_roots: Vec::new(),
+            maintenance: false,
+            target_bytes: None,
+        };
+        let empty = |path: &str| CandidacyScore {
+            size_bytes: 0,
+            ..test_candidate(path, 0.9)
+        };
+
+        let mut scored = vec![empty("/tmp/empty-a"), empty("/tmp/empty-b")];
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &del_tx,
+            &mut PassDispatch::default()
+        ));
+        assert!(scored.is_empty());
+        assert!(
+            del_rx.try_recv().is_err(),
+            "a batch of only empty candidates is not sent"
+        );
+
+        let mut scored = vec![empty("/tmp/empty-c"), test_candidate("/tmp/full", 0.5)];
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &del_tx,
+            &mut PassDispatch::default()
+        ));
+        let batch = del_rx.try_recv().expect("the non-empty candidate is sent");
+        let paths: Vec<_> = batch.candidates.iter().map(|c| c.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from("/tmp/full")]);
+    }
+
     #[derive(Debug, serde::Serialize)]
     struct PressureLatencyValidationArtifact {
         schema_version: u32,
@@ -12216,6 +16119,50 @@ mod tests {
         assert_eq!(args.watchdog_sec, 0);
     }
 
+    /// SIGUSR1 used to `send_timeout` and ignore the result: with the scan
+    /// queue full the forced scan was dropped while the log said triggered.
+    #[test]
+    fn a_forced_scan_reports_a_full_queue_and_queues_once_there_is_room() {
+        let response = PressureResponse {
+            level: PressureLevel::Green,
+            urgency: 0.0,
+            scan_interval: Duration::from_secs(3),
+            release_ballast_files: 0,
+            max_delete_batch: 7,
+            fallback_active: false,
+            causing_mount: PathBuf::from("/"),
+            free_pct: 60.0,
+            predicted_seconds: None,
+        };
+        let roots = [PathBuf::from("/data/tmp")];
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+        assert!(MonitoringDaemon::trigger_forced_scan(
+            &roots, &scan_tx, &response
+        ));
+        assert!(!MonitoringDaemon::trigger_forced_scan(
+            &roots, &scan_tx, &response
+        ));
+        let queued = scan_rx.try_recv().unwrap();
+        assert!(queued.force_full_scan);
+        assert_eq!(queued.paths, roots);
+        assert!(
+            scan_rx.try_recv().is_err(),
+            "the full-queue attempt queued nothing"
+        );
+        assert!(MonitoringDaemon::trigger_forced_scan(
+            &roots, &scan_tx, &response
+        ));
+        assert_eq!(
+            scan_reason_for_request(&scan_rx.try_recv().unwrap()),
+            "forced"
+        );
+        drop(scan_rx);
+        // Disconnected: given up (true) rather than retried forever.
+        assert!(MonitoringDaemon::trigger_forced_scan(
+            &roots, &scan_tx, &response
+        ));
+    }
+
     #[test]
     fn siginfo_status_dump_payload_serializes_as_single_json_object() {
         let response = PressureResponse {
@@ -12324,6 +16271,7 @@ mod tests {
             pressure_level: PressureLevel::Orange,
             urgency: 0.5,
             target_bytes: None,
+            target_only_root: None,
         };
         del_tx.send(batch).unwrap();
         let received_batch = del_rx.recv().unwrap();
@@ -12693,6 +16641,30 @@ mod tests {
         ));
     }
 
+    /// #36: a dispatch that is followed by another dispatch, with nothing
+    /// reclaimed in between, must not reset the streak, or the backoff never
+    /// grows past its first step.
+    #[test]
+    fn dispatches_that_reclaim_nothing_keep_growing_the_empty_pass_streak() {
+        let (mut consecutive, mut inconclusive, mut last_empty) = (0_u32, 0_u32, None);
+        for expected in 1..=4 {
+            // Pass start: the previous dispatch reclaimed nothing.
+            record_empty_pass(&mut consecutive, &mut inconclusive, false);
+            last_empty = Some(Instant::now());
+            // This pass dispatches again.
+            record_dispatching_pass(true, &mut consecutive, &mut inconclusive, &mut last_empty);
+            assert_eq!(consecutive, expected);
+            assert!(last_empty.is_some(), "the cooldown stays armed");
+        }
+        assert_eq!(
+            effective_empty_pass_cooldown(5, consecutive),
+            Duration::from_secs(40)
+        );
+        // A dispatch after one that did reclaim starts a fresh streak.
+        record_dispatching_pass(false, &mut consecutive, &mut inconclusive, &mut last_empty);
+        assert_eq!((consecutive, inconclusive, last_empty), (0, 0, None));
+    }
+
     #[test]
     fn effective_empty_pass_cooldown_backs_off_exponentially_and_caps() {
         // Base of 0 disables the cooldown regardless of the streak length.
@@ -12768,6 +16740,45 @@ mod tests {
     }
 
     #[test]
+    fn a_return_to_a_level_scanned_empty_minutes_ago_is_not_an_escalation() {
+        let start = Instant::now();
+        let mut peak = None;
+        note_empty_pass_level(&mut peak, PressureLevel::Red, start);
+        // Free space flapping at the Red line: an empty Orange pass in
+        // between neither erases the Red pass nor makes Red new again.
+        let orange_at = start + Duration::from_secs(90);
+        note_empty_pass_level(&mut peak, PressureLevel::Orange, orange_at);
+        assert_eq!(peak, Some((PressureLevel::Red, start)));
+        let back_to_red = start + Duration::from_secs(100);
+        assert!(rise_already_scanned_empty(
+            peak,
+            PressureLevel::Red,
+            back_to_red
+        ));
+        assert!(rise_already_scanned_empty(
+            peak,
+            PressureLevel::Orange,
+            back_to_red
+        ));
+        // A level above anything scanned empty is new information.
+        assert!(!rise_already_scanned_empty(
+            peak,
+            PressureLevel::Critical,
+            back_to_red
+        ));
+        // Another empty Red pass refreshes the window.
+        let red_again = start + Duration::from_secs(200);
+        note_empty_pass_level(&mut peak, PressureLevel::Red, red_again);
+        assert_eq!(peak, Some((PressureLevel::Red, red_again)));
+        // Once the window has passed, a return to Red clears the pacing again.
+        let later = red_again + ESCALATION_HYSTERESIS;
+        assert!(!rise_already_scanned_empty(peak, PressureLevel::Red, later));
+        note_empty_pass_level(&mut peak, PressureLevel::Orange, later);
+        assert_eq!(peak, Some((PressureLevel::Orange, later)));
+        assert!(!rise_already_scanned_empty(None, PressureLevel::Red, later));
+    }
+
+    #[test]
     fn empty_pass_cooldown_bypassed_for_maintenance_passes() {
         let now = Instant::now();
         let mut request = cooldown_request(PressureLevel::Green);
@@ -12825,6 +16836,43 @@ mod tests {
             &critical,
             TERMINAL_IDLE_EMPTY_PASSES,
         ));
+    }
+
+    #[test]
+    fn timed_out_empty_passes_still_reach_terminal_idle_under_red() {
+        // bd-qxrh: when the CPU bucket cuts every pass short, no pass is
+        // "complete", the streak used to stay at 0, and Red bypassed the
+        // cooldown forever with nothing to reclaim.
+        let now = Instant::now();
+        let request = cooldown_request(PressureLevel::Red);
+        let cooldown = Duration::from_secs(90);
+        let (mut streak, mut inconclusive) = (0u32, 0u32);
+        let mut passes = 0;
+        while !empty_pass_cooldown_active(Some(now), now, cooldown, &request, streak) {
+            record_empty_pass(&mut streak, &mut inconclusive, true);
+            passes += 1;
+            assert!(
+                passes <= 100,
+                "timed-out empty passes never reached terminal idle"
+            );
+        }
+        assert_eq!(
+            passes,
+            TERMINAL_IDLE_EMPTY_PASSES * TERMINAL_IDLE_EMPTY_PASSES
+        );
+        assert_eq!(streak, TERMINAL_IDLE_EMPTY_PASSES);
+    }
+
+    #[test]
+    fn a_few_timed_out_empty_passes_stay_inconclusive() {
+        let (mut streak, mut inconclusive) = (0u32, 0u32);
+        for _ in 1..TERMINAL_IDLE_EMPTY_PASSES {
+            record_empty_pass(&mut streak, &mut inconclusive, true);
+        }
+        assert_eq!(streak, 0, "a budget that ran out early proves nothing yet");
+        // A completed empty pass counts at once and clears the inconclusive run.
+        record_empty_pass(&mut streak, &mut inconclusive, false);
+        assert_eq!((streak, inconclusive), (1, 0));
     }
 
     #[test]
@@ -13162,6 +17210,26 @@ mod tests {
         ));
     }
 
+    /// bd-rxq5: the compression tier rewrites files, so the policy modes that
+    /// change nothing (observe, fallback-safe, which the kill switch forces)
+    /// and dry-run keep it from starting a pass.
+    #[test]
+    fn compress_tier_runs_only_where_the_policy_may_change_the_filesystem() {
+        let mut config = Config::default();
+        config.compress.enabled = true;
+        for mode in [ActiveMode::Enforce, ActiveMode::Canary] {
+            assert!(compress_tier_may_run(&config, mode), "{mode}");
+        }
+        for mode in [ActiveMode::Observe, ActiveMode::FallbackSafe] {
+            assert!(!compress_tier_may_run(&config, mode), "{mode}");
+        }
+        config.scanner.dry_run = true;
+        assert!(!compress_tier_may_run(&config, ActiveMode::Enforce));
+        config.scanner.dry_run = false;
+        config.compress.enabled = false;
+        assert!(!compress_tier_may_run(&config, ActiveMode::Enforce));
+    }
+
     #[test]
     fn v2_effective_parallelism_caps_low_pressure_refreshes() {
         let mut config = ScannerConfig {
@@ -13383,6 +17451,7 @@ mod tests {
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.5,
                 target_bytes: None,
+                target_only_root: None,
             })
             .expect("prefill channel");
 
@@ -13467,6 +17536,44 @@ mod tests {
         assert!(del_rx.try_recv().is_err());
     }
 
+    /// bd-1ouz: an opaque v2 candidate small enough to skip the reference
+    /// probe is still vetoed when the daemon cannot see every process (a
+    /// user-scoped macOS daemon), as v1 vetoes it; without the gap it is
+    /// scored on its merits.
+    #[test]
+    fn visibility_gap_vetoes_a_candidate_that_skips_the_reference_probe() {
+        use crate::scanner::scoring::{CandidateInput, DecisionAction, ScoringEngine};
+        let engine = ScoringEngine::from_config(&Config::default().scoring, 0);
+        let candidate = || CandidateInput {
+            path: PathBuf::from("/tmp/proj/target"),
+            size_bytes: 64 * 1024,
+            age: Duration::from_hours(5),
+            classification: ArtifactClassification {
+                pattern_name: "opaque-cargo-target".into(),
+                category: ArtifactCategory::RustTarget,
+                name_confidence: 0.93,
+                structural_confidence: 1.0,
+                combined_confidence: 0.93,
+            },
+            signals: StructuralSignals::default(),
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+
+        let mut seen = candidate();
+        mark_visibility_gap(&mut seen, None);
+        assert!(!engine.score_candidate(&seen, 0.9).vetoed);
+
+        let gap = crate::scanner::walker::MACOS_USER_SCOPE_ACTIVE_REFERENCE_WARNING;
+        let mut blind = candidate();
+        mark_visibility_gap(&mut blind, Some(gap));
+        let score = engine.score_candidate(&blind, 0.9);
+        assert!(score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert_eq!(score.veto_reason.as_deref(), Some(gap));
+    }
+
     #[test]
     fn temp_artifact_age_fast_track_applies_under_red_pressure() {
         let classification = ArtifactClassification {
@@ -13476,14 +17583,176 @@ mod tests {
             structural_confidence: 0.70,
             combined_confidence: 0.84,
         };
-        let adjusted = adjusted_candidate_age(
+        let adjusted = adjusted_candidate_age_after_arrival(
             Duration::from_mins(5),
             30,
             PressureLevel::Red,
             Path::new("/tmp/green-ft"),
             &classification,
+            || Some(Duration::from_hours(48)),
         );
         assert_eq!(adjusted, Duration::from_mins(30));
+    }
+
+    /// bd-macg (JE's policy, 2026-10-14): a tree that arrived less than the
+    /// minimum age ago keeps its real age under pressure. fmd deleted a fresh
+    /// copy of relocated scratch five minutes after it was made, recorded at
+    /// the 600 s minimum. An old tree with fresh contents is still
+    /// fast-tracked, and an unknown arrival keeps the real age.
+    #[test]
+    fn a_tree_that_just_arrived_is_not_age_fast_tracked() {
+        let scratch = ArtifactClassification {
+            pattern_name: "mktemp-scratch".into(),
+            category: ArtifactCategory::TempDir,
+            name_confidence: 0.90,
+            structural_confidence: 0.70,
+            combined_confidence: 0.84,
+        };
+        let path = Path::new("/data/tmp/tmpfs-relocated-20261014/tmp/x/tmp.B9bB76Il49");
+        let adjusted = |arrival: Option<Duration>| {
+            adjusted_candidate_age_after_arrival(
+                Duration::from_mins(5),
+                10,
+                PressureLevel::Orange,
+                path,
+                &scratch,
+                || arrival,
+            )
+        };
+        assert_eq!(
+            adjusted(Some(Duration::from_mins(5))),
+            Duration::from_mins(5)
+        );
+        assert_eq!(adjusted(None), Duration::from_mins(5));
+        assert_eq!(
+            adjusted(Some(Duration::from_hours(48))),
+            Duration::from_mins(10)
+        );
+
+        // A directory created just now has just arrived.
+        let fresh = tempfile::tempdir().unwrap();
+        let arrived = candidate_arrival_age(fresh.path()).unwrap();
+        assert!(arrived < Duration::from_mins(1), "{arrived:?}");
+        assert!(candidate_arrival_age(&fresh.path().join("missing")).is_none());
+    }
+
+    /// bd-d1kt: on hz2 at Red, the registry/ and git/ of a cargo home that a
+    /// running `cargo test` was compiling from were 5 and 8 minutes old,
+    /// recorded as 1800 s and deleted. A CACHEDIR.TAG says a directory is
+    /// regenerable, not that it is abandoned: it must be its real age.
+    #[test]
+    fn no_cache_or_cargo_home_is_age_fast_tracked() {
+        let class = |pattern_name: &'static str, category| ArtifactClassification {
+            pattern_name: pattern_name.into(),
+            category,
+            name_confidence: 0.9,
+            structural_confidence: 1.0,
+            combined_confidence: 0.9,
+        };
+        let observed = Duration::from_secs(174);
+        let cases = [
+            // The macOS proof: a default ~/.cargo under a temp home.
+            (
+                "/private/tmp/proof/home/.cargo/registry/src",
+                class("opaque-cargo-cache", ArtifactCategory::CacheDir),
+            ),
+            (
+                "/data/tmp/rch-cargo-cache-hz4/registry",
+                class("cachedir-tagged-cache", ArtifactCategory::CacheDir),
+            ),
+            (
+                "/data/tmp/job/go-build",
+                class("opaque-go-build-cache", ArtifactCategory::GoCache),
+            ),
+            (
+                "/data/tmp/cargo-home-x",
+                class("cargo-home-prefix", ArtifactCategory::TempDir),
+            ),
+            (
+                "/tmp/rch-cargo-home-1",
+                class("rch-cargo-home", ArtifactCategory::TempDir),
+            ),
+        ];
+        for (path, classification) in &cases {
+            for level in [
+                PressureLevel::Orange,
+                PressureLevel::Red,
+                PressureLevel::Critical,
+            ] {
+                assert_eq!(
+                    adjusted_candidate_age(observed, 5, level, Path::new(path), classification),
+                    observed,
+                    "{path} at {level:?}"
+                );
+            }
+        }
+        // Build output in temp storage still is.
+        assert_eq!(
+            adjusted_candidate_age_after_arrival(
+                observed,
+                5,
+                PressureLevel::Red,
+                Path::new("/data/tmp/job/target"),
+                &class("opaque-cargo-target", ArtifactCategory::RustTarget),
+                || Some(Duration::from_hours(48)),
+            ),
+            Duration::from_mins(5)
+        );
+    }
+
+    #[test]
+    fn a_cachedir_tagged_cache_is_never_age_fast_tracked() {
+        let tagged = ArtifactClassification {
+            pattern_name: "cachedir-tagged-cache".into(),
+            category: ArtifactCategory::CacheDir,
+            name_confidence: 0.75,
+            structural_confidence: 0.0,
+            combined_confidence: 0.75,
+        };
+        let registry = Path::new("/data/tmp/ftcairo-1013/cargo-home/registry");
+        for level in [
+            PressureLevel::Orange,
+            PressureLevel::Red,
+            PressureLevel::Critical,
+        ] {
+            for observed in [Duration::from_mins(5), Duration::from_mins(8)] {
+                assert_eq!(
+                    adjusted_candidate_age(observed, 30, level, registry, &tagged),
+                    observed,
+                    "{level:?}"
+                );
+            }
+        }
+        // A cache old enough by its real age is unaffected.
+        assert_eq!(
+            adjusted_candidate_age(
+                Duration::from_mins(45),
+                30,
+                PressureLevel::Red,
+                registry,
+                &tagged
+            ),
+            Duration::from_mins(45)
+        );
+        // A named build target beside it is still fast-tracked.
+        let target = ArtifactClassification {
+            pattern_name: "target".into(),
+            category: ArtifactCategory::RustTarget,
+            name_confidence: 0.95,
+            structural_confidence: 0.9,
+            combined_confidence: 0.93,
+        };
+        assert_eq!(
+            adjusted_candidate_age_after_arrival(
+                Duration::from_mins(5),
+                30,
+                PressureLevel::Red,
+                Path::new("/data/tmp/ftcairo-1013/target"),
+                &target,
+                || Some(Duration::from_hours(48)),
+            ),
+            Duration::from_mins(30)
+        );
     }
 
     #[test]
@@ -13530,12 +17799,13 @@ mod tests {
             structural_confidence: 0.70,
             combined_confidence: 0.88,
         };
-        let adjusted = adjusted_candidate_age(
+        let adjusted = adjusted_candidate_age_after_arrival(
             Duration::from_mins(5),
             30,
             PressureLevel::Red,
             Path::new("/data/projects/franken_engine/crates/franken-engine/.rch-target"),
             &classification,
+            || Some(Duration::from_hours(48)),
         );
         assert_eq!(adjusted, Duration::from_mins(30));
     }
@@ -13597,12 +17867,13 @@ mod tests {
             structural_confidence: 0.30,
             combined_confidence: 0.60,
         };
-        let adjusted = adjusted_candidate_age(
+        let adjusted = adjusted_candidate_age_after_arrival(
             Duration::from_mins(5),
             30,
             PressureLevel::Red,
             Path::new("/tmp/random-agent-build-cache"),
             &classification,
+            || Some(Duration::from_hours(48)),
         );
         assert_eq!(adjusted, Duration::from_mins(30));
     }
@@ -13955,5 +18226,31 @@ mod tests {
             super::is_swap_thrash_risk_inner(&genuine_thrash, true),
             "Low RAM with high zram swap is genuine thrash risk"
         );
+    }
+
+    #[test]
+    fn logging_ram_headroom_is_rechecked_only_while_pressured_and_at_most_every_30s() {
+        let now = Instant::now();
+        let earlier = |secs| now.checked_sub(Duration::from_secs(secs)).unwrap();
+        // First pressured tick checks; an unpressured level never does.
+        assert!(super::logging_ram_recheck_due(true, None, now));
+        assert!(!super::logging_ram_recheck_due(false, None, now));
+        assert!(!super::logging_ram_recheck_due(
+            false,
+            Some(earlier(600)),
+            now
+        ));
+        // While pressured: not before the interval, then again after it.
+        assert!(!super::logging_ram_recheck_due(
+            true,
+            Some(earlier(29)),
+            now
+        ));
+        assert!(super::logging_ram_recheck_due(true, Some(earlier(30)), now));
+        assert!(super::logging_ram_recheck_due(
+            true,
+            Some(earlier(300)),
+            now
+        ));
     }
 }

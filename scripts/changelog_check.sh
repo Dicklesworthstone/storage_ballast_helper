@@ -21,7 +21,7 @@
 set -euo pipefail
 
 REPOSITORY="Dicklesworthstone/storage_ballast_helper"
-USER_AGENT="OpenAI File Downloader, XaiImageApiFetch/1.0"
+USER_AGENT="sbh-changelog-check (+https://github.com/Dicklesworthstone/storage_ballast_helper)"
 MARKER='\*\*\[release\]\*\*'
 
 changelog="CHANGELOG.md"

@@ -1,9 +1,69 @@
-//! Bounded, deterministic selection of replay hints, never deletion authority.
+//! Bounded, deterministic selection and scoped revocation of replay hints.
+//! Persisted records are never deletion authority.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeSet, BinaryHeap};
+use std::path::Path;
 
-use super::{CandidateIndexRecord, CandidateSafetyState};
+use super::{CandidateIndexRecord, CandidateSafetyState, ScannerCandidateIndex};
+
+impl ScannerCandidateIndex {
+    /// Revoke replay hints overlapping changed paths or reconciliation scopes.
+    ///
+    /// An event inside an opaque candidate invalidates that candidate even
+    /// when its root's identity and mtime are unchanged. An event at an
+    /// ancestor invalidates all indexed descendants. Unrelated projects keep
+    /// their current generation and remain available under pressure.
+    ///
+    /// Coalesce overlapping scopes before using the ordered path index; do
+    /// not walk the filesystem, clone the record map, or scan the whole index
+    /// for every event. Temporary storage depends on the number of scopes,
+    /// not the number of candidates. Returns the number of changed records.
+    pub fn invalidate_paths<'a>(&mut self, paths: impl IntoIterator<Item = &'a Path>) -> usize {
+        let scopes: BTreeSet<&Path> = paths.into_iter().collect();
+        let mut covered: Option<&Path> = None;
+        let mut invalidated = 0;
+        for scope in scopes {
+            // Path ordering compares components: descendants form one range,
+            // while e.g. `target-other` is not inside `target`.
+            if covered.is_some_and(|ancestor| scope.starts_with(ancestor)) {
+                continue;
+            }
+            covered = Some(scope);
+            // The root itself is handled by the descendant range below.
+            for ancestor in scope.ancestors().skip(1) {
+                if let Some(identity) = self.paths.get(ancestor)
+                    && let Some(record) = self.records.get_mut(identity)
+                {
+                    invalidated += usize::from(revoke(record));
+                }
+            }
+            for (_, identity) in self
+                .paths
+                .range(scope.to_path_buf()..)
+                .take_while(|(path, _)| path.starts_with(scope))
+            {
+                if let Some(record) = self.records.get_mut(identity) {
+                    invalidated += usize::from(revoke(record));
+                }
+            }
+        }
+        invalidated
+    }
+}
+
+fn revoke(record: &mut CandidateIndexRecord) -> bool {
+    let changed = record.score.is_some() || record.safety_state != CandidateSafetyState::Unknown;
+    // Clearing only the safety state is insufficient: executor feedback from
+    // a batch already in flight can subsequently set it to Failed (retryable).
+    // No positive score survives to make that stale evidence replayable.
+    record.score = None;
+    record.safety_state = CandidateSafetyState::Unknown;
+    // Keep identity, observed metadata, structural evidence, and backoff as
+    // historical hints. A new walk must score the candidate again; unchanged
+    // evidence must not erase its accumulated failed-deletion cooldown.
+    changed
+}
 
 /// Best records compare smallest, so the heap exposes the worst retained
 /// record. A full sort and the bounded selection have exactly the same order.
@@ -40,6 +100,12 @@ impl Ord for RankedRecord<'_> {
 
 fn eligible(record: &CandidateIndexRecord, generation: u64, now_nanos: u128) -> bool {
     record.event_generation == generation
+        // A zero-byte hint cannot contribute to the planner's byte objective.
+        // Exclude it BEFORE the bounded heap: rejecting it only in the planner
+        // lets high-scored empty targets starve lower-scored useful candidates.
+        // Keep the stored record and all its safety/backoff evidence unchanged;
+        // a later walk can refresh its size without an artificial cooldown.
+        && record.size_estimate_bytes > 0
         && matches!(
             record.safety_state,
             CandidateSafetyState::Safe | CandidateSafetyState::Failed
@@ -122,6 +188,185 @@ mod tests {
     }
 
     #[test]
+    fn zero_byte_high_scores_cannot_starve_a_positive_size_hint() {
+        let mut index = index();
+        for inode in 1..=100 {
+            let mut empty = record(inode);
+            empty.size_estimate_bytes = 0;
+            empty.score = Some(1.0);
+            index.upsert(empty);
+        }
+        let mut useful = record(101);
+        useful.score = Some(0.6);
+        useful.size_estimate_bytes = 1;
+        index.upsert(useful.clone());
+
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![useful.clone()]);
+        assert_eq!(
+            index.ranked_records_within(&[PathBuf::from("/cache")], UNIX_EPOCH, 1),
+            vec![useful]
+        );
+        assert_eq!(index.len(), 101, "selection must not evict empty evidence");
+        assert_eq!(index.get(record(1).identity).unwrap().fail_count, 0);
+    }
+
+    #[test]
+    fn all_zero_byte_hints_produce_no_replay_without_mutating_the_index() {
+        let mut index = index();
+        let mut empty = record(1);
+        empty.size_estimate_bytes = 0;
+        index.upsert(empty.clone());
+
+        for limit in [0, 1, 32, usize::MAX] {
+            assert!(index.ranked_records(UNIX_EPOCH, limit).is_empty());
+            assert!(
+                index
+                    .ranked_records_within(&[PathBuf::from("/cache")], UNIX_EPOCH, limit)
+                    .is_empty()
+            );
+        }
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.get(empty.identity), Some(&empty));
+    }
+
+    #[test]
+    fn new_positive_size_evidence_is_replayable_without_an_artificial_cooldown() {
+        let mut index = index();
+        let mut current = record(1);
+        current.size_estimate_bytes = 0;
+        index.upsert(current.clone());
+        assert!(index.ranked_records(UNIX_EPOCH, 1).is_empty());
+
+        // A refreshed recursive size can change while root metadata does not.
+        // This is new evidence, not a reason to evict or quarantine the record.
+        current.size_estimate_bytes = 1;
+        index.upsert(current.clone());
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![current.clone()]);
+        assert_eq!(index.get(current.identity).unwrap().fail_count, 0);
+        assert_eq!(
+            index.get(current.identity).unwrap().cooldown_until_nanos,
+            None
+        );
+
+        current.size_estimate_bytes = 0;
+        index.upsert(current.clone());
+        assert!(index.ranked_records(UNIX_EPOCH, 1).is_empty());
+        assert_eq!(index.get(current.identity), Some(&current));
+    }
+
+    #[test]
+    fn size_refresh_does_not_clear_an_existing_failed_deletion_backoff() {
+        let mut index = index();
+        let mut current = record(1);
+        current.size_estimate_bytes = 0;
+        index.upsert(current.clone());
+        index.record_failure(
+            current.identity,
+            UNIX_EPOCH,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
+        let failed = index.get(current.identity).unwrap().clone();
+        current.size_estimate_bytes = 1;
+        index.upsert(current.clone());
+        let refreshed = index.get(current.identity).unwrap();
+        assert_eq!(refreshed.fail_count, failed.fail_count);
+        assert_eq!(refreshed.cooldown_until_nanos, failed.cooldown_until_nanos);
+        assert_eq!(refreshed.safety_state, CandidateSafetyState::Failed);
+        assert!(
+            index
+                .ranked_records(UNIX_EPOCH + Duration::from_secs(9), 1)
+                .is_empty()
+        );
+        let ranked = index.ranked_records(UNIX_EPOCH + Duration::from_secs(10), 1);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].identity, current.identity);
+        assert_eq!(ranked[0].size_estimate_bytes, 1);
+        assert_eq!(ranked[0].fail_count, 1);
+    }
+
+    #[test]
+    fn positive_size_does_not_override_safety_or_revoked_evidence() {
+        for state in [
+            CandidateSafetyState::Unknown,
+            CandidateSafetyState::ActiveReference,
+            CandidateSafetyState::Vetoed,
+        ] {
+            let mut index = index();
+            let mut current = record(1);
+            current.size_estimate_bytes = 0;
+            current.safety_state = state;
+            index.upsert(current.clone());
+            current.size_estimate_bytes = 1;
+            index.upsert(current.clone());
+            assert!(index.ranked_records(UNIX_EPOCH, 1).is_empty());
+            assert_eq!(index.get(current.identity).unwrap().safety_state, state);
+        }
+
+        let mut index = index();
+        let mut current = record(1);
+        current.size_estimate_bytes = 0;
+        index.upsert(current.clone());
+        assert_eq!(index.invalidate_paths([current.path.as_path()]), 1);
+        assert_eq!(index.get(current.identity).unwrap().score, None);
+        assert_eq!(
+            index.get(current.identity).unwrap().safety_state,
+            CandidateSafetyState::Unknown
+        );
+        assert!(index.ranked_records(UNIX_EPOCH, 1).is_empty());
+        // Only a new scoring observation supplies a usable hint again.
+        current.size_estimate_bytes = 1;
+        index.upsert(current.clone());
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![current]);
+        index.mark_event_overflow();
+        assert!(index.ranked_records(UNIX_EPOCH, 1).is_empty());
+    }
+
+    #[test]
+    fn positive_size_replay_stays_inside_the_requested_roots() {
+        let mut index = index();
+        let mut empty = record(1);
+        empty.path = PathBuf::from("/cache/project/empty");
+        empty.size_estimate_bytes = 0;
+        index.upsert(empty);
+        let mut sibling = record(2);
+        sibling.path = PathBuf::from("/cache/project-other/target");
+        sibling.score = Some(1.0);
+        index.upsert(sibling);
+        let mut useful = record(3);
+        useful.path = PathBuf::from("/cache/project/target");
+        useful.score = Some(0.6);
+        index.upsert(useful.clone());
+        assert_eq!(
+            index.ranked_records_within(&[PathBuf::from("/cache/project")], UNIX_EPOCH, 1),
+            vec![useful]
+        );
+    }
+
+    #[test]
+    fn zero_size_selection_and_later_refresh_survive_checkpoint_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkpoint = temp.path().join("index.json");
+        let mut index = index();
+        let mut empty = record(1);
+        empty.size_estimate_bytes = 0;
+        empty.score = Some(1.0);
+        let useful = record(2);
+        index.upsert(empty.clone());
+        index.upsert(useful.clone());
+        index.save_checkpoint(&checkpoint).unwrap();
+        let (mut loaded, status) =
+            ScannerCandidateIndex::load_checkpoint(&checkpoint, index.context().clone());
+        assert_eq!(status, ScannerIndexLoadStatus::Loaded);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get(empty.identity), Some(&empty));
+        assert_eq!(loaded.ranked_records(UNIX_EPOCH, 1), vec![useful]);
+        empty.size_estimate_bytes = 1;
+        loaded.upsert(empty.clone());
+        assert_eq!(loaded.ranked_records(UNIX_EPOCH, 1), vec![empty]);
+    }
+
+    #[test]
     fn stale_high_scores_cannot_starve_a_reconciled_candidate() {
         let mut index = index();
         for inode in 1..=100 {
@@ -194,6 +439,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut reference = records.clone();
+        // The independent full-sort reference has the same byte objective,
+        // but does not call the production eligibility predicate or heap.
+        reference.retain(|record| record.size_estimate_bytes > 0);
         reference.sort_by(compare);
         for limit in [0, 1, 7, 32, 512, usize::MAX] {
             let expected = &reference[..limit.min(reference.len())];
@@ -249,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_structural_evidence_reopens_a_previously_failed_candidate() {
+    fn a_changed_root_reopens_a_previously_failed_candidate() {
         let mut index = index();
         let mut current = record(1);
         index.upsert(current.clone());
@@ -259,7 +507,21 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(60),
         );
+        // The priority pre-scan sees only the root's own entries, the walk
+        // also the markers below them: two descriptions of one unchanged
+        // directory, so the backoff stands. Resetting it here re-dispatched
+        // a refused candidate on every pass.
+        let mut pre_scan_view = current.clone();
+        pre_scan_view.structural_signals.has_deps = !current.structural_signals.has_deps;
+        pre_scan_view.prune_decision = IndexedPruneDecision::None;
+        pre_scan_view.size_estimate_bytes += 1;
+        assert!(index.candidate_in_cooldown(&pre_scan_view, UNIX_EPOCH));
+        index.upsert(pre_scan_view);
+        assert_eq!(index.get(current.identity).unwrap().fail_count, 1);
+        // A marker created in the root changes the root: new evidence, so the
+        // candidate is retried now.
         current.structural_signals.has_cachedir_tag = true;
+        current.candidate_mtime_nanos += 1;
         assert!(!index.candidate_in_cooldown(&current, UNIX_EPOCH));
         index.upsert(current.clone());
         assert_eq!(index.get(current.identity).unwrap().fail_count, 0);
@@ -299,5 +561,201 @@ mod tests {
         assert!(index.is_empty());
         index.upsert(record(2));
         assert_eq!(index.ranked_records(UNIX_EPOCH, 1).len(), 1);
+    }
+
+    #[test]
+    fn descendant_change_revokes_opaque_root_without_a_global_generation_bump() {
+        let mut index = index();
+        let current = record(1);
+        let other = record(2);
+        index.upsert(current.clone());
+        index.upsert(other.clone());
+        let changed = current.path.join("debug/deps/object.o");
+        assert_eq!(index.invalidate_paths([changed.as_path()]), 1);
+        let invalidated = index.get(current.identity).unwrap();
+        assert!(
+            invalidated.evidence_matches(&current),
+            "root metadata need not change"
+        );
+        assert_eq!(invalidated.score, None);
+        assert_eq!(invalidated.safety_state, CandidateSafetyState::Unknown);
+        assert_eq!(index.event_generation(), 0);
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![other]);
+        assert_eq!(index.invalidate_paths([changed.as_path()]), 0);
+        index.upsert(current.clone());
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![current]);
+    }
+
+    #[test]
+    fn ancestor_and_duplicate_scopes_revoke_descendants_once_not_prefix_siblings() {
+        let mut index = index();
+        let paths = [
+            "/cache/project/target",
+            "/cache/project/target/debug",
+            "/cache/project/node_modules",
+            "/cache/project-other/target",
+            "/cache/project.other/target",
+            "/cache/another/target",
+        ];
+        for (n, path) in paths.iter().enumerate() {
+            let mut current = record(u64::try_from(n).unwrap());
+            current.path = PathBuf::from(path);
+            index.upsert(current);
+        }
+        let scopes = [
+            Path::new("/cache/project/target/debug/object.o"),
+            Path::new("/cache/project"),
+            Path::new("/cache/project/target"),
+            Path::new("/cache/project"),
+        ];
+        assert_eq!(index.invalidate_paths(scopes), 3);
+        assert_eq!(index.len(), paths.len(), "invalidation is not eviction");
+        for (n, _) in paths.iter().enumerate() {
+            let current = index
+                .get(record(u64::try_from(n).unwrap()).identity)
+                .unwrap();
+            assert_eq!(current.score.is_none(), n < 3);
+        }
+        assert_eq!(index.invalidate_paths([Path::new("/cache/absent")]), 0);
+        assert_eq!(index.ranked_records(UNIX_EPOCH, usize::MAX).len(), 3);
+    }
+
+    #[test]
+    fn delayed_failure_feedback_cannot_restore_a_revoked_score_or_erase_backoff() {
+        let mut index = index();
+        let current = record(1);
+        index.upsert(current.clone());
+        index.record_failure(
+            current.identity,
+            UNIX_EPOCH,
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        );
+        let before = index.get(current.identity).unwrap().clone();
+        index.invalidate_paths([current.path.as_path()]);
+        let invalidated = index.get(current.identity).unwrap();
+        assert_eq!(invalidated.fail_count, before.fail_count);
+        assert_eq!(
+            invalidated.cooldown_until_nanos,
+            before.cooldown_until_nanos
+        );
+        assert!(invalidated.evidence_matches(&before));
+        // The daemon drains executor feedback after applying event invalidation.
+        index.record_failure(
+            current.identity,
+            UNIX_EPOCH,
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        );
+        let after_cooldown = UNIX_EPOCH + Duration::from_secs(100);
+        assert!(index.ranked_records(after_cooldown, 1).is_empty());
+        assert_eq!(index.get(current.identity).unwrap().score, None);
+        // Only a new scoring observation restores eligibility, retaining the
+        // same evidence's failure history rather than starting a hot retry loop.
+        index.upsert(current.clone());
+        assert_eq!(index.get(current.identity).unwrap().fail_count, 2);
+        assert!(index.ranked_records(UNIX_EPOCH, 1).is_empty());
+        assert_eq!(
+            index.ranked_records(after_cooldown, 1)[0].identity,
+            current.identity
+        );
+    }
+
+    #[test]
+    fn scoped_revocation_and_unrelated_replay_survive_checkpoint_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkpoint = temp.path().join("index.json");
+        let mut index = index();
+        let current = record(1);
+        let other = record(2);
+        index.upsert(current.clone());
+        index.upsert(other.clone());
+        index.invalidate_paths([current.path.join("debug/changed.o").as_path()]);
+        index.save_checkpoint(&checkpoint).unwrap();
+        let (mut loaded, status) =
+            ScannerCandidateIndex::load_checkpoint(&checkpoint, index.context().clone());
+        assert_eq!(status, ScannerIndexLoadStatus::Loaded);
+        assert_eq!(loaded.event_generation(), index.event_generation());
+        assert_eq!(loaded.get(current.identity).unwrap().score, None);
+        assert_eq!(loaded.ranked_records(UNIX_EPOCH, usize::MAX), vec![other]);
+        loaded.record_failure(current.identity, UNIX_EPOCH, Duration::ZERO, Duration::ZERO);
+        assert_eq!(loaded.ranked_records(UNIX_EPOCH, 1).len(), 1);
+        loaded.upsert(current);
+        assert_eq!(loaded.ranked_records(UNIX_EPOCH, usize::MAX).len(), 2);
+    }
+
+    #[test]
+    fn revocation_uses_current_path_bindings_after_rename_or_rebuild() {
+        let mut index = index();
+        let old = record(1);
+        index.upsert(old.clone());
+        let mut moved = old.clone();
+        moved.path = PathBuf::from("/cache/moved/target");
+        index.upsert(moved.clone());
+        assert_eq!(index.invalidate_paths([old.path.as_path()]), 0);
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![moved.clone()]);
+        let mut replacement = record(2);
+        replacement.path.clone_from(&moved.path);
+        index.upsert(replacement.clone());
+        assert_eq!(index.invalidate_paths([moved.path.as_path()]), 1);
+        assert!(index.get(old.identity).is_none());
+        assert_eq!(index.get(replacement.identity).unwrap().score, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_revocation_preserves_non_utf8_component_boundaries() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let root = PathBuf::from("/cache").join(OsString::from_vec(vec![b'p', 0xff]));
+        let sibling = PathBuf::from("/cache").join(OsString::from_vec(vec![b'p', 0xff, b'-']));
+        let mut index = index();
+        let mut current = record(1);
+        current.path = root.join("target");
+        let mut other = record(2);
+        other.path = sibling.join("target");
+        index.upsert(current);
+        index.upsert(other.clone());
+        assert_eq!(index.invalidate_paths([root.as_path()]), 1);
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![other]);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn scoped_revocation_matches_full_overlap_reference(
+            changes in proptest::collection::vec((0u32..8, 0u32..4, 0u32..4), 0..40),
+        ) {
+            let mut index = index();
+            let mut records = Vec::new();
+            for project in 0..8_u32 {
+                for target in 0..4_u32 {
+                    let mut current = record(u64::from(project * 4 + target));
+                    current.path = PathBuf::from(format!("/cache/p{project}/target-{target}"));
+                    index.upsert(current.clone());
+                    records.push(current);
+                }
+            }
+            let scopes: Vec<PathBuf> = changes.into_iter().map(|(project, target, depth)| {
+                let project = PathBuf::from(format!("/cache/p{project}"));
+                match depth {
+                    0 => project,
+                    1 => project.join(format!("target-{target}")),
+                    2 => project.join(format!("target-{target}/debug/object.o")),
+                    _ => project.with_file_name(format!("{}-other", project.file_name().unwrap().to_string_lossy())),
+                }
+            }).collect();
+            let expected: Vec<bool> = records.iter().map(|record| {
+                scopes.iter().any(|path| record.path.starts_with(path) || path.starts_with(&record.path))
+            }).collect();
+            let count = index.invalidate_paths(scopes.iter().rev().map(PathBuf::as_path));
+            proptest::prop_assert_eq!(count, expected.iter().filter(|affected| **affected).count());
+            for (record, affected) in records.iter().zip(expected) {
+                let actual = index.get(record.identity).unwrap();
+                proptest::prop_assert_eq!(actual.score.is_none(), affected);
+                proptest::prop_assert!(actual.evidence_matches(record));
+            }
+            proptest::prop_assert_eq!(index.event_generation(), 0);
+            proptest::prop_assert_eq!(index.invalidate_paths(scopes.iter().map(PathBuf::as_path)), 0);
+        }
     }
 }

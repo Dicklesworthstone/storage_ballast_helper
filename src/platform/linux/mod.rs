@@ -7,7 +7,7 @@ pub mod cleanup_catalog;
 #[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
 #[cfg(target_os = "linux")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,8 @@ use crate::platform::types::{
     ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
 };
 
+#[cfg(target_os = "linux")]
+pub mod cgroup;
 #[cfg(target_os = "linux")]
 pub mod disk;
 #[cfg(target_os = "linux")]
@@ -81,6 +83,18 @@ impl LinuxPal {
     }
 }
 
+/// Resolve once per query, before both classification and capacity inspection.
+/// Lexically removing `..` before following a symlink changes its meaning.
+/// Do not cache these resolutions: an operator can retarget a pool alias while
+/// the mount table itself is unchanged. Failure is unknown, not disk-backed.
+#[cfg(target_os = "linux")]
+fn resolve_mount_path(path: &Path) -> Result<PathBuf> {
+    std::fs::canonicalize(path).map_err(|error| SbhError::FsStats {
+        path: path.to_path_buf(),
+        details: format!("could not resolve mount query: {error}"),
+    })
+}
+
 #[cfg(target_os = "linux")]
 impl Platform for LinuxPal {
     fn name(&self) -> &'static str {
@@ -88,12 +102,13 @@ impl Platform for LinuxPal {
     }
 
     fn fs_stats(&self, path: &Path) -> Result<FsStats> {
+        let resolved = resolve_mount_path(path)?;
         let mounts = self.mount_points()?;
-        let mount = disk::find_mount(path, &mounts).ok_or_else(|| SbhError::FsStats {
+        let mount = disk::find_mount(&resolved, &mounts).ok_or_else(|| SbhError::FsStats {
             path: path.to_path_buf(),
-            details: "could not map path to mount point".to_string(),
+            details: "could not map resolved path to mount point".to_string(),
         })?;
-        let stat = nix::sys::statvfs::statvfs(path).map_err(|error| SbhError::FsStats {
+        let stat = nix::sys::statvfs::statvfs(&resolved).map_err(|error| SbhError::FsStats {
             path: path.to_path_buf(),
             details: error.to_string(),
         })?;
@@ -113,10 +128,12 @@ impl Platform for LinuxPal {
     }
 
     fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+        let resolved = resolve_mount_path(path)?;
         let mounts = self.mount_points()?;
-        let Some(mount) = disk::find_mount(path, &mounts) else {
-            return Ok(false);
-        };
+        let mount = disk::find_mount(&resolved, &mounts).ok_or_else(|| SbhError::FsStats {
+            path: path.to_path_buf(),
+            details: "could not map resolved path to mount point".to_string(),
+        })?;
         Ok(mount.is_ram_backed)
     }
 
@@ -126,6 +143,12 @@ impl Platform for LinuxPal {
 
     fn memory_info(&self) -> Result<MemoryInfo> {
         memory::read_memory_info()
+    }
+
+    fn ram_write_memory_refusal(&self, minimum_available_percent: u8) -> Result<Option<String>> {
+        cgroup::ram_write_refusal(minimum_available_percent).map_err(|error| {
+            PalError::method_failed("linux", "ram_write_memory_refusal", error.to_string()).into()
+        })
     }
 
     fn memory_pressure(&self) -> Result<MemoryPressure> {
@@ -143,6 +166,14 @@ impl Platform for LinuxPal {
         process::read_process_list()
     }
 
+    fn process_list_without_command_lines(&self) -> Result<Vec<ProcessInfo>> {
+        process::read_process_list_without_command_lines()
+    }
+
+    fn process_list_brief(&self) -> Result<Vec<ProcessInfo>> {
+        process::read_process_list_brief()
+    }
+
     fn process_io(&self, pid: i32) -> Result<ProcessIo> {
         process::read_process_io(pid)
     }
@@ -155,8 +186,38 @@ impl Platform for LinuxPal {
         process::read_executables_under(path)
     }
 
+    fn open_files_under_roots(&self, roots: &[std::path::PathBuf]) -> Result<OpenFilesResult> {
+        process::read_open_files_under_roots(roots)
+    }
+
+    fn executables_under_roots(&self, roots: &[std::path::PathBuf]) -> Result<ExecutablesResult> {
+        process::read_executables_under_roots(roots)
+    }
+
+    fn build_directories_in_use(&self) -> Vec<(i32, std::path::PathBuf)> {
+        process::read_build_directories_in_use()
+    }
+
+    fn build_directories_in_use_checked(&self) -> (Vec<(i32, std::path::PathBuf)>, bool) {
+        process::read_build_directory_snapshot()
+    }
+
     fn mmap_regions_under(&self, path: &Path) -> Result<Vec<crate::platform::types::MappedRegion>> {
         process::read_mmap_regions_under(path)
+    }
+
+    fn mmap_regions_under_fresh(
+        &self,
+        path: &Path,
+    ) -> Result<Vec<crate::platform::types::MappedRegion>> {
+        process::read_mmap_regions_under_fresh(path)
+    }
+
+    fn mmap_regions_under_roots(
+        &self,
+        roots: &[PathBuf],
+    ) -> Result<Vec<crate::platform::types::MappedRegion>> {
+        process::read_mmap_regions_under_roots(roots)
     }
 
     fn self_stats(&self) -> Result<SelfStats> {
@@ -202,8 +263,9 @@ impl Platform for LinuxPal {
     }
 
     fn block_device_for(&self, path: &Path) -> Result<BlockDeviceInfo> {
+        let resolved = resolve_mount_path(path)?;
         let mounts = self.mount_points()?;
-        writeback::block_device_for(path, &mounts)
+        writeback::block_device_for(&resolved, &mounts)
     }
 
     fn apply_writeback_runtime(&self, dirty_bytes: u64, dirty_background_bytes: u64) -> Result<()> {
@@ -247,5 +309,133 @@ mod tests {
         assert_eq!(stats.idle_wakeups, None);
         assert!(stats.bytes_read.is_some());
         assert!(stats.bytes_written.is_some());
+    }
+
+    // Free bytes can change between probes; compare mount identity and stable
+    // capacity properties, not a fictitious globally frozen filesystem.
+    fn assert_same_mount(platform: &LinuxPal, target: &Path, query: &Path) {
+        let expected = platform.fs_stats(target).unwrap();
+        let actual = platform.fs_stats(query).unwrap();
+        assert_eq!(
+            actual.mount_point,
+            expected.mount_point,
+            "query={} query_bytes={:?}",
+            query.display(),
+            query.as_os_str().as_encoded_bytes()
+        );
+        assert_eq!(
+            actual.fs_type,
+            expected.fs_type,
+            "query={} query_bytes={:?}",
+            query.display(),
+            query.as_os_str().as_encoded_bytes()
+        );
+        assert_eq!(actual.total_bytes, expected.total_bytes);
+        assert_eq!(actual.is_readonly, expected.is_readonly);
+        assert_eq!(
+            platform.is_ram_backed(query).unwrap(),
+            platform.is_ram_backed(target).unwrap()
+        );
+        let expected_device = platform.block_device_for(target).unwrap();
+        let actual_device = platform.block_device_for(query).unwrap();
+        assert_eq!(actual_device.source_device, expected_device.source_device);
+        assert_eq!(actual_device.fs_type, expected_device.fs_type);
+    }
+
+    #[test]
+    fn relative_mount_queries_match_the_resolved_working_directory() {
+        let platform = LinuxPal::new();
+        let cwd = std::fs::canonicalize(".").unwrap();
+        for path in [Path::new("."), Path::new("./.")] {
+            assert_same_mount(&platform, &cwd, path);
+        }
+    }
+
+    #[test]
+    fn symlinked_directory_and_file_use_the_targets_mount() {
+        let temp = tempfile::tempdir().unwrap();
+        let platform = LinuxPal::new();
+        for (name, target) in [("directory", "/proc"), ("file", "/proc/self/status")] {
+            let alias = temp.path().join(name);
+            std::os::unix::fs::symlink(target, &alias).unwrap();
+            assert_same_mount(&platform, Path::new(target), &alias);
+            assert_eq!(std::fs::read_link(alias).unwrap(), Path::new(target));
+        }
+    }
+
+    #[test]
+    fn parent_components_are_resolved_after_following_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let alias = temp.path().join("kernel");
+        std::os::unix::fs::symlink("/proc/sys/kernel", &alias).unwrap();
+        assert_same_mount(&LinuxPal::new(), Path::new("/proc/sys"), &alias.join(".."));
+    }
+
+    #[test]
+    fn retargeted_aliases_do_not_inherit_old_mount_classification() {
+        let temp = tempfile::tempdir().unwrap();
+        let alias = temp.path().join("current");
+        let retired = temp.path().join("retired-link");
+        let platform = LinuxPal::new();
+        std::os::unix::fs::symlink("/proc", &alias).unwrap();
+        assert_same_mount(&platform, Path::new("/proc"), &alias);
+        std::fs::rename(&alias, &retired).unwrap();
+        std::os::unix::fs::symlink("/dev", &alias).unwrap();
+        assert_same_mount(&platform, Path::new("/dev"), &alias);
+        assert_eq!(std::fs::read_link(retired).unwrap(), Path::new("/proc"));
+    }
+
+    #[test]
+    fn byte_named_aliases_preserve_the_targets_native_scope() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let alias = temp.path().join(std::ffi::OsString::from_vec(
+            b"alias-\xff\n with space".to_vec(),
+        ));
+        std::os::unix::fs::symlink("/proc", &alias).unwrap();
+        assert_same_mount(&LinuxPal::new(), Path::new("/proc"), &alias);
+    }
+
+    #[test]
+    fn missing_cyclic_and_unmapped_paths_are_unknown_not_disk_backed() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let dangling = temp.path().join("dangling");
+        let cycle = temp.path().join("cycle");
+        std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+        std::os::unix::fs::symlink(&cycle, &cycle).unwrap();
+        let platform = LinuxPal::new();
+        for path in [&missing, &dangling, &cycle] {
+            assert!(platform.fs_stats(path).is_err());
+            assert!(platform.is_ram_backed(path).is_err());
+            assert!(platform.block_device_for(path).is_err());
+        }
+        // An existing path outside the available mount snapshot is also unknown.
+        let unmapped = LinuxPal {
+            mounts_cache: RwLock::new(Some((Vec::new(), Instant::now()))),
+            cache_ttl: Duration::from_secs(3600),
+        };
+        assert!(unmapped.fs_stats(temp.path()).is_err());
+        assert!(unmapped.is_ram_backed(temp.path()).is_err());
+        assert!(unmapped.block_device_for(temp.path()).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn ram_backed_alias_uses_the_real_memory_filesystem() {
+        let target = Path::new("/dev/shm");
+        let platform = LinuxPal::new();
+        if !std::fs::metadata(target).is_ok_and(|meta| meta.is_dir())
+            || !platform.is_ram_backed(target).unwrap()
+        {
+            eprintln!("SKIP: this namespace has no RAM-backed /dev/shm fixture");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let alias = temp.path().join("memory-pool");
+        std::os::unix::fs::symlink(target, &alias).unwrap();
+        assert_same_mount(&platform, target, &alias);
+        assert!(platform.is_ram_backed(&alias).unwrap());
     }
 }

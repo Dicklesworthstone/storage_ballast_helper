@@ -81,10 +81,7 @@ kp_scale_max = 2.0
 [scheduler]
 enabled = true
 scan_budget_per_interval = 5
-exploration_quota_fraction = 0.20
 io_cost_weight = 0.1
-fp_risk_weight = 0.15
-exploration_weight = 0.25
 forecast_error_threshold = 0.5
 fallback_trigger_windows = 3
 recovery_trigger_windows = 5

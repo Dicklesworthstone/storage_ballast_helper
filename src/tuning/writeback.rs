@@ -249,6 +249,38 @@ fn contents_set_dirty_ratio(contents: &str) -> bool {
     })
 }
 
+/// Why kernel writeback tuning must not be applied from this system, if it must not.
+///
+/// `vm.dirty_*` is not namespaced: a privileged container can write `/proc/sys/vm`,
+/// and a systemd container's `systemd-sysctl` loads `/etc/sysctl.d` at boot, so
+/// tuning from inside a container changes the host's limits with values sized for
+/// the container's view (bd-pivw). Looks for the usual container markers under
+/// `root` (`/` in production) and names the one it found.
+#[must_use]
+pub fn container_marker(root: &Path) -> Option<String> {
+    for (marker, runtime) in [
+        (".dockerenv", "Docker"),
+        ("run/.containerenv", "Podman"),
+        ("run/systemd/container", "systemd"),
+    ] {
+        if root.join(marker).exists() {
+            return Some(format!("/{marker} exists ({runtime} container)"));
+        }
+    }
+    // Readable only by PID 1's owner, so this check is effective when running as root,
+    // which is when tuning would be applied.
+    let environ = std::fs::read(root.join("proc/1/environ")).ok()?;
+    environ
+        .split(|&byte| byte == 0)
+        .find_map(|entry| entry.strip_prefix(b"container="))
+        .map(|value| {
+            format!(
+                "PID 1 runs with container={}",
+                String::from_utf8_lossy(value)
+            )
+        })
+}
+
 /// Whether a filesystem type is copy-on-write (kernel writeback threads escape ionice).
 #[must_use]
 pub fn is_cow_filesystem(fs_type: &str) -> bool {
@@ -427,5 +459,46 @@ mod tests {
         // Just under 1 MiB still reads in bytes; just under 1 GiB reads in MiB.
         assert_eq!(human_bytes(MIB - 1), "1048575 B");
         assert_eq!(human_bytes(GIB - 1), "1024 MiB");
+    }
+
+    #[test]
+    fn container_marker_names_each_runtime_and_ignores_a_plain_host() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(host.path().join("proc/1")).unwrap();
+        std::fs::write(
+            host.path().join("proc/1/environ"),
+            b"HOME=/\0TERM=linux\0containerish=no\0",
+        )
+        .unwrap();
+        assert_eq!(container_marker(host.path()), None);
+
+        let docker = tempfile::tempdir().unwrap();
+        std::fs::write(docker.path().join(".dockerenv"), b"").unwrap();
+        assert_eq!(
+            container_marker(docker.path()).as_deref(),
+            Some("/.dockerenv exists (Docker container)")
+        );
+
+        let podman = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(podman.path().join("run")).unwrap();
+        std::fs::write(podman.path().join("run/.containerenv"), b"").unwrap();
+        assert!(container_marker(podman.path()).unwrap().contains("Podman"));
+
+        let nspawn = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(nspawn.path().join("run/systemd")).unwrap();
+        std::fs::write(nspawn.path().join("run/systemd/container"), b"docker\n").unwrap();
+        assert!(container_marker(nspawn.path()).unwrap().contains("systemd"));
+
+        let pid1 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pid1.path().join("proc/1")).unwrap();
+        std::fs::write(
+            pid1.path().join("proc/1/environ"),
+            b"PATH=/usr/bin\0container=lxc\0",
+        )
+        .unwrap();
+        assert_eq!(
+            container_marker(pid1.path()).as_deref(),
+            Some("PID 1 runs with container=lxc")
+        );
     }
 }

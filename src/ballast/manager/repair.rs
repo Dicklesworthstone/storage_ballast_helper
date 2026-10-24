@@ -40,7 +40,7 @@ mod unix {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::Path;
 
-    use rustix::fs::{Mode, OFlags};
+    use rustix::fs::OFlags;
 
     use super::super::{HEADER_SIZE, ballast_file_name, ballast_header_buffer};
 
@@ -113,22 +113,12 @@ mod unix {
         }
         let name = ballast_file_name(index);
         let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-        #[cfg(target_os = "linux")]
-        let fd = {
-            use rustix::fs::{ResolveFlags, openat2};
-            // Also reject same-device file bind mounts: repairing such a slot
-            // would write through to an external file, unlike unlink (EBUSY).
-            openat2(
-                &pool,
-                name.as_str(),
-                flags,
-                Mode::empty(),
-                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
-            )
-        };
-        #[cfg(not(target_os = "linux"))]
-        let fd = rustix::fs::openat(&pool, name.as_str(), flags, Mode::empty());
-        let mut file = File::from(fd.map_err(|error| io(error.into()))?);
+        // Also reject same-device file bind mounts: repairing such a slot
+        // would write through to an external file, unlike unlink (EBUSY).
+        // openat2(RESOLVE_NO_XDEV), or where seccomp blocks it (#28) openat
+        // plus a mount-ID check.
+        let fd = crate::scanner::quarantine::open_beneath(&pool, name.as_ref(), flags);
+        let mut file = File::from(fd.map_err(io)?);
         current(manager, &path, &pool_meta, &file, &before).map_err(io)?;
         let opened = file.metadata().map_err(io)?;
         if opened.len() != before.len()

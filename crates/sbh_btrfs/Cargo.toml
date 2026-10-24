@@ -1,0 +1,13 @@
+[package]
+name = "sbh_btrfs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Small, descriptor-only Btrfs compression and physical-extent inspection boundary for sbh"
+
+# A workspace member, like sbh_mach: test it alone with `cargo test -p sbh_btrfs`.
+# The main application remains unsafe-free.
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

@@ -1,5 +1,10 @@
 //! systemd service integration.
 
+#[path = "systemd_load_state.rs"]
+mod load_state;
+#[path = "systemd_namespace.rs"]
+mod namespace;
+
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -162,73 +167,28 @@ impl SystemdConfig {
         paths
     }
 
-    /// `ReadWritePaths=` value for `paths`, with systemd quoting for paths
-    /// that contain spaces or quotes.
+    /// `ReadWritePaths=` value for `paths`, with systemd C escaping and
+    /// literal percent specifiers. This never expands environment variables.
     #[must_use]
     pub fn render_read_write_paths(paths: &[PathBuf]) -> String {
-        paths
-            .iter()
-            .map(|p| {
-                let s = p.display().to_string();
-                if s.contains(' ') || s.contains('"') {
-                    // Systemd quote escaping: escape internal quotes and wrap in quotes.
-                    format!("\"{}\"", s.replace('"', "\\\""))
-                } else {
-                    s
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
+        namespace::render(paths)
     }
 
     /// Parse the value of a `ReadWritePaths=` line (the inverse of
-    /// [`Self::render_read_write_paths`]).
+    /// [`Self::render_read_write_paths`]). Invalid syntax grants no paths.
     #[must_use]
     pub fn parse_read_write_paths(value: &str) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        let mut current = String::new();
-        let mut in_quotes = false;
-        let mut chars = value.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' if in_quotes => {
-                    if let Some(next) = chars.next() {
-                        current.push(next);
-                    }
-                }
-                '"' => in_quotes = !in_quotes,
-                ' ' if !in_quotes => {
-                    if !current.is_empty() {
-                        paths.push(PathBuf::from(std::mem::take(&mut current)));
-                    }
-                }
-                _ => current.push(c),
-            }
-        }
-        if !current.is_empty() {
-            paths.push(PathBuf::from(current));
-        }
-        paths
+        namespace::parse(value).unwrap_or_default()
     }
 
     /// Paths in `required` that a unit file's `ReadWritePaths=` line does not
     /// grant (a unit without `ProtectSystem=strict` needs none).
     #[must_use]
     pub fn missing_read_write_paths(unit_contents: &str, required: &[PathBuf]) -> Vec<PathBuf> {
-        let strict = unit_contents
-            .lines()
-            .any(|line| line.trim() == "ProtectSystem=strict");
-        if !strict {
-            return Vec::new();
-        }
-        let granted: Vec<PathBuf> = unit_contents
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("ReadWritePaths="))
-            .flat_map(Self::parse_read_write_paths)
-            .collect();
+        let sandbox = ServiceSandbox::from_unit_texts(&[unit_contents]);
         required
             .iter()
-            .filter(|path| !granted.iter().any(|g| path.starts_with(g)))
+            .filter(|path| sandbox.denies_write(path))
             .cloned()
             .collect()
     }
@@ -303,7 +263,7 @@ impl SystemdServiceManager {
     /// repair does not silently switch the daemon to another config file.
     #[must_use]
     pub fn generate_unit_file_with_config(&self, config: Option<&Path>) -> String {
-        let binary = self.config.binary_path.display();
+        let binary = systemd_exec_path(&self.config.binary_path, false);
         let rw_paths = SystemdConfig::render_read_write_paths(&self.config.read_write_paths);
 
         let mut unit = String::with_capacity(2048);
@@ -337,16 +297,10 @@ impl SystemdServiceManager {
         }
 
         match config {
-            Some(path) if path.to_string_lossy().contains(char::is_whitespace) => writeln!(
-                unit,
-                "ExecStart={binary} daemon --config \"{}\"",
-                path.display()
-            )
-            .ok(),
             Some(path) => writeln!(
                 unit,
                 "ExecStart={binary} daemon --config {}",
-                path.display()
+                systemd_exec_path(path, true)
             )
             .ok(),
             None => writeln!(unit, "ExecStart={binary} daemon").ok(),
@@ -379,12 +333,21 @@ impl SystemdServiceManager {
         writeln!(unit).ok();
 
         writeln!(unit, "# Resource limits").ok();
-        writeln!(unit, "MemoryMax=256M").ok();
+        writeln!(
+            unit,
+            "MemoryMax={}",
+            crate::daemon::service::SYSTEMD_MEMORY_MAX
+        )
+        .ok();
         // One core as the runaway backstop; the weight (plus Nice/IO idle)
         // keeps it out of the way of builds. 10% of one core starved every
         // host: throttled in up to 100% of periods, scans timing out at Critical.
         writeln!(unit, "CPUQuota=100%").ok();
         writeln!(unit, "CPUWeight=1").ok();
+        // glibc gives each walker thread its own malloc arena and keeps the
+        // freed pages: on a 500k-entry tree RSS settled at 480 MiB against
+        // ~290 MiB with two arenas, at the same scan CPU (ts2 2026-10-15).
+        writeln!(unit, "Environment=MALLOC_ARENA_MAX=2").ok();
         writeln!(unit).ok();
 
         if !self.config.user_scope {
@@ -465,14 +428,21 @@ impl SystemdServiceManager {
 
 impl ServiceManager for SystemdServiceManager {
     fn install(&self) -> Result<()> {
+        validate_systemd_binary(&self.config.binary_path)?;
         self.check_binary_ownership();
 
         let unit_dir = self.config.unit_dir();
         let unit_path = self.config.unit_path();
         let unit_content = self.generate_unit_file();
 
+        // Namespace setup precedes ExecStart (and ExecStartPre). Prepare the
+        // exact grants before publishing/enabling a unit; never broaden them
+        // to an existing ancestor or turn off ProtectSystem to make it start.
+        if !self.config.user_scope {
+            namespace::prepare(&self.config.read_write_paths)?;
+        }
         fs::create_dir_all(&unit_dir).map_err(|source| SbhError::Io {
-            path: unit_dir.clone(),
+            path: unit_path.clone(),
             source,
         })?;
 
@@ -547,9 +517,23 @@ impl ServiceManager for SystemdServiceManager {
         })
     }
 
+    fn notify_extend_startup(&self, extend_by: std::time::Duration, status: &str) -> Result<()> {
+        let Some(socket_path) = systemd_notify_socket() else {
+            return Ok(());
+        };
+        sd_notify_send(&sd_extend_timeout_message(extend_by, status), &socket_path).map_err(
+            |source| SbhError::Io {
+                path: PathBuf::from(socket_path),
+                source,
+            },
+        )
+    }
+
     fn restart(&self) -> Result<()> {
-        self.run_systemctl(&["restart", SYSTEMD_UNIT_NAME])?;
-        Ok(())
+        load_state::restart(self.config.user_scope, || {
+            self.run_systemctl(&["restart", SYSTEMD_UNIT_NAME])
+                .map(|_| ())
+        })
     }
 
     fn logs_path(&self) -> Result<Option<PathBuf>> {
@@ -557,11 +541,7 @@ impl ServiceManager for SystemdServiceManager {
     }
 
     fn is_loaded(&self) -> Result<bool> {
-        let state = self.run_systemctl_lenient(&["is-enabled", SYSTEMD_UNIT_NAME]);
-        Ok(matches!(
-            state.as_str(),
-            "enabled" | "static" | "linked" | "generated" | "transient"
-        ))
+        load_state::is_loaded(self.config.user_scope, &self.config.unit_path())
     }
 }
 
@@ -583,6 +563,16 @@ pub const SD_STOPPING_MESSAGE: &str = "STOPPING=1\n";
 #[must_use]
 pub fn sd_ready_message(pid: u32) -> String {
     format!("READY=1\nMAINPID={pid}\n")
+}
+
+/// `sd_notify(3)` message extending the current start timeout to at least
+/// `extend_by` from now (systemd 236+; older managers ignore it).
+#[must_use]
+pub fn sd_extend_timeout_message(extend_by: std::time::Duration, status: &str) -> String {
+    format!(
+        "EXTEND_TIMEOUT_USEC={}\nSTATUS={status}\n",
+        extend_by.as_micros()
+    )
 }
 
 /// `sd_notify(3)` watchdog heartbeat message.
@@ -793,6 +783,57 @@ pub fn parse_unit_directives(text: &str) -> std::collections::BTreeMap<String, V
         }
     }
     directives
+}
+
+/// What a unit's filesystem sandbox lets the service write. Under
+/// `ProtectSystem=strict` that is only the `ReadWritePaths=` entries and
+/// everything below them; otherwise the sandbox restricts nothing here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceSandbox {
+    /// The effective `ProtectSystem=` is `strict` (the last assignment wins).
+    pub strict: bool,
+    /// Every `ReadWritePaths=` grant, without its `-`/`+` modifier.
+    pub writable: Vec<PathBuf>,
+}
+
+impl ServiceSandbox {
+    /// The sandbox of a unit file followed by its drop-ins, in the order
+    /// systemd applies them: list entries accumulate, an empty assignment
+    /// resets them, and a later `ProtectSystem=` replaces an earlier one.
+    /// A grant that does not parse grants nothing.
+    #[must_use]
+    pub fn from_unit_texts<T: AsRef<str>>(texts: &[T]) -> Self {
+        let joined = texts
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>()
+            .join("\n");
+        let directives = parse_unit_directives(&joined);
+        let strict = directives
+            .get("Service/ProtectSystem")
+            .and_then(|values| values.last())
+            .is_some_and(|value| value == "strict");
+        let writable = directives
+            .get("Service/ReadWritePaths")
+            .into_iter()
+            .flatten()
+            .flat_map(|value| SystemdConfig::parse_read_write_paths(value))
+            .filter_map(|word| namespace::grant_path(&word).ok().map(|(path, _)| path))
+            .collect();
+        Self { strict, writable }
+    }
+
+    /// Whether the service cannot write `path`: the unit is strict and no
+    /// `ReadWritePaths=` entry covers it. A root CLI run outside the sandbox
+    /// can write such a path while the service cannot.
+    #[must_use]
+    pub fn denies_write(&self, path: &Path) -> bool {
+        self.strict
+            && !self
+                .writable
+                .iter()
+                .any(|granted| path.starts_with(granted))
+    }
 }
 
 /// A directive whose installed value differs from the generated one.
@@ -1082,17 +1123,19 @@ fn percent_value(value: &str) -> Option<f64> {
 
 fn exec_start_binary(
     directives: &std::collections::BTreeMap<String, Vec<String>>,
-) -> Option<String> {
-    directives
-        .get("Service/ExecStart")?
-        .last()?
-        .split_whitespace()
-        .next()
-        .map(|binary| {
-            binary
-                .trim_start_matches(['-', '@', ':', '+', '!'])
-                .to_string()
-        })
+) -> Option<Vec<u8>> {
+    let commands = directives.get("Service/ExecStart")?;
+    // Multiple commands cannot establish one executable identity.
+    let [command] = commands.as_slice() else {
+        return None;
+    };
+    let (word, _) = take_systemd_word(command)?;
+    let prefix_len = word
+        .iter()
+        .take_while(|byte| b"-@:+!".contains(byte))
+        .count();
+    let binary = literal_systemd_word(&word[prefix_len..], false)?;
+    (!binary.is_empty()).then_some(binary)
 }
 
 /// What `reinstall-unit` did.
@@ -1115,18 +1158,21 @@ pub struct ReinstallReport {
 
 impl SystemdServiceManager {
     /// Compare the installed unit and its drop-ins with what sbh would
-    /// generate now. Errors when no unit is installed.
+    /// generate now. Errors when no unit is installed or a required sandbox
+    /// path cannot be resolved; the latter names the 226/NAMESPACE blocker.
     pub fn drift_report(&self) -> Result<UnitDrift> {
         let unit_path = self.config.unit_path();
         let installed = fs::read_to_string(&unit_path).map_err(|source| SbhError::Io {
             path: unit_path.clone(),
             source,
         })?;
+        let dropins = self.config.read_dropins();
+        namespace::validate_unit(&installed, &dropins)?;
         Ok(UnitDrift::compute(
             &unit_path,
             &installed,
             &self.generate_unit_file(),
-            &self.config.read_dropins(),
+            &dropins,
         ))
     }
 
@@ -1135,20 +1181,32 @@ impl SystemdServiceManager {
     /// `purge_dropins` they are moved into the backup directory, otherwise
     /// they stay and keep applying.
     pub fn reinstall_unit(&self, purge_dropins: bool) -> Result<ReinstallReport> {
+        validate_systemd_binary(&self.config.binary_path)?;
         let unit_path = self.config.unit_path();
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
         let backup_path = unit_path.with_file_name(format!("{SYSTEMD_UNIT_NAME}.bak-{stamp}"));
         // Keep the config the unit runs with: a fleet unit's
         // `--config /root/.config/sbh/config.toml` dropped by a repair made the
         // daemon load /etc/sbh/config.toml instead (vmi1152480, 2026-09-25).
-        // A quoted path is not split back out whole, so it is not carried.
-        let preserved_config = unit_path
-            .parent()
-            .and_then(crate::core::config::config_from_systemd_unit_dir)
-            .filter(|path| !path.to_string_lossy().contains('"'));
+        let previous = match fs::read_to_string(&unit_path) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(SbhError::Io {
+                    path: unit_path,
+                    source,
+                });
+            }
+        };
+        let dropins = self.config.read_dropins();
+        let preserved_config = preserved_unit_config(previous.as_deref().unwrap_or(""), &dropins)?;
         let generated = self.generate_unit_file_with_config(preserved_config.as_deref());
+        // The repair path needs the same preparation as a fresh install.
+        // Failure must leave the existing unit and its drop-ins untouched.
+        if !self.config.user_scope {
+            namespace::prepare(&self.config.read_write_paths)?;
+        }
 
-        let previous = fs::read_to_string(&unit_path).ok();
         let backup_path = if previous.is_some() {
             fs::copy(&unit_path, &backup_path).map_err(|source| SbhError::Io {
                 path: backup_path.clone(),
@@ -1172,7 +1230,7 @@ impl SystemdServiceManager {
 
         let mut dropins_moved = Vec::new();
         let mut dropins_kept = Vec::new();
-        for (path, _) in self.config.read_dropins() {
+        for (path, _) in dropins {
             if purge_dropins {
                 let aside_dir =
                     unit_path.with_file_name(format!("{SYSTEMD_UNIT_NAME}.bak-{stamp}.d"));
@@ -1220,6 +1278,210 @@ impl SystemdServiceManager {
             daemon_reloaded,
         })
     }
+}
+
+// systemd ExecStart words are not shell words. Percent specifiers are expanded
+// even inside quotes. Environment expansion applies to arguments, not the
+// executable path, so doubling '$' in the executable selects the wrong file.
+fn systemd_exec_path(path: &Path, argument: bool) -> String {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-:@+".contains(byte))
+    {
+        return path.to_string_lossy().into_owned();
+    }
+    let mut quoted = String::from("\"");
+    for &byte in bytes {
+        match byte {
+            b'"' => quoted.push_str("\\\""),
+            b'\\' => quoted.push_str("\\\\"),
+            b'%' => quoted.push_str("%%"),
+            b'$' if argument => quoted.push_str("$$"),
+            b' '..=b'~' => quoted.push(char::from(byte)),
+            _ => {
+                let _ = write!(quoted, "\\x{byte:02x}");
+            }
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+// systemd rejects these characters in the executable itself even when they
+// are escaped. Refuse before overwriting a working unit, rather than emitting
+// a unit that can never start. Config arguments may contain escaped quotes.
+fn validate_systemd_binary(path: &Path) -> Result<()> {
+    if !path.is_absolute()
+        || path
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .copied()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b'"' | b'\'' | b'\\'))
+    {
+        return Err(SbhError::Runtime {
+            details: format!(
+                "systemd requires an absolute executable path without control characters, quotes or backslashes: {}; move sbh to a supported installation path",
+                path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+// Read a whole systemd word, preserving native path bytes. Inconclusive syntax
+// is not evidence of matching binaries. Only the C escapes systemd documents
+// are accepted; this parser never invokes a shell or expands the environment.
+fn take_systemd_word(input: &str) -> Option<(Vec<u8>, &str)> {
+    let input = input.trim_start_matches(|ch: char| ch.is_ascii_whitespace());
+    let mut chars = input.char_indices().peekable();
+    chars.peek()?;
+    let mut word = Vec::new();
+    let mut quote = None;
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\'' | '"' if quote == Some(ch) => quote = None,
+            '\'' | '"' if quote.is_none() => quote = Some(ch),
+            ch if ch.is_ascii_whitespace() && quote.is_none() => {
+                return Some((word, &input[index..]));
+            }
+            '\\' => {
+                let (_, escape) = chars.next()?;
+                let byte = match escape {
+                    'a' => 7,
+                    'b' => 8,
+                    'f' => 12,
+                    'n' => b'\n',
+                    'r' => b'\r',
+                    't' => b'\t',
+                    'v' => 11,
+                    's' => b' ',
+                    '\\' => b'\\',
+                    '\'' => b'\'',
+                    '"' => b'"',
+                    'x' | 'u' | 'U' | '0'..='7' => {
+                        let (radix, digits, mut value) = match escape {
+                            'x' => (16, 2, 0u32),
+                            'u' => (16, 4, 0),
+                            'U' => (16, 8, 0),
+                            digit => (8, 2, digit.to_digit(8)?),
+                        };
+                        for _ in 0..digits {
+                            value = value
+                                .checked_mul(radix)?
+                                .checked_add(chars.next()?.1.to_digit(radix)?)?;
+                        }
+                        if matches!(escape, 'u' | 'U') {
+                            let mut buffer = [0; 4];
+                            word.extend_from_slice(
+                                char::from_u32(value)?.encode_utf8(&mut buffer).as_bytes(),
+                            );
+                            continue;
+                        }
+                        u8::try_from(value).ok()?
+                    }
+                    _ => return None,
+                };
+                word.push(byte);
+            }
+            ch => {
+                let mut buffer = [0; 4];
+                word.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
+            }
+        }
+    }
+    quote.is_none().then_some((word, ""))
+}
+
+fn literal_systemd_word(word: &[u8], argument: bool) -> Option<Vec<u8>> {
+    let mut literal = Vec::with_capacity(word.len());
+    let mut bytes = word.iter().copied();
+    while let Some(byte) = bytes.next() {
+        if (byte == b'%' || (argument && byte == b'$')) && bytes.next()? != byte {
+            // A real specifier/environment reference needs manager context.
+            return None;
+        }
+        if byte == 0 {
+            return None;
+        }
+        literal.push(byte);
+    }
+    Some(literal)
+}
+
+// Preserve the effective config before any backup or unit write. Silently
+// dropping a quoted/dynamic config can restart a guardian with different scan
+// roots and cleanup policy. Unresolvable config syntax must stop the repair.
+fn preserved_unit_config(
+    installed: &str,
+    dropins: &[(PathBuf, String)],
+) -> Result<Option<PathBuf>> {
+    let key = "Service/ExecStart";
+    let mut directives = parse_unit_directives(installed);
+    for (_, text) in dropins {
+        if let Some(commands) = parse_unit_directives(text).remove(key) {
+            directives.insert(key.to_string(), commands);
+        }
+    }
+    let invalid = || {
+        SbhError::Runtime {
+        details: "cannot preserve the installed systemd --config path; refusing to rewrite the unit; use one absolute literal config path without environment or unit specifiers".to_string(),
+    }
+    };
+    let Some(commands) = directives.get(key) else {
+        return Ok(None);
+    };
+    if commands.is_empty() {
+        return Ok(None);
+    }
+    let [command] = commands.as_slice() else {
+        return Err(invalid());
+    };
+    let (executable, mut rest) = take_systemd_word(command).ok_or_else(invalid)?;
+    let prefix_len = executable
+        .iter()
+        .take_while(|byte| b"-@:+!".contains(byte))
+        .count();
+    let expand_environment = !executable[..prefix_len].contains(&b':');
+    if executable[..prefix_len].contains(&b'@') {
+        // With '@', the next word is argv[0], not a daemon option.
+        rest = take_systemd_word(rest).ok_or_else(invalid)?.1;
+    }
+    let mut config = None;
+    while !rest.trim().is_empty() {
+        let (word, tail) = take_systemd_word(rest).ok_or_else(invalid)?;
+        rest = tail;
+        if word == b";" {
+            return Err(invalid());
+        }
+        let value = if word == b"--config" {
+            let (value, tail) = take_systemd_word(rest).ok_or_else(invalid)?;
+            rest = tail;
+            Some(value)
+        } else {
+            word.strip_prefix(b"--config=").map(<[u8]>::to_vec)
+        };
+        if let Some(value) = value {
+            if config.is_some() {
+                return Err(invalid());
+            }
+            let bytes = literal_systemd_word(&value, expand_environment).ok_or_else(invalid)?;
+            #[cfg(unix)]
+            let path = {
+                use std::os::unix::ffi::OsStringExt;
+                PathBuf::from(std::ffi::OsString::from_vec(bytes))
+            };
+            #[cfg(not(unix))]
+            let path = PathBuf::from(String::from_utf8(bytes).map_err(|_| invalid())?);
+            if !path.is_absolute() {
+                return Err(invalid());
+            }
+            config = Some(path);
+        }
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -1280,6 +1542,37 @@ mod unit_drift_tests {
         );
         assert!(drift.is_clean(), "{drift:?}");
         assert!(drift.exec_start_matches);
+    }
+
+    /// The kernel's cap must sit above the daemon's own hard limit, or the
+    /// OOM killer (SIGKILL, maybe mid-deletion) always beats the graceful
+    /// exit-and-restart.
+    #[test]
+    fn generated_memory_max_is_above_the_daemons_own_rss_hard_limit() {
+        let directives = parse_unit_directives(&manager().generate_unit_file());
+        let value = &directives["Service/MemoryMax"][0];
+        let mib: u64 = value
+            .strip_suffix('M')
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("MemoryMax={value} is not in M"));
+        let hard_limit = crate::core::config::Config::default()
+            .telemetry
+            .daemon_rss_hard_limit_bytes;
+        assert!(mib * 1024 * 1024 > hard_limit, "MemoryMax={value}");
+    }
+
+    #[test]
+    fn generated_units_cap_glibc_malloc_arenas_in_both_scopes() {
+        for user_scope in [false, true] {
+            let mut manager = manager();
+            manager.config.user_scope = user_scope;
+            let directives = parse_unit_directives(&manager.generate_unit_file());
+            assert_eq!(
+                directives.get("Service/Environment"),
+                Some(&vec!["MALLOC_ARENA_MAX=2".to_string()]),
+                "user_scope={user_scope}"
+            );
+        }
     }
 
     #[test]
@@ -1506,6 +1799,44 @@ mod read_write_paths_tests {
         assert!(SystemdConfig::patch_read_write_paths(lenient, &required).is_none());
     }
 
+    /// Drop-ins apply in order: grants accumulate, an empty assignment
+    /// resets them, and a later `ProtectSystem=` replaces an earlier one.
+    #[test]
+    fn service_sandbox_follows_dropin_order() {
+        let unit = "[Service]\nProtectSystem=strict\nReadWritePaths=/var/lib/sbh -/data/tmp\n";
+        let sandbox = ServiceSandbox::from_unit_texts(&[unit]);
+        assert!(sandbox.strict);
+        assert_eq!(
+            sandbox.writable,
+            vec![PathBuf::from("/var/lib/sbh"), PathBuf::from("/data/tmp")],
+            "an optional '-' grant still grants its path"
+        );
+        assert!(!sandbox.denies_write(Path::new("/var/lib/sbh/ballast")));
+        assert!(!sandbox.denies_write(Path::new("/data/tmp/x")));
+        assert!(sandbox.denies_write(Path::new("/.sbh/ballast")));
+
+        let extended = ServiceSandbox::from_unit_texts(&[unit, "[Service]\nReadWritePaths=/srv\n"]);
+        assert!(!extended.denies_write(Path::new("/srv/a")));
+        assert!(!extended.denies_write(Path::new("/var/lib/sbh")));
+
+        let reset = ServiceSandbox::from_unit_texts(&[
+            unit,
+            "[Service]\nReadWritePaths=\nReadWritePaths=/srv\n",
+        ]);
+        assert_eq!(reset.writable, vec![PathBuf::from("/srv")]);
+        assert!(reset.denies_write(Path::new("/var/lib/sbh")));
+
+        let relaxed = ServiceSandbox::from_unit_texts(&[unit, "[Service]\nProtectSystem=full\n"]);
+        assert!(!relaxed.strict);
+        assert!(!relaxed.denies_write(Path::new("/.sbh/ballast")));
+
+        // A unit that never sets ProtectSystem restricts nothing here.
+        assert_eq!(
+            ServiceSandbox::from_unit_texts(&["[Service]\nNoNewPrivileges=true\n"]),
+            ServiceSandbox::default()
+        );
+    }
+
     #[test]
     fn generated_unit_uses_the_derived_sandbox() {
         let config = sample_config();
@@ -1571,6 +1902,10 @@ mod watchdog_tests {
 
     #[test]
     fn sd_notify_messages_follow_the_protocol() {
+        assert_eq!(
+            sd_extend_timeout_message(std::time::Duration::from_secs(30), "provisioning ballast"),
+            "EXTEND_TIMEOUT_USEC=30000000\nSTATUS=provisioning ballast\n"
+        );
         assert_eq!(sd_ready_message(4242), "READY=1\nMAINPID=4242\n");
         assert_eq!(SD_STOPPING_MESSAGE, "STOPPING=1\n");
         assert_eq!(
@@ -1677,5 +2012,277 @@ mod watchdog_tests {
         assert!(diagnostic.contains("systemctl daemon-reload failed with exit 1"));
         assert!(diagnostic.contains("systemd-analyze verify '/tmp/sbh test/sbh.service'"));
         assert!(diagnostic.contains("sudo systemctl status sbh.service"));
+    }
+}
+
+#[cfg(test)]
+mod exec_path_tests {
+    use super::*;
+
+    fn manager(binary: &str, user_scope: bool) -> SystemdServiceManager {
+        SystemdServiceManager::new(SystemdConfig {
+            user_scope,
+            binary_path: PathBuf::from(binary),
+            read_write_paths: vec![PathBuf::from("/tmp")],
+        })
+    }
+
+    #[test]
+    fn ordinary_execstart_output_stays_unchanged() {
+        let unit = manager("/usr/local/bin/sbh", false)
+            .generate_unit_file_with_config(Some(Path::new("/etc/sbh/config.toml")));
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/sbh daemon --config /etc/sbh/config.toml\n")
+        );
+        assert!(unit.contains("ExecReload=/bin/kill -HUP $MAINPID\n"));
+        assert!(unit.contains("NoNewPrivileges=true\n"));
+        assert!(unit.contains("ProtectSystem=strict\n"));
+    }
+
+    #[test]
+    fn execstart_preserves_spaces_specifiers_and_literal_dollars() {
+        for user_scope in [false, true] {
+            let unit = manager("/opt/sbh custom/%h/${HOME}/sbh", user_scope)
+                .generate_unit_file_with_config(Some(Path::new(
+                    "/etc/sbh config/%n/${USER}/config.toml",
+                )));
+            assert!(unit.contains(
+                "ExecStart=\"/opt/sbh custom/%%h/${HOME}/sbh\" daemon --config \"/etc/sbh config/%%n/$${USER}/config.toml\"\n"
+            ));
+            assert_eq!(
+                exec_start_binary(&parse_unit_directives(&unit)).unwrap(),
+                b"/opt/sbh custom/%h/${HOME}/sbh"
+            );
+        }
+    }
+
+    #[test]
+    fn config_paths_cannot_inject_unit_directives() {
+        let path = Path::new("/etc/quoted\"/back\\slash\nUser=root\n/config.toml");
+        let unit = manager("/usr/local/bin/sbh", false).generate_unit_file_with_config(Some(path));
+        let directives = parse_unit_directives(&unit);
+        assert!(!directives.contains_key("Service/User"));
+        assert_eq!(directives["Service/ExecStart"].len(), 1);
+        let encoded = systemd_exec_path(path, true);
+        let (word, rest) = take_systemd_word(&encoded).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(
+            literal_systemd_word(&word, true).unwrap(),
+            path.as_os_str().as_encoded_bytes()
+        );
+    }
+
+    #[test]
+    fn drift_compares_the_whole_quoted_executable_not_its_first_fragment() {
+        let generated = manager("/opt/shared prefix/one/sbh", false).generate_unit_file();
+        for command in [
+            "\"/opt/shared prefix/two/sbh\" daemon",
+            "/opt/shared prefix/one/sbh daemon",
+            "\"/opt/shared prefix/one/sbh daemon",
+        ] {
+            let installed = format!("[Service]\nExecStart={command}\n");
+            let drift =
+                UnitDrift::compute(Path::new("/x/sbh.service"), &installed, &generated, &[]);
+            assert!(!drift.exec_start_matches, "{command}");
+        }
+        for command in [
+            "'/opt/shared prefix/one/sbh' daemon",
+            r"-/opt/shared\sprefix/one/sbh daemon",
+            r"/opt/shared\x20prefix/one/sbh daemon",
+            r"/opt/shared\040prefix/one/sbh daemon",
+            r"/opt/shared\u0020prefix/one/sbh daemon",
+        ] {
+            let parsed = parse_unit_directives(&format!("[Service]\nExecStart={command}\n"));
+            assert_eq!(
+                exec_start_binary(&parsed).unwrap(),
+                b"/opt/shared prefix/one/sbh",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_context_dependent_execstart_is_not_a_match() {
+        for command in [
+            r"/opt/\xZZ/sbh daemon",
+            r"/opt/\q/sbh daemon",
+            r"/opt/\000/sbh daemon",
+            r"/opt/\Uffffffff/sbh daemon",
+            "\"/opt/missing quote/sbh daemon",
+            "/opt/%h/sbh daemon",
+            "\"\" daemon",
+        ] {
+            let parsed = parse_unit_directives(&format!("[Service]\nExecStart={command}\n"));
+            assert!(exec_start_binary(&parsed).is_none(), "{command}");
+        }
+        let multiple =
+            parse_unit_directives("[Service]\nExecStart=/opt/one/sbh\nExecStart=/opt/two/sbh\n");
+        assert!(exec_start_binary(&multiple).is_none());
+    }
+
+    #[test]
+    fn unsupported_systemd_executables_are_rejected_before_install() {
+        for path in [
+            "sbh",
+            "/opt/a\"b/sbh",
+            "/opt/a'b/sbh",
+            "/opt/a\\b/sbh",
+            "/opt/a\nb/sbh",
+        ] {
+            assert!(
+                validate_systemd_binary(Path::new(path)).is_err(),
+                "{path:?}"
+            );
+        }
+        for path in [
+            "/usr/local/bin/sbh",
+            "/opt/custom path/sbh",
+            "/opt/%h/${HOME}/sbh",
+        ] {
+            assert!(validate_systemd_binary(Path::new(path)).is_ok());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encoding_and_drift_preserve_native_path_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(OsStr::from_bytes(b"/opt/custom-\xff space/sbh"));
+        let mut manager = manager("/unused", true);
+        manager.config.binary_path = path.to_path_buf();
+        let unit = manager.generate_unit_file();
+        assert!(unit.contains(r"\xff"));
+        assert_eq!(
+            exec_start_binary(&parse_unit_directives(&unit)).unwrap(),
+            path.as_os_str().as_bytes()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires native systemd-analyze; no running service manager is needed"]
+    fn native_systemd_accepts_generated_custom_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        for (index, relative) in [
+            "custom destination/sbh",
+            "literal-%h/sbh",
+            "literal-${HOME}/sbh",
+            "unicode-\u{e9}/sbh",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let binary = temp.path().join(relative);
+            fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+            let unit_path = temp.path().join(format!("sbh-path-{index}.service"));
+            for user_scope in [false, true] {
+                let manager = manager(binary.to_str().unwrap(), user_scope);
+                fs::write(&unit_path, manager.generate_unit_file()).unwrap();
+                let output = Command::new("systemd-analyze")
+                    .args(["verify", "--man=no"])
+                    .arg(&unit_path)
+                    .output()
+                    .expect("install systemd-analyze before running this ignored test");
+                assert!(output.status.success(), "{relative}: {output:?}");
+            }
+            // Live parser negative controls: these are real, runnable files,
+            // but the old unquoted/unescaped output names the wrong executable.
+            if index < 2 {
+                fs::write(
+                    &unit_path,
+                    format!("[Service]\nExecStart={} daemon\n", binary.display()),
+                )
+                .unwrap();
+                let output = Command::new("systemd-analyze")
+                    .args(["verify", "--man=no"])
+                    .arg(&unit_path)
+                    .output()
+                    .unwrap();
+                assert!(
+                    !output.status.success(),
+                    "baseline unexpectedly passed: {relative}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod preserved_config_tests {
+    use super::*;
+
+    #[test]
+    fn repairs_preserve_quoted_escaped_and_equals_config_arguments() {
+        for command in [
+            r#""/opt/custom path/sbh" daemon --config "/etc/sbh config/a.toml""#,
+            r#"/opt/sbh daemon "--config=/etc/sbh config/a.toml""#,
+            r"/opt/sbh daemon --config /etc/sbh\sconfig/a.toml",
+        ] {
+            let unit = format!("[Service]\nExecStart={command}\n");
+            assert_eq!(
+                preserved_unit_config(&unit, &[]).unwrap(),
+                Some(PathBuf::from("/etc/sbh config/a.toml"))
+            );
+        }
+    }
+
+    #[test]
+    fn generated_literal_config_survives_repair_and_dropin_replacement() {
+        let path = Path::new("/etc/custom %h/${HOME}/quote\"/config.toml");
+        let manager = SystemdServiceManager::new(SystemdConfig {
+            user_scope: true,
+            binary_path: PathBuf::from("/opt/custom path/sbh"),
+            read_write_paths: Vec::new(),
+        });
+        let generated = manager.generate_unit_file_with_config(Some(path));
+        assert_eq!(
+            preserved_unit_config(&generated, &[]).unwrap().as_deref(),
+            Some(path)
+        );
+        let dropins = vec![(
+            PathBuf::from("/unit/sbh.service.d/config.conf"),
+            "[Service]\nExecStart=\nExecStart=/opt/sbh daemon --config '/etc/drop in/config.toml'\n".to_string(),
+        )];
+        assert_eq!(
+            preserved_unit_config(&generated, &dropins).unwrap(),
+            Some(PathBuf::from("/etc/drop in/config.toml"))
+        );
+    }
+
+    #[test]
+    fn repair_refuses_unknown_config_instead_of_switching_to_defaults() {
+        for command in [
+            "/opt/sbh daemon --config",
+            "/opt/sbh daemon --config=",
+            "/opt/sbh daemon --config relative.toml",
+            "/opt/sbh daemon --config %h/config.toml",
+            "/opt/sbh daemon --config /etc/${USER}/config.toml",
+            "/opt/sbh daemon --config /etc/one --config /etc/two",
+            "/opt/sbh daemon --config '/etc/unclosed quote",
+        ] {
+            let unit = format!("[Service]\nExecStart={command}\n");
+            assert!(preserved_unit_config(&unit, &[]).is_err(), "{command}");
+        }
+        assert!(
+            preserved_unit_config("[Service]\nExecStart=/opt/sbh daemon\n", &[])
+                .unwrap()
+                .is_none()
+        );
+        // ':' disables expansion in the old unit. The new generator escapes
+        // the dollar signs when it emits the equivalent command without ':'.
+        assert_eq!(
+            preserved_unit_config(
+                "[Service]\nExecStart=:/opt/sbh daemon --config /etc/${USER}/config.toml\n",
+                &[],
+            )
+            .unwrap(),
+            Some(PathBuf::from("/etc/${USER}/config.toml"))
+        );
     }
 }

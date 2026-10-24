@@ -244,6 +244,11 @@ pub struct ProtectionRegistry {
     config_patterns: Vec<GlobPattern>,
     /// B7: path → memoized *protected* verdict. Never holds "clean" verdicts.
     sacred_verdict_cache: HashMap<PathBuf, CachedSacredVerdict>,
+    /// Directories whose `.sbh-protect` probe, and every ancestor's, already
+    /// ran on this registry (bd-os02). A registry lives for one scan pass, so
+    /// a marker created mid-pass is seen on the next pass; deletion re-probes
+    /// every ancestor at the mutation boundary regardless.
+    ancestors_probed: HashSet<PathBuf>,
 }
 
 impl ProtectionRegistry {
@@ -272,6 +277,7 @@ impl ProtectionRegistry {
             marker_paths: HashSet::new(),
             config_patterns: compiled,
             sacred_verdict_cache: HashMap::new(),
+            ancestors_probed: HashSet::new(),
         })
     }
 
@@ -281,6 +287,7 @@ impl ProtectionRegistry {
             marker_paths: HashSet::new(),
             config_patterns: Vec::new(),
             sacred_verdict_cache: HashMap::new(),
+            ancestors_probed: HashSet::new(),
         }
     }
 
@@ -498,8 +505,17 @@ impl ProtectionRegistry {
     pub fn discover_ancestor_markers(&mut self, path: &Path) -> Result<usize> {
         let normalized = normalize_path_for_protection(path);
         let mut found = 0usize;
+        // Every entry under one root shares its ancestors: a prescan over a
+        // large $TMPDIR repeated the same five `.sbh-protect` probes per entry
+        // (2,737 times each in 10 s). Stop at the first ancestor whose upward
+        // walk already completed; only a walk that finished is remembered.
+        let mut walked = Vec::new();
 
         for ancestor in normalized.ancestors() {
+            if self.ancestors_probed.contains(ancestor) {
+                break;
+            }
+            walked.push(ancestor.to_path_buf());
             let marker_path = ancestor.join(MARKER_FILENAME);
             match fs::symlink_metadata(&marker_path) {
                 Ok(_) => {
@@ -523,6 +539,7 @@ impl ProtectionRegistry {
             }
         }
 
+        self.ancestors_probed.extend(walked);
         Ok(found)
     }
 
@@ -675,6 +692,27 @@ pub fn sacred_paths_from_protected_patterns(patterns: &[String]) -> Vec<SacredPa
             })
         })
         .collect()
+}
+
+/// Whether `pattern` protects everything under `root`.
+///
+/// It does when it matches the root, one of its ancestors, or any entry
+/// directly inside it (`<root>/**`, `<root>/*`). That is what a target-only
+/// root lifts (bd-232u); a pattern naming something further inside
+/// (`**/target`, one directory, a stowaway suffix) does not cover the root and
+/// still applies. A pattern that does not compile is reported as not
+/// covering, so it stays in force.
+#[must_use]
+pub fn pattern_covers_subtree(pattern: &str, root: &Path) -> bool {
+    let Ok(regex) = glob_to_regex(&normalize_protected_pattern_for_matching(pattern)) else {
+        return false;
+    };
+    // A name no operator writes into a pattern: matching it means matching
+    // any child. Its match texts include the root and every ancestor.
+    let probe = root.join(".sbh-target-only-probe");
+    path_match_texts(&probe)
+        .iter()
+        .any(|text| regex.is_match(text))
 }
 
 /// B7: mtime of a candidate root, used to invalidate memoized verdicts.
@@ -1516,6 +1554,36 @@ mod tests {
     }
 
     #[test]
+    fn ancestor_probes_are_remembered_for_one_registry_only() {
+        let tmp = TempDir::new().unwrap();
+        let protected = tmp.path().join("repo");
+        let first = protected.join("a").join("target");
+        let sibling = protected.join("b").join("target");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        create_marker(&protected, None).unwrap();
+
+        let mut reg = ProtectionRegistry::marker_only();
+        assert_eq!(reg.discover_ancestor_markers(&first).unwrap(), 1);
+        // The sibling's walk stops at the shared, already-probed ancestors but
+        // the marker found there still protects it.
+        assert_eq!(reg.discover_ancestor_markers(&sibling).unwrap(), 0);
+        assert!(reg.is_protected(&sibling));
+
+        // A marker created after its directory was probed is not re-read by
+        // the same registry (one scan pass); the next pass's registry sees it.
+        let late = tmp.path().join("late");
+        let candidate = late.join("target");
+        fs::create_dir_all(&candidate).unwrap();
+        assert_eq!(reg.discover_ancestor_markers(&candidate).unwrap(), 0);
+        create_marker(&late, None).unwrap();
+        assert_eq!(reg.discover_ancestor_markers(&candidate).unwrap(), 0);
+        let mut next_pass = ProtectionRegistry::marker_only();
+        assert_eq!(next_pass.discover_ancestor_markers(&candidate).unwrap(), 1);
+        assert!(next_pass.is_protected(&candidate));
+    }
+
+    #[test]
     fn ancestor_marker_discovery_protects_direct_candidate_checks() {
         let tmp = TempDir::new().unwrap();
         let protected = tmp.path().join("repo").join("tools");
@@ -1618,6 +1686,31 @@ mod tests {
 
         assert!(reg.is_protected(Path::new(r"C:\Users\alice\critical-builds")));
         assert!(!reg.is_protected(Path::new(r"C:\Users\alice\other-builds")));
+    }
+
+    #[test]
+    fn only_patterns_protecting_the_whole_root_cover_its_subtree() {
+        let root = Path::new("/srv/sbh-cover-test/claude-501");
+        for covering in [
+            "/srv/sbh-cover-test/claude-*",
+            "/srv/sbh-cover-test/claude-501",
+            "/srv/sbh-cover-test/**",
+            "/srv/sbh-cover-test/claude-*/**",
+            "/srv/sbh-cover-test/claude-501/*",
+            "/srv",
+        ] {
+            assert!(pattern_covers_subtree(covering, root), "{covering}");
+        }
+        for inside in [
+            "**/target",
+            "/srv/sbh-cover-test/claude-501/proj/target",
+            "/srv/sbh-cover-test/claude-*/*/target",
+            "**/*.sqlite3",
+            "/srv/sbh-cover-test/claude-502",
+            "/srv/sbh-cover-test/claude-5011/**",
+        ] {
+            assert!(!pattern_covers_subtree(inside, root), "{inside}");
+        }
     }
 
     #[test]

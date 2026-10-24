@@ -63,7 +63,7 @@ Source: `src/tui/parity_harness.rs` and `tests/fallback_verification.rs`
 | C-12 | Activity source fallback | INTENTIONAL DELTA | state.json `last_scan`; shows "never" vs "no database" |
 | C-13 | State-file schema compatibility | PASS | `parity_harness::c13_state_schema`; JSON roundtrip preserves all fields |
 | C-14 | Atomic state write + 0o600 permissions | PASS | Hardened in `b7ebeb4`; all 6 daemon write sites use 0o600 |
-| C-15 | Raw mode / alt-screen restoration | PASS | `terminal_guard.rs` RAII; `test_replay` covers exit paths |
+| C-15 | Raw mode / alt-screen restoration | PASS | `terminal_guard.rs` owns the cockpit's terminal: restored on exit, before a panic message, and on SIGTERM/SIGHUP/SIGQUIT; `tests/dashboard_pty.rs` (`a_panic_restores_the_terminal_before_its_message`, `pty_sigterm_ends_the_cockpit_promptly_without_drawing_on_the_shell`) |
 | C-16 | Exit key semantics (q, Esc, Ctrl-C) | PASS | `parity_harness::c16_exit_keys`; all three paths verified |
 | C-17 | Degraded-mode fallback visibility | INTENTIONAL DELTA | DEGRADED label displayed; monitor paths listed; adapter-level fs fallback |
 | C-18 | Required section visibility | INTENTIONAL DELTA | All 6 legacy sections present; upgraded formatting |

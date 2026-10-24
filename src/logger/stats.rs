@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use crate::core::errors::Result;
 use crate::logger::sqlite::SqliteLogger;
@@ -216,6 +216,100 @@ pub struct DeletionDetail {
     pub timestamp: String,
 }
 
+// ──────────────────── RAM-scratch notices ────────────────────
+
+/// The daemon's latest RAM-scratch observation, as its activity log holds it.
+///
+/// The observer samples tmpfs occupancy against RAM, swap and the swap
+/// processes hold every 5 minutes and logs a warning (repeated every 15
+/// minutes while the risk lasts), an incomplete reading, or a recovery. Nothing
+/// read them back (bd-paeg): on ts2 (2026-10-20) swap sat at 97% with 34 GB in
+/// tmpfs and processes holding 17.8 GB of it, and the warning reached only the
+/// log.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RamScratchNotice {
+    /// When the daemon logged it (RFC 3339).
+    pub logged_at: String,
+    /// `warning`, `incomplete` or `recovered`.
+    pub state: String,
+    /// Occupied tmpfs bytes, one sample per filesystem.
+    pub tmpfs_used_bytes: Option<u64>,
+    /// Swap the visible processes hold (their `VmSwap`).
+    pub process_swap_bytes: Option<u64>,
+    pub swap_free_bytes: Option<u64>,
+    pub swap_total_bytes: Option<u64>,
+    /// Why it warned, e.g. `low_swap_tmpfs_exceeds_process_swap`.
+    pub reasons: Vec<String>,
+    /// The largest trees it attributed, largest first (at most five).
+    pub largest: Vec<RamScratchTree>,
+}
+
+/// One tmpfs tree the RAM-scratch observer attributed.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RamScratchTree {
+    pub path: String,
+    pub allocated_bytes: u64,
+    /// Hours since anything in it changed; `None` when the walk was cut short.
+    pub idle_hours: Option<u64>,
+}
+
+impl RamScratchNotice {
+    /// The notice in an observer activity payload; `None` for anything else.
+    #[must_use]
+    pub fn from_details(logged_at: &str, details: &str) -> Option<Self> {
+        use serde_json::Value;
+        let value: Value = serde_json::from_str(details).ok()?;
+        if value.get("schema")?.as_str()? != "sbh.ram_scratch.observation.v1" {
+            return None;
+        }
+        let state = value.get("state")?.as_str()?.to_string();
+        let assessment = value.pointer("/observation/host/assessment");
+        let number = |pointer: &str| {
+            assessment
+                .and_then(|a| a.pointer(pointer))
+                .and_then(Value::as_u64)
+        };
+        let reasons = assessment
+            .and_then(|a| a.get("reasons"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|reason| reason.as_str().map(str::to_string))
+            .collect();
+        let mut largest: Vec<RamScratchTree> = value
+            .pointer("/observation/attribution")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|mount| mount.get("entries").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|entry| {
+                Some(RamScratchTree {
+                    path: entry.get("path")?.as_str()?.to_string(),
+                    allocated_bytes: entry.get("observed_allocated_bytes")?.as_u64()?,
+                    idle_hours: entry.get("idle_hours").and_then(Value::as_u64),
+                })
+            })
+            .collect();
+        largest.sort_by(|a, b| {
+            b.allocated_bytes
+                .cmp(&a.allocated_bytes)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        largest.truncate(5);
+        Some(Self {
+            logged_at: logged_at.to_string(),
+            state,
+            tmpfs_used_bytes: number("/tmpfs_used_bytes"),
+            process_swap_bytes: number("/process_swap/bytes"),
+            swap_free_bytes: number("/memory/swap_free_bytes"),
+            swap_total_bytes: number("/memory/swap_total_bytes"),
+            reasons,
+            largest,
+        })
+    }
+}
+
 // ──────────────────── stats engine ────────────────────
 
 /// Read-only query engine over the sbh activity database.
@@ -235,6 +329,25 @@ impl<'a> StatsEngine<'a> {
             .iter()
             .map(|&w| self.window_stats(w))
             .collect()
+    }
+
+    /// The RAM-scratch observer's latest notice logged within `window`.
+    pub fn ram_scratch_notice(&self, window: Duration) -> Result<Option<RamScratchNotice>> {
+        let since = since_timestamp(window);
+        let conn = self.db.connection();
+        let row = conn
+            .query_row(
+                "SELECT timestamp, details FROM activity_log
+                 WHERE event_type = 'info' AND timestamp >= ?1
+                   AND details LIKE '%\"schema\":\"sbh.ram_scratch.observation.v1\"%'
+                 ORDER BY id DESC LIMIT 1",
+                params![since],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(logged_at, details)| {
+            RamScratchNotice::from_details(&logged_at, details.as_deref()?)
+        }))
     }
 
     /// Get stats for a specific time window.
@@ -914,6 +1027,94 @@ mod tests {
             assert_eq!(ws.ballast.current_inventory, 0);
             assert_eq!(ws.pressure.transitions, 0);
         }
+    }
+
+    /// bd-paeg: the RAM-scratch observer's latest notice in the window comes
+    /// back parsed, its largest trees first; a notice older than the window
+    /// and another event's info row do not.
+    #[test]
+    fn ram_scratch_notice_reads_the_observers_latest_notice() {
+        let (_dir, db) = temp_db();
+        let payload = |state: &str, trees: u64| {
+            let entries: Vec<serde_json::Value> = (0..trees)
+                .map(|i| {
+                    // The walk of the first tree was cut short: no idle age.
+                    let idle = if i == 0 {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::from(i * 10)
+                    };
+                    serde_json::json!({
+                        "path": format!("/tmp/tree-{i}"),
+                        "observed_allocated_bytes": (i + 1) * 1_000_000_000,
+                        "idle_hours": idle,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "schema": "sbh.ram_scratch.observation.v1",
+                "state": state,
+                "observation": {
+                    "host": {"assessment": {
+                        "tmpfs_used_bytes": 34_146_168_832_u64,
+                        "process_swap": {"bytes": 17_808_011_264_u64, "complete": true},
+                        "memory": {
+                            "swap_free_bytes": 2_491_097_088_u64,
+                            "swap_total_bytes": 68_719_472_640_u64,
+                        },
+                        "reasons": ["low_swap_tmpfs_exceeds_process_swap"],
+                    }},
+                    "attribution": [{"entries": entries}],
+                },
+            })
+            .to_string()
+        };
+        let row = |minutes_ago: i64, code: Option<&str>, details: String| ActivityRow {
+            timestamp: ts(minutes_ago),
+            event_type: "info".to_string(),
+            severity: if code.is_some() { "warning" } else { "info" }.to_string(),
+            path: None,
+            size_bytes: None,
+            score: None,
+            score_factors: None,
+            pressure_level: None,
+            free_pct: None,
+            duration_ms: None,
+            success: 1,
+            error_code: code.map(str::to_string),
+            error_message: None,
+            details: Some(details),
+        };
+        let window = Duration::from_mins(35);
+        let engine = StatsEngine::new(&db);
+
+        db.log_activity(&row(50, Some("SBH-RAM-SCRATCH"), payload("warning", 1)))
+            .unwrap();
+        assert_eq!(engine.ram_scratch_notice(window).unwrap(), None);
+
+        db.log_activity(&row(10, Some("SBH-RAM-SCRATCH"), payload("warning", 7)))
+            .unwrap();
+        db.log_activity(&row(5, None, r#"{"schema":"other"}"#.to_string()))
+            .unwrap();
+        let notice = engine
+            .ram_scratch_notice(window)
+            .unwrap()
+            .expect("the warning 10 minutes ago");
+        assert_eq!(notice.state, "warning");
+        assert_eq!(notice.tmpfs_used_bytes, Some(34_146_168_832));
+        assert_eq!(notice.process_swap_bytes, Some(17_808_011_264));
+        assert_eq!(notice.swap_free_bytes, Some(2_491_097_088));
+        assert_eq!(notice.reasons, ["low_swap_tmpfs_exceeds_process_swap"]);
+        assert_eq!(notice.largest.len(), 5);
+        assert_eq!(notice.largest[0].path, "/tmp/tree-6");
+        assert_eq!(notice.largest[0].idle_hours, Some(60));
+
+        db.log_activity(&row(1, None, payload("recovered", 0)))
+            .unwrap();
+        let latest = engine.ram_scratch_notice(window).unwrap().unwrap();
+        assert_eq!(latest.state, "recovered");
+        assert!(latest.largest.is_empty());
+        assert_eq!(RamScratchNotice::from_details("t", "not json"), None);
     }
 
     fn scan_complete_row(timestamp: String, details: Option<String>) -> ActivityRow {

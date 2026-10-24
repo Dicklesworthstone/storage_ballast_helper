@@ -541,7 +541,7 @@ fn render_frame(
         row += 1;
 
         // ── Counters / PID summary ──
-        let gb_freed = s.counters.bytes_freed as f64 / 1_073_741_824.0;
+        let freed = s.counters.freed_basis.freed_phrase(s.counters.bytes_freed);
         let rss_mb = s.memory_rss_bytes / (1024 * 1024);
 
         queue!(
@@ -557,8 +557,8 @@ fn render_frame(
         queue!(stdout, MoveTo(3, row), SetForegroundColor(Color::White))?;
         write!(
             stdout,
-            "Scans: {}  |  Deleted: {} ({:.1} GB freed)  |  Errors: {}  |  RSS: {} MB  |  PID: {}",
-            s.counters.scans, s.counters.deletions, gb_freed, s.counters.errors, rss_mb, s.pid,
+            "Scans: {}  |  Deleted: {} ({freed})  |  Errors: {}  |  RSS: {} MB  |  PID: {}",
+            s.counters.scans, s.counters.deletions, s.counters.errors, rss_mb, s.pid,
         )?;
         queue!(stdout, SetAttribute(Attribute::Reset))?;
     } else {

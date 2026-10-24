@@ -22,10 +22,13 @@ pub(super) fn check(
     // newly-full or read-only filesystem. Never turn a failed probe into zero
     // cost for the candidate file.
     let stats = manager.platform.fs_stats(&manager.ballast_dir)?;
+    // The floor in force on this volume: absolute byte floors lower it on a
+    // large volume as they lower its pressure levels.
+    let floor_pct = manager.provision_floor.pct_on(stats.total_bytes);
     evaluate(
         &stats,
         manager.config.file_size_bytes,
-        manager.provision_floor_pct,
+        floor_pct,
         caller_pct,
     )
     .map_err(|details| SbhError::FsStats {
@@ -72,9 +75,13 @@ fn evaluate(
     if cost <= available && after >= floor_bytes {
         Ok(Admission::Admit {
             free_pct_after: Some(free_pct_after),
+            floor_pct,
         })
     } else {
-        Ok(Admission::Refuse { free_pct_after })
+        Ok(Admission::Refuse {
+            free_pct_after,
+            floor_pct,
+        })
     }
 }
 
@@ -387,6 +394,52 @@ mod tests {
         assert!(!admitted(evaluate(&at_floor, 0, 10.000_000_1, None)));
         assert!(!admitted(evaluate(&ample, 1, 10.0, Some(10.099_999_9))));
         assert!(admitted(evaluate(&ample, 1, 10.0, Some(10.1))));
+    }
+
+    /// A large volume that the absolute byte floors hold at Green gets a
+    /// reserve: the floor follows the thresholds in force on that volume, not
+    /// the percentage ones, and the report names the floor actually applied.
+    #[test]
+    fn byte_floors_admit_a_reserve_the_percentage_floor_refuses_on_a_large_volume() {
+        use crate::ballast::manager::ProvisionFloor;
+        const GIB: u64 = 1 << 30;
+        let total = 2_000_000_000_000_u64;
+        // 4.95% free: just under the 5% percentage floor, ~99 GB.
+        let temp = tempfile::tempdir().unwrap();
+        let mut pool = manager(temp.path(), Some(stats(total, 99_000_000_000)));
+        let pct = [10.0, 8.0, 5.0, 3.0];
+
+        pool.set_provision_floor_rule(ProvisionFloor::Thresholds { pct, bytes: [0; 4] });
+        let refused = pool.provision(None).unwrap();
+        assert_eq!(refused.files_created, 0);
+        assert_eq!(refused.skipped_for_floor, 3);
+        assert!(
+            (refused.floor_pct - 5.0).abs() < 1e-9,
+            "{}",
+            refused.floor_pct
+        );
+        assert!(!pool.file_path(1).exists());
+
+        let bytes = [80 * GIB, 60 * GIB, 40 * GIB, 25 * GIB];
+        pool.set_provision_floor_rule(ProvisionFloor::Thresholds { pct, bytes });
+        let built = pool.provision(None).unwrap();
+        assert_eq!(built.files_created, 3, "{built:?}");
+        assert_eq!(built.skipped_for_floor, 0);
+        #[allow(clippy::cast_precision_loss)]
+        let expected = (25 * GIB) as f64 * 100.0 / total as f64 + 2.0;
+        assert!(
+            (built.floor_pct - expected).abs() < 1e-9,
+            "{}",
+            built.floor_pct
+        );
+
+        // The same rule still refuses once the volume is under its own floor.
+        let temp = tempfile::tempdir().unwrap();
+        let mut low = manager(temp.path(), Some(stats(total, 60_000_000_000)));
+        low.set_provision_floor_rule(ProvisionFloor::Thresholds { pct, bytes });
+        let report = low.replenish_one(None).unwrap();
+        assert_eq!(report.files_created, 0);
+        assert_eq!(report.skipped_for_floor, 3);
     }
 
     #[test]

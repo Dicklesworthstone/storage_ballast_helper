@@ -112,19 +112,41 @@ fn configured_ancestor_aliases_receive_canonical_kernel_events() {
 }
 
 #[test]
+fn a_configured_root_that_is_itself_a_link_is_watched_like_macos_tmp() {
+    // The default root `/tmp` is a link to `/private/tmp`. It used to be
+    // rejected as "not a plain directory", leaving it with no event coverage.
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap().keep();
+    let real = temp.join("private-tmp");
+    fs::create_dir(&real).unwrap();
+    let link = temp.join("tmp");
+    symlink(&real, &link).unwrap();
+    let mut source = ScannerEventSource::start(config(std::slice::from_ref(&link), 1));
+    assert_native(&source);
+    assert!(source.capability().complete, "{:?}", source.capability());
+    assert_eq!(source.capability().watched_dirs, 1);
+    let _ = source.drain();
+
+    fs::write(real.join("object.o"), b"written through the real path").unwrap();
+    let events = await_paths(&mut source, &[link.join("object.o")]);
+    assert!(events.dirty_roots().contains(&link));
+}
+
+#[test]
 fn missing_roots_retry_without_events_and_unchanged_gaps_do_not_rescan() {
-    let temp = tempfile::tempdir().unwrap();
-    let healthy = temp.path().join("healthy");
-    let missing = temp.path().join("missing");
+    let temp = tempfile::tempdir().unwrap().keep();
+    let healthy = temp.join("healthy");
+    let missing = temp.join("missing");
     fs::create_dir(&healthy).unwrap();
     let now = Instant::now();
     let mut source = ScannerEventSource::start_at(config(&[healthy, missing.clone()], 2), now);
     assert_native(&source);
-    assert!(!source.capability().complete);
+    assert!(source.capability().complete);
+    assert_eq!(source.capability().absent_roots, vec![missing.clone()]);
     assert!(source.drain_at(now).dirty_roots().contains(&missing));
 
     let unchanged = source.drain_at(now + Duration::from_secs(31));
-    assert_eq!(source.stats().replans, 1);
+    assert_eq!(source.stats().replans, 0);
     assert!(
         !unchanged.requires_reconciliation(),
         "unchanged missing roots must not cause a scan loop: {unchanged:?}"
@@ -133,10 +155,12 @@ fn missing_roots_retry_without_events_and_unchanged_gaps_do_not_rescan() {
 
     fs::create_dir(&missing).unwrap();
     let _ = source.drain_at(now + Duration::from_secs(59));
-    assert_eq!(source.stats().replans, 1);
+    assert_eq!(source.stats().replans, 0);
     let recovered = source.drain_at(now + Duration::from_secs(62));
     assert_native(&source);
     assert!(source.capability().complete);
+    assert!(source.capability().absent_roots.is_empty());
+    assert_eq!(source.stats().replans, 1);
     assert_eq!(source.capability().watched_dirs, 2);
     assert!(recovered.requires_index_generation_bump());
     assert!(recovered.dirty_roots().contains(&missing));

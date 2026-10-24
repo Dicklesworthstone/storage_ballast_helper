@@ -452,7 +452,7 @@ mod tests {
                 entries.len(),
                 pointers.as_mut_ptr().cast(),
                 flags.as_ptr(),
-            )
+            );
         };
     }
 
@@ -467,7 +467,7 @@ mod tests {
         );
         assert!(!batch.must_rescan);
         assert!(!batch.restart_required);
-        assert!(inbox.drain().paths.is_empty());
+        assert_eq!(inbox.drain().paths, Vec::<std::path::PathBuf>::new());
     }
 
     #[test]
@@ -539,7 +539,7 @@ mod tests {
                 MAX_CALLBACK_EVENTS + 1,
                 ptr::null_mut(),
                 ptr::null(),
-            )
+            );
         };
         assert!(inbox.drain().must_rescan);
     }
@@ -548,10 +548,10 @@ mod tests {
     fn relative_paths_fail_closed_and_history_done_is_ignored() {
         let inbox = Inbox::default();
         deliver(&inbox, &[("/root", HISTORY_DONE)]);
-        assert!(inbox.drain().paths.is_empty());
+        assert_eq!(inbox.drain().paths, Vec::<std::path::PathBuf>::new());
         deliver(&inbox, &[("relative/file", 0)]);
         let batch = inbox.drain();
-        assert!(batch.paths.is_empty());
+        assert_eq!(batch.paths, Vec::<std::path::PathBuf>::new());
         assert!(batch.must_rescan);
     }
 

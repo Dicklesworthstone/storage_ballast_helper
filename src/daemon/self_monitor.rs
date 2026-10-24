@@ -25,6 +25,7 @@ use crate::daemon::mount_controller::MountStateRecord;
 use crate::monitor::pid::PressureLevel;
 use crate::platform::pal::Platform;
 use crate::platform::types::SelfStats;
+use crate::scanner::deletion::FreedBasis;
 
 // ──────────────────── constants ────────────────────
 
@@ -64,8 +65,36 @@ pub fn generate_run_id() -> String {
         chrono::Utc::now().timestamp_millis()
     )
 }
-pub const DEFAULT_DAEMON_RSS_WARNING_BYTES: u64 = 256 * 1024 * 1024;
-pub const DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES: u64 = 500 * 1024 * 1024;
+/// RSS that logs a warning.
+///
+/// Above the steady state of a host whose passes stop at the entry budget,
+/// so it reports growth rather than repeating.
+pub const DEFAULT_DAEMON_RSS_WARNING_BYTES: u64 = 512 * 1024 * 1024;
+/// RSS at which the daemon exits for a clean restart.
+///
+/// A leak guard, so it sits well above a large host's working set. ts2
+/// (2026-10-18), 500k entries per pass, two malloc arenas: 460-490 MiB steady
+/// and over 545 MiB at a pass's end. At the former 500 MiB it restarted itself
+/// under Critical pressure once `MemoryMax=4096M` stopped pushing its pages
+/// into swap.
+pub const DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Growth past the last reported RSS that logs the warning again.
+const RSS_WARNING_REGROWTH_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How often an RSS that stays over the warning level is reported again.
+const RSS_WARNING_REPEAT: Duration = Duration::from_hours(1);
+
+/// Whether an RSS over the warning level should be logged now. It is logged
+/// when it first crosses, then hourly or after further growth, not on every
+/// state write: a host whose tree needs ~300 MiB logged it once a minute,
+/// all day.
+fn rss_warning_due(warned: Option<(Instant, u64)>, rss: u64, now: Instant) -> bool {
+    warned.is_none_or(|(at, reported)| {
+        rss >= reported.saturating_add(RSS_WARNING_REGROWTH_BYTES)
+            || now.saturating_duration_since(at) >= RSS_WARNING_REPEAT
+    })
+}
 
 // ──────────────────── daemon lock (liveness) ────────────────────
 
@@ -262,8 +291,13 @@ pub enum DaemonLockProbe {
 #[must_use]
 pub fn probe_daemon_lock(state_file: &Path) -> DaemonLockProbe {
     let path = daemon_lock_path(state_file);
-    if !path.exists() {
-        return DaemonLockProbe::Absent;
+    // `Path::exists` is false when a parent directory cannot be searched: a
+    // root daemon's lock under 0700 /root, probed by an unprivileged
+    // `sbh status`, read as "no lock" and the running daemon as stopped.
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return DaemonLockProbe::Absent,
+        Err(e) => return DaemonLockProbe::Unreadable(e.to_string()),
     }
     let file = match fs::File::open(&path) {
         Ok(file) => file,
@@ -452,6 +486,39 @@ mod daemon_lock_tests {
         assert!(!v.running);
         assert_eq!(v.reason, "lock_released");
     }
+
+    /// A root daemon's lock under an unsearchable directory (0700 /root seen
+    /// by an unprivileged `sbh status`) is unreadable, not absent, so the
+    /// service manager's view decides. Root ignores directory modes, so the
+    /// check is skipped there.
+    #[test]
+    fn lock_under_unsearchable_dir_defers_to_the_unit() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("private");
+        fs::create_dir(&private).unwrap();
+        let state_file = private.join("state.json");
+        let lock = DaemonLock::acquire(&state_file).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let probe = probe_daemon_lock(&state_file);
+        let active = detect_daemon_liveness(&state_file, Some(true));
+        let inactive = detect_daemon_liveness(&state_file, Some(false));
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+        drop(lock);
+
+        assert!(
+            matches!(probe, DaemonLockProbe::Unreadable(_)),
+            "got {probe:?}"
+        );
+        assert!(active.running);
+        assert_eq!(active.reason, "lock_unreadable_unit_active");
+        assert!(!inactive.running);
+        assert_eq!(inactive.reason, "lock_unreadable_unit_inactive");
+    }
 }
 
 // ──────────────────── state file schema ────────────────────
@@ -565,13 +632,14 @@ pub struct VoiPathState {
     pub path: String,
     /// Expected reclaim per unit of scan cost, as ranked.
     pub utility: f64,
-    /// Chosen by the exploration quota rather than by utility.
+    /// An exploration pick (the plan's reserved exploration slot, or a path
+    /// never scanned) rather than a pick by utility.
     pub is_exploration: bool,
     pub forecast_reclaim_bytes: f64,
 }
 
 /// The VOI (value-of-information) scan scheduler as the daemon last saw it
-/// (bd-rc-master-ajg1.4.11): the budget and split from the config, the
+/// (bd-rc-master-ajg1.4.11): the budget from the config, the
 /// calibration guard's state, and the paths of the last plan.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -584,8 +652,6 @@ pub struct VoiState {
     pub budget_total: usize,
     /// Paths the last plan used.
     pub budget_used: usize,
-    /// `scheduler.exploration_quota_fraction`.
-    pub exploration_quota_fraction: f64,
     /// Round-robin fallback (disabled, or calibration tripped).
     pub fallback_active: bool,
     pub consecutive_bad_windows: u32,
@@ -615,7 +681,6 @@ impl VoiState {
                 plan.budget_total
             }),
             budget_used: last_plan.map_or(0, |(_, plan)| plan.budget_used),
-            exploration_quota_fraction: config.exploration_quota_fraction,
             fallback_active,
             consecutive_bad_windows: summary.consecutive_bad_windows,
             consecutive_good_windows: summary.consecutive_good_windows,
@@ -830,6 +895,11 @@ pub struct Counters {
     pub scans: u64,
     pub deletions: u64,
     pub bytes_freed: u64,
+    /// How `bytes_freed` is known: `observed`, or an allocated-size estimate
+    /// where the filesystem frees blocks at commit (bd-oj33).
+    pub freed_basis: FreedBasis,
+    /// The free space measured around the removals, when every one was.
+    pub bytes_freed_observed: Option<u64>,
     pub errors: u64,
     /// Log events silently dropped due to channel back-pressure.
     pub dropped_log_events: u64,
@@ -983,6 +1053,9 @@ pub struct SelfMonitor {
     last_write: Option<Instant>,
     rss_warning_bytes: u64,
     rss_hard_limit_bytes: u64,
+    /// When the RSS warning was last logged, and the RSS it reported; `None`
+    /// while RSS is under the warning level.
+    rss_warned: Option<(Instant, u64)>,
 
     // Mutable counters updated by the main loop.
     pub scan_count: u64,
@@ -991,6 +1064,10 @@ pub struct SelfMonitor {
     pub last_scan_deleted: usize,
     pub deletions_total: u64,
     pub bytes_freed_total: u64,
+    /// How `bytes_freed_total` is known: the weakest basis of its batches.
+    pub freed_basis: FreedBasis,
+    /// The free space measured around every removal, while each was.
+    pub bytes_freed_observed_total: Option<u64>,
     pub errors_total: u64,
     /// Cumulative scan duration for averaging.
     scan_duration_total: Duration,
@@ -1158,6 +1235,7 @@ impl SelfMonitor {
             last_write: None,
             rss_warning_bytes,
             rss_hard_limit_bytes,
+            rss_warned: None,
             mount_snapshot: Vec::new(),
             controller_snapshot: Vec::new(),
             rate_snapshot: std::collections::BTreeMap::new(),
@@ -1178,6 +1256,8 @@ impl SelfMonitor {
             last_scan_deleted: 0,
             deletions_total: 0,
             bytes_freed_total: 0,
+            freed_basis: FreedBasis::Observed,
+            bytes_freed_observed_total: Some(0),
             errors_total: 0,
             scan_duration_total: Duration::ZERO,
         }
@@ -1214,13 +1294,7 @@ impl SelfMonitor {
             return tick;
         }
 
-        if rss > self.rss_warning_bytes {
-            eprintln!(
-                "[SBH-SELFMON] WARNING: RSS {} MB exceeds limit {} MB",
-                rss / (1024 * 1024),
-                self.rss_warning_bytes / (1024 * 1024),
-            );
-        }
+        self.warn_on_rss(rss, now);
         if tick.rss_hard_limit_exceeded {
             eprintln!(
                 "[SBH-SELFMON] FATAL: RSS {} MB exceeds hard limit {} MB; daemon will exit nonzero for service restart",
@@ -1262,6 +1336,8 @@ impl SelfMonitor {
                 scans: self.scan_count,
                 deletions: self.deletions_total,
                 bytes_freed: self.bytes_freed_total,
+                freed_basis: self.freed_basis,
+                bytes_freed_observed: self.bytes_freed_observed_total,
                 errors: self.errors_total,
                 dropped_log_events,
             },
@@ -1316,11 +1392,11 @@ impl SelfMonitor {
         mount_path: &str,
     ) -> String {
         let rss_mb = self.current_rss_bytes() / (1024 * 1024);
-        let gb_freed = self.bytes_freed_total as f64 / 1_073_741_824.0;
         format!(
             "{pressure_level:?} {free_pct:.1}% free on {mount_path} | \
-             {deletions} deletions ({gb_freed:.1} GB freed) | RSS {rss_mb} MB",
+             {deletions} deletions ({freed}) | RSS {rss_mb} MB",
             deletions = self.deletions_total,
+            freed = self.freed_basis.freed_phrase(self.bytes_freed_total),
         )
     }
 
@@ -1386,9 +1462,34 @@ impl SelfMonitor {
         }
     }
 
+    /// How a batch's freed bytes are known, and what was measured beside
+    /// them; the totals keep the weakest basis (bd-oj33).
+    pub fn record_freed_basis(&mut self, basis: FreedBasis, observed: Option<u64>) {
+        self.freed_basis = self.freed_basis.combine(basis);
+        self.bytes_freed_observed_total = self
+            .bytes_freed_observed_total
+            .zip(observed)
+            .map(|(sum, bytes)| sum.saturating_add(bytes));
+    }
+
     /// Record an error.
     pub fn record_error(&mut self) {
         self.errors_total += 1;
+    }
+
+    /// Log an RSS over the warning level when [`rss_warning_due`] says so.
+    fn warn_on_rss(&mut self, rss: u64, now: Instant) {
+        if rss <= self.rss_warning_bytes {
+            self.rss_warned = None;
+        } else if rss_warning_due(self.rss_warned, rss, now) {
+            eprintln!(
+                "[SBH-SELFMON] WARNING: RSS {} MB exceeds limit {} MB (repeated hourly, or after {} MB more)",
+                rss / (1024 * 1024),
+                self.rss_warning_bytes / (1024 * 1024),
+                RSS_WARNING_REGROWTH_BYTES / (1024 * 1024),
+            );
+            self.rss_warned = Some((now, rss));
+        }
     }
 
     fn current_rss_bytes(&self) -> u64 {
@@ -1641,7 +1742,6 @@ mod tests {
         let config = crate::core::config::VoiConfig {
             enabled: true,
             scan_budget_per_interval: 5,
-            exploration_quota_fraction: 0.25,
             ..crate::core::config::VoiConfig::default()
         };
         let summary = CalibrationSummary {
@@ -1674,7 +1774,6 @@ mod tests {
         let voi = VoiState::from_scheduler(&config, &summary, true, Some(&planned));
         assert!(voi.reported && voi.enabled && voi.fallback_active);
         assert_eq!((voi.budget_total, voi.budget_used), (5, 2));
-        assert!((voi.exploration_quota_fraction - 0.25).abs() < f64::EPSILON);
         assert_eq!(voi.consecutive_bad_windows, 2);
         assert_eq!(voi.recent_mapes, vec![0.6, 0.55]);
         assert_eq!(voi.paths_tracked, 3);
@@ -1899,6 +1998,8 @@ mod tests {
                 bytes_freed: 467_800_000_000,
                 errors: 2,
                 dropped_log_events: 0,
+                freed_basis: FreedBasis::Observed,
+                bytes_freed_observed: None,
             },
             memory_rss_bytes: 44_040_192,
             policy_mode: "enforce".into(),
@@ -1960,6 +2061,8 @@ mod tests {
                 bytes_freed: 0,
                 errors: 0,
                 dropped_log_events: 0,
+                freed_basis: FreedBasis::Observed,
+                bytes_freed_observed: None,
             },
             memory_rss_bytes: 0,
             policy_mode: String::new(),
@@ -2023,6 +2126,8 @@ mod tests {
                 bytes_freed: 0,
                 errors: 0,
                 dropped_log_events: 0,
+                freed_basis: FreedBasis::Observed,
+                bytes_freed_observed: None,
             },
             memory_rss_bytes: 0,
             policy_mode: String::new(),
@@ -2303,6 +2408,49 @@ mod tests {
         let state = SelfMonitor::read_state(&path).expect("hard-limit tick should force write");
         assert_eq!(state.pressure.overall, "red");
         assert_eq!(state.memory_rss_bytes, 4096);
+    }
+
+    #[test]
+    fn an_rss_over_the_warning_level_is_reported_on_crossing_then_hourly_or_on_growth() {
+        const MIB: u64 = 1024 * 1024;
+        let start = Instant::now();
+        assert!(rss_warning_due(None, 300 * MIB, start), "first crossing");
+        let warned = Some((start, 300 * MIB));
+        let minute = start + Duration::from_secs(60);
+        assert!(
+            !rss_warning_due(warned, 300 * MIB, minute),
+            "same RSS a minute later"
+        );
+        assert!(
+            !rss_warning_due(warned, 363 * MIB, minute),
+            "under 64 MiB of growth"
+        );
+        assert!(
+            rss_warning_due(warned, 364 * MIB, minute),
+            "64 MiB of growth"
+        );
+        assert!(
+            rss_warning_due(warned, 300 * MIB, start + RSS_WARNING_REPEAT),
+            "an hour later"
+        );
+    }
+
+    #[test]
+    fn dropping_under_the_warning_level_rearms_the_rss_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut monitor = SelfMonitor::with_rss_limits(
+            dir.path().join("state.json"),
+            Arc::new(MockPlatform::healthy().with_self_stats(test_self_stats(2048))),
+            1024,
+            1 << 30,
+        );
+        monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10, 0, "enforce");
+        assert_eq!(monitor.rss_warned.map(|(_, rss)| rss), Some(2048));
+
+        monitor.platform = Arc::new(MockPlatform::healthy().with_self_stats(test_self_stats(512)));
+        monitor.last_write = None;
+        monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10, 0, "enforce");
+        assert_eq!(monitor.rss_warned, None);
     }
 
     // ──────── failure-injection tests ────────

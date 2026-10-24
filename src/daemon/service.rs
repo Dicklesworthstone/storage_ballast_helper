@@ -4,6 +4,7 @@
 //! `service/launchd.rs`. This file remains the module root so the repo can split
 //! the code without deleting or moving `src/daemon/service.rs`.
 
+mod executable;
 mod launchctl;
 mod launchd;
 mod systemd;
@@ -12,19 +13,35 @@ use std::path::{Path, PathBuf};
 
 use crate::core::errors::Result;
 
-/// `MemoryMax=` written into the generated systemd unit: the cgroup cap,
-/// above the daemon's own RSS warning and below nothing else (the daemon
-/// exits at its hard limit first only when that is lower).
-pub const SYSTEMD_MEMORY_MAX: &str = "256M";
+/// `MemoryMax=` written into the generated systemd unit.
+///
+/// It sits above the daemon's own RSS hard limit (1 GiB by default), so
+/// the daemon exits on its own and is restarted before the kernel OOM-kills
+/// it, maybe mid-deletion. A 500k-entry tree needs 290-550 MiB of RSS even
+/// with two malloc arenas (ts2 2026-10-15 and 2026-10-18), so the old 256M
+/// cap bound first.
+///
+/// The cgroup is also charged for the kernel's dentry and inode cache the
+/// walker fills, which RSS never shows. At 768M that share was ~400 MiB,
+/// less than one pass needs on a large host, so the cgroup sat at the cap:
+/// ts2 (2026-10-18) spent 73-79% of its time stalled on memory and the
+/// monitor tick stretched to minutes at Critical. Raised at runtime to 4G,
+/// the next pass ran with no memory stall at about 1.1 GiB; back at 768M
+/// the stall returned within a minute. The RSS limit
+/// still bounds the daemon's own allocations; the rest of this cap only
+/// bounds reclaimable cache.
+pub const SYSTEMD_MEMORY_MAX: &str = "4096M";
 use crate::platform::pal::{NoopServiceManager, Platform, ServiceManager};
 use crate::platform::types::ServiceKind;
 
+pub use executable::capture_sbh_binary_path;
+use executable::resolve_sbh_binary;
 pub use launchctl::{LaunchctlDomain, LaunchctlServiceTarget};
 pub use launchd::{LaunchdConfig, LaunchdServiceManager, LaunchdStatusReport};
 pub(crate) use systemd::test_unit_dir_override;
 pub use systemd::{
-    ConditionGate, DirectiveChange, DriftSeverity, ForeignDropIn, ReinstallReport, SystemdConfig,
-    SystemdServiceManager, UnitDrift, parse_unit_directives,
+    ConditionGate, DirectiveChange, DriftSeverity, ForeignDropIn, ReinstallReport, ServiceSandbox,
+    SystemdConfig, SystemdServiceManager, UnitDrift, parse_unit_directives,
 };
 
 /// Unit name for the systemd service.
@@ -245,24 +262,6 @@ pub fn try_service_manager_for_kind_control(
     }
 }
 
-/// Resolve the sbh binary path (prefers the running binary, falls back to PATH).
-fn resolve_sbh_binary() -> Result<PathBuf> {
-    if let Ok(exe) = std::env::current_exe()
-        && exe.exists()
-    {
-        return Ok(exe);
-    }
-    for candidate in &["/usr/local/bin/sbh", "/usr/bin/sbh"] {
-        let p = Path::new(candidate);
-        if p.exists() {
-            return Ok(p.to_path_buf());
-        }
-    }
-    Err(crate::core::errors::SbhError::Runtime {
-        details: "could not locate sbh binary; install it to a PATH directory first".to_string(),
-    })
-}
-
 #[cfg(test)]
 mod service_ownership_policy_tests {
     use super::*;
@@ -329,9 +328,10 @@ mod legacy_inline {
     use std::env;
     use std::fmt::Write as _;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::process::Command;
 
+    use super::resolve_sbh_binary;
     use crate::core::errors::{Result, SbhError};
     use crate::platform::pal::ServiceManager;
 
@@ -695,27 +695,6 @@ mod legacy_inline {
     // Helpers
     // ---------------------------------------------------------------------------
 
-    /// Resolve the sbh binary path (prefers the running binary, falls back to PATH).
-    fn resolve_sbh_binary() -> Result<PathBuf> {
-        // First try: the currently running executable.
-        if let Ok(exe) = env::current_exe()
-            && exe.exists()
-        {
-            return Ok(exe);
-        }
-        // Fallback: search PATH.
-        for candidate in &["/usr/local/bin/sbh", "/usr/bin/sbh"] {
-            let p = Path::new(candidate);
-            if p.exists() {
-                return Ok(p.to_path_buf());
-            }
-        }
-        Err(SbhError::Runtime {
-            details: "could not locate sbh binary; install it to a PATH directory first"
-                .to_string(),
-        })
-    }
-
     /// Default paths that sbh needs write access to under `ProtectSystem=strict`.
     ///
     /// Includes common cleanup targets (/tmp, /var/tmp) and sbh's own state dirs.
@@ -869,7 +848,7 @@ mod legacy_inline {
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>Nice</key>
-    <integer>19</integer>
+    <integer>5</integer>
     <key>LowPriorityIO</key>
     <true/>
     <key>StandardOutPath</key>
@@ -1215,7 +1194,10 @@ mod tests {
         let mgr = SystemdServiceManager::new(test_config(false));
         let unit = mgr.generate_unit_file();
 
-        assert!(unit.contains("MemoryMax=256M"));
+        assert!(unit.contains(&format!(
+            "MemoryMax={}",
+            crate::daemon::service::SYSTEMD_MEMORY_MAX
+        )));
         assert!(unit.contains("CPUQuota=100%"));
         assert!(unit.contains("CPUWeight=1"));
     }
@@ -1372,20 +1354,20 @@ mod tests {
         let plist = mgr.generate_plist();
 
         assert!(plist.contains("<key>Nice</key>"));
-        assert!(plist.contains("<integer>19</integer>"));
+        assert!(plist.contains("<integer>5</integer>"));
         assert!(plist.contains("<key>LowPriorityIO</key>"));
         assert!(plist.contains("<true/>"));
     }
 
     #[test]
-    fn plist_sets_background_qos_controls() {
+    fn plist_sets_standard_qos_at_low_priority() {
         let mgr = LaunchdServiceManager::new(test_launchd_config(false));
         let value = parse_plist(&mgr.generate_plist());
         let dict = value.as_dictionary().expect("plist root should be a dict");
 
         assert_eq!(
             dict.get("ProcessType").and_then(plist::Value::as_string),
-            Some("Background")
+            Some("Standard")
         );
         assert_eq!(
             dict.get("LowPriorityIO").and_then(plist::Value::as_boolean),
@@ -1393,7 +1375,7 @@ mod tests {
         );
         assert_eq!(
             dict.get("Nice").and_then(plist::Value::as_signed_integer),
-            Some(19)
+            Some(5)
         );
         assert_eq!(
             dict.get("ThrottleInterval")
@@ -1468,7 +1450,7 @@ mod tests {
         );
         assert_eq!(
             dict.get("ProcessType").and_then(plist::Value::as_string),
-            Some("Background")
+            Some("Standard")
         );
         assert_eq!(
             env.get("SBH_CONFIG_PATH").and_then(plist::Value::as_string),

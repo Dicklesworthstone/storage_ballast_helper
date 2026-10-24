@@ -34,10 +34,13 @@ pub mod fuzzing;
 pub mod logger;
 pub mod monitor;
 pub mod platform;
+#[cfg(unix)]
+pub mod relocate;
 pub mod scanner;
 #[cfg(feature = "tui")]
 pub mod tui;
 pub mod tuning;
+pub mod update_handoff;
 
 #[cfg(test)]
 mod decision_plane_tests;

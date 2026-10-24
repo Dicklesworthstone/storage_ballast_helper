@@ -116,7 +116,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 ```toml
 [profile.release]
-opt-level = "z"     # Optimize for size (lean binary for distribution)
+opt-level = 3       # Optimize for speed (release binaries are performance-optimized)
 lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # Smaller binary, no unwinding overhead
@@ -297,7 +297,7 @@ src/
     scoring.rs        # Multi-factor candidacy scoring engine
     deletion.rs       # Circuit-breaker-guarded deletion executor
     protection.rs     # .sbh-protect markers + config glob patterns
-    merkle.rs         # Incremental Merkle scan index
+    merkle.rs         # Legacy Merkle scan index (inactive: tests only; the daemon uses index.rs)
 
   ballast/
     manager.rs        # Ballast pool lifecycle (provision, verify, inventory)
@@ -342,7 +342,7 @@ src/
 | `src/cli/bootstrap.rs` | ~2800 | Bootstrap migration with 16 migration reason types |
 | `src/cli/assets.rs` | ~1240 | Asset manifest pipeline with SHA-256 verification |
 | `src/daemon/loop_main.rs` | ~1170 | Main daemon monitoring loop |
-| `src/scanner/merkle.rs` | ~1080 | Incremental Merkle scan index with full-scan fallback |
+| `src/scanner/merkle.rs` | ~1300 | Legacy Merkle scan index, not wired into the daemon (tests only) |
 | `src/cli/uninstall.rs` | ~1020 | Uninstall parity with 5 cleanup modes |
 | `src/daemon/notifications.rs` | ~1020 | Multi-channel notification system |
 | `src/cli/mod.rs` | ~910 | Shared installer/update contracts |
@@ -467,7 +467,7 @@ One mapping for every command (`CliError::exit_code`, C-EXIT); generated from `c
 | `[pressure]` | `green_min_free_pct`, `yellow_min_free_pct`, `orange_min_free_pct`, `red_min_free_pct`, `poll_interval_ms` |
 | `[pressure.prediction]` | `enabled`, `action_horizon_minutes`, `warning_horizon_minutes`, `min_confidence`, `min_samples`, `coverage_target` (conformal time-to-red bound) |
 | `[pressure.controller]` | per-mount PID: `kp`, `ki`, `kd`, `kf` (forecast feedforward), `integral_cap`, `hysteresis_pct`, `reference_total_bytes`, `kp_scale_min`, `kp_scale_max` |
-| `[scanner]` | `engine` (`"v2"` default, `"v1"` rollback), `root_paths`, `excluded_paths`, `protected_paths`, `min_file_age_minutes`, `max_depth`, `parallelism`, `dry_run`, `cross_devices`, `quarantine_enabled`, `quarantine_ttl_hours`, `quarantine_max_bytes_pct` |
+| `[scanner]` | `engine` (`"v2"` default, `"v1"` rollback), `root_paths`, `excluded_paths`, `protected_paths`, `min_file_age_minutes`, `max_depth`, `parallelism`, `dry_run`, `cross_devices`, `quarantine_enabled`, `quarantine_ttl_hours`, `quarantine_max_bytes_pct`, `target_only_roots` + `target_only_idle_hours` (pure idle cargo targets inside otherwise protected roots, `src/daemon/target_tier.rs`) |
 | `[scoring]` | `min_score`, `location_weight`, `name_weight`, `age_weight`, `size_weight`, `structure_weight` |
 | `[scoring]` (decision-theoretic) | `false_positive_loss`, `false_negative_loss`, `calibration_floor`, `posterior_floor_definite` |
 | `[scoring]` (batch planner) | `batch_risk_budget_by_level` (`green`, `yellow`, `orange`, `red`, `critical`): expected loss per batch as multiples of `false_positive_loss`; `[SBH-PLANNER]` line per batch, `plan` block in `clean`/`scan --json` |
@@ -662,12 +662,15 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | scanner | `prescan_time_budget_secs` | `60` | Longest priority pre-scan phase before the walker takes over | `src/core/config.rs` |
 | scanner | `quarantine_ttl_hours` | `24` | Quarantined entries expire after this | `src/core/config.rs` |
 | scanner | `quarantine_max_bytes_pct` | `5` | Quarantine size cap as % of the volume | `src/core/config.rs` |
+| scanner | `target_only_idle_hours` | `24` | Idle hours before a pure cargo target in a target-only root may go | `src/core/config.rs` |
 | scanner | `active_reference_cache_ttl_secs` | `30` | Active-reference (open file) cache lifetime | `src/core/config.rs` |
 | scanner | `active_reference_min_size_bytes` | `100 MiB` | Smallest entry checked for active references | `src/core/config.rs` |
 | walker | `RESULT_CHANNEL_CAP` | `10000` | Worker → collector channel bound | `src/scanner/walker.rs` |
+| walker | `WALK_BATCH_ENTRIES` | `64` | Entries a worker sends the collector at once | `src/scanner/walker.rs` |
 | walker | `WORK_RECV_TIMEOUT` | `50 ms` | Idle wait before a worker re-checks shutdown | `src/scanner/walker.rs` |
-| walker | `SEND_TIMEOUT` | `100 ms` | Wait on a full channel before dropping the entry | `src/scanner/walker.rs` |
-| walker | `MAX_ENTRIES_PER_DIR` | `65536` | Entries read per directory before it is cut off | `src/scanner/walker.rs` |
+| walker | `SEND_TIMEOUT` | `100 ms` | Wait on a full channel between cancellation checks | `src/scanner/walker.rs` |
+| walker | `MAX_ENTRIES_PER_DIR` | `65536` | Entries of one directory processed per pass; the window moves on each pass | `src/scanner/walker.rs` |
+| walker | `MAX_NAMES_READ_PER_DIR` | `1048576` | Names read per directory per pass (marker and signal checks) | `src/scanner/walker.rs` |
 | walker | `OPEN_FILES_SCAN_BUDGET` | `30 s` | Time budget of one /proc open-file sweep | `src/scanner/walker.rs` |
 | walker | `OPEN_FILES_MAX_PIDS` | `50000` | Processes inspected per open-file sweep | `src/scanner/walker.rs` |
 | walker | `OPAQUE_CANDIDATE_SIZE_FLOOR` | `100 MiB` | Opaque trees smaller than this are not sized | `src/scanner/walker.rs` |
@@ -702,10 +705,10 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | quarantine | `DEFAULT_MAX_BYTES_PCT` | `5` | Quarantine size cap used without config | `src/scanner/quarantine.rs` |
 | daemon | `DAEMON_STATE_WRITE_INTERVAL_SECS` | `30` | state.json write cadence | `src/daemon/self_monitor.rs` |
 | daemon | `DAEMON_STATE_STALE_THRESHOLD_SECS` | `90` | state.json older than this is stale | `src/daemon/self_monitor.rs` |
-| daemon | `DEFAULT_DAEMON_RSS_WARNING_BYTES` | `256 MiB` | RSS that logs a warning | `src/daemon/self_monitor.rs` |
-| daemon | `DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES` | `500 MiB` | RSS at which the daemon restarts itself | `src/daemon/self_monitor.rs` |
-| daemon | `daemon_rss_warning_bytes` | `256 MiB` | Config-side RSS warning | `src/core/config.rs` |
-| daemon | `daemon_rss_hard_limit_bytes` | `500 MiB` | Config-side RSS hard limit | `src/core/config.rs` |
+| daemon | `DEFAULT_DAEMON_RSS_WARNING_BYTES` | `512 MiB` | RSS that logs a warning | `src/daemon/self_monitor.rs` |
+| daemon | `DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES` | `1 GiB` | RSS at which the daemon restarts itself | `src/daemon/self_monitor.rs` |
+| daemon | `daemon_rss_warning_bytes` | `512 MiB` | Config-side RSS warning | `src/core/config.rs` |
+| daemon | `daemon_rss_hard_limit_bytes` | `1 GiB` | Config-side RSS hard limit | `src/core/config.rs` |
 | logger | `CHANNEL_CAPACITY` | `1024` | Logger channel bound (try_send, drops when full) | `src/logger/dual.rs` |
 | logger | `SQLITE_FAILURE_TRIP` | `3` | Consecutive SQLite write failures that switch to JSONL only | `src/logger/dual.rs` |
 | logger | `DAEMON_MAX_SIZE_BYTES` | `50 MiB` | JSONL size that triggers rotation in the daemon | `src/logger/jsonl.rs` |
@@ -716,7 +719,7 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | control | `MAX_REQUESTS_PER_SECOND` | `10` | Control-socket request rate limit | `src/daemon/control.rs` |
 | control | `MAX_LINE_BYTES` | `64 KiB` | Longest request line accepted | `src/daemon/control.rs` |
 | control | `IO_TIMEOUT` | `5 s` | Read/write timeout per control connection | `src/daemon/control.rs` |
-| service | `SYSTEMD_MEMORY_MAX` | `256M` | MemoryMax= in the generated systemd unit | `src/daemon/service.rs` |
+| service | `SYSTEMD_MEMORY_MAX` | `4096M` | MemoryMax= in the generated systemd unit | `src/daemon/service.rs` |
 | scanner | `event_watch_budget` | `8192` | inotify watches planned across the roots (Linux) | `src/core/config.rs` |
 | control | `MAX_SOCKET_PATH_BYTES` | `100` | Longest socket path a Unix address can carry | `src/daemon/control.rs` |
 | voi | `ewma_alpha` | `0.3` | Smoothing of the scheduler's expected-reclaim estimates | `src/core/config.rs` |
@@ -739,6 +742,8 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | daemon | `CATALOG_PROBE_MAX_ENTRIES` | `50000` | Entries a catalog freshness probe may visit | `src/daemon/loop_main.rs` |
 | daemon | `CATALOG_PROBE_MAX_DEPTH` | `5` | Depth of a catalog freshness probe | `src/daemon/loop_main.rs` |
 | daemon | `CANARY_REPROVE_MINUTES` | `30` | Clean minutes an automatic Canary needs to return to the intended mode | `src/daemon/policy.rs` |
+| daemon | `TARGET_TIER_PASS_MINUTES` | `10` | Shortest gap between two target-only passes | `src/daemon/target_tier.rs` |
+| agent_scratch | `DEFAULT_MIN_IDLE_DAYS` | `7` | Days a session tree and transcript must be unchanged before check --agent-scratch calls it idle | `src/monitor/agent_scratch.rs` |
 <!-- sbh-docs:end -->
 
 ---
@@ -800,9 +805,11 @@ The E2E script runs real CLI invocations with per-case logging.
 
 ### No hosted CI; releases go through dsr
 
-sbh never uses GitHub Actions (owner's rule; the workflows were deleted 2026-09-25). Before pushing, run the gates yourself through rch: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (shipped features, which include `tui`) and again with `--features legacy-crossterm-dashboard`, `cargo test --lib`, `cargo test --bin sbh`, the integration targets, and `tests/daemon_e2e.rs` with `--test-threads=1` on a host whose disk is not IO-starved. `scripts/quality-gate.sh` runs the staged gate. Keep `--features tui` building.
+sbh never uses GitHub Actions (owner's rule; the workflows were deleted 2026-09-25, and the three re-added on 2026-10-13/14 were replaced by dsr on 2026-10-19). Before pushing, run the gates yourself through rch: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (shipped features, which include `tui`) and again with `--features legacy-crossterm-dashboard`, `cargo test --lib`, `cargo test --bin sbh`, the integration targets, and `tests/daemon_e2e.rs` with `--test-threads=1` on a host whose disk is not IO-starved. `scripts/quality-gate.sh` runs the staged gate. Keep `--features tui` building. Never add a GitHub Actions workflow file: a check that needs a real host goes into `scripts/quality-gate.sh` as a stage, and one that needs root goes in as a `native-*` stage.
 
-Release: `scripts/changelog_check.sh --tag vX.Y.Z --expect-release`, tag and push, `dsr build storage_ballast_helper --version X.Y.Z` from a clean worktree at the tag, then `scripts/dsr_release.sh all X.Y.Z` (Developer ID signing, notarization, packaging and audit, manifest minisign, GitHub release upload and verification, Homebrew tap). `sbh doctor --release` checks the credentials and release drift.
+The `native-*` stages (`native-btrfs`: real zstd compression and reflink refusal on a loop-mounted Btrfs image; `native-systemd`: the strict-namespace startup proof through `systemd-run`) need Linux with passwordless sudo, so `scripts/quality-gate.sh` runs them only with `--native` or by name. `scripts/dsr_native_checks.sh [HOST]` ships `git archive HEAD` to a dsr build host (default `trj`), runs both there and cleans up; it is a `required_checks` entry of `storage_ballast_helper` in dsr's `repos.yaml`, so `dsr quality` and `dsr fallback` stop on a failure even with `--skip-checks`. Run it by hand after changing `crates/sbh_btrfs`, `src/scanner/compression`, `src/cli_compress.rs` or `src/daemon/service`.
+
+Release: `scripts/changelog_check.sh --tag vX.Y.Z --expect-release`, `scripts/dsr_native_checks.sh`, tag and push, `dsr build storage_ballast_helper --version X.Y.Z` from a clean worktree at the tag, then `scripts/dsr_release.sh all X.Y.Z` (Developer ID signing, notarization, packaging and audit, manifest minisign, GitHub release upload and verification, Homebrew tap). `sbh doctor --release` checks the credentials and release drift.
 
 ### Test Conventions
 
@@ -1301,4 +1308,4 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 
 Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
 
-For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
+For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "storage_ballast_helper-agent (+https://github.com/Dicklesworthstone/storage_ballast_helper)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.

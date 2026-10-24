@@ -15,6 +15,10 @@
 #   --ci             CI mode: no rch, capture all artifacts, exit 1 on first HARD failure
 #   --stage STAGE    Run only the named stage (e.g., "lint", "unit", "tui")
 #   --skip STAGE     Skip the named stage (repeatable)
+#   --native         Also run the native-* stages (Linux, passwordless sudo:
+#                    a loop-mounted Btrfs image, systemd-run as root). Off by
+#                    default; --stage native-X runs that one stage either way.
+#                    scripts/dsr_native_checks.sh runs them on a dsr host.
 #   --print-stages   Print the stage table (what would run) and exit
 #   --markdown       With --print-stages: emit a Markdown table (docs embed it)
 #   --write-stages   Rewrite the stage table embedded in the docs (between
@@ -40,6 +44,7 @@
 #   test   a cargo test run; must execute at least one test (else "vacuous")
 #   e2e    scripts/e2e_test.sh; its "summary pass=N fail=M" line is the count
 #   check  fmt/clippy: no tests by nature (allow-empty)
+#   native cargo tests run locally plus a root-only proof; counted like test
 #
 # Features: `tui` is a default feature (bd-rc-master-ajg1.4.7); the TUI
 # and fallback stages still pass `--features tui` explicitly so the gate
@@ -68,6 +73,7 @@ PRINT_STAGES=0
 MARKDOWN=0
 SELF_TEST=0
 STAGE_DOCS_MODE=""
+NATIVE=0
 
 # ── argument parsing ─────────────────────────────────────────────────────────
 
@@ -77,6 +83,7 @@ while [[ $# -gt 0 ]]; do
     --ci)     CI_MODE=1; USE_RCH=0; shift ;;
     --stage)  ONLY_STAGE="$2"; shift 2 ;;
     --skip)   SKIP_STAGES+=("$2"); shift 2 ;;
+    --native) NATIVE=1; shift ;;
     --print-stages) PRINT_STAGES=1; shift ;;
     --markdown) MARKDOWN=1; shift ;;
     --write-stages) STAGE_DOCS_MODE="write"; shift ;;
@@ -112,6 +119,7 @@ STAGES=(
   "decision-plane|HARD|test|Integration Tests|policy-correctness|cargo test --test proof_harness -- --test-threads=4|Decision safety invariant violated — check proof_harness for specific property"
   "decision-e2e|HARD|test|Integration Tests|policy-lifecycle|cargo test --test decision_plane_e2e -- --test-threads=4|Policy lifecycle (observe→canary→enforce) regression — check decision_plane_e2e"
   "explain-ledger|HARD|test|Integration Tests|explainability|cargo test --test explain_ledger -- --test-threads=4|sbh explain no longer matches the decision ledger — check decision_log writes and the explain query"
+  "source-root|HARD|test|Integration Tests|source-root-safety|cargo test --locked --lib source_root -- --test-threads=4|Source-root policy regression — a configured root inside a source tree must be reported or refused, never scanned blind"
   "fallback|HARD|test|Integration Tests|fallback-safety|cargo test --test fallback_verification --features tui -- --test-threads=4|Fallback/rollback path broken — check mode transition logic"
   "tui-unit|HARD|test|Dashboard / TUI Tests|dashboard-correctness|cargo test --lib --features tui tui:: -- --test-threads=4|TUI model/update/render regression — check which screen or overlay broke"
   "tui-replay|HARD|test|Dashboard / TUI Tests|deterministic-replay|cargo test --lib --features tui tui::test_replay -- --test-threads=4|Replay divergence — elm update loop produced different state for same inputs"
@@ -130,6 +138,8 @@ STAGES=(
   "daemon-e2e|SOFT|test|E2E & Installer|daemon-lifecycle|cargo test --test daemon_e2e -- --test-threads=1|Real daemon runs (start/stop, injected pressure, reclaim, events); the idle-CPU case is load-sensitive on a busy host — rerun quiet before treating as a regression"
   "installer|HARD|test|E2E & Installer|install-safety|cargo test --test installer_e2e -- --test-threads=4|Installer test failure — check install/uninstall/rollback logic"
   "e2e|HARD|e2e|E2E & Installer|user-experience|./scripts/e2e_test.sh|E2E failure — check the e2e/ artifact dir for per-case logs and summary.json"
+  "native-btrfs|HARD|native|Native Linux (--native, dsr)|btrfs-compression|./scripts/quality-gate.sh --stage native-btrfs|The C UAPI check, the sbh_btrfs or compression tests, or the root-only compression and reflink-refusal proof on a loop-mounted Btrfs image failed — check the stage log (needs passwordless sudo, btrfs-progs and a C compiler)"
+  "native-systemd|HARD|native|Native Linux (--native, dsr)|systemd-namespace|./scripts/quality-gate.sh --stage native-systemd|The systemd service tests or the root-only strict-namespace startup proof (systemd-run) failed — check the stage log (needs passwordless sudo and systemd)"
 )
 
 stage_field() {
@@ -257,6 +267,10 @@ should_skip() {
   if [[ -n "${ONLY_STAGE}" && "${ONLY_STAGE}" != "${stage}" ]]; then
     return 0
   fi
+  # Native stages need root on a Linux host: only with --native or by name.
+  if [[ "${stage}" == native-* && "${NATIVE}" -eq 0 && "${ONLY_STAGE}" != "${stage}" ]]; then
+    return 0
+  fi
   for s in "${SKIP_STAGES[@]+"${SKIP_STAGES[@]}"}"; do
     if [[ "${s}" == "${stage}" ]]; then
       return 0
@@ -320,6 +334,91 @@ stage_e2e() {
   (cd "${ROOT_DIR}" && SBH_E2E_LOG_DIR="${LOG_DIR}/e2e" ./scripts/e2e_test.sh) > "${logfile}" 2>&1
 }
 
+# The native stages took over the retired btrfs-compression and
+# systemd-namespace GitHub workflows, step for step. They build locally
+# (never through rch: the root-only step runs the test binary this host
+# built) in a scratch dir under target/ with its own CARGO_TARGET_DIR, and
+# remove it again.
+native_scratch() {
+  mkdir -p "${ROOT_DIR}/target"
+  mktemp -d "${ROOT_DIR}/target/qg-native.XXXXXX"
+}
+
+# rustup's own cargo, not an rch shim earlier on PATH: the root-only step runs
+# a test binary this host must have built itself. It still honors
+# rust-toolchain.toml and installs that toolchain on demand.
+native_cargo() {
+  local cargo="${HOME}/.cargo/bin/cargo"
+  [[ -x "${cargo}" ]] || cargo="$(command -v cargo)"
+  "${cargo}" "$@"
+}
+
+# The one test executable cargo builds for TARGET (file name TARGET-<hash>),
+# taken from cargo's own JSON report: newer cargo keeps test binaries under
+# build/<package>/<hash>/out, not debug/deps, so a path guess goes stale.
+native_test_executable() {
+  local target="$1"
+  shift
+  local found
+  found="$(native_cargo test "$@" --no-run --message-format=json \
+    | grep -o "\"executable\":\"[^\"]*/${target}-[0-9a-f]*\"" \
+    | sed 's/^"executable":"//; s/"$//' | sort -u)"
+  if [[ -z "${found}" || "$(printf '%s\n' "${found}" | wc -l)" -ne 1 ]]; then
+    echo "expected one ${target} test executable, got: ${found:-none}" >&2
+    return 1
+  fi
+  printf '%s\n' "${found}"
+}
+
+stage_native_btrfs() {
+  local logfile="$1"
+  (
+    set -euo pipefail
+    cd "${ROOT_DIR}"
+    work="$(native_scratch)"
+    mnt="${work}/mnt"
+    cleanup() {
+      if mountpoint -q "${mnt}" 2>/dev/null; then sudo -n umount "${mnt}"; fi
+      rm -r "${work}"
+    }
+    trap cleanup EXIT
+    export CARGO_TARGET_DIR="${work}/target" RCH_CARGO_WRAPPER_BYPASS=1
+    echo "== syscall ABI and pure tests"
+    cc -std=c11 -Wall -Wextra -Werror crates/sbh_btrfs/tests/uapi_abi.c -o "${work}/sbh-uapi"
+    "${work}/sbh-uapi"
+    native_cargo test --locked --manifest-path crates/sbh_btrfs/Cargo.toml
+    echo "== application admission and command wiring"
+    native_cargo test --locked --no-default-features --features cli,daemon,sqlite --lib scanner::compression
+    native_cargo test --locked --no-default-features --features cli,daemon,sqlite --bin sbh cli_compress
+    echo "== real compression and reflink refusal on a disposable Btrfs filesystem"
+    truncate -s 1G "${work}/sbh-btrfs.img"
+    mkfs.btrfs -f "${work}/sbh-btrfs.img"
+    mkdir "${mnt}"
+    sudo -n mount -o loop "${work}/sbh-btrfs.img" "${mnt}"
+    bin="$(native_test_executable btrfs_native --locked --manifest-path crates/sbh_btrfs/Cargo.toml --test btrfs_native)"
+    sudo -n env SBH_BTRFS_TEST_ROOT="${mnt}" "${bin}" --ignored --nocapture
+  ) > "${logfile}" 2>&1
+}
+
+stage_native_systemd() {
+  local logfile="$1"
+  (
+    set -euo pipefail
+    cd "${ROOT_DIR}"
+    work="$(native_scratch)"
+    trap 'rm -r "${work}"' EXIT
+    export CARGO_TARGET_DIR="${work}/target" RCH_CARGO_WRAPPER_BYPASS=1
+    systemctl --version
+    echo "== service contracts"
+    native_cargo test --locked --no-default-features --features cli,daemon,sqlite --lib daemon::service::systemd
+    echo "== missing grant fails, prepared strict namespace can write (root)"
+    bin="$(native_test_executable storage_ballast_helper --locked --no-default-features --features cli,daemon,sqlite --lib)"
+    name='daemon::service::systemd::namespace::tests::native_missing_grant_fails_then_prepared_namespace_can_write'
+    "${bin}" --list | grep -F "${name}: test"
+    sudo -n "${bin}" --exact "${name}" --ignored --nocapture
+  ) > "${logfile}" 2>&1
+}
+
 # Run one stage record: run the command, count executed tests, classify.
 #   pass      exit 0 and (kind=check or executed > 0)
 #   vacuous   exit 0 but a test/e2e stage executed zero tests (a failure)
@@ -355,6 +454,8 @@ run_stage() {
   case "${stage}" in
     fmt) stage_fmt "${logfile}" || rc=$? ;;
     e2e) stage_e2e "${logfile}" || rc=$? ;;
+    native-btrfs) stage_native_btrfs "${logfile}" || rc=$? ;;
+    native-systemd) stage_native_systemd "${logfile}" || rc=$? ;;
     *)   run_cargo "${logfile}" "${command}" || rc=$? ;;
   esac
 

@@ -1,492 +1,250 @@
-//! Risk-budgeted batch planning (W1, G16).
+//! Risk-budgeted batch planning with a hard safety-admission boundary.
 //!
-//! The executor used to take the top-N candidates by composite score. When
-//! a byte target is known (`clean --target-free`, the bytes a pressured
-//! mount needs to return to Green), "highest score first" is not "least
-//! risk for the bytes we need": a large candidate at posterior 0.85 is
-//! often a better first choice than a small one at 0.95. The decision
-//! layer already prices every candidate's loss; this module chooses the
-//! *set*.
+//! A vetoed descendant cannot be removed indirectly by selecting its parent.
+//! Likewise, a vetoed root cannot be bypassed by selecting one of its children,
+//! another observation at the same path, or an observed identity alias. Perform
+//! these checks before any risk/byte optimization or counterfactual accounting.
 //!
-//! The planner is the fractional-knapsack greedy: order candidates by
-//! expected reclaim per unit of expected loss, take them while the level's
-//! batch size, the risk budget and the byte target allow, and stop as soon
-//! as the target is met. A best-single fallback also considers large items
-//! crowded out by the greedy prefix. Overlapping paths are alternatives,
-//! never additive space: selecting a directory consumes its descendants.
-//! The approximation bound for ordinary knapsack does not extend to these
-//! overlap and batch-size constraints.
+//! Directory aliases also carry their descendants' vetoes: if `/a` and `/b`
+//! name the same directory, `/a/busy` protects `/b/busy/child` even without an
+//! observation of `/b/busy` itself. Only prefixes of supplied paths are stored;
+//! alias cycles never generate an unbounded set of synthetic pathnames.
+//! Ordinary batches without aliases use direct path scopes instead of building
+//! that graph; alias detection includes observations that cannot be selected.
 //!
-//! Determinism: ties break on bytes descending, then path ascending, so
-//! identical inputs plan identically whatever order the walker found them
-//! in (design principle 3).
+//! Admission uses only the observations supplied in this batch. It neither
+//! canonicalizes paths nor discovers unseen aliases, mounts or active references.
+//! The executor must still perform fresh identity, protection and lease checks.
 
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsString;
+use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use crate::scanner::scoring::CandidacyScore;
+use crate::scanner::walker::FsIdentity;
 
-use crate::monitor::pid::PressureLevel;
-use crate::scanner::decision_record::stable_decision_id;
-use crate::scanner::scoring::{CandidacyScore, DecisionAction};
+mod optimization;
 
-/// The risk budget per pressure level as a multiple of one false-positive
-/// loss (`scoring.false_positive_loss`): how many "average mistakes" one
-/// batch may risk. `None` is unbounded.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RiskBudgetByLevel {
-    /// Green: at most one average mistake.
-    pub green: f64,
-    /// Yellow.
-    pub yellow: f64,
-    /// Orange.
-    pub orange: f64,
-    /// Red.
-    pub red: f64,
-    /// Critical defaults to unbounded; an explicit value still limits risk.
-    pub critical: Option<f64>,
-}
+pub use optimization::{BatchPlan, PlanRequest, PlannedItem, RiskBudgetByLevel};
 
-impl Default for RiskBudgetByLevel {
-    fn default() -> Self {
-        Self {
-            green: 1.0,
-            yellow: 2.0,
-            orange: 5.0,
-            red: 10.0,
-            critical: None,
-        }
-    }
-}
-
-impl RiskBudgetByLevel {
-    /// The budget for `level` in loss units, given one false-positive loss.
-    #[must_use]
-    pub fn budget(&self, level: PressureLevel, false_positive_loss: f64) -> Option<f64> {
-        if !valid_loss_unit(false_positive_loss) {
-            return Some(0.0);
-        }
-        let multiple = match level {
-            PressureLevel::Green => Some(self.green),
-            PressureLevel::Yellow => Some(self.yellow),
-            PressureLevel::Orange => Some(self.orange),
-            PressureLevel::Red => Some(self.red),
-            PressureLevel::Critical => self.critical,
-        };
-        multiple.map(|m| finite_budget_or_zero(m * false_positive_loss))
-    }
-}
-
-fn valid_loss_unit(loss: f64) -> bool {
-    loss.is_finite() && loss > 0.0
-}
-
-// An invalid bound must not become an unbounded budget: comparisons with
-// NaN otherwise silently accept every candidate. Overflow also fails closed.
-fn finite_budget_or_zero(budget: f64) -> f64 {
-    if budget.is_finite() && budget >= 0.0 {
-        budget
-    } else {
-        0.0
-    }
-}
-
-/// What the planner was asked to do.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PlanRequest {
-    /// The pressure level the batch runs at.
-    pub level: PressureLevel,
-    /// Bytes the batch should reach; `None` means "as much as the batch
-    /// size and budget allow".
-    pub target_bytes: Option<u64>,
-    /// The level's batch size (0 plans nothing).
-    pub max_items: usize,
-    /// Risk budget in loss units; `None` is unbounded.
-    pub risk_budget: Option<f64>,
-    /// One false-positive loss, the unit of `risk_budget`.
-    pub false_positive_loss: f64,
-    /// Whether `Review` candidates may be planned (emergency only).
-    pub include_review: bool,
-}
-
-/// One planned or skipped candidate, as the record and `explain` show it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlannedItem {
-    /// The candidate's path.
-    pub path: PathBuf,
-    /// The candidate's stable decision id (`sbh explain --id`).
-    pub decision_id: String,
-    /// 1-based position in the batch (0 for a skipped candidate).
-    pub rank: usize,
-    /// Expected reclaim (the candidate's size estimate).
-    pub bytes: u64,
-    /// Posterior that the candidate is abandoned.
-    pub posterior: f64,
-    /// `(1 - posterior) * false_positive_loss`.
-    pub expected_loss: f64,
-    /// Bytes per loss unit, the greedy key.
-    pub value: f64,
-}
-
-/// The planned batch and its accounting.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BatchPlan {
-    /// Pressure level the plan was made for.
-    pub level: String,
-    /// The byte target, if any.
-    pub target_bytes: Option<u64>,
-    /// Bytes the chosen set is expected to reclaim.
-    pub planned_bytes: u64,
-    /// Risk budget in loss units, if bounded.
-    pub risk_budget: Option<f64>,
-    /// Expected loss of the chosen set.
-    pub risk_used: f64,
-    /// Chosen candidates in execution order.
-    pub chosen: Vec<PlannedItem>,
-    /// Plannable candidates the budget or batch size left out.
-    pub skipped_for_budget: Vec<PlannedItem>,
-    /// Alternatives overlapping a chosen path (including duplicate paths).
-    /// Their bytes are not additional reclaimable space. Older persisted
-    /// plans did not distinguish these from budget skips.
-    #[serde(default)]
-    pub skipped_for_overlap: Vec<PlannedItem>,
-    /// Expected loss the top-N-by-score set for the same target would have
-    /// carried; what the explanation compares against.
-    pub top_n_risk: f64,
-    /// Bytes the top-N-by-score set would have reclaimed.
-    pub top_n_bytes: u64,
-    /// Whether the target was met by the chosen set.
-    pub target_met: bool,
-}
-
-impl BatchPlan {
-    /// One line for the log: `level=.. target_bytes=.. planned_bytes=..
-    /// risk_budget=.. risk_used=.. chosen=n skipped_for_budget=m`.
-    #[must_use]
-    pub fn summary_line(&self) -> String {
-        format!(
-            "level={} target_bytes={} planned_bytes={} risk_budget={} risk_used={:.2} chosen={} skipped_for_budget={} top_n_risk={:.2} skipped_for_overlap={}",
-            self.level,
-            self.target_bytes
-                .map_or_else(|| "none".to_string(), |b| b.to_string()),
-            self.planned_bytes,
-            self.risk_budget
-                .map_or_else(|| "unbounded".to_string(), |b| format!("{b:.2}")),
-            self.risk_used,
-            self.chosen.len(),
-            self.skipped_for_budget.len(),
-            self.top_n_risk,
-            self.skipped_for_overlap.len()
-        )
-    }
-
-    /// Why the item at `rank` was chosen, for `explain`.
-    #[must_use]
-    pub fn explain_choice(&self, rank: usize) -> Option<String> {
-        let item = self.chosen.iter().find(|item| item.rank == rank)?;
-        let share = if self.top_n_risk > 0.0 {
-            format!(
-                " with {:.0}% of the risk the top-scored set would use",
-                self.risk_used / self.top_n_risk * 100.0
-            )
-        } else {
-            String::new()
-        };
-        Some(format!(
-            "chosen {}: {} at posterior {:.2} (loss {:.1} of budget {}) because it {}{share}",
-            ordinal(rank),
-            format_bytes(item.bytes),
-            item.posterior,
-            item.expected_loss,
-            self.risk_budget
-                .map_or_else(|| "unbounded".to_string(), |b| format!("{b:.1}")),
-            if self.target_bytes.is_some() {
-                if self.target_met {
-                    "reaches the target"
-                } else {
-                    "moves toward the target"
-                }
-            } else {
-                "reclaims the most per unit of risk"
-            }
-        ))
-    }
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn ordinal(n: usize) -> String {
-    let suffix = match (n % 10, n % 100) {
-        (1, 11) | (2, 12) | (3, 13) => "th",
-        (1, _) => "st",
-        (2, _) => "nd",
-        (3, _) => "rd",
-        _ => "th",
-    };
-    format!("{n}{suffix}")
-}
-
-/// A lexical antichain: no selected path contains another selected path.
-/// Remembering ancestors makes both directions of containment checks depend
-/// on path depth rather than the number of candidates in a scan. These are
-/// planning checks, not a replacement for executor identity/lease preflight.
-#[derive(Default)]
-struct SelectedPaths {
-    paths: BTreeSet<PathBuf>,
-    ancestors: BTreeSet<PathBuf>,
-}
-
-impl SelectedPaths {
-    fn overlaps(&self, path: &Path) -> bool {
-        self.ancestors.contains(path)
-            || path
-                .ancestors()
-                .any(|ancestor| self.paths.contains(ancestor))
-    }
-
-    fn insert(&mut self, path: &Path) {
-        self.paths.insert(path.to_path_buf());
-        self.ancestors
-            .extend(path.ancestors().map(Path::to_path_buf));
-    }
-}
-
-fn plannable(candidate: &CandidacyScore, include_review: bool) -> bool {
-    !candidate.vetoed
-        && !candidate.decision.category_suspended
-        && candidate.total_score.is_finite()
-        && (0.0..=1.0).contains(&candidate.decision.posterior_abandoned)
-        && match candidate.decision.action {
-            DecisionAction::Delete => true,
-            DecisionAction::Review => include_review,
-            DecisionAction::Keep => false,
-        }
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn item(candidate: &CandidacyScore, false_positive_loss: f64) -> PlannedItem {
-    // The eligibility gate validates this probability; clamping malformed
-    // evidence here would turn infinity into certainty (or NaN into tiny loss).
-    let posterior = candidate.decision.posterior_abandoned;
-    // A candidate the model is certain about still carries a floor of loss,
-    // so the greedy key stays finite and a huge certain candidate does not
-    // drown every other consideration.
-    let expected_loss = ((1.0 - posterior) * false_positive_loss).max(1e-6);
-    PlannedItem {
-        path: candidate.path.clone(),
-        decision_id: stable_decision_id(&candidate.path, candidate.identity, candidate.size_bytes),
-        rank: 0,
-        bytes: candidate.size_bytes,
-        posterior,
-        expected_loss,
-        value: candidate.size_bytes as f64 / expected_loss,
-    }
-}
-
-/// Plan a batch: the chosen candidates in execution order, plus the plan.
+/// Choose a disjoint, risk-budgeted batch after enforcing all supplied vetoes.
 ///
-/// Candidates that are not plannable (vetoed, suspended, invalid evidence,
-/// `Keep`, or `Review` outside Critical) are dropped silently; the rest are
-/// either chosen or listed under `skipped_for_budget`/`skipped_for_overlap`.
-/// Byte totals count only disjoint chosen paths. Invalid loss units or risk
-/// bounds fail closed, even at Critical pressure.
+/// Hard vetoes and category suspensions exclude overlapping deletion scopes and
+/// observed aliases. `Keep` or an ineligible `Review` alone is not a protection
+/// marker: it must not prevent an independently admissible subtree from being
+/// considered. Rejections are not risk-budget skips and cannot contribute bytes
+/// to either the chosen plan or its top-N comparison.
+///
+/// All existing item limits, emergency review rules, risk bounds, target-cover
+/// alternatives and deterministic ranking apply to the admitted observations.
 #[must_use]
-#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 pub fn plan_batch(
     candidates: Vec<CandidacyScore>,
     request: &PlanRequest,
 ) -> (Vec<CandidacyScore>, BatchPlan) {
-    let valid_loss = valid_loss_unit(request.false_positive_loss);
-    let risk_budget = if valid_loss {
-        request.risk_budget.map(finite_budget_or_zero)
-    } else {
-        Some(0.0)
-    };
-    let include_review = request.include_review && request.level == PressureLevel::Critical;
-    let mut plannable: Vec<(PlannedItem, CandidacyScore)> = candidates
+    if !candidates.iter().any(hard_veto) {
+        return optimization::plan_batch(candidates, request);
+    }
+    let rejected = rejected_observations(&candidates);
+    let admitted = candidates
         .into_iter()
-        .filter(|c| valid_loss && plannable(c, include_review))
-        .map(|c| (item(&c, request.false_positive_loss), c))
+        .zip(rejected)
+        .filter_map(|(candidate, rejected)| (!rejected).then_some(candidate))
         .collect();
+    optimization::plan_batch(admitted, request)
+}
 
-    // The comparison set: top-N by score for the same target.
-    let (top_n_bytes, top_n_risk) = {
-        let mut by_score: Vec<&(PlannedItem, CandidacyScore)> = plannable.iter().collect();
-        by_score.sort_by(|a, b| {
-            b.1.total_score
-                .partial_cmp(&a.1.total_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.0.bytes.cmp(&a.0.bytes))
-                .then_with(|| a.0.path.cmp(&b.0.path))
-                .then_with(|| a.0.decision_id.cmp(&b.0.decision_id))
-        });
-        let mut bytes = 0u64;
-        let mut risk = 0.0;
-        let mut selected = SelectedPaths::default();
-        for (planned, _) in by_score {
-            if selected.paths.len() >= request.max_items
-                || request.target_bytes.is_some_and(|target| bytes >= target)
-            {
-                break;
-            }
-            // A duplicate or descendant must not consume a comparison slot
-            // or count the same bytes toward the target twice.
-            if selected.overlaps(&planned.path) {
+fn hard_veto(candidate: &CandidacyScore) -> bool {
+    candidate.vetoed || candidate.decision.category_suspended
+}
+
+fn has_path_aliases(candidates: &[CandidacyScore]) -> bool {
+    let mut identities: HashMap<FsIdentity, &Path> = HashMap::new();
+    for candidate in candidates {
+        if let Some(identity) = candidate.identity
+            && let Some(previous) = identities.insert(identity, candidate.path.as_path())
+            && previous != candidate.path.as_path()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn rejected_observations(candidates: &[CandidacyScore]) -> Vec<bool> {
+    // Most walks observe each physical entry at one path. Do not materialize
+    // every path prefix and graph edge just because one candidate is protected.
+    // Keep/invalid-score observations still participate in alias detection.
+    if has_path_aliases(candidates) {
+        return rejected_with_aliases(candidates);
+    }
+    let scopes: BTreeSet<_> = candidates
+        .iter()
+        .filter(|candidate| hard_veto(candidate))
+        .map(|candidate| candidate.path.clone())
+        .collect();
+    candidates
+        .iter()
+        .map(|candidate| {
+            let path = candidate.path.as_path();
+            path.ancestors().any(|ancestor| scopes.contains(ancestor))
+                || scopes
+                    .range(candidate.path.clone()..)
+                    .next()
+                    .is_some_and(|scope| scope.starts_with(path))
+        })
+        .collect()
+}
+
+/// Identity/path equivalence, closed under equal child names. Children of
+/// equivalent directories are equivalent observations too, including prefix
+/// nodes for which the batch has no separate candidacy score.
+///
+/// Containment is NOT an equivalence edge. In particular, rejecting a parent
+/// because it contains a protected child must not protect its safe siblings.
+struct Groups {
+    parent: Vec<usize>,
+    size: Vec<usize>,
+    children: Vec<BTreeMap<OsString, usize>>,
+}
+
+impl Groups {
+    fn new(len: usize) -> Self {
+        Self {
+            parent: (0..len).collect(),
+            size: vec![1; len],
+            children: vec![BTreeMap::new(); len],
+        }
+    }
+
+    fn root(&mut self, mut index: usize) -> usize {
+        while self.parent[index] != index {
+            self.parent[index] = self.parent[self.parent[index]];
+            index = self.parent[index];
+        }
+        index
+    }
+
+    fn unite(&mut self, left: usize, right: usize) {
+        // Iterative congruence closure also handles an observed directory
+        // aliasing one of its ancestors. No recursion or path expansion.
+        let mut pending = vec![(left, right)];
+        while let Some((left, right)) = pending.pop() {
+            let mut left = self.root(left);
+            let mut right = self.root(right);
+            if left == right {
                 continue;
             }
-            selected.insert(&planned.path);
-            bytes = bytes.saturating_add(planned.bytes);
-            // Keep the counterfactual diagnostic serializable even when
-            // individually finite losses overflow their aggregate.
-            risk = (risk + planned.expected_loss).min(f64::MAX);
+            if self.size[left] < self.size[right] {
+                std::mem::swap(&mut left, &mut right);
+            }
+            self.parent[right] = left;
+            self.size[left] += self.size[right];
+            // Move the smaller group's edges. Each edge is moved only as its
+            // owning equivalence class grows; duplicate labels induce unions.
+            for (name, child) in std::mem::take(&mut self.children[right]) {
+                if let Some(previous) = self.children[left].insert(name, child) {
+                    pending.push((previous, child));
+                }
+            }
         }
-        (bytes, risk)
-    };
+    }
+}
 
-    // Greedy by value; deterministic tie-breaks.
-    plannable.sort_by(|a, b| {
-        b.0.value
-            .partial_cmp(&a.0.value)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.0.bytes.cmp(&a.0.bytes))
-            .then_with(|| a.0.path.cmp(&b.0.path))
-            .then_with(|| a.0.decision_id.cmp(&b.0.decision_id))
-    });
+fn mark_reachable(marked: &mut [bool], edges: &[Vec<usize>]) {
+    let mut pending: Vec<_> = marked
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &marked)| marked.then_some(index))
+        .collect();
+    while let Some(index) = pending.pop() {
+        for &next in &edges[index] {
+            if !marked[next] {
+                marked[next] = true;
+                pending.push(next);
+            }
+        }
+    }
+}
 
-    // Greedy pass: take in value order whatever the budget, batch size and
-    // target still allow. Skipping past an item that does not fit is what
-    // makes this a set choice rather than a prefix.
-    let mut chosen_idx: Vec<usize> = Vec::new();
-    let mut planned_bytes = 0u64;
-    let mut risk_used = 0.0f64;
-    let mut selected = SelectedPaths::default();
-    for (index, (planned, _)) in plannable.iter().enumerate() {
-        let target_met = request
-            .target_bytes
-            .is_some_and(|target| planned_bytes >= target);
-        let next_risk = risk_used + planned.expected_loss;
-        let over_budget =
-            !next_risk.is_finite() || risk_budget.is_some_and(|budget| next_risk > budget + 1e-9);
-        if target_met
-            || chosen_idx.len() >= request.max_items
-            || over_budget
-            || selected.overlaps(&planned.path)
-        {
-            continue;
-        }
-        selected.insert(&planned.path);
-        planned_bytes = planned_bytes.saturating_add(planned.bytes);
-        risk_used = next_risk;
-        chosen_idx.push(index);
-    }
-    let mut target_met = request
-        .target_bytes
-        .is_some_and(|target| planned_bytes >= target);
-    // Best-single fallback: when the greedy set falls short of the target
-    // (or has none), the single largest candidate that fits the budget on
-    // its own beats a bundle of small safe ones if it reclaims more.
-    if !target_met && request.max_items >= 1 {
-        let best_single = plannable
-            .iter()
-            .enumerate()
-            .filter(|(_, (planned, _))| {
-                risk_budget.is_none_or(|budget| planned.expected_loss <= budget + 1e-9)
-            })
-            .max_by(|(_, (a, _)), (_, (b, _))| {
-                a.bytes.cmp(&b.bytes).then_with(|| b.path.cmp(&a.path))
-            });
-        if let Some((index, (planned, _))) = best_single
-            && planned.bytes > planned_bytes
-        {
-            chosen_idx = vec![index];
-            planned_bytes = planned.bytes;
-            risk_used = planned.expected_loss;
-            target_met = request
-                .target_bytes
-                .is_some_and(|target| planned_bytes >= target);
+fn rejected_with_aliases(candidates: &[CandidacyScore]) -> Vec<bool> {
+    // The finite prefix trie is bounded by the input's total path components,
+    // not by the filesystem's size or the number of spellings an alias cycle
+    // could produce. Native components are never converted through UTF-8.
+    let mut paths: BTreeMap<&Path, usize> = BTreeMap::new();
+    let mut observations = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let next = paths.len();
+        observations.push(*paths.entry(candidate.path.as_path()).or_insert(next));
+        for ancestor in candidate.path.ancestors().skip(1) {
+            let next = paths.len();
+            paths.entry(ancestor).or_insert(next);
         }
     }
-
-    // Rebuild from the final set: best-single may have replaced the greedy
-    // set, so overlap explanations must not retain its discarded choices.
-    let mut selected = SelectedPaths::default();
-    for &index in &chosen_idx {
-        selected.insert(&plannable[index].0.path);
-    }
-    let mut chosen = Vec::with_capacity(chosen_idx.len());
-    let mut chosen_scores = Vec::with_capacity(chosen_idx.len());
-    let mut skipped = Vec::new();
-    let mut overlapping = Vec::new();
-    for (index, (mut planned, score)) in plannable.into_iter().enumerate() {
-        if let Some(rank) = chosen_idx
-            .iter()
-            .position(|&chosen_index| chosen_index == index)
+    let mut groups = Groups::new(paths.len());
+    for (&path, &index) in &paths {
+        if let Some(parent) = path.parent()
+            && let Some(&parent_index) = paths.get(parent)
+            && let Some(name) = path.components().next_back()
         {
-            planned.rank = rank + 1;
-            chosen.push(planned);
-            chosen_scores.push(score);
-        } else if selected.overlaps(&planned.path) {
-            overlapping.push(planned);
-        } else {
-            skipped.push(planned);
+            groups.children[parent_index].insert(name.as_os_str().to_os_string(), index);
         }
     }
-    // Only budget/size skips are worth listing; a target already met is a
-    // success, not a skip.
-    if target_met {
-        skipped.clear();
+    let mut identities: HashMap<FsIdentity, usize> = HashMap::new();
+    for (candidate, &index) in candidates.iter().zip(&observations) {
+        if let Some(identity) = candidate.identity
+            && let Some(previous) = identities.insert(identity, index)
+        {
+            groups.unite(index, previous);
+        }
     }
-    let plan = BatchPlan {
-        level: format!("{:?}", request.level).to_lowercase(),
-        target_bytes: request.target_bytes,
-        planned_bytes,
-        risk_budget,
-        risk_used,
-        chosen,
-        skipped_for_budget: skipped,
-        skipped_for_overlap: overlapping,
-        top_n_risk,
-        top_n_bytes,
-        target_met,
-    };
-    (chosen_scores, plan)
+    let roots: Vec<_> = (0..paths.len()).map(|index| groups.root(index)).collect();
+    let mut descendants = vec![Vec::new(); paths.len()];
+    let mut ancestors = vec![Vec::new(); paths.len()];
+    for (parent, children) in groups.children.iter().enumerate() {
+        for &child in children.values() {
+            descendants[roots[parent]].push(roots[child]);
+            ancestors[roots[child]].push(roots[parent]);
+        }
+    }
+    let mut rejected = vec![false; paths.len()];
+    for (candidate, &index) in candidates.iter().zip(&observations) {
+        if hard_veto(candidate) {
+            rejected[roots[index]] = true;
+        }
+    }
+    // First protect the vetoed subtrees, across all observed directory aliases.
+    mark_reachable(&mut rejected, &descendants);
+    // Then refuse enclosing cleanup units. NEVER feed this upward result into
+    // downward propagation: their independently safe siblings stay eligible.
+    mark_reachable(&mut rejected, &ancestors);
+    observations
+        .into_iter()
+        .map(|index| rejected[roots[index]])
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::pid::PressureLevel;
     use crate::scanner::patterns::ArtifactClassification;
     use crate::scanner::scoring::{
-        ArtifactCertainty, DecisionOutcome, EvidenceLedger, ScoreFactors,
+        ArtifactCertainty, DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors,
     };
+    use crate::scanner::walker::FsEntryKind;
+    use std::path::PathBuf;
     use std::time::Duration;
 
-    fn candidate(
-        path: &str,
-        bytes: u64,
-        posterior: f64,
-        score: f64,
-        action: DecisionAction,
-    ) -> CandidacyScore {
+    fn candidate(path: &str, bytes: u64, identity: Option<(u64, u64)>) -> CandidacyScore {
         CandidacyScore {
             path: PathBuf::from(path),
-            identity: None,
-            total_score: score,
+            identity: identity.map(|(device_id, inode)| FsIdentity {
+                device_id,
+                inode,
+                kind: FsEntryKind::Directory,
+            }),
+            total_score: 0.99,
             factors: ScoreFactors {
                 location: 0.9,
                 name: 0.9,
@@ -501,8 +259,8 @@ mod tests {
             size_bytes: bytes,
             age: Duration::from_hours(3),
             decision: DecisionOutcome {
-                action,
-                posterior_abandoned: posterior,
+                action: DecisionAction::Delete,
+                posterior_abandoned: 0.99,
                 expected_loss_keep: 0.0,
                 expected_loss_delete: 0.0,
                 calibration_score: 1.0,
@@ -519,539 +277,613 @@ mod tests {
         }
     }
 
-    fn request(level: PressureLevel, target: Option<u64>, budget: Option<f64>) -> PlanRequest {
+    fn veto(mut candidate: CandidacyScore) -> CandidacyScore {
+        candidate.vetoed = true;
+        candidate.veto_reason = Some("active or protected contents".into());
+        candidate
+    }
+
+    fn request(target_bytes: Option<u64>) -> PlanRequest {
         PlanRequest {
-            level,
-            target_bytes: target,
-            max_items: 10,
-            risk_budget: budget,
+            level: PressureLevel::Critical,
+            target_bytes,
+            max_items: 100,
+            risk_budget: None,
             false_positive_loss: 50.0,
-            include_review: false,
+            include_review: true,
         }
     }
 
-    const GIB: u64 = 1 << 30;
-    const MIB: u64 = 1 << 20;
-
     #[test]
-    fn a_parent_and_child_cannot_satisfy_a_target_with_the_same_bytes() {
+    fn a_vetoed_descendant_excludes_its_parent_but_not_a_safe_sibling() {
         let candidates = vec![
-            candidate("/p/target", 6 * GIB, 0.9, 3.0, DecisionAction::Delete),
-            candidate("/p/target/debug", 5 * GIB, 0.9, 2.0, DecisionAction::Delete),
-            candidate("/p/cache", 4 * GIB, 0.9, 1.0, DecisionAction::Delete),
+            candidate("/cache/tree", 1000, Some((7, 1))),
+            veto(candidate("/cache/tree/busy", 1, Some((7, 2)))),
+            candidate("/cache/tree/safe", 4, Some((7, 3))),
+            candidate("/cache/tree-other", 6, Some((7, 4))),
         ];
-        let mut req = request(PressureLevel::Orange, Some(10 * GIB), None);
-        req.max_items = 2;
+        let req = request(Some(10));
+        // Demonstrate the actual old optimizer's failure on this same input.
+        let (old, _) = optimization::plan_batch(candidates.clone(), &req);
+        assert!(
+            old.iter()
+                .any(|candidate| candidate.path == Path::new("/cache/tree"))
+        );
         let (chosen, plan) = plan_batch(candidates, &req);
+        let paths: BTreeSet<_> = chosen
+            .iter()
+            .map(|candidate| candidate.path.as_path())
+            .collect();
         assert_eq!(
-            chosen.iter().map(|c| c.path.as_path()).collect::<Vec<_>>(),
-            vec![Path::new("/p/target"), Path::new("/p/cache")]
+            paths,
+            BTreeSet::from([
+                Path::new("/cache/tree/safe"),
+                Path::new("/cache/tree-other"),
+            ])
         );
+        assert_eq!(plan.planned_bytes, 10);
+        assert_eq!(plan.top_n_bytes, 10);
         assert!(plan.target_met);
-        assert_eq!(plan.planned_bytes, 10 * GIB);
-        // The counterfactual must also skip overlaps BEFORE its slot limit.
-        assert_eq!(plan.top_n_bytes, 10 * GIB);
-        assert_eq!(plan.skipped_for_overlap.len(), 1);
-        assert_eq!(
-            plan.skipped_for_overlap[0].path,
-            Path::new("/p/target/debug")
-        );
         assert!(plan.skipped_for_budget.is_empty());
-        assert_finite_plan(&plan);
-    }
-
-    #[test]
-    fn a_safer_child_excludes_its_parent_without_excluding_other_roots() {
-        let candidates = vec![
-            candidate("/p/target", 6 * GIB, 0.8, 3.0, DecisionAction::Delete),
-            candidate(
-                "/p/target/debug",
-                5 * GIB,
-                0.99,
-                2.0,
-                DecisionAction::Delete,
-            ),
-            candidate("/p/cache", GIB, 0.9, 1.0, DecisionAction::Delete),
-        ];
-        let (chosen, plan) = plan_batch(
-            candidates,
-            &request(PressureLevel::Orange, Some(6 * GIB), None),
-        );
-        assert_eq!(
-            chosen.iter().map(|c| c.path.as_path()).collect::<Vec<_>>(),
-            vec![Path::new("/p/target/debug"), Path::new("/p/cache")]
-        );
-        assert_eq!(plan.planned_bytes, 6 * GIB);
-        assert!(plan.target_met);
-        assert_eq!(plan.skipped_for_overlap[0].path, Path::new("/p/target"));
-    }
-
-    #[test]
-    fn duplicate_paths_are_one_cleanup_unit_not_extra_capacity() {
-        let item = candidate("/p/target", 5 * GIB, 0.9, 1.0, DecisionAction::Delete);
-        let (chosen, plan) = plan_batch(
-            vec![item.clone(), item.clone(), item],
-            &request(PressureLevel::Critical, Some(8 * GIB), None),
-        );
-        assert_eq!(chosen.len(), 1);
-        assert_eq!(plan.planned_bytes, 5 * GIB);
-        assert_eq!(plan.top_n_bytes, 5 * GIB);
-        assert!(!plan.target_met);
-        assert_eq!(plan.skipped_for_overlap.len(), 2);
-        assert!(plan.skipped_for_budget.is_empty());
-        assert!(plan.summary_line().contains("skipped_for_overlap=2"));
-    }
-
-    #[test]
-    fn path_components_not_string_prefixes_determine_overlap() {
-        let candidates = vec![
-            candidate("/p/cache", 6 * GIB, 0.9, 1.0, DecisionAction::Delete),
-            candidate("/p/cache-other", 5 * GIB, 0.9, 1.0, DecisionAction::Delete),
-            candidate("/p/target/a", GIB, 0.9, 1.0, DecisionAction::Delete),
-            candidate("/p/target/b", GIB, 0.9, 1.0, DecisionAction::Delete),
-        ];
-        let (chosen, plan) = plan_batch(candidates, &request(PressureLevel::Orange, None, None));
-        assert_eq!(chosen.len(), 4);
-        assert_eq!(plan.planned_bytes, 13 * GIB);
         assert!(plan.skipped_for_overlap.is_empty());
     }
 
     #[test]
-    fn overlap_explanations_follow_the_final_single_item_replacement() {
-        let candidates = vec![
-            candidate("/p/target", 100 * GIB, 0.0, 1.0, DecisionAction::Delete),
-            candidate("/p/target/a", 40 * GIB, 0.99, 1.0, DecisionAction::Delete),
-            candidate("/p/target/b", 40 * GIB, 0.99, 1.0, DecisionAction::Delete),
-        ];
-        let (chosen, plan) = plan_batch(
-            candidates,
-            &request(PressureLevel::Orange, None, Some(50.0)),
-        );
-        assert_eq!(chosen.len(), 1);
-        assert_eq!(chosen[0].path, Path::new("/p/target"));
-        assert_eq!(plan.planned_bytes, 100 * GIB);
-        assert_eq!(plan.skipped_for_overlap.len(), 2);
-        assert!(plan.skipped_for_budget.is_empty());
-        assert!(plan.skipped_for_overlap.iter().all(|item| item.rank == 0));
+    fn a_vetoed_root_blocks_descendants_and_conflicting_path_observations() {
+        for identity in [None, Some((7, 99))] {
+            let blocked = veto(candidate("/cache/held", 1, Some((7, 1))));
+            let candidates = vec![
+                blocked,
+                candidate("/cache/held", 1000, identity),
+                candidate("/cache/held/deep/target", 1000, Some((7, 2))),
+                candidate("/cache/held-other", 7, None),
+            ];
+            let (chosen, plan) = plan_batch(candidates, &request(Some(8)));
+            assert_eq!(chosen.len(), 1);
+            assert_eq!(chosen[0].path, Path::new("/cache/held-other"));
+            assert_eq!(plan.planned_bytes, 7);
+            assert_eq!(plan.top_n_bytes, 7);
+            assert!(!plan.target_met);
+        }
     }
 
     #[test]
-    fn overlap_plans_are_disjoint_and_deterministic_under_permutation() {
+    fn veto_scopes_follow_transitive_path_and_identity_aliases() {
         let candidates = vec![
-            candidate("/p/a", 12 * GIB, 0.85, 1.0, DecisionAction::Delete),
-            candidate("/p/a/target", 8 * GIB, 0.95, 1.0, DecisionAction::Delete),
-            candidate(
-                "/p/a/target/debug",
-                7 * GIB,
-                0.99,
-                1.0,
-                DecisionAction::Delete,
-            ),
-            candidate("/p/a/cache", 3 * GIB, 0.95, 1.0, DecisionAction::Delete),
-            candidate("/p/b", 4 * GIB, 0.95, 1.0, DecisionAction::Delete),
+            veto(candidate("/protected/target", 1, Some((7, 1)))),
+            candidate("/alias/b", 100, Some((7, 1))),
+            candidate("/alias/b", 100, Some((7, 2))),
+            candidate("/alias/c", 100, Some((7, 2))),
+            candidate("/alias/c/deep", 100, None),
+            candidate("/alias/b/deep", 100, Some((7, 3))),
+            candidate("/independent", 9, None),
         ];
-        let req = request(PressureLevel::Orange, Some(15 * GIB), Some(20.0));
-        let (_, reference) = plan_batch(candidates.clone(), &req);
-        let mut seed = 0x1234_5678u64;
-        for _ in 0..100 {
-            let mut shuffled = candidates.clone();
-            for i in (1..shuffled.len()).rev() {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                let j = usize::try_from(seed % (i as u64 + 1)).unwrap();
-                shuffled.swap(i, j);
-            }
-            let (chosen, plan) = plan_batch(shuffled, &req);
-            assert_eq!(plan, reference);
-            for (i, first) in chosen.iter().enumerate() {
-                for second in chosen.iter().skip(i + 1) {
-                    assert!(!first.path.starts_with(&second.path));
-                    assert!(!second.path.starts_with(&first.path));
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, true, true, true, true, true, false]
+        );
+        let (chosen, plan) = plan_batch(candidates, &request(Some(10)));
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].path, Path::new("/independent"));
+        assert_eq!(plan.top_n_bytes, 9);
+        assert!(!plan.target_met);
+    }
+
+    #[test]
+    fn aliases_of_an_unsafe_enclosing_candidate_cannot_restore_its_capacity() {
+        let candidates = vec![
+            veto(candidate("/cache/tree/busy", 1, Some((7, 1)))),
+            candidate("/cache/tree", 1000, Some((7, 2))),
+            candidate("/elsewhere/same-tree", 1000, Some((7, 2))),
+            candidate("/cache/tree/safe", 5, Some((7, 3))),
+        ];
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, true, true, false]
+        );
+        let (chosen, plan) = plan_batch(candidates, &request(Some(6)));
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].path, Path::new("/cache/tree/safe"));
+        assert_eq!(plan.planned_bytes, 5);
+        assert!(!plan.target_met);
+    }
+
+    #[test]
+    fn suspension_is_a_hard_boundary_at_every_pressure_level() {
+        for level in [
+            PressureLevel::Green,
+            PressureLevel::Yellow,
+            PressureLevel::Orange,
+            PressureLevel::Red,
+            PressureLevel::Critical,
+        ] {
+            let mut suspended = candidate("/cache/tree/suspended", 1, None);
+            suspended.decision.category_suspended = true;
+            suspended.decision.action = DecisionAction::Keep;
+            // Invalid scoring evidence cannot erase a separately supplied veto.
+            suspended.total_score = f64::NAN;
+            suspended.decision.posterior_abandoned = f64::NAN;
+            let mut req = request(Some(8));
+            req.level = level;
+            let (chosen, plan) = plan_batch(
+                vec![
+                    suspended,
+                    candidate("/cache/tree", 1000, None),
+                    candidate("/independent", 7, None),
+                ],
+                &req,
+            );
+            assert_eq!(chosen.len(), 1);
+            assert_eq!(chosen[0].path, Path::new("/independent"));
+            assert_eq!(plan.planned_bytes, 7);
+            assert!(!plan.target_met);
+        }
+    }
+
+    #[test]
+    fn ordinary_keep_and_review_are_not_subtree_protection_markers() {
+        for action in [DecisionAction::Keep, DecisionAction::Review] {
+            let mut child = candidate("/cache/tree/child", 1, None);
+            child.decision.action = action;
+            let mut req = request(Some(10));
+            req.include_review = false;
+            let candidates = vec![child, candidate("/cache/tree", 100, None)];
+            let expected = optimization::plan_batch(candidates.clone(), &req);
+            assert_eq!(plan_batch(candidates, &req), expected);
+            assert_eq!(expected.0[0].path, Path::new("/cache/tree"));
+        }
+    }
+
+    #[test]
+    fn devices_kinds_and_unknown_identities_do_not_share_veto_authority() {
+        let blocked = veto(candidate("/blocked", 1, Some((7, 1))));
+        let other_device = candidate("/other-device", 3, Some((8, 1)));
+        let mut other_kind = candidate("/other-kind", 4, Some((7, 1)));
+        other_kind.identity.as_mut().unwrap().kind = FsEntryKind::File;
+        let candidates = vec![
+            blocked,
+            other_device,
+            other_kind,
+            candidate("/unknown", 5, None),
+        ];
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, false, false, false]
+        );
+        let (chosen, plan) = plan_batch(candidates, &request(None));
+        assert_eq!(chosen.len(), 3);
+        assert_eq!(plan.planned_bytes, 12);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_path_components_are_compared_without_lossy_aliases() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let path = |bytes: &[u8]| PathBuf::from(OsString::from_vec(bytes.to_vec()));
+        let mut blocked = veto(candidate("/unused", 1, None));
+        blocked.path = path(b"/cache/\xff");
+        let mut nested = candidate("/unused", 2, None);
+        nested.path = path(b"/cache/\xff/target");
+        let mut sibling = candidate("/unused", 3, None);
+        sibling.path = path(b"/cache/\xff-other");
+        let distinct = candidate("/cache/�", 4, None);
+        let candidates = vec![blocked, nested, sibling, distinct];
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, true, false, false]
+        );
+        assert_eq!(plan_batch(candidates, &request(None)).1.planned_bytes, 7);
+    }
+
+    #[test]
+    fn a_veto_follows_parent_aliases_without_an_explicit_child_observation() {
+        let candidates = vec![
+            candidate("/cache/tree", 1000, Some((7, 1))),
+            candidate("/mirror", 1000, Some((7, 1))),
+            veto(candidate("/cache/tree/busy", 1, Some((7, 2)))),
+            candidate("/mirror/busy/deep", 1000, None),
+            candidate("/mirror/safe", 5, Some((7, 3))),
+            candidate("/independent", 7, None),
+        ];
+        assert_eq!(
+            direct_reference_rejections(&candidates),
+            vec![true, true, true, false, false, false],
+            "the previous boundary missed the aliased descendant"
+        );
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, true, true, true, false, false]
+        );
+        let (chosen, plan) = plan_batch(candidates, &request(Some(13)));
+        let paths: BTreeSet<_> = chosen.iter().map(|c| c.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            BTreeSet::from([Path::new("/mirror/safe"), Path::new("/independent")])
+        );
+        assert_eq!(plan.planned_bytes, 12);
+        assert_eq!(plan.top_n_bytes, 12);
+        assert!(!plan.target_met);
+        assert!(plan.skipped_for_budget.is_empty());
+        assert!(plan.skipped_for_overlap.is_empty());
+    }
+
+    #[test]
+    fn nested_directory_aliases_reach_a_fixed_point_independently_of_order() {
+        let mut candidates = vec![
+            candidate("/a", 1000, Some((7, 1))),
+            candidate("/b", 1000, Some((7, 1))),
+            candidate("/a/sub", 1000, Some((7, 2))),
+            candidate("/third", 1000, Some((7, 2))),
+            veto(candidate("/third/busy", 1, None)),
+            candidate("/b/sub/busy/deep", 1000, None),
+            candidate("/b/sub/safe", 5, None),
+            candidate("/b/other", 7, None),
+        ];
+        let expected = BTreeSet::from([PathBuf::from("/b/sub/safe"), PathBuf::from("/b/other")]);
+        for _ in 0..candidates.len() {
+            let actual: BTreeSet<_> = candidates
+                .iter()
+                .zip(rejected_observations(&candidates))
+                .filter(|(_, rejected)| !*rejected)
+                .map(|(candidate, _)| candidate.path.clone())
+                .collect();
+            assert_eq!(actual, expected);
+            candidates.rotate_left(1);
+        }
+        candidates.reverse();
+        assert_eq!(
+            rejected_observations(&candidates),
+            reference_rejections(&candidates)
+        );
+    }
+
+    #[test]
+    fn directory_alias_cycles_terminate_without_protecting_safe_siblings() {
+        let candidates = vec![
+            candidate("/tree", 1000, Some((7, 1))),
+            candidate("/tree/again", 1000, Some((7, 1))),
+            veto(candidate("/tree/busy", 1, None)),
+            candidate("/tree/again/again/busy/deep", 1000, None),
+            candidate("/tree/again/safe", 5, None),
+            candidate("/other", 7, None),
+        ];
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, true, true, true, false, false]
+        );
+        let (chosen, plan) = plan_batch(candidates, &request(Some(13)));
+        assert_eq!(chosen.len(), 2);
+        assert_eq!(plan.planned_bytes, 12);
+        assert!(!plan.target_met);
+    }
+
+    #[test]
+    fn a_veto_below_an_alias_refuses_the_other_aliases_enclosing_scope() {
+        let candidates = vec![
+            candidate("/source", 1000, Some((7, 1))),
+            candidate("/holder/alias", 1000, Some((7, 1))),
+            veto(candidate("/source/held", 1, None)),
+            candidate("/holder", 1000, None),
+            candidate("/holder/safe", 5, None),
+        ];
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, true, true, true, false]
+        );
+        assert_eq!(plan_batch(candidates, &request(None)).1.planned_bytes, 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_alias_child_names_preserve_native_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut held = veto(candidate("/unused", 1, None));
+        held.path = PathBuf::from(OsString::from_vec(b"/a/\xff".to_vec()));
+        let mut child = candidate("/unused", 1000, None);
+        child.path = PathBuf::from(OsString::from_vec(b"/b/\xff/deep".to_vec()));
+        let candidates = vec![
+            candidate("/a", 1000, Some((7, 1))),
+            candidate("/b", 1000, Some((7, 1))),
+            held,
+            child,
+            candidate("/b/�/deep", 5, None),
+        ];
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, true, true, true, false]
+        );
+        assert_eq!(plan_batch(candidates, &request(None)).1.planned_bytes, 5);
+    }
+
+    #[test]
+    fn alias_detection_requires_a_full_identity_at_distinct_paths() {
+        let mut other_kind = candidate("/file", 1, Some((7, 1)));
+        other_kind.identity.as_mut().unwrap().kind = FsEntryKind::File;
+        let mut candidates = vec![
+            candidate("/a", 1, Some((7, 1))),
+            candidate("/a", 2, Some((7, 1))),
+            candidate("/a", 3, Some((7, 2))),
+            candidate("/other-device", 4, Some((8, 1))),
+            other_kind,
+            candidate("/unknown", 5, None),
+            candidate("/other-unknown", 6, None),
+        ];
+        assert!(!has_path_aliases(&candidates));
+        candidates.push(candidate("/b", 7, Some((7, 2))));
+        assert!(has_path_aliases(&candidates));
+    }
+
+    #[test]
+    fn large_nonaliased_batches_preserve_every_independent_sibling() {
+        let mut candidates = Vec::new();
+        let mut expected = Vec::new();
+        for index in 0..5000u64 {
+            let path = format!("/cache/group-{index}/target");
+            let mut root = candidate(&path, 1000, Some((7, index + 1)));
+            root.vetoed = index % 1000 == 0;
+            expected.extend([root.vetoed, root.vetoed, false]);
+            candidates.push(root);
+            candidates.push(candidate(&format!("{path}/child"), 1, None));
+            candidates.push(candidate(&format!("/cache/group-{index}/safe"), 1, None));
+        }
+        assert!(!has_path_aliases(&candidates));
+        let actual = rejected_observations(&candidates);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.iter().filter(|&&rejected| rejected).count(), 10);
+    }
+
+    #[test]
+    fn nonplannable_alias_evidence_still_propagates_category_suspensions() {
+        for level in [
+            PressureLevel::Green,
+            PressureLevel::Yellow,
+            PressureLevel::Orange,
+            PressureLevel::Red,
+            PressureLevel::Critical,
+        ] {
+            let mut source = candidate("/a", 1000, Some((7, 1)));
+            source.decision.action = DecisionAction::Keep;
+            source.total_score = f64::NAN;
+            let mut alias = source.clone();
+            alias.path = PathBuf::from("/b");
+            let mut suspended = candidate("/a/busy", 1, None);
+            suspended.decision.action = DecisionAction::Keep;
+            suspended.decision.category_suspended = true;
+            suspended.decision.posterior_abandoned = f64::NAN;
+            let candidates = vec![
+                source,
+                alias,
+                suspended,
+                candidate("/b/busy/deep", 1000, None),
+                candidate("/b/safe", 5, None),
+            ];
+            assert!(has_path_aliases(&candidates));
+            let mut req = request(Some(6));
+            req.level = level;
+            req.include_review = false;
+            let (chosen, plan) = plan_batch(candidates, &req);
+            assert_eq!(chosen.len(), 1);
+            assert_eq!(chosen[0].path, Path::new("/b/safe"));
+            assert_eq!(plan.planned_bytes, 5);
+            assert_eq!(plan.top_n_bytes, 5);
+            assert!(!plan.target_met);
+        }
+    }
+
+    // Previous small-instance oracle, retained to assert no old refusal is
+    // weakened. Its direct path/identity relation does not infer descendants
+    // of parent aliases; the concrete regressions above pin the difference.
+    fn direct_reference_rejections(candidates: &[CandidacyScore]) -> Vec<bool> {
+        let same = |left: usize, right: usize| {
+            candidates[left].path == candidates[right].path
+                || candidates[left]
+                    .identity
+                    .is_some_and(|id| candidates[right].identity == Some(id))
+        };
+        let expand = |marked: &mut Vec<bool>| loop {
+            let mut changed = false;
+            for left in 0..candidates.len() {
+                for right in 0..candidates.len() {
+                    if marked[left] && !marked[right] && same(left, right) {
+                        marked[right] = true;
+                        changed = true;
+                    }
                 }
             }
-            assert_eq!(
-                plan.planned_bytes,
-                chosen.iter().map(|c| c.size_bytes).sum::<u64>()
-            );
-            assert_finite_plan(&plan);
-        }
-    }
-
-    #[test]
-    fn old_persisted_plans_default_to_no_overlap_explanations() {
-        let (_, plan) = plan_batch(Vec::new(), &request(PressureLevel::Green, None, None));
-        let mut value = serde_json::to_value(&plan).unwrap();
-        value.as_object_mut().unwrap().remove("skipped_for_overlap");
-        let decoded: BatchPlan = serde_json::from_value(value).unwrap();
-        assert_eq!(decoded, plan);
-    }
-
-    #[test]
-    fn the_large_mid_posterior_candidate_goes_first_for_a_byte_target() {
-        let candidates = vec![
-            candidate("/p/small", 200 * MIB, 0.95, 2.0, DecisionAction::Delete),
-            candidate("/p/large", 40 * GIB, 0.85, 1.6, DecisionAction::Delete),
-            candidate("/p/medium", 2 * GIB, 0.90, 1.8, DecisionAction::Delete),
-        ];
-        let (chosen, plan) = plan_batch(
-            candidates,
-            &request(PressureLevel::Orange, Some(30 * GIB), Some(250.0)),
-        );
-        assert_eq!(chosen.len(), 1, "{plan:?}");
-        assert_eq!(chosen[0].path, Path::new("/p/large"));
-        assert!(plan.target_met);
-        assert_eq!(plan.planned_bytes, 40 * GIB);
-        assert!((plan.risk_used - 7.5).abs() < 1e-9, "{}", plan.risk_used);
-        // Top-N by score would have taken small, medium, large: 2.5 + 5 + 7.5.
-        assert!((plan.top_n_risk - 15.0).abs() < 1e-9, "{}", plan.top_n_risk);
-        assert!(plan.risk_used < plan.top_n_risk);
-        assert!(
-            plan.skipped_for_budget.is_empty(),
-            "a met target is not a skip"
-        );
-        let why = plan.explain_choice(1).unwrap();
-        assert!(why.contains("chosen 1st"), "{why}");
-        assert!(why.contains("posterior 0.85"), "{why}");
-        assert!(why.contains("reaches the target"), "{why}");
-        assert!(why.contains("50% of the risk"), "{why}");
-        assert!(
-            plan.summary_line()
-                .starts_with("level=orange target_bytes=")
-        );
-    }
-
-    #[test]
-    fn budget_and_batch_size_bound_the_set_and_list_the_skipped() {
-        let candidates = vec![
-            candidate("/p/a", 10 * GIB, 0.60, 1.0, DecisionAction::Delete), // loss 20
-            candidate("/p/b", 10 * GIB, 0.70, 1.0, DecisionAction::Delete), // loss 15
-            candidate("/p/c", 10 * GIB, 0.90, 1.0, DecisionAction::Delete), // loss 5
-            candidate("/p/d", GIB, 0.99, 1.0, DecisionAction::Delete),      // loss 0.5
-        ];
-        let (chosen, plan) = plan_batch(
-            candidates.clone(),
-            &request(PressureLevel::Green, None, Some(21.0)),
-        );
-        let paths: Vec<_> = chosen
-            .iter()
-            .map(|c| c.path.to_string_lossy().into_owned())
-            .collect();
-        // Greedy by bytes/loss: c (2 GiB/unit), d (2 GiB/unit, fewer bytes), b, a.
-        // c (5) + d (0.5) + b (15) = 20.5 fits; a (20) does not.
-        assert_eq!(paths, vec!["/p/c", "/p/d", "/p/b"], "{plan:?}");
-        assert_eq!(plan.skipped_for_budget.len(), 1);
-        assert_eq!(plan.skipped_for_budget[0].path, Path::new("/p/a"));
-        assert!(!plan.target_met);
-        assert!(plan.risk_used <= 21.0);
-        let mut small = request(PressureLevel::Green, None, None);
-        small.max_items = 2;
-        let (chosen, plan) = plan_batch(candidates, &small);
-        assert_eq!(chosen.len(), 2);
-        assert_eq!(plan.skipped_for_budget.len(), 2);
-    }
-
-    #[test]
-    fn review_is_planned_only_in_emergency_and_keep_never() {
-        let candidates = vec![
-            candidate("/p/review", 5 * GIB, 0.9, 1.0, DecisionAction::Review),
-            candidate("/p/keep", 5 * GIB, 0.9, 1.0, DecisionAction::Keep),
-            candidate("/p/delete", GIB, 0.9, 1.0, DecisionAction::Delete),
-        ];
-        let (chosen, plan) =
-            plan_batch(candidates.clone(), &request(PressureLevel::Red, None, None));
-        assert_eq!(chosen.len(), 1);
-        assert_eq!(chosen[0].path, Path::new("/p/delete"));
-        assert!(
-            plan.skipped_for_budget.is_empty(),
-            "unplannable candidates are not skips"
-        );
-        let mut emergency = request(PressureLevel::Critical, None, None);
-        emergency.include_review = true;
-        let (chosen, _) = plan_batch(candidates, &emergency);
-        assert_eq!(chosen.len(), 2);
-        assert!(
-            chosen
-                .iter()
-                .all(|c| c.decision.action != DecisionAction::Keep)
-        );
-    }
-
-    #[test]
-    fn level_budgets_scale_and_critical_is_unbounded() {
-        let table = RiskBudgetByLevel::default();
-        assert_eq!(table.budget(PressureLevel::Green, 50.0), Some(50.0));
-        assert_eq!(table.budget(PressureLevel::Yellow, 50.0), Some(100.0));
-        assert_eq!(table.budget(PressureLevel::Orange, 50.0), Some(250.0));
-        assert_eq!(table.budget(PressureLevel::Red, 50.0), Some(500.0));
-        assert_eq!(table.budget(PressureLevel::Critical, 50.0), None);
-        let bounded = RiskBudgetByLevel {
-            critical: Some(20.0),
-            ..RiskBudgetByLevel::default()
-        };
-        assert_eq!(bounded.budget(PressureLevel::Critical, 50.0), Some(1000.0));
-    }
-
-    #[test]
-    fn plans_are_deterministic_under_permutation() {
-        let base = vec![
-            candidate("/p/a", 3 * GIB, 0.80, 1.0, DecisionAction::Delete),
-            candidate("/p/b", 3 * GIB, 0.80, 1.2, DecisionAction::Delete),
-            candidate("/p/c", 6 * GIB, 0.60, 1.4, DecisionAction::Delete),
-            candidate("/p/d", 512 * MIB, 0.99, 1.1, DecisionAction::Delete),
-            candidate("/p/e", 3 * GIB, 0.80, 0.9, DecisionAction::Delete),
-        ];
-        let req = request(PressureLevel::Yellow, Some(7 * GIB), Some(100.0));
-        let (reference, reference_plan) = plan_batch(base.clone(), &req);
-        let reference_paths: Vec<_> = reference.iter().map(|c| c.path.clone()).collect();
-        let mut seed = 0x1234_5678u64;
-        for _ in 0..50 {
-            let mut shuffled = base.clone();
-            for i in (1..shuffled.len()).rev() {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                let j = usize::try_from(seed % (i as u64 + 1)).unwrap_or(0);
-                shuffled.swap(i, j);
+            if !changed {
+                break;
             }
-            let (chosen, plan) = plan_batch(shuffled, &req);
-            let paths: Vec<_> = chosen.iter().map(|c| c.path.clone()).collect();
-            assert_eq!(paths, reference_paths);
-            assert_eq!(plan, reference_plan);
+        };
+        let mut protected: Vec<_> = candidates.iter().map(hard_veto).collect();
+        expand(&mut protected);
+        let mut rejected = protected.clone();
+        for (left, candidate) in candidates.iter().enumerate() {
+            for (right, scope) in candidates.iter().enumerate() {
+                if protected[right]
+                    && (candidate.path.starts_with(&scope.path)
+                        || scope.path.starts_with(&candidate.path))
+                {
+                    rejected[left] = true;
+                }
+            }
         }
-        // Equal value, equal bytes: path ascending decides.
-        assert_eq!(reference_paths[0], Path::new("/p/d"), "{reference_paths:?}");
+        expand(&mut rejected);
+        rejected
     }
 
-    /// The greedy set is never over budget and reclaims at least half of
-    /// what the best 0/1 subset within the same budget would, on random
-    /// small instances.
+    fn reference_equivalence(
+        candidates: &[CandidacyScore],
+        paths: &[&Path],
+        observations: &[usize],
+    ) -> Vec<Vec<bool>> {
+        let parents: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                path.parent()
+                    .and_then(|parent| paths.iter().position(|path| *path == parent))
+            })
+            .collect();
+        let mut equivalent = vec![vec![false; paths.len()]; paths.len()];
+        for (index, row) in equivalent.iter_mut().enumerate() {
+            row[index] = true;
+        }
+        for (left, candidate) in candidates.iter().enumerate() {
+            for (right, other) in candidates.iter().enumerate() {
+                if candidate
+                    .identity
+                    .is_some_and(|identity| other.identity == Some(identity))
+                {
+                    equivalent[observations[left]][observations[right]] = true;
+                }
+            }
+        }
+        loop {
+            let mut changed = false;
+            for (via, _) in paths.iter().enumerate() {
+                for (left, _) in paths.iter().enumerate() {
+                    for (right, _) in paths.iter().enumerate() {
+                        if equivalent[left][via]
+                            && equivalent[via][right]
+                            && !equivalent[left][right]
+                        {
+                            equivalent[left][right] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            for (left, path) in paths.iter().enumerate() {
+                for (right, other) in paths.iter().enumerate() {
+                    if let (Some(a), Some(b)) = (parents[left], parents[right])
+                        && equivalent[a][b]
+                        && path.components().next_back() == other.components().next_back()
+                        && !equivalent[left][right]
+                    {
+                        equivalent[left][right] = true;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        equivalent
+    }
+
+    // Independent small-instance oracle: an explicit all-pairs equivalence
+    // relation, transitive closure and pairwise path containment. No production
+    // trie unions, edge merging or reachability helpers are used here.
+    fn reference_rejections(candidates: &[CandidacyScore]) -> Vec<bool> {
+        let paths: Vec<_> = candidates
+            .iter()
+            .flat_map(|candidate| candidate.path.ancestors())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let observations: Vec<_> = candidates
+            .iter()
+            .map(|candidate| {
+                paths
+                    .iter()
+                    .position(|path| *path == candidate.path)
+                    .unwrap()
+            })
+            .collect();
+        let equivalent = reference_equivalence(candidates, &paths, &observations);
+        let mut marked = vec![false; paths.len()];
+        for (candidate, &index) in candidates.iter().zip(&observations) {
+            marked[index] |= hard_veto(candidate);
+        }
+        for upwards in [false, true] {
+            loop {
+                let mut changed = false;
+                for (left, path) in paths.iter().enumerate() {
+                    for (right, other) in paths.iter().enumerate() {
+                        let contains = if upwards {
+                            path.starts_with(other)
+                        } else {
+                            other.starts_with(path)
+                        };
+                        if marked[left] && !marked[right] && (equivalent[left][right] || contains) {
+                            marked[right] = true;
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        observations
+            .into_iter()
+            .map(|index| marked[index])
+            .collect()
+    }
+
     #[test]
-    #[allow(clippy::cast_precision_loss)]
-    fn greedy_is_within_factor_two_of_the_brute_force_optimum() {
-        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    fn public_plans_match_exhaustive_admission_under_permutation() {
+        let names = [
+            "/p/a",
+            "/p/a/child",
+            "/p/a-other",
+            "/p/b",
+            "/p/b/child",
+            "/q/a",
+            "/q/b",
+        ];
+        let mut seed = 0x91e1_0da5_34bf_0821u64;
         let mut next = || {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
             seed
         };
-        for _case in 0..300 {
-            let n = 2 + (next() % 7) as usize;
-            let candidates: Vec<CandidacyScore> = (0..n)
-                .map(|i| {
-                    let bytes = (1 + next() % 64) * MIB;
-                    let posterior = 0.5 + (next() % 50) as f64 / 100.0;
-                    candidate(
-                        &format!("/p/{i}"),
-                        bytes,
-                        posterior,
-                        1.0,
-                        DecisionAction::Delete,
-                    )
+        for trial in 0..256 {
+            let mut candidates: Vec<_> = (0..12)
+                .map(|_| {
+                    let index = usize::try_from(next() % names.len() as u64).unwrap();
+                    let path = names[index];
+                    let identity = (next() % 3 != 0).then(|| (7 + next() % 2, next() % 5));
+                    let mut candidate = candidate(path, 1 + next() % 100, identity);
+                    candidate.vetoed = next() % 7 == 0;
+                    candidate.decision.category_suspended = next() % 13 == 0;
+                    candidate
                 })
                 .collect();
-            let losses: Vec<f64> = candidates
+            let mut req = request(Some(120));
+            req.max_items = 1 + trial % 5;
+            req.risk_budget = Some(1.5);
+            let reference = reference_rejections(&candidates);
+            assert_eq!(rejected_observations(&candidates), reference);
+            if !has_path_aliases(&candidates) {
+                assert_eq!(rejected_with_aliases(&candidates), reference);
+            }
+            let old = direct_reference_rejections(&candidates);
+            for (old, &current) in old.iter().zip(&reference) {
+                assert!(!old || current, "an existing veto must never be weakened");
+            }
+            let admitted = candidates
                 .iter()
-                .map(|c| ((1.0 - c.decision.posterior_abandoned) * 50.0).max(1e-6))
+                .zip(&reference)
+                .filter(|(_, rejected)| !**rejected)
+                .map(|(candidate, _)| candidate.clone())
                 .collect();
-            let total_loss: f64 = losses.iter().sum();
-            let budget = total_loss * (0.2 + (next() % 60) as f64 / 100.0);
-            let mut req = request(PressureLevel::Orange, None, Some(budget));
-            req.max_items = n;
-            let (chosen, plan) = plan_batch(candidates.clone(), &req);
-            assert!(plan.risk_used <= budget + 1e-6, "over budget: {plan:?}");
-            let greedy_bytes: u64 = chosen.iter().map(|c| c.size_bytes).sum();
-            assert_eq!(greedy_bytes, plan.planned_bytes);
-            // Brute force over all subsets.
-            let mut best = 0u64;
-            for mask in 0u32..(1 << n) {
-                let mut loss = 0.0;
-                let mut bytes = 0u64;
-                for (i, c) in candidates.iter().enumerate() {
-                    if mask & (1 << i) != 0 {
-                        loss += losses[i];
-                        bytes += c.size_bytes;
-                    }
-                }
-                if loss <= budget + 1e-9 {
-                    best = best.max(bytes);
-                }
-            }
-            // Greedy plus the first skipped item exceeds the optimum for a
-            // fractional knapsack, so greedy alone is at least half of it
-            // whenever the optimum is nonzero.
-            assert!(
-                greedy_bytes * 2 >= best || best == 0,
-                "greedy {greedy_bytes} vs optimum {best}: {plan:?}"
-            );
-        }
-    }
-
-    fn assert_finite_plan(plan: &BatchPlan) {
-        assert!(plan.risk_budget.is_none_or(f64::is_finite));
-        assert!(plan.risk_used.is_finite());
-        assert!(plan.top_n_risk.is_finite());
-        for item in plan
-            .chosen
-            .iter()
-            .chain(&plan.skipped_for_budget)
-            .chain(&plan.skipped_for_overlap)
-        {
-            assert!(item.posterior.is_finite());
-            assert!(item.expected_loss.is_finite());
-            assert!(item.value.is_finite());
-        }
-        // Non-finite JSON numbers serialize as null and cannot round-trip
-        // into required f64 fields, so validate the actual persisted shape.
-        let encoded = serde_json::to_string(plan).unwrap();
-        let decoded: BatchPlan = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded.chosen.len(), plan.chosen.len());
-        assert_eq!(decoded.risk_budget, plan.risk_budget);
-    }
-
-    #[test]
-    fn malformed_posterior_never_becomes_a_cheap_deletion() {
-        for posterior in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
-            for level in [PressureLevel::Green, PressureLevel::Critical] {
-                let candidates = vec![
-                    candidate(
-                        "/p/invalid",
-                        40 * GIB,
-                        posterior,
-                        2.0,
-                        DecisionAction::Delete,
-                    ),
-                    candidate("/p/valid", GIB, 0.9, 1.0, DecisionAction::Delete),
-                ];
-                let mut req = request(level, None, None);
-                req.include_review = true;
-                let (chosen, plan) = plan_batch(candidates, &req);
-                assert_eq!(chosen.len(), 1, "posterior={posterior}, {plan:?}");
-                assert_eq!(chosen[0].path, Path::new("/p/valid"));
-                assert_eq!(plan.top_n_bytes, GIB);
-                assert!(plan.skipped_for_budget.is_empty());
-                assert_finite_plan(&plan);
-            }
-        }
-    }
-
-    #[test]
-    fn invalid_scores_are_not_eligible_for_planning() {
-        for score in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let candidates = vec![candidate("/p/a", GIB, 0.99, score, DecisionAction::Delete)];
-            let (chosen, plan) =
-                plan_batch(candidates, &request(PressureLevel::Critical, None, None));
-            assert!(chosen.is_empty());
-            assert_finite_plan(&plan);
-        }
-    }
-
-    #[test]
-    fn malformed_direct_budgets_fail_closed_even_in_emergency() {
-        for budget in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
-            let candidates = vec![candidate("/p/a", GIB, 1.0, 1.0, DecisionAction::Delete)];
-            let (chosen, plan) = plan_batch(
-                candidates,
-                &request(PressureLevel::Critical, Some(GIB), Some(budget)),
-            );
-            assert!(chosen.is_empty(), "budget={budget}, {plan:?}");
-            assert!(!plan.target_met);
-            assert_eq!(plan.risk_budget, Some(0.0));
-            assert_eq!(plan.risk_used, 0.0);
-            assert_eq!(plan.skipped_for_budget.len(), 1);
-            assert_finite_plan(&plan);
-        }
-    }
-
-    #[test]
-    fn malformed_loss_units_cannot_disable_the_risk_limit() {
-        for loss in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -50.0, 0.0] {
-            for budget in [None, Some(100.0)] {
-                let candidates = vec![candidate("/p/a", GIB, 0.99, 1.0, DecisionAction::Delete)];
-                let mut req = request(PressureLevel::Critical, None, budget);
-                req.false_positive_loss = loss;
-                let (chosen, plan) = plan_batch(candidates, &req);
-                assert!(chosen.is_empty(), "loss={loss}, {plan:?}");
-                assert_eq!(plan.risk_budget, Some(0.0));
-                assert_eq!(plan.risk_used, 0.0);
-                assert_finite_plan(&plan);
+            let expected = optimization::plan_batch(admitted, &req);
+            for _ in 0..4 {
+                candidates.rotate_left(3);
+                candidates.reverse();
+                let actual = plan_batch(candidates.clone(), &req);
+                assert_eq!(actual, expected);
+                assert!(actual.0.len() <= req.max_items);
+                assert!(actual.1.risk_used <= 1.5 + 1e-9);
                 assert_eq!(
-                    RiskBudgetByLevel::default().budget(PressureLevel::Critical, loss),
-                    Some(0.0)
+                    actual.1.planned_bytes,
+                    actual.0.iter().map(|c| c.size_bytes).sum::<u64>()
                 );
             }
         }
-    }
-
-    #[test]
-    fn malformed_and_overflowing_level_budgets_fail_closed() {
-        for multiple in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, f64::MAX] {
-            let table = RiskBudgetByLevel {
-                green: multiple,
-                yellow: multiple,
-                orange: multiple,
-                red: multiple,
-                critical: Some(multiple),
-            };
-            for level in [
-                PressureLevel::Green,
-                PressureLevel::Yellow,
-                PressureLevel::Orange,
-                PressureLevel::Red,
-                PressureLevel::Critical,
-            ] {
-                assert_eq!(table.budget(level, 50.0), Some(0.0));
-            }
-        }
-    }
-
-    #[test]
-    fn review_opt_in_cannot_bypass_the_emergency_requirement() {
-        for level in [
-            PressureLevel::Green,
-            PressureLevel::Yellow,
-            PressureLevel::Orange,
-            PressureLevel::Red,
-        ] {
-            let candidates = vec![candidate("/p/a", GIB, 0.99, 1.0, DecisionAction::Review)];
-            let mut req = request(level, None, None);
-            req.include_review = true;
-            let (chosen, plan) = plan_batch(candidates, &req);
-            assert!(chosen.is_empty(), "{level:?}: {plan:?}");
-        }
-    }
-
-    #[test]
-    fn suspended_categories_and_vetoes_survive_emergency_planning() {
-        for action in [DecisionAction::Delete, DecisionAction::Review] {
-            let mut suspended = candidate("/p/suspended", GIB, 0.99, 1.0, action);
-            suspended.decision.category_suspended = true;
-            let mut vetoed = candidate("/p/vetoed", GIB, 0.99, 1.0, action);
-            vetoed.vetoed = true;
-            let candidates = vec![suspended, vetoed];
-            let mut req = request(PressureLevel::Critical, None, None);
-            req.include_review = true;
-            let (chosen, plan) = plan_batch(candidates, &req);
-            assert!(chosen.is_empty());
-            assert!(plan.skipped_for_budget.is_empty());
-            assert_finite_plan(&plan);
-        }
-    }
-
-    #[test]
-    fn unbounded_budget_does_not_allow_risk_accounting_to_overflow() {
-        let candidates = vec![
-            candidate("/p/a", GIB, 0.0, 1.0, DecisionAction::Delete),
-            candidate("/p/b", GIB, 0.0, 1.0, DecisionAction::Delete),
-        ];
-        let mut req = request(PressureLevel::Critical, None, None);
-        req.false_positive_loss = f64::MAX;
-        let (chosen, plan) = plan_batch(candidates, &req);
-        assert_eq!(chosen.len(), 1);
-        assert_eq!(plan.skipped_for_budget.len(), 1);
-        assert_eq!(plan.risk_used, f64::MAX);
-        assert_eq!(plan.top_n_risk, f64::MAX);
-        assert_finite_plan(&plan);
     }
 }

@@ -258,6 +258,14 @@ pub trait ServiceManager: Send + Sync {
         Ok(())
     }
 
+    /// Ask for more startup time while work that precedes `notify_ready` is
+    /// still running (`EXTEND_TIMEOUT_USEC=` for systemd: the start timeout
+    /// becomes at least `extend_by` from now). Default no-op.
+    fn notify_extend_startup(&self, extend_by: std::time::Duration, status: &str) -> Result<()> {
+        let _ = (extend_by, status);
+        Ok(())
+    }
+
     fn restart(&self) -> Result<()> {
         pal_not_implemented("service", "restart")
     }
@@ -289,6 +297,15 @@ pub trait Platform: Send + Sync {
     fn default_paths(&self) -> PlatformPaths;
     fn memory_info(&self) -> Result<MemoryInfo>;
     fn service_manager(&self) -> Box<dyn ServiceManager>;
+
+    /// Additional process-local memory constraints for a RAM-backed writer.
+    /// Host memory and filesystem checks remain the caller's responsibility.
+    /// Linux observes visible cgroup limits; the default adds no platform-local
+    /// policy. An error is missing evidence and must refuse the RAM route, not
+    /// be treated as an unconstrained process. This never reserves memory.
+    fn ram_write_memory_refusal(&self, _minimum_available_percent: u8) -> Result<Option<String>> {
+        Ok(None)
+    }
 
     fn capacity(&self, mount: &Path) -> Result<Capacity> {
         self.fs_stats(mount).map(Into::into)
@@ -322,6 +339,27 @@ pub trait Platform: Send + Sync {
         pal_not_implemented(self.name(), "process_list")
     }
 
+    /// [`Self::process_list`] with `command_line` left empty. Reading another
+    /// process's command line can block until that process releases its
+    /// memory-map lock, for many minutes under memory pressure: on ts2
+    /// (2026-10-15) the daemon's monitor thread sat 15+ minutes reading a
+    /// rustc's argv while one of its threads waited in mmap. The daemon's
+    /// monitor-thread callers and the scanner's active-reference index need
+    /// pids, names, cwd and counters only.
+    fn process_list_without_command_lines(&self) -> Result<Vec<ProcessInfo>> {
+        self.process_list()
+    }
+
+    /// [`Self::process_list_without_command_lines`] cut to what one
+    /// `/proc/<pid>/stat` read gives on Linux: pid, parent, name, start time
+    /// and CPU times, with no executable, cwd or memory counters. For a
+    /// sampler that keys processes by (pid, start time): the full list reads
+    /// three files and two links per process, every 30 s on the monitor
+    /// thread for the I/O history (~2,000 processes on trj, bd-du48).
+    fn process_list_brief(&self) -> Result<Vec<ProcessInfo>> {
+        self.process_list_without_command_lines()
+    }
+
     fn process_io(&self, _pid: i32) -> Result<ProcessIo> {
         pal_not_implemented(self.name(), "process_io")
     }
@@ -336,6 +374,81 @@ pub trait Platform: Send + Sync {
 
     fn mmap_regions_under(&self, _path: &Path) -> Result<Vec<MappedRegion>> {
         pal_not_implemented(self.name(), "mmap_regions_under")
+    }
+
+    /// Mutation-boundary mapping evidence. A successful answer must come from
+    /// a process sweep started by this call, never a cached absence verdict.
+    /// Incomplete observations may be reused to bound retries; they remain
+    /// errors. Platforms without this guarantee must refuse the query.
+    fn mmap_regions_under_fresh(&self, _path: &Path) -> Result<Vec<MappedRegion>> {
+        pal_not_implemented(self.name(), "mmap_regions_under_fresh")
+    }
+
+    /// Return mapped-file evidence under any candidate root. Platforms with a
+    /// host-wide process sweep should override this to scan once per pass.
+    /// Partial or inaccessible coverage is an error, not negative evidence.
+    fn mmap_regions_under_roots(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+        let mut merged = Vec::new();
+        for root in roots {
+            merged.extend(self.mmap_regions_under(root)?);
+        }
+        Ok(merged)
+    }
+
+    /// Open files under any of `roots`. The default asks root by root; a
+    /// platform whose sweep reads every process anyway answers all roots from
+    /// one sweep. A catalog pass hands over ~170 roots, and asking per root
+    /// cost a full process sweep each (trj: 160-514 CPU-s a pass, bd-om52).
+    /// A root that cannot be read leaves the result incomplete, never empty.
+    fn open_files_under_roots(&self, roots: &[PathBuf]) -> Result<OpenFilesResult> {
+        let mut merged = OpenFilesResult::complete(Vec::new());
+        for root in roots {
+            match self.open_files_under(root) {
+                Ok(result) => {
+                    merged.complete &= result.complete;
+                    if merged.incomplete_reason.is_none() {
+                        merged.incomplete_reason = result.incomplete_reason;
+                    }
+                    merged.files.extend(result.files);
+                }
+                Err(_) => merged.complete = false,
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Running executables under any of `roots`; see
+    /// [`Platform::open_files_under_roots`].
+    fn executables_under_roots(&self, roots: &[PathBuf]) -> Result<ExecutablesResult> {
+        let mut merged = ExecutablesResult {
+            processes: Vec::new(),
+            complete: true,
+        };
+        for root in roots {
+            match self.executables_under(root) {
+                Ok(result) => {
+                    merged.complete &= result.complete;
+                    merged.processes.extend(result.processes);
+                }
+                Err(_) => merged.complete = false,
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Directories a running build names as its own without necessarily
+    /// holding anything open in them: the cargo home's cache subtrees and the
+    /// target directory in a live cargo/rustc's environment (bd-d1kt). Each
+    /// entry is `(pid, path)`. Platforms that cannot tell report none.
+    fn build_directories_in_use(&self) -> Vec<(i32, PathBuf)> {
+        Vec::new()
+    }
+
+    /// Build-directory evidence together with coverage of the attempted
+    /// observation. The default preserves legacy platform implementations;
+    /// platforms with a coverage-aware collector should override this.
+    fn build_directories_in_use_checked(&self) -> (Vec<(i32, PathBuf)>, bool) {
+        (self.build_directories_in_use(), true)
     }
 
     fn self_stats(&self) -> Result<SelfStats> {
@@ -748,6 +861,7 @@ impl Platform for MockPlatform {
                 .cloned()
                 .collect(),
             complete: self.open_files_complete,
+            incomplete_reason: None,
         })
     }
 
@@ -778,6 +892,11 @@ impl Platform for MockPlatform {
             })
             .cloned()
             .collect())
+    }
+
+    fn mmap_regions_under_fresh(&self, path: &Path) -> Result<Vec<MappedRegion>> {
+        // Mock observations are supplied directly, without a process cache.
+        self.mmap_regions_under(path)
     }
 
     fn self_stats(&self) -> Result<SelfStats> {

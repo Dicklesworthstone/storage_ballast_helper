@@ -508,19 +508,23 @@ impl PredictiveActionPolicy {
 
 /// A narrow escape from percentage-only plausibility gates: both the EWMA
 /// and the calibrated historical baseline must project imminent exhaustion.
-/// The median uses the acceleration-aware implied free bytes, not just a
-/// ratio of current rates. Missing, invalid or overflowing baseline evidence
-/// cannot corroborate a rescue. This is not independent deletion authority.
+/// The baseline is independent evidence (#29): the free bytes measured at the
+/// sample, at the median rate of the intervals that consumed space. Deriving
+/// it from `seconds_to_exhaustion`, which the daemon has already shrunk by
+/// the conformal correction, made the "second" estimate the first one
+/// rescaled, and counting freeing intervals as consumption shortened it
+/// further. Missing, invalid or overflowing baseline evidence cannot
+/// corroborate a rescue. This is not independent deletion authority.
 fn corroborated_imminent_runway(estimate: &RateEstimate, horizon_minutes: f64) -> Option<f64> {
     if !estimate.burst_state.calibrated
-        || estimate.burst_state.median_rate <= 0.0
+        || estimate.burst_state.median_consumption_rate <= 0.0
         || !horizon_minutes.is_finite()
         || horizon_minutes <= 0.0
     {
         return None;
     }
     let ewma_minutes = estimate.seconds_to_exhaustion / 60.0;
-    let median_minutes = median_runway_minutes(estimate);
+    let median_minutes = consumption_runway_minutes(estimate);
     // Check both before max: f64::max deliberately ignores one NaN operand.
     if !ewma_minutes.is_finite()
         || ewma_minutes < 0.0
@@ -531,6 +535,22 @@ fn corroborated_imminent_runway(estimate: &RateEstimate, horizon_minutes: f64) -
     }
     let conservative_minutes = ewma_minutes.max(median_minutes);
     (conservative_minutes <= horizon_minutes).then_some(conservative_minutes)
+}
+
+/// Minutes until the measured free bytes run out at the median rate of the
+/// intervals that consumed space. Infinite without a consumption baseline.
+fn consumption_runway_minutes(estimate: &RateEstimate) -> f64 {
+    let rate = estimate.burst_state.median_consumption_rate;
+    if !rate.is_finite() || rate <= 0.0 {
+        return f64::INFINITY;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let minutes = estimate.free_bytes as f64 / rate / 60.0;
+    if minutes.is_finite() && minutes >= 0.0 {
+        minutes
+    } else {
+        f64::INFINITY
+    }
 }
 
 /// Project the forecast's implied free space at the historical median rate.
@@ -605,7 +625,14 @@ mod tests {
             alpha_used: 0.3,
             fallback_active,
             burst_state: BurstState::default(),
+            free_bytes: implied_free_bytes(bytes_per_second, seconds_to_exhaustion),
         }
+    }
+
+    /// Free bytes consistent with a constant rate and its time to exhaustion.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn implied_free_bytes(bytes_per_second: f64, seconds_to_exhaustion: f64) -> u64 {
+        (bytes_per_second * seconds_to_exhaustion).max(0.0) as u64
     }
 
     fn make_burst_estimate(
@@ -631,8 +658,10 @@ mod tests {
                 median_rate,
                 burst_duration_samples: 3,
                 calibrated: true,
+                median_consumption_rate: median_rate,
                 ..BurstState::default()
             },
+            free_bytes: implied_free_bytes(bytes_per_second, seconds_to_exhaustion),
         }
     }
 
@@ -1568,11 +1597,11 @@ mod tests {
     }
 
     #[test]
-    fn corroboration_includes_acceleration_in_the_baseline_distance() {
+    fn corroboration_measures_the_free_bytes_at_the_consumption_median() {
         let mut est = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Accelerating, 0.3, 1000.0);
         est.acceleration = 100.0;
-        // Implied free bytes = 1000*60 + 100*60*60/2 = 240000;
-        // the historical median has four minutes left, not one.
+        // 240,000 bytes free at a 1,000 B/s consumption median: four minutes.
+        est.free_bytes = 240_000;
         assert_eq!(corroborated_imminent_runway(&est, 5.0), Some(4.0));
         match default_policy().evaluate(&est, 80.0, PathBuf::from("/data")) {
             PredictiveAction::ImminentDanger {
@@ -1585,14 +1614,43 @@ mod tests {
             }
             other => panic!("expected conservative accelerating rescue, got {other:?}"),
         }
-        for acceleration in [200.0, f64::MAX] {
-            est.acceleration = acceleration;
-            assert_eq!(corroborated_imminent_runway(&est, 5.0), None);
-            assert_eq!(
-                default_policy().evaluate(&est, 80.0, PathBuf::from("/data")),
-                PredictiveAction::Clear
-            );
-        }
+        // Seven minutes of measured headroom is outside the five-minute horizon.
+        est.free_bytes = 420_000;
+        assert_eq!(corroborated_imminent_runway(&est, 5.0), None);
+        assert_eq!(
+            default_policy().evaluate(&est, 80.0, PathBuf::from("/data")),
+            PredictiveAction::Clear
+        );
+    }
+
+    /// #29: the daemon shrinks `seconds_to_exhaustion` by the conformal
+    /// correction before the policy sees it. The corroborating runway used
+    /// to be that same number rescaled, so a corrected one-minute forecast on
+    /// a mostly empty disk corroborated itself and released ballast.
+    #[test]
+    fn a_conformally_shortened_forecast_cannot_corroborate_itself() {
+        let mut est = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Stable, 0.3, 1000.0);
+        // 80% of a 1 TB disk is free; at the historical 1,000 B/s that is
+        // weeks, whatever the corrected EWMA says.
+        est.free_bytes = 800_000_000_000;
+        assert_eq!(corroborated_imminent_runway(&est, 5.0), None);
+        assert_eq!(
+            default_policy().evaluate(&est, 80.0, PathBuf::from("/data")),
+            PredictiveAction::Clear
+        );
+    }
+
+    /// Intervals that freed space are not consumption: a history dominated by
+    /// deletions has a small consumption median, not a large absolute one.
+    #[test]
+    fn freeing_intervals_do_not_count_toward_the_consumption_baseline() {
+        let mut est = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Stable, 0.3, 1000.0);
+        est.burst_state.median_consumption_rate = 0.0;
+        assert_eq!(
+            corroborated_imminent_runway(&est, 5.0),
+            None,
+            "without consumption there is no baseline to corroborate"
+        );
     }
 
     #[test]

@@ -1050,11 +1050,18 @@ mod tests {
         }
 
         /// Quantiles are monotone in `q`, bounded by the sample range, and
-        /// with enough samples the median stays within 10% of the range of
-        /// the exact one (the digest interpolates, so tiny samples differ).
+        /// with enough samples the median lies between the order statistics
+        /// five percent of ranks either side. A t-digest bounds rank error,
+        /// not value error: with an even count it returns the midpoint of the
+        /// two middle values, which can be far from either (16 zeros and 16
+        /// values near 1e12 give a median near 3e11).
         #[test]
         fn digest_quantiles_are_monotone_and_bounded(
-            values in proptest::collection::vec(0.0f64..1e12, 1..600),
+            // A quarter zeros: idle windows make real samples bimodal.
+            values in proptest::collection::vec(
+                proptest::prop_oneof![3 => 0.0f64..1e12, 1 => proptest::strategy::Just(0.0)],
+                1..600,
+            ),
         ) {
             let digest = digest_of(&values);
             let mut sorted = values;
@@ -1069,11 +1076,12 @@ mod tests {
                 previous = value;
             }
             if sorted.len() >= 30 {
-                let exact_median = sorted[(sorted.len() - 1) / 2];
+                let n = sorted.len();
+                let (low, high) = (sorted[n * 45 / 100], sorted[(n * 55 / 100).min(n - 1)]);
                 let median = digest.quantile(0.5).unwrap();
                 proptest::prop_assert!(
-                    (median - exact_median).abs() <= (max - min).mul_add(0.1, 1.0),
-                    "median {median} vs {exact_median}"
+                    median >= low && median <= high,
+                    "median {median} outside [{low}, {high}]"
                 );
             }
         }

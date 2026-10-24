@@ -3,6 +3,7 @@
 //! Architecture: a dedicated logger thread owns the `SqliteLogger` and `JsonlWriter`.
 //! All other threads send `ActivityEvent` via a bounded crossbeam channel. Non-blocking
 //! `try_send()` ensures the monitoring loop is never blocked by logging back-pressure.
+//! Mirror and shutdown requests use out-of-band control state, not queue capacity.
 
 #![allow(missing_docs)]
 
@@ -24,7 +25,9 @@ use crate::logger::sqlite::{ActivityRow, PressureRow, SqliteLogger};
 use crate::scanner::decision_record::DecisionRecord;
 
 mod diagnostics;
+mod lifecycle;
 use diagnostics::DiagnosticGate;
+pub use lifecycle::LoggerShutdownStatus;
 
 // ──────────────────── channel capacity ────────────────────
 
@@ -158,6 +161,9 @@ pub enum ActivityEvent {
     /// A cleanup decision (keep, delete, review, veto) for the evidence
     /// ledger: SQLite `decision_log` plus a JSONL `decision` line.
     DecisionRecorded(Box<DecisionRecord>),
+    /// A compression outcome is an audit event, not a throttled diagnostic.
+    /// Its structured info envelope never contributes deletion/ballast bytes.
+    CompressionRecorded(Box<crate::logger::compression::CompressionActivity>),
     /// What became of a deletion (regret label): SQLite `decision_outcome`
     /// plus a JSONL `decision_outcome` line.
     DecisionOutcome(Box<crate::scanner::regret::DecisionOutcome>),
@@ -176,9 +182,10 @@ pub enum ActivityEvent {
 /// `try_send()` so callers are never blocked by logging back-pressure.
 #[derive(Clone)]
 pub struct ActivityLoggerHandle {
-    tx: Sender<ActivityEvent>,
+    tx: Sender<lifecycle::Message>,
     dropped_events: Arc<AtomicU64>,
     diagnostics: Arc<DiagnosticGate>,
+    control: Arc<lifecycle::Control>,
     /// Epoch milliseconds of the logger thread's last loop iteration.
     last_beat_ms: Arc<AtomicU64>,
 }
@@ -200,11 +207,30 @@ impl ActivityLoggerHandle {
     /// Repetitive Info/Warning/Error diagnostics are bounded before enqueueing;
     /// audit and control events are never filtered. If the channel is full the
     /// admitted event is dropped and the dropped-events counter is incremented.
+    /// Shutdown closes admission; events submitted afterwards are ignored.
     pub fn send(&self, event: ActivityEvent) {
+        match &event {
+            ActivityEvent::Shutdown => {
+                self.shutdown();
+                return;
+            }
+            ActivityEvent::MirrorJsonl(on) => {
+                self.mirror_jsonl(*on);
+                return;
+            }
+            _ => {}
+        }
+        let Some(_admission) = self.control.admit() else {
+            return;
+        };
         if !self.diagnostics.admit(&event, Instant::now()) {
             return;
         }
-        if let Err(TrySendError::Full(_)) = self.tx.try_send(event) {
+        let message = lifecycle::Message {
+            event,
+            mirror: self.control.mirror(),
+        };
+        if let Err(TrySendError::Full(_)) = self.tx.try_send(message) {
             self.dropped_events.fetch_add(1, Ordering::Relaxed);
         }
         // Disconnected is fine during shutdown.
@@ -221,22 +247,26 @@ impl ActivityLoggerHandle {
         self.diagnostics.suppressed()
     }
 
-    /// Request graceful shutdown of the logger thread.
-    ///
-    /// Uses a blocking send so the sentinel is never silently dropped when
-    /// the channel is full. The caller should `.join()` the thread handle
-    /// returned by [`spawn_logger`] after calling this.
+    /// Request shutdown without waiting for data-queue capacity or disk I/O.
+    /// Already-admitted producers and their queued events precede the writer's
+    /// final flush attempts. Repeated requests are idempotent.
+    /// Join the handle returned by [`spawn_logger`] and inspect
+    /// [`Self::shutdown_status`]; requesting shutdown is not proof of durability.
     pub fn shutdown(&self) {
-        // Blocking send: acceptable during shutdown — we must deliver the
-        // sentinel even if the channel is temporarily full.
-        let _ = self.tx.send(ActivityEvent::Shutdown);
+        self.control.request_shutdown();
     }
 
-    /// Mirror every JSONL line to the RAM fallback as well (or stop doing
-    /// so). Blocking send: a control message must not be dropped under
-    /// back-pressure.
+    /// Mirror events admitted after this setting to the RAM fallback (or stop).
+    /// The setting never waits for queue space. Each event carries its observed
+    /// mode so an on/off interval survives even while the writer is stalled.
     pub fn mirror_jsonl(&self, on: bool) {
-        let _ = self.tx.send(ActivityEvent::MirrorJsonl(on));
+        self.control.set_mirror(on);
+    }
+
+    /// Lifecycle completion, distinct from successful backend writes or fsync.
+    #[must_use]
+    pub fn shutdown_status(&self) -> LoggerShutdownStatus {
+        self.control.status()
     }
 }
 
@@ -273,19 +303,41 @@ fn dirs_default_sqlite() -> String {
 
 // ──────────────────── spawn ────────────────────
 
-/// Spawn the logger thread and return a handle.
+/// Spawn the logger and return its producer handle and lifecycle join handle.
 ///
-/// The returned handle is `Clone + Send` and can be shared across threads.
-/// The logger thread runs until `handle.shutdown()` is called or all senders
-/// are dropped.
+/// The producer handle is `Clone + Send` and can be shared across threads.
+/// Shutdown closes admission; dropping all senders also ends the input stream.
+/// Inspect `shutdown_status` separately from backend write/durability evidence.
 pub fn spawn_logger(
     config: DualLoggerConfig,
 ) -> Result<(ActivityLoggerHandle, thread::JoinHandle<()>)> {
-    let (tx, rx) = bounded::<ActivityEvent>(config.channel_capacity);
+    spawn_logger_inner(config, None)
+}
+
+/// [`spawn_logger`] with a caller-chosen shutdown allowance.
+///
+/// The allowance is how long the writer may drain at shutdown before it is
+/// detached and reported `TimedOut` (the daemon's is 5 s). Tests in other
+/// crates that read the files after shutdown need a longer one on a loaded
+/// build host.
+pub fn spawn_logger_with_shutdown_wait(
+    config: DualLoggerConfig,
+    shutdown_wait: Duration,
+) -> Result<(ActivityLoggerHandle, thread::JoinHandle<()>)> {
+    spawn_logger_inner(config, Some(shutdown_wait))
+}
+
+fn spawn_logger_inner(
+    config: DualLoggerConfig,
+    shutdown_wait: Option<Duration>,
+) -> Result<(ActivityLoggerHandle, thread::JoinHandle<()>)> {
+    let (tx, rx) = bounded::<lifecycle::Message>(config.channel_capacity);
     let dropped = Arc::new(AtomicU64::new(0));
     let dropped_clone = Arc::clone(&dropped);
     let diagnostics = Arc::new(DiagnosticGate::new(Instant::now()));
     let diagnostics_clone = Arc::clone(&diagnostics);
+    let control = Arc::new(lifecycle::Control::new());
+    let worker_control = Arc::clone(&control);
     // The spawn is the first beat: a state file written before the thread's
     // first loop iteration (SQLite open, schema check) must not report the
     // logger as never having beaten.
@@ -296,25 +348,29 @@ pub fn spawn_logger(
         tx,
         dropped_events: dropped,
         diagnostics,
+        control: Arc::clone(&control),
         last_beat_ms: last_beat,
     };
 
-    let join = thread::Builder::new()
-        .name("sbh-logger".to_string())
-        .spawn(move || {
-            logger_thread_main(
-                rx,
-                config.sqlite_path,
-                config.jsonl_config,
-                dropped_clone,
-                last_beat_clone,
-                config.run_id,
-                diagnostics_clone,
-            );
-        })
-        .map_err(|e| crate::core::errors::SbhError::Runtime {
-            details: format!("failed to spawn logger thread: {e}"),
-        })?;
+    let worker = move || {
+        logger_thread_main(
+            rx,
+            config.sqlite_path,
+            config.jsonl_config,
+            dropped_clone,
+            last_beat_clone,
+            config.run_id,
+            diagnostics_clone,
+            worker_control,
+        );
+    };
+    let join = match shutdown_wait {
+        Some(wait) => lifecycle::spawn_worker_with_wait(&control, wait, worker),
+        None => lifecycle::spawn_worker(&control, worker),
+    }
+    .map_err(|e| crate::core::errors::SbhError::Runtime {
+        details: format!("failed to spawn logger thread: {e}"),
+    })?;
 
     Ok((handle, join))
 }
@@ -371,15 +427,16 @@ fn epoch_ms() -> u64 {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn logger_thread_main(
-    rx: Receiver<ActivityEvent>,
+    rx: Receiver<lifecycle::Message>,
     sqlite_path: Option<PathBuf>,
     jsonl_config: JsonlConfig,
     dropped: Arc<AtomicU64>,
     last_beat: Arc<AtomicU64>,
     run_id: Option<String>,
     diagnostics: Arc<DiagnosticGate>,
+    control: Arc<lifecycle::Control>,
 ) {
     #[cfg(feature = "sqlite")]
     const SQLITE_RECOVERY_INTERVAL: u32 = 50;
@@ -421,6 +478,9 @@ fn logger_thread_main(
     let mut last_drop_report = Instant::now();
     let mut last_diagnostic_check = Instant::now();
     let mut stopping = false;
+    // bd-jl92: verdicts acknowledged by SQLite, not merely admitted to the writer.
+    #[cfg(feature = "sqlite")]
+    let mut decisions = crate::logger::decision_dedupe::DecisionDedupe::default();
     loop {
         // Heartbeat for the daemon's thread health: once a second while
         // idle, and on every event while busy.
@@ -451,8 +511,11 @@ fn logger_thread_main(
         } else if stopping {
             break;
         } else {
-            match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(event) => event,
+            match control.receive(&rx, Duration::from_secs(1)) {
+                Ok(message) => {
+                    jsonl.set_mirror(message.mirror);
+                    message.event
+                }
                 Err(RecvTimeoutError::Timeout) => {
                     // Idle fsync timer: lines written before a quiet spell are
                     // made durable once the interval passes, with no new event.
@@ -472,6 +535,21 @@ fn logger_thread_main(
         }
         if let ActivityEvent::MirrorJsonl(on) = event {
             jsonl.set_mirror(on);
+            continue;
+        }
+        // Only an acknowledged SQLite record can suppress a later observation.
+        // JSONL-only traffic must still reach the periodic SQLite recovery path.
+        #[cfg(feature = "sqlite")]
+        if sqlite.is_some()
+            && let ActivityEvent::DecisionRecorded(record) = &event
+            && !decisions.should_record(record, now)
+        {
+            // Duplicate traffic can prevent both ordinary writes and the
+            // receive timeout from servicing the JSONL durability timer.
+            jsonl.tick(SystemTime::now());
+            if rx.is_empty() {
+                jsonl.flush();
+            }
             continue;
         }
 
@@ -495,7 +573,11 @@ fn logger_thread_main(
                     .map(|row| db.log_pressure(row).is_ok());
                 let decision_ok = match &event {
                     ActivityEvent::DecisionRecorded(record) => {
-                        Some(db.log_decision(record).is_ok())
+                        let ok = db.log_decision(record).is_ok();
+                        if ok {
+                            decisions.acknowledge(record, Instant::now());
+                        }
+                        Some(ok)
                     }
                     ActivityEvent::DecisionOutcome(outcome) => {
                         Some(db.log_outcome(outcome).is_ok())
@@ -549,6 +631,9 @@ fn logger_thread_main(
                         eprintln!("[SBH-DUAL] SQLite recovered at {}", p.display());
                         sqlite = Some(db);
                         sqlite_failures = 0;
+                        // Reopening may create a replacement database. Its
+                        // first observation must be persisted before dedupe.
+                        decisions = crate::logger::decision_dedupe::DecisionDedupe::default();
                     }
                 }
             }
@@ -606,6 +691,7 @@ fn scan_completion_details(
 #[allow(clippy::too_many_lines)]
 fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
     match event {
+        ActivityEvent::CompressionRecorded(record) => record.to_log_entry(),
         ActivityEvent::DaemonStarted {
             version,
             config_hash,
@@ -811,6 +897,7 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     match event {
+        ActivityEvent::CompressionRecorded(record) => Some(record.to_activity_row()),
         ActivityEvent::DaemonStarted {
             version,
             config_hash,
@@ -1355,6 +1442,119 @@ mod tests {
             std::fs::write(&blocker, b"regular file standing in for an unwritable dir").unwrap();
         }
         blocker.join(leaf)
+    }
+
+    /// bd-jl92 through the real logger: a kept artifact re-evaluated on every
+    /// pass is one `decision_log` row and one JSONL `decision` line, a changed
+    /// verdict and every delete add one each, and `sbh explain --id` (the
+    /// latest row for the stable id) still answers with the latest verdict.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn repeated_kept_verdicts_are_one_ledger_row() {
+        use crate::scanner::decision_record::{ActionRecord, PolicyMode, sample_record_for_tests};
+        use crate::scanner::scoring::DecisionAction;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join) = spawn_logger(test_config(dir.path())).unwrap();
+        let decided = |effective| {
+            let mut record = sample_record_for_tests(PolicyMode::Live, Some(effective));
+            record.id = "a1b2c3d4e5f6".to_string();
+            ActivityEvent::DecisionRecorded(Box::new(record))
+        };
+        for _ in 0..20 {
+            handle.send(decided(DecisionAction::Keep));
+        }
+        handle.send(decided(DecisionAction::Review));
+        handle.send(decided(DecisionAction::Keep));
+        handle.send(decided(DecisionAction::Delete));
+        handle.send(decided(DecisionAction::Delete));
+        handle.send(decided(DecisionAction::Keep));
+        handle.shutdown();
+        join.join().unwrap();
+
+        let db = SqliteLogger::open(&dir.path().join("test.db")).unwrap();
+        let (latest, rows) = db.decision_by_id("a1b2c3d4e5f6").unwrap().unwrap();
+        assert_eq!(
+            rows, 6,
+            "3 keeps + 1 review + 2 deletes, including the return to KEEP"
+        );
+        assert_eq!(latest.effective_action, Some(ActionRecord::Keep));
+        let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        let lines = jsonl
+            .lines()
+            .filter(|line| line.contains("a1b2c3d4e5f6"))
+            .count();
+        assert_eq!(lines, 6);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn failed_decision_write_is_retried_before_deduplication() {
+        use crate::scanner::decision_record::{PolicyMode, sample_record_for_tests};
+        use crate::scanner::scoring::DecisionAction;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        drop(SqliteLogger::open(&db_path).unwrap());
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER reject_first_decision BEFORE INSERT ON decision_log
+             WHEN NEW.timestamp = '2026-10-01T00:00:00.000Z'
+             BEGIN SELECT RAISE(FAIL, 'injected decision write failure'); END;",
+        )
+        .unwrap();
+        drop(db);
+        let (handle, join) = spawn_logger(test_config(dir.path())).unwrap();
+        let mut record = sample_record_for_tests(PolicyMode::Live, Some(DecisionAction::Keep));
+        record.id = "112233445566".to_string();
+        record.timestamp = "2026-10-01T00:00:00.000Z".to_string();
+        handle.send(ActivityEvent::DecisionRecorded(Box::new(record.clone())));
+        record.timestamp = "2026-10-01T00:01:00.000Z".to_string();
+        handle.send(ActivityEvent::DecisionRecorded(Box::new(record.clone())));
+        handle.send(ActivityEvent::DecisionRecorded(Box::new(record.clone())));
+        handle.shutdown();
+        join.join().unwrap();
+
+        let db = SqliteLogger::open(&db_path).unwrap();
+        let (latest, count) = db.decision_by_id(&record.id).unwrap().unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(latest.timestamp, record.timestamp);
+        let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        assert_eq!(
+            jsonl
+                .lines()
+                .filter(|line| line.contains(&record.id))
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn jsonl_only_decisions_are_not_deduplicated_without_acknowledgement() {
+        use crate::scanner::decision_record::{PolicyMode, sample_record_for_tests};
+        use crate::scanner::scoring::DecisionAction;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.sqlite_path = None;
+        let (handle, join) = spawn_logger(config).unwrap();
+        let mut record = sample_record_for_tests(PolicyMode::Live, Some(DecisionAction::Keep));
+        record.id = "665544332211".to_string();
+        for _ in 0..3 {
+            handle.send(ActivityEvent::DecisionRecorded(Box::new(record.clone())));
+        }
+        handle.shutdown();
+        join.join().unwrap();
+
+        let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        assert_eq!(
+            jsonl
+                .lines()
+                .filter(|line| line.contains(&record.id))
+                .count(),
+            3
+        );
     }
 
     #[test]

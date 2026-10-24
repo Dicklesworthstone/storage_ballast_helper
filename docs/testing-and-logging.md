@@ -126,37 +126,56 @@ macOS-only tests are compiled out here, `#[ignore]` tests are listed.
 <!-- sbh-census:begin -->
 | Target | Tests |
 | --- | --- |
-| `cargo test --lib` (default features, with the TUI) | 2605 |
-| `cargo test --lib --no-default-features --features cli,daemon,sqlite` (lean) | 1625 |
-| `cargo test --bin sbh` | 151 |
-| `cargo test --test cli_exit_codes` | 5 |
-| `cargo test --test daemon_e2e` | 22 |
+| `cargo test --lib` (default features, with the TUI) | 4183 |
+| `cargo test --lib --no-default-features --features cli,daemon,sqlite` (lean) | 3205 |
+| `cargo test --bin sbh` | 189 |
+| `cargo test --test build_reference_coverage` | 5 |
+| `cargo test --test cli_exit_codes` | 6 |
+| `cargo test --test compression_activity` | 4 |
+| `cargo test --test compression_discovery` | 4 |
+| `cargo test --test daemon_e2e` | 27 |
 | `cargo test --test dashboard_integration_tests` | 31 |
-| `cargo test --test dashboard_pty` | 3 |
+| `cargo test --test dashboard_pty` | 6 |
 | `cargo test --test decision_plane_e2e` | 7 |
-| `cargo test --test explain_ledger` | 4 |
+| `cargo test --test deletion_boundary` | 20 |
+| `cargo test --test explain_ledger` | 5 |
 | `cargo test --test fallback_verification` | 42 |
 | `cargo test --test fuzz_smoke` | 2 |
 | `cargo test --test installer_e2e` | 50 |
 | `cargo test --test integration_tests` | 71 |
+| `cargo test --test macos_fsevents` | 0 |
+| `cargo test --test macos_pid_inventory` | 13 |
+| `cargo test --test mount_pressure_wake` | 16 |
 | `cargo test --test proof_harness` | 26 |
+| `cargo test --test ram_log_memory_constraints` | 8 |
 | `cargo test --test regression_issue_pid_slow_attack` | 1 |
 | `cargo test --test regression_path_traversal` | 4 |
 | `cargo test --test regression_risky_patterns` | 16 |
 | `cargo test --test repro_ballast_restart_stability` | 1 |
+| `cargo test --test repro_cachedir_tag_evidence` | 12 |
 | `cargo test --test repro_dangerous_patterns` | 1 |
 | `cargo test --test repro_glob` | 2 |
+| `cargo test --test repro_inotify_lifecycle` | 10 |
 | `cargo test --test repro_issue` | 2 |
+| `cargo test --test repro_linux_executable_coverage` | 1 |
+| `cargo test --test repro_linux_mmap_coverage` | 1 |
 | `cargo test --test repro_merkle_index_integration` | 1 |
 | `cargo test --test repro_pid_skew` | 1 |
+| `cargo test --test repro_pressure_scan_scheduling` | 6 |
 | `cargo test --test repro_risky_patterns` | 2 |
 | `cargo test --test repro_symlink_loop` | 1 |
 | `cargo test --test repro_tui_panic` | 2 |
+| `cargo test --test root_install_script` | 3 |
+| `cargo test --test self_update_service_restart` | 17 |
+| `cargo test --test source_root_cli` | 7 |
+| `cargo test --test source_root_default_executor` | 16 |
 | `cargo test --test stress_harness` | 9 |
 | `cargo test --test stress_tests` | 12 |
-| Integration test files (sum of the `--test` rows) | 318 |
+| `cargo test --test update_transaction_lock` | 8 |
+| `cargo test --test walker_result_batch` | 10 |
+| Integration test files (sum of the `--test` rows) | 489 |
 | E2E shell cases defined in `scripts/e2e_test.sh` | 129 |
-| **Cargo tests on Linux, default features (lib + bin + integration)** | **3074** |
+| **Cargo tests on Linux, default features (lib + bin + integration)** | **4861** |
 <!-- sbh-census:end -->
 
 ### Binary Tests (CLI)
@@ -246,26 +265,29 @@ clippy) have no tests.
 | 10 | `decision-plane` | HARD | test | Integration Tests | policy-correctness | `cargo test --test proof_harness -- --test-threads=4` |
 | 11 | `decision-e2e` | HARD | test | Integration Tests | policy-lifecycle | `cargo test --test decision_plane_e2e -- --test-threads=4` |
 | 12 | `explain-ledger` | HARD | test | Integration Tests | explainability | `cargo test --test explain_ledger -- --test-threads=4` |
-| 13 | `fallback` | HARD | test | Integration Tests | fallback-safety | `cargo test --test fallback_verification --features tui -- --test-threads=4` |
-| 14 | `tui-unit` | HARD | test | Dashboard / TUI Tests | dashboard-correctness | `cargo test --lib --features tui tui:: -- --test-threads=4` |
-| 15 | `tui-replay` | HARD | test | Dashboard / TUI Tests | deterministic-replay | `cargo test --lib --features tui tui::test_replay -- --test-threads=4` |
-| 16 | `tui-scenarios` | HARD | test | Dashboard / TUI Tests | operator-workflows | `cargo test --lib --features tui tui::test_scenario_drills -- --test-threads=4` |
-| 17 | `tui-properties` | HARD | test | Dashboard / TUI Tests | invariant-safety | `cargo test --lib --features tui tui::test_properties -- --test-threads=4` |
-| 18 | `tui-fault-injection` | HARD | test | Dashboard / TUI Tests | degraded-recovery | `cargo test --lib --features tui tui::test_fault_injection -- --test-threads=4` |
-| 19 | `tui-snapshots` | SOFT | test | Dashboard / TUI Tests | visual-contract | `cargo test --lib --features tui tui::test_snapshot_golden -- --test-threads=4` |
-| 20 | `tui-parity` | HARD | test | Dashboard / TUI Tests | legacy-parity | `cargo test --lib --features tui tui::parity_harness -- --test-threads=4` |
-| 21 | `tui-benchmarks` | SOFT | test | Dashboard / TUI Tests | operator-efficiency | `cargo test --lib --features tui tui::test_operator_benchmark -- --test-threads=4` |
-| 22 | `dashboard-integration` | HARD | test | Dashboard / TUI Tests | dashboard-e2e | `cargo test --test dashboard_integration_tests --features tui -- --test-threads=4` |
-| 23 | `dashboard-pty` | HARD | test | Dashboard / TUI Tests | dashboard-pty-session | `cargo test --test dashboard_pty --features tui -- --test-threads=1` |
-| 24 | `stress` | HARD | test | Stress & Performance | daemon-stability | `cargo test --test stress_tests -- --test-threads=2` |
-| 25 | `fuzz` | SOFT | test | Stress & Performance | parser-robustness | `cargo test --test fuzz_smoke` |
-| 26 | `stress-harness` | SOFT | test | Stress & Performance | concurrency-safety | `cargo test --test stress_harness -- --test-threads=2` |
-| 27 | `tui-stress` | SOFT | test | Stress & Performance | dashboard-endurance | `cargo test --lib --features tui tui::test_stress -- --test-threads=4` |
-| 28 | `daemon-e2e` | SOFT | test | E2E & Installer | daemon-lifecycle | `cargo test --test daemon_e2e -- --test-threads=1` |
-| 29 | `installer` | HARD | test | E2E & Installer | install-safety | `cargo test --test installer_e2e -- --test-threads=4` |
-| 30 | `e2e` | HARD | e2e | E2E & Installer | user-experience | `./scripts/e2e_test.sh` |
+| 13 | `source-root` | HARD | test | Integration Tests | source-root-safety | `cargo test --locked --lib source_root -- --test-threads=4` |
+| 14 | `fallback` | HARD | test | Integration Tests | fallback-safety | `cargo test --test fallback_verification --features tui -- --test-threads=4` |
+| 15 | `tui-unit` | HARD | test | Dashboard / TUI Tests | dashboard-correctness | `cargo test --lib --features tui tui:: -- --test-threads=4` |
+| 16 | `tui-replay` | HARD | test | Dashboard / TUI Tests | deterministic-replay | `cargo test --lib --features tui tui::test_replay -- --test-threads=4` |
+| 17 | `tui-scenarios` | HARD | test | Dashboard / TUI Tests | operator-workflows | `cargo test --lib --features tui tui::test_scenario_drills -- --test-threads=4` |
+| 18 | `tui-properties` | HARD | test | Dashboard / TUI Tests | invariant-safety | `cargo test --lib --features tui tui::test_properties -- --test-threads=4` |
+| 19 | `tui-fault-injection` | HARD | test | Dashboard / TUI Tests | degraded-recovery | `cargo test --lib --features tui tui::test_fault_injection -- --test-threads=4` |
+| 20 | `tui-snapshots` | SOFT | test | Dashboard / TUI Tests | visual-contract | `cargo test --lib --features tui tui::test_snapshot_golden -- --test-threads=4` |
+| 21 | `tui-parity` | HARD | test | Dashboard / TUI Tests | legacy-parity | `cargo test --lib --features tui tui::parity_harness -- --test-threads=4` |
+| 22 | `tui-benchmarks` | SOFT | test | Dashboard / TUI Tests | operator-efficiency | `cargo test --lib --features tui tui::test_operator_benchmark -- --test-threads=4` |
+| 23 | `dashboard-integration` | HARD | test | Dashboard / TUI Tests | dashboard-e2e | `cargo test --test dashboard_integration_tests --features tui -- --test-threads=4` |
+| 24 | `dashboard-pty` | HARD | test | Dashboard / TUI Tests | dashboard-pty-session | `cargo test --test dashboard_pty --features tui -- --test-threads=1` |
+| 25 | `stress` | HARD | test | Stress & Performance | daemon-stability | `cargo test --test stress_tests -- --test-threads=2` |
+| 26 | `fuzz` | SOFT | test | Stress & Performance | parser-robustness | `cargo test --test fuzz_smoke` |
+| 27 | `stress-harness` | SOFT | test | Stress & Performance | concurrency-safety | `cargo test --test stress_harness -- --test-threads=2` |
+| 28 | `tui-stress` | SOFT | test | Stress & Performance | dashboard-endurance | `cargo test --lib --features tui tui::test_stress -- --test-threads=4` |
+| 29 | `daemon-e2e` | SOFT | test | E2E & Installer | daemon-lifecycle | `cargo test --test daemon_e2e -- --test-threads=1` |
+| 30 | `installer` | HARD | test | E2E & Installer | install-safety | `cargo test --test installer_e2e -- --test-threads=4` |
+| 31 | `e2e` | HARD | e2e | E2E & Installer | user-experience | `./scripts/e2e_test.sh` |
+| 32 | `native-btrfs` | HARD | native | Native Linux (--native, dsr) | btrfs-compression | `./scripts/quality-gate.sh --stage native-btrfs` |
+| 33 | `native-systemd` | HARD | native | Native Linux (--native, dsr) | systemd-namespace | `./scripts/quality-gate.sh --stage native-systemd` |
 
-30 stages: 21 HARD, 9 SOFT.
+33 stages: 24 HARD, 9 SOFT.
 <!-- sbh-qg:stages:end -->
 
 **Output artifacts:**
@@ -281,6 +303,17 @@ tests or for releases. The gates above, `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, and the test suites are run by
 whoever changes the code, through rch, before pushing. Releases go through
 `dsr build` and `scripts/dsr_release.sh` (see `docs/macos.md`).
+
+**Native stages:** `native-btrfs` (the C UAPI check, the `sbh_btrfs` and
+compression tests, then real zstd compression and reflink refusal as root on a
+loop-mounted 1 GiB Btrfs image) and `native-systemd` (the systemd service
+tests, then the root-only strict-namespace startup proof through
+`systemd-run`) need Linux with passwordless sudo. They run only with
+`--native` or by name (`--stage native-btrfs`), build with rustup's cargo in a
+scratch dir under `target/` that they remove, and never go through rch.
+`scripts/dsr_native_checks.sh [HOST]` runs both for `git archive HEAD` on a dsr
+build host (default `trj`) and removes its remote copy; dsr runs it as a
+required check before every sbh build.
 
 **Docs update lint:** `scripts/ci_docs_update_check.sh` compares a head
 revision against a base and fails when user-facing source, installer,

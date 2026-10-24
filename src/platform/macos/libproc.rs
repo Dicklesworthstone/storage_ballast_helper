@@ -202,10 +202,27 @@ fn fd_arg(fd: i32) -> io::Result<Fd> {
 }
 
 fn process_not_found(pid: i32) -> io::Error {
-    io::Error::new(
+    native_or(io::Error::new(
         io::ErrorKind::NotFound,
         format!("libproc returned no data for pid {pid}"),
-    )
+    ))
+}
+
+/// The reason a libproc call that just returned no data failed, or `fallback`.
+///
+/// libproc returns zero bytes when the call fails and leaves the reason in
+/// errno; the proc_pidinfo crate reports that as `Ok(None)` and drops it. Call
+/// this at once, before any other call. Without it a zombie (ESRCH: about 20
+/// at any time on one busy Mac) looked like an unreadable process, and every
+/// collector that treats only ESRCH as exited reported incomplete coverage on
+/// every pass.
+pub fn native_or(fallback: io::Error) -> io::Error {
+    let native = io::Error::last_os_error();
+    if native.raw_os_error().is_some_and(|code| code != 0) {
+        native
+    } else {
+        fallback
+    }
 }
 
 #[cfg(test)]

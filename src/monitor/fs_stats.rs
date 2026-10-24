@@ -31,10 +31,15 @@ struct MountBinding {
 }
 
 impl MountBinding {
-    fn of(mount: &MountPoint) -> Self {
+    /// `resolved` must come from the same `Platform::mount_lookup_path` that
+    /// spells the paths looked up against it. On macOS that lookup rewrites
+    /// firmlinks (`/Volumes/X` -> `/System/Volumes/Data/Volumes/X`); a mount
+    /// point left in its raw spelling would never match, and every path on an
+    /// external volume would be attributed to the Data volume instead.
+    fn of(mount: &MountPoint, resolved: PathBuf) -> Self {
         Self {
             path: mount.path.clone(),
-            resolved: crate::core::paths::resolve_absolute_path(&mount.path),
+            resolved,
             device: mount.device.clone(),
             fs_type: mount.fs_type.clone(),
             is_ram_backed: mount.is_ram_backed,
@@ -183,12 +188,16 @@ impl FsStatsCollector {
         }
         state.mounts = None;
         let collected_at = Instant::now();
-        let bindings: Vec<_> = self
+        let bindings = self
             .platform
             .mount_points()?
             .iter()
-            .map(MountBinding::of)
-            .collect();
+            .map(|mount| {
+                self.platform
+                    .mount_lookup_path(&mount.path)
+                    .map(|resolved| MountBinding::of(mount, resolved))
+            })
+            .collect::<Result<Vec<_>>>()?;
         state.generation = state
             .generation
             .checked_add(1)
@@ -211,7 +220,10 @@ impl FsStatsCollector {
 
     fn collect_for_mount(&self, mount: &MountBinding, generation: u64) -> Result<FsStats> {
         let collected_at = Instant::now();
-        if crate::core::paths::resolve_absolute_path(&mount.path) != mount.resolved {
+        // Compare in the binding's own namespace. `resolved` was spelled by
+        // the platform's mount lookup, so a plain path resolution reports
+        // every firmlinked macOS volume (`/Volumes/X`) as changed.
+        if self.platform.mount_lookup_path(&mount.path).ok().as_ref() != Some(&mount.resolved) {
             self.invalidate(mount, generation, collected_at);
             return Err(changed_mount(&mount.path));
         }
@@ -233,8 +245,12 @@ impl FsStatsCollector {
                 return Err(error);
             }
         };
-        if crate::core::paths::resolve_absolute_path(&mount.path) != mount.resolved
-            || crate::core::paths::resolve_absolute_path(&fresh.mount_point) != mount.resolved
+        // Re-resolve both spellings in the binding's namespace (the platform's
+        // mount lookup, which also catches an alias retargeted since discovery).
+        let resolved_now = self.platform.mount_lookup_path(&mount.path);
+        let fresh_resolved = self.platform.mount_lookup_path(&fresh.mount_point);
+        if resolved_now.ok().as_ref() != Some(&mount.resolved)
+            || fresh_resolved.ok().as_ref() != Some(&mount.resolved)
             || fresh.fs_type != mount.fs_type
         {
             self.invalidate(mount, generation, collected_at);

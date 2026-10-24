@@ -29,6 +29,10 @@
 #   DSR_ARTIFACTS       artifact dir (default ~/.local/state/dsr/artifacts/storage_ballast_helper-vVERSION)
 #   SBH_SIGN_IDENTITY   codesign identity (default: Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY))
 #   SBH_NOTARY_PROFILE  notarytool keychain profile (default: sbh-notary)
+#   SBH_NOTARY_KEY      App Store Connect API key file (.p8). Together with
+#   SBH_NOTARY_KEY_ID   the key id and issuer id it replaces the keychain
+#   SBH_NOTARY_ISSUER   profile, so notarize also runs in a session that cannot
+#                       reach the login keychain. Set all three or none.
 #   SBH_MINISIGN_HOST   host holding the dsr minisign key (default: css)
 #   SBH_TAP_REPO        Homebrew tap (default: Dicklesworthstone/homebrew-sbh)
 
@@ -130,13 +134,22 @@ PY
 }
 
 step_notarize() {
+    local auth
+    if [ -n "${SBH_NOTARY_KEY:-}${SBH_NOTARY_KEY_ID:-}${SBH_NOTARY_ISSUER:-}" ]; then
+        [ -n "${SBH_NOTARY_KEY:-}" ] && [ -n "${SBH_NOTARY_KEY_ID:-}" ] && [ -n "${SBH_NOTARY_ISSUER:-}" ] \
+            || die "set all of SBH_NOTARY_KEY, SBH_NOTARY_KEY_ID and SBH_NOTARY_ISSUER, or none"
+        [ -r "${SBH_NOTARY_KEY}" ] || die "SBH_NOTARY_KEY ${SBH_NOTARY_KEY} is not readable"
+        auth=(--key "${SBH_NOTARY_KEY}" --key-id "${SBH_NOTARY_KEY_ID}" --issuer "${SBH_NOTARY_ISSUER}")
+    else
+        auth=(--keychain-profile "${NOTARY_PROFILE}")
+    fi
     for triple in "${darwin_triples[@]}"; do
         local raw zip result status
         raw="${DIR}/$(raw_name "${triple}")"
         zip="${WORK}/$(raw_name "${triple}").zip"
         signed_by_identity "${raw}" || die "sign ${raw} before notarizing"
         ditto -c -k --keepParent "${raw}" "${zip}"
-        result="$(xcrun notarytool submit "${zip}" --keychain-profile "${NOTARY_PROFILE}" \
+        result="$(xcrun notarytool submit "${zip}" "${auth[@]}" \
             --wait --timeout 30m --output-format json)"
         status="$(printf '%s' "${result}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')"
         [ "${status}" = "Accepted" ] || die "notarization of ${triple} ended '${status}': ${result}"
@@ -162,13 +175,27 @@ step_package() {
 }
 
 step_minisign() {
-    local base
+    local base names stage here there
     base="$(basename "${MANIFEST}")"
-    scp -q "${MANIFEST}" "${MINISIGN_HOST}:/tmp/${base}"
+    # dsr >= 0.2.3 signs a manifest only beside exactly the release set it
+    # lists (css refused v0.7.8's manifest copied alone to /tmp), so stage
+    # both in a fresh directory on the key host and sign there.
+    names="$(jq -r '.artifacts[].name' "${MANIFEST}")" || die "cannot list the artifacts in ${MANIFEST}"
+    [ -n "${names}" ] || die "${MANIFEST} lists no artifacts"
+    stage="$(ssh "${MINISIGN_HOST}" 'mktemp -d /tmp/sbh-minisign.XXXXXX')" ||
+        die "cannot create a staging directory on ${MINISIGN_HOST}"
+    # shellcheck disable=SC2086 # one word per artifact name
+    (cd "${DIR}" && scp -q ${names} "${base}" "${MINISIGN_HOST}:${stage}/") ||
+        die "staging the release set on ${MINISIGN_HOST}:${stage} failed"
+    # shellcheck disable=SC2086
+    here="$(cd "${DIR}" && shasum -a 256 ${names} "${base}" | LC_ALL=C sort -k2)"
     # shellcheck disable=SC2029 # the path is meant to expand locally
-    ssh "${MINISIGN_HOST}" "dsr signing sign /tmp/${base} && dsr signing verify /tmp/${base}" >/dev/null
-    scp -q "${MINISIGN_HOST}:/tmp/${base}.minisig" "${DIR}/"
-    say "manifest minisigned on ${MINISIGN_HOST}"
+    there="$(ssh "${MINISIGN_HOST}" "cd ${stage} && sha256sum * | LC_ALL=C sort -k2")"
+    [ "${here}" = "${there}" ] || die "staged bytes on ${MINISIGN_HOST}:${stage} differ from ${DIR}"
+    # shellcheck disable=SC2029
+    ssh "${MINISIGN_HOST}" "dsr signing sign ${stage}/${base} && dsr signing verify ${stage}/${base}" >/dev/null
+    scp -q "${MINISIGN_HOST}:${stage}/${base}.minisig" "${DIR}/"
+    say "manifest minisigned on ${MINISIGN_HOST} (release set staged in ${stage})"
 }
 
 step_publish() {

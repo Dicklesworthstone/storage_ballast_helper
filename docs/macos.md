@@ -133,8 +133,9 @@ duplicative purgeable and snapshot bytes, `sbh` reports a unified
 `estimated_reclaimable_by_snapshot_thinning` field with the estimation `method`
 (`foundation` or `apfs_unattributed`).
 
-Foundation purgeable querying is default-on via `[platform.macos] query_foundation_purgeable = true`
-(overridable with the `SBH_MACOS_QUERY_FOUNDATION_PURGEABLE` environment variable).
+Foundation purgeable querying is on by default; `SBH_MACOS_QUERY_FOUNDATION_PURGEABLE=0` in the
+environment turns it off, and the estimate then comes from the APFS container inventory. It has no
+`config.toml` key.
 Treat this estimate as diagnostic context, not as guaranteed emergency headroom.
 
 ## Local Time Machine Snapshots
@@ -498,13 +499,13 @@ mkdir -p "$ARTIFACT_DIR"
 
 Build fallback artifacts with the same nightly Rust toolchain and feature set as
 `dsr build`, whose sbh config builds with
-`--no-default-features --features cli,daemon,sqlite`. The repository
+`--no-default-features --features cli,daemon,sqlite,tui`. The repository
 `rust-toolchain.toml` pins nightly;
 keep `+nightly` in manual release commands so shell-level overrides cannot
 accidentally publish stable-built binaries:
 
 ```bash
-export CI_FEATURES="--no-default-features --features cli,daemon,sqlite"
+export CI_FEATURES="--no-default-features --features cli,daemon,sqlite,tui"
 cargo +nightly build $CI_FEATURES --release --target aarch64-apple-darwin
 cargo +nightly build $CI_FEATURES --release --target x86_64-apple-darwin
 cross +nightly build $CI_FEATURES --release --target aarch64-unknown-linux-gnu

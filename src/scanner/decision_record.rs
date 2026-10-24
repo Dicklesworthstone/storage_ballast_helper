@@ -709,6 +709,22 @@ pub fn decision_summary_line(record: &DecisionRecord) -> String {
     )
 }
 
+/// A representative record for tests elsewhere in the crate (the logger's
+/// evidence-ledger dedupe builds its records from it).
+#[cfg(test)]
+pub(crate) fn sample_record_for_tests(
+    policy_mode: PolicyMode,
+    effective_action: Option<DecisionAction>,
+) -> DecisionRecord {
+    DecisionRecordBuilder::new().build(
+        &tests::sample_score(),
+        policy_mode,
+        None,
+        None,
+        effective_action,
+    )
+}
+
 // ──────────────────── tests ────────────────────
 
 #[cfg(test)]
@@ -751,7 +767,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    fn sample_score() -> CandidacyScore {
+    pub(super) fn sample_score() -> CandidacyScore {
         CandidacyScore {
             path: PathBuf::from("/data/projects/foo/.target_opus"),
             identity: None,
@@ -1363,6 +1379,7 @@ mod tests {
                 has_cargo_toml: false,
                 mostly_object_files: true,
                 has_cachedir_tag: false,
+                has_pyvenv_cfg: false,
             },
             active_references: ActiveReferenceSummary::default(),
             is_open: false,

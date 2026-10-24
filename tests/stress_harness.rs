@@ -1350,7 +1350,6 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
 
         let mut voi = VoiScheduler::new(VoiConfig {
             scan_budget_per_interval: 5,
-            exploration_quota_fraction: 0.20,
             ..VoiConfig::default()
         });
 

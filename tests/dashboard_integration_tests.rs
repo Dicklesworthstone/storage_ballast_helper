@@ -172,6 +172,8 @@ fn sample_daemon_state() -> DaemonState {
             bytes_freed: 10_737_418_240, // 10 GB
             errors: 2,
             dropped_log_events: 0,
+            freed_basis: storage_ballast_helper::scanner::deletion::FreedBasis::Observed,
+            bytes_freed_observed: None,
         },
         policy_mode: "enforce".into(),
         mount_controllers: Vec::new(),
@@ -456,6 +458,8 @@ fn state_file_large_counters_roundtrip() {
             bytes_freed: u64::MAX / 2,
             errors: 999_999,
             dropped_log_events: 1_000_000,
+            freed_basis: storage_ballast_helper::scanner::deletion::FreedBasis::Observed,
+            bytes_freed_observed: None,
         },
         ..DaemonState::default()
     };

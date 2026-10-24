@@ -1,6 +1,6 @@
 [package]
 name = "storage_ballast_helper"
-version = "0.6.24"
+version = "0.7.10"
 edition = "2024"
 license = "MIT"
 description = "System service that prevents disk-full scenarios from coding agent swarms via ballast files, artifact scanning, and special location monitoring."
@@ -22,8 +22,8 @@ harness = false
 [features]
 # `tui` ships by default (bd-rc-master-ajg1.4.7): `sbh dashboard` is the
 # cockpit, and CI builds the feature set the release binaries carry
-# (`--no-default-features --features cli,daemon,sqlite,tui`; frankentui is a
-# public git dependency). A lean build drops it with
+# (`--no-default-features --features cli,daemon,sqlite,tui`; frankentui comes
+# from crates.io). A lean build drops it with
 # `--no-default-features --features cli,daemon,sqlite`.
 default = ["cli", "daemon", "sqlite", "tui"]
 cli = ["dep:clap", "dep:clap_complete", "dep:colored", "sqlite", "daemon"]
@@ -59,14 +59,12 @@ rusqlite = { version = "0.40", features = ["bundled", "functions"], optional = t
 # Error handling (core)
 thiserror = "2.0"
 # TUI (optional — gated behind "tui" feature).
-# Sourced from the frankentui git repo at a pinned tag (matching the convention
-# in cass/frankenterm) rather than a local /dp path, so `cargo install --git` and
-# CI can resolve these off this VPS. The previous absolute-path deps broke any
-# off-VPS source build because cargo reads optional deps during resolution
-# regardless of which features are active (sbh#12).
-ftui = { git = "https://github.com/Dicklesworthstone/frankentui", tag = "v0.6.0", default-features = false, optional = true }
-ftui-backend = { git = "https://github.com/Dicklesworthstone/frankentui", tag = "v0.6.0", optional = true }
-ftui-tty = { git = "https://github.com/Dicklesworthstone/frankentui", tag = "v0.6.0", optional = true }
+# Published crates.io releases, so any source build resolves them. The earlier
+# absolute-path deps broke every off-VPS build, because cargo reads optional
+# deps during resolution whichever features are active (sbh#12).
+ftui = { version = "0.6.0", default-features = false, optional = true }
+ftui-backend = { version = "0.6.0", optional = true }
+ftui-tty = { version = "0.6.0", optional = true }
 # Timestamps (core)
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # Concurrency (core — used by scanner walker, not just daemon)
@@ -90,6 +88,7 @@ rustix = { version = "=1.1.4", features = ["fs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 inotify = { version = "0.11.1", default-features = false }
+sbh_btrfs = { path = "crates/sbh_btrfs" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue"] }
@@ -104,11 +103,19 @@ filetime = "0.2"
 criterion = "0.8.2"
 insta = { version = "1.47.2", default-features = false }
 [profile.release]
-opt-level = "z"
+# Speed, not size: release binaries are performance-optimized (the size build
+# was 28-36% slower in user CPU on scan and plan workloads, and 46% smaller).
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+[profile.dev.package.sha2]
+# The updater and its tests hash the whole sbh binary (225 MB in a debug
+# build). Unoptimized SHA-256 spent 20+ s per pass, past the update
+# tests' restart deadlines on a loaded worker. Release builds are opt-level 3
+# already; this only speeds dev and test builds.
+opt-level = 3
 [lints.rust]
 # The daemon and CLI never touch raw FFI: every unsafe call the project needs
 # (Mach task/host statistics, libproc, the dispatch memory-pressure source)
@@ -136,4 +143,8 @@ assert_is_empty = "allow"
 # compiles to nothing (`#![cfg(target_os = "macos")]`), so Linux jobs that build
 # the root package alone are unaffected.
 [workspace]
-members = [".", "crates/sbh_mach"]
+# `crates/sbh_btrfs` likewise compiles to nothing off Linux x86-64/AArch64 and
+# keeps its own lane through `cargo test -p sbh_btrfs`. It must be a member:
+# excluded while the root depends on it by path, cargo refuses the workspace
+# ("multiple workspace roots").
+members = [".", "crates/sbh_mach", "crates/sbh_btrfs"]

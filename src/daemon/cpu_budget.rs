@@ -38,7 +38,11 @@
 //! state write, the service-manager heartbeat and signal handling keep
 //! their cadence because the per-tick yield is capped below the shortest
 //! of those cadences, and Critical pressure disables yielding entirely
-//! (disk safety wins). Operator and config-reload scans bypass it too.
+//! (disk safety wins). This is a monitor exemption, not unlimited permission
+//! for a discretionary scan: a large volume can remain Critical by percentage
+//! for days with hundreds of GiB still available (bd-gh0x, bd-51ti). Such passes
+//! use the same measured CPU allowance as other levels. Operator and
+//! config-reload scans continue to bypass pass admission at the caller.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -239,17 +243,23 @@ impl CpuBudget {
     }
 
     /// What a discretionary scan pass may spend right now, in **CPU**-seconds:
-    /// `None` means no limit (budget disabled, or Critical pressure),
-    /// `Some(0.0)` means do not start (fewer than [`PASS_MIN_TOKENS`]
-    /// CPU-seconds in the bucket), otherwise the CPU-seconds in the bucket.
+    /// `None` means no limit (budget explicitly disabled). `Some(0.0)` means
+    /// wait for the admission floor; otherwise the allowance is the currently
+    /// available CPU-seconds. Critical affects urgency, not this resource bound.
+    ///
+    /// The monitor's [`Self::yield_for`] exemption keeps Critical ballast,
+    /// heartbeat and state work responsive while the discretionary scanner
+    /// waits. Forced/config-reload callers may still select an unlimited guard.
+    /// The pressure argument is retained for source compatibility; a level
+    /// transition must not create fresh credit or discard an existing deficit.
     ///
     /// The caller charges the pass its measured rusage delta through
     /// [`PassCpuGuard`] rather than converting this to a wall deadline; see
     /// the module docs for why the conversion was the bug that kept the
     /// scanner to 0.7 s passes.
     #[must_use]
-    pub fn pass_cpu_allowance(&self, level: PressureLevel) -> Option<f64> {
-        if !self.enabled() || level >= PressureLevel::Critical {
+    pub fn pass_cpu_allowance(&self, _level: PressureLevel) -> Option<f64> {
+        if !self.enabled() {
             return None;
         }
         // Wait for a nearly full bucket, not merely PASS_MIN_TOKENS: a pass
@@ -400,16 +410,18 @@ impl std::fmt::Debug for PassCpuGuard {
 impl PassCpuGuard {
     /// A guard over `allowance_secs` CPU-seconds (`None` = unlimited),
     /// reading the process's cumulative user+system CPU seconds from
-    /// `sampler`. A sampler that returns `None` (the platform cannot report
-    /// CPU time) makes the guard inert: the pass is then bounded by its wall
-    /// budget alone, which is the safe direction — the old code's failure was
-    /// stopping too early, not too late.
+    /// `sampler`. Unavailable or invalid CPU readings do not invent a cost.
+    /// Sampling continues at the configured interval, so a transient startup
+    /// failure does not disable pacing for the entire pass. The first valid
+    /// reading becomes the baseline; CPU before it is unknown, not the process's
+    /// lifetime total. If no usable measurements arrive, only the caller's wall
+    /// budget bounds the pass, preserving the unsupported-platform fallback.
     pub fn new(
         allowance_secs: Option<f64>,
         now: Instant,
         mut sampler: impl FnMut() -> Option<f64> + Send + 'static,
     ) -> Self {
-        let baseline_secs = sampler();
+        let baseline_secs = sampler().filter(|value| value.is_finite() && *value >= 0.0);
         Self {
             allowance_secs,
             baseline_secs,
@@ -441,7 +453,8 @@ impl PassCpuGuard {
         self.allowance_secs
     }
 
-    /// CPU-seconds charged to this pass so far (as of the last sample).
+    /// Greatest valid CPU delta observed for this pass. A missing initial
+    /// baseline leaves the unmeasured prefix out, so this can be a lower bound.
     #[must_use]
     pub const fn spent_secs(&self) -> f64 {
         self.spent_secs
@@ -456,10 +469,13 @@ impl PassCpuGuard {
         let Some(allowance) = self.allowance_secs else {
             return false;
         };
-        if self.baseline_secs.is_none() {
-            return false;
-        }
-        if now.saturating_duration_since(self.last_sample) < self.sample_interval {
+        // A failed baseline must not make the guard permanently inert. Retry
+        // at the same bounded cadence used after successful observations.
+        // A regressing caller clock never renews the sampling allowance.
+        if now
+            .checked_duration_since(self.last_sample)
+            .is_none_or(|elapsed| elapsed < self.sample_interval)
+        {
             return false;
         }
         self.last_sample = now;
@@ -468,16 +484,22 @@ impl PassCpuGuard {
         self.exhausted
     }
 
-    /// Read the sampler once and update `spent_secs` (no latching).
+    /// Recover a missing baseline, then keep the largest observed delta.
+    /// A later failed, malformed or regressing sample cannot erase CPU already
+    /// charged. Retaining the original baseline also counts a temporary read
+    /// gap when the cumulative process counter becomes available again.
     fn sample(&mut self) {
-        let (Some(baseline), Some(current)) = (self.baseline_secs, (self.sampler)()) else {
+        let Some(current) = (self.sampler)().filter(|value| value.is_finite() && *value >= 0.0)
+        else {
             return;
         };
-        self.spent_secs = (current - baseline).max(0.0);
+        let baseline = *self.baseline_secs.get_or_insert(current);
+        self.spent_secs = self.spent_secs.max((current - baseline).max(0.0));
     }
 
-    /// Final accounting for the pass, ignoring the sampling interval. Call
-    /// once when the pass ends so the reported figure is the whole pass.
+    /// Final accounting, ignoring the sampling interval. Call once when the
+    /// pass ends. A failed final read preserves the greatest observed cost;
+    /// this cannot reconstruct CPU spent before the first usable baseline.
     pub fn finish(&mut self) -> f64 {
         self.sample();
         self.spent_secs
@@ -568,8 +590,11 @@ mod tests {
         b.observe(t0 + secs(17.0), 104.5); // +3.5 refill -> 4.75 = 95% of 5
         let refilled = b.pass_cpu_allowance(PressureLevel::Orange).unwrap();
         assert!((refilled - 4.75).abs() < 1e-9, "{refilled}");
-        // Critical and a disabled budget never limit a pass.
-        assert_eq!(b.pass_cpu_allowance(PressureLevel::Critical), None);
+        // A Critical pass has the same funded slice, not an unlimited bypass.
+        assert_eq!(
+            b.pass_cpu_allowance(PressureLevel::Critical),
+            Some(refilled)
+        );
         let (off, _) = budget(0);
         assert_eq!(off.pass_cpu_allowance(PressureLevel::Green), None);
     }
@@ -702,6 +727,150 @@ mod tests {
     }
 
     #[test]
+    fn critical_pass_is_finite_while_its_monitor_never_yields() {
+        let (b, t0) = budget(25);
+        let allowance = b.pass_cpu_allowance(PressureLevel::Critical);
+        assert_eq!(allowance, Some(BURST_SECS));
+        let cpu = std::sync::Arc::new(std::sync::Mutex::new(100.0));
+        let sample = std::sync::Arc::clone(&cpu);
+        let mut guard = PassCpuGuard::new(allowance, t0, move || Some(*sample.lock().unwrap()))
+            .with_sample_interval(Duration::ZERO);
+        *cpu.lock().unwrap() = 100.0 + BURST_SECS - 0.25;
+        assert!(!guard.exhausted(t0));
+        *cpu.lock().unwrap() = 100.0 + BURST_SECS;
+        assert!(guard.exhausted(t0));
+        assert_eq!(
+            b.yield_for(PressureLevel::Critical, MAX_TICK_YIELD),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn critical_deficit_blocks_only_scan_admission_and_recovers_at_the_fill_floor() {
+        let (mut b, t0) = budget(25);
+        b.observe(t0 + secs(1.0), 106.0); // 5 + .25 - 6 = -.75.
+        assert_eq!(b.pass_cpu_allowance(PressureLevel::Critical), Some(0.0));
+        assert_eq!(
+            b.yield_for(PressureLevel::Critical, MAX_TICK_YIELD),
+            Duration::ZERO
+        );
+        // At 22 seconds the balance is 4.5, still below the 4.75 start floor.
+        b.observe(t0 + secs(22.0), 106.0);
+        assert_eq!(b.pass_cpu_allowance(PressureLevel::Critical), Some(0.0));
+        b.observe(t0 + secs(23.0), 106.0);
+        assert_eq!(b.pass_cpu_allowance(PressureLevel::Critical), Some(4.75));
+    }
+
+    #[test]
+    fn pressure_escalation_and_flapping_do_not_mint_scan_credit() {
+        let (mut b, t0) = budget(25);
+        b.observe(t0 + secs(1.0), 108.0);
+        let before = b.snapshot(t0 + secs(1.0));
+        for _ in 0..100 {
+            for level in [
+                PressureLevel::Green,
+                PressureLevel::Critical,
+                PressureLevel::Red,
+            ] {
+                assert_eq!(b.pass_cpu_allowance(level), Some(0.0));
+            }
+        }
+        assert_eq!(b.snapshot(t0 + secs(1.0)), before);
+        b.set_pct(50);
+        assert_eq!(b.pass_cpu_allowance(PressureLevel::Critical), Some(0.0));
+        assert_eq!(b.deficit_secs(), before.deficit_secs);
+    }
+
+    #[test]
+    fn explicit_budget_disable_and_operator_guard_keep_their_bypass() {
+        let (mut b, t0) = budget(25);
+        b.observe(t0 + secs(1.0), 200.0);
+        b.set_pct(0);
+        for level in [
+            PressureLevel::Green,
+            PressureLevel::Red,
+            PressureLevel::Critical,
+        ] {
+            assert_eq!(b.pass_cpu_allowance(level), None);
+        }
+        let mut forced = PassCpuGuard::unlimited(t0);
+        assert!(!forced.exhausted(t0 + secs(3600.0)));
+        // Turning accounting back on does not erase the existing cost.
+        b.set_pct(25);
+        assert_eq!(b.pass_cpu_allowance(PressureLevel::Critical), Some(0.0));
+    }
+
+    #[test]
+    fn memory_reduced_pace_still_applies_at_critical_disk_pressure() {
+        let t0 = Instant::now();
+        let mut b = CpuBudget::new(paced_pct(50, ScanAggressiveness::DefiniteOnly), t0, 0.0);
+        assert_eq!(b.pct(), 25);
+        b.observe(t0 + secs(1.0), 6.0);
+        assert_eq!(b.pass_cpu_allowance(PressureLevel::Critical), Some(0.0));
+        b.observe(t0 + secs(23.0), 6.0);
+        assert_eq!(b.pass_cpu_allowance(PressureLevel::Critical), Some(4.75));
+        let mut wider = CpuBudget::new(25, t0, 0.0).with_burst_secs(120.0);
+        assert_eq!(
+            wider.pass_cpu_allowance(PressureLevel::Critical),
+            Some(120.0)
+        );
+        wider.set_burst_secs(2.0);
+        assert_eq!(wider.pass_cpu_allowance(PressureLevel::Critical), Some(2.0));
+    }
+
+    #[test]
+    fn sustained_critical_work_makes_progress_without_an_unlimited_scan() {
+        // Drive the production bucket and pass guard with synthetic process
+        // CPU. This verifies accounting, not a real host's scheduling latency.
+        let t0 = Instant::now();
+        let mut b = CpuBudget::new(25, t0, 0.0);
+        let cpu = std::sync::Arc::new(std::sync::Mutex::new(0.0_f64));
+        let mut guard: Option<PassCpuGuard> = None;
+        let mut completed = 0;
+        let mut deferred = 0;
+        for tick in 0..6000_u32 {
+            let now = t0 + Duration::from_millis(u64::from(tick) * 100);
+            if guard.is_none() {
+                match b.pass_cpu_allowance(PressureLevel::Critical) {
+                    Some(allowance) if allowance > 0.0 => {
+                        let sample = std::sync::Arc::clone(&cpu);
+                        guard = Some(
+                            PassCpuGuard::new(Some(allowance), now, move || {
+                                Some(*sample.lock().unwrap())
+                            })
+                            .with_sample_interval(Duration::ZERO),
+                        );
+                    }
+                    Some(_) => deferred += 1,
+                    None => panic!("enabled Critical scanning must not be unlimited"),
+                }
+            }
+            let end = now + Duration::from_millis(100);
+            if let Some(active) = guard.as_mut() {
+                *cpu.lock().unwrap() += 0.1;
+                if active.exhausted(end) {
+                    completed += 1;
+                    guard = None;
+                }
+            }
+            let consumed = *cpu.lock().unwrap();
+            b.observe(end, consumed);
+            assert_eq!(
+                b.yield_for(PressureLevel::Critical, MAX_TICK_YIELD),
+                Duration::ZERO
+            );
+            let elapsed = end.duration_since(t0).as_secs_f64();
+            // One synthetic work quantum may cross the measured boundary.
+            assert!(consumed <= elapsed.mul_add(b.rate(), BURST_SECS) + 0.100_001);
+        }
+        assert!(
+            completed > 10,
+            "finite slices must continue to make progress"
+        );
+        assert!(deferred > 0, "permanent Critical must not erase pacing");
+    }
+
+    #[test]
     fn exceeded_line_is_logged_at_most_once_a_minute() {
         let (mut b, t0) = budget(10);
         assert!(b.observe(t0 + secs(1.0), 120.0).log_exceeded);
@@ -784,6 +953,17 @@ mod tests {
                     _ => PressureLevel::Critical,
                 };
                 let wait = b.yield_for(level, MAX_TICK_YIELD);
+                let allowance = b.pass_cpu_allowance(level);
+                if pct == 0 {
+                    proptest::prop_assert_eq!(allowance, None);
+                } else {
+                    // prop_assert! turns its expression into a format string,
+                    // so the closure's braces cannot appear inside it.
+                    let bounded = allowance
+                        .is_some_and(|value| value.is_finite() && (0.0..=BURST_SECS).contains(&value));
+                    proptest::prop_assert!(bounded, "allowance {allowance:?} outside 0..={BURST_SECS}");
+                    proptest::prop_assert_eq!(allowance, b.pass_cpu_allowance(PressureLevel::Green));
+                }
                 proptest::prop_assert!(wait <= MAX_TICK_YIELD);
                 if level == PressureLevel::Critical || pct == 0 {
                     proptest::prop_assert_eq!(wait, Duration::ZERO);
@@ -794,3 +974,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod sampling_tests;

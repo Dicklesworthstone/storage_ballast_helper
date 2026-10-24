@@ -16,7 +16,7 @@ use crate::platform::cleanup_catalog::{CleanupConfidence, CleanupRule, ReclaimCo
 use crate::platform::{linux, macos};
 use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, StructuralSignals, is_cargo_registry_internal_path,
-    is_obvious_build_artifact_basename,
+    is_obvious_build_artifact_basename, is_uv_cache_internal_path,
 };
 use crate::scanner::protection::SacredOverlap;
 use crate::scanner::walker::FsIdentity;
@@ -123,12 +123,14 @@ pub fn classify_certainty(
     let in_temp_root = location_factor >= 0.9;
     let pattern = classification.pattern_name.as_ref();
 
-    let definite = signals.has_cachedir_tag
+    let definite = signals.regenerable_cache_tag()
         || rust_markers >= 2
         || (classification.category == ArtifactCategory::GoCache
             && classification.structural_confidence >= 0.9)
         || (classification.category == ArtifactCategory::NodeModules && in_temp_root)
         || pattern == "xcode-derived-data"
+        // A copy of an installed app, made again at every launch.
+        || pattern == "opaque-browser-code-sign-clone"
         || pattern.starts_with("electron-");
     if definite {
         return ArtifactCertainty::Definite;
@@ -170,6 +172,8 @@ pub struct ActiveReferenceSummary {
     pub incomplete_reason: Option<String>,
 }
 
+// Each flag is an independent kind of evidence the veto names.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveReferenceProcess {
     pub pid: i32,
@@ -177,6 +181,13 @@ pub struct ActiveReferenceProcess {
     pub open_file_descriptors: usize,
     pub running_executable: bool,
     pub mmap_regions: usize,
+    /// The process's working directory is inside the tree (bd-d1kt).
+    pub working_directory: bool,
+    /// The process names the tree as its cargo home or target directory.
+    pub build_directory: bool,
+    /// The process is a running instance of the app this browser code-sign
+    /// clone copies, started just before the clone was made (bd-39da).
+    pub app_instance: bool,
 }
 
 impl ActiveReferenceSummary {
@@ -196,6 +207,26 @@ impl ActiveReferenceSummary {
 
     pub fn add_mmap_region(&mut self, pid: i32, name: Option<String>) {
         self.process_mut(pid, name).mmap_regions += 1;
+    }
+
+    /// A process working inside a tree is using it even when it holds no
+    /// descriptor there at the instant of the sweep (bd-d1kt): rustc compiles
+    /// a registry crate from that crate's source directory, opening each file
+    /// only for as long as it reads it.
+    pub fn add_working_directory(&mut self, pid: i32, name: Option<String>) {
+        self.process_mut(pid, name).working_directory = true;
+    }
+
+    /// A running build names the tree as its cargo home or target directory
+    /// (bd-d1kt). It is in use for as long as that build runs.
+    pub fn add_build_directory(&mut self, pid: i32, name: Option<String>) {
+        self.process_mut(pid, name).build_directory = true;
+    }
+
+    /// A browser need not hold its code-sign clone open while it runs, yet
+    /// needs it to launch helpers after an in-place update (bd-39da).
+    pub fn add_app_instance(&mut self, pid: i32, name: Option<String>) {
+        self.process_mut(pid, name).app_instance = true;
     }
 
     pub fn mark_incomplete(&mut self, reason: impl Into<String>) {
@@ -246,6 +277,9 @@ impl ActiveReferenceSummary {
                 open_file_descriptors: 0,
                 running_executable: false,
                 mmap_regions: 0,
+                working_directory: false,
+                build_directory: false,
+                app_instance: false,
             });
             self.processes.sort_by_key(|p| p.pid);
             self.processes
@@ -267,7 +301,12 @@ impl ActiveReferenceSummary {
 impl ActiveReferenceProcess {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.open_file_descriptors == 0 && !self.running_executable && self.mmap_regions == 0
+        self.open_file_descriptors == 0
+            && !self.running_executable
+            && self.mmap_regions == 0
+            && !self.working_directory
+            && !self.build_directory
+            && !self.app_instance
     }
 
     fn safe_reclaim_reason(&self) -> String {
@@ -289,6 +328,15 @@ impl ActiveReferenceProcess {
         }
         if self.mmap_regions > 0 {
             evidence.push(pluralize(self.mmap_regions, "mmap region", "mmap regions"));
+        }
+        if self.working_directory {
+            evidence.push("its working directory here".to_string());
+        }
+        if self.build_directory {
+            evidence.push("its cargo home or target directory here".to_string());
+        }
+        if self.app_instance {
+            evidence.push("the running app this clone was made for".to_string());
         }
         format!("{label} has {}", evidence.join(", "))
     }
@@ -617,6 +665,11 @@ impl ScoringEngine {
                 "inside a cargo registry/git store: crate source, not build output",
             ));
         }
+        if is_uv_cache_internal_path(&input.path) {
+            return Some(Cow::Borrowed(
+                "inside a uv cache entry: installed packages, managed by uv",
+            ));
+        }
         if let Some(reason) = rch_target_veto_reason(&input.path, urgency) {
             return Some(reason);
         }
@@ -673,7 +726,10 @@ impl ScoringEngine {
         // re-dispatch from the index every pass and an "empty pass" back-off
         // (fmd: 902 refused plans an hour, hz1: 58 back-offs at Critical,
         // 2026-09-30). The executor keeps its own checks.
-        if crate::scanner::deletion::is_hardcoded_source_tree(&input.path) {
+        if crate::scanner::deletion::is_hardcoded_source_tree_given(
+            &input.path,
+            input.signals.has_strong_signal(),
+        ) {
             return Some(Cow::Borrowed(
                 "inside a project source tree and not an obvious build-artifact name",
             ));
@@ -1040,6 +1096,8 @@ fn factor_location(path: &Path) -> f64 {
         || text.starts_with("/data/tmp")
         || text.starts_with("/dev/shm")
         || crate::scanner::patterns::is_darwin_user_temp_path(path)
+        // A browser makes each code-sign clone as a temporary directory.
+        || crate::scanner::patterns::is_browser_code_sign_clone(path)
     {
         0.95
     } else if text.contains("/data/projects/") && text.contains("/.tmp_") {
@@ -1164,7 +1222,7 @@ fn factor_structure(signals: StructuralSignals) -> f64 {
     }
     // A validated CACHEDIR.TAG root marker is a definitive regenerable-cache
     // signal, independent of the directory's name or nested cargo markers.
-    if signals.has_cachedir_tag {
+    if signals.regenerable_cache_tag() {
         return 0.95;
     }
     if signals.has_fingerprint || signals.has_incremental {
@@ -1922,9 +1980,11 @@ mod tests {
     fn is_system_path_lifts_only_root_build_artifacts() {
         // THE fix: a proven regenerable build artifact stranded under /root is
         // no longer a system path, so it can be scored + reclaimed.
-        assert!(!is_system_path(Path::new("/root/cass-ft-target")));
         assert!(!is_system_path(Path::new("/root/target")));
-        assert!(!is_system_path(Path::new("/root/foo_target")));
+        // A descriptive suffix name lifts only with cargo's root markers
+        // readable (issue #34); nothing is readable at these test paths.
+        assert!(is_system_path(Path::new("/root/cass-ft-target")));
+        assert!(is_system_path(Path::new("/root/foo_target")));
         // A cargo target nested a level under a non-artifact dir is also
         // liftable (only its own basename matters); the parent stays vetoed.
         assert!(!is_system_path(Path::new("/root/build-area/target")));
@@ -2145,6 +2205,7 @@ mod tests {
                     has_cargo_toml: false,
                     mostly_object_files: true,
                     has_cachedir_tag: false,
+                    has_pyvenv_cfg: false,
                 },
                 active_references: ActiveReferenceSummary::default(),
                 is_open: false,
@@ -2318,6 +2379,29 @@ mod tests {
         let score = engine.score_candidate(&fresh, 0.93);
         assert!(score.vetoed, "{:?}", score.veto_reason);
         assert!(!score.decision.posterior_floor_applied);
+    }
+
+    /// A browser's per-launch app clone sits in the temp location band and is
+    /// definitely regenerable; whether it is in use is the vetoes' call
+    /// (bd-39da).
+    #[test]
+    fn browser_code_sign_clones_are_definite_temp_output() {
+        let clone = Path::new(
+            "/private/var/folders/vt/n2xy/X/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk",
+        );
+        let location = super::factor_location(clone);
+        assert!((location - 0.95).abs() < f64::EPSILON, "{location}");
+        let classification = ArtifactClassification {
+            pattern_name: Cow::Borrowed("opaque-browser-code-sign-clone"),
+            category: ArtifactCategory::TempDir,
+            name_confidence: 0.93,
+            structural_confidence: 1.0,
+            combined_confidence: 0.93,
+        };
+        assert_eq!(
+            classify_certainty(&classification, StructuralSignals::default(), location),
+            ArtifactCertainty::Definite
+        );
     }
 
     #[test]
@@ -2698,6 +2782,7 @@ mod tests {
                 has_cargo_toml: false,
                 mostly_object_files: true,
                 has_cachedir_tag: false,
+                has_pyvenv_cfg: false,
             },
             active_references: ActiveReferenceSummary::default(),
             is_open: false,
@@ -2741,6 +2826,7 @@ mod tests {
                 has_cargo_toml: false,
                 mostly_object_files: false,
                 has_cachedir_tag: false,
+                has_pyvenv_cfg: false,
             },
             active_references: ActiveReferenceSummary::default(),
             is_open: false,
@@ -2887,6 +2973,7 @@ mod tests {
                 has_cargo_toml: false,
                 mostly_object_files: false,
                 has_cachedir_tag: false,
+                has_pyvenv_cfg: false,
             },
             active_references: ActiveReferenceSummary::default(),
             is_open: false,
@@ -2957,6 +3044,38 @@ mod tests {
         let score = engine.score_candidate(&candidate(scratch_crate), 0.95);
         assert!(!score.vetoed, "{score:?}");
         assert_eq!(score.decision.action, DecisionAction::Delete);
+    }
+
+    #[test]
+    fn suffix_named_evidence_without_cargo_structure_is_vetoed_in_a_project_tree() {
+        // Issue #34 (ts2, 2026-09-25): these scored name=1.0, structure=0.4 and
+        // were deleted on the `*_target` / `*-target` suffix alone.
+        let engine = default_engine();
+        for path in [
+            "/data/projects/hfdt-release-v0.3.15/publish-gates-v1/sanitizer-wrapper-controls-v1/invalid_target",
+            "/data/projects/hfdt-fon4nq/baseline/ambient-target",
+        ] {
+            let input = CandidateInput {
+                path: PathBuf::from(path),
+                size_bytes: 28_672,
+                age: Duration::from_hours(400),
+                classification: classification(0.93, ArtifactCategory::RustTarget),
+                signals: StructuralSignals::default(),
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            };
+            let score = engine.score_candidate(&input, 0.95);
+            assert!(score.vetoed, "{path}");
+            assert!(
+                score
+                    .veto_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("project source tree")),
+                "{path}: {:?}",
+                score.veto_reason
+            );
+        }
     }
 
     #[test]
@@ -3034,6 +3153,7 @@ mod tests {
                     has_cargo_toml: false,
                     mostly_object_files: false,
                     has_cachedir_tag: false,
+                    has_pyvenv_cfg: false,
                 },
                 active_references: ActiveReferenceSummary::default(),
                 is_open: false,

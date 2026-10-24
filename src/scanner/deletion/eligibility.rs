@@ -37,6 +37,14 @@ pub(super) fn check(candidate: &CandidacyScore, config: &DeletionConfig) -> Resu
     {
         return Err(SkipReason::Vetoed);
     }
+    // The daemon already supplies every configured scanner root here, even
+    // for unlink batches. A caller that omitted explicit policy installation
+    // must not lose whole-root protection of untracked repository siblings.
+    // This initializes deny-only scope, never an opt-in; the existing root
+    // authorizations still refresh it during preflight and final mutation.
+    config
+        .source_roots
+        .include_default_roots(&config.quarantine_roots);
     check_path(candidate, config)
 }
 
@@ -202,6 +210,7 @@ mod tests {
     use crate::scanner::scoring::{
         ArtifactCertainty, DecisionOutcome, EvidenceLedger, ScoreFactors,
     };
+    use crate::scanner::source_roots::SourceRootPolicy;
     use crate::scanner::walker::identity_for_path;
 
     const PAYLOAD: &[u8] = b"preserve these bytes";
@@ -693,6 +702,9 @@ mod tests {
             symlink(&real, &alias).unwrap();
             let item = candidate(&alias.join("target"));
             let mut cfg = config(dir.path(), mode);
+            // Scope the scanner to the real subtree, not the parent holding
+            // a directory link whose full contents cannot be proven clear.
+            cfg.source_roots = SourceRootPolicy::new(std::slice::from_ref(&real), false);
             cfg.sacred_paths.clear();
             let executor = DeletionExecutor::new(cfg, None);
             assert!(executor.explain_preflight(&item, None).is_ok());
@@ -730,6 +742,7 @@ mod tests {
                     protected.clone()
                 };
                 let mut cfg = config(dir.path(), mode);
+                cfg.source_roots = SourceRootPolicy::new(std::slice::from_ref(&real), false);
                 cfg.sacred_paths
                     .extend(protection::sacred_paths_from_protected_patterns(&[pattern
                         .to_string_lossy()
@@ -788,7 +801,9 @@ mod tests {
             let alias = dir.path().join("alias");
             symlink(&real, &alias).unwrap();
             let item = candidate(&alias.join("target"));
-            let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+            let mut cfg = config(dir.path(), mode);
+            cfg.source_roots = SourceRootPolicy::new(std::slice::from_ref(&real), false);
+            let executor = DeletionExecutor::new(cfg, None);
             assert!(executor.explain_preflight(&item, None).is_ok());
             let plan = executor.plan(vec![item]);
             assert_eq!(plan.estimated_items, 1);

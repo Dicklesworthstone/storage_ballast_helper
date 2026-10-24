@@ -29,7 +29,7 @@ fn config_in(dir: &Path) -> std::path::PathBuf {
     fs::create_dir_all(&data).unwrap();
     let config = format!(
         "[paths]\nballast_dir = {:?}\njsonl_log = {:?}\nsqlite_db = {:?}\nstate_file = {:?}\n\
-         [scanner]\nroot_paths = [{:?}]\nmin_file_age_minutes = 0\n[notifications]\nenabled = false\n",
+         [scanner]\ninclude_user_temp_dir = false\nroot_paths = [{:?}]\nmin_file_age_minutes = 0\n[notifications]\nenabled = false\n",
         data.join("ballast").display().to_string(),
         data.join("activity.jsonl").display().to_string(),
         data.join("activity.sqlite3").display().to_string(),
@@ -40,6 +40,13 @@ fn config_in(dir: &Path) -> std::path::PathBuf {
     fs::write(&path, config).unwrap();
     fs::create_dir_all(dir.join("root")).unwrap();
     path
+}
+
+/// A directory on the build volume. `check` on a tmpfs or ramfs path also
+/// requires a clean host RAM-scratch assessment (bd-paeg), so a threshold
+/// test on a tempdir under a busy tmpfs `/tmp` would test the host instead.
+fn disk_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
 }
 
 fn stdout(output: &Output) -> String {
@@ -54,7 +61,7 @@ fn stderr(output: &Output) -> String {
 /// (not the I/O class), and the report is on stdout.
 #[test]
 fn check_unmet_need_is_exit_one_with_the_report_on_stdout() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = disk_tempdir();
     let config = config_in(dir.path());
     let need = u64::MAX / 2;
     let output = sbh(
@@ -94,7 +101,7 @@ fn check_unmet_need_is_exit_one_with_the_report_on_stdout() {
 /// `check` on a volume above its threshold is exit 0 and prints nothing.
 #[test]
 fn check_above_threshold_is_exit_zero() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = disk_tempdir();
     let config = config_in(dir.path());
     let output = sbh(
         &config,
@@ -107,6 +114,29 @@ fn check_above_threshold_is_exit_zero() {
     );
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+}
+
+/// `check` without `--target-free` uses the daemon's Yellow line, absolute
+/// floors included (bd-ud9s): a large disk well above its floor is not under
+/// pressure just because its free share is below the percentage.
+#[test]
+fn check_honours_the_absolute_free_floors() {
+    let dir = disk_tempdir();
+    let config = config_in(dir.path());
+    let base = fs::read_to_string(&config).unwrap();
+    let percentages = "[pressure]\ngreen_min_free_pct = 99.9\nyellow_min_free_pct = 99.8\n\
+                       orange_min_free_pct = 99.7\nred_min_free_pct = 99.6\n";
+    let target = dir.path().display().to_string();
+
+    fs::write(&config, format!("{base}{percentages}")).unwrap();
+    let without_floors = sbh(&config, &["check", &target]);
+    assert_eq!(without_floors.status.code(), Some(1), "{without_floors:?}");
+
+    let floors = "green_min_free_bytes = 4\nyellow_min_free_bytes = 3\n\
+                  orange_min_free_bytes = 2\nred_min_free_bytes = 1\n";
+    fs::write(&config, format!("{base}{percentages}{floors}")).unwrap();
+    let with_floors = sbh(&config, &["check", &target]);
+    assert_eq!(with_floors.status.code(), Some(0), "{with_floors:?}");
 }
 
 /// A path that cannot be stat'ed is an I/O failure: exit 2.

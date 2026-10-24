@@ -4,13 +4,12 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use crate::core::errors::{Result, SbhError};
 use crate::core::paths::resolve_absolute_path;
 use crate::platform::types::{
-    ExecutablesResult, MappedRegion, OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET, OpenFile,
-    OpenFileKind, OpenFileMode, OpenFilesResult, PalError, ProcessInfo, ProcessIo, SelfStats,
+    ExecutablesResult, MappedRegion, OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET, OpenFileKind,
+    OpenFileMode, OpenFilesResult, PalError, ProcessInfo, ProcessIo, SelfStats,
 };
 
 const PROC_SELF_STATUS: &str = "/proc/self/status";
@@ -18,6 +17,9 @@ const PROC_SELF_STAT: &str = "/proc/self/stat";
 const PROC_SELF_IO: &str = "/proc/self/io";
 const PROC_ROOT: &str = "/proc";
 const PROC_STAT: &str = "/proc/stat";
+
+mod mmap_scan;
+mod reference_scan;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StatusMemory {
@@ -38,6 +40,70 @@ struct IoCounters {
 }
 
 pub(super) fn read_process_list() -> Result<Vec<ProcessInfo>> {
+    read_processes(true)
+}
+
+/// The process list without reading any process's `cmdline`, which takes
+/// that process's memory-map lock and can block behind it indefinitely.
+pub(super) fn read_process_list_without_command_lines() -> Result<Vec<ProcessInfo>> {
+    read_processes(false)
+}
+
+/// Pid, parent, name, start time and CPU times of every visible process,
+/// each from one `/proc/<pid>/stat` read: no executable, cwd, memory
+/// counters or command line (see `Platform::process_list_brief`).
+pub(super) fn read_process_list_brief() -> Result<Vec<ProcessInfo>> {
+    let current_pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
+    let boot_time_unix_ms = read_proc_file(PROC_STAT)
+        .ok()
+        .and_then(|raw| parse_proc_boot_time_unix_ms(&raw).ok());
+    let ticks_per_second = clock_ticks_per_second();
+    let mut processes: Vec<ProcessInfo> = proc_pids()?
+        .into_iter()
+        .filter(|pid| *pid > 0 && *pid != current_pid)
+        .filter_map(|pid| {
+            let stat = fs::read_to_string(pid_proc_path(pid).join("stat")).ok()?;
+            brief_process_info(pid, &stat, boot_time_unix_ms, ticks_per_second)
+        })
+        .collect();
+    processes.sort_by_key(|process| process.pid);
+    Ok(processes)
+}
+
+/// A [`read_process_list_brief`] entry from one `/proc/<pid>/stat` line.
+/// The name sits between the first `(` and the last `)`, since a command
+/// name may contain either.
+fn brief_process_info(
+    pid: i32,
+    stat: &str,
+    boot_time_unix_ms: Option<i64>,
+    ticks_per_second: u64,
+) -> Option<ProcessInfo> {
+    let name = stat
+        .split_once('(')
+        .and_then(|(_, rest)| rest.rsplit_once(')'))
+        .map(|(name, _)| name.to_string())
+        .filter(|name| !name.is_empty())?;
+    let fields = proc_stat_fields_after_comm(stat).ok()?;
+    let cpu = parse_proc_self_stat(stat, ticks_per_second).ok();
+    Some(ProcessInfo {
+        pid,
+        parent_pid: fields.get(1).and_then(|raw| raw.parse::<i32>().ok()),
+        name,
+        command_line: Vec::new(),
+        executable: None,
+        cwd: None,
+        start_time_unix_ms: boot_time_unix_ms.and_then(|boot_time| {
+            parse_proc_start_time_unix_ms(stat, boot_time, ticks_per_second).ok()
+        }),
+        virtual_memory_bytes: None,
+        resident_memory_bytes: None,
+        cpu_user_micros: cpu.map(|times| times.user_micros),
+        cpu_system_micros: cpu.map(|times| times.system_micros),
+    })
+}
+
+fn read_processes(with_command_lines: bool) -> Result<Vec<ProcessInfo>> {
     let current_pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
     let boot_time_unix_ms = read_proc_file(PROC_STAT)
         .ok()
@@ -48,7 +114,7 @@ pub(super) fn read_process_list() -> Result<Vec<ProcessInfo>> {
         if pid <= 0 || pid == current_pid {
             continue;
         }
-        if let Some(process) = process_info_for_pid(pid, boot_time_unix_ms) {
+        if let Some(process) = process_info_for_pid(pid, boot_time_unix_ms, with_command_lines) {
             processes.push(process);
         }
     }
@@ -62,116 +128,50 @@ pub(super) fn read_process_list() -> Result<Vec<ProcessInfo>> {
 }
 
 pub(super) fn read_open_files_under(root: &Path) -> Result<OpenFilesResult> {
-    let root = resolve_absolute_path(root);
-    let mut open_files = Vec::new();
-    let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
-    let mut pids_scanned: usize = 0;
-    let mut incomplete = false;
+    reference_scan::open_files(root)
+}
 
-    for pid in proc_pids()? {
-        if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
-            incomplete = true;
-            break;
-        }
-        if pid > 0 {
-            pids_scanned += 1;
-            open_files.extend(open_files_for_pid_under(pid, &root));
-        }
-    }
-    open_files.sort_by(|left, right| {
-        left.pid
-            .cmp(&right.pid)
-            .then_with(|| left.fd.cmp(&right.fd))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    Ok(OpenFilesResult {
-        files: open_files,
-        complete: !incomplete,
-    })
+pub(super) fn read_open_files_under_roots(roots: &[PathBuf]) -> Result<OpenFilesResult> {
+    reference_scan::open_files_roots(roots)
+}
+
+/// The native executor needs paths and coverage, not per-descriptor display
+/// metadata. Share the bounded proc traversal without paying for annotations.
+pub(crate) fn read_open_file_targets() -> Result<(Vec<PathBuf>, bool)> {
+    reference_scan::open_targets()
 }
 
 pub(super) fn read_executables_under(root: &Path) -> Result<ExecutablesResult> {
-    let root = resolve_absolute_path(root);
-    let boot_time_unix_ms = read_proc_file(PROC_STAT)
-        .ok()
-        .and_then(|raw| parse_proc_boot_time_unix_ms(&raw).ok());
-    let mut processes = Vec::new();
-    let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
-    let mut pids_scanned: usize = 0;
-    let mut incomplete = false;
-
-    for pid in proc_pids()? {
-        if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
-            incomplete = true;
-            break;
-        }
-        if pid > 0 {
-            pids_scanned += 1;
-            if let Some(process) = process_info_for_pid(pid, boot_time_unix_ms)
-                && process
-                    .executable
-                    .as_deref()
-                    .is_some_and(|executable| resolve_absolute_path(executable).starts_with(&root))
-            {
-                processes.push(process);
-            }
-        }
-    }
-    processes.sort_by(|left, right| {
-        left.pid
-            .cmp(&right.pid)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    Ok(ExecutablesResult {
-        processes,
-        complete: !incomplete,
-    })
+    reference_scan::executables(root)
 }
 
-/// How long one sweep of every process's `maps` serves all roots and callers.
-const MMAP_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+pub(super) fn read_executables_under_roots(roots: &[PathBuf]) -> Result<ExecutablesResult> {
+    reference_scan::executables_roots(roots)
+}
 
+pub(super) fn read_build_directories_in_use() -> Vec<(i32, PathBuf)> {
+    reference_scan::build_directories()
+}
+
+pub(crate) fn read_build_directory_snapshot() -> (Vec<(i32, PathBuf)>, bool) {
+    reference_scan::build_directory_snapshot()
+}
+
+/// Return mappings only when the visible process scope was fully inspected.
+/// The Vec-returning PAL interface cannot carry partial coverage, so access
+/// failures, malformed data and budget exhaustion must remain explicit errors.
 pub(super) fn read_mmap_regions_under(root: &Path) -> Result<Vec<MappedRegion>> {
-    let root = resolve_absolute_path(root);
-    Ok(mmap_snapshot()?
-        .iter()
-        .filter(|region| region.path.starts_with(&root))
-        .cloned()
-        .collect())
+    mmap_scan::read_under(root)
 }
 
-/// Every file-backed mapping of every process, shared for
-/// [`MMAP_SNAPSHOT_TTL`]. Reading `/proc/*/maps` is kernel-heavy (one sweep
-/// of trj's ~2,400 processes cost ~6 CPU-seconds) and was done once per scan
-/// root on every active-reference index build, which ran almost every pass:
-/// trj's scanner sat at a full core (2026-09-28).
-fn mmap_snapshot() -> Result<std::sync::Arc<Vec<MappedRegion>>> {
-    type Snapshot = Option<(Instant, std::sync::Arc<Vec<MappedRegion>>)>;
-    static SNAPSHOT: std::sync::OnceLock<parking_lot::Mutex<Snapshot>> = std::sync::OnceLock::new();
-    let slot = SNAPSHOT.get_or_init(|| parking_lot::Mutex::new(None));
-    if let Some((at, snapshot)) = slot.lock().as_ref()
-        && at.elapsed() < MMAP_SNAPSHOT_TTL
-    {
-        return Ok(std::sync::Arc::clone(snapshot));
-    }
-    // Resolve each distinct mapped path once per sweep: ~100k maps lines are
-    // mostly the same few shared libraries.
-    let mut resolved = std::collections::HashMap::<String, PathBuf>::new();
-    let mut regions = Vec::new();
-    for pid in proc_pids()? {
-        if pid > 0 {
-            collect_mapped_regions_for_pid(pid, &mut resolved, &mut regions);
-        }
-    }
-    regions.sort_by(|left, right| {
-        left.pid
-            .cmp(&right.pid)
-            .then_with(|| left.start_address.cmp(&right.start_address))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    let snapshot = std::sync::Arc::new(regions);
-    *slot.lock() = Some((Instant::now(), std::sync::Arc::clone(&snapshot)));
-    Ok(snapshot)
+/// Mutation admission cannot reuse a successful scanner snapshot.
+pub(super) fn read_mmap_regions_under_fresh(root: &Path) -> Result<Vec<MappedRegion>> {
+    mmap_scan::read_under_fresh(root)
+}
+
+/// Inspect the mapped regions once for the complete candidate-root set.
+pub(super) fn read_mmap_regions_under_roots(roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+    mmap_scan::read_under_roots(roots)
 }
 
 pub(super) fn read_process_io(pid: i32) -> Result<ProcessIo> {
@@ -241,7 +241,11 @@ fn pid_proc_path(pid: i32) -> PathBuf {
     PathBuf::from(PROC_ROOT).join(pid.to_string())
 }
 
-fn process_info_for_pid(pid: i32, boot_time_unix_ms: Option<i64>) -> Option<ProcessInfo> {
+fn process_info_for_pid(
+    pid: i32,
+    boot_time_unix_ms: Option<i64>,
+    with_command_line: bool,
+) -> Option<ProcessInfo> {
     let proc_path = pid_proc_path(pid);
     let name = fs::read_to_string(proc_path.join("comm"))
         .ok()?
@@ -264,7 +268,11 @@ fn process_info_for_pid(pid: i32, boot_time_unix_ms: Option<i64>) -> Option<Proc
             .as_deref()
             .and_then(|raw| parse_status_i32_field(raw, "PPid")),
         name,
-        command_line: read_command_line(&proc_path),
+        command_line: if with_command_line {
+            read_command_line(&proc_path)
+        } else {
+            Vec::new()
+        },
         executable: fs::read_link(proc_path.join("exe")).ok(),
         cwd: fs::read_link(proc_path.join("cwd")).ok(),
         start_time_unix_ms: stat
@@ -294,46 +302,6 @@ fn read_command_line(proc_path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-fn open_files_for_pid_under(pid: i32, root: &Path) -> Vec<OpenFile> {
-    let proc_path = pid_proc_path(pid);
-    let fd_dir = proc_path.join("fd");
-    let Ok(entries) = fs::read_dir(&fd_dir) else {
-        return Vec::new();
-    };
-
-    entries
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let fd_path = entry.path();
-            open_file_for_fd_under(pid, &proc_path, &fd_path, root)
-        })
-        .collect()
-}
-
-fn open_file_for_fd_under(
-    pid: i32,
-    proc_path: &Path,
-    fd_path: &Path,
-    root: &Path,
-) -> Option<OpenFile> {
-    let fd = fd_path
-        .file_name()
-        .and_then(|name| name.to_str())?
-        .parse::<i32>()
-        .ok()?;
-    let path = resolve_absolute_path(&fs::read_link(fd_path).ok()?);
-    if !path.starts_with(root) {
-        return None;
-    }
-    Some(OpenFile {
-        pid,
-        path,
-        fd: Some(fd),
-        kind: open_file_kind_for_fd(fd_path),
-        mode: open_file_mode_for_fd(proc_path, fd),
-    })
-}
-
 fn open_file_kind_for_fd(fd_path: &Path) -> OpenFileKind {
     use std::os::unix::fs::FileTypeExt;
 
@@ -357,10 +325,17 @@ fn open_file_kind_for_fd(fd_path: &Path) -> OpenFileKind {
 }
 
 fn open_file_mode_for_fd(proc_path: &Path, fd: i32) -> OpenFileMode {
+    use std::io::Read as _;
+
     let fdinfo = proc_path.join("fdinfo").join(fd.to_string());
-    let Some(flags) = fs::read_to_string(fdinfo)
+    // Only the fixed prefix is needed. Event descriptors can have arbitrarily
+    // large fdinfo bodies; optional mode annotations must not defeat the scan's
+    // resource bound or discard an already observed reference.
+    let mut raw = String::new();
+    let Some(flags) = fs::File::open(fdinfo)
+        .and_then(|file| file.take(4096).read_to_string(&mut raw))
         .ok()
-        .and_then(|raw| parse_fdinfo_flags(&raw))
+        .and_then(|_| parse_fdinfo_flags(&raw))
     else {
         return OpenFileMode::Unknown;
     };
@@ -387,83 +362,16 @@ fn parse_fdinfo_flags(raw: &str) -> Option<u64> {
     })
 }
 
-fn collect_mapped_regions_for_pid(
-    pid: i32,
-    resolved: &mut std::collections::HashMap<String, PathBuf>,
-    regions: &mut Vec<MappedRegion>,
-) {
-    let maps_path = pid_proc_path(pid).join("maps");
-    let Ok(raw) = fs::read_to_string(maps_path) else {
-        return;
-    };
-    for line in raw.lines() {
-        if let Some(region) = parse_maps_line(pid, line, |raw_path| {
-            resolved
-                .entry(raw_path.to_string())
-                .or_insert_with(|| resolve_absolute_path(Path::new(raw_path)))
-                .clone()
-        }) {
-            regions.push(region);
-        }
-    }
-}
-
 #[cfg(test)]
 fn mapped_region_from_maps_line(pid: i32, line: &str, root: &Path) -> Option<MappedRegion> {
-    parse_maps_line(pid, line, |raw_path| {
-        resolve_absolute_path(Path::new(raw_path))
-    })
-    .filter(|region| region.path.starts_with(root))
-}
-
-/// A file-backed `maps` line as a region, its path resolved by `resolve`.
-fn parse_maps_line(
-    pid: i32,
-    line: &str,
-    resolve: impl FnOnce(&str) -> PathBuf,
-) -> Option<MappedRegion> {
-    let (range, rest) = take_whitespace_field(line)?;
-    let (perms, rest) = take_whitespace_field(rest)?;
-    let (_, rest) = take_whitespace_field(rest)?;
-    let (_, rest) = take_whitespace_field(rest)?;
-    let (_, rest) = take_whitespace_field(rest)?;
-    let raw_path = rest.trim_start();
-    if raw_path.is_empty() || raw_path.starts_with('[') {
-        return None;
-    }
-    let (start, end) = parse_maps_address_range(range)?;
-    Some(MappedRegion {
-        pid,
-        path: resolve(raw_path),
-        start_address: Some(start),
-        end_address: Some(end),
-        protection: Some(maps_protection(perms)),
-    })
-}
-
-fn take_whitespace_field(input: &str) -> Option<(&str, &str)> {
-    let trimmed = input.trim_start();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
-    Some((&trimmed[..end], &trimmed[end..]))
-}
-
-fn parse_maps_address_range(range: &str) -> Option<(u64, u64)> {
-    let (start, end) = range.split_once('-')?;
-    Some((
-        u64::from_str_radix(start, 16).ok()?,
-        u64::from_str_radix(end, 16).ok()?,
-    ))
-}
-
-fn maps_protection(perms: &str) -> String {
-    let mut protection = perms.chars().take(3).collect::<String>();
-    while protection.len() < 3 {
-        protection.push('-');
-    }
-    protection
+    mmap_scan::parse_row(pid, line.as_bytes())
+        .ok()
+        .flatten()
+        .map(|mut region| {
+            region.path = resolve_absolute_path(&region.path);
+            region
+        })
+        .filter(|region| region.path.starts_with(root))
 }
 
 fn parse_status_i32_field(raw: &str, key: &'static str) -> Option<i32> {
@@ -660,10 +568,11 @@ fn process_parse_error(method: &'static str, details: impl Into<String>) -> SbhE
 #[cfg(test)]
 mod tests {
     use super::{
-        mapped_region_from_maps_line, parse_fdinfo_flags, parse_proc_boot_time_unix_ms,
-        parse_proc_io, parse_proc_self_stat, parse_proc_self_status, parse_proc_start_time_unix_ms,
-        read_executables_under, read_mmap_regions_under, read_open_files_under, read_process_io,
-        read_process_list, read_self_stats, ticks_to_micros,
+        brief_process_info, mapped_region_from_maps_line, parse_fdinfo_flags,
+        parse_proc_boot_time_unix_ms, parse_proc_io, parse_proc_self_stat, parse_proc_self_status,
+        parse_proc_start_time_unix_ms, read_executables_under, read_mmap_regions_under,
+        read_open_files_under, read_process_io, read_process_list, read_process_list_brief,
+        read_process_list_without_command_lines, read_self_stats, ticks_to_micros,
     };
     use crate::core::paths::resolve_absolute_path;
     use crate::platform::types::{OpenFileKind, OpenFileMode};
@@ -763,6 +672,82 @@ mod tests {
         );
     }
 
+    /// The monitor thread's list reads no argv, which can block behind another
+    /// process's memory-map lock; everything else is still there.
+    #[test]
+    fn linux_process_list_without_command_lines_keeps_everything_but_argv() {
+        let processes = read_process_list_without_command_lines()
+            .expect("process list should be readable from /proc");
+        assert!(!processes.is_empty());
+        assert!(
+            processes
+                .iter()
+                .all(|process| process.command_line.is_empty())
+        );
+        assert!(processes.iter().all(|process| !process.name.is_empty()));
+        assert!(processes.iter().any(|process| process.cwd.is_some()));
+    }
+
+    /// The brief list reads only `/proc/<pid>/stat`, so a command name with
+    /// parentheses and spaces must not shift the fields after it.
+    #[test]
+    fn brief_entry_parses_a_command_name_with_parentheses() {
+        let stat = "4242 (a) b (c) S 77 2 3 4 5 6 7 8 9 10 345 67 0 0 20 0 1 0 12345";
+        let entry = brief_process_info(4242, stat, Some(1_700_000_000_000), 100).unwrap();
+        assert_eq!(entry.name, "a) b (c");
+        assert_eq!(entry.parent_pid, Some(77));
+        assert_eq!(entry.start_time_unix_ms, Some(1_700_000_123_450));
+        assert_eq!(entry.cpu_user_micros, Some(3_450_000));
+        assert_eq!(
+            (entry.executable, entry.cwd, entry.resident_memory_bytes),
+            (None, None, None)
+        );
+        assert!(brief_process_info(1, "1 () S 0", None, 100).is_none());
+    }
+
+    /// The brief list names the same processes with the same pid, parent,
+    /// name and start time as the full list; a child this test spawns is in
+    /// both, with this process as its parent.
+    #[test]
+    fn linux_brief_process_list_matches_the_full_list_where_they_overlap() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let child_pid = i32::try_from(child.id()).unwrap();
+        let brief = read_process_list_brief().expect("brief list");
+        let full = read_process_list_without_command_lines().expect("full list");
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let spawned = brief
+            .iter()
+            .find(|process| process.pid == child_pid)
+            .expect("the spawned child is listed");
+        assert_eq!(
+            spawned.parent_pid,
+            Some(i32::try_from(std::process::id()).unwrap())
+        );
+        assert_eq!(spawned.name, "sleep");
+        let full_child = full
+            .iter()
+            .find(|process| process.pid == child_pid)
+            .unwrap();
+        assert_eq!(
+            (
+                &spawned.name,
+                spawned.parent_pid,
+                spawned.start_time_unix_ms
+            ),
+            (
+                &full_child.name,
+                full_child.parent_pid,
+                full_child.start_time_unix_ms
+            )
+        );
+        assert!(brief.iter().all(|process| process.cwd.is_none()));
+    }
+
     #[test]
     fn linux_process_io_reports_current_process_counters() {
         let current_pid = i32::try_from(std::process::id()).expect("pid should fit i32");
@@ -814,7 +799,10 @@ mod tests {
 
         let result =
             read_open_files_under(dir.path()).expect("open files should be readable from /proc");
-        assert!(result.complete);
+        // Other visible PIDs may deny inspection on an unprivileged or
+        // containerized runner. Completeness is asserted for the known-readable
+        // current-PID scope in reference_scan; retain the real all-PID positive
+        // reference assertion here without assuming host-wide permissions.
         let actual = result
             .files
             .iter()
@@ -842,7 +830,10 @@ mod tests {
 
         let result =
             read_executables_under(root).expect("executables should be readable from /proc");
-        assert!(result.complete);
+        // Keep the all-PID positive check without assuming permission to read
+        // every unrelated executable. reference_scan separately asserts full
+        // coverage for the real current PID and controlled readable scopes,
+        // and asserts incomplete coverage for denied executable links.
 
         assert!(result.processes.iter().any(|process| {
             process.pid == current_pid && process.executable.as_ref() == Some(&resolved_exe)
@@ -855,16 +846,26 @@ mod tests {
         let resolved_exe = resolve_absolute_path(&exe);
         let current_pid = i32::try_from(std::process::id()).expect("pid should fit i32");
 
-        let regions =
-            read_mmap_regions_under(&resolved_exe).expect("maps should be readable from /proc");
-
-        assert!(regions.iter().any(|region| {
-            region.pid == current_pid
-                && region.path == resolved_exe
-                && region
-                    .protection
-                    .as_deref()
-                    .is_some_and(|mode| mode.contains('x'))
-        }));
+        match read_mmap_regions_under(&resolved_exe) {
+            Ok(regions) => assert!(regions.iter().any(|region| {
+                region.pid == current_pid
+                    && region.path == resolved_exe
+                    && region
+                        .protection
+                        .as_deref()
+                        .is_some_and(|mode| mode.contains('x'))
+            })),
+            // The public Vec API must reject partial host coverage. It cannot
+            // safely return this process's mappings as a complete all-PID set.
+            // mmap_scan separately always tests the real current PID's positive
+            // mapping and pairs readable-scope success with injected denials.
+            Err(crate::core::errors::SbhError::Runtime { details }) => {
+                assert!(
+                    details.starts_with("memory-map inspection incomplete:"),
+                    "{details}"
+                );
+            }
+            Err(error) => panic!("unexpected maps failure: {error}"),
+        }
     }
 }

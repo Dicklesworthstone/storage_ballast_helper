@@ -119,6 +119,7 @@ fn make_candidate_input(
             has_cargo_toml: false,
             mostly_object_files: rng.next_bool(0.6),
             has_cachedir_tag: false,
+            has_pyvenv_cfg: false,
         },
         active_references: ActiveReferenceSummary::default(),
         is_open: false,

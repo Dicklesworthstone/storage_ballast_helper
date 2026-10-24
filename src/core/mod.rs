@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod errors;
+pub(crate) mod path_serde;
 pub mod paths;
 pub mod update_cache;
 

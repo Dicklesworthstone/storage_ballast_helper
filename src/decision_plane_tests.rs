@@ -104,6 +104,7 @@ fn make_candidate(
             has_cargo_toml: false,
             mostly_object_files: rng.next_f64() > 0.4,
             has_cachedir_tag: false,
+            has_pyvenv_cfg: false,
         },
         active_references: ActiveReferenceSummary::default(),
         is_open: false,

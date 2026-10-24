@@ -38,6 +38,35 @@ consent does not override a hard veto, category suspension, or a protection
 marker. A quarantine failure retains the candidate rather than silently
 selecting irreversible removal; see `docs/quarantine-recovery.md`.
 
+## Direct removal stays within verified directory descriptors
+
+Irreversible cleanup and quarantine purge share the descriptor-relative remover.
+The executor compares the exact final stat result with the scanner identity,
+then binds that root to an opened parent before removal. A parent alias such as
+macOS `/tmp` is resolved once; subsequent child lookups and mutations use the
+opened directory and a single basename.
+
+The root must be a regular file or directory on its parent's filesystem.
+Descendant directories are opened without following symlinks and checked against
+their observed identities. Linux additionally requires `openat2(NO_XDEV)`, which
+rejects same-device bind mounts as well as device changes; an unavailable or
+blocked `openat2` fails closed. Other Unix systems use no-follow opens and device
+checks. Symlink children are unlinked as entries without opening their targets.
+
+Recognized regenerable Go and Cargo caches may add owner traversal/write bits
+through verified directory handles. File permissions are never widened: deleting
+one cache name must not change the permissions of an external hardlink. A
+directory that cannot be opened for reading remains a refusal, including an
+unreadable `0000` directory; there is no pathname-based chmod fallback. Ordinary
+artifacts and quarantine purges retain their conservative permission policy.
+
+Direct removal allocates no store or recovery record, preserving emergency
+operation on a full disk. It may remove earlier children before discovering a
+boundary or error, and reports success only after removing the root. This is
+descriptor confinement with identity rechecks, not an atomic whole-tree
+transaction: a last-moment rename after a check can still affect the originally
+opened object, and the final identity check and unlink are separate syscalls.
+
 ## Regression coverage
 
 Unit tests beside the admission helper exercise the public batch and checked
@@ -48,3 +77,10 @@ parents, dangling markers, and markers introduced between preflight and the
 mutation helper. Positive controls prove an unprotected file still unlinks or
 round-trips through quarantine and undo. These tests supplement the public-API
 integration tests in `tests/deletion_boundary.rs`.
+
+Direct-removal regressions also cover captured-root replacement, parent replacement
+before mutation, symlink substitution at descent/open checkpoints, leaf replacement
+before unlink, stable parent aliases, external hardlink permissions, and filesystem
+boundaries. Bind-mount fixtures require mount capability and report a skip when it
+is unavailable; separate read-only Linux tests exercise existing mount boundaries
+without attempting to remove system paths.
