@@ -1489,6 +1489,15 @@ before dispatching its pressure scans, and checks it again before executing
 already queued deletions or draining quarantine. Unrelated filesystems
 continue working. The compression tier remains off by default.
 
+`compress.roots` may live on volumes outside `scanner.root_paths`. When no
+scanner controller monitors a compression root's mount, the tier samples that
+root's current free space and applies the configured pressure percentages and
+absolute floors to decide whether `compress.start_level` is reached. Existing
+controllers retain their hysteresis and predictive levels. This sampling only
+admits compression; it does not add deletion roots, change the daemon's global
+pressure level, or grant a cleanup hold through an unmonitored mount alias.
+Read-only filesystems, failed samples, and unknown capacity cannot start a pass.
+
 The hold ends when the pass finishes or its wall-clock allowance expires:
 the 60-second discovery budget plus `compress.policy.timeout_secs`, measured
 from the scheduling tick. A cancellation asks the worker to stop and retains

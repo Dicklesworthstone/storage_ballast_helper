@@ -87,6 +87,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Configured compression roots work on volumes outside deletion scanning**
+  (bd-rxq5). Such roots previously had no controller pressure level and never
+  started a daemon pass. The tier now samples their own free space using the
+  configured percentages and absolute floors, while monitored mounts retain
+  their controller levels. These samples do not expand deletion scope, steer
+  global pressure, or create cleanup holds through unmonitored aliases.
+  Read-only, unreadable, and unknown-capacity volumes remain ineligible.
 - **A full memory-pressure queue retains the newest observation.** A busy
   monitor previously lost callbacks once its bounded queue filled, and a steady
   final pressure level produced no replacement event. Overflow now evicts the

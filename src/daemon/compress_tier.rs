@@ -22,10 +22,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::core::config::{CompressConfig, Config};
+use crate::core::config::{CompressConfig, Config, PressureConfig};
 use crate::logger::compression::CompressionActivity;
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle};
-use crate::monitor::pid::PressureLevel;
+use crate::monitor::pid::{PressureLevel, classify_level};
 use crate::platform::pal::Platform;
 use crate::scanner::compression::{
     self, CompressionMode, CompressionObservation, CompressionReport, ConcurrencyAcknowledgement,
@@ -41,7 +41,8 @@ pub struct RootStatus {
     pub root: PathBuf,
     /// Whether the filesystem holding it is btrfs.
     pub btrfs: bool,
-    /// Pressure of the mount holding it, if the daemon monitors that mount.
+    /// Pressure of the mount holding it. Uses its controller when present,
+    /// otherwise the current free space and configured pressure thresholds.
     pub level: Option<PressureLevel>,
     /// Mount whose pressure governs this root, when it could be resolved.
     pub mount_point: Option<PathBuf>,
@@ -257,7 +258,12 @@ impl CompressTier {
         if due_start_level(&config.compress, running, self.last_start, now).is_none() {
             return;
         }
-        let statuses = root_statuses(&config.compress.roots, platform.as_ref(), mount_levels);
+        let statuses = root_statuses(
+            &config.compress.roots,
+            platform.as_ref(),
+            mount_levels,
+            &config.pressure,
+        );
         let roots = due_roots(&config.compress, &statuses, running, self.last_start, now);
         if roots.is_empty() {
             return;
@@ -266,9 +272,19 @@ impl CompressTier {
         // No pass is running (due_roots checked), so no stop is pending.
         self.stop.store(false, Ordering::Release);
         self.running.store(true, Ordering::Release);
-        let selected: Vec<_> = statuses
+        // Only controllers can maintain a cleanup hold across ticks. A root
+        // configured solely for compression may start a pass, but must not
+        // delay cleanup through an unmonitored alias of a device or create a
+        // new deletion-scanning scope.
+        let cleanup_roots: Vec<_> = statuses
             .iter()
-            .filter(|status| roots.contains(&status.root))
+            .filter(|status| {
+                roots.contains(&status.root)
+                    && status
+                        .mount_point
+                        .as_ref()
+                        .is_some_and(|mount| mount_levels.contains_key(mount))
+            })
             .cloned()
             .collect();
         // Discovery has a 60-second cooperative budget; apply has the operator's
@@ -276,7 +292,7 @@ impl CompressTier {
         // a stuck syscall cannot postpone deletion indefinitely.
         let allowance = Duration::from_secs(60)
             .saturating_add(Duration::from_secs(config.compress.policy.timeout_secs));
-        let held_mounts = self.first.begin(&selected, &statuses, now, allowance);
+        let held_mounts = self.first.begin(&cleanup_roots, &statuses, now, allowance);
         let guard = RunningGuard {
             running: Arc::clone(&self.running),
             first: Arc::clone(&self.first),
@@ -349,6 +365,7 @@ fn root_statuses(
     roots: &[PathBuf],
     platform: &dyn Platform,
     mount_levels: &HashMap<PathBuf, PressureLevel>,
+    pressure: &PressureConfig,
 ) -> Vec<RootStatus> {
     roots
         .iter()
@@ -359,7 +376,21 @@ fn root_statuses(
                 btrfs: stats.as_ref().is_some_and(|stats| stats.fs_type == "btrfs"),
                 level: stats
                     .as_ref()
-                    .and_then(|stats| mount_levels.get(&stats.mount_point).copied()),
+                    .filter(|stats| !stats.is_readonly && stats.total_bytes > 0)
+                    .map(|stats| {
+                        // Compression roots are an independent opt-in. Requiring
+                        // a scanner controller here silently disabled this tier
+                        // on other volumes. Sample only the configured root and
+                        // keep its pressure out of global deletion policy.
+                        mount_levels
+                            .get(&stats.mount_point)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                let [green, yellow, orange, red] =
+                                    pressure.free_pct_thresholds_for(stats.total_bytes);
+                                classify_level(stats.free_pct(), green, yellow, orange, red)
+                            })
+                    }),
                 mount_point: stats.as_ref().map(|stats| stats.mount_point.clone()),
                 device_id: stats
                     .as_ref()
@@ -1032,6 +1063,173 @@ mod tests {
             allow_zstd_feature: true,
             ..CompressConfig::default()
         }
+    }
+
+    fn volume(
+        mount: &str,
+        fs_type: &str,
+        total_gib: u64,
+        available_gib: u64,
+    ) -> crate::platform::pal::FsStats {
+        crate::platform::pal::FsStats {
+            total_bytes: total_gib << 30,
+            free_bytes: available_gib << 30,
+            available_bytes: available_gib << 30,
+            fs_type: fs_type.into(),
+            mount_point: PathBuf::from(mount),
+            is_readonly: false,
+        }
+    }
+
+    fn mounted_platform(
+        stats: Vec<crate::platform::pal::FsStats>,
+    ) -> crate::platform::pal::MockPlatform {
+        use crate::platform::pal::{MockPlatform, MountPoint, PlatformPaths};
+
+        let mounts = stats
+            .iter()
+            .map(|stats| MountPoint {
+                path: stats.mount_point.clone(),
+                device: stats.mount_point.display().to_string(),
+                fs_type: stats.fs_type.clone(),
+                is_ram_backed: false,
+            })
+            .collect();
+        MockPlatform::new(
+            mounts,
+            stats
+                .into_iter()
+                .map(|stats| (stats.mount_point.clone(), stats))
+                .collect(),
+            MockPlatform::healthy().memory_info().unwrap(),
+            PlatformPaths::default(),
+        )
+    }
+
+    #[test]
+    fn compression_only_volumes_use_their_own_pressure_without_scanner_controllers() {
+        let platform = mounted_platform(vec![
+            volume("/archive", "btrfs", 1000, 120),
+            volume("/healthy", "btrfs", 1000, 500),
+            volume("/unsupported", "ext4", 1000, 0),
+        ]);
+        let config = CompressConfig {
+            roots: [
+                "/archive/first",
+                "/archive/second",
+                "/healthy/scratch",
+                "/unsupported/scratch",
+                "/missing/scratch",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+            ..enabled()
+        };
+        // A healthy scanned root must not hide the independently configured
+        // archive's pressure, and a critical root must not make healthy
+        // compression volumes eligible either.
+        for scanned_level in [PressureLevel::Green, PressureLevel::Critical] {
+            let levels = HashMap::from([(PathBuf::from("/"), scanned_level)]);
+            let statuses = root_statuses(
+                &config.roots,
+                &platform,
+                &levels,
+                &PressureConfig::default(),
+            );
+            assert_eq!(statuses[0].level, Some(PressureLevel::Orange));
+            assert_eq!(statuses[2].level, Some(PressureLevel::Green));
+            assert!(!statuses[3].btrfs);
+            assert_eq!(statuses[4].level, None);
+            assert_eq!(
+                due_roots(&config, &statuses, false, None, Instant::now()),
+                vec![
+                    PathBuf::from("/archive/first"),
+                    PathBuf::from("/archive/second")
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn monitored_volumes_keep_the_controller_level_instead_of_raw_reclassification() {
+        let roots = vec![PathBuf::from("/archive/scratch")];
+        for (available_gib, level) in [(500, PressureLevel::Red), (1, PressureLevel::Green)] {
+            let platform = mounted_platform(vec![volume("/archive", "btrfs", 1000, available_gib)]);
+            let statuses = root_statuses(
+                &roots,
+                &platform,
+                &HashMap::from([(PathBuf::from("/archive"), level)]),
+                &PressureConfig::default(),
+            );
+            assert_eq!(statuses[0].level, Some(level));
+            assert_eq!(
+                due_roots(&enabled(), &statuses, false, None, Instant::now()).is_empty(),
+                level == PressureLevel::Green,
+                "preserve controller hysteresis and prediction"
+            );
+        }
+    }
+
+    #[test]
+    fn compression_only_pressure_honors_configured_percentages_and_absolute_floors() {
+        let roots = vec![PathBuf::from("/archive/scratch")];
+        let platform = mounted_platform(vec![volume("/archive", "btrfs", 2000, 160)]);
+        let levels = HashMap::new();
+        let statuses = root_statuses(&roots, &platform, &levels, &PressureConfig::default());
+        assert_eq!(statuses[0].level, Some(PressureLevel::Red));
+
+        let floors = PressureConfig {
+            green_min_free_bytes: 100 << 30,
+            yellow_min_free_bytes: 80 << 30,
+            orange_min_free_bytes: 60 << 30,
+            red_min_free_bytes: 40 << 30,
+            ..PressureConfig::default()
+        };
+        let statuses = root_statuses(&roots, &platform, &levels, &floors);
+        assert_eq!(statuses[0].level, Some(PressureLevel::Green));
+        assert!(due_roots(&enabled(), &statuses, false, None, Instant::now()).is_empty());
+
+        let percentages = PressureConfig {
+            green_min_free_pct: 10.0,
+            yellow_min_free_pct: 7.0,
+            orange_min_free_pct: 4.0,
+            red_min_free_pct: 1.0,
+            ..PressureConfig::default()
+        };
+        let statuses = root_statuses(&roots, &platform, &levels, &percentages);
+        assert_eq!(statuses[0].level, Some(PressureLevel::Yellow));
+        assert_eq!(
+            due_roots(&enabled(), &statuses, false, None, Instant::now()),
+            roots
+        );
+    }
+
+    #[test]
+    fn readonly_unknown_capacity_and_failed_samples_never_admit_compression() {
+        let mut readonly = volume("/readonly", "btrfs", 1000, 0);
+        readonly.is_readonly = true;
+        let platform = mounted_platform(vec![readonly, volume("/unknown", "btrfs", 0, 0)]);
+        let config = CompressConfig {
+            roots: ["/readonly/scratch", "/unknown/scratch", "/missing/scratch"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            start_level: "green".into(),
+            ..enabled()
+        };
+        let levels = HashMap::from([
+            (PathBuf::from("/readonly"), PressureLevel::Critical),
+            (PathBuf::from("/unknown"), PressureLevel::Critical),
+        ]);
+        let statuses = root_statuses(
+            &config.roots,
+            &platform,
+            &levels,
+            &PressureConfig::default(),
+        );
+        assert!(statuses.iter().all(|status| status.level.is_none()));
+        assert!(due_roots(&config, &statuses, false, None, Instant::now()).is_empty());
     }
 
     fn status(root: &str, btrfs: bool, level: Option<PressureLevel>) -> RootStatus {
