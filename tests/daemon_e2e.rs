@@ -1227,10 +1227,20 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
     let keep = KeepFixtures::build(dir.path(), &fixtures.root, stale_age);
     let created = Instant::now();
     let fixture_mount = dir.path().to_path_buf();
-    // 11% free of 1 TB: Orange, far above the special-location floor.
-    let table = injected_table(&[
-        (&fixture_mount, 1_000_000_000_000, 110_000_000_000, false),
-        quiet_root_mount(),
+    // Green for the first 12 s, while the pool provisions at startup, then
+    // 11% free of 1 TB: Orange, far above the special-location floor. The
+    // provisioning floor refuses ballast that would leave a volume where it
+    // is released (#38), so a pool provisioned at Orange would stay empty.
+    let (root, root_total, root_free, root_ro) = quiet_root_mount();
+    let table = table_of(&[
+        mount_entry(
+            &fixture_mount,
+            1_000_000_000_000,
+            500_000_000_000,
+            false,
+            &[(12, 110_000_000_000)],
+        ),
+        mount_entry(root, root_total, root_free, root_ro, &[]),
     ]);
     let scenario = ScenarioConfig {
         root_paths: vec![fixtures.root.clone()],
@@ -1823,14 +1833,15 @@ fn alias_mount_release_credit_survives_state_writes_and_restart() {
 /// bd-7spb: after a release a large volume can sit at Yellow for days with
 /// nothing left to reclaim. Replenishing only after a Green cooldown left its
 /// reserve empty for good; an idle Yellow mount now rebuilds it (provisioning
-/// still keeps free space above the Orange floor).
+/// still keeps free space above the 15% floor, Yellow plus hysteresis, where
+/// the default matrix does not release ballast).
 #[test]
 fn an_idle_yellow_mount_rebuilds_an_empty_reserve() {
     let dir = scratch();
     let scan_root = dir.path().join("scan-root");
     fs::create_dir(&scan_root).unwrap();
     let mount = dir.path();
-    // 1 TB at 16% free: Yellow (green 20, yellow 14), far above Orange (10).
+    // 1 TB at 16% free: Yellow (green 20, yellow 14), above the 15% floor.
     let table = injected_table(&[
         (mount, 1_000_000_000_000, 160_000_000_000, false),
         quiet_root_mount(),
@@ -2581,14 +2592,14 @@ fn special_locations_stay_quiet_at_fourteen_percent_of_a_large_volume() {
 }
 
 /// Scenario `partial-provision` (privileged): a real 128 MiB ext4 volume at
-/// 22% free with the default 10% floor takes three 4 MiB ballast files of
+/// 26% free with the default 15% floor takes three 4 MiB ballast files of
 /// the five configured; the fourth would cross the floor.
 #[test]
 #[ignore = "needs passwordless sudo for a loop-mounted ext4 image; run with --ignored"]
 fn partial_provision_stops_the_pool_at_the_headroom_floor() {
     let dir = scratch();
     let vol = LoopMount::create(dir.path(), 128);
-    vol.fill_to(22.0);
+    vol.fill_to(26.0);
     let root = vol.path.join("root");
     fs::create_dir_all(&root).unwrap();
     let scenario = ScenarioConfig {

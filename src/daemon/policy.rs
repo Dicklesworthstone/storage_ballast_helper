@@ -992,6 +992,22 @@ impl BehaviorDispatchTable {
         self.cells[memory_pressure.index()][disk_index(disk_pressure)]
     }
 
+    /// The least severe disk level at which some memory row releases ballast,
+    /// or `None` when no cell does.
+    ///
+    /// Every row counts, because memory pressure can change between creating
+    /// a ballast file and the next tick. Provisioning keeps free space out of
+    /// this level (see `ProvisionFloor`), so a refill can never be the reason
+    /// the daemon releases the files it just wrote.
+    #[must_use]
+    pub fn least_severe_ballast_release_level(&self) -> Option<PressureLevel> {
+        BEHAVIOR_DISK_LEVELS.into_iter().find(|disk| {
+            BEHAVIOR_MEMORY_LEVELS.into_iter().any(|memory| {
+                self.mode_for_levels(memory, *disk).ballast_action != BallastAction::None
+            })
+        })
+    }
+
     /// Normalize the platform memory reading and return the matching behavior.
     #[must_use]
     pub fn mode_for(

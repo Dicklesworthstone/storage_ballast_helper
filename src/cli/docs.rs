@@ -1428,7 +1428,7 @@ pub fn constants() -> Vec<ConstantDoc> {
             "ballast",
             "ballast_provision_floor_pct()",
             Config::default().ballast_provision_floor_pct(),
-            "Effective floor with default thresholds: max(orange, red + 2)",
+            "Effective floor with default thresholds: yellow + hysteresis, since v0.6 releases ballast from Orange",
             CONFIG,
         ),
         constant(

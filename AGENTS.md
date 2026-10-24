@@ -700,7 +700,7 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | ballast | `CHUNK_SIZE` | `4 MiB` | Write chunk when filling a ballast file | `src/ballast/manager.rs` |
 | ballast | `FSYNC_EVERY_BYTES` | `64 MiB` | fsync cadence while filling | `src/ballast/manager.rs` |
 | ballast | `DEFAULT_PROVISION_FLOOR_PCT` | `20` | Manager's floor before the config applies | `src/ballast/manager.rs` |
-| ballast | `ballast_provision_floor_pct()` | `10` | Effective floor with default thresholds: max(orange, red + 2) | `src/core/config.rs` |
+| ballast | `ballast_provision_floor_pct()` | `15` | Effective floor with default thresholds: yellow + hysteresis, since v0.6 releases ballast from Orange | `src/core/config.rs` |
 | quarantine | `DEFAULT_TTL_HOURS` | `24` | Quarantine TTL used without config | `src/scanner/quarantine.rs` |
 | quarantine | `DEFAULT_MAX_BYTES_PCT` | `5` | Quarantine size cap used without config | `src/scanner/quarantine.rs` |
 | daemon | `DAEMON_STATE_WRITE_INTERVAL_SECS` | `30` | state.json write cadence | `src/daemon/self_monitor.rs` |

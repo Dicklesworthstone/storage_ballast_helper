@@ -1057,10 +1057,11 @@ TOML
   mkdir -p "${ballast_dir}"
 
   # Write config pointing ballast at our test dir.
-  # The fixture's own thresholds put its provisioning floor, max(orange, red
-  # + 2), at 2.5% free (bd-p18q). With the 10% default, a host disk above 90%
-  # used provisioned nothing, and ballast_release then failed: the lifecycle
-  # was never tested there.
+  # The fixture's own thresholds put its provisioning floor (yellow +
+  # hysteresis, never under max(orange, red + 2)) at 2.5% free (bd-p18q).
+  # With the default floor, 15% free (10% before #38), a nearly full host disk
+  # provisioned nothing, and ballast_release then failed: the lifecycle was
+  # never tested there.
   cat > "${config_dir}/ballast.toml" <<TOML
 [ballast]
 file_count = 3

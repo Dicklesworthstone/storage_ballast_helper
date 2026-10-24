@@ -1579,7 +1579,7 @@ The data payload is written differently depending on the filesystem:
 - **ext4/xfs**: Uses `fallocate()` for near-instant allocation without writing actual data.
 - **btrfs/zfs**: Writes <!-- claim:constants.ballast.CHUNK_SIZE -->4 MiB<!-- /claim --> chunks of random data to defeat copy-on-write deduplication, which would otherwise make the ballast files share physical blocks and release nothing when deleted.
 
-All writes are fsynced every <!-- claim:constants.ballast.FSYNC_EVERY_BYTES -->64 MiB<!-- /claim --> to ensure durability. Provisioning aborts if free space drops below the provisioning floor, `max(orange_min_free_pct, red_min_free_pct + 2)` (<!-- claim:constants.ballast.ballast_provision_floor_pct() -->10<!-- /claim -->% with the default thresholds), to avoid filling the disk while trying to reserve space against future fills.
+All writes are fsynced every <!-- claim:constants.ballast.FSYNC_EVERY_BYTES -->64 MiB<!-- /claim --> to ensure durability. Provisioning stops before a file that would take free space below the provisioning floor (<!-- claim:constants.ballast.ballast_provision_floor_pct() -->15<!-- /claim -->% with the default thresholds), so it never fills the disk while reserving space against future fills. The floor keeps every new file out of the first pressure level at which the behavior matrix releases ballast, with `pressure.controller.hysteresis_pct` to spare: the default matrix releases from Orange, so the floor is `yellow_min_free_pct + hysteresis_pct`. It is never lower than `max(orange_min_free_pct, red_min_free_pct + 2)`. A lower floor let a refill on a Yellow volume end in Orange, and the daemon released the files it had just written.
 
 Per-volume configuration overrides allow different file counts and sizes for different mount points. A 2 TiB data volume might use 10 x 2 GiB ballast files (20 GiB total), while a 100 GiB root volume uses 5 x 512 MiB files (2.5 GiB).
 
@@ -2470,7 +2470,7 @@ For test harness conventions and structured logging registration, see `docs/test
 - Process attribution relies on platform-specific process inspection and may be reduced on restricted environments.
 - Extremely bursty workloads may require tighter sample intervals and controller tuning.
 - Network and ephemeral filesystems are intentionally conservative for ballast and cleanup safety.
-- Ballast reserve cannot exceed the reserve floor (`max(orange_min_free_pct, red_min_free_pct + 2%)`); on volumes below the floor, ballast provisioning is deferred and catalog roots serve as the fallback.
+- Ballast provisioning never takes a volume below the provisioning floor (`yellow_min_free_pct + hysteresis_pct` with the default matrix; see The Ballast System in Depth); on volumes below the floor, ballast provisioning is deferred and catalog roots serve as the fallback.
 
 ## FAQ
 

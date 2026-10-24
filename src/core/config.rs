@@ -2665,30 +2665,39 @@ impl Config {
     }
 
     /// Percent of a volume that must remain free after each ballast file is
-    /// created: the Orange threshold, but never closer than two points to
-    /// Red. A reserve is worth building only while the volume is still above
-    /// the level at which the daemon starts reclaiming; below Red it is
-    /// releasing, not reserving.
+    /// created, before absolute byte floors apply; on a given volume use
+    /// [`Self::ballast_provision_floor`], which honors them.
     ///
-    /// This is the floor before absolute byte floors apply; on a given volume
-    /// use [`Self::ballast_provision_floor`], which honors them.
+    /// With the default thresholds and behavior matrix this is 15%: ballast
+    /// is released from Orange (below 14% free), so a new file must leave the
+    /// volume at least `hysteresis_pct` above that.
     #[must_use]
     pub fn ballast_provision_floor_pct(&self) -> f64 {
-        self.pressure
-            .orange_min_free_pct
-            .max(self.pressure.red_min_free_pct + 2.0)
-            .clamp(0.0, 100.0)
+        self.ballast_provision_floor().pct_on(0)
     }
 
-    /// The ballast headroom floor as a rule each volume is checked against:
-    /// [`Self::ballast_provision_floor_pct`]'s rule applied to the thresholds
-    /// in force on that volume, so `pressure.*_min_free_bytes` lower it on a
-    /// large volume exactly as they lower that volume's pressure levels.
+    /// The ballast headroom floor as a rule each volume is checked against.
+    ///
+    /// A new file must leave the volume outside the least severe level at
+    /// which the behavior matrix releases ballast (in any memory row), with
+    /// `pressure.controller.hysteresis_pct` to spare, and never below the
+    /// Orange threshold or two points above Red. Otherwise a refill can
+    /// push a volume into a releasing level and the daemon releases the
+    /// files it just wrote (#38). The thresholds are those in force on each
+    /// volume, so `pressure.*_min_free_bytes` lower the floor on a large
+    /// volume exactly as they lower that volume's pressure levels.
     #[must_use]
-    pub const fn ballast_provision_floor(&self) -> crate::ballast::manager::ProvisionFloor {
+    pub fn ballast_provision_floor(&self) -> crate::ballast::manager::ProvisionFloor {
+        // The daemon runs the v0.6 matrix when this one does not resolve
+        // (`behavior_table_from_config`); validation rejects that at load.
+        let release_level = BehaviorDispatchTable::from_config(&self.behavior)
+            .unwrap_or_default()
+            .least_severe_ballast_release_level();
         crate::ballast::manager::ProvisionFloor::Thresholds {
             pct: self.pressure.free_pct_thresholds(),
             bytes: self.pressure.min_free_bytes(),
+            release_level,
+            margin_pct: self.pressure.controller.hysteresis_pct,
         }
     }
 
@@ -3654,21 +3663,69 @@ mod tests {
         assert!(cfg.validate().is_ok());
     }
 
-    /// The ballast headroom floor follows the pressure thresholds instead of
-    /// a fixed 20%: provisioning may take a volume down to Orange but never
-    /// into Red (kept two points above it).
+    /// The ballast headroom floor follows the pressure thresholds and the
+    /// behavior matrix (#38): a new file must leave the volume outside the
+    /// least severe level that releases ballast, `hysteresis_pct` to spare,
+    /// and never below Orange or within two points of Red.
     #[test]
     fn ballast_provision_floor_tracks_pressure_thresholds() {
+        fn assert_floor(cfg: &Config, want: f64) {
+            let got = cfg.ballast_provision_floor_pct();
+            assert!((got - want).abs() < 1e-9, "floor {got}, want {want}");
+        }
+        // A custom matrix whose ballast column is `none` for `disks`, in
+        // every memory row (the never-reduce rule only raises rows).
+        fn without_release_at(disks: &[&str]) -> Config {
+            let cells: String = ["normal", "warn", "critical"]
+                .into_iter()
+                .flat_map(|memory| {
+                    disks.iter().map(move |disk| {
+                        format!(
+                            "[behavior.cells.{memory}_{disk}]\nscan = \"aggressive\"\n\
+                             cleanup = \"identify_only\"\nballast = \"none\"\nnotify = \"low\"\n"
+                        )
+                    })
+                })
+                .collect();
+            let toml = format!("[behavior]\npreset = \"custom\"\n{cells}");
+            let (cfg, unknown) = Config::parse_toml(&toml).unwrap();
+            assert!(unknown.is_empty(), "{unknown:?}");
+            cfg.validate().unwrap();
+            cfg
+        }
+
+        // v0.6 releases from Orange (below 14% free): Yellow plus 1 point.
         let mut cfg = Config::default();
-        assert!((cfg.ballast_provision_floor_pct() - 10.0).abs() < f64::EPSILON);
+        assert_floor(&cfg, 15.0);
+        cfg.pressure.controller.hysteresis_pct = 0.0;
+        assert_floor(&cfg, 14.0);
+        cfg.pressure.controller.hysteresis_pct = 2.5;
+        assert_floor(&cfg, 16.5);
 
+        // The v0.5 matrix releases from Yellow under memory pressure, so a
+        // file must leave the volume at Green: 20 plus 1 point.
+        let mut cfg = Config::default();
+        cfg.behavior.preset = BehaviorPreset::V0_5;
+        assert_floor(&cfg, 21.0);
+
+        // Released only at Critical: Red plus 1 point is under the older
+        // lower bound, the Orange threshold (10).
+        assert_floor(&without_release_at(&["orange", "red"]), 10.0);
+        // Never released by level: only the lower bound applies.
+        assert_floor(&without_release_at(&["orange", "red", "critical"]), 10.0);
+
+        // The lower bound still wins when the thresholds crowd Red: Yellow
+        // 7.5 + 1 = 8.5 is under Red 6.8 + 2 = 8.8.
+        let mut cfg = Config::default();
+        cfg.pressure.green_min_free_pct = 10.0;
+        cfg.pressure.yellow_min_free_pct = 7.5;
         cfg.pressure.orange_min_free_pct = 7.0;
-        cfg.pressure.red_min_free_pct = 6.0;
-        assert!((cfg.ballast_provision_floor_pct() - 8.0).abs() < f64::EPSILON);
-
-        cfg.pressure.orange_min_free_pct = 30.0;
+        cfg.pressure.red_min_free_pct = 6.8;
+        cfg.validate().unwrap();
+        assert_floor(&cfg, 8.8);
+        cfg.pressure.orange_min_free_pct = 7.2;
         cfg.pressure.red_min_free_pct = 5.0;
-        assert!((cfg.ballast_provision_floor_pct() - 30.0).abs() < f64::EPSILON);
+        assert_floor(&cfg, 8.5);
     }
 
     /// With byte floors off, the per-volume rule is the percentage floor on
@@ -3683,6 +3740,7 @@ mod tests {
         cfg.pressure.orange_min_free_pct = 5.0;
         cfg.pressure.red_min_free_pct = 3.0;
         let pct_floor = cfg.ballast_provision_floor_pct();
+        assert!((pct_floor - 9.0).abs() < 1e-12, "{pct_floor}");
         for total in [0, 100_000_000_000, 2_000_000_000_000] {
             assert!((cfg.ballast_provision_floor().pct_on(total) - pct_floor).abs() < 1e-12);
         }
@@ -3693,11 +3751,12 @@ mod tests {
         cfg.pressure.red_min_free_bytes = 25 * GIB;
         cfg.validate().unwrap();
         let rule = cfg.ballast_provision_floor();
-        // 2 TB: Orange in force is 40 GiB (2.15%), Red 25 GiB (1.34%), so the
-        // floor is Red + 2 points (3.34%, ~67 GB) instead of 5% (100 GB).
+        // 2 TB: Yellow in force is 60 GiB (3.22%), so the floor is 4.22%
+        // (~84 GB) instead of 9% (180 GB). Orange (2.15%) and Red + 2
+        // (3.34%) sit below it.
         let total = 2_000_000_000_000_u64;
         #[allow(clippy::cast_precision_loss)]
-        let expected = (25 * GIB) as f64 * 100.0 / total as f64 + 2.0;
+        let expected = (60 * GIB) as f64 * 100.0 / total as f64 + 1.0;
         assert!((rule.pct_on(total) - expected).abs() < 1e-9);
         assert!(rule.pct_on(total) < pct_floor);
         // 100 GB: each byte floor is above its percentage, so nothing changes.

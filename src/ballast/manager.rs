@@ -24,6 +24,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use crate::core::config::BallastConfig;
 use crate::core::errors::{Result, SbhError};
+use crate::monitor::pid::PressureLevel;
 use crate::platform::pal::Platform;
 
 mod admission;
@@ -53,14 +54,33 @@ pub const DEFAULT_PROVISION_FLOOR_PCT: f64 = 20.0;
 /// levels. A single percentage for every volume left a 2 TB disk that the byte
 /// floors held at Green without a reserve: each file was refused below the
 /// percentage Orange threshold, roughly 100 GB free.
+///
+/// It also keeps every new file out of the first level at which the daemon
+/// releases ballast (#38). A floor at the Orange threshold let a refill on a
+/// Yellow volume end in Orange, where the default behavior matrix releases
+/// ballast, so the files were released again seconds after they were written.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProvisionFloor {
     /// The same percentage on every volume.
     Fixed(f64),
-    /// The volume's Orange threshold, never closer than two points to its Red
-    /// threshold, from `[green, yellow, orange, red]` percentages and their
-    /// absolute byte floors (0 = off).
-    Thresholds { pct: [f64; 4], bytes: [u64; 4] },
+    /// Derived from `[green, yellow, orange, red]` percentages and their
+    /// absolute byte floors (0 = off), as each volume sees them.
+    ///
+    /// The floor is the threshold that keeps the volume out of
+    /// `release_level` plus `margin_pct` points (the level hysteresis), and
+    /// never lower than the Orange threshold or two points above Red. With
+    /// `release_level = None` (no level releases ballast) only that lower
+    /// bound applies.
+    Thresholds {
+        /// `[green, yellow, orange, red]` minimum free percentages.
+        pct: [f64; 4],
+        /// The matching absolute floors in bytes (0 = off).
+        bytes: [u64; 4],
+        /// The least severe level whose behavior releases ballast.
+        release_level: Option<PressureLevel>,
+        /// Points of free space kept above the threshold of `release_level`.
+        margin_pct: f64,
+    },
 }
 
 impl ProvisionFloor {
@@ -70,10 +90,43 @@ impl ProvisionFloor {
     pub fn pct_on(&self, total_bytes: u64) -> f64 {
         let pct = match *self {
             Self::Fixed(pct) => pct,
-            Self::Thresholds { pct, bytes } => {
-                let [_, _, orange, red] =
+            Self::Thresholds {
+                pct,
+                bytes,
+                release_level,
+                margin_pct,
+            } => {
+                let [green, yellow, orange, red] =
                     crate::core::config::floored_free_pct_thresholds(pct, bytes, total_bytes);
-                orange.max(red + 2.0)
+                let headroom = orange.max(red + 2.0);
+                // A volume at or above this much free space is not in the
+                // release level: a file that leaves it there cannot be what
+                // makes the daemon release the pool.
+                let outside_release = match release_level {
+                    None => None,
+                    // No floor keeps a volume out of Green; staying at Green
+                    // is the most a floor can do for a matrix that releases
+                    // there.
+                    Some(PressureLevel::Green | PressureLevel::Yellow) => Some(green),
+                    Some(PressureLevel::Orange) => Some(yellow),
+                    Some(PressureLevel::Red) => Some(orange),
+                    Some(PressureLevel::Critical) => Some(red),
+                };
+                match outside_release {
+                    None => headroom,
+                    // `f64::max` ignores a NaN operand, so an unusable margin
+                    // or threshold is turned into NaN explicitly; it becomes
+                    // the 100% floor below (admit nothing).
+                    Some(threshold) if margin_pct >= 0.0 && !headroom.is_nan() => {
+                        let keep_out = threshold + margin_pct;
+                        if keep_out.is_nan() {
+                            f64::NAN
+                        } else {
+                            keep_out.max(headroom)
+                        }
+                    }
+                    Some(_) => f64::NAN,
+                }
             }
         };
         if pct.is_finite() {

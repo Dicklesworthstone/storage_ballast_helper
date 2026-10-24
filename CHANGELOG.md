@@ -87,6 +87,16 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **A ballast refill is no longer released seconds after it is written**
+  (#38). The provisioning floor was the Orange threshold, but the default
+  behavior matrix releases ballast from Orange, so a refill on a Yellow volume
+  could end in Orange and the next tick released part of the pool again; each
+  cycle wrote and deleted gigabytes for nothing. Every new file must now leave
+  the volume outside the least severe level whose behavior releases ballast,
+  with `pressure.controller.hysteresis_pct` to spare: 15% free with the
+  defaults (`yellow_min_free_pct + hysteresis_pct`), 21% with the v0.5 preset,
+  and never lower than the previous floor. The floor only decides whether a
+  new file is written; existing ballast files are kept.
 - **Forward relocation pins the tree it copies and is allowed to remove.**
   Copying and checksum verification use the opened source directory. Bounded
   descendant fingerprints detect replacements and changes hidden by matching

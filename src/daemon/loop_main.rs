@@ -5534,8 +5534,9 @@ impl MonitoringDaemon {
             // A mount idle at Yellow with nothing left to reclaim counts as
             // Green here (bd-7spb): after a release a large volume can sit at
             // Yellow for days, and a Green-only gate never rebuilt its
-            // reserve. Provisioning still keeps free space above the Orange
-            // floor, so a refill cannot push the mount into a release.
+            // reserve. The provisioning floor keeps every refill outside the
+            // first level that releases ballast, with the level hysteresis to
+            // spare (#38), so a refill cannot push the mount into a release.
             let replenish_level =
                 if tick.response.level == PressureLevel::Yellow && idle_with_nothing_to_reclaim {
                     PressureLevel::Green
