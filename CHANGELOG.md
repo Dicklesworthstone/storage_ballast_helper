@@ -87,6 +87,29 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Relocation honors opt-outs and excluded caches throughout a selected tree.**
+  A nested `relocatable = false` marker or excluded component now vetoes its
+  enclosing units while leaving safe siblings eligible. Ancestor opt-outs,
+  overlapping roots, and protection below `unit_depth` are checked explicitly;
+  malformed or unsafe markers cannot grant permission. Apply renews protection
+  before copy, after rename, and at source removal, using fresh file and process
+  evidence at the final boundary. Late refusals preserve the original data and
+  report the verified copy and restore-stub locations for recovery.
+- **Relocation reports preserve concurrent transfers and recovery history.**
+  Reports and apply runs now share one writer lock across the full ledger
+  load/observe/save cycle. Busy or unwritable reports remain useful and expose
+  explicit observation-save status; corrupt or unreadable history is preserved
+  and blocks applying. Ledger saves use private, exclusively created staging
+  files and synchronize both the file and containing directory. Completion
+  persistence must succeed before source removal: a failure retains the original
+  tree, verified backup, and restore stub and reports their recovery locations.
+- **Configured compression roots work on volumes outside deletion scanning**
+  (bd-rxq5). Such roots previously had no controller pressure level and never
+  started a daemon pass. The tier now samples their own free space using the
+  configured percentages and absolute floors, while monitored mounts retain
+  their controller levels. These samples do not expand deletion scope, steer
+  global pressure, or create cleanup holds through unmonitored aliases.
+  Read-only, unreadable, and unknown-capacity volumes remain ineligible.
 - **A full memory-pressure queue retains the newest observation.** A busy
   monitor previously lost callbacks once its bounded queue filled, and a steady
   final pressure level produced no replacement event. Overflow now evicts the

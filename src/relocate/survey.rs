@@ -1,17 +1,45 @@
 //! One metadata walk of a protected tree, aggregated per candidate unit.
 //!
-//! The walk opens no file contents and follows no symlinks. It records, for
+//! The metadata walk follows no symlinks. Its policy-aware form reads only
+//! bounded protection markers, never the files being relocated. It records, for
 //! the marked tree and for every directory up to `unit_depth` below it, the
 //! newest change (max of mtime and ctime over every entry), the newest
 //! regular-file atime, and the allocated bytes. A directory on another
 //! device is not entered; its units are flagged instead.
 
+use std::ffi::OsStr;
+#[cfg(any(target_os = "linux", test))]
 use std::fs;
-use std::io;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat, statat};
 use serde::Serialize;
+
+use super::config::RelocationConfig;
+use crate::scanner::protection::MARKER_FILENAME;
+use crate::scanner::quarantine::open_beneath;
+
+const MAX_MARKER_BYTES: u64 = 64 * 1024;
+
+/// Policy evidence that prevents moving a unit, even when it is dormant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyVeto {
+    /// The protected or excluded entry, which can be below the unit boundary.
+    pub path: PathBuf,
+    /// Why this entry cannot be included in a relocation.
+    pub reason: String,
+    /// The configured or built-in exclusion, when this is an excluded component.
+    pub excluded_pattern: Option<String>,
+}
+
+impl std::fmt::Display for PolicyVeto {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.path.display(), self.reason)
+    }
+}
 
 /// Aggregates for one candidate unit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -37,6 +65,10 @@ pub struct UnitStats {
     pub crosses_mount: bool,
     /// Some directory below it could not be read.
     pub unreadable: bool,
+    /// An ancestor or descendant must stay in place. A veto on a sibling is
+    /// never inherited: unaffected sibling units can still be relocated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relocation_veto: Option<PolicyVeto>,
     /// Owner of the unit directory.
     pub uid: u32,
     /// Group of the unit directory.
@@ -67,11 +99,12 @@ impl TreeSurvey {
     }
 }
 
-fn change_time(meta: &fs::Metadata) -> i64 {
-    meta.mtime().max(meta.ctime())
+fn change_time(meta: &Stat) -> i64 {
+    meta.st_mtime.max(meta.st_ctime)
 }
 
-fn new_unit(path: PathBuf, depth: usize, meta: &fs::Metadata) -> UnitStats {
+#[allow(clippy::useless_conversion)] // mode_t is narrower on some Unix targets.
+fn new_unit(path: PathBuf, depth: usize, meta: &Stat) -> UnitStats {
     UnitStats {
         path,
         depth,
@@ -83,63 +116,272 @@ fn new_unit(path: PathBuf, depth: usize, meta: &fs::Metadata) -> UnitStats {
         newest_access: None,
         crosses_mount: false,
         unreadable: false,
-        uid: meta.uid(),
-        gid: meta.gid(),
-        mode: meta.mode() & 0o7777,
+        relocation_veto: None,
+        uid: meta.st_uid,
+        gid: meta.st_gid,
+        mode: u32::from(meta.st_mode) & 0o7777,
     }
+}
+
+pub(super) fn open_directory(path: &Path) -> io::Result<File> {
+    Ok(File::from(rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?))
+}
+
+/// Reopen a descendant from the pinned root one component at a time. Keeping
+/// only paths in the pending queue bounds descriptors even in very wide trees.
+pub(super) fn open_relative_directory(root: &File, relative: &Path) -> io::Result<File> {
+    let mut directory = root.try_clone()?;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "relocation requires normal descendant path components",
+            ));
+        };
+        let child = File::from(open_beneath(
+            &directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        )?);
+        if rustix::fs::fstat(&child)?.st_dev != rustix::fs::fstat(&directory)?.st_dev {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        directory = child;
+    }
+    Ok(directory)
+}
+
+fn same_stamp(left: &Stat, right: &Stat) -> bool {
+    left.st_dev == right.st_dev
+        && left.st_ino == right.st_ino
+        && left.st_mode == right.st_mode
+        && left.st_size == right.st_size
+        && left.st_mtime == right.st_mtime
+        && left.st_mtime_nsec == right.st_mtime_nsec
+        && left.st_ctime == right.st_ctime
+        && left.st_ctime_nsec == right.st_ctime_nsec
+}
+
+/// Missing markers are distinct from unsafe or unreadable markers. Empty
+/// markers and the TOML/JSON metadata formats used by protection are valid;
+/// an explicit relocation key must be a boolean.
+pub(super) fn marker_policy(directory: &File) -> io::Result<Option<bool>> {
+    let before = match statat(directory, MARKER_FILENAME, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile
+        || !u64::try_from(before.st_size).is_ok_and(|size| size <= MAX_MARKER_BYTES)
+    {
+        return Err(io::Error::other(
+            "protection marker is not a bounded regular file",
+        ));
+    }
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    // Reading policy must not make every marked tree look recently used at
+    // the next sweep. Without permission to avoid atime writes, fail closed.
+    #[cfg(target_os = "linux")]
+    let flags = flags | OFlags::NOATIME;
+    let mut marker = File::from(open_beneath(directory, OsStr::new(MARKER_FILENAME), flags)?);
+    if !same_stamp(&before, &rustix::fs::fstat(&marker)?) {
+        return Err(io::Error::other("protection marker changed while opening"));
+    }
+    let mut contents = String::new();
+    marker
+        .by_ref()
+        .take(MAX_MARKER_BYTES + 1)
+        .read_to_string(&mut contents)?;
+    if contents.len() as u64 > MAX_MARKER_BYTES
+        || !same_stamp(&before, &rustix::fs::fstat(&marker)?)
+        || !same_stamp(
+            &before,
+            &statat(directory, MARKER_FILENAME, AtFlags::SYMLINK_NOFOLLOW)?,
+        )
+    {
+        return Err(io::Error::other("protection marker changed while reading"));
+    }
+    if let Ok(table) = toml::from_str::<toml::Table>(&contents) {
+        return table.get("relocatable").map_or(Ok(Some(true)), |value| {
+            value
+                .as_bool()
+                .map(Some)
+                .ok_or_else(|| io::Error::other("protection marker relocatable must be a boolean"))
+        });
+    }
+    if let Ok(table) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&contents)
+    {
+        return table.get("relocatable").map_or(Ok(Some(true)), |value| {
+            value
+                .as_bool()
+                .map(Some)
+                .ok_or_else(|| io::Error::other("protection marker relocatable must be a boolean"))
+        });
+    }
+    Err(io::Error::other(
+        "protection marker is not valid TOML or JSON",
+    ))
+}
+
+pub(super) fn marker_veto(directory: &File, path: &Path) -> Option<PolicyVeto> {
+    let reason = match marker_policy(directory) {
+        Ok(Some(false)) => "protection marker sets relocatable = false".into(),
+        Err(error) => format!("cannot establish relocation permission: {error}"),
+        Ok(None | Some(true)) => return None,
+    };
+    Some(PolicyVeto {
+        path: path.join(MARKER_FILENAME),
+        reason,
+        excluded_pattern: None,
+    })
+}
+
+pub(super) fn excluded_veto(config: &RelocationConfig, path: &Path) -> Option<PolicyVeto> {
+    let pattern = config.excluded_by(&path.file_name()?.to_string_lossy())?;
+    Some(PolicyVeto {
+        path: path.to_path_buf(),
+        reason: format!("component matches never-relocate pattern {pattern}"),
+        excluded_pattern: Some(pattern),
+    })
 }
 
 /// Walk `root` and aggregate per unit. `max_entries` bounds the whole walk.
 pub fn survey_tree(root: &Path, unit_depth: usize, max_entries: u64) -> io::Result<TreeSurvey> {
-    let root_meta = fs::symlink_metadata(root)?;
-    if !root_meta.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} is not a directory", root.display()),
-        ));
-    }
-    let device = root_meta.dev();
+    survey_tree_inner(root, unit_depth, max_entries, None)
+}
+
+/// Include relocation policy throughout the tree, even below `unit_depth`.
+///
+/// Descendant vetoes apply to enclosing units; ancestor vetoes apply only to
+/// their own branch, so a protected child does not hide movable siblings.
+pub fn survey_tree_with_policy(
+    root: &Path,
+    unit_depth: usize,
+    max_entries: u64,
+    config: &RelocationConfig,
+) -> io::Result<TreeSurvey> {
+    survey_tree_inner(root, unit_depth, max_entries, Some(config))
+}
+
+struct PendingDirectory {
+    relative: PathBuf,
+    depth: usize,
+    chain: Vec<usize>,
+    expected: Stat,
+    inherited_veto: Option<PolicyVeto>,
+}
+
+#[allow(clippy::too_many_lines)]
+fn survey_tree_inner(
+    root: &Path,
+    unit_depth: usize,
+    max_entries: u64,
+    config: Option<&RelocationConfig>,
+) -> io::Result<TreeSurvey> {
+    let anchor = open_directory(root)?;
+    let root_meta = rustix::fs::fstat(&anchor)?;
+    let device = root_meta.st_dev;
     let mut survey = TreeSurvey {
         units: vec![new_unit(root.to_path_buf(), 0, &root_meta)],
         truncated: false,
         entries: 0,
     };
-    // (directory, depth below root, indices of the units enclosing it)
-    let mut stack: Vec<(PathBuf, usize, Vec<usize>)> = vec![(root.to_path_buf(), 0, vec![0])];
-    while let Some((dir, depth, chain)) = stack.pop() {
-        let Ok(reader) = fs::read_dir(&dir) else {
-            for &unit in &chain {
-                survey.units[unit].unreadable = true;
+    let mut stack = vec![PendingDirectory {
+        relative: PathBuf::new(),
+        depth: 0,
+        chain: vec![0],
+        expected: root_meta,
+        inherited_veto: None,
+    }];
+    while let Some(task) = stack.pop() {
+        let path = root.join(&task.relative);
+        let opened = open_relative_directory(&anchor, &task.relative).and_then(|directory| {
+            let stat = rustix::fs::fstat(&directory)?;
+            if stat.st_dev != task.expected.st_dev || stat.st_ino != task.expected.st_ino {
+                return Err(io::Error::other(
+                    "relocation directory changed during survey",
+                ));
             }
-            continue;
+            let reader = Dir::read_from(&directory)?;
+            Ok((directory, stat, reader))
+        });
+        let (directory, before, reader) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                for &unit in &task.chain {
+                    if error.raw_os_error() == Some(libc::EXDEV) {
+                        survey.units[unit].crosses_mount = true;
+                    } else {
+                        survey.units[unit].unreadable = true;
+                    }
+                }
+                continue;
+            }
         };
+        let inherited = task
+            .inherited_veto
+            .or_else(|| config.and_then(|_| marker_veto(&directory, &path)));
+        if let Some(veto) = &inherited {
+            for &unit in &task.chain {
+                survey.units[unit]
+                    .relocation_veto
+                    .get_or_insert_with(|| veto.clone());
+            }
+        }
         for entry in reader {
+            let Ok(entry) = entry else {
+                for &unit in &task.chain {
+                    survey.units[unit].unreadable = true;
+                }
+                continue;
+            };
+            let name = OsStr::from_bytes(entry.file_name().to_bytes());
+            if name == OsStr::new(".") || name == OsStr::new("..") {
+                continue;
+            }
             survey.entries += 1;
             if survey.entries > max_entries {
                 survey.truncated = true;
                 return Ok(survey);
             }
-            // `DirEntry::metadata` is an lstat: symlinks are never followed.
-            let Ok(meta) = entry.and_then(|entry| entry.metadata().map(|meta| (entry, meta)))
-            else {
-                for &unit in &chain {
+            let Ok(meta) = statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW) else {
+                for &unit in &task.chain {
                     survey.units[unit].unreadable = true;
                 }
                 continue;
             };
-            let (entry, meta) = meta;
+            let child_path = path.join(name);
+            let excluded = config.and_then(|config| excluded_veto(config, &child_path));
+            if let Some(veto) = &excluded {
+                for &unit in &task.chain {
+                    survey.units[unit]
+                        .relocation_veto
+                        .get_or_insert_with(|| veto.clone());
+                }
+            }
             let changed = change_time(&meta);
-            let regular = meta.file_type().is_file();
-            let accessed = meta.atime();
-            let counted_bytes = if meta.is_dir() {
+            let file_type = FileType::from_raw_mode(meta.st_mode);
+            let regular = file_type == FileType::RegularFile;
+            let accessed = meta.st_atime;
+            let counted_bytes = if file_type == FileType::Directory {
                 0
             } else {
-                meta.blocks() * 512
+                u64::try_from(meta.st_blocks)
+                    .ok()
+                    .and_then(|blocks| blocks.checked_mul(512))
+                    .ok_or_else(|| io::Error::other("allocated byte accounting overflow"))?
             };
-            for &unit in &chain {
+            for &unit in &task.chain {
                 let stats = &mut survey.units[unit];
                 stats.entries += 1;
-                stats.bytes += counted_bytes;
+                stats.bytes = stats
+                    .bytes
+                    .checked_add(counted_bytes)
+                    .ok_or_else(|| io::Error::other("allocated byte accounting overflow"))?;
                 stats.newest_change = stats.newest_change.max(changed);
                 stats.newest_change_below = stats.newest_change_below.max(changed);
                 if regular {
@@ -148,22 +390,35 @@ pub fn survey_tree(root: &Path, unit_depth: usize, max_entries: u64) -> io::Resu
                         Some(stats.newest_access.map_or(accessed, |a| a.max(accessed)));
                 }
             }
-            if !meta.is_dir() {
+            if file_type != FileType::Directory {
                 continue;
             }
-            if meta.dev() != device {
-                for &unit in &chain {
+            if meta.st_dev != device {
+                for &unit in &task.chain {
                     survey.units[unit].crosses_mount = true;
                 }
                 continue;
             }
-            let path = entry.path();
-            let mut child_chain = chain.clone();
-            if depth < unit_depth {
-                survey.units.push(new_unit(path.clone(), depth + 1, &meta));
+            let child_veto = inherited.clone().or(excluded);
+            let mut child_chain = task.chain.clone();
+            if task.depth < unit_depth {
+                let mut unit = new_unit(child_path, task.depth + 1, &meta);
+                unit.relocation_veto.clone_from(&child_veto);
+                survey.units.push(unit);
                 child_chain.push(survey.units.len() - 1);
             }
-            stack.push((path, depth + 1, child_chain));
+            stack.push(PendingDirectory {
+                relative: task.relative.join(name),
+                depth: task.depth + 1,
+                chain: child_chain,
+                expected: meta,
+                inherited_veto: child_veto,
+            });
+        }
+        if !same_stamp(&before, &rustix::fs::fstat(&directory)?) {
+            for &unit in &task.chain {
+                survey.units[unit].unreadable = true;
+            }
         }
     }
     // Order units so every parent precedes its descendants.
@@ -299,6 +554,172 @@ mod tests {
             fs::write(root.join(format!("f{index}")), b"x").unwrap();
         }
         assert!(survey_tree(&root, 2, 5).unwrap().truncated);
+    }
+
+    #[test]
+    fn policy_veto_below_unit_depth_propagates_up_but_not_sideways() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("marked");
+        fs::create_dir_all(root.join("pinned/deep/below")).unwrap();
+        fs::create_dir_all(root.join("safe/child")).unwrap();
+        fs::write(root.join(MARKER_FILENAME), "").unwrap();
+        let marker = root.join("pinned/deep/below").join(MARKER_FILENAME);
+        fs::write(&marker, "relocatable = false\n").unwrap();
+        let config = RelocationConfig::default();
+        let survey = survey_tree_with_policy(&root, 1, 1_000, &config).unwrap();
+        assert_eq!(survey.units.len(), 3);
+        for unit in &survey.units {
+            if unit.path == root.join("safe") {
+                assert!(unit.relocation_veto.is_none());
+            } else {
+                assert_eq!(unit.relocation_veto.as_ref().unwrap().path, marker);
+            }
+        }
+    }
+
+    #[test]
+    fn descendant_true_cannot_override_an_ancestor_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("marked");
+        fs::create_dir_all(root.join("pinned/child")).unwrap();
+        fs::create_dir_all(root.join("safe")).unwrap();
+        let marker = root.join("pinned").join(MARKER_FILENAME);
+        fs::write(&marker, "relocatable = false\n").unwrap();
+        fs::write(
+            root.join("pinned/child").join(MARKER_FILENAME),
+            "relocatable = true\n",
+        )
+        .unwrap();
+        let survey =
+            survey_tree_with_policy(&root, 2, 1_000, &RelocationConfig::default()).unwrap();
+        let child = survey
+            .units
+            .iter()
+            .find(|unit| unit.path == root.join("pinned/child"))
+            .unwrap();
+        assert_eq!(child.relocation_veto.as_ref().unwrap().path, marker);
+        let safe = survey
+            .units
+            .iter()
+            .find(|unit| unit.path == root.join("safe"))
+            .unwrap();
+        assert!(safe.relocation_veto.is_none());
+    }
+
+    #[test]
+    fn marker_formats_and_unsafe_entries_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, contents, permission) in [
+            ("empty", "", Some(true)),
+            ("toml", "added_by = \"agent\"\n", Some(true)),
+            (
+                "json",
+                "{\"reason\":\"keep\",\"relocatable\":false}",
+                Some(false),
+            ),
+            ("false", "relocatable = false\n", Some(false)),
+            ("malformed", "relocatable =", None),
+            ("wrong_type", "relocatable = \"false\"", None),
+            ("json_wrong_type", "{\"relocatable\":\"false\"}", None),
+        ] {
+            let directory = tmp.path().join(name);
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join(MARKER_FILENAME), contents).unwrap();
+            let descriptor = open_directory(&directory).unwrap();
+            let result = marker_policy(&descriptor);
+            if let Some(permission) = permission {
+                assert_eq!(result.unwrap(), Some(permission), "{name}");
+            } else {
+                assert!(result.is_err(), "{name} granted permission");
+                assert!(marker_veto(&descriptor, &directory).is_some());
+            }
+        }
+        for name in ["symlink", "directory", "fifo", "oversized"] {
+            let directory = tmp.path().join(name);
+            fs::create_dir(&directory).unwrap();
+            let marker = directory.join(MARKER_FILENAME);
+            match name {
+                "symlink" => std::os::unix::fs::symlink(
+                    tmp.path().join("empty").join(MARKER_FILENAME),
+                    &marker,
+                )
+                .unwrap(),
+                "directory" => fs::create_dir(&marker).unwrap(),
+                "fifo" => nix::unistd::mkfifo(&marker, nix::sys::stat::Mode::S_IRUSR).unwrap(),
+                "oversized" => File::create(&marker)
+                    .unwrap()
+                    .set_len(MAX_MARKER_BYTES + 1)
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            let descriptor = open_directory(&directory).unwrap();
+            assert!(
+                marker_policy(&descriptor).is_err(),
+                "{name} granted permission"
+            );
+            let report =
+                survey_tree_with_policy(&directory, 0, 100, &RelocationConfig::default()).unwrap();
+            assert!(
+                report.units[0].relocation_veto.is_some(),
+                "{name} was not vetoed"
+            );
+        }
+    }
+
+    #[test]
+    fn excluded_descendant_applies_beyond_unit_depth_and_to_its_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("marked");
+        fs::create_dir_all(root.join("branch/deep/.cargo/cache")).unwrap();
+        fs::create_dir_all(root.join("safe")).unwrap();
+        let survey =
+            survey_tree_with_policy(&root, 4, 1_000, &RelocationConfig::default()).unwrap();
+        for unit in &survey.units {
+            if unit.path == root.join("safe") {
+                assert!(unit.relocation_veto.is_none());
+            } else {
+                assert_eq!(
+                    unit.relocation_veto
+                        .as_ref()
+                        .unwrap()
+                        .excluded_pattern
+                        .as_deref(),
+                    Some(".cargo")
+                );
+            }
+        }
+        let shallow =
+            survey_tree_with_policy(&root, 0, 1_000, &RelocationConfig::default()).unwrap();
+        assert_eq!(shallow.units.len(), 1);
+        assert_eq!(
+            shallow.units[0]
+                .relocation_veto
+                .as_ref()
+                .unwrap()
+                .excluded_pattern
+                .as_deref(),
+            Some(".cargo")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn policy_reads_do_not_reset_marker_access_age() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join(MARKER_FILENAME);
+        fs::write(&marker, "added_by = \"agent\"\n").unwrap();
+        age(&marker, 30);
+        let before = fs::metadata(&marker).unwrap();
+        let survey =
+            survey_tree_with_policy(tmp.path(), 0, 100, &RelocationConfig::default()).unwrap();
+        assert!(survey.units[0].relocation_veto.is_none());
+        let after = fs::metadata(&marker).unwrap();
+        assert_eq!(
+            (before.atime(), before.atime_nsec()),
+            (after.atime(), after.atime_nsec())
+        );
     }
 
     #[test]
