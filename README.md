@@ -413,6 +413,7 @@ For non-interactive environments (CI, automation), `sbh install --auto` applies 
 | `sbh scan` | Manual candidate discovery and scoring report |
 | `sbh clean` | Manual cleanup with confirmation/dry-run |
 | `sbh undo` | Restore quarantined entries (`<decision-id>`, `--path`, `--all-since`, `--list`) |
+| `sbh relocate` | Report dormant protected scratch, apply verified backup relocation, or restore a relocated tree ([guide](docs/relocation.md)) |
 | `sbh emergency` | Zero-write recovery mode on critically full disks |
 
 ### Ballast and Protection
@@ -1487,6 +1488,20 @@ reflinks/shared blocks prevent a reclaimable-space promise. Missing transcripts,
 limited process visibility, changed trees, and exhausted scan budgets remain
 explicit uncertainty. See [the inventory guide](docs/agent-scratch.md) for roots,
 limits, JSON fields, and exit statuses.
+
+### Restoring Relocated Scratch
+
+On Linux, `sbh relocate --restore /absolute/path/to/stub` copies the backup into
+a private directory unique to the attempt, verifies it, and installs it at the
+original path. The opened payload directory pins rsync's destination even if a
+parent or staging pathname moves. Concurrent restores of the same stub refuse
+immediately; changed records, replaced stubs, and newly occupied original paths
+stop the swap while preserving the available recovery trees.
+
+The backup and previous stub are retained after success. Human and JSON output
+name the saved stub, including files written there since relocation. Refused or
+interrupted transfers retain their staging for recovery. See [relocation and
+restore](docs/relocation.md) for recovery locations and evidence limits.
 
 ### Lossless Reclaim Before Cleanup
 

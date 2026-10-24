@@ -21,13 +21,18 @@
 //! Every remote operation is an rsync, so a key restricted with `rrsync` to
 //! one directory on the target is enough.
 
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use chrono::{DateTime, Utc};
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, Stat};
 use serde::{Deserialize, Serialize};
 
 use super::config::RelocationConfig;
@@ -223,11 +228,12 @@ fn copy_and_verify(
     destination: &str,
 ) -> Result<(), (String, String)> {
     let mut copy = rsync_command(config, remote);
-    copy.arg(source).arg(destination);
+    copy.arg("--").arg(source).arg(destination);
     run(copy, "copy")?;
     let mut verify = rsync_command(config, remote);
     verify
         .args(["--checksum", "--dry-run", "--itemize-changes", "--delete"])
+        .arg("--")
         .arg(source)
         .arg(destination);
     let differences = run(verify, "verify")?;
@@ -281,7 +287,7 @@ Copy: `{destination}`{note}\n\n\
 ## Restore\n\n\
 ```\nsudo sbh relocate --restore {path}\n```\n\n\
 That copies the tree back, verifies it, and swaps it in for this stub. The \
-backup copy is kept.\n\n\
+backup copy and previous stub are kept for recovery.\n\n\
 Without sbh: `rsync -aHAX --numeric-ids {fake}{destination} <somewhere>/`\n\n\
 To keep a tree from ever being relocated, write `relocatable = false` into its \
 `.sbh-protect` marker.\n",
@@ -617,58 +623,392 @@ fn relocate_with_hooks(
     }
 }
 
-/// Bring a relocated tree back from its copy and replace the stub.
+const MAX_RESTORE_RECORD_BYTES: u64 = 1024 * 1024;
+const MAX_RESTORE_STUB_ENTRIES: usize = 4096;
+
+fn restore_invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn same_restore_identity(left: &Stat, right: &Stat) -> bool {
+    left.st_dev == right.st_dev
+        && left.st_ino == right.st_ino
+        && FileType::from_raw_mode(left.st_mode) == FileType::from_raw_mode(right.st_mode)
+}
+
+fn same_restore_stamp(left: &Stat, right: &Stat) -> bool {
+    same_restore_identity(left, right)
+        && left.st_mode == right.st_mode
+        && left.st_uid == right.st_uid
+        && left.st_gid == right.st_gid
+        && left.st_nlink == right.st_nlink
+        && left.st_size == right.st_size
+        && left.st_mtime == right.st_mtime
+        && left.st_mtime_nsec == right.st_mtime_nsec
+        && left.st_ctime == right.st_ctime
+        && left.st_ctime_nsec == right.st_ctime_nsec
+}
+
+struct RestoreSnapshot {
+    directory: Stat,
+    entries: BTreeMap<OsString, Stat>,
+    record: Vec<u8>,
+}
+
+impl RestoreSnapshot {
+    fn same_contents(&self, other: &Self) -> bool {
+        same_restore_identity(&self.directory, &other.directory)
+            && self.directory.st_mode == other.directory.st_mode
+            && self.directory.st_uid == other.directory.st_uid
+            && self.directory.st_gid == other.directory.st_gid
+            && self.record == other.record
+            && self.entries.len() == other.entries.len()
+            && self.entries.iter().zip(&other.entries).all(
+                |((name, stamp), (other_name, other_stamp))| {
+                    name == other_name && same_restore_stamp(stamp, other_stamp)
+                },
+            )
+    }
+}
+
+/// The stub is small metadata, but may also contain newer user files. Pin
+/// their top-level identities without following links or reading payloads.
+fn restore_snapshot(directory: &fs::File) -> io::Result<RestoreSnapshot> {
+    let before = rustix::fs::fstat(directory)?;
+    let mut entries = BTreeMap::new();
+    for entry in Dir::read_from(directory)? {
+        let entry = entry?;
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        if name == OsStr::new(".") || name == OsStr::new("..") {
+            continue;
+        }
+        if entries.len() >= MAX_RESTORE_STUB_ENTRIES {
+            return Err(restore_invalid("restore stub entry budget exhausted"));
+        }
+        entries.insert(
+            name.to_os_string(),
+            rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?,
+        );
+    }
+    let expected = entries
+        .get(OsStr::new(RECORD_FILENAME))
+        .ok_or_else(|| restore_invalid("restore stub has no relocation record"))?;
+    if FileType::from_raw_mode(expected.st_mode) != FileType::RegularFile
+        || !u64::try_from(expected.st_size).is_ok_and(|size| size <= MAX_RESTORE_RECORD_BYTES)
+    {
+        return Err(restore_invalid(
+            "relocation record is not a bounded regular file",
+        ));
+    }
+    let file = fs::File::from(crate::scanner::quarantine::open_beneath(
+        directory,
+        OsStr::new(RECORD_FILENAME),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOATIME | OFlags::CLOEXEC,
+    )?);
+    if !same_restore_stamp(expected, &rustix::fs::fstat(&file)?) {
+        return Err(restore_invalid("relocation record changed while opening"));
+    }
+    let mut record = Vec::new();
+    (&file)
+        .take(MAX_RESTORE_RECORD_BYTES + 1)
+        .read_to_end(&mut record)?;
+    if record.len() as u64 > MAX_RESTORE_RECORD_BYTES
+        || !same_restore_stamp(expected, &rustix::fs::fstat(&file)?)
+        || !same_restore_stamp(
+            expected,
+            &rustix::fs::statat(directory, RECORD_FILENAME, AtFlags::SYMLINK_NOFOLLOW)?,
+        )
+        || !same_restore_stamp(&before, &rustix::fs::fstat(directory)?)
+    {
+        return Err(restore_invalid("restore stub changed while reading"));
+    }
+    Ok(RestoreSnapshot {
+        directory: before,
+        entries,
+        record,
+    })
+}
+
+fn restore_parent_current(parent: &fs::File, path: &Path) -> io::Result<()> {
+    let current = rustix::fs::statat(rustix::fs::CWD, path, AtFlags::SYMLINK_NOFOLLOW)?;
+    if !same_restore_identity(&rustix::fs::fstat(parent)?, &current) {
+        return Err(restore_invalid("restore parent path was replaced or moved"));
+    }
+    Ok(())
+}
+
+struct RestoreWorkspace {
+    directory: fs::File,
+    name: String,
+    path: PathBuf,
+}
+
+impl RestoreWorkspace {
+    fn create(parent: &fs::File, parent_path: &Path) -> io::Result<Self> {
+        for _ in 0..8 {
+            let name = format!(".sbh-restore-{:032x}", rand::random::<u128>());
+            match rustix::fs::mkdirat(parent, &name, Mode::from_raw_mode(0o700)) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::EXIST) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            let directory = fs::File::from(crate::scanner::quarantine::open_beneath(
+                parent,
+                OsStr::new(&name),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            )?);
+            let metadata = rustix::fs::fstat(&directory)?;
+            if metadata.st_uid != nix::unistd::geteuid().as_raw()
+                || metadata.st_mode & 0o777 != 0o700
+            {
+                return Err(restore_invalid("restore workspace is not private"));
+            }
+            rustix::fs::mkdirat(&directory, "payload", Mode::from_raw_mode(0o700))?;
+            parent.sync_all()?;
+            return Ok(Self {
+                directory,
+                path: parent_path.join(&name),
+                name,
+            });
+        }
+        Err(restore_invalid(
+            "cannot exclusively create a restore workspace",
+        ))
+    }
+
+    fn location(&self) -> PathBuf {
+        fs::read_link(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
+            .unwrap_or_else(|_| self.path.clone())
+    }
+
+    fn check_identity(&self, parent: &fs::File) -> io::Result<()> {
+        let current = rustix::fs::statat(parent, &self.name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if !same_restore_identity(&rustix::fs::fstat(&self.directory)?, &current) {
+            return Err(restore_invalid("restore workspace was replaced or moved"));
+        }
+        Ok(())
+    }
+}
+
+type RestoreHook<'a> = &'a dyn Fn(&Path, &Path);
+
+#[derive(Default)]
+struct RestoreHooks<'a> {
+    before_copy: Option<RestoreHook<'a>>,
+    before_swap: Option<RestoreHook<'a>>,
+    after_stub_move: Option<RestoreHook<'a>>,
+}
+
+/// Bring a relocated tree back from its copy and replace the stub. Every
+/// attempt has private staging; the previous stub is retained for recovery.
 pub fn restore(stub: &Path) -> Result<Restored, String> {
-    let record: RelocationRecord = serde_json::from_slice(
-        &fs::read(stub.join(RECORD_FILENAME))
-            .map_err(|error| format!("{}: {error}", stub.join(RECORD_FILENAME).display()))?,
-    )
-    .map_err(|error| format!("bad record: {error}"))?;
-    if record.path != stub {
+    restore_with_hooks(stub, &RestoreHooks::default())
+}
+
+#[allow(clippy::too_many_lines)]
+fn restore_with_hooks(stub: &Path, hooks: &RestoreHooks<'_>) -> Result<Restored, String> {
+    if !stub.is_absolute()
+        || stub
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err("restore needs an absolute path without parent components".into());
+    }
+    let (Some(parent_path), Some(name)) = (stub.parent(), stub.file_name()) else {
+        return Err("restore path has no parent or name".into());
+    };
+    let parent = survey::open_directory(parent_path).map_err(|error| error.to_string())?;
+    let directory = fs::File::from(
+        crate::scanner::quarantine::open_beneath(
+            &parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        )
+        .map_err(|error| format!("opening restore stub: {error}"))?,
+    );
+    // A directory lock cannot be redirected by a replaced lock file and
+    // needs no allocation. Different opens of this inode serialize restores.
+    let locked = nix::fcntl::Flock::lock(directory, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        .map_err(|(_, error)| {
+            format!("cannot lock restore stub (another restore may be running): {error}")
+        })?;
+    let initial = restore_snapshot(&locked).map_err(|error| error.to_string())?;
+    let record: RelocationRecord = serde_json::from_slice(&initial.record)
+        .map_err(|error| format!("bad relocation record: {error}"))?;
+    if record.schema != SCHEMA || record.path != stub {
         return Err(format!(
-            "the record is for {}, not {}",
-            record.path.display(),
+            "relocation record does not identify this stub: {}",
             stub.display()
         ));
     }
-    let remote = is_remote(&record.destination);
+    if record.destination.is_empty() || !record.destination.ends_with('/') {
+        return Err("relocation record has no directory destination".into());
+    }
     let config = RelocationConfig {
+        target: Some(record.destination.clone()),
         ssh_identity: record.ssh_identity.clone(),
         ssh_port: record.ssh_port,
         ssh_options: record.ssh_options.clone(),
         fake_super: record.fake_super,
         ..RelocationConfig::default()
     };
-    let incoming = sibling(stub, "sbh-restoring").map_err(|error| error.to_string())?;
-    let incoming_arg = format!("{}/", incoming.display());
-    copy_and_verify(&config, remote, &record.destination, &incoming_arg)
-        .map_err(|(stage, error)| format!("{stage}: {error}"))?;
-    let old_stub = sibling(stub, "sbh-stub").map_err(|error| error.to_string())?;
-    fs::rename(stub, &old_stub).map_err(|error| format!("moving the stub aside: {error}"))?;
-    if let Err(error) = fs::rename(&incoming, stub) {
-        let _ = fs::rename(&old_stub, stub);
-        return Err(format!("swapping the tree in: {error}"));
+    config
+        .validate()
+        .map_err(|error| format!("bad relocation settings: {error}"))?;
+    restore_parent_current(&parent, parent_path).map_err(|error| error.to_string())?;
+    let workspace = RestoreWorkspace::create(&parent, parent_path)
+        .map_err(|error| format!("creating private restore staging: {error}"))?;
+    let retained = |reason: String| {
+        format!(
+            "{reason}; restore data retained at {}; backup remains at {}",
+            workspace.location().display(),
+            record.destination
+        )
+    };
+    let payload = fs::File::from(
+        crate::scanner::quarantine::open_beneath(
+            &workspace.directory,
+            OsStr::new("payload"),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        )
+        .map_err(|error| retained(error.to_string()))?,
+    );
+    let payload_identity =
+        rustix::fs::fstat(&payload).map_err(|error| retained(error.to_string()))?;
+    if let Some(hook) = hooks.before_copy {
+        hook(stub, &workspace.location());
     }
-    // The stub is an ordinary directory; a job may have written into it
-    // since the move. Only a stub holding nothing but sbh's files goes.
-    let foreign: Vec<String> = fs::read_dir(&old_stub)
-        .map_err(|error| format!("restored, but reading the old stub failed: {error}"))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| {
-            ![README_FILENAME, RECORD_FILENAME, MARKER_FILENAME].contains(&name.as_str())
+    // Pin the payload itself, not just its parent: replacing the payload
+    // entry with a symlink must never redirect even the initial rsync writes.
+    let destination = format!("/proc/{}/fd/{}/", std::process::id(), payload.as_raw_fd());
+    copy_and_verify(
+        &config,
+        is_remote(&record.destination),
+        &record.destination,
+        &destination,
+    )
+    .map_err(|(stage, error)| retained(format!("{stage}: {error}")))?;
+    if let Some(hook) = hooks.before_swap {
+        hook(stub, &workspace.location());
+    }
+    let current = restore_snapshot(&locked).map_err(|error| retained(error.to_string()))?;
+    if !same_restore_stamp(&initial.directory, &current.directory)
+        || !initial.same_contents(&current)
+    {
+        return Err(retained("restore stub changed during the copy".into()));
+    }
+    restore_parent_current(&parent, parent_path).map_err(|error| retained(error.to_string()))?;
+    workspace
+        .check_identity(&parent)
+        .map_err(|error| retained(error.to_string()))?;
+    let current_stub = rustix::fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| retained(error.to_string()))?;
+    let current_payload =
+        rustix::fs::statat(&workspace.directory, "payload", AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| retained(error.to_string()))?;
+    if !same_restore_identity(&initial.directory, &current_stub)
+        || !same_restore_identity(&payload_identity, &current_payload)
+    {
+        return Err(retained("restore stub or copied tree was replaced".into()));
+    }
+    rustix::fs::renameat_with(
+        &parent,
+        name,
+        &workspace.directory,
+        "stub",
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| retained(format!("moving the stub aside: {error}")))?;
+    let undo = |reason: String| {
+        let rollback = rustix::fs::renameat_with(
+            &workspace.directory,
+            "stub",
+            &parent,
+            name,
+            RenameFlags::NOREPLACE,
+        );
+        retained(match rollback {
+            Ok(()) => format!("{reason}; original stub put back"),
+            Err(error) => format!(
+                "{reason}; original path was not overwritten and rollback could not finish ({error}); previous stub is at {}",
+                workspace.location().join("stub").display()
+            ),
         })
-        .collect();
-    if !foreign.is_empty() {
-        return Ok(Restored {
-            path: record.path,
-            kept_stub: Some((old_stub, foreign)),
-        });
+    };
+    if let Some(hook) = hooks.after_stub_move {
+        hook(stub, &workspace.location());
     }
-    remove_own_stub(&old_stub);
+    // Rename changes the directory ctime. Its identity and entries must
+    // still match, including the record read before the transfer started.
+    let moved = fs::File::from(
+        crate::scanner::quarantine::open_beneath(
+            &workspace.directory,
+            OsStr::new("stub"),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        )
+        .map_err(|error| undo(error.to_string()))?,
+    );
+    let moved_snapshot = restore_snapshot(&moved).map_err(|error| undo(error.to_string()))?;
+    if !initial.same_contents(&moved_snapshot) {
+        return Err(undo("stub identity or contents changed during swap".into()));
+    }
+    restore_parent_current(&parent, parent_path).map_err(|error| undo(error.to_string()))?;
+    workspace
+        .check_identity(&parent)
+        .map_err(|error| undo(error.to_string()))?;
+    let current_payload =
+        rustix::fs::statat(&workspace.directory, "payload", AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| undo(error.to_string()))?;
+    if !same_restore_identity(&payload_identity, &current_payload) {
+        return Err(undo("copied tree was replaced during swap".into()));
+    }
+    rustix::fs::renameat_with(
+        &workspace.directory,
+        "payload",
+        &parent,
+        name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| undo(format!("publishing restored tree: {error}")))?;
+    let published_error = |reason: String| {
+        let actual_parent = fs::read_link(format!("/proc/self/fd/{}", parent.as_raw_fd()))
+            .unwrap_or_else(|_| parent_path.to_path_buf());
+        format!(
+            "restored tree was installed at {}, but completion could not be confirmed: {reason}; previous stub retained at {}; backup remains at {}",
+            actual_parent.join(name).display(),
+            workspace.location().join("stub").display(),
+            record.destination,
+        )
+    };
+    let published = rustix::fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| published_error(error.to_string()))?;
+    if !same_restore_identity(&payload_identity, &published) {
+        return Err(published_error("installed tree identity changed".into()));
+    }
+    parent
+        .sync_all()
+        .map_err(|error| published_error(format!("restored tree directory sync: {error}")))?;
+    workspace
+        .directory
+        .sync_all()
+        .map_err(|error| published_error(format!("saved stub directory sync: {error}")))?;
+    restore_parent_current(&parent, parent_path)
+        .map_err(|error| published_error(error.to_string()))?;
+    // Retain even a pristine stub. A writer holding a directory/file handle
+    // can still add work after the swap; cleanup by known filename would lose it.
+    let foreign = initial
+        .entries
+        .keys()
+        .filter(|name| {
+            ![README_FILENAME, RECORD_FILENAME, MARKER_FILENAME]
+                .iter()
+                .any(|known| name.as_os_str() == OsStr::new(known))
+        })
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect();
     Ok(Restored {
         path: record.path,
-        kept_stub: old_stub.exists().then(|| (old_stub, Vec::new())),
+        kept_stub: Some((workspace.location().join("stub"), foreign)),
     })
 }
 
@@ -677,8 +1017,8 @@ pub fn restore(stub: &Path) -> Result<Restored, String> {
 pub struct Restored {
     /// The restored path.
     pub path: PathBuf,
-    /// The old stub, kept because it held more than sbh's files, with the
-    /// names it held.
+    /// The previous stub retained in private recovery staging, with any
+    /// additional names it held before restoration.
     pub kept_stub: Option<(PathBuf, Vec<String>)>,
 }
 
@@ -791,10 +1131,11 @@ mod tests {
         assert!(ledger.in_progress.is_empty());
 
         let restored = restore(&unit).unwrap();
-        assert_eq!(
-            (restored.path.as_path(), restored.kept_stub),
-            (unit.as_path(), None)
-        );
+        assert_eq!(restored.path, unit);
+        let (kept, foreign) = restored.kept_stub.expect("previous stub retained");
+        assert!(foreign.is_empty());
+        assert!(kept.join(RECORD_FILENAME).is_file());
+        assert!(kept.join(README_FILENAME).is_file());
         assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
         assert!(!unit.join(README_FILENAME).exists());
         assert!(!sibling(&unit, "sbh-stub").unwrap().exists());
@@ -804,6 +1145,389 @@ mod tests {
             fs::metadata(unit.join("top")).unwrap().ino(),
             fs::metadata(unit.join("a/top-link")).unwrap().ino()
         );
+    }
+
+    fn restore_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let stub = root.join("scratch/unit");
+        let backup = root.join("backup");
+        fs::create_dir_all(&stub).unwrap();
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("data"), b"verified backup payload").unwrap();
+        let record = RelocationRecord {
+            schema: SCHEMA.into(),
+            path: stub.clone(),
+            destination: format!("{}/", backup.display()),
+            host: "fixture".into(),
+            relocated_at: rfc3339(1_000),
+            bytes: 4096,
+            files: 1,
+            newest_change: rfc3339(1),
+            newest_access: None,
+            observed_days: Some(14.0),
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: nix::unistd::getegid().as_raw(),
+            mode: 0o700,
+            ssh_identity: None,
+            ssh_port: None,
+            ssh_options: Vec::new(),
+            fake_super: false,
+            target_note: None,
+        };
+        fs::write(
+            stub.join(RECORD_FILENAME),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        fs::write(stub.join(README_FILENAME), readme(&record)).unwrap();
+        (stub, backup)
+    }
+
+    #[test]
+    fn restore_never_reuses_foreign_or_symlinked_legacy_staging() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        for symlink in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (stub, backup) = restore_fixture(tmp.path());
+            let foreign = tmp.path().join("foreign");
+            fs::create_dir(&foreign).unwrap();
+            fs::write(foreign.join("data"), b"unrelated data").unwrap();
+            let incoming = sibling(&stub, "sbh-restoring").unwrap();
+            if symlink {
+                std::os::unix::fs::symlink(&foreign, &incoming).unwrap();
+            } else {
+                fs::create_dir(&incoming).unwrap();
+                fs::write(incoming.join("data"), b"interrupted work").unwrap();
+            }
+            let old = sibling(&stub, "sbh-stub").unwrap();
+            fs::create_dir(&old).unwrap();
+            fs::write(old.join("keep"), b"previous recovery").unwrap();
+            let restored = restore(&stub).unwrap();
+            assert_eq!(
+                fs::read(stub.join("data")).unwrap(),
+                b"verified backup payload"
+            );
+            assert_eq!(
+                fs::read(backup.join("data")).unwrap(),
+                b"verified backup payload"
+            );
+            assert_eq!(fs::read(foreign.join("data")).unwrap(), b"unrelated data");
+            assert_eq!(fs::read(old.join("keep")).unwrap(), b"previous recovery");
+            if symlink {
+                assert_eq!(fs::read_link(incoming).unwrap(), foreign);
+            } else {
+                assert_eq!(
+                    fs::read(incoming.join("data")).unwrap(),
+                    b"interrupted work"
+                );
+            }
+            let (kept, _) = restored.kept_stub.unwrap();
+            assert_eq!(
+                fs::metadata(kept.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert!(kept.join(RECORD_FILENAME).is_file());
+        }
+    }
+
+    #[test]
+    fn restore_lock_refuses_a_second_attempt_before_it_copies() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (stub, _) = restore_fixture(tmp.path());
+        let attempted = std::cell::Cell::new(false);
+        let concurrent = |path: &Path, _: &Path| {
+            let error = restore(path).unwrap_err();
+            assert!(error.contains("cannot lock restore stub"), "{error}");
+            attempted.set(true);
+            let workspaces = fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".sbh-restore-")
+                })
+                .count();
+            assert_eq!(workspaces, 1, "the second attempt never created staging");
+        };
+        restore_with_hooks(
+            &stub,
+            &RestoreHooks {
+                before_copy: Some(&concurrent),
+                ..RestoreHooks::default()
+            },
+        )
+        .unwrap();
+        assert!(attempted.get());
+        assert_eq!(
+            fs::read(stub.join("data")).unwrap(),
+            b"verified backup payload"
+        );
+    }
+
+    #[test]
+    fn restore_copies_to_its_pinned_payload_and_refuses_a_substituted_leaf() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        for after_move in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (stub, backup) = restore_fixture(tmp.path());
+            let foreign = tmp.path().join("foreign");
+            fs::create_dir(&foreign).unwrap();
+            fs::write(foreign.join("data"), b"unrelated destination").unwrap();
+            let workspace = std::cell::RefCell::new(PathBuf::new());
+            let substitute = |_: &Path, staging: &Path| {
+                *workspace.borrow_mut() = staging.to_path_buf();
+                fs::rename(staging.join("payload"), staging.join("retained-payload")).unwrap();
+                std::os::unix::fs::symlink(&foreign, staging.join("payload")).unwrap();
+            };
+            let hooks = if after_move {
+                RestoreHooks {
+                    after_stub_move: Some(&substitute),
+                    ..RestoreHooks::default()
+                }
+            } else {
+                RestoreHooks {
+                    before_copy: Some(&substitute),
+                    ..RestoreHooks::default()
+                }
+            };
+            let error = restore_with_hooks(&stub, &hooks).unwrap_err();
+            assert!(error.contains("replaced"), "{error}");
+            assert!(
+                stub.join(RECORD_FILENAME).is_file(),
+                "original stub survives"
+            );
+            assert!(!stub.join("data").exists());
+            assert_eq!(
+                fs::read(foreign.join("data")).unwrap(),
+                b"unrelated destination"
+            );
+            assert_eq!(
+                fs::read(workspace.borrow().join("retained-payload/data")).unwrap(),
+                b"verified backup payload"
+            );
+            assert_eq!(
+                fs::read(backup.join("data")).unwrap(),
+                b"verified backup payload"
+            );
+            assert!(error.contains(&workspace.borrow().display().to_string()));
+        }
+    }
+
+    #[test]
+    fn restore_refuses_a_replaced_stub_or_edited_record_after_copy() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        for replace in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (stub, backup) = restore_fixture(tmp.path());
+            let workspace = std::cell::RefCell::new(PathBuf::new());
+            let change = |path: &Path, staging: &Path| {
+                *workspace.borrow_mut() = staging.to_path_buf();
+                if replace {
+                    fs::rename(path, tmp.path().join("original-stub")).unwrap();
+                    fs::create_dir(path).unwrap();
+                    fs::write(path.join("data"), b"new occupant").unwrap();
+                } else {
+                    let file = path.join(RECORD_FILENAME);
+                    let mut record: RelocationRecord =
+                        serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+                    record.host = "edited during transfer".into();
+                    fs::write(file, serde_json::to_vec(&record).unwrap()).unwrap();
+                }
+            };
+            let error = restore_with_hooks(
+                &stub,
+                &RestoreHooks {
+                    before_swap: Some(&change),
+                    ..RestoreHooks::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("changed") || error.contains("replaced"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&workspace.borrow().display().to_string()),
+                "{error}"
+            );
+            assert_eq!(
+                fs::read(workspace.borrow().join("payload/data")).unwrap(),
+                b"verified backup payload"
+            );
+            assert_eq!(
+                fs::read(backup.join("data")).unwrap(),
+                b"verified backup payload"
+            );
+            if replace {
+                assert_eq!(fs::read(stub.join("data")).unwrap(), b"new occupant");
+                assert!(
+                    tmp.path()
+                        .join("original-stub")
+                        .join(RECORD_FILENAME)
+                        .is_file()
+                );
+            } else {
+                assert!(
+                    fs::read_to_string(stub.join(RECORD_FILENAME))
+                        .unwrap()
+                        .contains("edited during transfer")
+                );
+                assert!(!stub.join("data").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn restore_preserves_a_path_recreated_during_swap_and_both_recovery_trees() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (stub, backup) = restore_fixture(tmp.path());
+        let workspace = std::cell::RefCell::new(PathBuf::new());
+        let recreate = |path: &Path, staging: &Path| {
+            *workspace.borrow_mut() = staging.to_path_buf();
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("new-work"), b"keep the new occupant").unwrap();
+        };
+        let error = restore_with_hooks(
+            &stub,
+            &RestoreHooks {
+                after_stub_move: Some(&recreate),
+                ..RestoreHooks::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("original path was not overwritten"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&workspace.borrow().join("stub").display().to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(stub.join("new-work")).unwrap(),
+            b"keep the new occupant"
+        );
+        assert_eq!(
+            fs::read(workspace.borrow().join("payload/data")).unwrap(),
+            b"verified backup payload"
+        );
+        assert!(
+            workspace
+                .borrow()
+                .join("stub")
+                .join(RECORD_FILENAME)
+                .is_file()
+        );
+        assert_eq!(
+            fs::read(backup.join("data")).unwrap(),
+            b"verified backup payload"
+        );
+    }
+
+    #[test]
+    fn restore_reports_the_actual_staging_location_when_its_parent_moves() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (stub, _) = restore_fixture(tmp.path());
+        let retained = std::cell::RefCell::new(PathBuf::new());
+        let move_parent = |path: &Path, staging: &Path| {
+            let parent = path.parent().unwrap();
+            let moved = tmp.path().join("moved-scratch");
+            fs::rename(parent, &moved).unwrap();
+            *retained.borrow_mut() = moved.join(staging.file_name().unwrap());
+            fs::create_dir(parent).unwrap();
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("new-work"), b"unrelated replacement").unwrap();
+        };
+        let error = restore_with_hooks(
+            &stub,
+            &RestoreHooks {
+                before_copy: Some(&move_parent),
+                ..RestoreHooks::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("parent path was replaced or moved"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&retained.borrow().display().to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(retained.borrow().join("payload/data")).unwrap(),
+            b"verified backup payload"
+        );
+        assert!(
+            tmp.path()
+                .join("moved-scratch/unit")
+                .join(RECORD_FILENAME)
+                .is_file()
+        );
+        assert_eq!(
+            fs::read(stub.join("new-work")).unwrap(),
+            b"unrelated replacement"
+        );
+    }
+
+    #[test]
+    fn restore_refuses_unsafe_or_oversized_records_before_creating_staging() {
+        for kind in ["symlink", "fifo", "oversized", "wrong-schema"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (stub, _) = restore_fixture(tmp.path());
+            let path = stub.join(RECORD_FILENAME);
+            let saved = tmp.path().join("saved-record");
+            fs::rename(&path, &saved).unwrap();
+            match kind {
+                "symlink" => std::os::unix::fs::symlink(&saved, &path).unwrap(),
+                "fifo" => nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR).unwrap(),
+                "oversized" => fs::File::create(&path)
+                    .unwrap()
+                    .set_len(MAX_RESTORE_RECORD_BYTES + 1)
+                    .unwrap(),
+                _ => {
+                    let mut record: RelocationRecord =
+                        serde_json::from_slice(&fs::read(&saved).unwrap()).unwrap();
+                    record.schema = "not-a-relocation".into();
+                    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+                }
+            }
+            assert!(restore(&stub).is_err(), "{kind}");
+            assert_eq!(
+                fs::read_dir(stub.parent().unwrap()).unwrap().count(),
+                1,
+                "{kind}"
+            );
+            assert!(saved.is_file());
+            assert!(!stub.join("data").exists());
+        }
     }
 
     #[test]

@@ -87,6 +87,15 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Restore cannot reuse foreign staging or overwrite a concurrent occupant.**
+  Each relocation restore locks its stub and creates a private random workspace.
+  Rsync writes through the opened payload directory, so replaced parent or
+  payload pathnames cannot redirect the transfer. Bounded, non-symlink records
+  and stub identities are rechecked before publication; publication and rollback
+  refuse occupied paths. The previous stub is always retained, even when it
+  initially contains only relocation metadata, so late writes through old handles
+  survive. Human and JSON output expose its recovery path, and failed attempts
+  retain partial or verified data with explicit recovery locations.
 - **RAM-backed `check --need` honors the caller's memory limits** (bd-paeg).
   Positive explicit byte requests on Linux tmpfs/ramfs now compare fresh host
   `MemAvailable` with every finite visible cgroup-v2 `memory.high` and

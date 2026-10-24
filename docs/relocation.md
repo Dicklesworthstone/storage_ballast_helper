@@ -40,7 +40,13 @@ Nothing is deleted before the copy verifies. To bring a tree back:
 sudo sbh relocate --restore /dev/shm/old-scratch
 ```
 
-This copies the tree back next to the stub, verifies it, swaps it in, and keeps the backup copy.
+This copies the tree back next to the stub, verifies it, swaps it in, and keeps the backup copy and previous stub.
+
+Restore locks the opened stub directory for the entire attempt. A second restore of the same stub refuses immediately. Each attempt creates a private `0700` `.sbh-restore-<random>` directory beside the stub, with a `payload` directory for the copy. Existing `.name.sbh-restoring` and `.name.sbh-stub` paths are left intact. Copying uses the opened payload directory, so replacing its name or an ancestor pathname cannot redirect rsync into unrelated files.
+
+The relocation record must be a regular, non-symlink file of at most 1 MiB, name this exact stub, and use the supported schema. Before swapping, restore renews the stub identity, record contents, top-level entry evidence (bounded to 4,096 entries), and parent identity. Publication and rollback never replace a newly occupied original path. An interrupted or refused attempt retains its staging and names the recovery location, including when an ancestor was renamed.
+
+After a successful restore, the previous stub remains at `<private staging>/stub`, including any files written there since relocation. The command reports that path even for a pristine stub, because a process holding an old file or directory handle may still write into it. Failed attempts retain partial or verified data at `<private staging>/payload`; review that location when recovering or retrying a large transfer. The backup remains available throughout.
 
 If the completion ledger cannot be saved, the command reports failure and keeps all three recovery locations: the original tree at `.<name>.sbh-relocating`, the verified backup, and the restore stub. The error names those paths. Repair the state directory or ledger before continuing; the preserved original is not automatically removed.
 
