@@ -10,7 +10,9 @@ use storage_ballast_helper::monitor::ram_scratch::attribution::{
     self, AttributionLimits, MountAttribution,
 };
 use storage_ballast_helper::monitor::ram_scratch::{self, ScratchLimits, ScratchReport};
-use storage_ballast_helper::platform::pal::Platform;
+#[cfg(any(target_os = "linux", test))]
+use storage_ballast_helper::platform::pal::MemoryInfo;
+use storage_ballast_helper::platform::pal::{MemoryBoundaryKind, MemoryHeadroom, Platform};
 
 /// Extend the existing check command with explicit scratch inventory modes.
 pub fn augment(command: Command) -> Command {
@@ -56,6 +58,199 @@ struct Report {
     host: ScratchReport,
     attribution_requested: bool,
     attribution: Vec<MountAttribution>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HeadroomSource {
+    HostAvailable,
+    ProcessBoundary,
+}
+
+/// Read-only byte admission for an explicitly requested RAM-backed write.
+/// Kept separate from the host-wide scratch inventory and its schema.
+#[derive(Debug, Serialize)]
+pub struct RamWriteAdmission {
+    schema: &'static str,
+    read_only: bool,
+    scope: &'static str,
+    requested_bytes: u64,
+    host_available_bytes: Option<u64>,
+    process_boundary: Option<MemoryHeadroom>,
+    observed_headroom_bytes: Option<u64>,
+    limiting_factor: Option<HeadroomSource>,
+    complete: bool,
+    /// Missing evidence cannot certify a requested allocation.
+    pub issues: Vec<String>,
+    /// Zero fits observed headroom, one is a known shortfall, four is unknown.
+    pub exit_code: i32,
+}
+
+impl RamWriteAdmission {
+    /// Quantities and the limiting boundary for human check output.
+    pub fn summary(&self) -> String {
+        let Some(available) = self.observed_headroom_bytes else {
+            return format!(
+                "RAM-backed --need {} bytes: memory headroom evidence is incomplete",
+                self.requested_bytes
+            );
+        };
+        let boundary = if self.limiting_factor == Some(HeadroomSource::ProcessBoundary) {
+            self.process_boundary.as_ref().map_or_else(
+                || "process memory boundary".into(),
+                |limit| {
+                    let kind = match limit.boundary_kind {
+                        MemoryBoundaryKind::Throttle => "throttle boundary",
+                        MemoryBoundaryKind::HardLimit => "hard limit",
+                    };
+                    format!(
+                        "{} {kind} at {} (current={} bytes, limit={} bytes)",
+                        limit.boundary,
+                        limit.scope.display(),
+                        limit.current_bytes,
+                        limit.limit_bytes,
+                    )
+                },
+            )
+        } else {
+            "host MemAvailable".into()
+        };
+        format!(
+            "RAM-backed --need {} bytes: observed headroom {available} bytes, limited by {boundary}; observation only, not a reservation",
+            self.requested_bytes,
+        )
+    }
+}
+
+/// Check a positive explicit byte request without adding a reserve percentage.
+/// Disk paths, omitted requests, and zero requests issue no memory-limit I/O.
+pub fn write_admission(
+    platform: &dyn Platform,
+    fs_type: &str,
+    requested: Option<u64>,
+) -> Option<RamWriteAdmission> {
+    #[cfg(target_os = "linux")]
+    {
+        write_admission_with(
+            fs_type,
+            requested,
+            || platform.memory_info().map_err(|error| error.to_string()),
+            || {
+                platform
+                    .ram_write_headroom()
+                    .map_err(|error| error.to_string())
+            },
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (platform, fs_type, requested);
+        None
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn write_admission_with(
+    fs_type: &str,
+    requested: Option<u64>,
+    host: impl FnOnce() -> Result<MemoryInfo, String>,
+    process: impl FnOnce() -> Result<Option<MemoryHeadroom>, String>,
+) -> Option<RamWriteAdmission> {
+    let requested_bytes = requested.filter(|bytes| *bytes > 0)?;
+    if !fs_type.eq_ignore_ascii_case("tmpfs") && !fs_type.eq_ignore_ascii_case("ramfs") {
+        return None;
+    }
+    let mut issues = Vec::new();
+    let host_available_bytes = match host() {
+        Ok(memory) if memory.total_bytes > 0 && memory.available_bytes <= memory.total_bytes => {
+            Some(memory.available_bytes)
+        }
+        Ok(_) => {
+            issues.push("host RAM counters are inconsistent".into());
+            None
+        }
+        Err(error) => {
+            issues.push(format!("host RAM is unreadable: {error}"));
+            None
+        }
+    };
+    let process_boundary = match process() {
+        Ok(boundary) => boundary,
+        Err(error) => {
+            issues.push(format!("process memory headroom is unknown: {error}"));
+            None
+        }
+    };
+    let complete = issues.is_empty();
+    let (observed_headroom_bytes, limiting_factor) = if complete {
+        host_available_bytes.map_or((None, None), |available| {
+            process_boundary.as_ref().map_or(
+                (Some(available), Some(HeadroomSource::HostAvailable)),
+                |boundary| {
+                    let process_available = boundary.available_bytes();
+                    if process_available <= available {
+                        (
+                            Some(process_available),
+                            Some(HeadroomSource::ProcessBoundary),
+                        )
+                    } else {
+                        (Some(available), Some(HeadroomSource::HostAvailable))
+                    }
+                },
+            )
+        })
+    } else {
+        (None, None)
+    };
+    let exit_code = if complete {
+        i32::from(observed_headroom_bytes.is_none_or(|available| available < requested_bytes))
+    } else {
+        4
+    };
+    Some(RamWriteAdmission {
+        schema: "sbh.ram_write_admission.v1",
+        read_only: true,
+        scope: "host MemAvailable and visible process memory boundaries; swap excluded; observation, not a reservation",
+        requested_bytes,
+        host_available_bytes,
+        process_boundary,
+        observed_headroom_bytes,
+        limiting_factor,
+        complete,
+        issues,
+        exit_code,
+    })
+}
+
+/// Combine host-scratch and explicit-byte observations without letting a
+/// partial observation claim a successful or fully assessed admission.
+pub fn preflight_failure(
+    scratch: Option<&ScratchReport>,
+    admission: Option<&RamWriteAdmission>,
+) -> Option<(i32, &'static str)> {
+    for exit_code in [4, 1] {
+        if admission.is_some_and(|report| report.exit_code == exit_code) {
+            return Some((
+                exit_code,
+                if exit_code == 4 {
+                    "ram_write_admission_incomplete"
+                } else {
+                    "ram_write_headroom"
+                },
+            ));
+        }
+        if scratch.is_some_and(|report| report.exit_code == exit_code) {
+            return Some((
+                exit_code,
+                if exit_code == 4 {
+                    "ram_scratch_incomplete"
+                } else {
+                    "ram_scratch_pressure"
+                },
+            ));
+        }
+    }
+    None
 }
 
 /// Fresh, bounded host evidence for an ordinary check of a RAM-backed target.
@@ -591,6 +786,239 @@ mod tests {
             assert!(!report.complete);
             assert!(report.issues.iter().any(|issue| issue.contains("/scratch")));
         }
+    }
+
+    fn memory_boundary(kind: MemoryBoundaryKind, used: u64, limit: u64) -> MemoryHeadroom {
+        MemoryHeadroom {
+            scope: "/sys/fs/cgroup/workload".into(),
+            boundary: match kind {
+                MemoryBoundaryKind::Throttle => "memory.high",
+                MemoryBoundaryKind::HardLimit => "memory.max",
+            },
+            boundary_kind: kind,
+            current_bytes: used,
+            limit_bytes: limit,
+        }
+    }
+
+    fn byte_admission(
+        required: u64,
+        host_available: u64,
+        boundary: Option<MemoryHeadroom>,
+    ) -> RamWriteAdmission {
+        write_admission_with(
+            "tmpfs",
+            Some(required),
+            || {
+                Ok(MemoryInfo {
+                    total_bytes: 128 << 30,
+                    available_bytes: host_available,
+                    swap_total_bytes: 0,
+                    swap_free_bytes: 0,
+                })
+            },
+            || Ok(boundary),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn explicit_ram_bytes_are_the_only_route_to_memory_limit_collection() {
+        for (fs_type, need) in [
+            ("ext4", Some(1)),
+            ("btrfs", Some(1)),
+            ("apfs", Some(1)),
+            ("unknown", Some(1)),
+            ("tmpfs", None),
+            ("tmpfs", Some(0)),
+            ("ramfs", None),
+            ("ramfs", Some(0)),
+        ] {
+            assert!(
+                write_admission_with(
+                    fs_type,
+                    need,
+                    || panic!("no byte request must read no host memory"),
+                    || panic!("disk or zero/no byte request must read no cgroup limits"),
+                )
+                .is_none(),
+                "{fs_type}, {need:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_bytes_fit_exact_observed_ram_without_swap_or_a_percentage_reserve() {
+        for (required, expected) in [(64 << 30, 0), ((64 << 30) + 1, 1)] {
+            let admission = byte_admission(required, 64 << 30, None);
+            assert_eq!(admission.exit_code, expected);
+            assert_eq!(admission.observed_headroom_bytes, Some(64 << 30));
+            assert_eq!(
+                admission.limiting_factor,
+                Some(HeadroomSource::HostAvailable)
+            );
+            assert!(admission.complete);
+        }
+        let boundary = memory_boundary(MemoryBoundaryKind::HardLimit, 999, 1000);
+        assert_eq!(
+            byte_admission(1, 64 << 30, Some(boundary.clone())).exit_code,
+            0
+        );
+        assert_eq!(byte_admission(2, 64 << 30, Some(boundary)).exit_code, 1);
+    }
+
+    #[test]
+    fn healthy_host_cannot_admit_a_write_beyond_the_process_boundary() {
+        for kind in [MemoryBoundaryKind::Throttle, MemoryBoundaryKind::HardLimit] {
+            let boundary = memory_boundary(kind, (1 << 30) - (64 << 20), 1 << 30);
+            let admission = byte_admission(1 << 30, 64 << 30, Some(boundary.clone()));
+            assert_eq!(admission.exit_code, 1);
+            assert_eq!(admission.observed_headroom_bytes, Some(64 << 20));
+            assert_eq!(
+                admission.limiting_factor,
+                Some(HeadroomSource::ProcessBoundary)
+            );
+            let json = serde_json::to_value(&admission).unwrap();
+            assert_eq!(json["schema"], "sbh.ram_write_admission.v1");
+            assert_eq!(json["requested_bytes"], 1_u64 << 30);
+            assert_eq!(json["host_available_bytes"], 64_u64 << 30);
+            assert_eq!(json["process_boundary"]["scope"], "/sys/fs/cgroup/workload");
+            assert_eq!(json["process_boundary"]["boundary"], boundary.boundary);
+            assert_eq!(json["read_only"], true);
+            assert!(admission.summary().contains(boundary.boundary));
+            assert!(admission.summary().contains("not a reservation"));
+            if kind == MemoryBoundaryKind::Throttle {
+                assert_eq!(json["process_boundary"]["boundary_kind"], "throttle");
+                assert!(admission.summary().contains("throttle boundary"));
+            } else {
+                assert_eq!(json["process_boundary"]["boundary_kind"], "hard_limit");
+            }
+        }
+    }
+
+    #[test]
+    fn host_headroom_still_limits_a_process_with_a_larger_local_allowance() {
+        let boundary = memory_boundary(MemoryBoundaryKind::HardLimit, 0, 1000);
+        let admission = byte_admission(11, 10, Some(boundary));
+        assert_eq!(admission.exit_code, 1);
+        assert_eq!(admission.observed_headroom_bytes, Some(10));
+        assert_eq!(
+            admission.limiting_factor,
+            Some(HeadroomSource::HostAvailable)
+        );
+        assert!(
+            admission.process_boundary.is_some(),
+            "retain separately scoped evidence"
+        );
+        assert!(admission.summary().contains("host MemAvailable"));
+    }
+
+    #[test]
+    fn missing_or_inconsistent_memory_evidence_is_unknown_not_unlimited() {
+        for host in [
+            Err("meminfo denied".to_owned()),
+            Ok(MemoryInfo {
+                total_bytes: 0,
+                available_bytes: 0,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            }),
+            Ok(MemoryInfo {
+                total_bytes: 100,
+                available_bytes: 101,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            }),
+        ] {
+            let admission = write_admission_with("tmpfs", Some(1), || host, || Ok(None)).unwrap();
+            assert_eq!(admission.exit_code, 4);
+            assert!(!admission.complete);
+            assert_eq!(admission.observed_headroom_bytes, None);
+        }
+        let admission = write_admission_with(
+            "ramfs",
+            Some(1 << 30),
+            || {
+                Ok(MemoryInfo {
+                    total_bytes: 128 << 30,
+                    available_bytes: 64 << 30,
+                    swap_total_bytes: 0,
+                    swap_free_bytes: 0,
+                })
+            },
+            || Err("cgroup limits changed during observation".into()),
+        )
+        .unwrap();
+        assert_eq!(admission.exit_code, 4);
+        assert_eq!(admission.host_available_bytes, Some(64 << 30));
+        assert_eq!(admission.observed_headroom_bytes, None);
+        assert_eq!(admission.limiting_factor, None);
+        assert!(admission.issues[0].contains("changed during observation"));
+        assert!(admission.summary().contains("incomplete"));
+    }
+
+    #[test]
+    fn complete_and_partial_admission_preserve_the_checks_failure_precedence() {
+        let healthy = preflight_fixture(64 << 30);
+        let warning = preflight_fixture(0);
+        let fit = byte_admission(1, 100, None);
+        let short = byte_admission(101, 100, None);
+        assert_eq!(preflight_failure(Some(&healthy), Some(&fit)), None);
+        assert_eq!(
+            preflight_failure(Some(&warning), None),
+            Some((1, "ram_scratch_pressure"))
+        );
+        assert_eq!(
+            preflight_failure(Some(&warning), Some(&fit)),
+            Some((1, "ram_scratch_pressure"))
+        );
+        assert_eq!(
+            preflight_failure(Some(&healthy), Some(&short)),
+            Some((1, "ram_write_headroom"))
+        );
+
+        let mut partial_admission = byte_admission(1, 100, None);
+        partial_admission.exit_code = 4;
+        assert_eq!(
+            preflight_failure(Some(&warning), Some(&partial_admission)),
+            Some((4, "ram_write_admission_incomplete"))
+        );
+        let mut partial_scratch = preflight_fixture(64 << 30);
+        partial_scratch.exit_code = 4;
+        assert_eq!(
+            preflight_failure(Some(&partial_scratch), Some(&short)),
+            Some((4, "ram_scratch_incomplete"))
+        );
+    }
+
+    #[test]
+    fn byte_admission_recovers_from_new_evidence_instead_of_caching_a_refusal() {
+        let calls = std::cell::Cell::new(0);
+        for (used, expected) in [(99, 1), (0, 0)] {
+            let admission = write_admission_with(
+                "TMPFS",
+                Some(50),
+                || {
+                    Ok(MemoryInfo {
+                        total_bytes: 1000,
+                        available_bytes: 500,
+                        swap_total_bytes: 0,
+                        swap_free_bytes: 0,
+                    })
+                },
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(Some(memory_boundary(
+                        MemoryBoundaryKind::HardLimit,
+                        used,
+                        100,
+                    )))
+                },
+            )
+            .unwrap();
+            assert_eq!(admission.exit_code, expected);
+        }
+        assert_eq!(calls.get(), 2);
     }
 
     #[cfg(unix)]

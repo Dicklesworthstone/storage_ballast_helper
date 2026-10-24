@@ -893,6 +893,7 @@ struct CheckArgs {
     #[arg(long, value_name = "PERCENT")]
     target_free: Option<f64>,
     /// Minimum required free space. Accepts bytes or K/M/G/T suffixes, e.g. 5G.
+    /// Linux RAM-backed paths also require this much observed memory headroom.
     #[arg(long, value_name = "SIZE", value_parser = parse_byte_count)]
     need: Option<u64>,
     /// Predict if space will last for this many minutes (requires running daemon).
@@ -14346,27 +14347,31 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         &capacity.fs_type,
         &capacity.mount_point,
     );
-    if let Some(report) = &ram_scratch
-        && report.exit_code != 0
-    {
-        let incomplete = report.exit_code == 4;
-        let reason = if incomplete {
-            "ram_scratch_incomplete"
-        } else {
-            "ram_scratch_pressure"
-        };
+    let ram_write_admission =
+        crate::cli_ram_scratch::write_admission(platform.as_ref(), &capacity.fs_type, args.need);
+    if let Some((exit_code, reason)) = crate::cli_ram_scratch::preflight_failure(
+        ram_scratch.as_ref(),
+        ram_write_admission.as_ref(),
+    ) {
+        let incomplete = exit_code == 4;
         match output_mode(cli) {
             OutputMode::Human => {
                 println!(
                     "sbh: {} is RAM-backed; {}. Inspect: sbh check --ram-scratch",
                     capacity.mount_point.display(),
-                    if incomplete {
-                        "host RAM-scratch evidence is incomplete"
-                    } else {
-                        "host RAM-scratch pressure prevents a successful preflight"
+                    match reason {
+                        "ram_write_admission_incomplete" =>
+                            "memory-headroom evidence is incomplete",
+                        "ram_write_headroom" =>
+                            "the requested write exceeds observed memory headroom",
+                        "ram_scratch_incomplete" => "host RAM-scratch evidence is incomplete",
+                        _ => "host RAM-scratch pressure prevents a successful preflight",
                     },
                 );
-                if let Some(assessment) = &report.assessment {
+                if let Some(assessment) = ram_scratch
+                    .as_ref()
+                    .and_then(|report| report.assessment.as_ref())
+                {
                     println!(
                         "  tmpfs occupied: {}; RAM available: {}; swap free: {}/{}; reasons: [{}]",
                         format_bytes(assessment.tmpfs_used_bytes),
@@ -14376,8 +14381,14 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                         assessment.reasons.join(", "),
                     );
                 }
-                for issue in report.issues.iter().take(5) {
+                for issue in ram_scratch.iter().flat_map(|report| &report.issues).take(5) {
                     println!("  {issue}");
+                }
+                if let Some(admission) = &ram_write_admission {
+                    println!("  {}", admission.summary());
+                    for issue in admission.issues.iter().take(5) {
+                        println!("  {issue}");
+                    }
                 }
             }
             OutputMode::Json => {
@@ -14392,8 +14403,9 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                     "total_bytes": capacity.total_bytes,
                     "free_pct": free_pct,
                     "platform": capacity_platform_json(&capacity),
-                    "ram_scratch": report,
-                    "exit_code": report.exit_code,
+                    "ram_scratch": ram_scratch,
+                    "ram_write_admission": ram_write_admission,
+                    "exit_code": exit_code,
                 }))?;
             }
         }
@@ -14509,6 +14521,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                                 "free_excludes_purgeable": true,
                                 "platform": capacity_platform_json(&capacity),
                                 "ram_scratch": ram_scratch,
+                                "ram_write_admission": ram_write_admission,
                                 "exit_code": 1,
                             });
                             write_json_line(&payload)?;
@@ -14552,6 +14565,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             "platform": capacity_platform_json(&capacity),
             // Fresh host evidence only for Linux RAM-backed check targets.
             "ram_scratch": ram_scratch,
+            "ram_write_admission": ram_write_admission,
             // The daemon's forecast when `--predict` asked for one: the rate
             // object, or a string saying why none was usable.
             "forecast": forecast_json,

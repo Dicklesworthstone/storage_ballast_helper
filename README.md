@@ -1449,11 +1449,19 @@ Source: `src/daemon/loop_main.rs`
 ### RAM-Backed Scratch Preflight
 
 On Linux, `sbh check /tmp --need 5G` also checks current host RAM-scratch
-pressure when the path is on tmpfs or ramfs. Plenty of free tmpfs blocks does
-not establish swap headroom. A complete warning exits as a pressure condition,
-incomplete evidence as a partial success ([Exit Codes](#exit-codes)). JSON
-includes the fresh `ram_scratch` report. Disk-backed checks skip
-the host collection, and the check does not authorize cleanup or relocation.
+pressure when the path is on tmpfs or ramfs. A positive explicit `--need`
+additionally compares the requested bytes with host `MemAvailable` and every
+finite `memory.high` or `memory.max` boundary in the caller's visible cgroup-v2
+ancestry. Each boundary uses its own scope's current charge. A large tmpfs size
+limit or healthy host cannot hide a smaller process allowance.
+
+The byte comparison adds no percentage reserve and does not count swap as RAM.
+It distinguishes throttling boundaries from hard limits. A known shortfall
+exits 1; incomplete evidence exits 4 ([Exit Codes](#exit-codes)). JSON includes
+the fresh `ram_scratch` report and a separate `ram_write_admission` with the
+requested bytes, observed headroom, and limiting scope. A successful check is a
+current observation, not a memory reservation. Disk-backed checks skip the RAM
+collection, and the check does not authorize cleanup or relocation.
 Use `sbh check --ram-scratch` for the fuller report and top-entry attribution.
 See [RAM-scratch headroom](docs/ram-scratch.md) for the warning rules and limits.
 

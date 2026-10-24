@@ -87,6 +87,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **RAM-backed `check --need` honors the caller's memory limits** (bd-paeg).
+  Positive explicit byte requests on Linux tmpfs/ramfs now compare fresh host
+  `MemAvailable` with every finite visible cgroup-v2 `memory.high` and
+  `memory.max` boundary, using each ancestor's own usage. The tightest observed
+  headroom limits the request. No reserve percentage or swap allowance is added;
+  throttling and hard limits remain distinct. Known shortfalls exit 1 and
+  incomplete evidence exits 4, with a separate `ram_write_admission` JSON report.
+  Omitted/zero requests and disk-backed paths avoid this additional query.
 - **Compression admission cannot block the monitoring loop** (bd-rxq5).
   Filesystem and device probes now run on a single bounded background worker.
   Ready roots can start while a later probe is blocked; evidence expires after

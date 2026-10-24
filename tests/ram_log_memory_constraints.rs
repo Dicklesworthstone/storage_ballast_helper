@@ -12,7 +12,8 @@ use storage_ballast_helper::monitor::ram_scratch::{
     RamLogHeadroom, ram_log_mirror_refusal, ram_log_mirror_refusal_for,
 };
 use storage_ballast_helper::platform::pal::{
-    FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
+    FsStats, MemoryBoundaryKind, MemoryHeadroom, MemoryInfo, MountPoint, Platform, PlatformPaths,
+    ServiceManager,
 };
 use storage_ballast_helper::platform::test_overlay::{InjectedFsTable, TestOverlayPlatform};
 use storage_ballast_helper::platform::types::PalError;
@@ -122,6 +123,25 @@ impl Platform for LocalMemory {
             (self.local_available.load(Ordering::SeqCst) < minimum_available_percent)
                 .then(|| "cgroup memory.max lacks headroom".to_owned()),
         )
+    }
+
+    fn ram_write_headroom(&self) -> Result<Option<MemoryHeadroom>> {
+        if self.local_error.load(Ordering::SeqCst) {
+            return Err(PalError::method_failed(
+                self.name(),
+                "ram_write_headroom",
+                "cgroup evidence denied",
+            )
+            .into());
+        }
+        Ok(Some(MemoryHeadroom {
+            scope: "/cgroup/workload".into(),
+            boundary: "memory.max",
+            boundary_kind: MemoryBoundaryKind::HardLimit,
+            current_bytes: 100_u64
+                .saturating_sub(u64::from(self.local_available.load(Ordering::SeqCst))),
+            limit_bytes: 100,
+        }))
     }
 }
 
@@ -253,6 +273,39 @@ fn nested_filesystem_overlays_preserve_local_limits_errors_and_margins() {
     assert!(reason.contains("cgroup evidence denied"));
     assert_eq!(*inner.local_queries.lock().unwrap(), vec![10, 15, 10]);
     assert_eq!(outer.memory_info().unwrap().total_bytes, 100);
+}
+
+#[test]
+fn nested_filesystem_overlays_preserve_byte_headroom_evidence_and_recovery() {
+    let inner = Arc::new(LocalMemory::default());
+    let first = Arc::new(TestOverlayPlatform::new(
+        inner.clone(),
+        InjectedFsTable::default(),
+    ));
+    let outer = TestOverlayPlatform::new(first, InjectedFsTable::default());
+    inner.local_available.store(1, Ordering::SeqCst);
+    let boundary = outer.ram_write_headroom().unwrap().unwrap();
+    assert_eq!(boundary.available_bytes(), 1);
+    assert_eq!(boundary.scope, Path::new("/cgroup/workload"));
+    assert_eq!(boundary.boundary_kind, MemoryBoundaryKind::HardLimit);
+
+    inner.local_error.store(true, Ordering::SeqCst);
+    let error = outer.ram_write_headroom().unwrap_err();
+    assert!(error.to_string().contains("cgroup evidence denied"));
+    inner.local_error.store(false, Ordering::SeqCst);
+    inner.local_available.store(100, Ordering::SeqCst);
+    assert_eq!(
+        outer
+            .ram_write_headroom()
+            .unwrap()
+            .unwrap()
+            .available_bytes(),
+        100
+    );
+    assert!(
+        inner.local_queries.lock().unwrap().is_empty(),
+        "byte admission does not apply a log percentage reserve"
+    );
 }
 
 #[cfg(target_os = "linux")]

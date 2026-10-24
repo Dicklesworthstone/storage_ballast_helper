@@ -77,6 +77,42 @@ pub struct MemoryInfo {
     pub swap_free_bytes: u64,
 }
 
+/// Meaning of a finite process-local memory boundary.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryBoundaryKind {
+    /// Crossing this boundary triggers throttling and reclaim pressure.
+    Throttle,
+    /// Further unreclaimable charges can reach the cgroup's hard limit.
+    HardLimit,
+}
+
+/// The tightest observed finite memory boundary in the visible hierarchy.
+///
+/// This is current uncharged headroom, without assuming that existing charges
+/// can be reclaimed or adding swap to RAM. It is not an allocation reservation.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MemoryHeadroom {
+    /// The scope whose own usage is compared with its own boundary.
+    pub scope: PathBuf,
+    /// Kernel interface name, such as `memory.high` or `memory.max`.
+    pub boundary: &'static str,
+    /// Distinguishes a throttle boundary from a hard limit.
+    pub boundary_kind: MemoryBoundaryKind,
+    /// Largest usage observed while reading this scope's boundary.
+    pub current_bytes: u64,
+    /// The finite boundary in bytes.
+    pub limit_bytes: u64,
+}
+
+impl MemoryHeadroom {
+    /// Headroom before reaching the observed boundary, zero when already over it.
+    #[must_use]
+    pub const fn available_bytes(&self) -> u64 {
+        self.limit_bytes.saturating_sub(self.current_bytes)
+    }
+}
+
 /// Platform-specific data/service directories.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlatformPaths {
@@ -304,6 +340,14 @@ pub trait Platform: Send + Sync {
     /// policy. An error is missing evidence and must refuse the RAM route, not
     /// be treated as an unconstrained process. This never reserves memory.
     fn ram_write_memory_refusal(&self, _minimum_available_percent: u8) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Current process-local headroom for an explicit RAM-backed byte request.
+    /// Linux observes all visible cgroup ancestors; `None` means no finite
+    /// additional memory boundary was found. Errors are unknown evidence, not
+    /// unlimited capacity. Host memory remains separate, and swap is not added.
+    fn ram_write_headroom(&self) -> Result<Option<MemoryHeadroom>> {
         Ok(None)
     }
 

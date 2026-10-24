@@ -27,7 +27,8 @@ use serde::Deserialize;
 
 use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::{
-    BlockDeviceInfo, FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
+    BlockDeviceInfo, FsStats, MemoryHeadroom, MemoryInfo, MountPoint, Platform, PlatformPaths,
+    ServiceManager,
 };
 use crate::platform::types::{
     Capacity, ExecutablesResult, FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion,
@@ -314,6 +315,10 @@ impl Platform for TestOverlayPlatform {
     fn ram_write_memory_refusal(&self, minimum_available_percent: u8) -> Result<Option<String>> {
         self.inner
             .ram_write_memory_refusal(minimum_available_percent)
+    }
+
+    fn ram_write_headroom(&self) -> Result<Option<MemoryHeadroom>> {
+        self.inner.ram_write_headroom()
     }
 
     fn service_manager(&self) -> Box<dyn ServiceManager> {
