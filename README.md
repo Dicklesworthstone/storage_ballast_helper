@@ -1357,6 +1357,13 @@ entries are being removed revokes eligibility even if the target's inode stays
 the same. An unreadable or truncated purity listing retains the target. Live
 policy and compression checks follow that filesystem probe.
 
+Target-only nominations also carry revocable permission from the scanner
+configuration that selected them. Changing the opted-in roots, idle window,
+exclusions, or protection rules invalidates old work; removing and re-adding
+the same root requires a fresh selection. The executor renews that permission
+after the purity probe and before mutation, so a long batch cannot keep using
+a protection exception that the operator has withdrawn.
+
 #### Layer 2: Pre-Flight Safety Checks
 
 Before any deletion is executed, an eight-point pre-flight check must pass:
@@ -1847,6 +1854,14 @@ What feeds the index is platform-specific, and the daemon says which at startup 
 - **Everything else:** reconciliation only; the bound on staleness is the maintenance cadence (`pressure.maintenance_interval_secs`) plus the pressure-driven passes.
 
 On Linux and macOS, a configured root whose initial metadata lookup reports that it does not exist is tracked separately from coverage gaps. Existing roots retain their watches; absent roots are checked every 30 seconds without rebuilding healthy coverage. When one appears, the scanner immediately revokes the old index generation, reconciles the roots, and installs coverage for the new directory. Permission failures, unreadable directory listings, disappearing descendants, invalid root types, dangling root links and exhausted watch budgets still require reconciliation. macOS also follows configured directory links such as `/tmp -> /private/tmp`, preserving their configured spelling and rechecking their canonical identity; links inside the scanned tree remain excluded. Explicit reconciliation-only mode and a zero watch budget continue to disable event subscriptions. The default roots remain `/tmp`, `/data/tmp`, `/var/tmp` on Linux; other platforms default to `/tmp`, `/var/tmp` (macOS configuration loading also includes the user's temporary directory unless opted out).
+
+Subscriptions follow the configured roots, independently of which roots a
+particular pressure or maintenance pass selects. Alternating pass scopes no
+longer rebuilds watches or invalidates the whole index. Events outside the
+current request remain pending until a relevant pass covers them; pending work
+does not widen that request's scan scope. Special or catalog-derived request
+paths outside the subscription set receive explicit reconciliation. Genuine
+configuration changes and overflow recovery still invalidate stale evidence.
 
 For validation and A/B artifacts, `sbh scan --json` reports `scanner_engine`, `scanner_dispatch`, `opaque_pruning`, `opaque_pruned_dirs`, `scanned_entries`, and nullable `process_cpu_micros` alongside the existing candidate totals. Daemon `scan_complete` activity events also include the selected dispatch, pruning state, dirty event-root count, index generation, indexed-record count, candidate bytes seen, and timeout state in their `details` payload, plus `process_cpu_micros=` when the pass measured its CPU. `sbh stats --json` aggregates those events into a `scanner` block (`cpu_seconds_by_day`, `passes`, `entries_scanned`, `opaque_pruned_dirs`), and human `sbh stats` prints the scanner's 7-day CPU-seconds/day average. These fields are intended to make v1/v2 scan captures auditable without scraping human output.
 

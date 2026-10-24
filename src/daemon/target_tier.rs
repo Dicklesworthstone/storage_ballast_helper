@@ -44,7 +44,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::Sender;
 
-use crate::core::config::Config;
+use crate::core::config::{Config, ScannerConfig};
 use crate::core::paths::resolve_absolute_path;
 use crate::daemon::loop_main::DeletionBatch;
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle};
@@ -718,6 +718,37 @@ pub struct DueRoot {
     pub urgency: f64,
 }
 
+/// Revocable authority for the protection exception carried by a target-only
+/// batch. The root and scanner settings are those that admitted its survey;
+/// an old worker cannot acquire new authority from a later configuration.
+#[derive(Debug, Clone)]
+pub struct TargetOnlyConsent {
+    root: PathBuf,
+    scanner: ScannerConfig,
+    revoked: Arc<AtomicBool>,
+}
+
+impl TargetOnlyConsent {
+    pub(super) fn new(root: &Path, scanner: &ScannerConfig, revoked: Arc<AtomicBool>) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            scanner: scanner.clone(),
+            revoked,
+        }
+    }
+
+    pub(super) fn permits(&self, root: &Path, scanner: &ScannerConfig) -> bool {
+        !self.revoked.load(Ordering::Acquire)
+            && self.root == root
+            && !scanner.target_only_roots.is_empty()
+            && crate::daemon::loop_main::scanner_mutation_scope_matches(
+                &self.scanner,
+                scanner,
+                true,
+            )
+    }
+}
+
 /// Scheduling state of the tier: at most one pass in flight.
 #[derive(Debug, Default)]
 pub struct TargetTier {
@@ -725,9 +756,28 @@ pub struct TargetTier {
     last_start: Option<Instant>,
     /// When the roots were last expanded to see whether one is due.
     last_probe: Option<Instant>,
+    /// A configuration change permanently revokes this generation, including
+    /// batches already queued for the executor. Re-enabling cannot revive it.
+    revoked: Arc<AtomicBool>,
+    scanner: Option<ScannerConfig>,
 }
 
 impl TargetTier {
+    /// Called at reload, even when the target-only roots become empty. No
+    /// filesystem I/O or waiting: a blocked old worker keeps its slot but loses
+    /// authority to submit or execute work under its previous configuration.
+    pub fn update_config(&mut self, scanner: &ScannerConfig) {
+        if self.scanner.as_ref().is_some_and(|previous| {
+            !crate::daemon::loop_main::scanner_mutation_scope_matches(previous, scanner, true)
+        }) {
+            self.revoked.store(true, Ordering::Release);
+            self.revoked = Arc::new(AtomicBool::new(false));
+            self.last_probe = None;
+            self.last_start = None;
+        }
+        self.scanner = Some(scanner.clone());
+    }
+
     /// Start a pass on its own thread when one is due. `mounts` maps each
     /// monitored mount to its pressure level and urgency.
     pub fn tick(
@@ -739,6 +789,7 @@ impl TargetTier {
         del_tx: &Sender<DeletionBatch>,
         logger: &ActivityLoggerHandle,
     ) {
+        self.update_config(&config.scanner);
         if config.scanner.target_only_roots.is_empty()
             || self.running.load(Ordering::Acquire)
             || self
@@ -773,17 +824,22 @@ impl TargetTier {
         let platform = Arc::clone(platform);
         let del_tx = del_tx.clone();
         let logger = logger.clone();
+        let revoked = Arc::clone(&self.revoked);
         let spawned = std::thread::Builder::new()
             .name("sbh-targets".to_string())
             .spawn(move || {
                 let _guard = guard;
                 for root in due {
+                    if revoked.load(Ordering::Acquire) {
+                        break;
+                    }
                     let message = run_root(
                         &root,
                         &config,
                         platform.as_ref(),
                         &del_tx,
                         SystemTime::now(),
+                        &revoked,
                     );
                     eprintln!("[SBH-TARGETS] {message}");
                     logger.send(ActivityEvent::Info { message });
@@ -804,12 +860,20 @@ fn run_root(
     platform: &dyn Platform,
     del_tx: &Sender<DeletionBatch>,
     now: SystemTime,
+    revoked: &Arc<AtomicBool>,
 ) -> String {
+    if revoked.load(Ordering::Acquire) {
+        return format!("root={} target-only consent revoked", due.root.display());
+    }
     let selection = select(&due.root, config, platform, due.urgency, now);
     let summary = selection.summary(&due.root);
+    if revoked.load(Ordering::Acquire) {
+        return format!("{summary}; target-only consent revoked; no batch submitted");
+    }
     if selection.candidates.is_empty() {
         return summary;
     }
+    let root = resolve_absolute_path(&due.root);
     let batch = DeletionBatch {
         candidates: selection.candidates,
         pressure_level: due.level,
@@ -817,7 +881,12 @@ fn run_root(
         target_bytes: None,
         // Resolved like the candidates' paths, so the executor's containment
         // check compares like with like.
-        target_only_root: Some(resolve_absolute_path(&due.root)),
+        target_only_root: Some(root.clone()),
+        target_only_consent: Some(TargetOnlyConsent::new(
+            &root,
+            &config.scanner,
+            Arc::clone(revoked),
+        )),
     };
     match del_tx.try_send(batch) {
         Ok(()) => format!("{summary}; sent to the executor (level={:?})", due.level),
@@ -1111,13 +1180,16 @@ mod tests {
             level: PressureLevel::Red,
             urgency: 0.8,
         };
+        let mut config = Config::default();
+        config.scanner.target_only_roots = vec![root.clone()];
 
         let summary = run_root(
             &due,
-            &Config::default(),
+            &config,
             &MockPlatform::healthy(),
             &del_tx,
             later(),
+            &Arc::new(AtomicBool::new(false)),
         );
         let batch = del_rx
             .try_recv()
@@ -1128,6 +1200,156 @@ mod tests {
         let candidate = &batch.candidates[0];
         assert!(candidate.path.starts_with(resolve_absolute_path(&root)));
         assert!(candidate.identity.is_some());
+        assert!(
+            batch
+                .target_only_consent
+                .as_ref()
+                .unwrap()
+                .permits(batch.target_only_root.as_ref().unwrap(), &config.scanner,)
+        );
+    }
+
+    #[test]
+    fn material_reloads_permanently_revoke_old_target_only_consent() {
+        type ScopeChange = fn(&mut ScannerConfig);
+        let cases: [(&str, ScopeChange); 10] = [
+            ("disabled", |scanner| scanner.target_only_roots.clear()),
+            ("different roots", |scanner| {
+                scanner.target_only_roots = vec!["/different".into()]
+            }),
+            ("idle window", |scanner| scanner.target_only_idle_hours += 1),
+            ("minimum age", |scanner| scanner.min_file_age_minutes += 1),
+            ("excluded path", |scanner| {
+                scanner.excluded_paths.push("/scratch/new-work".into())
+            }),
+            ("protected path", |scanner| {
+                scanner.protected_paths.push("/scratch/new-work/**".into())
+            }),
+            ("scanner roots", |scanner| {
+                scanner.root_paths.push("/new-scan-root".into())
+            }),
+            ("source permission", |scanner| {
+                scanner.allow_source_tree_roots = !scanner.allow_source_tree_roots
+            }),
+            ("symlinks", |scanner| {
+                scanner.follow_symlinks = !scanner.follow_symlinks
+            }),
+            ("devices", |scanner| {
+                scanner.cross_devices = !scanner.cross_devices
+            }),
+        ];
+        let root = Path::new("/scratch");
+        let scanner = ScannerConfig {
+            target_only_roots: vec![root.into()],
+            ..Default::default()
+        };
+        for (label, change) in cases {
+            let mut tier = TargetTier::default();
+            tier.update_config(&scanner);
+            let old = TargetOnlyConsent::new(root, &scanner, Arc::clone(&tier.revoked));
+            assert!(old.permits(root, &scanner), "{label}");
+            tier.running.store(true, Ordering::Release);
+            let guard = RunningGuard(Arc::clone(&tier.running));
+            tier.last_start = Some(Instant::now());
+            tier.last_probe = Some(Instant::now());
+
+            let mut replacement = scanner.clone();
+            change(&mut replacement);
+            tier.update_config(&replacement);
+            assert!(!old.permits(root, &replacement), "{label}");
+            assert!(
+                !old.permits(root, &scanner),
+                "{label}: old authority is revoked"
+            );
+            assert!(
+                tier.running.load(Ordering::Acquire),
+                "{label}: worker keeps its slot"
+            );
+            assert!(tier.last_start.is_none(), "{label}");
+            assert!(tier.last_probe.is_none(), "{label}");
+
+            tier.update_config(&scanner);
+            assert!(
+                !old.permits(root, &scanner),
+                "{label}: re-enabling cannot revive old work"
+            );
+            let current = TargetOnlyConsent::new(root, &scanner, Arc::clone(&tier.revoked));
+            assert!(
+                current.permits(root, &scanner),
+                "{label}: future work has fresh consent"
+            );
+            assert!(
+                !current.permits(Path::new("/other-root"), &scanner),
+                "{label}"
+            );
+            drop(guard);
+        }
+    }
+
+    #[test]
+    fn event_and_worker_tuning_preserve_target_only_consent() {
+        let root = Path::new("/scratch");
+        let mut scanner = ScannerConfig {
+            target_only_roots: vec![root.into()],
+            ..Default::default()
+        };
+        let mut tier = TargetTier::default();
+        tier.update_config(&scanner);
+        let consent = TargetOnlyConsent::new(root, &scanner, Arc::clone(&tier.revoked));
+        scanner.parallelism += 1;
+        scanner.event_watch_budget += 1;
+        scanner.event_source = crate::core::config::ScannerEventSourceMode::ReconciliationOnly;
+        tier.update_config(&scanner);
+        assert!(consent.permits(root, &scanner));
+    }
+
+    #[test]
+    fn queued_target_only_batch_stays_revoked_after_disable_and_reenable() {
+        let (_temp, root) = scratch_root();
+        cargo_target(&root.join("s1/target"));
+        age(&root, 48);
+        let mut config = Config::default();
+        config.scanner.target_only_roots = vec![root.clone()];
+        let mut tier = TargetTier::default();
+        tier.update_config(&config.scanner);
+        let old_token = Arc::clone(&tier.revoked);
+        let due = DueRoot {
+            root,
+            level: PressureLevel::Red,
+            urgency: 0.8,
+        };
+        let (send, receive) = crossbeam_channel::bounded(1);
+        let summary = run_root(
+            &due,
+            &config,
+            &MockPlatform::healthy(),
+            &send,
+            later(),
+            &old_token,
+        );
+        let batch = receive.try_recv().unwrap_or_else(|_| panic!("{summary}"));
+        let witness = batch.target_only_consent.as_ref().unwrap();
+        let bound_root = batch.target_only_root.as_ref().unwrap();
+        assert!(witness.permits(bound_root, &config.scanner));
+
+        let mut disabled = config.scanner.clone();
+        disabled.target_only_roots.clear();
+        tier.update_config(&disabled);
+        tier.update_config(&config.scanner);
+        assert!(!witness.permits(bound_root, &config.scanner));
+        let summary = run_root(
+            &due,
+            &config,
+            &MockPlatform::healthy(),
+            &send,
+            later(),
+            &old_token,
+        );
+        assert!(summary.contains("consent revoked"));
+        assert!(
+            receive.try_recv().is_err(),
+            "old worker cannot submit another root"
+        );
     }
 
     #[test]

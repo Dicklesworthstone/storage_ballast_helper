@@ -1029,6 +1029,9 @@ pub struct DeletionBatch {
     /// patterns that cover the root as a whole; patterns naming something
     /// inside it, `.sbh-protect` markers and every other check still apply.
     pub target_only_root: Option<PathBuf>,
+    /// Revocable permission captured by the target-only tier. A root name
+    /// alone never authorizes lifting protection after configuration reload.
+    pub target_only_consent: Option<crate::daemon::target_tier::TargetOnlyConsent>,
 }
 
 /// Results reported from worker threads back to the main monitoring loop.
@@ -2585,20 +2588,151 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// loop sent: the configured roots and the mount's level and free space.
 struct EventPassTemplate {
     paths: Vec<PathBuf>,
+    event_config: EventSourceConfig,
     pressure_level: PressureLevel,
     free_pct: Option<f64>,
     max_delete_batch: usize,
 }
 
 impl EventPassTemplate {
-    fn from_request(request: &ScanRequest) -> Self {
+    fn from_request(request: &ScanRequest, config: &ScannerConfig) -> Self {
         Self {
             paths: request.paths.clone(),
+            event_config: EventSourceConfig::from_scanner_config(&config.root_paths, config),
             pressure_level: request.pressure_level,
             free_pct: request.free_pct,
             max_delete_batch: request.max_delete_batch,
         }
     }
+}
+
+/// New invalidations revoke index evidence once. Reconciliation that belongs
+/// to another mount's pass remains queued separately, without repeatedly
+/// revoking the index entries a completed pass just refreshed.
+#[derive(Default)]
+struct PendingScannerEvents {
+    invalidation: Option<EventInvalidation>,
+    reconciliation: BTreeSet<PathBuf>,
+}
+
+impl PendingScannerEvents {
+    fn remember(&mut self, fresh: EventInvalidation) {
+        if fresh.requires_reconciliation() || fresh.requires_index_generation_bump() {
+            match self.invalidation.as_mut() {
+                Some(kept) => kept.merge(fresh),
+                None => self.invalidation = Some(fresh),
+            }
+        }
+    }
+
+    fn take_invalidation(
+        &mut self,
+        mut fresh: EventInvalidation,
+        configured_roots: &[PathBuf],
+    ) -> EventInvalidation {
+        if let Some(pending) = self.invalidation.take() {
+            fresh.merge(pending);
+        }
+        self.reconciliation
+            .extend(fresh.dirty_roots().iter().cloned());
+        // Deferred roots may accumulate many independent project changes.
+        // Collapse that backlog to its configured root instead of growing it
+        // indefinitely while pressure keeps selecting another filesystem.
+        const MAX_PENDING_SCOPES_PER_ROOT: usize = 64;
+        for root in configured_roots {
+            if self
+                .reconciliation
+                .iter()
+                .filter(|path| path.starts_with(root))
+                .take(MAX_PENDING_SCOPES_PER_ROOT + 1)
+                .count()
+                > MAX_PENDING_SCOPES_PER_ROOT
+            {
+                self.reconciliation.retain(|path| !path.starts_with(root));
+                self.reconciliation.insert(root.clone());
+            }
+        }
+        remove_covered_event_paths(&mut self.reconciliation);
+        fresh
+    }
+
+    fn has_work_within(&self, paths: &[PathBuf]) -> bool {
+        self.reconciliation
+            .iter()
+            .chain(
+                self.invalidation
+                    .iter()
+                    .flat_map(EventInvalidation::dirty_roots),
+            )
+            .any(|dirty| {
+                paths
+                    .iter()
+                    .any(|path| dirty.starts_with(path) || path.starts_with(dirty))
+            })
+    }
+
+    fn select_for_request(
+        &self,
+        requested: &[PathBuf],
+        configured_roots: &[PathBuf],
+    ) -> BTreeSet<PathBuf> {
+        let mut selected = event_paths_within(requested, &self.reconciliation);
+        // Special locations, catalog roots and target-only passes can name
+        // paths outside the permanent subscriptions. Their explicit request
+        // supplies the reconciliation opportunity; no event may arrive there.
+        selected.extend(
+            requested
+                .iter()
+                .filter(|path| !configured_roots.iter().any(|root| path.starts_with(root)))
+                .cloned(),
+        );
+        remove_covered_event_paths(&mut selected);
+        selected
+    }
+
+    fn acknowledge_walk(&mut self, walked: &[PathBuf], unfinished: Option<&[PathBuf]>) {
+        if unfinished.is_none_or(|paths| !paths.is_empty()) {
+            return;
+        }
+        // Selecting work proves nothing about coverage: replay, a byte target,
+        // a failed start, or any budget/cancellation can leave it unseen. Only
+        // a completed walk clears scopes it covered in full. A child-only
+        // walk still owes reconciliation of its dirty ancestor's other data.
+        self.reconciliation
+            .retain(|dirty| !walked.iter().any(|path| dirty.starts_with(path)));
+    }
+}
+
+fn remove_covered_event_paths(paths: &mut BTreeSet<PathBuf>) {
+    let covered: Vec<_> = paths
+        .iter()
+        .filter(|path| {
+            path.ancestors()
+                .skip(1)
+                .any(|ancestor| paths.contains(ancestor))
+        })
+        .cloned()
+        .collect();
+    for path in covered {
+        paths.remove(&path);
+    }
+}
+
+/// Intersect dirty scopes with the roots this pass is authorized to visit.
+/// A dirty parent selects a requested child, never the parent's other data.
+fn event_paths_within(requested: &[PathBuf], dirty_roots: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    let mut selected = BTreeSet::new();
+    for dirty in dirty_roots {
+        for path in requested {
+            if dirty.starts_with(path) {
+                selected.insert(dirty.clone());
+            } else if path.starts_with(dirty) {
+                selected.insert(path.clone());
+            }
+        }
+    }
+    remove_covered_event_paths(&mut selected);
+    selected
 }
 
 /// Poll the event source while the scanner is idle and, when events left
@@ -2608,9 +2742,10 @@ impl EventPassTemplate {
 /// pass deferred by pacing loses nothing.
 fn event_triggered_request(
     source: Option<&mut ScannerEventSource>,
-    pending: &mut Option<EventInvalidation>,
+    pending: &mut PendingScannerEvents,
     last_poll: &mut Instant,
     template: Option<&EventPassTemplate>,
+    config: &ScannerConfig,
 ) -> Option<ScanRequest> {
     if last_poll.elapsed() < EVENT_POLL_INTERVAL {
         return None;
@@ -2618,23 +2753,26 @@ fn event_triggered_request(
     *last_poll = Instant::now();
     let source = source?;
     let template = template?;
+    if config.engine != ScannerEngineMode::V2
+        || !source.matches_config(&template.event_config)
+        || !source.matches_config(&EventSourceConfig::from_scanner_config(
+            &config.root_paths,
+            config,
+        ))
+    {
+        // A queued event cannot revive a request's old root scope after a
+        // reload. The next monitor request configures the replacement source
+        // and supplies a fresh pressure/authorization template.
+        return None;
+    }
     if !matches!(
         template.pressure_level,
         PressureLevel::Green | PressureLevel::Yellow
     ) {
         return None;
     }
-    let fresh = source.drain();
-    if fresh.requires_reconciliation() {
-        match pending.as_mut() {
-            Some(kept) => kept.merge(fresh),
-            None => *pending = Some(fresh),
-        }
-    }
-    if pending
-        .as_ref()
-        .is_none_or(|kept| !kept.requires_reconciliation())
-    {
+    pending.remember(source.drain());
+    if !pending.has_work_within(&template.paths) {
         return None;
     }
     Some(ScanRequest {
@@ -2661,7 +2799,10 @@ fn v2_active_scan_paths(
     request: &ScanRequest,
     dirty_roots: &BTreeSet<PathBuf>,
 ) -> Option<Vec<PathBuf>> {
-    if request.force_full_scan || request.maintenance {
+    // A catalog request is an explicit bounded probe of whole candidate
+    // units. Their device can differ from a configured ancestor's device,
+    // so ordinary event coverage does not establish that they were probed.
+    if request.force_full_scan || request.maintenance || !request.catalog_roots.is_empty() {
         return None;
     }
     match request.pressure_level {
@@ -2669,7 +2810,11 @@ fn v2_active_scan_paths(
             if dirty_roots.is_empty() {
                 Some(Vec::new())
             } else {
-                Some(dirty_roots.iter().cloned().collect())
+                Some(
+                    event_paths_within(&request.paths, dirty_roots)
+                        .into_iter()
+                        .collect(),
+                )
             }
         }
         PressureLevel::Orange | PressureLevel::Red | PressureLevel::Critical => None,
@@ -6826,6 +6971,9 @@ impl MonitoringDaemon {
 
                     // Update shared configs for scanner thread.
                     self.regret.update_config(&new_config);
+                    // Revoke old target-only surveys and queued exceptions
+                    // before publishing replacement scanner permissions.
+                    self.target_tier.update_config(&new_config.scanner);
                     *self.shared_scoring_config.write() = new_config.scoring.clone();
                     *self.shared_scanner_config.write() = new_config.scanner.clone();
 
@@ -7332,6 +7480,7 @@ fn dispatch_top_candidates(
         urgency: request.urgency,
         target_bytes: request.target_bytes,
         target_only_root: None,
+        target_only_consent: None,
     };
     let batch_len = batch.candidates.len();
     let batch_paths: Vec<PathBuf> = batch.candidates.iter().map(|c| c.path.clone()).collect();
@@ -7782,6 +7931,27 @@ impl ScanCursor {
             .collect()
     }
 
+    /// Fresh events revoke old barren verdicts before they can hide changed
+    /// ground from a reconciliation walk. The event source has already
+    /// resolved changed paths into bounded scan scopes. An ancestor hint
+    /// would skip the scope, and a descendant hint would skip part of it.
+    fn invalidate_events(&mut self, invalidation: &EventInvalidation) {
+        if invalidation.requires_index_generation_bump() {
+            // Lost event history cannot establish which cached paths changed.
+            self.barren_dirs.clear();
+            return;
+        }
+        if invalidation.dirty_roots().is_empty() {
+            return;
+        }
+        self.barren_dirs.retain(|cached, _| {
+            !invalidation
+                .dirty_roots()
+                .iter()
+                .any(|dirty| cached.starts_with(dirty) || dirty.starts_with(cached))
+        });
+    }
+
     /// Update the cache after a scan pass.
     ///
     /// `visited_dirs` — all directories the walker emitted entries for.
@@ -7948,7 +8118,7 @@ fn scanner_thread_main(
     // instead of waiting for the next maintenance walk. The invalidation is
     // kept until the pass that consumes it runs; the template is the last
     // request the main loop sent, which carries the roots and the level.
-    let mut pending_event_invalidation: Option<EventInvalidation> = None;
+    let mut pending_event_invalidation = PendingScannerEvents::default();
     let mut last_event_poll = Instant::now();
     let mut event_request_template: Option<EventPassTemplate> = None;
 
@@ -8006,20 +8176,19 @@ fn scanner_thread_main(
         let request = match scan_rx.recv_timeout(WORKER_SHUTDOWN_POLL_INTERVAL) {
             Ok(request) => {
                 request_from_events = false;
-                if request.catalog_roots.is_empty() {
-                    event_request_template = Some(EventPassTemplate::from_request(&request));
-                }
                 request
             }
             Err(RecvTimeoutError::Timeout) => {
                 // Idle is alive: "stalled" must mean stuck inside a pass,
                 // not waiting for one.
                 heartbeat.beat();
+                let event_config = shared_scanner_config.read().clone();
                 let Some(request) = event_triggered_request(
                     scanner_event_source.as_mut(),
                     &mut pending_event_invalidation,
                     &mut last_event_poll,
                     event_request_template.as_ref(),
+                    &event_config,
                 ) else {
                     continue;
                 };
@@ -8035,6 +8204,12 @@ fn scanner_thread_main(
         // Read latest config at the start of each scan.
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
+        if !request_from_events && request.catalog_roots.is_empty() {
+            event_request_template = Some(EventPassTemplate::from_request(
+                &request,
+                &current_scanner_config,
+            ));
+        }
 
         let mut dispatch_confirmed_empty = false;
         if let Some(reclaim_before) = unconfirmed_dispatch.take() {
@@ -8182,12 +8357,18 @@ fn scanner_thread_main(
                 }
                 scanner_index = Some(loaded);
             }
-            let event_config =
-                EventSourceConfig::from_scanner_config(&request.paths, &current_scanner_config);
+            let event_config = EventSourceConfig::from_scanner_config(
+                &current_scanner_config.root_paths,
+                &current_scanner_config,
+            );
             let needs_event_source = scanner_event_source
                 .as_ref()
                 .is_none_or(|source| !source.matches_config(&event_config));
             if needs_event_source {
+                // The replacement subscribes to all current configured roots
+                // and revokes pre-subscription history. Old scopes (including
+                // removed roots) must not remain queued across this restart.
+                pending_event_invalidation = PendingScannerEvents::default();
                 scanner_event_source = Some(ScannerEventSource::start(event_config));
                 if let Some(source) = scanner_event_source.as_ref() {
                     let capability = source.capability();
@@ -8205,11 +8386,11 @@ fn scanner_thread_main(
                 }
             }
             if let Some(source) = scanner_event_source.as_mut() {
-                let mut invalidation = source.drain();
-                if let Some(pending) = pending_event_invalidation.take() {
-                    invalidation.merge(pending);
-                }
-                scanner_event_dirty_roots.clone_from(invalidation.dirty_roots());
+                let invalidation = pending_event_invalidation
+                    .take_invalidation(source.drain(), &current_scanner_config.root_paths);
+                scan_cursor.invalidate_events(&invalidation);
+                scanner_event_dirty_roots = pending_event_invalidation
+                    .select_for_request(&request.paths, &current_scanner_config.root_paths);
                 scanner_event_stats = source.stats();
                 if invalidation.requires_reconciliation() {
                     logger.send(ActivityEvent::Info {
@@ -8256,6 +8437,7 @@ fn scanner_thread_main(
                 .map_or(0, ScannerCandidateIndex::event_generation)
         } else {
             scanner_event_source = None;
+            pending_event_invalidation = PendingScannerEvents::default();
             0
         };
         let mut scanner_index_records = Vec::new();
@@ -9444,6 +9626,7 @@ fn scanner_thread_main(
         let mut paths_scanned = 0;
         // Which limit ended the general walk, if any.
         let mut walk_stop: Option<PassStop> = None;
+        let mut walk_exhausted = false;
         let mut opaque_pruned_dirs = 0usize;
         let mut scored: Vec<CandidacyScore> = Vec::with_capacity(1024);
 
@@ -9505,7 +9688,10 @@ fn scanner_thread_main(
                     }
                     continue;
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    walk_exhausted = true;
+                    break;
+                }
             };
             if shutdown.load(Ordering::Relaxed) {
                 cancel_token.store(true, Ordering::Relaxed);
@@ -9832,7 +10018,19 @@ fn scanner_thread_main(
         // at or above that ground may be cached as barren (bd-y70k). If the
         // walker threads do not stop in time, what they left is unknown, and
         // the pass caches nothing new.
-        if scan_timed_out {
+        if walk_exhausted
+            && request.catalog_roots.is_empty()
+            && !scan_timed_out
+            && !scanner_should_exit
+            && !shutdown.load(Ordering::Relaxed)
+            && !cancel_token.load(Ordering::Relaxed)
+        {
+            // EOF means every sender has exited, so collecting its final
+            // coverage receipt cannot wait. A directory-window stop or other
+            // recorded unfinished subtree still keeps the event work pending.
+            let unfinished = rx.unfinished_after_cancel(Duration::ZERO);
+            pending_event_invalidation.acknowledge_walk(&active_scan_paths, unfinished.as_deref());
+        } else if scan_timed_out {
             let unfinished = rx.unfinished_after_cancel(WALK_STOP_WAIT);
             for path in unfinished.iter().flatten() {
                 mark_non_barren(&mut non_barren_dirs, path);
@@ -10154,6 +10352,56 @@ impl RepeatDeletionTracker {
 
 // ──────────────────── executor thread ────────────────────
 
+/// Settings that authorize the selected paths, independent of event backend,
+/// worker count and other scheduling choices. Compare outside filesystem work:
+/// no scan or permission probe may hold the shared configuration lock.
+pub(super) fn scanner_mutation_scope_matches(
+    previous: &crate::core::config::ScannerConfig,
+    current: &crate::core::config::ScannerConfig,
+    target_only: bool,
+) -> bool {
+    previous.root_paths == current.root_paths
+        && previous.allow_source_tree_roots == current.allow_source_tree_roots
+        && previous.catalog_roots_on_pressured_device == current.catalog_roots_on_pressured_device
+        && previous.excluded_paths == current.excluded_paths
+        && previous.protected_paths == current.protected_paths
+        && previous.min_file_age_minutes == current.min_file_age_minutes
+        && previous.follow_symlinks == current.follow_symlinks
+        && previous.cross_devices == current.cross_devices
+        && (!target_only
+            || (previous.target_only_roots == current.target_only_roots
+                && previous.target_only_idle_hours == current.target_only_idle_hours))
+}
+
+fn target_only_consent_current(
+    batch: &DeletionBatch,
+    scanner: &crate::core::config::ScannerConfig,
+) -> bool {
+    batch.target_only_root.as_deref().is_none_or(|root| {
+        batch
+            .target_only_consent
+            .as_ref()
+            .is_some_and(|consent| consent.permits(root, scanner))
+    })
+}
+
+/// A queued batch keeps no permission to use a stale protection registry.
+/// Policy changes defer the remaining work without per-path failure backoff.
+fn authorize_scanner_mutation_scope(
+    batch: &DeletionBatch,
+    planned: &crate::core::config::ScannerConfig,
+    current: &RwLock<crate::core::config::ScannerConfig>,
+) -> std::result::Result<(), SkipReason> {
+    let current = current.read();
+    if scanner_mutation_scope_matches(planned, &current, batch.target_only_root.is_some())
+        && target_only_consent_current(batch, &current)
+    {
+        Ok(())
+    } else {
+        Err(SkipReason::PolicyChanged)
+    }
+}
+
 /// The operator's `protected_paths` as the executor applies them to a batch.
 /// A target-only batch (bd-232u) goes without the patterns that protect its
 /// root as a whole, which is why the tier exists; one naming something inside
@@ -10163,6 +10411,9 @@ fn batch_protected_paths(
     batch: &DeletionBatch,
     scanner: &crate::core::config::ScannerConfig,
 ) -> Vec<String> {
+    if !target_only_consent_current(batch, scanner) {
+        return scanner.protected_paths.clone();
+    }
     batch.target_only_root.as_deref().map_or_else(
         || scanner.protected_paths.clone(),
         |root| {
@@ -10180,7 +10431,15 @@ fn batch_protected_paths(
 /// root, with the identity the tier recorded when it surveyed them, and
 /// still pure now (`target_tier::still_pure`). Returns how many were dropped;
 /// an ordinary batch is left as it is.
-fn retain_target_only_candidates(batch: &mut DeletionBatch) -> usize {
+fn retain_target_only_candidates(
+    batch: &mut DeletionBatch,
+    scanner: &crate::core::config::ScannerConfig,
+) -> usize {
+    if !target_only_consent_current(batch, scanner) {
+        let dropped = batch.candidates.len();
+        batch.candidates.clear();
+        return dropped;
+    }
     let Some(root) = &batch.target_only_root else {
         return 0;
     };
@@ -10298,11 +10557,12 @@ fn executor_thread_main(
         heartbeat.beat();
         batch_count += 1;
 
-        let outside = retain_target_only_candidates(&mut batch);
+        let scanner_snapshot = shared_scanner_config.read().clone();
+        let outside = retain_target_only_candidates(&mut batch, &scanner_snapshot);
         if outside > 0 {
             let message = format!(
-                "dropped {outside} target-only candidate(s) outside {}, without an identity, \
-                 or no longer pure",
+                "dropped {outside} target-only candidate(s) outside {}, without current consent \
+                 or identity, or no longer pure",
                 batch
                     .target_only_root
                     .as_deref()
@@ -10496,7 +10756,7 @@ fn executor_thread_main(
         }
         // The executor's pre-flight sacred rail sees the same catalog the
         // scoring stage does: platform builtins plus operator patterns.
-        let operator_protected_paths = batch_protected_paths(&batch, &shared_scanner_config.read());
+        let operator_protected_paths = batch_protected_paths(&batch, &scanner_snapshot);
         let executor_sacred_paths = {
             let mut catalog = platform_sacred_paths.to_vec();
             catalog.extend(protection::sacred_paths_from_protected_patterns(
@@ -10513,7 +10773,7 @@ fn executor_thread_main(
                 // A target-only batch is pinned to the inodes the tier
                 // surveyed, whatever the engine.
                 require_identity: batch.target_only_root.is_some()
-                    || matches!(shared_scanner_config.read().engine, ScannerEngineMode::V2),
+                    || matches!(scanner_snapshot.engine, ScannerEngineMode::V2),
                 sacred_paths: executor_sacred_paths,
                 // Layer 7: at Green there is time to keep the bytes around,
                 // so the batch quarantines; from Yellow up the space is
@@ -10528,7 +10788,7 @@ fn executor_thread_main(
                 quarantine_ttl: Duration::from_secs(
                     shared_config.quarantine_ttl_secs.load(Ordering::Relaxed),
                 ),
-                quarantine_roots: shared_scanner_config.read().root_paths.clone(),
+                quarantine_roots: scanner_snapshot.root_paths.clone(),
                 ..Default::default()
             },
             Some(logger.clone()),
@@ -10627,10 +10887,14 @@ fn executor_thread_main(
             // A batch planned as a dry-run cannot mutate and still owes its
             // preview counts. Real batches must obey newly restrictive policy.
             if !dry_run {
+                authorize_scanner_mutation_scope(&batch, &scanner_snapshot, shared_scanner_config)?;
                 // Renew the filesystem exception before the cheap live gates:
                 // a large purity probe must not hide a policy change while it
                 // runs or outlive a newly published compression hold.
                 authorize_target_only_candidate(candidate, batch.target_only_root.as_deref())?;
+                // A potentially large purity listing must not outlive new
+                // root, exclusion, protection or idle-window permissions.
+                authorize_scanner_mutation_scope(&batch, &scanner_snapshot, shared_scanner_config)?;
                 shared_config.authorize_mutation(policy_mode, policy_engine.lock().mode())?;
                 shared_config.authorize_compression_first(candidate, batch.pressure_level)?;
             }
@@ -11029,7 +11293,7 @@ mod tests {
             (ActiveMode::Enforce, true),
         ] {
             let fixture = RegretDaemonFixture::new();
-            let candidates_dir = tempfile::tempdir_in("/tmp").unwrap();
+            let candidates_dir = temp_root_scratch_dir();
             let project = candidates_dir.path().join("project");
             std::fs::create_dir(&project).unwrap();
             let first = project.join("target");
@@ -12567,6 +12831,83 @@ mod tests {
         assert!(candidates.contains(Path::new("/r/a/b/node_modules")));
     }
 
+    #[test]
+    fn fresh_events_reopen_cached_barren_ground_for_the_next_walk() {
+        use crate::scanner::events::{DirtyRootTracker, FsEvent, FsEventKind};
+
+        let scratch = temp_root_scratch_dir();
+        let root = scratch.path().join("scan");
+        let project = root.join("project");
+        let nested = project.join("one/two");
+        let unrelated = root.join("unchanged");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&unrelated).unwrap();
+        let mut cursor = ScanCursor::new();
+        cursor.update(
+            &HashSet::from([
+                root.clone(),
+                project.clone(),
+                nested.clone(),
+                unrelated.clone(),
+            ]),
+            &HashSet::new(),
+            true,
+        );
+        // A build arrives after an earlier budgeted pass cached this ground.
+        let target = nested.join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let artifact = target.join("debug/libdemo.rlib");
+        std::fs::write(&artifact, b"fresh build").unwrap();
+        let walk = |cursor: &ScanCursor| -> Vec<PathBuf> {
+            DirectoryWalker::new(
+                WalkerConfig {
+                    root_paths: vec![root.clone()],
+                    max_depth: 10,
+                    follow_symlinks: false,
+                    cross_devices: false,
+                    parallelism: 1,
+                    excluded_paths: cursor.barren_exclusions(),
+                    opaque_pruning: false,
+                },
+                ProtectionRegistry::marker_only(),
+            )
+            .walk()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect()
+        };
+        assert!(!walk(&cursor).contains(&target));
+
+        let roots = vec![root.clone()];
+        let mut invalidation = DirtyRootTracker::new(&roots).apply_event(FsEvent {
+            kind: FsEventKind::Modify,
+            path: Some(artifact),
+        });
+        invalidation.resolve_scan_roots(&roots);
+        assert_eq!(invalidation.dirty_roots(), &BTreeSet::from([project]));
+        cursor.invalidate_events(&invalidation);
+        assert_eq!(cursor.barren_exclusions(), HashSet::from([unrelated]));
+        assert!(walk(&cursor).contains(&target));
+    }
+
+    #[test]
+    fn lost_event_history_revokes_barren_hints_even_without_a_dirty_scope() {
+        use crate::scanner::events::{DirtyRootTracker, FsEvent, FsEventKind};
+
+        let mut cursor = scan_cursor(100, &[("/a/project", 1), ("/b/other", 1)]);
+        cursor.invalidate_events(&EventInvalidation::empty());
+        assert_eq!(cursor.barren_exclusions().len(), 2);
+        let invalidation = DirtyRootTracker::new(&[]).apply_event(FsEvent {
+            kind: FsEventKind::Overflow,
+            path: None,
+        });
+        assert!(invalidation.dirty_roots().is_empty());
+        assert!(invalidation.requires_index_generation_bump());
+        cursor.invalidate_events(&invalidation);
+        assert!(cursor.barren_exclusions().is_empty());
+    }
+
     /// bd-y70k: a pass that stops on its budget must not cache a listed
     /// directory as barren while ground below it is unseen. One worker walks
     /// breadth-first, so a pass that stops after the top level has listed
@@ -12734,6 +13075,275 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn test_target_only_consent(
+        root: &Path,
+        scanner: &crate::core::config::ScannerConfig,
+    ) -> crate::daemon::target_tier::TargetOnlyConsent {
+        crate::daemon::target_tier::TargetOnlyConsent::new(
+            root,
+            scanner,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_only_batches_need_current_root_bound_consent_before_lifting_protection() {
+        let scratch = tempfile::tempdir_in("/tmp").unwrap();
+        let root = scratch.path().join("claude-501");
+        let target = root.join("session/target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        std::fs::write(target.join("debug/libdemo.rlib"), [7_u8; 64]).unwrap();
+        let scanner = crate::core::config::ScannerConfig {
+            target_only_roots: vec![root.clone()],
+            protected_paths: vec![root.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let mut candidate = test_candidate(&target.to_string_lossy(), 2.0);
+        candidate.identity =
+            Some(crate::scanner::walker::identity_for_path(&target, false).unwrap());
+        let batch = DeletionBatch {
+            candidates: vec![candidate],
+            pressure_level: PressureLevel::Red,
+            urgency: 0.8,
+            target_bytes: None,
+            target_only_root: Some(root.clone()),
+            target_only_consent: Some(test_target_only_consent(&root, &scanner)),
+        };
+        assert!(batch_protected_paths(&batch, &scanner).is_empty());
+        assert_eq!(
+            retain_target_only_candidates(&mut batch.clone(), &scanner),
+            0
+        );
+
+        let mut withdrawn = scanner.clone();
+        withdrawn.target_only_roots.clear();
+        let mut invalid_cases = vec![(batch.clone(), withdrawn)];
+        let mut missing = batch.clone();
+        missing.target_only_consent = None;
+        invalid_cases.push((missing, scanner.clone()));
+        let mut other_root = batch.clone();
+        other_root.target_only_consent = Some(test_target_only_consent(scratch.path(), &scanner));
+        invalid_cases.push((other_root, scanner.clone()));
+        let mut older_policy = scanner.clone();
+        older_policy.target_only_idle_hours += 24;
+        invalid_cases.push((batch, older_policy));
+        for (mut refused, current) in invalid_cases {
+            assert_eq!(
+                batch_protected_paths(&refused, &current),
+                current.protected_paths
+            );
+            assert_eq!(retain_target_only_candidates(&mut refused, &current), 1);
+            assert!(refused.candidates.is_empty());
+            assert!(target.join("debug/libdemo.rlib").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    fn assert_scanner_reload_defers_remaining_candidate(
+        target_only: bool,
+        reload: fn(&mut crate::core::config::ScannerConfig, &Path),
+    ) {
+        let scratch = temp_root_scratch_dir();
+        let root = scratch.path().join("claude-501");
+        let first = root.join("s1/target-first");
+        let retained = root.join("s2/target-retained");
+        let mut candidates = Vec::new();
+        for (path, score) in [(&first, 2.0), (&retained, 1.0)] {
+            std::fs::create_dir_all(path.join("debug")).unwrap();
+            std::fs::write(path.join("debug/libdemo.rlib"), [7_u8; 64]).unwrap();
+            std::fs::write(path.join(".rustc_info.json"), b"{}").unwrap();
+            let mut candidate = test_candidate(&path.to_string_lossy(), score);
+            candidate.identity =
+                Some(crate::scanner::walker::identity_for_path(path, false).unwrap());
+            candidate.size_bytes = 66;
+            candidates.push(candidate);
+        }
+        let scanner = crate::core::config::ScannerConfig {
+            target_only_roots: vec![root.clone()],
+            protected_paths: if target_only {
+                vec![root.to_string_lossy().into_owned()]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        let live_scanner = RwLock::new(scanner.clone());
+        let mut batch = DeletionBatch {
+            candidates,
+            pressure_level: PressureLevel::Critical,
+            urgency: 0.9,
+            target_bytes: None,
+            target_only_root: target_only.then(|| root.clone()),
+            target_only_consent: target_only.then(|| test_target_only_consent(&root, &scanner)),
+        };
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        let mut sacred_paths = platform.sacred_paths();
+        sacred_paths.extend(protection::sacred_paths_from_protected_patterns(
+            &batch_protected_paths(&batch, &scanner),
+        ));
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                dry_run: false,
+                min_score: 0.0,
+                check_open_files: true,
+                require_identity: true,
+                sacred_paths,
+                mode: DeletionMode::Unlink,
+                ..Default::default()
+            },
+            None,
+        )
+        .with_platform(platform);
+        let plan = executor.plan(std::mem::take(&mut batch.candidates));
+        assert_eq!(plan.candidates.len(), 2);
+        let authorize = |candidate: &CandidacyScore| {
+            authorize_scanner_mutation_scope(&batch, &scanner, &live_scanner)?;
+            authorize_target_only_candidate(candidate, batch.target_only_root.as_deref())?;
+            authorize_scanner_mutation_scope(&batch, &scanner, &live_scanner)
+        };
+        let change_after_first = |candidate: &CandidacyScore, _: Instant| {
+            assert_eq!(candidate.path, first);
+            reload(&mut live_scanner.write(), &retained);
+        };
+        let report =
+            executor.execute_with_hooks(&plan, None, Some(&authorize), Some(&change_after_first));
+        assert_eq!(report.deleted_paths, vec![first]);
+        assert_eq!(report.skipped_by_reason.get("policy_changed"), Some(&1));
+        assert_eq!(report.items_failed, 0);
+        assert!(
+            report.backoff_candidates.is_empty(),
+            "withdrawn consent is not a path failure"
+        );
+        assert_eq!(
+            std::fs::read(retained.join("debug/libdemo.rlib")).unwrap(),
+            [7_u8; 64]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_batches_defer_when_protection_or_exclusions_change_mid_batch() {
+        assert_scanner_reload_defers_remaining_candidate(false, |scanner, retained| {
+            scanner.protected_paths.push(
+                retained
+                    .join("debug/libdemo.rlib")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        });
+        assert_scanner_reload_defers_remaining_candidate(false, |scanner, retained| {
+            scanner.excluded_paths.push(retained.join("debug"));
+        });
+        assert_scanner_reload_defers_remaining_candidate(false, |scanner, _| {
+            scanner.catalog_roots_on_pressured_device = false;
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_only_batches_defer_when_permission_or_idle_window_changes_mid_batch() {
+        assert_scanner_reload_defers_remaining_candidate(true, |scanner, _| {
+            scanner.target_only_roots.clear();
+        });
+        assert_scanner_reload_defers_remaining_candidate(true, |scanner, _| {
+            scanner.target_only_idle_hours += 24;
+        });
+        assert_scanner_reload_defers_remaining_candidate(true, |scanner, retained| {
+            scanner.protected_paths.push(
+                retained
+                    .join("debug/libdemo.rlib")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_thread_rejects_revoked_or_missing_target_only_consent_before_policy() {
+        for case in ["revoked", "missing", "removed root", "longer idle"] {
+            let mut fixture = RegretDaemonFixture::new();
+            let root = fixture.directory.path().join("claude-501");
+            let target = root.join("s1/target");
+            std::fs::create_dir_all(target.join("debug")).unwrap();
+            std::fs::write(target.join("debug/libdemo.rlib"), [7_u8; 64]).unwrap();
+            let scanner = crate::core::config::ScannerConfig {
+                target_only_roots: vec![root.clone()],
+                protected_paths: vec![root.to_string_lossy().into_owned()],
+                ..fixture.daemon.shared_scanner_config.read().clone()
+            };
+            *fixture.daemon.shared_scanner_config.write() = scanner.clone();
+            let revoked = Arc::new(AtomicBool::new(false));
+            let consent = crate::daemon::target_tier::TargetOnlyConsent::new(
+                &root,
+                &scanner,
+                Arc::clone(&revoked),
+            );
+            let mut candidate = test_candidate(&target.to_string_lossy(), 3.0);
+            candidate.identity =
+                Some(crate::scanner::walker::identity_for_path(&target, false).unwrap());
+            candidate.size_bytes = 64;
+            let (send, receive) = crossbeam_channel::bounded(1);
+            send.send(DeletionBatch {
+                candidates: vec![candidate],
+                pressure_level: PressureLevel::Critical,
+                urgency: 0.9,
+                target_bytes: None,
+                target_only_root: Some(root),
+                target_only_consent: (case != "missing").then_some(consent),
+            })
+            .unwrap();
+            match case {
+                "revoked" => revoked.store(true, Ordering::Release),
+                "removed root" => fixture
+                    .daemon
+                    .shared_scanner_config
+                    .write()
+                    .target_only_roots
+                    .clear(),
+                "longer idle" => {
+                    fixture
+                        .daemon
+                        .shared_scanner_config
+                        .write()
+                        .target_only_idle_hours += 24
+                }
+                _ => {}
+            }
+            let (report_send, _report_receive) = crossbeam_channel::bounded(16);
+            let (index_send, _index_receive) = crossbeam_channel::bounded(16);
+            let executor = fixture
+                .daemon
+                .spawn_executor_thread(
+                    receive,
+                    fixture.daemon.logger_handle.clone(),
+                    ThreadHeartbeat::new("sbh-executor"),
+                    report_send,
+                    index_send,
+                )
+                .unwrap();
+            drop(send);
+            executor.join().unwrap();
+            fixture.flush_logger();
+            let log = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
+            assert!(
+                log.contains("dropped 1 target-only candidate(s) outside"),
+                "{case}: {log}"
+            );
+            assert!(
+                !log.contains(target.to_string_lossy().as_ref()),
+                "{case}: stale work reached policy: {log}"
+            );
+            assert_eq!(
+                std::fs::read(target.join("debug/libdemo.rlib")).unwrap(),
+                [7_u8; 64]
+            );
+        }
+    }
+
     /// bd-232u: a pattern protecting the whole root stops an ordinary batch
     /// but not a target-only one; a pattern naming a dir inside the root and
     /// a `.sbh-protect` marker above the target stop both; a target-only batch never reaches
@@ -12750,8 +13360,7 @@ mod tests {
         use crate::scanner::walker::{FsEntryKind, FsIdentity};
         use std::os::unix::fs::MetadataExt;
 
-        // Under /tmp, as above (bd-c47s).
-        let scratch = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = temp_root_scratch_dir();
         let root = scratch.path().join("claude-501");
         let ordinary = root.join("a/target-ordinary");
         let target_only = root.join("b/target-only");
@@ -12775,6 +13384,7 @@ mod tests {
         // purity re-check would drop it before the marker check ran).
         protection::create_marker(marked.parent().unwrap(), None).unwrap();
         let scanner = crate::core::config::ScannerConfig {
+            target_only_roots: vec![root.clone()],
             protected_paths: vec![
                 root.to_string_lossy().into_owned(),
                 named.to_string_lossy().into_owned(),
@@ -12810,8 +13420,10 @@ mod tests {
                 urgency: 0.9,
                 target_bytes: None,
                 target_only_root: target_only_root.map(Path::to_path_buf),
+                target_only_consent: target_only_root
+                    .map(|root| test_target_only_consent(root, &scanner)),
             };
-            let dropped = retain_target_only_candidates(&mut batch);
+            let dropped = retain_target_only_candidates(&mut batch, &scanner);
             let patterns = batch_protected_paths(&batch, &scanner);
             let skip_sacred = protection::sacred_paths_from_protected_patterns(&patterns);
             let mut catalog = platform.sacred_paths();
@@ -12881,7 +13493,7 @@ mod tests {
     fn target_only_batch_rechecks_purity_before_each_mutation() {
         use std::cell::Cell;
 
-        let scratch = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch = temp_root_scratch_dir();
         let root = scratch.path().join("claude-501");
         let first = root.join("s1/target-first");
         let held = root.join("s2/target-held");
@@ -12897,18 +13509,20 @@ mod tests {
             candidates.push(candidate);
         }
         let held_identity = candidates[1].identity;
+        let scanner = crate::core::config::ScannerConfig {
+            target_only_roots: vec![root.clone()],
+            protected_paths: vec![root.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
         let mut batch = DeletionBatch {
             candidates,
             pressure_level: PressureLevel::Critical,
             urgency: 0.9,
             target_bytes: None,
             target_only_root: Some(root.clone()),
+            target_only_consent: Some(test_target_only_consent(&root, &scanner)),
         };
-        assert_eq!(retain_target_only_candidates(&mut batch), 0);
-        let scanner = crate::core::config::ScannerConfig {
-            protected_paths: vec![root.to_string_lossy().into_owned()],
-            ..Default::default()
-        };
+        assert_eq!(retain_target_only_candidates(&mut batch, &scanner), 0);
         let patterns = batch_protected_paths(&batch, &scanner);
         assert!(
             patterns.is_empty(),
@@ -12980,6 +13594,10 @@ mod tests {
         let root = scratch.path().join("claude-501");
         let still_pure = root.join("s1/target-a");
         let turned = root.join("s2/target-b");
+        let scanner = crate::core::config::ScannerConfig {
+            target_only_roots: vec![root.clone()],
+            ..Default::default()
+        };
         for dir in [&still_pure, &turned] {
             std::fs::create_dir_all(dir.join("debug")).unwrap();
             std::fs::write(dir.join("debug/libdemo.rlib"), [7u8; 64]).unwrap();
@@ -13005,21 +13623,28 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             urgency: 0.9,
             target_bytes: None,
+            target_only_consent: target_only_root
+                .as_deref()
+                .map(|root| test_target_only_consent(root, &scanner)),
             target_only_root,
         };
 
         let mut before = batch(Some(root.clone()));
-        assert_eq!(retain_target_only_candidates(&mut before), 0, "both pure");
+        assert_eq!(
+            retain_target_only_candidates(&mut before, &scanner),
+            0,
+            "both pure"
+        );
 
         // Written into the target after the survey: the same inode, now work.
         std::fs::create_dir(turned.join("trace")).unwrap();
         let mut after = batch(Some(root));
-        assert_eq!(retain_target_only_candidates(&mut after), 1);
+        assert_eq!(retain_target_only_candidates(&mut after, &scanner), 1);
         let kept: Vec<&Path> = after.candidates.iter().map(|c| c.path.as_path()).collect();
         assert_eq!(kept, [still_pure.as_path()]);
 
         let mut ordinary = batch(None);
-        assert_eq!(retain_target_only_candidates(&mut ordinary), 0);
+        assert_eq!(retain_target_only_candidates(&mut ordinary, &scanner), 0);
         assert_eq!(ordinary.candidates.len(), 2);
     }
 
@@ -13040,6 +13665,12 @@ mod tests {
         let root = base.join("claude-501");
         let inside = root.join("s1/target-inside");
         let outside = base.join("elsewhere/target-outside");
+        fixture
+            .daemon
+            .shared_scanner_config
+            .write()
+            .target_only_roots = vec![root.clone()];
+        let consent = test_target_only_consent(&root, &fixture.daemon.shared_scanner_config.read());
         let candidates = [&inside, &outside]
             .into_iter()
             .map(|path| {
@@ -13076,6 +13707,7 @@ mod tests {
                 urgency: 0.9,
                 target_bytes: None,
                 target_only_root: Some(root),
+                target_only_consent: Some(consent),
             })
             .unwrap();
         // The thread handles the batch, then stops on the closed channel.
@@ -13140,6 +13772,7 @@ mod tests {
                 urgency: 0.9,
                 target_bytes: None,
                 target_only_root: None,
+                target_only_consent: None,
             })
             .unwrap();
         drop(del_tx);
@@ -13174,6 +13807,7 @@ mod tests {
             urgency: 0.9,
             target_bytes: None,
             target_only_root: None,
+            target_only_consent: None,
         };
         batch.candidates[0].size_bytes = 0;
         batch.candidates[1].size_bytes = 4096;
@@ -13190,7 +13824,7 @@ mod tests {
         use crate::daemon::compress_tier::RootStatus;
 
         let fixture = RegretDaemonFixture::new();
-        let candidates_dir = tempfile::tempdir_in("/tmp").unwrap();
+        let candidates_dir = temp_root_scratch_dir();
         let project = candidates_dir.path().join("project");
         let path = project.join("target");
         std::fs::create_dir_all(&path).unwrap();
@@ -16272,6 +16906,7 @@ mod tests {
             urgency: 0.5,
             target_bytes: None,
             target_only_root: None,
+            target_only_consent: None,
         };
         del_tx.send(batch).unwrap();
         let received_batch = del_rx.recv().unwrap();
@@ -16450,6 +17085,472 @@ mod tests {
 
         request.pressure_level = PressureLevel::Orange;
         assert_eq!(v2_active_scan_paths(&request, &dirty), None);
+    }
+
+    fn event_test_request(paths: Vec<PathBuf>) -> ScanRequest {
+        ScanRequest {
+            paths,
+            urgency: 0.0,
+            pressure_level: PressureLevel::Green,
+            free_pct: None,
+            max_delete_batch: 10,
+            force_full_scan: false,
+            config_update: None,
+            catalog_roots: Vec::new(),
+            maintenance: false,
+            target_bytes: None,
+        }
+    }
+
+    #[test]
+    fn v2_catalog_requests_keep_explicit_scope_without_pending_events() {
+        let configured = vec![PathBuf::from("/home")];
+        let path = PathBuf::from("/home/alice/.cache/tool");
+        let mut request = event_test_request(vec![path.clone()]);
+        request.catalog_roots = vec![ExpandedCatalogRoot {
+            path,
+            rule: "test-catalog-cache",
+            confidence: cleanup_catalog::CleanupConfidence::Definite,
+            min_age: Duration::ZERO,
+        }];
+        let pending = PendingScannerEvents::default();
+        let dirty = pending.select_for_request(&request.paths, &configured);
+        assert!(dirty.is_empty(), "the configured ancestor is already clean");
+        for level in [PressureLevel::Green, PressureLevel::Yellow] {
+            request.pressure_level = level;
+            assert_eq!(v2_active_scan_paths(&request, &dirty), None);
+        }
+    }
+
+    #[test]
+    fn v2_event_scopes_never_escape_the_requested_roots() {
+        let request = event_test_request(vec!["/a/selected".into(), "/b".into()]);
+        let dirty = ["/a", "/b/project", "/b/project/child", "/other"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(
+            v2_active_scan_paths(&request, &dirty),
+            Some(vec!["/a/selected".into(), "/b/project".into()])
+        );
+    }
+
+    #[test]
+    fn pending_event_reconciliation_survives_other_passes_without_rebumping() {
+        use crate::scanner::events::{DirtyRootTracker, FsEvent, FsEventKind};
+
+        let config = ScannerConfig {
+            root_paths: vec!["/a".into(), "/b".into()],
+            ..ScannerConfig::default()
+        };
+        let tracker = DirtyRootTracker::new(&config.root_paths);
+        let mut index = ScannerCandidateIndex::new(ScannerIndexContext::from_roots_and_config(
+            &config.root_paths,
+            &config,
+        ));
+        let mut pending = PendingScannerEvents::default();
+        pending.remember(tracker.apply_event(FsEvent {
+            kind: FsEventKind::Overflow,
+            path: None,
+        }));
+        let invalidation =
+            pending.take_invalidation(EventInvalidation::empty(), &config.root_paths);
+        invalidation.apply_to_index(&mut index);
+        assert_eq!(index.event_generation(), 1);
+        assert_eq!(
+            pending.select_for_request(&["/a".into()], &config.root_paths),
+            BTreeSet::from([PathBuf::from("/a")])
+        );
+        assert!(pending.has_work_within(&["/a".into()]));
+        pending.acknowledge_walk(&["/a".into()], Some(&[]));
+        assert!(!pending.has_work_within(&["/a".into()]));
+        assert!(pending.has_work_within(&["/b".into()]));
+
+        for path in ["/a", "/b"] {
+            let fresh = pending.take_invalidation(EventInvalidation::empty(), &config.root_paths);
+            assert!(!fresh.requires_index_generation_bump());
+            assert!(!fresh.requires_reconciliation());
+            fresh.apply_to_index(&mut index);
+            assert_eq!(
+                index.event_generation(),
+                1,
+                "retained work is not another overflow"
+            );
+            let selected = pending.select_for_request(&[path.into()], &config.root_paths);
+            if path == "/a" {
+                assert!(selected.is_empty());
+            } else {
+                assert_eq!(selected, BTreeSet::from([PathBuf::from("/b")]));
+            }
+            pending.acknowledge_walk(&[path.into()], Some(&[]));
+        }
+        assert!(pending.reconciliation.is_empty());
+
+        let later = pending.take_invalidation(
+            tracker.apply_event(FsEvent {
+                kind: FsEventKind::Overflow,
+                path: None,
+            }),
+            &config.root_paths,
+        );
+        later.apply_to_index(&mut index);
+        assert_eq!(
+            index.event_generation(),
+            2,
+            "a genuinely new loss still revokes evidence"
+        );
+    }
+
+    #[test]
+    fn pending_event_parents_survive_partial_requests_and_unwatched_paths_still_run() {
+        use crate::scanner::events::{DirtyRootTracker, FsEvent, FsEventKind};
+
+        let configured = vec![PathBuf::from("/a")];
+        let mut pending = PendingScannerEvents::default();
+        pending.take_invalidation(
+            DirtyRootTracker::new(&configured).apply_event(FsEvent {
+                kind: FsEventKind::BackendRestart,
+                path: None,
+            }),
+            &configured,
+        );
+        assert_eq!(
+            pending.select_for_request(&["/a/selected".into()], &configured),
+            BTreeSet::from([PathBuf::from("/a/selected")])
+        );
+        pending.acknowledge_walk(&["/a/selected".into()], Some(&[]));
+        assert_eq!(
+            pending.reconciliation,
+            BTreeSet::from([PathBuf::from("/a")])
+        );
+        for outside in ["/special", "/catalog/cache", "/target-only/project"] {
+            assert_eq!(
+                pending.select_for_request(&[outside.into()], &configured),
+                BTreeSet::from([PathBuf::from(outside)])
+            );
+            assert_eq!(
+                pending.reconciliation,
+                BTreeSet::from([PathBuf::from("/a")])
+            );
+        }
+        assert_eq!(
+            pending.select_for_request(&configured, &configured),
+            BTreeSet::from([PathBuf::from("/a")])
+        );
+        pending.acknowledge_walk(&configured, Some(&[]));
+        assert!(pending.reconciliation.is_empty());
+    }
+
+    #[test]
+    fn pending_event_backlog_collapses_to_a_bounded_root_without_losing_work() {
+        use crate::scanner::events::{DirtyRootTracker, FsEvent, FsEventKind};
+
+        let roots = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        let tracker = DirtyRootTracker::new(&roots);
+        let mut pending = PendingScannerEvents::default();
+        for number in 0..200 {
+            pending.take_invalidation(
+                tracker.apply_event(FsEvent {
+                    kind: FsEventKind::WatchBudgetExceeded,
+                    path: Some(PathBuf::from(format!("/b/project-{number}"))),
+                }),
+                &roots,
+            );
+            assert!(pending.reconciliation.len() <= 64);
+            assert!(
+                pending
+                    .select_for_request(&["/a".into()], &roots)
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            pending.select_for_request(&["/b".into()], &roots),
+            BTreeSet::from([PathBuf::from("/b")])
+        );
+    }
+
+    #[test]
+    fn pending_event_work_survives_partial_attempts_until_covering_walk_completion() {
+        use crate::scanner::events::{DirtyRootTracker, FsEvent, FsEventKind};
+
+        let roots = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        let config = ScannerConfig {
+            root_paths: roots.clone(),
+            ..ScannerConfig::default()
+        };
+        let mut index =
+            ScannerCandidateIndex::new(ScannerIndexContext::from_roots_and_config(&roots, &config));
+        let mut pending = PendingScannerEvents::default();
+        let invalidation = pending.take_invalidation(
+            DirtyRootTracker::new(&roots).apply_event(FsEvent {
+                kind: FsEventKind::Overflow,
+                path: None,
+            }),
+            &roots,
+        );
+        invalidation.apply_to_index(&mut index);
+        let request = vec![PathBuf::from("/a")];
+        let expected = BTreeSet::from([PathBuf::from("/a")]);
+
+        // A pass can finish from replay, fail before opening the walker, or
+        // exhaust a pre-scan budget. Selection alone never spends its event.
+        for _ in 0..3 {
+            assert_eq!(pending.select_for_request(&request, &roots), expected);
+            let fresh = pending.take_invalidation(EventInvalidation::empty(), &roots);
+            fresh.apply_to_index(&mut index);
+            assert_eq!(index.event_generation(), 1);
+            assert!(pending.has_work_within(&request));
+        }
+        // A missing receipt and a known unvisited subtree both retain the
+        // same work, including normal stream EOF after a directory window.
+        pending.acknowledge_walk(&request, None);
+        assert_eq!(pending.select_for_request(&request, &roots), expected);
+        pending.acknowledge_walk(&request, Some(&[PathBuf::from("/a/unvisited")]));
+        assert_eq!(pending.select_for_request(&request, &roots), expected);
+        pending.acknowledge_walk(&["/a/child".into()], Some(&[]));
+        assert_eq!(pending.select_for_request(&request, &roots), expected);
+
+        pending.acknowledge_walk(&request, Some(&[]));
+        assert!(pending.select_for_request(&request, &roots).is_empty());
+        assert_eq!(
+            pending.reconciliation,
+            BTreeSet::from([PathBuf::from("/b")])
+        );
+        pending.acknowledge_walk(&["/b".into()], Some(&[]));
+        assert!(pending.reconciliation.is_empty());
+    }
+
+    #[test]
+    fn idle_event_requests_keep_other_roots_pending_and_reject_stale_templates() {
+        use crate::core::config::ScannerEventSourceMode;
+        use crate::scanner::events::{DirtyRootTracker, FsEvent, FsEventKind};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        std::fs::create_dir(&root_a).unwrap();
+        std::fs::create_dir(&root_b).unwrap();
+        let mut config = ScannerConfig {
+            root_paths: vec![root_a.clone(), root_b.clone()],
+            event_source: ScannerEventSourceMode::ReconciliationOnly,
+            ..ScannerConfig::default()
+        };
+        let mut source = ScannerEventSource::start(EventSourceConfig::from_scanner_config(
+            &config.root_paths,
+            &config,
+        ));
+        source.drain();
+        let mut pending = PendingScannerEvents::default();
+        pending.remember(
+            DirtyRootTracker::new(&config.root_paths).apply_event(FsEvent {
+                kind: FsEventKind::WatchBudgetExceeded,
+                path: Some(root_b.clone()),
+            }),
+        );
+        let mut last_poll = Instant::now() - EVENT_POLL_INTERVAL;
+        let template_a =
+            EventPassTemplate::from_request(&event_test_request(vec![root_a]), &config);
+        assert!(
+            event_triggered_request(
+                Some(&mut source),
+                &mut pending,
+                &mut last_poll,
+                Some(&template_a),
+                &config,
+            )
+            .is_none()
+        );
+        assert!(pending.has_work_within(std::slice::from_ref(&root_b)));
+        let template_b =
+            EventPassTemplate::from_request(&event_test_request(vec![root_b.clone()]), &config);
+        last_poll = Instant::now() - EVENT_POLL_INTERVAL;
+        let request = event_triggered_request(
+            Some(&mut source),
+            &mut pending,
+            &mut last_poll,
+            Some(&template_b),
+            &config,
+        )
+        .expect("the relevant request can consume retained work");
+        assert_eq!(request.paths, vec![root_b]);
+
+        config.root_paths = vec![temp.path().join("replacement")];
+        last_poll = Instant::now() - EVENT_POLL_INTERVAL;
+        assert!(
+            event_triggered_request(
+                Some(&mut source),
+                &mut pending,
+                &mut last_poll,
+                Some(&template_b),
+                &config,
+            )
+            .is_none(),
+            "a reload cannot revive the removed root's request"
+        );
+        let mut replacement = ScannerEventSource::start(EventSourceConfig::from_scanner_config(
+            &config.root_paths,
+            &config,
+        ));
+        last_poll = Instant::now() - EVENT_POLL_INTERVAL;
+        assert!(
+            event_triggered_request(
+                Some(&mut replacement),
+                &mut pending,
+                &mut last_poll,
+                Some(&template_b),
+                &config,
+            )
+            .is_none(),
+            "a replacement subscription still needs a fresh request template"
+        );
+    }
+
+    /// Exercise the actual scanner loop: alternating mount and special-location
+    /// requests keep one subscription, retain the other mount's startup work,
+    /// and restart only when the configured root set really changes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn scanner_event_subscriptions_survive_alternating_passes_and_restart_on_reload() {
+        let temp = temp_root_scratch_dir();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let outside = temp.path().join("special");
+        let replacement = temp.path().join("replacement");
+        let catalog_child = root_a.join("ordinary-data");
+        for root in [&root_a, &root_b, &outside, &replacement] {
+            std::fs::create_dir_all(root.join("ordinary-data")).unwrap();
+            std::fs::write(root.join("ordinary-data/notes.txt"), b"not an artifact").unwrap();
+        }
+        let mut config = Config::default();
+        config.scanner.engine = ScannerEngineMode::V2;
+        config.scanner.root_paths = vec![root_a.clone(), root_b.clone()];
+        config.scanner.parallelism = 1;
+        config.scanner.event_watch_budget = 64;
+        config.scanner.active_reference_min_size_bytes = u64::MAX;
+        let log_path = temp.path().join("activity.jsonl");
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: JsonlConfig {
+                path: log_path.clone(),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 128,
+            run_id: None,
+        })
+        .unwrap();
+        let scoring = Arc::new(RwLock::new(config.scoring));
+        let scanner_config = Arc::new(RwLock::new(config.scanner));
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+        let (del_tx, _del_rx) = bounded::<DeletionBatch>(16);
+        let (report_tx, report_rx) = bounded::<WorkerReport>(1);
+        let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        let (index_path, cursor_path) = scanner_state_paths(temp.path());
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                scanner_thread_main(
+                    &scan_rx,
+                    &del_tx,
+                    &logger,
+                    &scoring,
+                    &scanner_config,
+                    &platform,
+                    &ThreadHeartbeat::new("event-lifetime-test"),
+                    &report_tx,
+                    &Arc::new(AtomicBool::new(false)),
+                    &index_path,
+                    &cursor_path,
+                    &feedback_rx,
+                    &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+                    &Arc::new(SharedExecutorConfig::new(
+                        false, 10, 0.0, 60, 3600, false, 0,
+                    )),
+                    &Arc::new(SharedRegret::new(&Config::default())),
+                );
+            });
+            for (path, dirty, catalog) in [
+                (&root_a, true, false),
+                // A bounded catalog probe cannot acknowledge an ordinary
+                // root's pending walk, even when their paths are identical.
+                (&root_b, true, true),
+                (&root_b, true, false),
+                (&root_a, false, false),
+                // A catalog unit below an already reconciled configured
+                // root still receives its explicitly requested probe.
+                (&catalog_child, false, true),
+                (&outside, true, false),
+                (&root_b, false, false),
+                (&replacement, true, false),
+            ] {
+                if path == &replacement {
+                    scanner_config.write().root_paths = vec![replacement.clone()];
+                }
+                // No invented disk sample: synthetic requests without one
+                // use the existing pacing exemption, leaving scope selection
+                // and the native event backend fully active.
+                let mut request = event_test_request(vec![path.clone()]);
+                if catalog {
+                    request.pressure_level = PressureLevel::Yellow;
+                    request.catalog_roots.push(ExpandedCatalogRoot {
+                        path: path.clone(),
+                        rule: "test-catalog-cache",
+                        confidence: cleanup_catalog::CleanupConfidence::Definite,
+                        // Observe that the probe ran without admitting a
+                        // deletion candidate or relying on process visibility.
+                        min_age: Duration::MAX,
+                    });
+                }
+                scan_tx.send(request).unwrap();
+                let report = report_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("each selected pass must report bounded completion");
+                match report {
+                    WorkerReport::ScanCompleted {
+                        root_stats,
+                        timed_out,
+                        ..
+                    } => {
+                        assert!(!timed_out);
+                        assert_eq!(root_stats.len(), 1, "a pass cannot visit another root");
+                        assert_eq!(&root_stats[0].path, path);
+                        assert_eq!(root_stats[0].dirty, dirty, "{}", path.display());
+                    }
+                    other => panic!("unexpected scanner report: {other:?}"),
+                }
+            }
+            drop(scan_tx);
+            worker.join().unwrap();
+        });
+        logger.shutdown();
+        logger_join.join().unwrap();
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert_eq!(
+            log.matches("scanner_events: backend=recursive-inotify")
+                .count(),
+            2,
+            "one initial subscription and one real root reload: {log}"
+        );
+        let completions: Vec<_> = log
+            .lines()
+            .filter(|line| line.contains("\"event\":\"scan_complete\""))
+            .collect();
+        assert_eq!(completions.len(), 8, "{log}");
+        assert_eq!(
+            log.matches("catalog scan: 1 root(s) probed, 1 skipped as recently used")
+                .count(),
+            2,
+            "both pending and already reconciled catalog scopes must be probed: {log}"
+        );
+        for completion in completions {
+            assert!(
+                completion.contains("index_event_generation=1 "),
+                "{completion}"
+            );
+        }
     }
 
     #[test]
@@ -17452,6 +18553,7 @@ mod tests {
                 urgency: 0.5,
                 target_bytes: None,
                 target_only_root: None,
+                target_only_consent: None,
             })
             .expect("prefill channel");
 

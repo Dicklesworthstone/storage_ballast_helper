@@ -137,6 +137,16 @@ shows a file written under a small project producing an event pass that walks a
 fraction of the directories the forced full pass walked.
 
 ### 3.2 Pressure-gated effort
+
+Subscription lifetime (bd-2pi1): event sources are keyed on the configured root
+set, not the roots selected for one pressure or maintenance pass. Draining an
+event applies its index invalidation once, then retains uncovered work for a
+later relevant request. A pass intersects event work with its requested paths;
+it does not scan another root just because that root has pending events.
+Unmonitored special-location or catalog request paths reconcile explicitly.
+Real subscription configuration changes still rebuild coverage, and pending
+overflow work remains conservative until its affected roots are covered.
+
 - Drive everything off the existing cheap `statfs` pressure poll. Effort ladder:
   - **green:** event subscription only + one shallow top-level reconciliation every
     few minutes. No deep work.

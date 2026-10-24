@@ -87,6 +87,18 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Scanner reloads revoke stale target-only cleanup permission** (bd-232u).
+  Target-only batches carry the consent under which they were selected. Changes
+  to opted-in roots, idle windows, exclusions, or protection invalidate old
+  nominations; removing and re-adding a root cannot revive revoked work. The
+  executor renews permission at the mutation boundary, after purity inspection,
+  so a queued or long-running batch cannot use a withdrawn protection exception.
+- **Alternating scan scopes retain event watches and pending coverage**
+  (bd-2pi1). Subscriptions follow configured roots instead of each pass's root
+  subset. New events invalidate the index once, and work outside the current
+  request stays pending without widening that pass. Unmonitored special/catalog
+  request paths reconcile explicitly; genuine configuration changes and
+  overflows still revoke stale index evidence.
 - **Restore cannot reuse foreign staging or overwrite a concurrent occupant.**
   Each relocation restore locks its stub and creates a private random workspace.
   Rsync writes through the opened payload directory, so replaced parent or
