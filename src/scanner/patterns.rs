@@ -2502,7 +2502,7 @@ mod tests {
             PathBuf::from("/root/.cargo"),
             PathBuf::from("/data/ssd/tmp/rch-cargo-cache-csd"),
             PathBuf::from("/scratch/tmp/rch-cargo-cache-timeout-worker"),
-            marked_home.clone(),
+            marked_home,
         ] {
             for root in ["registry", "git"] {
                 let path = home.join(root);

@@ -4,8 +4,9 @@
 //! With `[compress] enabled`, the monitor calls [`CompressTier::tick`] on every
 //! tick. A pass starts when a configured root sits on btrfs whose mount is at
 //! or above `start_level`, no pass is running, and `interval_minutes` have
-//! passed since the last start. The pass runs on its own `sbh-compress` thread,
-//! so discovery and rewrite I/O do not run on the monitor. It finds files under
+//! passed since the last start. Root probes and passes have separate bounded
+//! worker slots, so filesystem admission, discovery and rewrite I/O do not run
+//! on the monitor. A root awaiting fresh evidence cannot hold cleanup. It finds files under
 //! due roots, resuming where the previous pass stopped, and runs the same
 //! checked executor as `sbh compress --discover --apply`. Every file outcome
 //! reaches the activity log, and a summary line names the bytes saved. Nothing
@@ -19,14 +20,14 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::core::config::{CompressConfig, Config, PressureConfig};
 use crate::logger::compression::CompressionActivity;
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle};
 use crate::monitor::pid::{PressureLevel, classify_level};
-use crate::platform::pal::Platform;
+use crate::platform::pal::{FsStats, Platform};
 use crate::scanner::compression::{
     self, CompressionMode, CompressionObservation, CompressionReport, ConcurrencyAcknowledgement,
     discovery,
@@ -48,6 +49,96 @@ pub struct RootStatus {
     pub mount_point: Option<PathBuf>,
     /// Device identity used to hold only cleanup on this filesystem.
     pub device_id: Option<u64>,
+}
+
+/// Freshness is measured from probe completion, using monotonic time. A probe
+/// which itself exceeds this window supplies unknown evidence instead.
+const ROOT_PROBE_MAX_AGE: Duration = Duration::from_secs(60);
+/// Matches the validated configuration limit and bounds queued snapshots.
+const ROOT_PROBE_LIMIT: usize = 32;
+
+#[derive(Debug)]
+struct RootEvidence {
+    root: PathBuf,
+    stats: Option<FsStats>,
+    device_id: Option<u64>,
+    completed_at: Instant,
+}
+
+impl RootEvidence {
+    fn fresh(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.completed_at) < ROOT_PROBE_MAX_AGE
+    }
+
+    /// Controller levels are live monitor evidence, never a value captured by
+    /// the worker before a potentially slow filesystem query.
+    fn status(
+        &self,
+        mount_levels: &HashMap<PathBuf, PressureLevel>,
+        pressure: &PressureConfig,
+    ) -> RootStatus {
+        RootStatus {
+            root: self.root.clone(),
+            btrfs: self
+                .stats
+                .as_ref()
+                .is_some_and(|stats| stats.fs_type == "btrfs"),
+            level: self
+                .stats
+                .as_ref()
+                .filter(|stats| !stats.is_readonly && stats.total_bytes > 0)
+                .map(|stats| {
+                    mount_levels
+                        .get(&stats.mount_point)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            let [green, yellow, orange, red] =
+                                pressure.free_pct_thresholds_for(stats.total_bytes);
+                            classify_level(stats.free_pct(), green, yellow, orange, red)
+                        })
+                }),
+            mount_point: self.stats.as_ref().map(|stats| stats.mount_point.clone()),
+            device_id: self.device_id,
+        }
+    }
+}
+
+/// There is at most one native probe worker, even if a syscall never returns.
+/// Cancellation invalidates its output; it does not pretend to kill native I/O.
+#[derive(Debug)]
+struct RootProbe {
+    receive: mpsc::Receiver<RootEvidence>,
+    cancelled: Arc<AtomicBool>,
+    worker: std::thread::JoinHandle<()>,
+}
+
+/// A pass captures its configuration. Revoke it when consent, work limits or
+/// the executor's protected paths change; unrelated UI/notification settings
+/// do not change its authority to rewrite a file.
+#[derive(Debug, PartialEq, Eq)]
+struct CompressionScope {
+    compress: CompressConfig,
+    protected_paths: Vec<String>,
+    control_paths: [PathBuf; 6],
+}
+
+impl From<&Config> for CompressionScope {
+    fn from(config: &Config) -> Self {
+        Self {
+            compress: config.compress.clone(),
+            protected_paths: config.scanner.protected_paths.clone(),
+            // Keep these aligned with compression::linux::check_control_paths.
+            // The database sidecars and journal directory derive from them.
+            control_paths: [
+                config.paths.config_file.clone(),
+                config.paths.state_file.clone(),
+                config.paths.sqlite_db.clone(),
+                config.paths.jsonl_log.clone(),
+                config.update.metadata_cache_file.clone(),
+                config.notifications.file.path.clone(),
+            ],
+        }
+    }
 }
 
 /// A bounded first chance for lossless reclaim, shared with the executor.
@@ -220,7 +311,7 @@ fn due_start_level(
     Some(start)
 }
 
-/// Scheduling state of the tier: at most one pass in flight.
+/// Scheduling state of the tier: at most one pass and one root probe in flight.
 #[derive(Debug, Default)]
 pub struct CompressTier {
     running: Arc<AtomicBool>,
@@ -234,6 +325,14 @@ pub struct CompressTier {
     /// `None` starts from the top. This is not a durable completion ledger.
     resume_after: Arc<Mutex<Option<PathBuf>>>,
     first: Arc<CompressionFirst>,
+    probe: Option<RootProbe>,
+    probe_roots: Vec<PathBuf>,
+    evidence: HashMap<PathBuf, RootEvidence>,
+    /// An old worker's token stays cancelled even if roots are removed and
+    /// re-added, or the same configuration is re-enabled before it returns.
+    probes_invalidated: AtomicBool,
+    next_probe_root: usize,
+    scope: Option<CompressionScope>,
 }
 
 impl CompressTier {
@@ -241,6 +340,87 @@ impl CompressTier {
         Self {
             first,
             ..Self::default()
+        }
+    }
+
+    /// Drain completed observations without waiting on a worker or touching
+    /// the filesystem. Even cancelled workers keep their slot until they exit.
+    fn poll_probes(&mut self, roots: &[PathBuf], now: Instant) {
+        let changed = self.probe_roots != roots;
+        if self.probes_invalidated.swap(false, Ordering::AcqRel) || changed {
+            if let Some(probe) = &self.probe {
+                probe.cancelled.store(true, Ordering::Release);
+            }
+            self.evidence.clear();
+            self.next_probe_root = 0;
+            self.probe_roots = roots.to_vec();
+            if changed && self.running.load(Ordering::Acquire) {
+                // Removing a root also revokes an already running pass's old
+                // scope. Its normal chunk-boundary cancellation still applies.
+                self.stop.store(true, Ordering::Release);
+            }
+        }
+        if let Some(probe) = &self.probe {
+            let accept = !probe.cancelled.load(Ordering::Acquire);
+            for observation in probe.receive.try_iter() {
+                if accept && observation.fresh(now) && roots.contains(&observation.root) {
+                    self.evidence.insert(observation.root.clone(), observation);
+                }
+            }
+            // Joining an already-finished thread cannot wait on native I/O.
+            // Keep a blocked slot: repeatedly replacing it would leak workers.
+            if probe.worker.is_finished()
+                && let Some(probe) = self.probe.take()
+            {
+                if probe.worker.join().is_err() {
+                    eprintln!("[SBH-COMPRESS] root probe worker failed");
+                }
+                // A final observation can arrive between try_iter reporting
+                // empty and is_finished. Joining seals that publication race.
+                for observation in probe.receive.try_iter() {
+                    if accept && observation.fresh(now) && roots.contains(&observation.root) {
+                        self.evidence.insert(observation.root.clone(), observation);
+                    }
+                }
+            }
+        }
+        self.evidence
+            .retain(|_, observation| observation.fresh(now));
+    }
+
+    fn start_probe(&mut self, roots: &[PathBuf], platform: &Arc<dyn Platform>) {
+        if self.probe.is_some() || roots.is_empty() {
+            return;
+        }
+        let mut ordered = roots.to_vec();
+        let offset = self.next_probe_root % ordered.len();
+        ordered.rotate_left(offset);
+        ordered.truncate(ROOT_PROBE_LIMIT);
+        let (send, receive) = mpsc::sync_channel(ROOT_PROBE_LIMIT);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancelled);
+        let platform = Arc::clone(platform);
+        match std::thread::Builder::new()
+            .name("sbh-compress-roots".into())
+            .spawn(move || {
+                for root in ordered {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let observation = probe_root(root, platform.as_ref());
+                    if stop.load(Ordering::Acquire) || send.try_send(observation).is_err() {
+                        break;
+                    }
+                }
+            }) {
+            Ok(worker) => {
+                self.probe = Some(RootProbe {
+                    receive,
+                    cancelled,
+                    worker,
+                });
+            }
+            Err(error) => eprintln!("[SBH-COMPRESS] root probe thread failed to start: {error}"),
         }
     }
 
@@ -253,20 +433,56 @@ impl CompressTier {
         mount_levels: &HashMap<PathBuf, PressureLevel>,
         logger: &ActivityLoggerHandle,
     ) {
+        let scope = CompressionScope::from(config);
+        if self
+            .scope
+            .as_ref()
+            .is_some_and(|previous| previous != &scope)
+        {
+            self.stop_running_pass();
+            // An old pass may still finish discovery or cancellation. Give
+            // the new scope its own cursor so that late publication cannot
+            // skip work under the new roots or newly admitted policy.
+            self.resume_after = Arc::new(Mutex::new(None));
+        }
+        self.scope = Some(scope);
         self.first.update_levels(mount_levels);
+        if !config.compress.enabled {
+            self.stop_running_pass();
+        }
+        self.poll_probes(&config.compress.roots, now);
         let running = self.running.load(Ordering::Acquire);
         if due_start_level(&config.compress, running, self.last_start, now).is_none() {
             return;
         }
-        let statuses = root_statuses(
-            &config.compress.roots,
-            platform.as_ref(),
-            mount_levels,
-            &config.pressure,
-        );
+        let statuses: Vec<_> = config
+            .compress
+            .roots
+            .iter()
+            .filter_map(|root| self.evidence.get(root))
+            .map(|observation| observation.status(mount_levels, &config.pressure))
+            .collect();
         let roots = due_roots(&config.compress, &statuses, running, self.last_start, now);
         if roots.is_empty() {
+            if config
+                .compress
+                .roots
+                .iter()
+                .any(|root| !self.evidence.contains_key(root))
+            {
+                self.start_probe(&config.compress.roots, platform);
+            }
             return;
+        }
+        // If a later probe blocks, the ready prefix can still start. On the
+        // next cycle give roots beyond that prefix first access to the worker.
+        if let Some(index) = config
+            .compress
+            .roots
+            .iter()
+            .rposition(|root| roots.contains(root))
+        {
+            self.next_probe_root = (index + 1) % config.compress.roots.len();
         }
         self.last_start = Some(now);
         // No pass is running (due_roots checked), so no stop is pending.
@@ -336,8 +552,13 @@ impl CompressTier {
     /// changes (observe or fallback-safe mode, the kill switch, dry-run, the
     /// tier was switched off, or shutdown). It stops before its next file, or before
     /// the next chunk of the file it is rewriting, whose raw remainder a
-    /// later pass picks up. Does nothing when no pass is running.
+    /// later pass picks up. Also invalidates pending admission evidence, without
+    /// waiting for a blocked root probe or starting a replacement worker.
     pub fn stop_running_pass(&self) {
+        self.probes_invalidated.store(true, Ordering::Release);
+        if let Some(probe) = &self.probe {
+            probe.cancelled.store(true, Ordering::Release);
+        }
         if self.running.load(Ordering::Acquire) {
             if !self.stop.swap(true, Ordering::AcqRel) {
                 eprintln!("[SBH-COMPRESS] stopping the running pass");
@@ -361,45 +582,29 @@ impl Drop for RunningGuard {
     }
 }
 
-fn root_statuses(
-    roots: &[PathBuf],
-    platform: &dyn Platform,
-    mount_levels: &HashMap<PathBuf, PressureLevel>,
-    pressure: &PressureConfig,
-) -> Vec<RootStatus> {
-    roots
-        .iter()
-        .map(|root| {
-            let stats = platform.fs_stats(root).ok();
-            RootStatus {
-                root: root.clone(),
-                btrfs: stats.as_ref().is_some_and(|stats| stats.fs_type == "btrfs"),
-                level: stats
-                    .as_ref()
-                    .filter(|stats| !stats.is_readonly && stats.total_bytes > 0)
-                    .map(|stats| {
-                        // Compression roots are an independent opt-in. Requiring
-                        // a scanner controller here silently disabled this tier
-                        // on other volumes. Sample only the configured root and
-                        // keep its pressure out of global deletion policy.
-                        mount_levels
-                            .get(&stats.mount_point)
-                            .copied()
-                            .unwrap_or_else(|| {
-                                let [green, yellow, orange, red] =
-                                    pressure.free_pct_thresholds_for(stats.total_bytes);
-                                classify_level(stats.free_pct(), green, yellow, orange, red)
-                            })
-                    }),
-                mount_point: stats.as_ref().map(|stats| stats.mount_point.clone()),
-                device_id: stats
-                    .as_ref()
-                    .filter(|stats| stats.fs_type == "btrfs")
-                    .and_then(|_| identity_for_path(root, true).ok())
-                    .map(|identity| identity.device_id),
-            }
-        })
-        .collect()
+/// The only root admission path which performs filesystem I/O. It runs on
+/// the probe worker, never on the monitor or in cancellation/drop handling.
+fn probe_root(root: PathBuf, platform: &dyn Platform) -> RootEvidence {
+    let started = Instant::now();
+    let mut stats = platform.fs_stats(&root).ok();
+    let mut device_id = stats
+        .as_ref()
+        .filter(|stats| stats.fs_type == "btrfs")
+        .and_then(|_| identity_for_path(&root, true).ok())
+        .map(|identity| identity.device_id);
+    let completed_at = Instant::now();
+    if completed_at.saturating_duration_since(started) >= ROOT_PROBE_MAX_AGE {
+        // A fresh completion timestamp cannot refresh an old filesystem
+        // reading when a later identity lookup was stuck for a long time.
+        stats = None;
+        device_id = None;
+    }
+    RootEvidence {
+        root,
+        stats,
+        device_id,
+        completed_at,
+    }
 }
 
 /// One pass: discover, then apply to exactly what discovery selected.
@@ -585,6 +790,631 @@ fn summarize(report: &CompressionReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn root_statuses(
+        roots: &[PathBuf],
+        platform: &dyn Platform,
+        mount_levels: &HashMap<PathBuf, PressureLevel>,
+        pressure: &PressureConfig,
+    ) -> Vec<RootStatus> {
+        roots
+            .iter()
+            .map(|root| probe_root(root.clone(), platform).status(mount_levels, pressure))
+            .collect()
+    }
+
+    #[derive(Default)]
+    struct ProbeGate {
+        allowed: parking_lot::Mutex<HashSet<PathBuf>>,
+        all: AtomicBool,
+        changed: parking_lot::Condvar,
+    }
+
+    impl ProbeGate {
+        fn release(&self, path: &std::path::Path) {
+            self.allowed.lock().insert(path.to_path_buf());
+            self.changed.notify_all();
+        }
+
+        fn release_all(&self) {
+            let _guard = self.allowed.lock();
+            self.all.store(true, Ordering::Release);
+            self.changed.notify_all();
+        }
+
+        fn wait(&self, path: &std::path::Path) {
+            let mut allowed = self.allowed.lock();
+            while !self.all.load(Ordering::Acquire) && !allowed.contains(path) {
+                self.changed.wait(&mut allowed);
+            }
+        }
+    }
+
+    struct ControlledPlatform {
+        inner: crate::platform::pal::MockPlatform,
+        requests: mpsc::Sender<PathBuf>,
+        gate: Arc<ProbeGate>,
+    }
+
+    impl Platform for ControlledPlatform {
+        fn fs_stats(&self, path: &std::path::Path) -> crate::core::errors::Result<FsStats> {
+            let _ = self.requests.send(path.to_path_buf());
+            self.gate.wait(path);
+            self.inner.fs_stats(path)
+        }
+
+        fn mount_points(
+            &self,
+        ) -> crate::core::errors::Result<Vec<crate::platform::pal::MountPoint>> {
+            self.inner.mount_points()
+        }
+
+        fn is_ram_backed(&self, path: &std::path::Path) -> crate::core::errors::Result<bool> {
+            self.inner.is_ram_backed(path)
+        }
+
+        fn default_paths(&self) -> crate::platform::pal::PlatformPaths {
+            self.inner.default_paths()
+        }
+
+        fn memory_info(&self) -> crate::core::errors::Result<crate::platform::pal::MemoryInfo> {
+            self.inner.memory_info()
+        }
+
+        fn service_manager(&self) -> Box<dyn crate::platform::pal::ServiceManager> {
+            self.inner.service_manager()
+        }
+    }
+
+    struct ProbeFixture {
+        platform: Arc<dyn Platform>,
+        requests: mpsc::Receiver<PathBuf>,
+        gate: Arc<ProbeGate>,
+    }
+
+    impl ProbeFixture {
+        fn new(stats: Vec<FsStats>) -> Self {
+            let (send, requests) = mpsc::channel();
+            let gate = Arc::new(ProbeGate::default());
+            let platform = Arc::new(ControlledPlatform {
+                inner: mounted_platform(stats),
+                requests: send,
+                gate: Arc::clone(&gate),
+            });
+            Self {
+                platform,
+                requests,
+                gate,
+            }
+        }
+
+        fn requested(&self, root: &std::path::Path) {
+            assert_eq!(
+                self.requests.recv_timeout(Duration::from_secs(5)).unwrap(),
+                root
+            );
+        }
+
+        /// A separate caller and a bounded receive prove the monitor returned
+        /// while native probe I/O remains blocked, without a timing benchmark.
+        fn monitor(
+            &self,
+            mut tier: CompressTier,
+            work: impl FnOnce(&mut CompressTier) + Send + 'static,
+        ) -> CompressTier {
+            let (send, receive) = mpsc::sync_channel(1);
+            let caller = std::thread::spawn(move || {
+                work(&mut tier);
+                let _ = send.send(tier);
+            });
+            let result = receive.recv_timeout(Duration::from_secs(5));
+            if result.is_err() {
+                // A regression must fail the test rather than leave a native
+                // worker or the test caller blocked after its assertion.
+                self.gate.release_all();
+            }
+            caller.join().unwrap();
+            result.expect("monitor tick/stop waited for a blocked root probe")
+        }
+    }
+
+    impl Drop for ProbeFixture {
+        fn drop(&mut self) {
+            self.gate.release_all();
+        }
+    }
+
+    struct ProbeLogger {
+        handle: ActivityLoggerHandle,
+        join: Option<std::thread::JoinHandle<()>>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl ProbeLogger {
+        fn new() -> Self {
+            use crate::logger::dual::{DualLoggerConfig, spawn_logger};
+            use crate::logger::jsonl::JsonlConfig;
+
+            let directory = tempfile::tempdir().unwrap();
+            let (handle, join) = spawn_logger(DualLoggerConfig {
+                sqlite_path: None,
+                jsonl_config: JsonlConfig {
+                    path: directory.path().join("activity.jsonl"),
+                    fallback_path: None,
+                    max_size_bytes: 1024 * 1024,
+                    max_rotated_files: 1,
+                    fsync_interval_secs: 60,
+                },
+                channel_capacity: 32,
+                run_id: None,
+            })
+            .unwrap();
+            Self {
+                handle,
+                join: Some(join),
+                _directory: directory,
+            }
+        }
+    }
+
+    impl Drop for ProbeLogger {
+        fn drop(&mut self) {
+            self.handle.shutdown();
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    fn probe_config(roots: &[&str]) -> Config {
+        Config {
+            compress: CompressConfig {
+                roots: roots.iter().map(PathBuf::from).collect(),
+                ..enabled()
+            },
+            ..Config::default()
+        }
+    }
+
+    fn drain_finished_probe(tier: &mut CompressTier, roots: &[PathBuf]) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tier.probe.is_some() {
+            tier.poll_probes(roots, Instant::now());
+            assert!(Instant::now() < deadline, "released probe did not finish");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn blocked_root_io_never_blocks_ticks_stop_or_grows_a_worker_backlog() {
+        let root = PathBuf::from("/sbh-test-blocked-root/scratch");
+        let fixture = ProbeFixture::new(vec![volume("/sbh-test-blocked-root", "btrfs", 1000, 120)]);
+        let logger = ProbeLogger::new();
+        let config = probe_config(&["/sbh-test-blocked-root/scratch"]);
+        let initial = config.clone();
+        let platform = Arc::clone(&fixture.platform);
+        let handle = logger.handle.clone();
+        let tier = fixture.monitor(CompressTier::default(), move |tier| {
+            tier.tick(
+                Instant::now(),
+                &initial,
+                &platform,
+                &HashMap::new(),
+                &handle,
+            );
+        });
+        fixture.requested(&root);
+        let platform = Arc::clone(&fixture.platform);
+        let handle = logger.handle.clone();
+        let repeated = config.clone();
+        let mut tier = fixture.monitor(tier, move |tier| {
+            for _ in 0..32 {
+                tier.tick(
+                    Instant::now(),
+                    &repeated,
+                    &platform,
+                    &HashMap::new(),
+                    &handle,
+                );
+            }
+            tier.stop_running_pass();
+            for _ in 0..32 {
+                tier.tick(
+                    Instant::now(),
+                    &repeated,
+                    &platform,
+                    &HashMap::new(),
+                    &handle,
+                );
+            }
+        });
+        assert!(
+            fixture.requests.try_recv().is_err(),
+            "only one native query is outstanding"
+        );
+        assert!(tier.last_start.is_none());
+        assert!(!tier.running.load(Ordering::Acquire));
+        assert!(
+            tier.first.state.lock().holds.is_empty(),
+            "unknown roots cannot hold cleanup"
+        );
+        assert!(
+            tier.probe
+                .as_ref()
+                .unwrap()
+                .cancelled
+                .load(Ordering::Acquire)
+        );
+        fixture.gate.release_all();
+        drain_finished_probe(&mut tier, &config.compress.roots);
+        assert!(tier.evidence.is_empty(), "cancelled results remain invalid");
+    }
+
+    #[test]
+    fn scope_reload_cancels_old_work_and_discards_its_late_continuation() {
+        type ScopeChange = (&'static str, fn(&mut Config));
+        let cases: [ScopeChange; 11] = [
+            ("roots", |config| {
+                config.compress.roots = vec![PathBuf::from("/sbh-test-new-scope/scratch")];
+            }),
+            ("disabled", |config| config.compress.enabled = false),
+            ("feature consent", |config| {
+                config.compress.allow_zstd_feature = false;
+            }),
+            ("work policy", |config| {
+                config.compress.policy.min_age_secs *= 2;
+            }),
+            ("protected paths", |config| {
+                config
+                    .scanner
+                    .protected_paths
+                    .push("/newly-protected/**".into());
+            }),
+            ("configuration path", |config| {
+                config.paths.config_file = PathBuf::from("/new/config.toml");
+            }),
+            ("state and journal path", |config| {
+                config.paths.state_file = PathBuf::from("/new/state.json");
+            }),
+            ("database and sidecar paths", |config| {
+                config.paths.sqlite_db = PathBuf::from("/new/activity.sqlite3");
+            }),
+            ("activity log path", |config| {
+                config.paths.jsonl_log = PathBuf::from("/new/activity.jsonl");
+            }),
+            ("update cache path", |config| {
+                config.update.metadata_cache_file = PathBuf::from("/new/update.json");
+            }),
+            ("notification log path", |config| {
+                config.notifications.file.path = PathBuf::from("/new/notifications.jsonl");
+            }),
+        ];
+        let logger = ProbeLogger::new();
+        for (label, change) in cases {
+            let root = PathBuf::from("/sbh-test-scope/scratch");
+            let fixture = ProbeFixture::new(vec![volume("/sbh-test-scope", "btrfs", 1000, 120)]);
+            let config = probe_config(&["/sbh-test-scope/scratch"]);
+            let mut tier = CompressTier::default();
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &HashMap::new(),
+                &logger.handle,
+            );
+            fixture.requested(&root);
+            // Model an admitted worker's lifetime using the production guard.
+            // A later root's native probe remains blocked during the reload.
+            tier.running.store(true, Ordering::Release);
+            let guard = RunningGuard {
+                running: Arc::clone(&tier.running),
+                first: Arc::clone(&tier.first),
+            };
+            let old_cursor = Arc::clone(&tier.resume_after);
+            *old_cursor.lock().unwrap() = Some(root.join("already-visited"));
+            let mut reloaded = config.clone();
+            change(&mut reloaded);
+            tier.tick(
+                Instant::now(),
+                &reloaded,
+                &fixture.platform,
+                &HashMap::new(),
+                &logger.handle,
+            );
+            assert!(tier.stop.load(Ordering::Acquire), "{label}");
+            assert!(tier.running.load(Ordering::Acquire), "{label}");
+            assert!(!Arc::ptr_eq(&old_cursor, &tier.resume_after), "{label}");
+            // Restoring the old settings cannot revive work already revoked,
+            // replace a blocked native worker, or start another rewrite pass.
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &HashMap::new(),
+                &logger.handle,
+            );
+            assert!(tier.stop.load(Ordering::Acquire), "{label}");
+            assert!(tier.last_start.is_none(), "{label}");
+            assert!(fixture.requests.try_recv().is_err(), "{label}");
+            *old_cursor.lock().unwrap() = Some(root.join("late-old-policy-progress"));
+            drop(guard);
+            assert_eq!(*tier.resume_after.lock().unwrap(), None, "{label}");
+            fixture.gate.release_all();
+            drain_finished_probe(&mut tier, &config.compress.roots);
+            assert!(tier.evidence.is_empty(), "{label}");
+        }
+    }
+
+    #[test]
+    fn unrelated_reload_keeps_active_work_probe_evidence_and_continuation() {
+        let root = PathBuf::from("/sbh-test-unrelated-reload/scratch");
+        let fixture = ProbeFixture::new(vec![volume(
+            "/sbh-test-unrelated-reload",
+            "btrfs",
+            1000,
+            120,
+        )]);
+        let logger = ProbeLogger::new();
+        let mut config = probe_config(&["/sbh-test-unrelated-reload/scratch"]);
+        let mut tier = CompressTier::default();
+        tier.tick(
+            Instant::now(),
+            &config,
+            &fixture.platform,
+            &HashMap::new(),
+            &logger.handle,
+        );
+        fixture.requested(&root);
+        tier.running.store(true, Ordering::Release);
+        let guard = RunningGuard {
+            running: Arc::clone(&tier.running),
+            first: Arc::clone(&tier.first),
+        };
+        let cursor = Arc::clone(&tier.resume_after);
+        *cursor.lock().unwrap() = Some(root.join("progress"));
+        config.notifications.enabled = !config.notifications.enabled;
+        config.notifications.min_notify_interval_secs += 30;
+        config.dashboard.kill_switch = !config.dashboard.kill_switch;
+        tier.tick(
+            Instant::now(),
+            &config,
+            &fixture.platform,
+            &HashMap::new(),
+            &logger.handle,
+        );
+        assert!(!tier.stop.load(Ordering::Acquire));
+        assert!(tier.running.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(&cursor, &tier.resume_after));
+        assert_eq!(
+            *tier.resume_after.lock().unwrap(),
+            Some(root.join("progress"))
+        );
+        fixture.gate.release_all();
+        drain_finished_probe(&mut tier, &config.compress.roots);
+        assert!(tier.evidence.contains_key(&root));
+        drop(guard);
+        tier.stop_running_pass();
+    }
+
+    #[test]
+    fn removed_readded_and_reenabled_roots_cannot_accept_an_old_workers_result() {
+        for change_roots in [true, false] {
+            let root = PathBuf::from("/sbh-test-old-generation/scratch");
+            let fixture =
+                ProbeFixture::new(vec![volume("/sbh-test-old-generation", "btrfs", 1000, 120)]);
+            let logger = ProbeLogger::new();
+            let mut config = probe_config(&["/sbh-test-old-generation/scratch"]);
+            let mut tier = CompressTier::default();
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &HashMap::new(),
+                &logger.handle,
+            );
+            fixture.requested(&root);
+            if change_roots {
+                config.compress.roots = vec![PathBuf::from("/sbh-test-other-generation/scratch")];
+            } else {
+                config.compress.enabled = false;
+            }
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &HashMap::new(),
+                &logger.handle,
+            );
+            config.compress.roots = vec![root.clone()];
+            config.compress.enabled = true;
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &HashMap::new(),
+                &logger.handle,
+            );
+            assert!(
+                fixture.requests.try_recv().is_err(),
+                "a blocked slot is not replaced"
+            );
+            fixture.gate.release_all();
+            drain_finished_probe(&mut tier, &config.compress.roots);
+            assert!(
+                tier.evidence.is_empty(),
+                "the old generation was permanently revoked"
+            );
+            assert!(tier.last_start.is_none());
+
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &HashMap::new(),
+                &logger.handle,
+            );
+            fixture.requested(&root);
+            drain_finished_probe(&mut tier, &config.compress.roots);
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &HashMap::new(),
+                &logger.handle,
+            );
+            assert!(
+                tier.last_start.is_some(),
+                "a fresh valid root eventually starts a pass"
+            );
+            tier.stop_running_pass();
+        }
+    }
+
+    #[test]
+    fn delayed_probe_uses_live_controller_levels_at_admission() {
+        let root = PathBuf::from("/sbh-test-live-controller/scratch");
+        let mount = PathBuf::from("/sbh-test-live-controller");
+        let fixture =
+            ProbeFixture::new(vec![volume("/sbh-test-live-controller", "btrfs", 1000, 1)]);
+        let logger = ProbeLogger::new();
+        let config = probe_config(&["/sbh-test-live-controller/scratch"]);
+        let mut tier = CompressTier::default();
+        let critical = HashMap::from([(mount.clone(), PressureLevel::Critical)]);
+        tier.tick(
+            Instant::now(),
+            &config,
+            &fixture.platform,
+            &critical,
+            &logger.handle,
+        );
+        fixture.requested(&root);
+        fixture.gate.release_all();
+        drain_finished_probe(&mut tier, &config.compress.roots);
+        let green = HashMap::from([(mount.clone(), PressureLevel::Green)]);
+        tier.tick(
+            Instant::now(),
+            &config,
+            &fixture.platform,
+            &green,
+            &logger.handle,
+        );
+        assert!(
+            tier.last_start.is_none(),
+            "the earlier Critical sample is not admission authority"
+        );
+        assert!(
+            fixture.requests.try_recv().is_err(),
+            "fresh observations need no repeated I/O"
+        );
+        let yellow = HashMap::from([(mount, PressureLevel::Yellow)]);
+        tier.tick(
+            Instant::now(),
+            &config,
+            &fixture.platform,
+            &yellow,
+            &logger.handle,
+        );
+        assert!(tier.last_start.is_some());
+        tier.stop_running_pass();
+    }
+
+    #[test]
+    fn expired_and_disabled_completed_snapshots_need_new_admission_evidence() {
+        for disable in [false, true] {
+            let root = PathBuf::from("/sbh-test-expiring-root/scratch");
+            let fixture =
+                ProbeFixture::new(vec![volume("/sbh-test-expiring-root", "btrfs", 1000, 500)]);
+            let logger = ProbeLogger::new();
+            let config = probe_config(&["/sbh-test-expiring-root/scratch"]);
+            let mut tier = CompressTier::default();
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &HashMap::new(),
+                &logger.handle,
+            );
+            fixture.requested(&root);
+            fixture.gate.release_all();
+            drain_finished_probe(&mut tier, &config.compress.roots);
+            let completed = tier.evidence[&root].completed_at;
+            let now = if disable {
+                tier.stop_running_pass();
+                Instant::now()
+            } else {
+                completed + ROOT_PROBE_MAX_AGE
+            };
+            let levels = HashMap::from([(
+                PathBuf::from("/sbh-test-expiring-root"),
+                PressureLevel::Critical,
+            )]);
+            tier.tick(now, &config, &fixture.platform, &levels, &logger.handle);
+            assert!(
+                tier.last_start.is_none(),
+                "old snapshots cannot authorize a pass"
+            );
+            fixture.requested(&root);
+            tier.stop_running_pass();
+            drain_finished_probe(&mut tier, &config.compress.roots);
+        }
+    }
+
+    #[test]
+    fn a_ready_root_runs_while_a_later_root_is_blocked_and_rotates_the_next_probe() {
+        let first = PathBuf::from("/sbh-test-probe-first/scratch");
+        let second = PathBuf::from("/sbh-test-probe-second/scratch");
+        let fixture = ProbeFixture::new(vec![
+            volume("/sbh-test-probe-first", "btrfs", 1000, 120),
+            volume("/sbh-test-probe-second", "btrfs", 1000, 120),
+        ]);
+        let logger = ProbeLogger::new();
+        let config = probe_config(&[
+            "/sbh-test-probe-first/scratch",
+            "/sbh-test-probe-second/scratch",
+        ]);
+        let mut tier = CompressTier::default();
+        tier.tick(
+            Instant::now(),
+            &config,
+            &fixture.platform,
+            &HashMap::new(),
+            &logger.handle,
+        );
+        fixture.requested(&first);
+        fixture.gate.release(&first);
+        fixture.requested(&second);
+        tier.tick(
+            Instant::now(),
+            &config,
+            &fixture.platform,
+            &HashMap::new(),
+            &logger.handle,
+        );
+        let started = tier
+            .last_start
+            .expect("the ready root starts despite a later blocked probe");
+        assert!(tier.probe.is_some());
+        assert_eq!(tier.next_probe_root, 1);
+        fixture.gate.release_all();
+        drain_finished_probe(&mut tier, &config.compress.roots);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tier.running.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "empty pass did not finish");
+            std::thread::yield_now();
+        }
+        let due = started + Duration::from_mins(config.compress.interval_minutes);
+        tier.tick(
+            due,
+            &config,
+            &fixture.platform,
+            &HashMap::new(),
+            &logger.handle,
+        );
+        fixture.requested(&second);
+        fixture.requested(&first);
+        tier.stop_running_pass();
+        drain_finished_probe(&mut tier, &config.compress.roots);
+    }
 
     #[test]
     fn first_chance_is_per_device_bounded_and_does_not_repeat_within_an_episode() {

@@ -87,6 +87,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Compression admission cannot block the monitoring loop** (bd-rxq5).
+  Filesystem and device probes now run on a single bounded background worker.
+  Ready roots can start while a later probe is blocked; evidence expires after
+  60 seconds, and unknown roots cannot delay cleanup. A stuck native call keeps
+  its worker slot without preventing monitoring or spawning replacement threads.
+  Reloading compression settings, protected paths, or control-file locations
+  cancels old work and admission evidence; old discovery progress cannot leak
+  into the new scope. Unrelated UI and notification changes retain active work.
 - **Relocation honors opt-outs and excluded caches throughout a selected tree.**
   A nested `relocatable = false` marker or excluded component now vetoes its
   enclosing units while leaving safe siblings eligible. Ancestor opt-outs,
