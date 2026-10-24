@@ -2,13 +2,13 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 use serde::Serialize;
 use storage_ballast_helper::relocate::SCHEMA;
 use storage_ballast_helper::relocate::config::{DEFAULT_CONFIG_PATH, RelocationConfig};
-use storage_ballast_helper::relocate::ledger::Ledger;
+use storage_ballast_helper::relocate::ledger::{Ledger, WriterLock};
 use storage_ballast_helper::relocate::plan::{self, Candidate, Plan, Verdict};
 
 /// The `relocate` subcommand.
@@ -60,10 +60,87 @@ struct Report<'a> {
     marked_trees: usize,
     entries: u64,
     truncated: bool,
+    observation_save: ObservationSave,
     totals: BTreeMap<&'static str, (usize, u64)>,
     candidates: Vec<&'a Candidate>,
     #[cfg(target_os = "linux")]
     outcomes: Vec<storage_ballast_helper::relocate::execute::Outcome>,
+}
+
+#[derive(Debug, Serialize)]
+struct ObservationSave {
+    saved: bool,
+    reason: Option<String>,
+}
+
+/// One coherent ledger snapshot. A report may proceed without a writer lock
+/// or usable history, but must then remain read-only for its whole lifetime.
+struct LedgerSession {
+    ledger: Ledger,
+    _lock: Option<WriterLock>,
+    write_blocker: Option<String>,
+}
+
+impl LedgerSession {
+    fn open(state_dir: &Path, apply: bool) -> Result<Self, (i32, String)> {
+        let (lock, mut write_blocker) = match WriterLock::acquire(state_dir) {
+            Ok(lock) => (Some(lock), None),
+            Err(error) => {
+                let busy = error.kind() == io::ErrorKind::WouldBlock;
+                let reason = if busy {
+                    "another relocation is updating the ledger".to_string()
+                } else {
+                    format!("cannot lock the relocation ledger: {error}")
+                };
+                if apply {
+                    return Err((if busy { 3 } else { 1 }, reason));
+                }
+                (None, Some(reason))
+            }
+        };
+        // Only a genuinely absent file is a new ledger. If existing history
+        // cannot be read, reporting uses no historical evidence and cannot
+        // replace it; apply refuses before planning or starting a transfer.
+        let ledger = match Ledger::load(state_dir) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                let reason = format!(
+                    "cannot read the relocation ledger; existing state was preserved and historical observations are unavailable: {error}"
+                );
+                if apply {
+                    return Err((1, reason));
+                }
+                write_blocker = Some(reason);
+                Ledger::default()
+            }
+        };
+        Ok(Self {
+            ledger,
+            _lock: lock,
+            write_blocker,
+        })
+    }
+
+    fn save_observations(&self, state_dir: &Path) -> ObservationSave {
+        let result = self.write_blocker.as_ref().map_or_else(
+            || {
+                self.ledger
+                    .save(state_dir)
+                    .map_err(|error| format!("cannot durably save the relocation ledger: {error}"))
+            },
+            |reason| Err(reason.clone()),
+        );
+        match result {
+            Ok(()) => ObservationSave {
+                saved: true,
+                reason: None,
+            },
+            Err(reason) => ObservationSave {
+                saved: false,
+                reason: Some(reason),
+            },
+        }
+    }
 }
 
 fn verdict_key(verdict: &Verdict) -> &'static str {
@@ -132,19 +209,6 @@ pub fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
         eprintln!("sbh relocate: {problem}");
         return Ok(Some(1));
     }
-    #[cfg(target_os = "linux")]
-    let _lock = if apply {
-        match lock(&config) {
-            Ok(lock) => Some(lock),
-            Err(error) => {
-                eprintln!("sbh relocate: another relocation is running ({error})");
-                return Ok(Some(3));
-            }
-        }
-    } else {
-        None
-    };
-
     let now = match command.get_one::<i64>("assume_now") {
         Some(_) if config.state_dir == RelocationConfig::default().state_dir => {
             eprintln!("sbh relocate: --assume-now needs a config with its own state_dir");
@@ -153,16 +217,32 @@ pub fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
         Some(assumed) => *assumed,
         None => chrono::Utc::now().timestamp(),
     };
-    let mut ledger = Ledger::load(&config.state_dir).unwrap_or_default();
+    // The same lock covers reports, disabled --apply sweeps, and active
+    // transfers, from before the load until after the final completion save.
+    let mut session = match LedgerSession::open(&config.state_dir, apply) {
+        Ok(session) => session,
+        Err((code, reason)) => {
+            eprintln!("sbh relocate: {reason}");
+            return Ok(Some(code));
+        }
+    };
     let platform = storage_ballast_helper::platform::current();
-    let plan = plan::build_plan(&config, &platform, &mut ledger, now);
-    // Observations accumulate on every run that may write the state dir; a
-    // report from an unprivileged shell simply records nothing.
-    let ledger_saved = ledger.save(&config.state_dir).is_ok();
+    let plan = plan::build_plan(&config, &platform, &mut session.ledger, now);
+    let observation_save = session.save_observations(&config.state_dir);
+    if apply && !observation_save.saved {
+        eprintln!(
+            "sbh relocate: {}; no transfer started",
+            observation_save
+                .reason
+                .as_deref()
+                .unwrap_or("ledger save failed")
+        );
+        return Ok(Some(1));
+    }
 
     #[cfg(target_os = "linux")]
     let outcomes = if apply {
-        execute(&config, &platform, &mut ledger, &plan, now)
+        execute(&config, &platform, &mut session.ledger, &plan, now)
     } else {
         Vec::new()
     };
@@ -182,6 +262,7 @@ pub fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
         marked_trees: plan.marked_trees,
         entries: plan.entries,
         truncated: plan.truncated,
+        observation_save,
         totals: totals(&plan),
         candidates,
         #[cfg(target_os = "linux")]
@@ -192,7 +273,7 @@ pub fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
         serde_json::to_writer_pretty(&mut out, &report)?;
         writeln!(out)?;
     } else {
-        write_human(&mut out, &report, &plan, ledger_saved)?;
+        write_human(&mut out, &report, &plan)?;
     }
     out.flush()?;
     #[cfg(target_os = "linux")]
@@ -256,18 +337,6 @@ fn apply_blocker(config: &RelocationConfig) -> Option<String> {
         return Some(format!("no target; set target in {DEFAULT_CONFIG_PATH}"));
     }
     None
-}
-
-#[cfg(target_os = "linux")]
-fn lock(config: &RelocationConfig) -> io::Result<nix::fcntl::Flock<std::fs::File>> {
-    std::fs::create_dir_all(&config.state_dir)?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(config.state_dir.join("relocate.lock"))?;
-    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-        .map_err(|(_, errno)| io::Error::from(errno))
 }
 
 #[cfg(target_os = "linux")]
@@ -340,12 +409,7 @@ fn restore(stub: &std::path::Path, json: bool) -> i32 {
     }
 }
 
-fn write_human(
-    out: &mut impl Write,
-    report: &Report<'_>,
-    plan: &Plan,
-    ledger_saved: bool,
-) -> io::Result<()> {
+fn write_human(out: &mut impl Write, report: &Report<'_>, plan: &Plan) -> io::Result<()> {
     writeln!(
         out,
         "sbh relocate: {} marked trees, {} units >= min_bytes, {} entries walked{}",
@@ -369,10 +433,17 @@ fn write_human(
             "report only"
         }
     )?;
-    if !ledger_saved {
+    if report.observation_save.saved {
+        writeln!(out, "  observations saved")?;
+    } else {
         writeln!(
             out,
-            "  (ledger not writable here: this run recorded no observations)"
+            "  observations not saved: {}",
+            report
+                .observation_save
+                .reason
+                .as_deref()
+                .unwrap_or("ledger unavailable")
         )?;
     }
     for (key, (count, bytes)) in &report.totals {
@@ -397,4 +468,151 @@ fn write_human(
         )?;
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use storage_ballast_helper::relocate::ledger::LEDGER_FILENAME;
+
+    #[test]
+    fn concurrent_report_cannot_overwrite_newer_transfer_state_even_after_unlock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active = WriterLock::acquire(tmp.path()).unwrap();
+        let mut current = Ledger::default();
+        current
+            .in_progress
+            .insert(PathBuf::from("/tmp/first"), "backup:first/".into());
+        current.save(tmp.path()).unwrap();
+
+        let mut report = LedgerSession::open(tmp.path(), false).unwrap();
+        assert_eq!(
+            report.ledger, current,
+            "report can read the current snapshot"
+        );
+        report
+            .ledger
+            .observe(Path::new("/tmp/observed"), 1, true, 10, 20);
+        // The writer advances while the report holds its earlier snapshot.
+        current
+            .in_progress
+            .insert(PathBuf::from("/tmp/second"), "backup:second/".into());
+        current.save(tmp.path()).unwrap();
+        let saved_bytes = fs::read(tmp.path().join(LEDGER_FILENAME)).unwrap();
+        drop(active);
+
+        let status = report.save_observations(tmp.path());
+        assert!(!status.saved);
+        assert!(status.reason.unwrap().contains("another relocation"));
+        assert_eq!(
+            fs::read(tmp.path().join(LEDGER_FILENAME)).unwrap(),
+            saved_bytes
+        );
+        assert_eq!(Ledger::load(tmp.path()).unwrap(), current);
+    }
+
+    #[test]
+    fn a_report_writer_blocks_apply_until_its_last_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut report = LedgerSession::open(tmp.path(), false).unwrap();
+        report
+            .ledger
+            .observe(Path::new("/tmp/observed"), 1, true, 10, 20);
+        let (code, reason) = LedgerSession::open(tmp.path(), true).err().unwrap();
+        assert_eq!(code, 3);
+        assert!(reason.contains("another relocation"));
+        assert!(report.save_observations(tmp.path()).saved);
+        drop(report);
+
+        let apply = LedgerSession::open(tmp.path(), true).unwrap();
+        assert!(
+            apply
+                .ledger
+                .observations
+                .contains_key(Path::new("/tmp/observed"))
+        );
+    }
+
+    #[test]
+    fn corrupt_history_is_preserved_by_reports_and_refused_by_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(LEDGER_FILENAME);
+        let corrupt = b"{\"in_progress\": {\"/tmp/valuable\": \"backup:";
+        fs::write(&path, corrupt).unwrap();
+        let mut report = LedgerSession::open(tmp.path(), false).unwrap();
+        assert_eq!(report.ledger, Ledger::default());
+        report
+            .ledger
+            .observe(Path::new("/tmp/new"), 1, true, 10, 20);
+        let status = report.save_observations(tmp.path());
+        assert!(!status.saved);
+        assert!(
+            status
+                .reason
+                .unwrap()
+                .contains("historical observations are unavailable")
+        );
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
+        drop(report);
+
+        let (code, reason) = LedgerSession::open(tmp.path(), true).err().unwrap();
+        assert_eq!(code, 1);
+        assert!(reason.contains("existing state was preserved"));
+        assert_eq!(fs::read(path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn inaccessible_state_remains_read_only_for_reports_and_blocks_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Deterministic access failure even when this test runs as root.
+        let state = tmp.path().join("state");
+        fs::write(&state, b"existing state path").unwrap();
+        let report = LedgerSession::open(&state, false).unwrap();
+        assert!(!report.save_observations(&state).saved);
+        assert_eq!(fs::read(&state).unwrap(), b"existing state path");
+        assert_eq!(LedgerSession::open(&state, true).err().unwrap().0, 1);
+    }
+
+    #[test]
+    fn report_exposes_observation_save_status_in_json_and_human_output() {
+        let plan = Plan {
+            marked_trees: 0,
+            candidates: Vec::new(),
+            entries: 0,
+            truncated: false,
+        };
+        let report = Report {
+            schema: SCHEMA,
+            config: None,
+            min_idle_days: 14,
+            target: None,
+            enabled: false,
+            marked_trees: 0,
+            entries: 0,
+            truncated: false,
+            observation_save: ObservationSave {
+                saved: false,
+                reason: Some("another relocation is updating the ledger".into()),
+            },
+            totals: BTreeMap::new(),
+            candidates: Vec::new(),
+            #[cfg(target_os = "linux")]
+            outcomes: Vec::new(),
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["observation_save"]["saved"], false);
+        assert_eq!(
+            json["observation_save"]["reason"],
+            "another relocation is updating the ledger"
+        );
+        let mut human = Vec::new();
+        write_human(&mut human, &report, &plan).unwrap();
+        assert!(
+            String::from_utf8(human)
+                .unwrap()
+                .contains("observations not saved: another relocation is updating the ledger")
+        );
+    }
 }

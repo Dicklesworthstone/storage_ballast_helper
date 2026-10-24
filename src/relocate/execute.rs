@@ -11,7 +11,8 @@
 //!    rename is undone and the unit stays.
 //! 6. Put a stub at the original path (RELOCATED.md, the record, and the
 //!    marker when the unit was the marked tree itself).
-//! 7. Remove the renamed tree.
+//! 7. Durably save the completed relocation in the ledger.
+//! 8. Remove the renamed tree.
 //!
 //! Every remote operation is an rsync, so a key restricted with `rrsync` to
 //! one directory on the target is enough.
@@ -315,6 +316,9 @@ fn holder(platform: &dyn Platform, path: &Path) -> Option<String> {
 }
 
 /// Relocate one selected candidate. `stamp` names this run.
+///
+/// The caller must hold the ledger's [`super::ledger::WriterLock`] from
+/// before loading it until this operation and its completion save finish.
 pub fn relocate(
     config: &RelocationConfig,
     platform: &dyn Platform,
@@ -536,18 +540,31 @@ fn relocate_with_hooks(
         return undo("stub", error.to_string());
     }
 
-    ledger.in_progress.remove(&path);
-    ledger.observations.remove(&path);
-    ledger.relocations.push(RelocationEntry {
+    // Keep resumable state in memory until the completion is durable. If
+    // saving fails, a later candidate must not persist this as completed.
+    let mut completed = ledger.clone();
+    completed.in_progress.remove(&path);
+    completed.observations.remove(&path);
+    completed.relocations.push(RelocationEntry {
         path: path.clone(),
         destination: destination.clone(),
         bytes: snapshot.bytes,
         files: snapshot.files,
         relocated_at: now,
     });
-    let saved = ledger.save(&config.state_dir);
-    // The copy is verified and the stub is in place; only now may the
-    // original bytes go.
+    if let Err(error) = completed.save(&config.state_dir) {
+        return fail(
+            "ledger",
+            format!(
+                "completion could not be durably saved: {error}; original tree preserved at {}; verified copy at {destination}; restore stub at {}. Repair the ledger before continuing; no original bytes were removed",
+                aside.display(),
+                path.display()
+            ),
+        );
+    }
+    *ledger = completed;
+    // The copy is verified, the stub is in place and the completion is
+    // durable; only now may the original bytes go.
     if let Some(hook) = hooks.before_remove {
         hook(&aside);
     }
@@ -560,12 +577,6 @@ fn relocate_with_hooks(
                 "relocated, but {} could not be removed: {error}",
                 aside.display()
             ),
-        );
-    }
-    if let Err(error) = saved {
-        return fail(
-            "ledger",
-            format!("relocated, but the ledger was not saved: {error}"),
         );
     }
     Outcome::Relocated {
@@ -761,6 +772,63 @@ mod tests {
             fs::metadata(unit.join("top")).unwrap().ino(),
             fs::metadata(unit.join("a/top-link")).unwrap().ino()
         );
+    }
+
+    #[test]
+    fn failed_completion_save_preserves_original_backup_stub_and_resume_state() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        if !sees_every_process(&unit) {
+            return;
+        }
+        let config = local_config(tmp.path());
+        let _lock = super::super::ledger::WriterLock::acquire(&config.state_dir).unwrap();
+        let preserved_state = tmp.path().join("preserved-state");
+        // The transfer and its resumable destination have already been saved.
+        // Now make the state path unwritable without relying on uid or chmod.
+        let lose_state_directory = |_: &Path| {
+            fs::rename(&config.state_dir, &preserved_state).unwrap();
+            fs::write(&config.state_dir, b"state directory unavailable").unwrap();
+        };
+        let mut ledger = Ledger::default();
+        let outcome = relocate_with_hooks(
+            &config,
+            &crate::platform::current(),
+            &mut ledger,
+            &candidate_for(&unit),
+            "S",
+            1_000,
+            &Hooks {
+                after_rename: Some(&lose_state_directory),
+                ..Hooks::default()
+            },
+        );
+        let aside = sibling(&unit, "sbh-relocating").unwrap();
+        let record: RelocationRecord =
+            serde_json::from_slice(&fs::read(unit.join(RECORD_FILENAME)).unwrap()).unwrap();
+        let copy = PathBuf::from(record.destination.trim_end_matches('/'));
+        assert!(
+            matches!(&outcome, Outcome::Failed { stage, error, .. }
+                if stage == "ledger"
+                    && error.contains("no original bytes were removed")
+                    && error.contains(&aside.display().to_string())
+                    && error.contains(&record.destination)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            fs::read(aside.join("a/b/data")).unwrap(),
+            vec![7u8; 300_000]
+        );
+        assert_eq!(fs::read(copy.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+        assert!(unit.join(README_FILENAME).is_file());
+        assert!(unit.join(MARKER_FILENAME).is_file());
+        assert_eq!(ledger.in_progress.get(&unit), Some(&record.destination));
+        assert!(ledger.relocations.is_empty());
+        assert_eq!(Ledger::load(&preserved_state).unwrap(), ledger);
     }
 
     #[test]

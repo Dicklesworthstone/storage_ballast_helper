@@ -87,6 +87,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Relocation reports preserve concurrent transfers and recovery history.**
+  Reports and apply runs now share one writer lock across the full ledger
+  load/observe/save cycle. Busy or unwritable reports remain useful and expose
+  explicit observation-save status; corrupt or unreadable history is preserved
+  and blocks applying. Ledger saves use private, exclusively created staging
+  files and synchronize both the file and containing directory. Completion
+  persistence must succeed before source removal: a failure retains the original
+  tree, verified backup, and restore stub and reports their recovery locations.
 - **Configured compression roots work on volumes outside deletion scanning**
   (bd-rxq5). Such roots previously had no controller pressure level and never
   started a daemon pass. The tier now samples their own free space using the

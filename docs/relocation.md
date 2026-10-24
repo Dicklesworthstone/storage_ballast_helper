@@ -29,7 +29,8 @@ When a whole marked tree is eligible, it moves as one unit. Otherwise, dormant c
 4. Rename the unit aside, so a writer that opens by path fails instead of writing into a tree that is about to go.
 5. Survey it and sweep processes again. If anything changed or holds it, the rename is undone.
 6. Put a stub at the original path: `RELOCATED.md`, `.sbh-relocated.json`, and the marker if the unit was the marked tree.
-7. Only then remove the original bytes.
+7. Durably save the completed relocation in the ledger.
+8. Only then remove the original bytes.
 
 Nothing is deleted before the copy verifies. To bring a tree back:
 
@@ -38,6 +39,8 @@ sudo sbh relocate --restore /dev/shm/old-scratch
 ```
 
 This copies the tree back next to the stub, verifies it, swaps it in, and keeps the backup copy.
+
+If the completion ledger cannot be saved, the command reports failure and keeps all three recovery locations: the original tree at `.<name>.sbh-relocating`, the verified backup, and the restore stub. The error names those paths. Repair the state directory or ledger before continuing; the preserved original is not automatically removed.
 
 ## Configuration: `/etc/sbh/relocation.toml`
 
@@ -69,11 +72,15 @@ command="/usr/bin/rrsync /bulk/sbh-relocated/<host>",restrict ssh-ed25519 AAAAâ€
 
 ## Running it
 
-- `sbh relocate` prints a report: a total per verdict, and the units that are selected.
+- `sbh relocate` prints a report: a total per verdict, the units that are selected, and whether this run saved its observations.
 - `sbh relocate --all --json` lists every unit with its evidence.
 - `sudo sbh relocate --apply` relocates the selected units. It is limited by `max_bytes_per_run`, holds a lock, and logs one JSON line per unit to stderr.
 
-The ledger is `relocation-ledger.json` in `state_dir` (`/var/lib/sbh`). A run that cannot write it, such as an unprivileged report, records no observations.
+The ledger is `relocation-ledger.json` in `state_dir` (`/var/lib/sbh`). Every writer, including report-only sweeps and disabled `--apply` runs, holds the same `relocate.lock` from before reading the ledger through its last save. Each save uses a private, exclusively created staging file, syncs the file, atomically replaces the ledger, then syncs the state directory.
+
+A report that cannot acquire the writer lock or write the state directory remains useful and records no observations. It cannot overwrite a running transfer's resumable destination or newer history, even if that transfer finishes while the report is scanning. JSON reports expose `observation_save.saved` and `observation_save.reason`; human reports print the same status.
+
+A missing ledger starts a new observation window. A corrupt or unreadable existing ledger is preserved. Reports can still survey the trees, but use no unavailable historical observations and do not save over the damaged state; noatime trees cannot qualify from missing history. `--apply` refuses an unreadable ledger, unavailable writer lock, or failed observation save before starting any transfer. Lock contention exits with status 3; other initial state failures exit with status 1.
 
 A timer that runs every 6 hours keeps the ledger's observations continuous:
 
