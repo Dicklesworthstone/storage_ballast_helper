@@ -2630,6 +2630,8 @@ impl PendingScannerEvents {
         mut fresh: EventInvalidation,
         configured_roots: &[PathBuf],
     ) -> EventInvalidation {
+        const MAX_PENDING_SCOPES_PER_ROOT: usize = 64;
+
         if let Some(pending) = self.invalidation.take() {
             fresh.merge(pending);
         }
@@ -2638,7 +2640,6 @@ impl PendingScannerEvents {
         // Deferred roots may accumulate many independent project changes.
         // Collapse that backlog to its configured root instead of growing it
         // indefinitely while pressure keeps selecting another filesystem.
-        const MAX_PENDING_SCOPES_PER_ROOT: usize = 64;
         for root in configured_roots {
             if self
                 .reconciliation

@@ -719,7 +719,9 @@ pub struct DueRoot {
 }
 
 /// Revocable authority for the protection exception carried by a target-only
-/// batch. The root and scanner settings are those that admitted its survey;
+/// batch.
+///
+/// The root and scanner settings are those that admitted its survey;
 /// an old worker cannot acquire new authority from a later configuration.
 #[derive(Debug, Clone)]
 pub struct TargetOnlyConsent {
