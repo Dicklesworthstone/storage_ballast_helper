@@ -87,6 +87,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Relocation honors opt-outs and excluded caches throughout a selected tree.**
+  A nested `relocatable = false` marker or excluded component now vetoes its
+  enclosing units while leaving safe siblings eligible. Ancestor opt-outs,
+  overlapping roots, and protection below `unit_depth` are checked explicitly;
+  malformed or unsafe markers cannot grant permission. Apply renews protection
+  before copy, after rename, and at source removal, using fresh file and process
+  evidence at the final boundary. Late refusals preserve the original data and
+  report the verified copy and restore-stub locations for recovery.
 - **Relocation reports preserve concurrent transfers and recovery history.**
   Reports and apply runs now share one writer lock across the full ledger
   load/observe/save cycle. Busy or unwritable reports remain useful and expose

@@ -14,6 +14,10 @@
 //! 7. Durably save the completed relocation in the ledger.
 //! 8. Remove the renamed tree.
 //!
+//! Relocation permission is renewed before copying, after renaming, and
+//! immediately before removing the original. A new ancestor or descendant
+//! opt-out, excluded component, or uncertain policy observation stops the move.
+//!
 //! Every remote operation is an rsync, so a key restricted with `rrsync` to
 //! one directory on the target is enough.
 
@@ -393,20 +397,19 @@ fn relocate_with_hooks(
     let host = hostname();
 
     // Re-check right before acting: the plan may be minutes old.
+    let before = match plan::check_relocation_policy(config, &path, &path) {
+        Ok(survey) => survey,
+        Err(error) => {
+            return fail(
+                "precheck",
+                format!("relocation policy refuses the move: {error}"),
+            );
+        }
+    };
     if let Some(reason) = holder(platform, &path) {
         return fail("precheck", format!("in use: {reason}"));
     }
-    let snapshot = match survey::survey_tree(&path, 0, config.max_entries) {
-        Ok(survey)
-            if !survey.truncated
-                && !survey.units[0].unreadable
-                && !survey.units[0].crosses_mount =>
-        {
-            survey.units[0].clone()
-        }
-        Ok(_) => return fail("precheck", "tree is no longer fully readable".into()),
-        Err(error) => return fail("precheck", error.to_string()),
-    };
+    let snapshot = before.units[0].clone();
     if snapshot.newest_change != candidate.stats.newest_change {
         return fail("precheck", "tree changed since it was planned".into());
     }
@@ -502,10 +505,10 @@ fn relocate_with_hooks(
     if let Some(hook) = hooks.after_rename {
         hook(&path);
     }
-    match survey::survey_tree(&aside, 0, config.max_entries) {
+    match plan::check_relocation_policy(config, &path, &aside) {
         Ok(after) if postcheck_matches(&snapshot, &after) => {}
         Ok(_) => return undo("postcheck", "tree changed during the copy".into()),
-        Err(error) => return undo("postcheck", error.to_string()),
+        Err(error) => return undo("postcheck", format!("relocation policy changed: {error}")),
     }
     let aside_identity = match fs::symlink_metadata(&aside) {
         Ok(metadata) => metadata,
@@ -567,6 +570,34 @@ fn relocate_with_hooks(
     // durable; only now may the original bytes go.
     if let Some(hook) = hooks.before_remove {
         hook(&aside);
+    }
+    let refuse_removal = |reason: String| {
+        fail(
+            "remove",
+            format!(
+                "{reason}; original tree preserved at {}; earlier verified copy at {destination}; restore stub at {}; no original bytes were removed",
+                aside.display(),
+                path.display()
+            ),
+        )
+    };
+    match plan::check_relocation_policy(config, &path, &aside) {
+        Ok(current) if postcheck_matches(&snapshot, &current) => {}
+        Ok(_) => {
+            return refuse_removal(
+                "tree changed after verification; preserved source may contain newer data than the backup".into(),
+            );
+        }
+        Err(error) => {
+            return refuse_removal(format!(
+                "relocation policy no longer permits removal: {error}"
+            ));
+        }
+    }
+    // A policy walk may be large. Its current content evidence and a holder
+    // sweep after that walk must both pass at the final removal boundary.
+    if let Some(reason) = holder(platform, &aside) {
+        return refuse_removal(format!("in use before removal: {reason}"));
     }
     // Descriptor-relative, no symlinks followed, and refusing any other
     // mount (openat2 NO_XDEV): the deletion executor's own removal.
@@ -705,6 +736,7 @@ mod tests {
             enabled: true,
             target: Some(root.join("bulk").display().to_string()),
             state_dir: root.join("state"),
+            roots: vec![root.join("scratch")],
             ..RelocationConfig::default()
         }
     }
@@ -829,6 +861,271 @@ mod tests {
         assert_eq!(ledger.in_progress.get(&unit), Some(&record.destination));
         assert!(ledger.relocations.is_empty());
         assert_eq!(Ledger::load(&preserved_state).unwrap(), ledger);
+    }
+
+    #[test]
+    fn ancestor_opt_out_after_planning_refuses_before_any_transfer_or_ledger_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        let config = local_config(tmp.path());
+        let candidate = candidate_for(&unit);
+        // This is outside the selected unit: its own metadata and payload
+        // have not changed, so the ordinary tree snapshot cannot catch it.
+        let marker = unit.parent().unwrap().join(MARKER_FILENAME);
+        fs::write(&marker, "relocatable = false\n").unwrap();
+        let mut ledger = Ledger::default();
+        let outcome = relocate(
+            &config,
+            &crate::platform::pal::MockPlatform::healthy(),
+            &mut ledger,
+            &candidate,
+            "S",
+            1_000,
+        );
+        assert!(
+            matches!(&outcome, Outcome::Failed { stage, error, .. }
+                if stage == "precheck"
+                    && error.contains("relocatable = false")
+                    && error.contains(&marker.display().to_string())),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+        assert!(!tmp.path().join("bulk").exists());
+        assert!(!config.state_dir.exists());
+        assert_eq!(ledger, Ledger::default());
+    }
+
+    #[test]
+    fn ancestor_opt_out_after_rename_undoes_the_move_and_preserves_verified_copy() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        if !sees_every_process(&unit) {
+            return;
+        }
+        let config = local_config(tmp.path());
+        let _lock = super::super::ledger::WriterLock::acquire(&config.state_dir).unwrap();
+        let marker = unit.parent().unwrap().join(MARKER_FILENAME);
+        let opt_out = |_: &Path| {
+            fs::write(&marker, "relocatable = false\n").unwrap();
+        };
+        let mut ledger = Ledger::default();
+        let outcome = relocate_with_hooks(
+            &config,
+            &crate::platform::current(),
+            &mut ledger,
+            &candidate_for(&unit),
+            "S",
+            1_000,
+            &Hooks {
+                after_rename: Some(&opt_out),
+                ..Hooks::default()
+            },
+        );
+        assert!(
+            matches!(&outcome, Outcome::Failed { stage, error, .. }
+                if stage == "postcheck"
+                    && error.contains("relocatable = false")
+                    && error.contains(&marker.display().to_string())),
+            "{outcome:?}"
+        );
+        let destination = ledger.in_progress.get(&unit).expect("resumable copy");
+        let copy = PathBuf::from(destination.trim_end_matches('/'));
+        assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+        assert_eq!(fs::read(copy.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+        assert!(!sibling(&unit, "sbh-relocating").unwrap().exists());
+        assert!(
+            !unit.join(RECORD_FILENAME).exists(),
+            "no stub was installed"
+        );
+        assert!(ledger.relocations.is_empty());
+        assert_eq!(Ledger::load(&config.state_dir).unwrap(), ledger);
+    }
+
+    #[test]
+    fn late_ancestor_or_descendant_opt_out_preserves_original_copy_and_stub() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        for ancestor in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            if !sees_every_process(&unit) {
+                return;
+            }
+            let config = local_config(tmp.path());
+            let _lock = super::super::ledger::WriterLock::acquire(&config.state_dir).unwrap();
+            let opt_out = |aside: &Path| {
+                let marker = if ancestor {
+                    unit.parent().unwrap().join(MARKER_FILENAME)
+                } else {
+                    aside.join("a").join(MARKER_FILENAME)
+                };
+                fs::write(marker, "relocatable = false\n").unwrap();
+            };
+            let mut ledger = Ledger::default();
+            let outcome = relocate_with_hooks(
+                &config,
+                &crate::platform::current(),
+                &mut ledger,
+                &candidate_for(&unit),
+                "S",
+                1_000,
+                &Hooks {
+                    before_remove: Some(&opt_out),
+                    ..Hooks::default()
+                },
+            );
+            let aside = sibling(&unit, "sbh-relocating").unwrap();
+            assert!(
+                matches!(&outcome, Outcome::Failed { stage, error, .. }
+                    if stage == "remove"
+                        && error.contains("relocatable = false")
+                        && error.contains("no original bytes were removed")
+                        && error.contains(&aside.display().to_string())
+                        && error.contains(&unit.display().to_string())),
+                "ancestor={ancestor}: {outcome:?}"
+            );
+            let record: RelocationRecord =
+                serde_json::from_slice(&fs::read(unit.join(RECORD_FILENAME)).unwrap()).unwrap();
+            let copy = PathBuf::from(record.destination.trim_end_matches('/'));
+            assert_eq!(
+                fs::read(aside.join("a/b/data")).unwrap(),
+                vec![7u8; 300_000]
+            );
+            assert_eq!(fs::read(copy.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+            assert!(unit.join(README_FILENAME).is_file());
+            assert!(unit.join(MARKER_FILENAME).is_file());
+            assert!(matches!(&outcome, Outcome::Failed { error, .. }
+                if error.contains(&record.destination)));
+            // Completion was saved before the final guard; its copy/stub
+            // record remains true, while failed removal is explicit.
+            assert_eq!(ledger.relocations.len(), 1);
+            assert!(ledger.in_progress.is_empty());
+            assert_eq!(Ledger::load(&config.state_dir).unwrap(), ledger);
+        }
+    }
+
+    #[test]
+    fn content_changed_after_postcheck_preserves_new_source_and_earlier_backup() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        if !sees_every_process(&unit) {
+            return;
+        }
+        let config = local_config(tmp.path());
+        let _lock = super::super::ledger::WriterLock::acquire(&config.state_dir).unwrap();
+        let new_work = |aside: &Path| {
+            fs::write(aside.join("a/b/data"), b"new work after verification").unwrap();
+            // A new entry makes the changed tree unambiguous even when the
+            // fixture and hook run within one filesystem timestamp second.
+            fs::write(aside.join("late-output"), b"also preserve this").unwrap();
+        };
+        let mut ledger = Ledger::default();
+        let outcome = relocate_with_hooks(
+            &config,
+            &crate::platform::current(),
+            &mut ledger,
+            &candidate_for(&unit),
+            "S",
+            1_000,
+            &Hooks {
+                before_remove: Some(&new_work),
+                ..Hooks::default()
+            },
+        );
+        let aside = sibling(&unit, "sbh-relocating").unwrap();
+        assert!(
+            matches!(&outcome, Outcome::Failed { stage, error, .. }
+                if stage == "remove"
+                    && error.contains("tree changed after verification")
+                    && error.contains("preserved source may contain newer data")
+                    && error.contains("no original bytes were removed")
+                    && error.contains(&aside.display().to_string())),
+            "{outcome:?}"
+        );
+        let record: RelocationRecord =
+            serde_json::from_slice(&fs::read(unit.join(RECORD_FILENAME)).unwrap()).unwrap();
+        let copy = PathBuf::from(record.destination.trim_end_matches('/'));
+        assert_eq!(
+            fs::read(aside.join("a/b/data")).unwrap(),
+            b"new work after verification"
+        );
+        assert_eq!(
+            fs::read(aside.join("late-output")).unwrap(),
+            b"also preserve this"
+        );
+        assert_eq!(fs::read(copy.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+        assert!(!copy.join("late-output").exists());
+        assert!(unit.join(README_FILENAME).is_file());
+        assert!(matches!(&outcome, Outcome::Failed { error, .. }
+            if error.contains(&record.destination)
+                && error.contains(&unit.display().to_string())));
+    }
+
+    #[test]
+    fn regular_file_opened_after_postcheck_refuses_removal_with_all_copies_intact() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        if !sees_every_process(&unit) {
+            return;
+        }
+        let config = local_config(tmp.path());
+        let _lock = super::super::ledger::WriterLock::acquire(&config.state_dir).unwrap();
+        let held = std::cell::RefCell::new(None);
+        let open_after_postcheck = |aside: &Path| {
+            // Opening an existing regular file changes no content metadata.
+            // The fresh process sweep, not the tree comparison, must veto it.
+            *held.borrow_mut() = Some(fs::File::open(aside.join("a/b/data")).unwrap());
+        };
+        let mut ledger = Ledger::default();
+        let outcome = relocate_with_hooks(
+            &config,
+            &crate::platform::current(),
+            &mut ledger,
+            &candidate_for(&unit),
+            "S",
+            1_000,
+            &Hooks {
+                before_remove: Some(&open_after_postcheck),
+                ..Hooks::default()
+            },
+        );
+        let aside = sibling(&unit, "sbh-relocating").unwrap();
+        assert!(
+            matches!(&outcome, Outcome::Failed { stage, error, .. }
+                if stage == "remove"
+                    && error.contains("in use before removal")
+                    && error.contains("open file descriptor")
+                    && error.contains("no original bytes were removed")
+                    && error.contains(&aside.display().to_string())),
+            "{outcome:?}"
+        );
+        assert!(held.borrow().is_some());
+        let record: RelocationRecord =
+            serde_json::from_slice(&fs::read(unit.join(RECORD_FILENAME)).unwrap()).unwrap();
+        let copy = PathBuf::from(record.destination.trim_end_matches('/'));
+        assert_eq!(
+            fs::read(aside.join("a/b/data")).unwrap(),
+            vec![7u8; 300_000]
+        );
+        assert_eq!(fs::read(copy.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+        assert!(unit.join(README_FILENAME).is_file());
+        assert!(matches!(&outcome, Outcome::Failed { error, .. }
+            if error.contains(&record.destination)
+                && error.contains(&unit.display().to_string())));
     }
 
     #[test]
