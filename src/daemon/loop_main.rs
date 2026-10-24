@@ -5546,10 +5546,27 @@ impl MonitoringDaemon {
             self.release_controller
                 .observe_level(&mount, replenish_level);
 
+            // The tick's behavior mode follows the worst mount, but a release
+            // frees space only on this mount's own volume. Release here only
+            // from a level whose matrix cell releases ballast, or when the
+            // predictive policy names this mount in imminent danger (as the
+            // Green safety net below does). Otherwise a mount idle at Yellow
+            // beside an Orange one released the file it had just refilled on
+            // the next tick, and refilled it again after each cooldown (#38).
+            let release_here = release_ballast
+                && (behavior_should_release_ballast(
+                    self.behavior_state
+                        .table()
+                        .mode_for(self.behavior_state.memory_level, tick.response.level),
+                ) || matches!(
+                    &self.last_predictive_action,
+                    PredictiveAction::ImminentDanger { mount: danger, .. } if *danger == mount
+                ));
+
             let mut files_released = 0;
             match decision.state {
                 MountState::Reclaim => {
-                    if decision.release_ballast && release_ballast {
+                    if decision.release_ballast && release_here {
                         files_released = self.release_ballast(&mount, &tick.response).unwrap_or(0);
                         self.last_tick_cleanup_ran = true;
                     }
@@ -11713,6 +11730,159 @@ mod tests {
             2
         );
         assert_eq!(available(&daemon), 0);
+
+        daemon.logger_handle.shutdown();
+        if let Some(logger) = daemon.logger_join.take() {
+            logger.join().unwrap();
+        }
+    }
+
+    /// GitHub #38: the behavior mode follows the worst mount, so a mount idle
+    /// at Yellow beside an Orange one released its reserve, including a file
+    /// it had just refilled, although its own level releases nothing and the
+    /// release frees nothing on the Orange volume. Each mount releases only
+    /// from its own level, or when the predictive policy names it.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ballast_release_follows_each_mounts_own_level() {
+        use crate::core::config::PathsConfig;
+        use crate::platform::pal::{FsStats, MemoryInfo, MountPoint, PlatformPaths};
+
+        let directory = tempfile::tempdir().unwrap();
+        // Both mock mounts live in the temp dir: no real reserve directory
+        // (/root, /home/*, /var/lib/sbh) resolves to either of them.
+        let yellow = directory.path().join("mnt-yellow");
+        let orange = directory.path().join("mnt-orange");
+        for mount in [&yellow, &orange] {
+            std::fs::create_dir_all(mount.join("project")).unwrap();
+        }
+        let mut config = Config::with_paths(PathsConfig {
+            config_file: yellow.join("config.toml"),
+            ballast_dir: yellow.join("ballast"),
+            state_file: yellow.join("state.json"),
+            sqlite_db: yellow.join("activity.sqlite3"),
+            jsonl_log: yellow.join("activity.jsonl"),
+        });
+        config.scanner.root_paths = vec![yellow.join("project"), orange.join("project")];
+        config.ballast.auto_provision = false;
+        config.ballast.file_count = 2;
+        config.ballast.file_size_bytes = 8192;
+        config.notifications.enabled = false;
+
+        let stats = |mount: &Path, available_bytes: u64| FsStats {
+            total_bytes: 1_000_000_000_000,
+            free_bytes: available_bytes,
+            available_bytes,
+            fs_type: "mockfs".to_string(),
+            mount_point: mount.to_path_buf(),
+            is_readonly: false,
+        };
+        let mut platform = MockPlatform::new(
+            vec![
+                MountPoint {
+                    path: yellow.clone(),
+                    device: "mockdev-yellow".to_string(),
+                    fs_type: "mockfs".to_string(),
+                    is_ram_backed: false,
+                },
+                MountPoint {
+                    path: orange.clone(),
+                    device: "mockdev-orange".to_string(),
+                    fs_type: "mockfs".to_string(),
+                    is_ram_backed: false,
+                },
+            ],
+            HashMap::from([
+                (yellow.clone(), stats(&yellow, 155_000_000_000)),
+                (orange.clone(), stats(&orange, 120_000_000_000)),
+            ]),
+            MemoryInfo {
+                total_bytes: 64 << 30,
+                available_bytes: 32 << 30,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            },
+            PlatformPaths::default(),
+        )
+        .with_home(directory.path())
+        .with_temp_dirs(Vec::new())
+        .with_cache_roots(Vec::new());
+        // MockPlatform reports no blocks unless told: 8192-byte files are 16.
+        for pool in [yellow.join("ballast"), orange.join(".sbh/ballast")] {
+            for index in 1..=2 {
+                platform = platform
+                    .with_block_count(pool.join(format!("SBH_BALLAST_FILE_{index:05}.dat")), 16);
+            }
+        }
+        let platform = Arc::new(platform);
+        let mut daemon = MonitoringDaemon::init_with_platform(
+            config,
+            &DaemonArgs::default(),
+            Arc::clone(&platform) as Arc<dyn Platform>,
+        )
+        .unwrap();
+        let available = |daemon: &MonitoringDaemon, mount: &Path| {
+            daemon
+                .ballast_coordinator
+                .pool_for_mount(mount)
+                .map_or(0, crate::ballast::coordinator::BallastPool::available_count)
+        };
+        assert_eq!(
+            (available(&daemon, &yellow), available(&daemon, &orange)),
+            (0, 0),
+            "only the fixture's own files may be visible to its pools"
+        );
+        daemon.ballast_coordinator.set_provision_floor(0.0);
+        let provisioned = daemon
+            .ballast_coordinator
+            .provision_all(platform.as_ref())
+            .unwrap();
+        assert_eq!(provisioned.total_files_created(), 4, "{provisioned:?}");
+
+        // Default v0.6 matrix, normal memory: Orange releases, Yellow does
+        // not. The worst mount is Orange, so the tick's mode releases.
+        daemon.behavior_state = PressureBehaviorState::new(
+            behavior_table_from_config(&daemon.config),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Orange,
+        );
+        let tick = |mount: &Path, level: PressureLevel, free_pct: f64| {
+            let mut tick = quarantine_tick(level, mount);
+            tick.response.free_pct = free_pct;
+            tick
+        };
+        let worst = tick(&orange, PressureLevel::Orange, 12.0);
+        let response = worst.response.clone();
+        let (scan_tx, scan_rx) = crossbeam_channel::bounded(16);
+        let (del_tx, _del_rx) = crossbeam_channel::bounded(16);
+
+        daemon.mount_responses = vec![tick(&yellow, PressureLevel::Yellow, 15.5), worst.clone()];
+        daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(
+            available(&daemon, &yellow),
+            2,
+            "a Yellow mount keeps its reserve while another mount is Orange"
+        );
+        assert_eq!(
+            available(&daemon, &orange),
+            0,
+            "the Orange mount releases its own reserve (urgency 0.7 asks for three)"
+        );
+
+        // A mount the predictive policy names in imminent danger still
+        // releases while another mount sets the tick's mode.
+        daemon.last_predictive_action = PredictiveAction::ImminentDanger {
+            mount: yellow.clone(),
+            minutes_remaining: 3.0,
+            critical: false,
+        };
+        daemon.mount_responses = vec![tick(&yellow, PressureLevel::Yellow, 15.5), worst];
+        daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+        assert!(
+            available(&daemon, &yellow) < 2,
+            "the mount in imminent danger releases ballast"
+        );
 
         daemon.logger_handle.shutdown();
         if let Some(logger) = daemon.logger_join.take() {
