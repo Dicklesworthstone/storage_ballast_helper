@@ -2040,7 +2040,7 @@ mod tests {
         structural_score,
     };
     use crate::platform::{linux, macos};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn darwin_user_temp_dir_is_a_temp_root() {
