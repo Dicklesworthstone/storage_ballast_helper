@@ -413,6 +413,7 @@ For non-interactive environments (CI, automation), `sbh install --auto` applies 
 | `sbh scan` | Manual candidate discovery and scoring report |
 | `sbh clean` | Manual cleanup with confirmation/dry-run |
 | `sbh undo` | Restore quarantined entries (`<decision-id>`, `--path`, `--all-since`, `--list`) |
+| `sbh relocate` | Report dormant protected scratch, apply verified backup relocation, or restore a relocated tree ([guide](docs/relocation.md)) |
 | `sbh emergency` | Zero-write recovery mode on critically full disks |
 
 ### Ballast and Protection
@@ -1449,11 +1450,19 @@ Source: `src/daemon/loop_main.rs`
 ### RAM-Backed Scratch Preflight
 
 On Linux, `sbh check /tmp --need 5G` also checks current host RAM-scratch
-pressure when the path is on tmpfs or ramfs. Plenty of free tmpfs blocks does
-not establish swap headroom. A complete warning exits as a pressure condition,
-incomplete evidence as a partial success ([Exit Codes](#exit-codes)). JSON
-includes the fresh `ram_scratch` report. Disk-backed checks skip
-the host collection, and the check does not authorize cleanup or relocation.
+pressure when the path is on tmpfs or ramfs. A positive explicit `--need`
+additionally compares the requested bytes with host `MemAvailable` and every
+finite `memory.high` or `memory.max` boundary in the caller's visible cgroup-v2
+ancestry. Each boundary uses its own scope's current charge. A large tmpfs size
+limit or healthy host cannot hide a smaller process allowance.
+
+The byte comparison adds no percentage reserve and does not count swap as RAM.
+It distinguishes throttling boundaries from hard limits. A known shortfall
+exits 1; incomplete evidence exits 4 ([Exit Codes](#exit-codes)). JSON includes
+the fresh `ram_scratch` report and a separate `ram_write_admission` with the
+requested bytes, observed headroom, and limiting scope. A successful check is a
+current observation, not a memory reservation. Disk-backed checks skip the RAM
+collection, and the check does not authorize cleanup or relocation.
 Use `sbh check --ram-scratch` for the fuller report and top-entry attribution.
 See [RAM-scratch headroom](docs/ram-scratch.md) for the warning rules and limits.
 
@@ -1479,6 +1488,20 @@ reflinks/shared blocks prevent a reclaimable-space promise. Missing transcripts,
 limited process visibility, changed trees, and exhausted scan budgets remain
 explicit uncertainty. See [the inventory guide](docs/agent-scratch.md) for roots,
 limits, JSON fields, and exit statuses.
+
+### Restoring Relocated Scratch
+
+On Linux, `sbh relocate --restore /absolute/path/to/stub` copies the backup into
+a private directory unique to the attempt, verifies it, and installs it at the
+original path. The opened payload directory pins rsync's destination even if a
+parent or staging pathname moves. Concurrent restores of the same stub refuse
+immediately; changed records, replaced stubs, and newly occupied original paths
+stop the swap while preserving the available recovery trees.
+
+The backup and previous stub are retained after success. Human and JSON output
+name the saved stub, including files written there since relocation. Refused or
+interrupted transfers retain their staging for recovery. See [relocation and
+restore](docs/relocation.md) for recovery locations and evidence limits.
 
 ### Lossless Reclaim Before Cleanup
 

@@ -18,8 +18,8 @@ use parking_lot::RwLock;
 use crate::core::errors::{Result, SbhError};
 #[cfg(target_os = "linux")]
 use crate::platform::pal::{
-    BlockDeviceInfo, FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
-    verify_preallocated_blocks,
+    BlockDeviceInfo, FsStats, MemoryHeadroom, MemoryInfo, MountPoint, Platform, PlatformPaths,
+    ServiceManager, verify_preallocated_blocks,
 };
 #[cfg(target_os = "linux")]
 use crate::platform::sacred_catalog::cross_platform_sacred_paths;
@@ -148,6 +148,12 @@ impl Platform for LinuxPal {
     fn ram_write_memory_refusal(&self, minimum_available_percent: u8) -> Result<Option<String>> {
         cgroup::ram_write_refusal(minimum_available_percent).map_err(|error| {
             PalError::method_failed("linux", "ram_write_memory_refusal", error.to_string()).into()
+        })
+    }
+
+    fn ram_write_headroom(&self) -> Result<Option<MemoryHeadroom>> {
+        cgroup::ram_write_headroom().map_err(|error| {
+            PalError::method_failed("linux", "ram_write_headroom", error.to_string()).into()
         })
     }
 

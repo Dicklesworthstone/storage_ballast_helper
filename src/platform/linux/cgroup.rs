@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use rustix::fs::{Mode, OFlags, fstatfs, open, openat};
 
+use crate::platform::pal::{MemoryBoundaryKind, MemoryHeadroom};
+
 pub(super) mod pressure;
 
 const MEMBERSHIP: &str = "/proc/self/cgroup";
@@ -187,6 +189,36 @@ pub fn ram_write_refusal(percent: u8) -> io::Result<Option<String>> {
     refusal_with(&Native, percent)
 }
 
+/// Tightest observed finite RAM boundary across this process's visible ancestry.
+///
+/// This uses the same bounded, stable hierarchy observation as RAM logging,
+/// but adds no percentage reserve and never treats swap as a RAM allowance.
+pub fn ram_write_headroom() -> io::Result<Option<MemoryHeadroom>> {
+    headroom_with(&Native)
+}
+
+fn headroom_with(access: &impl Access) -> io::Result<Option<MemoryHeadroom>> {
+    Ok(inspect(access, false)?
+        .into_iter()
+        .filter_map(|constraint| {
+            let boundary_kind = match constraint.field {
+                "memory.high" => MemoryBoundaryKind::Throttle,
+                "memory.max" => MemoryBoundaryKind::HardLimit,
+                // Swap is independently constrained and is never necessary
+                // to fit a byte request which already fits observed RAM.
+                _ => return None,
+            };
+            Some(MemoryHeadroom {
+                scope: constraint.scope,
+                boundary: constraint.field,
+                boundary_kind,
+                current_bytes: constraint.used,
+                limit_bytes: constraint.limit,
+            })
+        })
+        .min_by_key(MemoryHeadroom::available_bytes))
+}
+
 fn refusal_with(access: &impl Access, percent: u8) -> io::Result<Option<String>> {
     if !(1..=100).contains(&percent) {
         return Err(io::Error::new(
@@ -194,7 +226,7 @@ fn refusal_with(access: &impl Access, percent: u8) -> io::Result<Option<String>>
             "invalid memory headroom percentage",
         ));
     }
-    Ok(inspect(access)?
+    Ok(inspect(access, true)?
         .into_iter()
         .find(|limit| limit.refuses(percent))
         .map(|limit| {
@@ -209,7 +241,7 @@ fn refusal_with(access: &impl Access, percent: u8) -> io::Result<Option<String>>
         }))
 }
 
-fn inspect(access: &impl Access) -> io::Result<Vec<Constraint>> {
+fn inspect(access: &impl Access, include_swap: bool) -> io::Result<Vec<Constraint>> {
     let mut observation = Observation::new(access);
     let membership = observation.read(Path::new(MEMBERSHIP), MEMBERSHIP_BYTES, Source::Proc)?;
     let member = membership_path(&membership)?;
@@ -228,7 +260,13 @@ fn inspect(access: &impl Access) -> io::Result<Vec<Constraint>> {
         if depth >= MAX_ANCESTORS || !scope.starts_with(&mount) {
             return Err(invalid("cgroup ancestry exceeded its observation boundary"));
         }
-        observe_scope(&mut observation, scope, &mount, &mut constraints)?;
+        observe_scope(
+            &mut observation,
+            scope,
+            &mount,
+            &mut constraints,
+            include_swap,
+        )?;
         if scope == mount {
             reached_root = true;
             break;
@@ -255,6 +293,7 @@ fn observe_scope(
     scope: &Path,
     mount: &Path,
     constraints: &mut Vec<Constraint>,
+    include_swap: bool,
 ) -> io::Result<()> {
     let current = observation.optional(&scope.join("memory.current"), SCALAR_BYTES)?;
     let high = observation.optional(&scope.join("memory.high"), SCALAR_BYTES)?;
@@ -302,6 +341,9 @@ fn observe_scope(
                 limit,
             });
         }
+    }
+    if !include_swap {
+        return Ok(());
     }
     let swap_current = observation.optional(&scope.join("memory.swap.current"), SCALAR_BYTES)?;
     let swap_max = observation.optional(&scope.join("memory.swap.max"), SCALAR_BYTES)?;
@@ -609,6 +651,122 @@ mod tests {
     }
 
     #[test]
+    fn byte_headroom_uses_the_tightest_ancestors_own_charge() {
+        let mut fixture = Fixture::default();
+        fixture.put(MEMBERSHIP, b"0::/service/child\n");
+        fixture.scope("/cg/service/child", 10, b"max\n", b"1000\n");
+        fixture.scope("/cg/service", 951, b"max\n", b"1000\n");
+        let headroom = headroom_with(&fixture).unwrap().unwrap();
+        assert_eq!(headroom.scope, Path::new("/cg/service"));
+        assert_eq!(headroom.boundary, "memory.max");
+        assert_eq!(headroom.boundary_kind, MemoryBoundaryKind::HardLimit);
+        assert_eq!(headroom.current_bytes, 951);
+        assert_eq!(headroom.available_bytes(), 49);
+        assert!(fixture.calls("/cg/service/child/memory.max") >= 2);
+        assert!(fixture.calls("/cg/service/memory.max") >= 2);
+    }
+
+    #[test]
+    fn byte_headroom_preserves_throttle_kind_without_a_percentage_reserve() {
+        let mut fixture = Fixture::default();
+        fixture.scope("/cg/service", 99, b"100\n", b"1000\n");
+        let headroom = headroom_with(&fixture).unwrap().unwrap();
+        assert_eq!(headroom.boundary, "memory.high");
+        assert_eq!(headroom.boundary_kind, MemoryBoundaryKind::Throttle);
+        assert_eq!(headroom.available_bytes(), 1);
+        assert!(
+            refusal_with(&fixture, 10).unwrap().is_some(),
+            "log policy stays independent"
+        );
+    }
+
+    #[test]
+    fn byte_headroom_neither_adds_nor_requires_swap() {
+        for (used, max) in [(0, 0), (100, 100), (0, u64::MAX)] {
+            let mut fixture = Fixture::default();
+            fixture.scope("/cg/service", 900, b"max\n", b"1000\n");
+            fixture.swap("/cg/service", used, format!("{max}\n").as_bytes());
+            // Byte admission needs only RAM boundaries, even if independent
+            // swap counters cannot be inspected at all.
+            fixture.denied = Some("/cg/service/memory.swap.current".into());
+            assert_eq!(
+                headroom_with(&fixture).unwrap().unwrap().available_bytes(),
+                100
+            );
+            assert_eq!(fixture.calls("/cg/service/memory.swap.current"), 0);
+            assert_eq!(fixture.calls("/cg/service/memory.swap.max"), 0);
+            assert!(
+                refusal_with(&fixture, 10).is_err(),
+                "log swap policy is unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn byte_headroom_distinguishes_unlimited_zero_and_over_limit() {
+        let mut fixture = Fixture::default();
+        assert!(headroom_with(&fixture).unwrap().is_none());
+        for (used, limit) in [(0, 0), (101, 100), (u64::MAX, 1)] {
+            fixture.scope(
+                "/cg/service",
+                used,
+                b"max\n",
+                format!("{limit}\n").as_bytes(),
+            );
+            assert_eq!(
+                headroom_with(&fixture).unwrap().unwrap().available_bytes(),
+                0
+            );
+        }
+        fixture.denied = Some("/cg/service/memory.max".into());
+        assert!(headroom_with(&fixture).is_err());
+    }
+
+    #[test]
+    fn byte_headroom_uses_later_higher_usage_and_refuses_changed_boundaries() {
+        let mut fixture = Fixture::default();
+        fixture.scope("/cg/service", 10, b"max\n", b"100\n");
+        fixture.replacement = Some(("/cg/service/memory.current".into(), 2, b"99\n".to_vec()));
+        assert_eq!(
+            headroom_with(&fixture).unwrap().unwrap().available_bytes(),
+            1
+        );
+
+        for (path, replacement) in [
+            ("/cg/service/memory.max", b"200\n".as_slice()),
+            ("/cg/service/memory.high", b"50\n"),
+            (MEMBERSHIP, b"0::/other\n"),
+            (MOUNTS, b"37 25 0:32 / /cg rw - cgroup2 cgroup rw\n"),
+        ] {
+            let mut fixture = Fixture::default();
+            fixture.scope("/cg/service", 10, b"max\n", b"100\n");
+            fixture.replacement = Some((path.into(), 2, replacement.to_vec()));
+            assert!(headroom_with(&fixture).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn byte_headroom_requires_complete_ancestry_within_the_shared_deadline() {
+        let mut fixture = Fixture::default();
+        fixture.put(MEMBERSHIP, b"0::/service/child\n");
+        fixture.scope("/cg/service/child", 100, b"max\n", b"100\n");
+        fixture.denied = Some("/cg/service/memory.max".into());
+        assert!(
+            headroom_with(&fixture).is_err(),
+            "leaf shortfall does not certify complete ancestry"
+        );
+
+        let fixture = Fixture {
+            step: Duration::from_millis(50),
+            ..Fixture::default()
+        };
+        assert_eq!(
+            headroom_with(&fixture).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
     fn ancestor_usage_is_compared_to_its_own_limit_not_child_usage() {
         let mut fixture = Fixture::default();
         fixture.put(MEMBERSHIP, b"0::/service/child\n");
@@ -828,7 +986,7 @@ mod tests {
     #[test]
     fn deadline_counts_the_first_and_last_read_without_renewal() {
         let baseline = Fixture::default();
-        inspect(&baseline).unwrap();
+        inspect(&baseline, true).unwrap();
         let calls: usize = baseline.reads.borrow().values().sum();
         let step = SCAN_TIME / u32::try_from(calls).unwrap() + Duration::from_nanos(1);
         let fixture = Fixture {
@@ -836,7 +994,7 @@ mod tests {
             ..Fixture::default()
         };
         assert_eq!(
-            inspect(&fixture).unwrap_err().kind(),
+            inspect(&fixture, true).unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
         let fixture = Fixture {
@@ -844,7 +1002,7 @@ mod tests {
             ..Fixture::default()
         };
         assert_eq!(
-            inspect(&fixture).unwrap_err().kind(),
+            inspect(&fixture, true).unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
         assert_eq!(fixture.calls(MEMBERSHIP), 1);
@@ -861,7 +1019,7 @@ mod tests {
                 _ => SCALAR_BYTES,
             };
             fixture.put(field, &vec![b'x'; size + 1]);
-            assert!(inspect(&fixture).is_err(), "{field}");
+            assert!(inspect(&fixture, true).is_err(), "{field}");
         }
         let mut fixture = Fixture::default();
         let mut member = String::new();
@@ -870,7 +1028,7 @@ mod tests {
             fixture.scope(&format!("/cg{member}"), 0, b"max\n", b"max\n");
         }
         fixture.put(MEMBERSHIP, format!("0::{member}\n").as_bytes());
-        assert!(inspect(&fixture).is_err());
+        assert!(inspect(&fixture, true).is_err());
     }
 
     #[test]

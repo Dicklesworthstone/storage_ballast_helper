@@ -32,17 +32,58 @@ The same warning predicates described below apply. A complete warning exits 1
 with reason `ram_scratch_pressure`; missing, inaccessible, or bounded-out
 evidence exits 4 with reason `ram_scratch_incomplete`. A disappeared target
 mount or unmeasurable ramfs occupancy is incomplete, never healthy. JSON includes
-the fresh `ram_scratch` report; a complete healthy RAM-backed check exits 0 and
-remains silent in human mode. `--allow-unprotected` applies only to the daemon's
-reclaim capability and does not bypass this host assessment.
+the fresh `ram_scratch` report. `--allow-unprotected` applies only to the daemon's
+reclaim capability and does not bypass the RAM checks.
+
+A **positive explicit `--need`** on Linux tmpfs or ramfs additionally checks the
+requested bytes against a fresh host `MemAvailable` reading and every finite
+`memory.high` / `memory.max` boundary in the caller's visible cgroup-v2 ancestry.
+Each ancestor uses its **own** `memory.current`; the tightest observed remaining
+headroom wins. A healthy host and a large tmpfs size limit cannot override a
+small process or ancestor allowance. This comparison uses the requested byte
+count directly, with no additional percentage reserve. Swap is neither added to
+available RAM nor required to accommodate the request; disabled or exhausted
+cgroup swap alone does not reject otherwise adequate RAM headroom.
+
+`memory.high` is a reclaim/throttling boundary, while `memory.max` is a hard
+limit. The report distinguishes them. Observed headroom is the nonnegative
+difference between the boundary and the scope's current charge; it does not
+assume that charged pages can be reclaimed. Exceeding it exits 1 with reason
+`ram_write_headroom`. Unreadable, unstable, malformed or bounded-out memory
+evidence exits 4 with reason `ram_write_admission_incomplete`. Incomplete evidence
+from either RAM check takes precedence over a known warning, and both reports
+remain available. A complete healthy RAM-backed check exits 0 and remains silent
+in human mode.
+
+JSON adds `ram_write_admission` separately from the host `ram_scratch` report:
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | `sbh.ram_write_admission.v1` |
+| `requested_bytes` | The positive explicit `--need` value |
+| `host_available_bytes` | Fresh host `MemAvailable`, or null if unavailable/inconsistent |
+| `process_boundary` | Tightest finite visible boundary, or null; includes `scope`, `boundary`, `boundary_kind` (`throttle` or `hard_limit`), `current_bytes` and `limit_bytes` |
+| `observed_headroom_bytes` | Minimum of host availability and observed process headroom; null when evidence is incomplete |
+| `limiting_factor` | `host_available`, `process_boundary`, or null when incomplete |
+| `complete`, `issues`, `exit_code` | Evidence status, details and this admission result |
+| `read_only`, `scope` | Observation-only contract and coverage |
+
+A null `process_boundary` means no finite boundary was observed only when
+`complete` is true. An unreadable hierarchy also produces null, with `complete`
+false and a reported issue. No request, `--need 0`, and disk-backed targets do not
+perform this additional memory-headroom query; their `ram_write_admission` is
+null where the field is emitted.
 
 This preflight reads host counters and process status files, with a cooperative
 10-second deadline, at most 16,384 processes and 256 RAM-backed mount paths.
 It does not walk scratch directories, consult an old daemon warning, delete or
-relocate files, or raise a mount's daemon pressure level. `--need` still describes
-filesystem free space: a successful check is not a memory reservation or proof
-of cgroup headroom. Use `--ram-scratch` separately for the fuller report and
-optional top-entry attribution.
+relocate files, or raise a mount's daemon pressure level. The additional byte
+admission reuses the bounded cgroup observer described below, with a separate
+100 ms cooperative deadline, and reads only the memory boundaries relevant to
+RAM. A successful check is an observation, **not a memory reservation or an OOM
+guarantee**: charges and limits can change immediately, and cgroup namespaces can
+hide further enforcing ancestors. Use `--ram-scratch` separately for the fuller
+host report and optional top-entry attribution.
 
 ## What is measured
 

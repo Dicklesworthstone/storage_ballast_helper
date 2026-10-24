@@ -376,6 +376,14 @@ fn restore(stub: &std::path::Path, json: bool) -> i32 {
         let (code, message) = match &result {
             Ok(restored) => match &restored.kept_stub {
                 None => (0, format!("restored {}", restored.path.display())),
+                Some((kept, names)) if names.is_empty() => (
+                    0,
+                    format!(
+                        "restored {}; previous stub preserved for recovery at {}",
+                        restored.path.display(),
+                        kept.display()
+                    ),
+                ),
                 Some((kept, names)) => (
                     0,
                     format!(
@@ -391,7 +399,18 @@ fn restore(stub: &std::path::Path, json: bool) -> i32 {
         if json {
             println!(
                 "{}",
-                serde_json::json!({"schema": SCHEMA, "restore": stub, "ok": result.is_ok(), "message": message})
+                serde_json::json!({
+                    "schema": SCHEMA,
+                    "restore": stub,
+                    "ok": result.is_ok(),
+                    "message": message,
+                    "kept_stub": result.as_ref().ok()
+                        .and_then(|restored| restored.kept_stub.as_ref())
+                        .map(|(path, names)| serde_json::json!({
+                            "path": path,
+                            "additional_entries": names,
+                        })),
+                })
             );
         } else {
             println!("sbh relocate: {message}");
