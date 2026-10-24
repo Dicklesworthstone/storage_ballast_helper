@@ -237,7 +237,7 @@ pub fn classify_opaque_tree(
     // that lives under a temp-like `CARGO_HOME` would otherwise be promoted to
     // a 0.93 `opaque-cargo-target` candidate purely on that name. The stores
     // themselves are excluded here: they are the opaque reclaim unit handled
-    // below (the `.cargo/registry` / `.cargo/git` roots above them are kept).
+    // below (a cargo home's `registry` / `git` roots above them are kept).
     if is_cargo_registry_internal_path(path) {
         return Some(OpaqueTreeClassification::protected(
             "cargo registry/git store content is crate source, never a build target",
@@ -302,7 +302,7 @@ pub fn classify_opaque_tree(
         ));
     }
 
-    // `.cargo/registry` and `.cargo/git` themselves must survive: rch's per-job
+    // A cargo home's `registry` and `git` themselves must survive: rch's per-job
     // CARGO_HOME symlinks them, and a removed root leaves the link dangling so
     // every crates.io download fails with EEXIST (hz4, 2026-09-26: a release
     // lost 33 min). Descend and reclaim the stores inside instead.
@@ -741,7 +741,10 @@ pub fn is_agent_harness_dir_name(lowercase_name: &str) -> bool {
 /// scorer vetoes it outright. The store directories themselves are
 /// deliberately NOT matched: they are the opaque, whole-store reclaim unit
 /// (`opaque-cargo-cache` / the cleanup catalog). The `registry` / `git`
-/// roots above them are never reclaimed (rch symlinks them).
+/// roots above them are never nominated: `classify_opaque_tree` keeps them
+/// signal-only for every cargo home it recognises (`is_cargo_home`), because
+/// rch symlinks them. Sacred protection does not cover them; the classifier
+/// does.
 #[must_use]
 pub fn is_cargo_registry_internal_path(path: &Path) -> bool {
     // `ancestors()` yields `path` first; the store dir must be a STRICT
@@ -916,19 +919,32 @@ pub fn darwin_code_sign_clone_area_for_temp_root(root: &Path) -> Option<std::pat
         .then(|| root.with_file_name("X"))
 }
 
-/// `.cargo/registry` or `.cargo/git`.
+/// `registry` or `git` directly inside a cargo home (see [`is_cargo_home`]).
 fn is_cargo_home_store_root(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| matches!(name, "registry" | "git"))
-        && path
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|parent| parent == ".cargo")
+        && path.parent().is_some_and(is_cargo_home)
+}
+
+/// A directory cargo uses as `CARGO_HOME`: `.cargo`, rch's shared
+/// `rch-cargo-cache-<host>` stores, or any directory holding cargo's
+/// `.package-cache` lock file.
+///
+/// Recognising only `.cargo` left the rch stores' `registry`/`git` roots to
+/// the CACHEDIR.TAG rescue, which nominated them whole: on csd (2026-10-23)
+/// Green event passes quarantined `rch-cargo-cache-csd/{git,registry}`
+/// hourly while builds re-created them, the root removal the hz4 guard
+/// below exists to prevent.
+fn is_cargo_home(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == ".cargo" || name.starts_with("rch-cargo-cache"))
+        || dir.join(".package-cache").is_file()
 }
 
 /// A regenerable store directly inside a cargo-home root:
-/// `.cargo/registry/{cache,src,index}` or `.cargo/git/{checkouts,db}`.
+/// `<cargo home>/registry/{cache,src,index}` or `<cargo home>/git/{checkouts,db}`.
 fn is_cargo_cache_store(path: &Path) -> bool {
     let (Some(name), Some(root)) = (
         path.file_name().and_then(|name| name.to_str()),
@@ -2468,6 +2484,58 @@ mod tests {
             "/repo/.git/objects",
         ] {
             assert!(!is_cargo_registry_internal_path(Path::new(p)), "{p}");
+        }
+    }
+
+    /// csd 2026-10-23: rch's shared store `rch-cargo-cache-csd` was not a
+    /// recognised cargo home, so its `git`/`registry` roots were nominated
+    /// whole. Every cargo home keeps its roots and offers its stores instead.
+    #[test]
+    fn every_cargo_home_keeps_its_roots_and_offers_its_stores() {
+        let classify = |path: &Path| classify_opaque_tree(path, OpaqueTreeContext::default());
+        let marked = tempfile::tempdir().unwrap();
+        let marked_home = marked.path().join("job-7-cargo");
+        std::fs::create_dir(&marked_home).unwrap();
+        std::fs::write(marked_home.join(".package-cache"), b"").unwrap();
+
+        for home in [
+            PathBuf::from("/root/.cargo"),
+            PathBuf::from("/data/ssd/tmp/rch-cargo-cache-csd"),
+            PathBuf::from("/scratch/tmp/rch-cargo-cache-timeout-worker"),
+            marked_home.clone(),
+        ] {
+            for root in ["registry", "git"] {
+                let path = home.join(root);
+                assert_eq!(
+                    classify(&path).map(|opaque| opaque.disposition),
+                    Some(OpaqueTreeDisposition::SignalOnly),
+                    "{}",
+                    path.display()
+                );
+            }
+            for store in ["registry/src", "registry/cache", "registry/index", "git/db"] {
+                let path = home.join(store);
+                let opaque = classify(&path).unwrap();
+                assert_eq!(
+                    opaque.disposition,
+                    OpaqueTreeDisposition::CandidateOpaque,
+                    "{}",
+                    path.display()
+                );
+                assert_eq!(opaque.classification.pattern_name, "opaque-cargo-cache");
+            }
+        }
+
+        // A `registry` or `git` that is not in a cargo home gets no cargo verdict.
+        let plain = marked.path().join("project");
+        for path in [plain.join("registry"), plain.join("git")] {
+            assert!(
+                classify(&path).is_none_or(|opaque| opaque.classification.pattern_name
+                    != "opaque-cargo-cache"
+                    && opaque.disposition != OpaqueTreeDisposition::SignalOnly),
+                "{}",
+                path.display()
+            );
         }
     }
 
