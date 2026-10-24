@@ -25,14 +25,37 @@ Opt-outs and exclusions follow their own branch: a pinned child keeps its enclos
 
 ## What `--apply` does
 
-1. rsync the unit to `<target>[/<host>]/<run stamp>/<original path>/`.
+1. Pin the source and its parent, collect bounded identity and content-change evidence, then rsync the opened source to `<target>[/<host>]/<run stamp>/<original path>/`.
 2. Verify with a checksum dry run. Any itemized difference aborts the move.
 3. Upload the relocation record next to the copy as `<copy>.sbh-relocated.json`.
-4. Rename the unit aside, so a writer that opens by path fails instead of writing into a tree that is about to go.
+4. Renew the source evidence and rename the unit aside without replacing an existing recovery path, so a writer that opens by path fails instead of writing into a tree that is about to go.
 5. Renew relocation permission, survey it and sweep processes again. If anything changed, opted out, or holds it, the rename is undone.
-6. Put a stub at the original path: `RELOCATED.md`, `.sbh-relocated.json`, and the marker if the unit was the marked tree.
+6. Build a private stub containing `RELOCATED.md`, `.sbh-relocated.json`, and the marker if the unit was the marked tree, then publish it atomically without replacing a newly occupied original path.
 7. Durably save the completed relocation in the ledger.
-8. Renew relocation permission and the content comparison once more, then sweep processes again immediately before removing the original bytes.
+8. Renew relocation permission, source evidence and stub evidence once more, then sweep processes again immediately before removing the original bytes through the pinned parent.
+
+The copy and checksum verification use the opened source directory throughout.
+Replacing the source name or moving its parent cannot redirect the transfer to
+another tree. Before renaming and removing the source, `--apply` renews its
+identity and compares a fingerprint of every descendant's name, device, inode,
+type, mode, ownership, link count, size, and nanosecond mtime/ctime. Matching file
+counts or an unchanged newest timestamp cannot hide a replaced child. Reads do
+not invalidate the evidence through atime; after the rename, only the source
+directory's expected ctime change is exempted.
+
+Evidence collection must finish within `max_entries`, 64 directory levels, and
+a 16 MiB budget for live filename storage. An exhausted budget, changed directory
+during inspection, or filesystem boundary refuses the move. These bounds limit
+the proof's working memory without retaining a manifest proportional to the
+whole tree.
+
+An existing `.<name>.sbh-relocating`, including a dangling symlink, is preserved.
+Stub files are created exclusively in a private `.sbh-relocation-stub-<random>`
+directory; publication and rollback never overwrite another occupant. A replaced
+source, moved parent, changed stub, or failed publication retains the available
+source, backup, and staging data. Error messages identify the opened directories'
+current recovery locations when their parent has moved. Only the source identity
+captured before copying is eligible for removal.
 
 Nothing is deleted before the copy verifies. To bring a tree back:
 

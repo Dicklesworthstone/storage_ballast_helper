@@ -87,6 +87,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Forward relocation pins the tree it copies and is allowed to remove.**
+  Copying and checksum verification use the opened source directory. Bounded
+  descendant fingerprints detect replacements and changes hidden by matching
+  counts or coarse timestamps; source, parent, policy and stub evidence are
+  renewed before mutation. Renaming aside, publishing a privately built stub,
+  and rollback refuse to replace existing occupants, including dangling
+  recovery symlinks. Changed sources, moved parents and replaced stubs retain
+  the available original, backup and staging data with current recovery paths.
 - **Scanner reloads revoke stale target-only cleanup permission** (bd-232u).
   Target-only batches carry the consent under which they were selected. Changes
   to opted-in roots, idle windows, exclusions, or protection invalidate old

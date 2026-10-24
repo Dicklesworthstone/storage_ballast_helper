@@ -1496,7 +1496,16 @@ limited process visibility, changed trees, and exhausted scan budgets remain
 explicit uncertainty. See [the inventory guide](docs/agent-scratch.md) for roots,
 limits, JSON fields, and exit statuses.
 
-### Restoring Relocated Scratch
+### Moving and Restoring Protected Scratch
+
+On Linux, `sbh relocate --apply` copies dormant eligible scratch through an
+opened source directory and verifies the backup before removal. It renews the
+source and parent identities, every descendant's identity and change stamps,
+relocation permission, and process-use evidence at the relevant mutation
+boundaries. Replaced sources, changed children, moved parents, and occupied
+recovery paths refuse the move while retaining the available recovery data.
+The restore stub is built privately and published without overwriting a new
+occupant of the original path.
 
 On Linux, `sbh relocate --restore /absolute/path/to/stub` copies the backup into
 a private directory unique to the attempt, verifies it, and installs it at the

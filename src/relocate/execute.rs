@@ -34,6 +34,7 @@ use std::process::Command;
 use chrono::{DateTime, Utc};
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, Stat};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::config::RelocationConfig;
 use super::ledger::{Ledger, RelocationEntry};
@@ -262,7 +263,10 @@ fn sibling(path: &Path, suffix: &str) -> io::Result<PathBuf> {
             "path has no parent",
         ));
     };
-    Ok(parent.join(format!(".{}.{suffix}", name.to_string_lossy())))
+    let mut sibling_name = OsString::from(".");
+    sibling_name.push(name);
+    sibling_name.push(format!(".{suffix}"));
+    Ok(parent.join(sibling_name))
 }
 
 /// `12.3 GiB` or `41.0 MiB`, for people.
@@ -361,13 +365,341 @@ fn postcheck_matches(snapshot: &survey::UnitStats, after: &survey::TreeSurvey) -
         && unit.entries == snapshot.entries
 }
 
-/// Remove the stub this run created, file by file. Anything else found in it
-/// (a job that wrote there meanwhile) keeps the directory.
-fn remove_own_stub(path: &Path) {
-    for name in [README_FILENAME, RECORD_FILENAME, MARKER_FILENAME] {
-        let _ = fs::remove_file(path.join(name));
+/// Sorting is limited by live names, not by the potentially enormous tree's
+/// total entry count. A proof that exceeds either bound refuses the move.
+const SOURCE_EVIDENCE_NAME_BYTES: usize = 16 * 1024 * 1024;
+const SOURCE_EVIDENCE_MAX_DEPTH: usize = 64;
+
+struct SourceEvidence {
+    root: Stat,
+    descendants: [u8; 32],
+}
+
+struct EvidenceBudget {
+    entries_left: u64,
+    names_left: usize,
+}
+
+impl SourceEvidence {
+    fn capture(source: &fs::File, max_entries: u64) -> io::Result<Self> {
+        let root = rustix::fs::fstat(source)?;
+        let mut digest = Sha256::new();
+        let mut budget = EvidenceBudget {
+            entries_left: max_entries,
+            names_left: SOURCE_EVIDENCE_NAME_BYTES,
+        };
+        fingerprint_directory(source, Path::new(""), &root, 0, &mut budget, &mut digest)?;
+        Ok(Self {
+            root,
+            descendants: digest.finalize().into(),
+        })
     }
-    let _ = fs::remove_dir(path);
+
+    fn matches(&self, current: &Self, renamed: bool) -> bool {
+        self.descendants == current.descendants
+            && if renamed {
+                // Rename changes only the source directory's ctime. Its mtime
+                // still detects replacing an immediate child of the unit.
+                same_restore_identity(&self.root, &current.root)
+                    && self.root.st_mode == current.root.st_mode
+                    && self.root.st_uid == current.root.st_uid
+                    && self.root.st_gid == current.root.st_gid
+                    && self.root.st_nlink == current.root.st_nlink
+                    && self.root.st_size == current.root.st_size
+                    && self.root.st_mtime == current.root.st_mtime
+                    && self.root.st_mtime_nsec == current.root.st_mtime_nsec
+            } else {
+                same_restore_stamp(&self.root, &current.root)
+            }
+    }
+}
+
+/// Stream exact metadata tuples in sorted path order. Atime is deliberately
+/// absent: copying reads files. Identities, names and nanosecond change stamps
+/// prevent aggregate counts or a newest-second timestamp from hiding changes.
+fn fingerprint_directory(
+    directory: &fs::File,
+    relative: &Path,
+    expected: &Stat,
+    depth: usize,
+    budget: &mut EvidenceBudget,
+    digest: &mut Sha256,
+) -> io::Result<()> {
+    if depth >= SOURCE_EVIDENCE_MAX_DEPTH {
+        return Err(restore_invalid(
+            "relocation evidence directory depth exhausted",
+        ));
+    }
+    let before = rustix::fs::fstat(directory)?;
+    if !same_restore_stamp(expected, &before) {
+        return Err(restore_invalid(
+            "relocation source changed during evidence collection",
+        ));
+    }
+    let mut names = Vec::new();
+    let mut charged = 0usize;
+    for entry in Dir::read_from(directory)? {
+        let entry = entry?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        budget.entries_left = budget
+            .entries_left
+            .checked_sub(1)
+            .ok_or_else(|| restore_invalid("relocation evidence entry budget exhausted"))?;
+        // Include vector capacity and name storage rather than just filename
+        // bytes. Parent frames retain their names during a recursive descent.
+        let cost = 2 * (std::mem::size_of::<OsString>() + bytes.len());
+        budget.names_left = budget
+            .names_left
+            .checked_sub(cost)
+            .ok_or_else(|| restore_invalid("relocation evidence working-name budget exhausted"))?;
+        charged += cost;
+        names.push(OsStr::from_bytes(bytes).to_os_string());
+    }
+    names.sort_unstable();
+    for name in &names {
+        let metadata = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if metadata.st_dev != before.st_dev {
+            return Err(restore_invalid("relocation evidence crosses a filesystem"));
+        }
+        let child = relative.join(name);
+        let bytes = child.as_os_str().as_bytes();
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+        digest.update(metadata.st_dev.to_le_bytes());
+        digest.update(metadata.st_ino.to_le_bytes());
+        digest.update(metadata.st_mode.to_le_bytes());
+        digest.update(metadata.st_uid.to_le_bytes());
+        digest.update(metadata.st_gid.to_le_bytes());
+        digest.update(metadata.st_nlink.to_le_bytes());
+        digest.update(metadata.st_size.to_le_bytes());
+        digest.update(metadata.st_mtime.to_le_bytes());
+        digest.update(metadata.st_mtime_nsec.to_le_bytes());
+        digest.update(metadata.st_ctime.to_le_bytes());
+        digest.update(metadata.st_ctime_nsec.to_le_bytes());
+        if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
+            let child_directory = fs::File::from(crate::scanner::quarantine::open_beneath(
+                directory,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            )?);
+            fingerprint_directory(
+                &child_directory,
+                &child,
+                &metadata,
+                depth + 1,
+                budget,
+                digest,
+            )?;
+        }
+    }
+    if !same_restore_stamp(&before, &rustix::fs::fstat(directory)?) {
+        return Err(restore_invalid(
+            "relocation directory changed during evidence collection",
+        ));
+    }
+    budget.names_left += charged;
+    Ok(())
+}
+
+fn descriptor_path(directory: &fs::File) -> PathBuf {
+    PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        directory.as_raw_fd()
+    ))
+}
+
+fn actual_directory(directory: &fs::File, fallback: &Path) -> PathBuf {
+    fs::read_link(descriptor_path(directory)).unwrap_or_else(|_| fallback.to_path_buf())
+}
+
+struct RelocationAnchor {
+    parent: fs::File,
+    source: fs::File,
+    parent_path: PathBuf,
+    name: OsString,
+    aside_name: OsString,
+}
+
+impl RelocationAnchor {
+    fn open(path: &Path) -> io::Result<Self> {
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+        {
+            return Err(restore_invalid(
+                "relocation needs an absolute path without parent components",
+            ));
+        }
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| restore_invalid("source has no parent"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| restore_invalid("source has no name"))?;
+        let parent = survey::open_directory(parent_path)?;
+        let source = fs::File::from(crate::scanner::quarantine::open_beneath(
+            &parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        )?);
+        let aside = sibling(path, "sbh-relocating")?;
+        let anchor = Self {
+            parent,
+            source,
+            parent_path: parent_path.to_path_buf(),
+            name: name.to_os_string(),
+            aside_name: aside.file_name().unwrap().to_os_string(),
+        };
+        anchor.check_location(false)?;
+        Ok(anchor)
+    }
+
+    fn check_parent(&self) -> io::Result<()> {
+        let named = rustix::fs::statat(
+            rustix::fs::CWD,
+            &self.parent_path,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+        if !same_restore_identity(&rustix::fs::fstat(&self.parent)?, &named) {
+            return Err(restore_invalid(
+                "relocation parent path was replaced or moved",
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_source_name(&self, renamed: bool) -> io::Result<()> {
+        let name = if renamed {
+            &self.aside_name
+        } else {
+            &self.name
+        };
+        let named = rustix::fs::statat(&self.parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if !same_restore_identity(&rustix::fs::fstat(&self.source)?, &named) {
+            return Err(restore_invalid(
+                "relocation source path was replaced or moved",
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_location(&self, renamed: bool) -> io::Result<()> {
+        self.check_parent()?;
+        self.check_source_name(renamed)
+    }
+
+    fn current_parent(&self) -> PathBuf {
+        actual_directory(&self.parent, &self.parent_path)
+    }
+
+    fn current_source(&self) -> PathBuf {
+        actual_directory(&self.source, &self.current_parent().join(&self.aside_name))
+    }
+}
+
+struct StagedStub {
+    directory: fs::File,
+    name: String,
+}
+
+impl StagedStub {
+    fn create(anchor: &RelocationAnchor) -> io::Result<Self> {
+        for _ in 0..8 {
+            let name = format!(".sbh-relocation-stub-{:032x}", rand::random::<u128>());
+            match rustix::fs::mkdirat(&anchor.parent, &name, Mode::from_raw_mode(0o700)) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::EXIST) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            let directory = fs::File::from(crate::scanner::quarantine::open_beneath(
+                &anchor.parent,
+                OsStr::new(&name),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            )?);
+            let stat = rustix::fs::fstat(&directory)?;
+            if stat.st_uid != nix::unistd::geteuid().as_raw() || stat.st_mode & 0o777 != 0o700 {
+                return Err(restore_invalid("relocation stub staging is not private"));
+            }
+            return Ok(Self { directory, name });
+        }
+        Err(restore_invalid(
+            "cannot exclusively create relocation stub staging",
+        ))
+    }
+
+    fn location(&self, anchor: &RelocationAnchor) -> PathBuf {
+        actual_directory(&self.directory, &anchor.current_parent().join(&self.name))
+    }
+
+    fn write(&self, name: &str, contents: &[u8], record: &RelocationRecord) -> io::Result<()> {
+        let mut file = fs::File::from(rustix::fs::openat(
+            &self.directory,
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )?);
+        file.write_all(contents)?;
+        nix::unistd::fchown(
+            &file,
+            Some(nix::unistd::Uid::from_raw(record.uid)),
+            Some(nix::unistd::Gid::from_raw(record.gid)),
+        )?;
+        file.sync_all()
+    }
+
+    fn populate(
+        &self,
+        anchor: &RelocationAnchor,
+        record: &RelocationRecord,
+        record_json: &[u8],
+        whole_marked_tree: bool,
+    ) -> io::Result<()> {
+        self.write(README_FILENAME, readme(record).as_bytes(), record)?;
+        self.write(RECORD_FILENAME, record_json, record)?;
+        if whole_marked_tree {
+            let marker = fs::File::from(crate::scanner::quarantine::open_beneath(
+                &anchor.source,
+                OsStr::new(MARKER_FILENAME),
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            )?);
+            let mut contents = Vec::new();
+            marker.take(64 * 1024 + 1).read_to_end(&mut contents)?;
+            if contents.len() > 64 * 1024 {
+                return Err(restore_invalid(
+                    "relocation marker exceeds the evidence limit",
+                ));
+            }
+            self.write(MARKER_FILENAME, &contents, record)?;
+        }
+        nix::unistd::fchown(
+            &self.directory,
+            Some(nix::unistd::Uid::from_raw(record.uid)),
+            Some(nix::unistd::Gid::from_raw(record.gid)),
+        )?;
+        self.directory
+            .set_permissions(fs::Permissions::from_mode(record.mode))?;
+        self.directory.sync_all()
+    }
+
+    fn check_name(&self, anchor: &RelocationAnchor, published: bool) -> io::Result<()> {
+        let name = if published {
+            anchor.name.as_os_str()
+        } else {
+            OsStr::new(&self.name)
+        };
+        let current = rustix::fs::statat(&anchor.parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if !same_restore_identity(&rustix::fs::fstat(&self.directory)?, &current) {
+            return Err(restore_invalid(
+                "relocation restore stub was replaced or moved",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Fault-injection points for tests: what another process might do between
@@ -375,7 +707,10 @@ fn remove_own_stub(path: &Path) {
 /// renamed tree.
 #[derive(Default)]
 struct Hooks<'a> {
+    before_copy: Option<&'a dyn Fn(&Path)>,
+    before_rename: Option<&'a dyn Fn(&Path)>,
     after_rename: Option<&'a dyn Fn(&Path)>,
+    before_stub_publish: Option<&'a dyn Fn(&Path)>,
     before_remove: Option<&'a dyn Fn(&Path)>,
 }
 
@@ -401,6 +736,16 @@ fn relocate_with_hooks(
     };
     let remote = is_remote(target);
     let host = hostname();
+    let anchor = match RelocationAnchor::open(&path) {
+        Ok(anchor) => anchor,
+        Err(error) => return fail("precheck", error.to_string()),
+    };
+    // This identity precedes copying. Never bless whatever happens to be
+    // named by the aside after a transfer as the source eligible for removal.
+    let source_identity = match anchor.source.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return fail("precheck", error.to_string()),
+    };
 
     // Re-check right before acting: the plan may be minutes old.
     let before = match plan::check_relocation_policy(config, &path, &path) {
@@ -419,6 +764,13 @@ fn relocate_with_hooks(
     if snapshot.newest_change != candidate.stats.newest_change {
         return fail("precheck", "tree changed since it was planned".into());
     }
+    let evidence = match SourceEvidence::capture(&anchor.source, config.max_entries) {
+        Ok(evidence) => evidence,
+        Err(error) => return fail("precheck", error.to_string()),
+    };
+    if let Err(error) = anchor.check_location(false) {
+        return fail("precheck", error.to_string());
+    }
 
     let destination = ledger
         .in_progress
@@ -429,11 +781,22 @@ fn relocate_with_hooks(
     if let Err(error) = ledger.save(&config.state_dir) {
         return fail("ledger", error.to_string());
     }
-    let source = format!("{}/", path.display());
-    if let Err((stage, error)) = copy_and_verify(config, remote, &source, &destination) {
-        return fail(&stage, error);
+    let retained = |error: String| {
+        format!(
+            "{error}; original source retained at {}; transfer destination at {destination}",
+            anchor.current_source().display(),
+        )
+    };
+    if let Some(hook) = hooks.before_copy {
+        hook(&path);
     }
-
+    let source = format!("{}/", descriptor_path(&anchor.source).display());
+    if let Err((stage, error)) = copy_and_verify(config, remote, &source, &destination) {
+        return fail(&stage, retained(error));
+    }
+    if let Err(error) = anchor.check_location(false) {
+        return fail("postcheck", retained(error.to_string()));
+    }
     let record = RelocationRecord {
         schema: SCHEMA.to_string(),
         path: path.clone(),
@@ -482,71 +845,135 @@ fn relocate_with_hooks(
         return fail(&stage, error);
     }
 
-    let aside = match sibling(&path, "sbh-relocating") {
-        Ok(aside) if !aside.exists() => aside,
-        Ok(aside) => return fail("rename", format!("{} already exists", aside.display())),
-        Err(error) => return fail("rename", error.to_string()),
-    };
-    if let Err(error) = fs::rename(&path, &aside) {
-        return fail("rename", error.to_string());
+    if let Some(hook) = hooks.before_rename {
+        hook(&path);
     }
+    if let Err(error) = anchor.check_location(false) {
+        return fail("rename", retained(error.to_string()));
+    }
+    match SourceEvidence::capture(&anchor.source, config.max_entries) {
+        Ok(current) if evidence.matches(&current, false) => {}
+        Ok(_) => {
+            return fail(
+                "postcheck",
+                retained("source changed after verification".into()),
+            );
+        }
+        Err(error) => return fail("postcheck", retained(error.to_string())),
+    }
+    if let Err(error) = rustix::fs::renameat_with(
+        &anchor.parent,
+        &anchor.name,
+        &anchor.parent,
+        &anchor.aside_name,
+        RenameFlags::NOREPLACE,
+    ) {
+        return fail("rename", retained(error.to_string()));
+    }
+    let aside = anchor.parent_path.join(&anchor.aside_name);
     let undo = |stage: &str, error: String| {
-        let restored = if path.exists() {
-            format!(
-                "; {} was recreated meanwhile, so the tree stays at {}",
-                path.display(),
-                aside.display()
-            )
-        } else {
-            match fs::rename(&aside, &path) {
-                Ok(()) => String::new(),
-                Err(undo_error) => format!(
-                    "; rename back failed: {undo_error}; tree is at {}",
-                    aside.display()
+        let restored = match anchor.check_source_name(true) {
+            Err(error) => format!("; rollback refused changed source identity: {error}"),
+            Ok(()) => match rustix::fs::renameat_with(
+                &anchor.parent,
+                &anchor.aside_name,
+                &anchor.parent,
+                &anchor.name,
+                RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => format!(
+                    "; original tree put back at {}",
+                    anchor.current_parent().join(&anchor.name).display()
                 ),
-            }
+                Err(undo_error) => {
+                    format!("; original path was not overwritten; rename back failed: {undo_error}")
+                }
+            },
         };
-        fail(stage, format!("{error}{restored}"))
+        fail(stage, retained(format!("{error}{restored}")))
     };
     if let Some(hook) = hooks.after_rename {
         hook(&path);
+    }
+    if let Err(error) = anchor.check_location(true) {
+        return undo("postcheck", error.to_string());
     }
     match plan::check_relocation_policy(config, &path, &aside) {
         Ok(after) if postcheck_matches(&snapshot, &after) => {}
         Ok(_) => return undo("postcheck", "tree changed during the copy".into()),
         Err(error) => return undo("postcheck", format!("relocation policy changed: {error}")),
     }
-    let aside_identity = match fs::symlink_metadata(&aside) {
-        Ok(metadata) => metadata,
+    match SourceEvidence::capture(&anchor.source, config.max_entries) {
+        Ok(current) if evidence.matches(&current, true) => {}
+        Ok(_) => {
+            return undo(
+                "postcheck",
+                "source identity or contents changed during the move".into(),
+            );
+        }
         Err(error) => return undo("postcheck", error.to_string()),
-    };
+    }
     if let Some(reason) = holder(platform, &aside) {
         return undo("postcheck", format!("in use: {reason}"));
     }
 
-    // The stub: same owner and mode as the original directory. A path that
-    // reappeared meanwhile belongs to whoever made it: create_dir fails and
-    // nothing of theirs is touched.
-    let mut created = false;
-    let stub = (|| -> io::Result<()> {
-        fs::create_dir(&path)?;
-        created = true;
-        write_file(&path.join(README_FILENAME), readme(&record).as_bytes())?;
-        write_file(&path.join(RECORD_FILENAME), &record_json)?;
-        if candidate.stats.depth == 0 {
-            fs::copy(aside.join(MARKER_FILENAME), path.join(MARKER_FILENAME))?;
-        }
-        for entry in fs::read_dir(&path)? {
-            std::os::unix::fs::lchown(entry?.path(), Some(record.uid), Some(record.gid))?;
-        }
-        std::os::unix::fs::chown(&path, Some(record.uid), Some(record.gid))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(record.mode))
-    })();
-    if let Err(error) = stub {
-        if created {
-            remove_own_stub(&path);
-        }
-        return undo("stub", error.to_string());
+    // Build the entire stub in private staging, then publish it atomically.
+    // Never write metadata through a pathname another job may have recreated.
+    let stub = match StagedStub::create(&anchor) {
+        Ok(stub) => stub,
+        Err(error) => return undo("stub", error.to_string()),
+    };
+    let stub_failure = |error: String| {
+        undo(
+            "stub",
+            format!(
+                "{error}; restore stub staging retained at {}",
+                stub.location(&anchor).display()
+            ),
+        )
+    };
+    if let Err(error) = stub.populate(&anchor, &record, &record_json, candidate.stats.depth == 0) {
+        return stub_failure(error.to_string());
+    }
+    let stub_evidence = match restore_snapshot(&stub.directory) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return stub_failure(error.to_string()),
+    };
+    if let Some(hook) = hooks.before_stub_publish {
+        hook(&path);
+    }
+    if let Err(error) = anchor
+        .check_location(true)
+        .and_then(|()| stub.check_name(&anchor, false))
+    {
+        return stub_failure(error.to_string());
+    }
+    if let Err(error) = rustix::fs::renameat_with(
+        &anchor.parent,
+        &stub.name,
+        &anchor.parent,
+        &anchor.name,
+        RenameFlags::NOREPLACE,
+    ) {
+        return stub_failure(error.to_string());
+    }
+    let published_failure = |stage: &str, error: String| {
+        fail(
+            stage,
+            format!(
+                "{error}; original tree preserved at {}; verified copy at {destination}; restore stub at {}; no original bytes were removed",
+                anchor.current_source().display(),
+                stub.location(&anchor).display(),
+            ),
+        )
+    };
+    if let Err(error) = anchor
+        .parent
+        .sync_all()
+        .and_then(|()| anchor.check_location(true))
+        .and_then(|()| stub.check_name(&anchor, true))
+    {
+        return published_failure("stub", error.to_string());
     }
 
     // Keep resumable state in memory until the completion is durable. If
@@ -566,8 +993,8 @@ fn relocate_with_hooks(
             "ledger",
             format!(
                 "completion could not be durably saved: {error}; original tree preserved at {}; verified copy at {destination}; restore stub at {}. Repair the ledger before continuing; no original bytes were removed",
-                aside.display(),
-                path.display()
+                anchor.current_source().display(),
+                stub.location(&anchor).display()
             ),
         );
     }
@@ -582,11 +1009,17 @@ fn relocate_with_hooks(
             "remove",
             format!(
                 "{reason}; original tree preserved at {}; earlier verified copy at {destination}; restore stub at {}; no original bytes were removed",
-                aside.display(),
-                path.display()
+                anchor.current_source().display(),
+                stub.location(&anchor).display()
             ),
         )
     };
+    if let Err(error) = anchor
+        .check_location(true)
+        .and_then(|()| stub.check_name(&anchor, true))
+    {
+        return refuse_removal(error.to_string());
+    }
     match plan::check_relocation_policy(config, &path, &aside) {
         Ok(current) if postcheck_matches(&snapshot, &current) => {}
         Ok(_) => {
@@ -600,19 +1033,52 @@ fn relocate_with_hooks(
             ));
         }
     }
+    match SourceEvidence::capture(&anchor.source, config.max_entries) {
+        Ok(current) if evidence.matches(&current, true) => {}
+        Ok(_) => {
+            return refuse_removal("source identity or contents changed after verification".into());
+        }
+        Err(error) => return refuse_removal(error.to_string()),
+    }
+    match restore_snapshot(&stub.directory) {
+        Ok(current) if stub_evidence.same_contents(&current) => {}
+        Ok(_) => return refuse_removal("restore stub changed before source removal".into()),
+        Err(error) => return refuse_removal(error.to_string()),
+    }
     // A policy walk may be large. Its current content evidence and a holder
     // sweep after that walk must both pass at the final removal boundary.
     if let Some(reason) = holder(platform, &aside) {
         return refuse_removal(format!("in use before removal: {reason}"));
     }
+    if let Err(error) = anchor
+        .check_location(true)
+        .and_then(|()| stub.check_name(&anchor, true))
+    {
+        return refuse_removal(error.to_string());
+    }
     // Descriptor-relative, no symlinks followed, and refusing any other
     // mount (openat2 NO_XDEV): the deletion executor's own removal.
-    if let Err(error) = crate::scanner::quarantine::remove_direct(&aside, &aside_identity, false) {
+    let anchored_aside = descriptor_path(&anchor.parent).join(&anchor.aside_name);
+    if let Err(error) =
+        crate::scanner::quarantine::remove_direct(&anchored_aside, &source_identity, false)
+    {
         return fail(
             "remove",
             format!(
                 "relocated, but {} could not be removed: {error}",
-                aside.display()
+                anchor.current_source().display()
+            ),
+        );
+    }
+    if let Err(error) = anchor
+        .check_parent()
+        .and_then(|()| stub.check_name(&anchor, true))
+    {
+        return fail(
+            "remove",
+            format!(
+                "verified source removal completed, but its original location changed: {error}; backup at {destination}; restore stub retained at {}",
+                stub.location(&anchor).display(),
             ),
         );
     }
@@ -1145,6 +1611,424 @@ mod tests {
             fs::metadata(unit.join("top")).unwrap().ino(),
             fs::metadata(unit.join("a/top-link")).unwrap().ino()
         );
+    }
+
+    #[test]
+    fn source_replacement_before_copy_or_rename_preserves_both_trees_and_verified_bytes() {
+        if !rsync_available() {
+            return;
+        }
+        for before_copy in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let replacement = marked_tree(&tmp.path().join("replacement"));
+            fs::write(replacement.join("a/b/data"), vec![9u8; 300_000]).unwrap();
+            let unit = marked_tree(tmp.path());
+            if !sees_every_process(&unit) {
+                return;
+            }
+            let saved = tmp.path().join("original-preserved");
+            let substitute = |path: &Path| {
+                fs::rename(path, &saved).unwrap();
+                fs::rename(&replacement, path).unwrap();
+            };
+            let hooks = if before_copy {
+                Hooks {
+                    before_copy: Some(&substitute),
+                    ..Hooks::default()
+                }
+            } else {
+                Hooks {
+                    before_rename: Some(&substitute),
+                    ..Hooks::default()
+                }
+            };
+            let config = local_config(tmp.path());
+            let mut ledger = Ledger::default();
+            let outcome = relocate_with_hooks(
+                &config,
+                &crate::platform::current(),
+                &mut ledger,
+                &candidate_for(&unit),
+                "source-replaced",
+                1_000,
+                &hooks,
+            );
+            let Outcome::Failed { error, .. } = outcome else {
+                panic!("source replacement was accepted: {outcome:?}");
+            };
+            assert!(error.contains("replaced or moved"), "{error}");
+            assert!(error.contains(saved.to_str().unwrap()), "{error}");
+            let backup = PathBuf::from(ledger.in_progress[&unit].trim_end_matches('/'));
+            assert_eq!(
+                fs::read(backup.join("a/b/data")).unwrap(),
+                vec![7u8; 300_000]
+            );
+            assert_eq!(
+                fs::read(saved.join("a/b/data")).unwrap(),
+                vec![7u8; 300_000]
+            );
+            assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![9u8; 300_000]);
+            assert!(!sibling(&unit, "sbh-relocating").unwrap().exists());
+            assert!(ledger.relocations.is_empty());
+        }
+    }
+
+    #[test]
+    fn replacing_the_renamed_source_cannot_bless_uncopied_matching_aggregates() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let replacement = marked_tree(&tmp.path().join("replacement"));
+        fs::write(replacement.join("a/b/data"), vec![9u8; 300_000]).unwrap();
+        let unit = marked_tree(tmp.path());
+        if !sees_every_process(&unit) {
+            return;
+        }
+        let candidate = candidate_for(&unit);
+        let aside = sibling(&unit, "sbh-relocating").unwrap();
+        let saved = tmp.path().join("original-preserved");
+        let substitute = |_: &Path| {
+            fs::rename(&aside, &saved).unwrap();
+            fs::rename(&replacement, &aside).unwrap();
+            let other = survey::survey_tree(&aside, 0, 10_000).unwrap();
+            assert!(
+                postcheck_matches(&candidate.stats, &other),
+                "old aggregate gate accepts this different tree"
+            );
+        };
+        let config = local_config(tmp.path());
+        let mut ledger = Ledger::default();
+        let outcome = relocate_with_hooks(
+            &config,
+            &crate::platform::current(),
+            &mut ledger,
+            &candidate,
+            "aside-replaced",
+            1_000,
+            &Hooks {
+                after_rename: Some(&substitute),
+                ..Hooks::default()
+            },
+        );
+        assert!(
+            matches!(&outcome, Outcome::Failed { stage, error, .. } if stage == "postcheck" && error.contains("changed source identity")),
+            "{outcome:?}"
+        );
+        let backup = PathBuf::from(ledger.in_progress[&unit].trim_end_matches('/'));
+        assert_eq!(
+            fs::read(backup.join("a/b/data")).unwrap(),
+            vec![7u8; 300_000]
+        );
+        assert_eq!(
+            fs::read(saved.join("a/b/data")).unwrap(),
+            vec![7u8; 300_000]
+        );
+        assert_eq!(
+            fs::read(aside.join("a/b/data")).unwrap(),
+            vec![9u8; 300_000]
+        );
+        assert!(
+            !unit.exists(),
+            "rollback must not move the unverified replacement"
+        );
+        assert!(ledger.relocations.is_empty());
+    }
+
+    #[test]
+    fn a_same_count_child_change_hidden_by_aggregate_timestamps_is_preserved() {
+        if !rsync_available() {
+            return;
+        }
+        for before_remove in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            if !sees_every_process(&unit) {
+                return;
+            }
+            // This timestamp masks later writes in the old max-seconds
+            // comparison. Candidates are explicit fixtures, as in the other
+            // executor tests; the planner's idle policy is tested separately.
+            fs::File::open(unit.join("a/b/data"))
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(86_400),
+                ))
+                .unwrap();
+            let root_mtime = fs::metadata(&unit).unwrap().modified().unwrap();
+            let candidate = candidate_for(&unit);
+            let aside = sibling(&unit, "sbh-relocating").unwrap();
+            let saved = tmp.path().join("old-top-preserved");
+            let substitute = |_: &Path| {
+                fs::rename(aside.join("top"), &saved).unwrap();
+                fs::write(aside.join("top"), b"new").unwrap();
+                // Even restoring the root mtime cannot hide a different
+                // descendant inode from the full metadata fingerprint.
+                fs::File::open(&aside)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(root_mtime))
+                    .unwrap();
+                let current = survey::survey_tree(&aside, 0, 10_000).unwrap();
+                assert!(
+                    postcheck_matches(&candidate.stats, &current),
+                    "old aggregate gate misses the replaced child"
+                );
+            };
+            let hooks = if before_remove {
+                Hooks {
+                    before_remove: Some(&substitute),
+                    ..Hooks::default()
+                }
+            } else {
+                Hooks {
+                    after_rename: Some(&substitute),
+                    ..Hooks::default()
+                }
+            };
+            let config = local_config(tmp.path());
+            let mut ledger = Ledger::default();
+            let outcome = relocate_with_hooks(
+                &config,
+                &crate::platform::current(),
+                &mut ledger,
+                &candidate,
+                "child-replaced",
+                1_000,
+                &hooks,
+            );
+            let expected_stage = if before_remove { "remove" } else { "postcheck" };
+            assert!(
+                matches!(&outcome, Outcome::Failed { stage, error, .. } if stage == expected_stage && error.contains("contents changed")),
+                "{outcome:?}"
+            );
+            let preserved = if before_remove { &aside } else { &unit };
+            assert_eq!(fs::read(preserved.join("top")).unwrap(), b"new");
+            assert_eq!(fs::read(saved).unwrap(), b"top");
+            let destination = ledger.in_progress.get(&unit).map_or_else(
+                || ledger.relocations[0].destination.as_str(),
+                String::as_str,
+            );
+            assert_eq!(
+                fs::read(Path::new(destination).join("top")).unwrap(),
+                b"top"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_replacement_never_redirects_copy_stub_publication_or_removal() {
+        if !rsync_available() {
+            return;
+        }
+        for boundary in ["copy", "stub", "remove"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            if !sees_every_process(&unit) {
+                return;
+            }
+            let old_parent = unit.parent().unwrap().to_path_buf();
+            let moved = tmp.path().join("scratch-moved");
+            let replace_parent = |_: &Path| {
+                fs::rename(&old_parent, &moved).unwrap();
+                fs::create_dir_all(&unit).unwrap();
+                fs::write(unit.join("foreign-work"), b"keep replacement data").unwrap();
+                fs::write(unit.join(RECORD_FILENAME), b"keep replacement metadata").unwrap();
+            };
+            let hooks = match boundary {
+                "copy" => Hooks {
+                    before_copy: Some(&replace_parent),
+                    ..Hooks::default()
+                },
+                "stub" => Hooks {
+                    before_stub_publish: Some(&replace_parent),
+                    ..Hooks::default()
+                },
+                _ => Hooks {
+                    before_remove: Some(&replace_parent),
+                    ..Hooks::default()
+                },
+            };
+            let config = local_config(tmp.path());
+            let mut ledger = Ledger::default();
+            let outcome = relocate_with_hooks(
+                &config,
+                &crate::platform::current(),
+                &mut ledger,
+                &candidate_for(&unit),
+                "parent-replaced",
+                1_000,
+                &hooks,
+            );
+            let Outcome::Failed { error, .. } = outcome else {
+                panic!("moved parent was accepted: {outcome:?}");
+            };
+            assert!(
+                error.contains("parent path was replaced or moved"),
+                "{boundary}: {error}"
+            );
+            assert!(
+                error.contains(moved.to_str().unwrap()),
+                "{boundary}: {error}"
+            );
+            assert_eq!(
+                fs::read(unit.join("foreign-work")).unwrap(),
+                b"keep replacement data"
+            );
+            assert_eq!(
+                fs::read(unit.join(RECORD_FILENAME)).unwrap(),
+                b"keep replacement metadata"
+            );
+            let original = if boundary == "remove" {
+                moved.join(".unit.sbh-relocating")
+            } else {
+                moved.join("unit")
+            };
+            assert_eq!(
+                fs::read(original.join("a/b/data")).unwrap(),
+                vec![7u8; 300_000]
+            );
+            let destination = ledger.in_progress.get(&unit).map_or_else(
+                || ledger.relocations[0].destination.as_str(),
+                String::as_str,
+            );
+            assert_eq!(
+                fs::read(Path::new(destination).join("a/b/data")).unwrap(),
+                vec![7u8; 300_000]
+            );
+        }
+    }
+
+    #[test]
+    fn a_preexisting_aside_including_a_dangling_symlink_is_never_replaced() {
+        if !rsync_available() {
+            return;
+        }
+        for symlink in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            if !sees_every_process(&unit) {
+                return;
+            }
+            let aside = sibling(&unit, "sbh-relocating").unwrap();
+            let link_target = tmp.path().join("absent-foreign-target");
+            if symlink {
+                std::os::unix::fs::symlink(&link_target, &aside).unwrap();
+                assert!(
+                    !aside.exists(),
+                    "the old exists guard misses dangling links"
+                );
+            } else {
+                fs::create_dir(&aside).unwrap();
+                fs::write(aside.join("foreign"), b"unrelated tree").unwrap();
+            }
+            let mut ledger = Ledger::default();
+            let outcome = relocate(
+                &local_config(tmp.path()),
+                &crate::platform::current(),
+                &mut ledger,
+                &candidate_for(&unit),
+                "existing-aside",
+                1_000,
+            );
+            assert!(
+                matches!(outcome, Outcome::Failed { ref stage, .. } if stage == "rename"),
+                "{outcome:?}"
+            );
+            assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+            if symlink {
+                assert_eq!(fs::read_link(&aside).unwrap(), link_target);
+            } else {
+                assert_eq!(fs::read(aside.join("foreign")).unwrap(), b"unrelated tree");
+            }
+            let backup = PathBuf::from(ledger.in_progress[&unit].trim_end_matches('/'));
+            assert_eq!(
+                fs::read(backup.join("a/b/data")).unwrap(),
+                vec![7u8; 300_000]
+            );
+        }
+    }
+
+    #[test]
+    fn a_replaced_published_stub_keeps_the_source_and_both_stub_locations() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        if !sees_every_process(&unit) {
+            return;
+        }
+        let kept_stub = tmp.path().join("saved-stub");
+        let replace_stub = |_: &Path| {
+            fs::rename(&unit, &kept_stub).unwrap();
+            fs::create_dir(&unit).unwrap();
+            fs::write(unit.join("new-work"), b"preserve new occupant").unwrap();
+        };
+        let mut ledger = Ledger::default();
+        let outcome = relocate_with_hooks(
+            &local_config(tmp.path()),
+            &crate::platform::current(),
+            &mut ledger,
+            &candidate_for(&unit),
+            "stub-replaced",
+            1_000,
+            &Hooks {
+                before_remove: Some(&replace_stub),
+                ..Hooks::default()
+            },
+        );
+        assert!(
+            matches!(&outcome, Outcome::Failed { stage, error, .. } if stage == "remove" && error.contains(kept_stub.to_str().unwrap())),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            fs::read(unit.join("new-work")).unwrap(),
+            b"preserve new occupant"
+        );
+        assert!(kept_stub.join(RECORD_FILENAME).is_file());
+        let aside = sibling(&unit, "sbh-relocating").unwrap();
+        assert_eq!(
+            fs::read(aside.join("a/b/data")).unwrap(),
+            vec![7u8; 300_000]
+        );
+        assert_eq!(
+            fs::read(Path::new(&ledger.relocations[0].destination).join("a/b/data")).unwrap(),
+            vec![7u8; 300_000]
+        );
+    }
+
+    #[test]
+    fn source_evidence_is_repeatable_and_refuses_incomplete_work_budgets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        let source = survey::open_directory(&unit).unwrap();
+        let first = SourceEvidence::capture(&source, 100).unwrap();
+        assert!(first.matches(&SourceEvidence::capture(&source, 100).unwrap(), false));
+        let error = SourceEvidence::capture(&source, 0).err().unwrap();
+        assert!(error.to_string().contains("entry budget exhausted"));
+        for (depth, names_left, expected) in [
+            (0, 0, "working-name budget exhausted"),
+            (
+                SOURCE_EVIDENCE_MAX_DEPTH,
+                SOURCE_EVIDENCE_NAME_BYTES,
+                "directory depth exhausted",
+            ),
+        ] {
+            let error = fingerprint_directory(
+                &source,
+                Path::new(""),
+                &rustix::fs::fstat(&source).unwrap(),
+                depth,
+                &mut EvidenceBudget {
+                    entries_left: 100,
+                    names_left,
+                },
+                &mut Sha256::new(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
     }
 
     fn restore_fixture(root: &Path) -> (PathBuf, PathBuf) {
