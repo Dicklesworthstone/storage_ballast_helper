@@ -1498,6 +1498,18 @@ admits compression; it does not add deletion roots, change the daemon's global
 pressure level, or grant a cleanup hold through an unmonitored mount alias.
 Read-only filesystems, failed samples, and unknown capacity cannot start a pass.
 
+Root filesystem and device probes run on one bounded background worker; the
+monitor never waits for them. Completed roots can start a pass while a later
+probe is blocked. Admission evidence expires after 60 seconds, and a root
+awaiting fresh evidence cannot hold cleanup. A stuck native probe retains its
+worker slot rather than spawning more threads, so it can delay compression
+without blocking monitoring, ballast release, or emergency cleanup.
+
+Reloading compression settings, protected paths, or control-file locations
+revokes the active pass and pending root evidence. Cancellation remains set
+until the old worker exits, and old discovery progress cannot skip work under
+the new settings. Unrelated UI and notification settings preserve active work.
+
 The hold ends when the pass finishes or its wall-clock allowance expires:
 the 60-second discovery budget plus `compress.policy.timeout_secs`, measured
 from the scheduling tick. A cancellation asks the worker to stop and retains

@@ -2040,7 +2040,7 @@ mod tests {
         structural_score,
     };
     use crate::platform::{linux, macos};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn darwin_user_temp_dir_is_a_temp_root() {
@@ -2502,7 +2502,7 @@ mod tests {
             PathBuf::from("/root/.cargo"),
             PathBuf::from("/data/ssd/tmp/rch-cargo-cache-csd"),
             PathBuf::from("/scratch/tmp/rch-cargo-cache-timeout-worker"),
-            marked_home.clone(),
+            marked_home,
         ] {
             for root in ["registry", "git"] {
                 let path = home.join(root);
