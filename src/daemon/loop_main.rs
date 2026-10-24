@@ -1626,6 +1626,10 @@ struct MountTickResponse {
     response: crate::monitor::pid::PressureResponse,
     seconds_to_red: Option<f64>,
     prediction_confident: bool,
+    /// The predictive policy put this mount itself in imminent danger this
+    /// tick (after confidence gating). `last_predictive_action` keeps only
+    /// the most severe action across mounts, so it can name one mount only.
+    imminent_danger: bool,
     /// The mount's EWMA estimate, for `state.json` (`rates`, `rate_bps`).
     rate: MountRateState,
 }
@@ -5252,6 +5256,7 @@ impl MonitoringDaemon {
             {
                 pred_action = PredictiveAction::Clear;
             }
+            let imminent_danger = matches!(pred_action, PredictiveAction::ImminentDanger { .. });
 
             if pred_action.severity() > self.last_predictive_action.severity() {
                 self.last_predictive_action = pred_action;
@@ -5272,6 +5277,7 @@ impl MonitoringDaemon {
                 response: response.clone(),
                 seconds_to_red: predicted_seconds,
                 prediction_confident: rate_estimate.confidence >= effective_min_conf,
+                imminent_danger,
                 rate: MountRateState {
                     bytes_per_sec: rate_estimate.bytes_per_second,
                     accel: rate_estimate.acceleration,
@@ -5549,19 +5555,18 @@ impl MonitoringDaemon {
             // The tick's behavior mode follows the worst mount, but a release
             // frees space only on this mount's own volume. Release here only
             // from a level whose matrix cell releases ballast, or when the
-            // predictive policy names this mount in imminent danger (as the
+            // predictive policy puts this mount in imminent danger (as the
             // Green safety net below does). Otherwise a mount idle at Yellow
             // beside an Orange one released the file it had just refilled on
             // the next tick, and refilled it again after each cooldown (#38).
+            // The danger is this mount's own forecast: last_predictive_action
+            // names only the most severe mount, and two mounts can fill at once.
             let release_here = release_ballast
                 && (behavior_should_release_ballast(
                     self.behavior_state
                         .table()
                         .mode_for(self.behavior_state.memory_level, tick.response.level),
-                ) || matches!(
-                    &self.last_predictive_action,
-                    PredictiveAction::ImminentDanger { mount: danger, .. } if *danger == mount
-                ));
+                ) || tick.imminent_danger);
 
             let mut files_released = 0;
             match decision.state {
@@ -11240,6 +11245,7 @@ mod tests {
             },
             seconds_to_red: None,
             prediction_confident: false,
+            imminent_danger: false,
             rate: MountRateState::default(),
         }
     }
@@ -11741,7 +11747,7 @@ mod tests {
     /// at Yellow beside an Orange one released its reserve, including a file
     /// it had just refilled, although its own level releases nothing and the
     /// release frees nothing on the Orange volume. Each mount releases only
-    /// from its own level, or when the predictive policy names it.
+    /// from its own level, or when its own forecast is imminent danger.
     #[cfg(unix)]
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -11870,14 +11876,20 @@ mod tests {
             "the Orange mount releases its own reserve (urgency 0.7 asks for three)"
         );
 
-        // A mount the predictive policy names in imminent danger still
-        // releases while another mount sets the tick's mode.
+        // A mount whose own forecast is imminent danger still releases while
+        // another mount sets the tick's mode, even when that other mount is
+        // also in (more severe) imminent danger and is the one
+        // last_predictive_action names: it keeps only the worst mount's.
         daemon.last_predictive_action = PredictiveAction::ImminentDanger {
-            mount: yellow.clone(),
-            minutes_remaining: 3.0,
-            critical: false,
+            mount: orange,
+            minutes_remaining: 1.0,
+            critical: true,
         };
-        daemon.mount_responses = vec![tick(&yellow, PressureLevel::Yellow, 15.5), worst];
+        let mut endangered = tick(&yellow, PressureLevel::Yellow, 15.5);
+        endangered.imminent_danger = true;
+        let mut worst = worst;
+        worst.imminent_danger = true;
+        daemon.mount_responses = vec![endangered, worst];
         daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
         assert!(
             available(&daemon, &yellow) < 2,
