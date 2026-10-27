@@ -1426,6 +1426,8 @@ mod tests {
                 bytes_freed: 1_073_741_824,
                 errors: 0,
                 dropped_log_events: 0,
+                freed_basis: crate::scanner::deletion::FreedBasis::Observed,
+                bytes_freed_observed: None,
             },
             policy_mode: "enforce".into(),
             memory_rss_bytes: 52_428_800,

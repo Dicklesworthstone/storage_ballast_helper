@@ -91,12 +91,18 @@ fn apply_requires_both_acknowledgements_before_any_file_access() {
         CompressionMode {
             apply: true,
             allow_zstd_feature: true,
-            quiescent: false,
+            ..CompressionMode::default()
         },
         CompressionMode {
             apply: true,
-            allow_zstd_feature: false,
-            quiescent: true,
+            acknowledgement: ConcurrencyAcknowledgement::Quiescent,
+            ..CompressionMode::default()
+        },
+        // The daemon's opt-in replaces quiescence, never the zstd consent.
+        CompressionMode {
+            apply: true,
+            acknowledgement: ConcurrencyAcknowledgement::Unattended,
+            ..CompressionMode::default()
         },
     ] {
         let error = run(
@@ -109,6 +115,29 @@ fn apply_requires_both_acknowledgements_before_any_file_access() {
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("requires"));
+    }
+
+    // With the zstd consent, either acknowledgement passes the gate: whatever
+    // happens next is about the file, not a refused acknowledgement.
+    for acknowledgement in [
+        ConcurrencyAcknowledgement::Quiescent,
+        ConcurrencyAcknowledgement::Unattended,
+    ] {
+        let mode = CompressionMode {
+            apply: true,
+            allow_zstd_feature: true,
+            acknowledgement,
+        };
+        let outcome = run(
+            &["/nonexistent/no-file-opened".into()],
+            &CompressionPolicy::default(),
+            mode,
+            &Config::default(),
+            &MockPlatform::healthy(),
+        );
+        if let Err(error) = outcome {
+            assert!(!error.to_string().contains("--quiescent"), "{error}");
+        }
     }
 }
 

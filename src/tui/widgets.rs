@@ -217,6 +217,18 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// A freed-bytes counter. An allocated-size estimate is marked as one, so it
+/// never reads as a measurement (bd-oj33).
+#[must_use]
+pub fn human_freed(bytes: u64, basis: crate::scanner::deletion::FreedBasis) -> String {
+    use crate::scanner::deletion::FreedBasis;
+    match basis {
+        FreedBasis::Observed => human_bytes(bytes),
+        FreedBasis::Estimated => format!("~{} est.", human_bytes(bytes)),
+        FreedBasis::EstimatedUpperBound => format!("<={} est.", human_bytes(bytes)),
+    }
+}
+
 /// Format a rate in bytes/sec as a human-readable string.
 #[must_use]
 pub fn human_rate(bps: f64) -> String {

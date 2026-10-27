@@ -2,15 +2,14 @@
 //! units are dormant.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
 use super::config::RelocationConfig;
 use super::ledger::Ledger;
-use super::survey::{self, TreeSurvey, UnitStats};
+use super::survey::{self, PolicyVeto, TreeSurvey, UnitStats};
 use crate::platform::pal::Platform;
-use crate::scanner::protection::MARKER_FILENAME;
 use crate::scanner::walker::{ActiveReferenceIndex, collect_active_reference_index};
 
 /// A directory holding a `.sbh-protect` marker under a scratch root.
@@ -18,7 +17,7 @@ use crate::scanner::walker::{ActiveReferenceIndex, collect_active_reference_inde
 pub struct MarkedTree {
     /// The marked directory.
     pub path: PathBuf,
-    /// False when the marker says `relocatable = false`.
+    /// False when the marker opts out or its permission cannot be established.
     pub relocatable: bool,
 }
 
@@ -105,17 +104,15 @@ impl Plan {
     }
 }
 
-/// Read a marker's `relocatable` key. A marker that does not parse as TOML
-/// (an empty or legacy marker) is relocatable.
+/// Read a marker's `relocatable` key without following links or blocking.
+///
+/// Empty and valid metadata markers remain relocatable;
+/// malformed, unreadable, or unsafe markers never grant permission.
 #[must_use]
 pub fn marker_relocatable(dir: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(dir.join(MARKER_FILENAME)) else {
-        return true;
-    };
-    toml::from_str::<toml::Table>(&text)
-        .ok()
-        .and_then(|table| table.get("relocatable").and_then(toml::Value::as_bool))
-        .unwrap_or(true)
+    survey::open_directory(dir)
+        .and_then(|directory| survey::marker_policy(&directory))
+        .is_ok_and(|policy| policy != Some(false))
 }
 
 /// Marked trees under `root`, searched `depth` levels deep. A marker ends
@@ -133,9 +130,11 @@ pub fn find_marked_trees(root: &Path, config: &RelocationConfig) -> Vec<MarkedTr
     let device = std::os::unix::fs::MetadataExt::dev(&root_meta);
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
-        if dir.join(MARKER_FILENAME).is_file() {
+        let marker =
+            survey::open_directory(&dir).and_then(|directory| survey::marker_policy(&directory));
+        if !matches!(marker, Ok(None)) {
             found.push(MarkedTree {
-                relocatable: marker_relocatable(&dir),
+                relocatable: matches!(marker, Ok(Some(true))),
                 path: dir,
             });
             continue;
@@ -162,6 +161,145 @@ pub fn find_marked_trees(root: &Path, config: &RelocationConfig) -> Vec<MarkedTr
     }
     found.sort_by(|a, b| a.path.cmp(&b.path));
     found
+}
+
+fn uncertain_policy(path: &Path, reason: impl std::fmt::Display) -> PolicyVeto {
+    PolicyVeto {
+        path: path.to_path_buf(),
+        reason: format!("cannot establish relocation permission: {reason}"),
+        excluded_pattern: None,
+    }
+}
+
+/// Check the full configured scope, including markers above the first marked
+/// tree. With overlapping roots the outermost one wins: naming a deeper root
+/// cannot bypass an opt-out or excluded component below the outer root.
+fn ancestor_policy(
+    config: &RelocationConfig,
+    path: &Path,
+    allow_missing_leaf: bool,
+) -> Result<(), PolicyVeto> {
+    if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+        return Err(uncertain_policy(
+            path,
+            "candidate path is not an absolute, confined path",
+        ));
+    }
+    let root = config
+        .roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .min_by_key(|root| root.components().count())
+        .ok_or_else(|| uncertain_policy(path, "candidate is outside configured scratch roots"))?;
+    if root.components().any(|part| part == Component::ParentDir) {
+        return Err(uncertain_policy(
+            root,
+            "scratch root contains a parent component",
+        ));
+    }
+    if let Some(veto) = survey::excluded_veto(config, root) {
+        return Err(veto);
+    }
+    let mut directory = match survey::open_directory(root) {
+        Ok(directory) => directory,
+        // A configured root may itself be the marked relocation unit. Once
+        // renamed, its marker is checked at tree_path by the fresh survey;
+        // a root recreated meanwhile is inspected normally and may opt out.
+        Err(error)
+            if allow_missing_leaf
+                && root == path
+                && error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(uncertain_policy(root, error)),
+    };
+    let mut current = root.clone();
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|error| uncertain_policy(path, error))?;
+    let mut components = relative.components();
+    loop {
+        if let Some(veto) = survey::excluded_veto(config, &current)
+            .or_else(|| survey::marker_veto(&directory, &current))
+        {
+            return Err(veto);
+        }
+        let Some(Component::Normal(name)) = components.next() else {
+            return Ok(());
+        };
+        current.push(name);
+        if let Some(veto) = survey::excluded_veto(config, &current) {
+            return Err(veto);
+        }
+        // Ancestor policy is read-only. An explicitly configured scratch
+        // root may be a mount below another configured root; inspect its
+        // ancestors without rejecting that valid scope. The subtree survey
+        // separately refuses every mount boundary inside the moved unit.
+        let opened = rustix::fs::openat(
+            &directory,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map(fs::File::from)
+        .map_err(std::io::Error::from);
+        directory = match opened {
+            Ok(child) => child,
+            Err(error)
+                if allow_missing_leaf
+                    && current == path
+                    && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(uncertain_policy(&current, error)),
+        };
+    }
+}
+
+/// Renew relocation policy at an execution boundary.
+///
+/// `original_path` is the operator-visible location; `tree_path` is that directory before copy, or
+/// its renamed sibling before removal. Ancestor opt-outs remain effective
+/// after rename, while descendant policy is read from the actual source.
+///
+/// The existing entry budget bounds a fresh policy-aware survey. Incomplete
+/// evidence, unsafe markers, mount crossings and exclusions all refuse the
+/// operation. The complete survey is returned so the executor can also renew
+/// its content comparison without a second traversal. Process safety still
+/// requires a fresh holder check after this walk.
+pub fn check_relocation_policy(
+    config: &RelocationConfig,
+    original_path: &Path,
+    tree_path: &Path,
+) -> Result<TreeSurvey, String> {
+    if original_path != tree_path && original_path.parent() != tree_path.parent() {
+        return Err("renamed relocation source is not a sibling of the original path".into());
+    }
+    let renamed = original_path != tree_path;
+    ancestor_policy(config, original_path, renamed).map_err(|veto| veto.to_string())?;
+    let survey = survey::survey_tree_with_policy(tree_path, 0, config.max_entries, config)
+        .map_err(|error| format!("cannot inspect relocation policy: {error}"))?;
+    let unit = &survey.units[0];
+    if survey.truncated || unit.unreadable || unit.crosses_mount {
+        return Err("relocation policy survey is incomplete or crosses a mount".into());
+    }
+    if let Some(veto) = &unit.relocation_veto {
+        return Err(veto.to_string());
+    }
+    let source = survey::open_directory(tree_path)
+        .map_err(|error| format!("cannot renew source policy: {error}"))?;
+    if let Some(veto) = survey::marker_veto(&source, tree_path) {
+        return Err(veto.to_string());
+    }
+    // A large subtree walk must not hide an owner opt-out made on its
+    // ancestors while that walk was running.
+    ancestor_policy(config, original_path, renamed).map_err(|veto| veto.to_string())?;
+    Ok(survey)
 }
 
 /// One process sweep over `roots`, retried while it is incomplete.
@@ -245,6 +383,14 @@ pub struct Evidence {
 /// Decide one unit.
 #[must_use]
 pub fn classify(stats: &UnitStats, evidence: &Evidence, now: i64, window: i64) -> Verdict {
+    if let Some(veto) = &stats.relocation_veto {
+        return veto
+            .excluded_pattern
+            .as_ref()
+            .map_or(Verdict::NotRelocatable, |pattern| Verdict::Excluded {
+                pattern: pattern.clone(),
+            });
+    }
     if let Some(pattern) = &evidence.excluded {
         return Verdict::Excluded {
             pattern: pattern.clone(),
@@ -321,9 +467,16 @@ pub fn build_plan(
             plan.truncated = true;
             break;
         }
-        let Ok(survey) = survey::survey_tree(&tree.path, config.unit_depth, budget) else {
+        let Ok(mut survey) =
+            survey::survey_tree_with_policy(&tree.path, config.unit_depth, budget, config)
+        else {
             continue;
         };
+        if let Err(veto) = ancestor_policy(config, &tree.path, false) {
+            for unit in &mut survey.units {
+                unit.relocation_veto.get_or_insert_with(|| veto.clone());
+            }
+        }
         plan.entries += survey.entries;
         plan.truncated |= survey.truncated;
         surveys.push((tree, survey));
@@ -353,6 +506,8 @@ pub fn build_plan(
                 let quiet = !survey.truncated
                     && !stats.unreadable
                     && !stats.crosses_mount
+                    && stats.relocation_veto.is_none()
+                    && tree.relocatable
                     && holders == Holders::None;
                 ledger.observe(&stats.path, stats.newest_change, quiet, now, gap);
             }
@@ -388,6 +543,9 @@ pub fn build_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::pal::MockPlatform;
+    use crate::relocate::ledger::Observation;
+    use crate::scanner::protection::MARKER_FILENAME;
 
     const DAY: i64 = 86_400;
     const NOW: i64 = 2_000_000_000;
@@ -404,6 +562,7 @@ mod tests {
             newest_access: access_days.map(|days| NOW - days * DAY),
             crosses_mount: false,
             unreadable: false,
+            relocation_veto: None,
             uid: 1000,
             gid: 1000,
             mode: 0o755,
@@ -539,5 +698,185 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn test_config(root: &Path) -> RelocationConfig {
+        RelocationConfig {
+            roots: vec![root.to_path_buf()],
+            min_bytes: 0,
+            unit_depth: 1,
+            max_entries: 1_000,
+            ..RelocationConfig::default()
+        }
+    }
+
+    /// Supply a real continuous observation history so the same fixture
+    /// works on both atime and noatime test filesystems.
+    fn dormant_plan(config: &RelocationConfig, marked: &Path) -> Plan {
+        let now = chrono::Utc::now().timestamp() + 30 * DAY;
+        let survey = survey::survey_tree(marked, config.unit_depth, config.max_entries).unwrap();
+        let mut ledger = Ledger::default();
+        for unit in survey.units {
+            ledger.observations.insert(
+                unit.path,
+                Observation {
+                    quiet_since: now - 20 * DAY,
+                    last_seen: now,
+                    newest_change: unit.newest_change,
+                },
+            );
+        }
+        build_plan(config, &MockPlatform::healthy(), &mut ledger, now)
+    }
+
+    #[test]
+    fn nested_opt_out_and_cache_keep_enclosing_units_but_allow_safe_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marked = tmp.path().join("session");
+        for directory in ["pinned/deep/inside", ".cargo", "safe"] {
+            fs::create_dir_all(marked.join(directory)).unwrap();
+            fs::write(marked.join(directory).join("data"), b"preserve").unwrap();
+        }
+        fs::write(marked.join(MARKER_FILENAME), "added_by = \"agent\"\n").unwrap();
+        let pinned = marked.join("pinned/deep/inside").join(MARKER_FILENAME);
+        fs::write(&pinned, "relocatable = false\n").unwrap();
+        let plan = dormant_plan(&test_config(tmp.path()), &marked);
+        let selected: Vec<_> = plan
+            .selected()
+            .iter()
+            .map(|unit| unit.stats.path.clone())
+            .collect();
+        assert_eq!(selected, vec![marked.join("safe")]);
+        let parent = plan
+            .candidates
+            .iter()
+            .find(|unit| unit.stats.path == marked)
+            .unwrap();
+        assert!(parent.stats.relocation_veto.is_some());
+        let pinned_unit = plan
+            .candidates
+            .iter()
+            .find(|unit| unit.stats.path == marked.join("pinned"))
+            .unwrap();
+        assert_eq!(pinned_unit.verdict, Verdict::NotRelocatable);
+        assert_eq!(
+            pinned_unit.stats.relocation_veto.as_ref().unwrap().path,
+            pinned
+        );
+        let cache = plan
+            .candidates
+            .iter()
+            .find(|unit| unit.stats.path == marked.join(".cargo"))
+            .unwrap();
+        assert_eq!(
+            cache.verdict,
+            Verdict::Excluded {
+                pattern: ".cargo".into()
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_outer_marker_vetoes_every_child_and_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marked = tmp.path().join("session");
+        fs::create_dir_all(marked.join("child")).unwrap();
+        fs::write(marked.join("child/data"), b"keep").unwrap();
+        fs::write(marked.join(MARKER_FILENAME), "relocatable = \"false\"\n").unwrap();
+        let plan = dormant_plan(&test_config(tmp.path()), &marked);
+        assert_eq!(plan.marked_trees, 1);
+        assert!(plan.selected().is_empty());
+        assert_eq!(plan.candidates.len(), 2);
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|unit| unit.verdict == Verdict::NotRelocatable)
+        );
+    }
+
+    #[test]
+    fn fresh_policy_honors_ancestor_opt_out_across_overlapping_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marked = tmp.path().join("outer/session");
+        let child = marked.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(marked.join(MARKER_FILENAME), "").unwrap();
+        fs::write(child.join("data"), b"keep").unwrap();
+        let mut config = test_config(tmp.path());
+        config.roots.push(marked.clone());
+        assert!(check_relocation_policy(&config, &child, &child).is_ok());
+        // The owner opts out above the first marked tree after planning.
+        let ancestor_marker = tmp.path().join(MARKER_FILENAME);
+        fs::write(&ancestor_marker, "relocatable = false\n").unwrap();
+        let refusal = check_relocation_policy(&config, &child, &child).unwrap_err();
+        assert!(refusal.contains(&ancestor_marker.display().to_string()));
+        assert!(refusal.contains("relocatable = false"));
+        assert!(dormant_plan(&config, &marked).selected().is_empty());
+    }
+
+    #[test]
+    fn fresh_policy_reads_renamed_source_and_original_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marked = tmp.path().join("session");
+        let child = marked.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(marked.join(MARKER_FILENAME), "").unwrap();
+        fs::write(child.join("data"), b"keep").unwrap();
+        let config = test_config(tmp.path());
+        let aside = marked.join("child.sbh-relocating");
+        fs::rename(&child, &aside).unwrap();
+        assert!(check_relocation_policy(&config, &child, &aside).is_ok());
+        fs::write(marked.join(MARKER_FILENAME), "relocatable = false\n").unwrap();
+        assert!(check_relocation_policy(&config, &child, &aside).is_err());
+        fs::write(marked.join(MARKER_FILENAME), "").unwrap();
+        fs::write(aside.join(MARKER_FILENAME), "relocatable = false\n").unwrap();
+        assert!(check_relocation_policy(&config, &child, &aside).is_err());
+    }
+
+    #[test]
+    fn configured_root_can_be_renewed_after_rename_without_ignoring_a_new_opt_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("scratch");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join(MARKER_FILENAME), "").unwrap();
+        fs::write(root.join("data"), b"keep").unwrap();
+        let config = test_config(&root);
+        let aside = tmp.path().join("scratch.sbh-relocating");
+        fs::rename(&root, &aside).unwrap();
+        assert!(check_relocation_policy(&config, &root, &aside).is_ok());
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join(MARKER_FILENAME), "relocatable = false\n").unwrap();
+        assert!(check_relocation_policy(&config, &root, &aside).is_err());
+    }
+
+    #[test]
+    fn exclusions_are_scoped_to_scratch_root_and_include_descendants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rch-outside-scope/scratch");
+        let marked = root.join("session");
+        fs::create_dir_all(marked.join("safe")).unwrap();
+        fs::write(marked.join(MARKER_FILENAME), "").unwrap();
+        let mut config = test_config(&root);
+        assert!(check_relocation_policy(&config, &marked, &marked).is_ok());
+        config.exclude.push("keep-*".into());
+        fs::create_dir_all(marked.join("deep/inside/keep-data")).unwrap();
+        assert!(check_relocation_policy(&config, &marked, &marked).is_err());
+        let safe = marked.join("safe");
+        assert!(check_relocation_policy(&config, &safe, &safe).is_ok());
+        let mut outside = config.clone();
+        outside.roots = vec![tmp.path().join("unrelated")];
+        assert!(check_relocation_policy(&outside, &safe, &safe).is_err());
+    }
+
+    #[test]
+    fn fresh_policy_refuses_incomplete_walks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marked = tmp.path().join("session");
+        fs::create_dir(&marked).unwrap();
+        fs::write(marked.join(MARKER_FILENAME), "").unwrap();
+        fs::write(marked.join("data"), b"keep").unwrap();
+        let mut config = test_config(tmp.path());
+        config.max_entries = 1;
+        assert!(check_relocation_policy(&config, &marked, &marked).is_err());
     }
 }

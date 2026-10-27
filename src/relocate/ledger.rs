@@ -8,13 +8,69 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 /// File name of the ledger inside the state directory.
 pub const LEDGER_FILENAME: &str = "relocation-ledger.json";
+
+/// Exclusive ownership of a ledger's load, observation and save cycle.
+///
+/// Keep this guard alive through the last save, including transfers. Reports
+/// that cannot acquire it may read a snapshot, but must not save observations.
+pub struct WriterLock {
+    #[cfg(unix)]
+    _file: nix::fcntl::Flock<fs::File>,
+}
+
+impl WriterLock {
+    /// Acquire the shared report/apply writer lock without waiting.
+    pub fn acquire(state_dir: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            fs::create_dir_all(state_dir)?;
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(state_dir.join("relocate.lock"))?;
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "relocation lock is not a regular file",
+                ));
+            }
+            let file = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                .map_err(|(_, errno)| io::Error::from(errno))?;
+            Ok(Self { _file: file })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = state_dir;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "relocation ledger locking requires Unix",
+            ))
+        }
+    }
+}
+
+fn create_staging(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
 
 /// One tree's quiet streak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,23 +116,60 @@ pub struct Ledger {
 impl Ledger {
     /// Read the ledger in `state_dir`; a missing file is an empty ledger.
     pub fn load(state_dir: &Path) -> io::Result<Self> {
-        match fs::read(state_dir.join(LEDGER_FILENAME)) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error),
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // A dangling symlink is existing, unreadable state, not a missing
+            // ledger. Nonblocking open also keeps a FIFO from stalling reports.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
+        let file = match options.open(state_dir.join(LEDGER_FILENAME)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "relocation ledger is not a regular file",
+            ));
+        }
+        serde_json::from_reader(io::BufReader::new(file))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
-    /// Write the ledger atomically (temporary file, fsync, rename).
+    /// Write the ledger atomically and durably, using a private staging file.
+    ///
+    /// The caller must hold [`WriterLock`] from before loading this ledger
+    /// through this save, so concurrent reports cannot replace newer state.
     pub fn save(&self, state_dir: &Path) -> io::Result<()> {
         fs::create_dir_all(state_dir)?;
         let path = state_dir.join(LEDGER_FILENAME);
-        let temporary = state_dir.join(format!(".{LEDGER_FILENAME}.tmp"));
-        let mut file = fs::File::create(&temporary)?;
-        file.write_all(&serde_json::to_vec_pretty(self).map_err(io::Error::other)?)?;
-        file.sync_all()?;
-        fs::rename(&temporary, &path)
+        let temporary = state_dir.join(format!(
+            ".{LEDGER_FILENAME}.{}.{:032x}.tmp",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        // Exclusive creation never truncates or follows an existing path. Only
+        // a file successfully created by this call may be cleaned up below.
+        let mut file = create_staging(&temporary)?;
+        let staged = serde_json::to_writer_pretty(&mut file, self)
+            .map_err(io::Error::other)
+            .and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(error) = staged {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&temporary, &path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        #[cfg(unix)]
+        fs::File::open(state_dir)?.sync_all()?;
+        Ok(())
     }
 
     /// Record one sweep's finding for `path`. `quiet` means unchanged for
@@ -182,5 +275,117 @@ mod tests {
             Ledger::load(&tmp.path().join("missing")).unwrap(),
             Ledger::default()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writer_lock_serializes_reports_and_transfers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = WriterLock::acquire(tmp.path()).unwrap();
+        let error = WriterLock::acquire(tmp.path()).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        drop(first);
+        assert!(WriterLock::acquire(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn corrupt_existing_state_is_an_error_not_an_empty_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(LEDGER_FILENAME);
+        fs::write(&path, b"{interrupted or corrupt").unwrap();
+        assert_eq!(
+            Ledger::load(tmp.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(fs::read(path).unwrap(), b"{interrupted or corrupt");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dangling_ledger_symlink_is_not_treated_as_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(LEDGER_FILENAME);
+        let absent = tmp.path().join("absent");
+        std::os::unix::fs::symlink(&absent, &path).unwrap();
+        assert!(Ledger::load(tmp.path()).is_err());
+        assert_eq!(fs::read_link(path).unwrap(), absent);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn nonregular_ledger_is_rejected_without_waiting_for_a_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(LEDGER_FILENAME);
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        assert_eq!(
+            Ledger::load(tmp.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn staging_is_private_and_never_truncates_existing_files_or_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("staged");
+        let file = create_staging(&staged).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        drop(file);
+        fs::write(&staged, b"previous interrupted save").unwrap();
+        assert_eq!(
+            create_staging(&staged).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&staged).unwrap(), b"previous interrupted save");
+        let link = tmp.path().join("staging-link");
+        std::os::unix::fs::symlink(&staged, &link).unwrap();
+        assert!(create_staging(&link).is_err());
+        assert_eq!(fs::read(staged).unwrap(), b"previous interrupted save");
+        assert!(fs::symlink_metadata(link).unwrap().is_symlink());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_preserves_legacy_staging_symlinks_and_publishes_private_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _lock = WriterLock::acquire(tmp.path()).unwrap();
+        let victim = tmp.path().join("unrelated-data");
+        fs::write(&victim, b"keep these bytes").unwrap();
+        let legacy = tmp.path().join(format!(".{LEDGER_FILENAME}.tmp"));
+        std::os::unix::fs::symlink(&victim, &legacy).unwrap();
+        let mut ledger = Ledger::default();
+        ledger
+            .in_progress
+            .insert(PathBuf::from("/tmp/unit"), "backup:resume-here/".into());
+        ledger.save(tmp.path()).unwrap();
+        assert_eq!(Ledger::load(tmp.path()).unwrap(), ledger);
+        assert_eq!(fs::read(victim).unwrap(), b"keep these bytes");
+        assert!(fs::symlink_metadata(legacy).unwrap().is_symlink());
+        assert_eq!(
+            fs::metadata(tmp.path().join(LEDGER_FILENAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        // Only the caller's permanent files remain; the successful staging
+        // file was atomically replaced, and unrelated staging was preserved.
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 4);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writer_lock_refuses_a_symlink_without_touching_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("other-lock");
+        fs::write(&target, b"unrelated lock").unwrap();
+        std::os::unix::fs::symlink(&target, tmp.path().join("relocate.lock")).unwrap();
+        assert!(WriterLock::acquire(tmp.path()).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"unrelated lock");
     }
 }

@@ -24,6 +24,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use crate::core::config::BallastConfig;
 use crate::core::errors::{Result, SbhError};
+use crate::monitor::pid::PressureLevel;
 use crate::platform::pal::Platform;
 
 mod admission;
@@ -42,8 +43,99 @@ pub const FSYNC_EVERY_BYTES: u64 = 64 * 1024 * 1024; // fsync every 64 MB
 ///
 /// A ballast file is created only if the volume stays at or above this much
 /// free space after it. The daemon and CLI replace this with
-/// `Config::ballast_provision_floor_pct`, which follows the pressure thresholds.
+/// `Config::ballast_provision_floor`, which follows the pressure thresholds.
 pub const DEFAULT_PROVISION_FLOOR_PCT: f64 = 20.0;
+
+/// How much of a volume must stay free after each ballast file is created.
+///
+/// `Thresholds` derives the floor from the pressure thresholds in force on the
+/// volume being provisioned, so the absolute floors (`pressure.*_min_free_bytes`)
+/// lower it on a large volume exactly as they lower that volume's pressure
+/// levels. A single percentage for every volume left a 2 TB disk that the byte
+/// floors held at Green without a reserve: each file was refused below the
+/// percentage Orange threshold, roughly 100 GB free.
+///
+/// It also keeps every new file out of the first level at which the daemon
+/// releases ballast (#38). A floor at the Orange threshold let a refill on a
+/// Yellow volume end in Orange, where the default behavior matrix releases
+/// ballast, so the files were released again seconds after they were written.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProvisionFloor {
+    /// The same percentage on every volume.
+    Fixed(f64),
+    /// Derived from `[green, yellow, orange, red]` percentages and their
+    /// absolute byte floors (0 = off), as each volume sees them.
+    ///
+    /// The floor is the threshold that keeps the volume out of
+    /// `release_level` plus `margin_pct` points (the level hysteresis), and
+    /// never lower than the Orange threshold or two points above Red. With
+    /// `release_level = None` (no level releases ballast) only that lower
+    /// bound applies.
+    Thresholds {
+        /// `[green, yellow, orange, red]` minimum free percentages.
+        pct: [f64; 4],
+        /// The matching absolute floors in bytes (0 = off).
+        bytes: [u64; 4],
+        /// The least severe level whose behavior releases ballast.
+        release_level: Option<PressureLevel>,
+        /// Points of free space kept above the threshold of `release_level`.
+        margin_pct: f64,
+    },
+}
+
+impl ProvisionFloor {
+    /// The floor, in percent free, on a volume of `total_bytes`. An unusable
+    /// rule yields 100%, which admits nothing.
+    #[must_use]
+    pub fn pct_on(&self, total_bytes: u64) -> f64 {
+        let pct = match *self {
+            Self::Fixed(pct) => pct,
+            Self::Thresholds {
+                pct,
+                bytes,
+                release_level,
+                margin_pct,
+            } => {
+                let [green, yellow, orange, red] =
+                    crate::core::config::floored_free_pct_thresholds(pct, bytes, total_bytes);
+                let headroom = orange.max(red + 2.0);
+                // A volume at or above this much free space is not in the
+                // release level: a file that leaves it there cannot be what
+                // makes the daemon release the pool.
+                let outside_release = match release_level {
+                    None => None,
+                    // No floor keeps a volume out of Green; staying at Green
+                    // is the most a floor can do for a matrix that releases
+                    // there.
+                    Some(PressureLevel::Green | PressureLevel::Yellow) => Some(green),
+                    Some(PressureLevel::Orange) => Some(yellow),
+                    Some(PressureLevel::Red) => Some(orange),
+                    Some(PressureLevel::Critical) => Some(red),
+                };
+                match outside_release {
+                    None => headroom,
+                    // `f64::max` ignores a NaN operand, so an unusable margin
+                    // or threshold is turned into NaN explicitly; it becomes
+                    // the 100% floor below (admit nothing).
+                    Some(threshold) if margin_pct >= 0.0 && !headroom.is_nan() => {
+                        let keep_out = threshold + margin_pct;
+                        if keep_out.is_nan() {
+                            f64::NAN
+                        } else {
+                            keep_out.max(headroom)
+                        }
+                    }
+                    Some(_) => f64::NAN,
+                }
+            }
+        };
+        if pct.is_finite() {
+            pct.clamp(0.0, 100.0)
+        } else {
+            100.0
+        }
+    }
+}
 
 // ──────────────────── header ────────────────────
 
@@ -356,9 +448,9 @@ pub struct BallastManager {
     /// Set for CoW filesystems (btrfs, zfs) where zero-allocated extents can
     /// be trivially deduplicated, defeating the purpose of ballast.
     skip_fallocate: bool,
-    /// Percent of the volume that must remain free after each ballast file
-    /// is created. See [`DEFAULT_PROVISION_FLOOR_PCT`].
-    provision_floor_pct: f64,
+    /// How much of the volume must remain free after each ballast file is
+    /// created. See [`DEFAULT_PROVISION_FLOOR_PCT`] and [`ProvisionFloor`].
+    provision_floor: ProvisionFloor,
     /// Last controller observation for this manager's physical directory.
     /// A fresh controller can retain actual release credit without treating
     /// never-provisioned configured slots as releases.
@@ -369,9 +461,12 @@ pub struct BallastManager {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Admission {
     /// The next file fits: free space after creating it stays above the floor.
-    Admit { free_pct_after: Option<f64> },
+    Admit {
+        free_pct_after: Option<f64>,
+        floor_pct: f64,
+    },
     /// Creating the next file would take the volume below the floor.
-    Refuse { free_pct_after: f64 },
+    Refuse { free_pct_after: f64, floor_pct: f64 },
 }
 
 impl BallastManager {
@@ -398,7 +493,7 @@ impl BallastManager {
             inventory: Vec::new(),
             platform,
             skip_fallocate: false,
-            provision_floor_pct: DEFAULT_PROVISION_FLOOR_PCT,
+            provision_floor: ProvisionFloor::Fixed(DEFAULT_PROVISION_FLOOR_PCT),
             release_history: None,
         };
         mgr.scan_existing();
@@ -484,17 +579,31 @@ impl BallastManager {
     /// built incrementally on a low-but-not-critical volume instead of being
     /// refused wholesale.
     pub fn set_provision_floor(&mut self, floor_pct: f64) {
-        self.provision_floor_pct = if floor_pct.is_finite() {
+        self.provision_floor = ProvisionFloor::Fixed(if floor_pct.is_finite() {
             floor_pct.clamp(0.0, 100.0)
         } else {
             100.0
-        };
+        });
     }
 
-    /// The headroom floor in effect.
+    /// Set the headroom floor as a rule evaluated against the capacity of the
+    /// volume each file is created on (see [`ProvisionFloor`]).
+    pub fn set_provision_floor_rule(&mut self, floor: ProvisionFloor) {
+        self.provision_floor = floor;
+    }
+
+    /// The headroom floor rule in effect.
+    #[must_use]
+    pub const fn provision_floor(&self) -> ProvisionFloor {
+        self.provision_floor
+    }
+
+    /// The headroom floor before the volume's capacity is known: the floor
+    /// without absolute byte floors. Admission replaces it with the floor on
+    /// the volume it reads.
     #[must_use]
     pub fn provision_floor_pct(&self) -> f64 {
-        self.provision_floor_pct
+        self.provision_floor.pct_on(0)
     }
 
     /// Decide whether the next ballast file fits above the floor.
@@ -572,7 +681,7 @@ impl BallastManager {
             total_bytes: 0,
             errors: Vec::new(),
             skipped_for_floor: 0,
-            floor_pct: self.provision_floor_pct,
+            floor_pct: self.provision_floor_pct(),
             free_pct_after: None,
             created: Vec::new(),
         };
@@ -592,11 +701,19 @@ impl BallastManager {
             }
 
             match self.admit_next_file(free_pct_check) {
-                Ok(Admission::Admit { free_pct_after }) => {
+                Ok(Admission::Admit {
+                    free_pct_after,
+                    floor_pct,
+                }) => {
                     report.free_pct_after = free_pct_after;
+                    report.floor_pct = floor_pct;
                 }
-                Ok(Admission::Refuse { free_pct_after }) => {
+                Ok(Admission::Refuse {
+                    free_pct_after,
+                    floor_pct,
+                }) => {
                     report.free_pct_after = Some(free_pct_after);
+                    report.floor_pct = floor_pct;
                     report.skipped_for_floor = self
                         .config
                         .file_count
@@ -731,7 +848,7 @@ impl BallastManager {
             total_bytes: 0,
             errors: Vec::new(),
             skipped_for_floor: 0,
-            floor_pct: self.provision_floor_pct,
+            floor_pct: self.provision_floor_pct(),
             free_pct_after: None,
             created: Vec::new(),
         };
@@ -750,11 +867,19 @@ impl BallastManager {
             }
 
             match self.admit_next_file(free_pct_check) {
-                Ok(Admission::Admit { free_pct_after }) => {
+                Ok(Admission::Admit {
+                    free_pct_after,
+                    floor_pct,
+                }) => {
                     report.free_pct_after = free_pct_after;
+                    report.floor_pct = floor_pct;
                 }
-                Ok(Admission::Refuse { free_pct_after }) => {
+                Ok(Admission::Refuse {
+                    free_pct_after,
+                    floor_pct,
+                }) => {
                     report.free_pct_after = Some(free_pct_after);
+                    report.floor_pct = floor_pct;
                     report.skipped_for_floor = self
                         .config
                         .file_count

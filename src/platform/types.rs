@@ -387,6 +387,11 @@ pub const OPEN_FILES_MAX_PIDS: usize = 50_000;
 pub struct OpenFilesResult {
     pub files: Vec<OpenFile>,
     pub complete: bool,
+    /// The bound that cut an incomplete sweep short, when one did (such as a
+    /// process holding more descriptors than the per-process cap), so the
+    /// operator learns why every candidate is held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<String>,
 }
 
 impl OpenFilesResult {
@@ -395,6 +400,7 @@ impl OpenFilesResult {
         Self {
             files,
             complete: true,
+            incomplete_reason: None,
         }
     }
 
@@ -403,6 +409,7 @@ impl OpenFilesResult {
         Self {
             files,
             complete: false,
+            incomplete_reason: None,
         }
     }
 }

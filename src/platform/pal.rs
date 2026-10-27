@@ -77,6 +77,42 @@ pub struct MemoryInfo {
     pub swap_free_bytes: u64,
 }
 
+/// Meaning of a finite process-local memory boundary.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryBoundaryKind {
+    /// Crossing this boundary triggers throttling and reclaim pressure.
+    Throttle,
+    /// Further unreclaimable charges can reach the cgroup's hard limit.
+    HardLimit,
+}
+
+/// The tightest observed finite memory boundary in the visible hierarchy.
+///
+/// This is current uncharged headroom, without assuming that existing charges
+/// can be reclaimed or adding swap to RAM. It is not an allocation reservation.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MemoryHeadroom {
+    /// The scope whose own usage is compared with its own boundary.
+    pub scope: PathBuf,
+    /// Kernel interface name, such as `memory.high` or `memory.max`.
+    pub boundary: &'static str,
+    /// Distinguishes a throttle boundary from a hard limit.
+    pub boundary_kind: MemoryBoundaryKind,
+    /// Largest usage observed while reading this scope's boundary.
+    pub current_bytes: u64,
+    /// The finite boundary in bytes.
+    pub limit_bytes: u64,
+}
+
+impl MemoryHeadroom {
+    /// Headroom before reaching the observed boundary, zero when already over it.
+    #[must_use]
+    pub const fn available_bytes(&self) -> u64 {
+        self.limit_bytes.saturating_sub(self.current_bytes)
+    }
+}
+
 /// Platform-specific data/service directories.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlatformPaths {
@@ -298,6 +334,23 @@ pub trait Platform: Send + Sync {
     fn memory_info(&self) -> Result<MemoryInfo>;
     fn service_manager(&self) -> Box<dyn ServiceManager>;
 
+    /// Additional process-local memory constraints for a RAM-backed writer.
+    /// Host memory and filesystem checks remain the caller's responsibility.
+    /// Linux observes visible cgroup limits; the default adds no platform-local
+    /// policy. An error is missing evidence and must refuse the RAM route, not
+    /// be treated as an unconstrained process. This never reserves memory.
+    fn ram_write_memory_refusal(&self, _minimum_available_percent: u8) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Current process-local headroom for an explicit RAM-backed byte request.
+    /// Linux observes all visible cgroup ancestors; `None` means no finite
+    /// additional memory boundary was found. Errors are unknown evidence, not
+    /// unlimited capacity. Host memory remains separate, and swap is not added.
+    fn ram_write_headroom(&self) -> Result<Option<MemoryHeadroom>> {
+        Ok(None)
+    }
+
     fn capacity(&self, mount: &Path) -> Result<Capacity> {
         self.fs_stats(mount).map(Into::into)
     }
@@ -330,6 +383,27 @@ pub trait Platform: Send + Sync {
         pal_not_implemented(self.name(), "process_list")
     }
 
+    /// [`Self::process_list`] with `command_line` left empty. Reading another
+    /// process's command line can block until that process releases its
+    /// memory-map lock, for many minutes under memory pressure: on ts2
+    /// (2026-10-15) the daemon's monitor thread sat 15+ minutes reading a
+    /// rustc's argv while one of its threads waited in mmap. The daemon's
+    /// monitor-thread callers and the scanner's active-reference index need
+    /// pids, names, cwd and counters only.
+    fn process_list_without_command_lines(&self) -> Result<Vec<ProcessInfo>> {
+        self.process_list()
+    }
+
+    /// [`Self::process_list_without_command_lines`] cut to what one
+    /// `/proc/<pid>/stat` read gives on Linux: pid, parent, name, start time
+    /// and CPU times, with no executable, cwd or memory counters. For a
+    /// sampler that keys processes by (pid, start time): the full list reads
+    /// three files and two links per process, every 30 s on the monitor
+    /// thread for the I/O history (~2,000 processes on trj, bd-du48).
+    fn process_list_brief(&self) -> Result<Vec<ProcessInfo>> {
+        self.process_list_without_command_lines()
+    }
+
     fn process_io(&self, _pid: i32) -> Result<ProcessIo> {
         pal_not_implemented(self.name(), "process_io")
     }
@@ -344,6 +418,14 @@ pub trait Platform: Send + Sync {
 
     fn mmap_regions_under(&self, _path: &Path) -> Result<Vec<MappedRegion>> {
         pal_not_implemented(self.name(), "mmap_regions_under")
+    }
+
+    /// Mutation-boundary mapping evidence. A successful answer must come from
+    /// a process sweep started by this call, never a cached absence verdict.
+    /// Incomplete observations may be reused to bound retries; they remain
+    /// errors. Platforms without this guarantee must refuse the query.
+    fn mmap_regions_under_fresh(&self, _path: &Path) -> Result<Vec<MappedRegion>> {
+        pal_not_implemented(self.name(), "mmap_regions_under_fresh")
     }
 
     /// Return mapped-file evidence under any candidate root. Platforms with a
@@ -363,14 +445,14 @@ pub trait Platform: Send + Sync {
     /// cost a full process sweep each (trj: 160-514 CPU-s a pass, bd-om52).
     /// A root that cannot be read leaves the result incomplete, never empty.
     fn open_files_under_roots(&self, roots: &[PathBuf]) -> Result<OpenFilesResult> {
-        let mut merged = OpenFilesResult {
-            files: Vec::new(),
-            complete: true,
-        };
+        let mut merged = OpenFilesResult::complete(Vec::new());
         for root in roots {
             match self.open_files_under(root) {
                 Ok(result) => {
                     merged.complete &= result.complete;
+                    if merged.incomplete_reason.is_none() {
+                        merged.incomplete_reason = result.incomplete_reason;
+                    }
                     merged.files.extend(result.files);
                 }
                 Err(_) => merged.complete = false,
@@ -404,6 +486,13 @@ pub trait Platform: Send + Sync {
     /// entry is `(pid, path)`. Platforms that cannot tell report none.
     fn build_directories_in_use(&self) -> Vec<(i32, PathBuf)> {
         Vec::new()
+    }
+
+    /// Build-directory evidence together with coverage of the attempted
+    /// observation. The default preserves legacy platform implementations;
+    /// platforms with a coverage-aware collector should override this.
+    fn build_directories_in_use_checked(&self) -> (Vec<(i32, PathBuf)>, bool) {
+        (self.build_directories_in_use(), true)
     }
 
     fn self_stats(&self) -> Result<SelfStats> {
@@ -816,6 +905,7 @@ impl Platform for MockPlatform {
                 .cloned()
                 .collect(),
             complete: self.open_files_complete,
+            incomplete_reason: None,
         })
     }
 
@@ -846,6 +936,11 @@ impl Platform for MockPlatform {
             })
             .cloned()
             .collect())
+    }
+
+    fn mmap_regions_under_fresh(&self, path: &Path) -> Result<Vec<MappedRegion>> {
+        // Mock observations are supplied directly, without a process cache.
+        self.mmap_regions_under(path)
     }
 
     fn self_stats(&self) -> Result<SelfStats> {

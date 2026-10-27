@@ -991,9 +991,20 @@ TOML
   tally_case run_case_expect_fail explain_empty_ledger 1 "no decision ledger is readable" \
     "${bin}" --config "${explain_dir}/sbh.toml" explain --last 5
 
-  # A dry-run clean records its plan; explain reads it back.
-  tally_case run_case explain_clean_dry_run_records "Dry run complete" \
-    "${bin}" --config "${explain_dir}/sbh.toml" clean "${artifact_root}" --dry-run --yes --min-score 0.0
+  # A dry-run clean records its plan; explain reads it back. On a host where
+  # another user's processes cannot be inspected (non-root on a busy shared
+  # host), the open-file sweep is incomplete and the batch is held by design
+  # (bd-p18q). That is reported as a skip, never as a pass.
+  local clean_probe
+  clean_probe="$(env SBH_OUTPUT_FORMAT=human "${bin}" --config "${explain_dir}/sbh.toml" \
+    clean "${artifact_root}" --dry-run --yes --min-score 0.0 2>&1 || true)"
+  if grep -Fq "candidates in this batch are held" <<< "${clean_probe}"; then
+    skip_case explain_clean_dry_run_records \
+      "open-file sweep incomplete on this host; the batch is held by design"
+  else
+    tally_case run_case explain_clean_dry_run_records "Dry run complete" \
+      "${bin}" --config "${explain_dir}/sbh.toml" clean "${artifact_root}" --dry-run --yes --min-score 0.0
+  fi
 
   tally_case run_case_json explain_last_json "decisions" \
     "${bin}" --config "${explain_dir}/sbh.toml" --json explain --last 5
@@ -1046,10 +1057,21 @@ TOML
   mkdir -p "${ballast_dir}"
 
   # Write config pointing ballast at our test dir.
+  # The fixture's own thresholds put its provisioning floor (yellow +
+  # hysteresis, never under max(orange, red + 2)) at 2.5% free (bd-p18q).
+  # With the default floor, 15% free (10% before #38), a nearly full host disk
+  # provisioned nothing, and ballast_release then failed: the lifecycle was
+  # never tested there.
   cat > "${config_dir}/ballast.toml" <<TOML
 [ballast]
 file_count = 3
 file_size_bytes = 1048576
+
+[pressure]
+green_min_free_pct = 2.0
+yellow_min_free_pct = 1.5
+orange_min_free_pct = 1.0
+red_min_free_pct = 0.5
 
 [paths]
 config_file = "${config_dir}/ballast.toml"

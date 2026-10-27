@@ -754,6 +754,7 @@ mod release_tests {
         assert_eq!(report.errors.len(), 1);
         assert!(busy_file.exists());
         assert!(!healthy_file.exists());
+        flock(&lock, FlockOperation::Unlock).unwrap();
         drop(lock);
         assert_eq!(reserve.release(1).files_released, 1);
     }
@@ -850,6 +851,7 @@ mod release_tests {
         flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
         assert_eq!(reserve.refresh().len(), 1);
         assert_eq!(reserve.files().len(), 1);
+        flock(&lock, FlockOperation::Unlock).unwrap();
         drop(lock);
         assert!(reserve.refresh().is_empty());
         assert_eq!(reserve.files().len(), 1);

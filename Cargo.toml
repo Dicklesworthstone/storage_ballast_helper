@@ -1,6 +1,6 @@
 [package]
 name = "storage_ballast_helper"
-version = "0.7.4"
+version = "0.7.10"
 edition = "2024"
 license = "MIT"
 description = "System service that prevents disk-full scenarios from coding agent swarms via ballast files, artifact scanning, and special location monitoring."
@@ -110,6 +110,12 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+[profile.dev.package.sha2]
+# The updater and its tests hash the whole sbh binary (225 MB in a debug
+# build). Unoptimized SHA-256 spent 20+ s per pass, past the update
+# tests' restart deadlines on a loaded worker. Release builds are opt-level 3
+# already; this only speeds dev and test builds.
+opt-level = 3
 [lints.rust]
 # The daemon and CLI never touch raw FFI: every unsafe call the project needs
 # (Mach task/host statistics, libproc, the dispatch memory-pressure source)

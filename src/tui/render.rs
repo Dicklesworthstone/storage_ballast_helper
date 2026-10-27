@@ -21,9 +21,9 @@ use super::model::{
 use super::preferences::{DensityMode, HintVerbosity, StartScreen};
 use super::theme::{AccessibilityProfile, PaletteEntry, SpacingScale, Theme, ThemePalette};
 use super::widgets::{
-    colored_sparkline, extract_time, gauge, human_bytes, human_duration, human_rate, key_hint,
-    mini_bar_chart, progress_indicator, section_header, segmented_gauge, separator_line, sparkline,
-    status_badge, styled_badge, styled_status_strip, trend_label,
+    colored_sparkline, extract_time, gauge, human_bytes, human_duration, human_freed, human_rate,
+    key_hint, mini_bar_chart, progress_indicator, section_header, segmented_gauge, separator_line,
+    sparkline, status_badge, styled_badge, styled_status_strip, trend_label,
 };
 use crate::daemon::mount_controller::unprotected_pressure;
 use crate::daemon::self_monitor::DaemonState;
@@ -957,7 +957,7 @@ fn styled_action_lane<'a>(model: &'a DashboardModel, theme: &'a Theme) -> Vec<Li
                         "scans={} deleted={} freed={}",
                         state.counters.scans,
                         state.counters.deletions,
-                        human_bytes(state.counters.bytes_freed)
+                        human_freed(state.counters.bytes_freed, state.counters.freed_basis)
                     ),
                     Style::default().fg(theme.palette.text_secondary()),
                 ),
@@ -1059,7 +1059,7 @@ fn styled_extended_counters<'a>(model: &'a DashboardModel, theme: &'a Theme) -> 
         lines.push(Line::from_spans([Span::styled(
             format!(
                 "  freed={} rss={} up={}",
-                human_bytes(state.counters.bytes_freed),
+                human_freed(state.counters.bytes_freed, state.counters.freed_basis),
                 human_bytes(state.memory_rss_bytes),
                 human_duration(state.uptime_seconds),
             ),
@@ -3207,17 +3207,6 @@ fn voi_live_lines<'a>(model: &'a DashboardModel, theme: &'a Theme) -> Vec<Line<'
             Style::default().fg(secondary),
         ),
     ]));
-    let explore_pct = (voi.exploration_quota_fraction * 100.0).round();
-    let exploit_pct = 100.0 - explore_pct;
-    let exploit_text = format!("{exploit_pct:.0}%");
-    let explore_text = format!("{explore_pct:.0}%");
-    lines.push(Line::from_spans([
-        Span::styled("  split        ", Style::default().fg(muted)),
-        styled_badge(&exploit_text, theme.palette.success_color()),
-        Span::styled(" exploit  ", Style::default().fg(secondary)),
-        styled_badge(&explore_text, theme.palette.warning_color()),
-        Span::styled(" explore", Style::default().fg(secondary)),
-    ]));
     let mape = voi
         .recent_mapes
         .last()
@@ -4268,7 +4257,7 @@ fn render_action_lane(model: &DashboardModel) -> String {
             "actions scans={} deleted={} freed={}",
             state.counters.scans,
             state.counters.deletions,
-            human_bytes(state.counters.bytes_freed),
+            human_freed(state.counters.bytes_freed, state.counters.freed_basis),
         )
     } else {
         String::from("actions awaiting daemon connection")
@@ -4514,7 +4503,7 @@ fn render_extended_counters(model: &DashboardModel) -> String {
         let _ = write!(
             out,
             "\n  freed={} rss={} uptime={}",
-            human_bytes(state.counters.bytes_freed),
+            human_freed(state.counters.bytes_freed, state.counters.freed_basis),
             human_bytes(state.memory_rss_bytes),
             human_duration(state.uptime_seconds),
         );
@@ -5852,6 +5841,8 @@ mod tests {
                 bytes_freed: 1_024_000,
                 errors: 1,
                 dropped_log_events: 0,
+                freed_basis: crate::scanner::deletion::FreedBasis::Observed,
+                bytes_freed_observed: None,
             },
             policy_mode: "enforce".into(),
             mount_controllers: Vec::new(),
@@ -6028,6 +6019,8 @@ mod tests {
                 bytes_freed: 2_147_483_648,
                 errors: 3,
                 dropped_log_events: 1,
+                freed_basis: crate::scanner::deletion::FreedBasis::Observed,
+                bytes_freed_observed: None,
             },
             policy_mode: "enforce".into(),
             mount_controllers: Vec::new(),
@@ -7030,7 +7023,6 @@ mod tests {
             enabled: true,
             budget_total: 5,
             budget_used: 3,
-            exploration_quota_fraction: 0.2,
             fallback_active: false,
             consecutive_bad_windows: 1,
             consecutive_good_windows: 4,
@@ -7048,7 +7040,10 @@ mod tests {
         let frame = voi_text(&model);
         assert!(frame.contains("VOI ranking"), "{frame}");
         assert!(frame.contains("3 used by the last plan"), "{frame}");
-        assert!(frame.contains("80%"), "{frame}");
+        assert!(
+            !frame.contains("split"),
+            "no exploit/explore quota exists: {frame}"
+        );
         assert!(frame.contains("last MAPE 12%"), "{frame}");
         assert!(frame.contains("explore /work/alpha"), "{frame}");
         assert!(frame.contains("2026-09-03T08:00:00Z"), "{frame}");

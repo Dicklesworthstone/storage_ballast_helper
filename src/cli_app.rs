@@ -41,7 +41,7 @@ use storage_ballast_helper::daemon::service::{
     launchd_system_plist_path_for_label, launchd_user_plist_path_for_label,
 };
 use storage_ballast_helper::logger::sqlite::SqliteLogger;
-use storage_ballast_helper::logger::stats::{StatsEngine, window_label};
+use storage_ballast_helper::logger::stats::{RamScratchNotice, StatsEngine, window_label};
 use storage_ballast_helper::monitor::burst::BurstStats;
 use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
 use storage_ballast_helper::monitor::pid::{PressureLevel, classify_level};
@@ -57,7 +57,7 @@ use storage_ballast_helper::scanner::active_lease::{
     self, ACTIVE_LEASE_TARGET_ENV, ACTIVE_LEASE_TOKEN_ENV, ActiveLease, LeasePolicy,
 };
 use storage_ballast_helper::scanner::deletion::{
-    DeletionConfig, DeletionExecutor, DeletionMode, DeletionPlan,
+    DeletionConfig, DeletionExecutor, DeletionMode, DeletionPlan, SkipCheck, SkipReason,
 };
 use storage_ballast_helper::scanner::engine::{ScannerEngine, SelectedScannerEngine};
 use storage_ballast_helper::scanner::patterns::{
@@ -885,13 +885,15 @@ struct TuneArgs {
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
 struct CheckArgs {
-    /// Path to evaluate (defaults to cwd).
+    /// Path to evaluate (defaults to cwd). Linux RAM-backed paths also require
+    /// a fresh, complete host RAM-scratch assessment without warnings.
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
     /// Desired minimum free percentage.
     #[arg(long, value_name = "PERCENT")]
     target_free: Option<f64>,
     /// Minimum required free space. Accepts bytes or K/M/G/T suffixes, e.g. 5G.
+    /// Linux RAM-backed paths also require this much observed memory headroom.
     #[arg(long, value_name = "SIZE", value_parser = parse_byte_count)]
     need: Option<u64>,
     /// Predict if space will last for this many minutes (requires running daemon).
@@ -6254,6 +6256,14 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
                         println!();
                     }
                     println!("  Run `sbh tune --apply` to apply these changes.");
+                    // Kernel and burst-reserve advice needs no history, so say
+                    // when the activity-based recommendations are missing.
+                    if db.is_none() {
+                        println!();
+                        println!(
+                            "  No activity database found, so none of these use scan or deletion history. Run the daemon to collect data."
+                        );
+                    }
                 }
             }
             OutputMode::Json => {
@@ -6971,6 +6981,11 @@ fn ballast_volume_json(
             .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect::<Vec<_>>(),
+        "unreachable_reserve": volume
+            .unreachable_reserve
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>(),
         "skipped": volume.skipped,
         "skip_reason": volume.skip_reason,
     })
@@ -6986,7 +7001,7 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
         config.ballast.clone(),
     )
     .map_err(|e| CliError::Runtime(e.to_string()))?;
-    manager.set_provision_floor(config.ballast_provision_floor_pct());
+    manager.set_provision_floor_rule(config.ballast_provision_floor());
 
     match &args.command {
         None | Some(BallastCommand::Status) => {
@@ -7085,6 +7100,14 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                                 );
                                 for orphan in &volume.orphans {
                                     println!("      orphan: {}", orphan.display());
+                                }
+                                for dir in &volume.unreachable_reserve {
+                                    println!(
+                                        "      not releasable by the service (read-only in its \
+                                         sandbox; grant it in ReadWritePaths= or release those \
+                                         files by hand): {}",
+                                        dir.display()
+                                    );
                                 }
                             }
                         }
@@ -7478,7 +7501,7 @@ struct DashboardRuntimeRequest {
     /// `[ballast]` settings and the provisioning floor: what the cockpit
     /// needs to release or replenish a pool itself when no daemon holds it.
     ballast: storage_ballast_helper::core::config::BallastConfig,
-    provision_floor_pct: f64,
+    provision_floor: storage_ballast_helper::ballast::manager::ProvisionFloor,
     /// `--replay <file>`, `--from`, `--speed`: validated by the cockpit runtime.
     replay: Option<PathBuf>,
     replay_from: Option<String>,
@@ -7650,12 +7673,23 @@ fn run_new_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Re
         start_screen,
         ballast: Some(tui::BallastFallback {
             config: request.ballast.clone(),
-            provision_floor_pct: request.provision_floor_pct,
+            provision_floor: request.provision_floor,
         }),
         replay,
     };
-    tui::run_dashboard(&config)
-        .map_err(|e| CliError::Runtime(format!("dashboard runtime failure: {e}")))
+    match tui::run_dashboard(&config) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // A termination signal, after a clean teardown: exit as ftui-tty
+            // would have, with 128 + the signal.
+            if let Some(signal) = tui::terminal_guard::TerminatedBySignal::in_error(&error) {
+                std::process::exit(128 + signal);
+            }
+            Err(CliError::Runtime(format!(
+                "dashboard runtime failure: {error}"
+            )))
+        }
+    }
 }
 
 /// Without the `tui` feature the cockpit cannot run. An explicit
@@ -7703,7 +7737,7 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
         eprintln!("[dashboard] runtime={selection:?}, reason={reason}");
     }
 
-    let provision_floor_pct = config.ballast_provision_floor_pct();
+    let provision_floor = config.ballast_provision_floor();
     let request = DashboardRuntimeRequest {
         refresh_ms: normalize_refresh_ms(args.refresh_ms),
         state_file: config.paths.state_file.clone(),
@@ -7713,7 +7747,7 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
         sqlite_db: Some(config.paths.sqlite_db.clone()),
         jsonl_log: Some(config.paths.jsonl_log),
         start_screen: args.start_screen.clone(),
-        provision_floor_pct,
+        provision_floor,
         ballast: config.ballast,
         replay: args.replay.clone(),
         replay_from: args.from.clone(),
@@ -8024,7 +8058,7 @@ fn system_doctor_checks(
 ) -> Vec<DoctorCheck> {
     let mut checks = vec![
         writeback_doctor_check(platform, config),
-        ballast_reserve_doctor_check(config),
+        ballast_reserve_doctor_check(platform, config),
         quarantine_stuck_doctor_check(config),
     ];
     checks.extend(reserve_coverage_doctor_checks(config, bursts, pools));
@@ -8359,11 +8393,17 @@ fn quarantine_stuck_doctor_check(config: &Config) -> DoctorCheck {
     )
 }
 
-fn ballast_reserve_doctor_check(config: &Config) -> DoctorCheck {
-    let availability = BallastAvailability::observe(
-        &resolve_configured_pool_alias(&config.paths.ballast_dir),
-        &config.ballast,
-    );
+fn ballast_reserve_doctor_check(platform: &dyn Platform, config: &Config) -> DoctorCheck {
+    let pool_dir = resolve_configured_pool_alias(&config.paths.ballast_dir);
+    let availability = BallastAvailability::observe(&pool_dir, &config.ballast);
+    // The floor in force on the pool's volume (absolute byte floors lower it on
+    // a large volume); the percentage floor if the volume cannot be read.
+    let floor_pct = platform
+        .fs_stats(&nearest_existing_ancestor(&pool_dir))
+        .map_or_else(
+            |_| config.ballast_provision_floor_pct(),
+            |stats| config.ballast_provision_floor().pct_on(stats.total_bytes),
+        );
     match availability.health {
         BallastHealth::Unconfigured => doctor_check(
             "ballast.reserve",
@@ -8397,8 +8437,7 @@ fn ballast_reserve_doctor_check(config: &Config) -> DoctorCheck {
             ),
             Some(format!(
                 "Run `sbh ballast replenish` (or `sbh ballast provision`); files are created \
-                 one at a time while the volume stays above the {:.1}% headroom floor.",
-                config.ballast_provision_floor_pct()
+                 one at a time while the volume stays above the {floor_pct:.1}% headroom floor."
             )),
         ),
         BallastHealth::Empty => doctor_check(
@@ -8412,10 +8451,9 @@ fn ballast_reserve_doctor_check(config: &Config) -> DoctorCheck {
             ),
             Some(format!(
                 "Run `sbh ballast provision`; files are created one at a time while the \
-                 volume stays above the {:.1}% headroom floor, so even a low volume gets a \
-                 partial reserve. Until then the daemon has no instant-release reserve for \
-                 ENOSPC recovery.",
-                config.ballast_provision_floor_pct()
+                 volume stays above the {floor_pct:.1}% headroom floor, so even a low volume \
+                 gets a partial reserve. Until then the daemon has no instant-release reserve \
+                 for ENOSPC recovery."
             )),
         ),
         // Deliberately WARN, not FAIL: we could not read the pool, so we do not
@@ -9986,7 +10024,9 @@ fn count_sacred_scan_overlaps(
     let mut candidate_count = 0usize;
     let mut overlap_count = 0usize;
     for entry in entries.iter().filter(|entry| entry.metadata.is_dir) {
-        let classification = patterns.classify(&entry.path, entry.structural_signals);
+        let Some(classification) = entry.walk_classification(&patterns) else {
+            continue;
+        };
         if classification.category == ArtifactCategory::Unknown {
             continue;
         }
@@ -10053,6 +10093,21 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             .and_then(|db| {
                 let engine = StatsEngine::new(&db);
                 engine.window_stats(std::time::Duration::from_hours(1)).ok()
+            })
+    } else {
+        None
+    };
+    // bd-paeg: the daemon's RAM-scratch warning, which repeats every 15
+    // minutes while the risk lasts; one older than two repeats (plus a
+    // 5-minute sample) is stale.
+    let ram_scratch = if config.paths.sqlite_db.exists() {
+        SqliteLogger::open_read_only(&config.paths.sqlite_db)
+            .ok()
+            .and_then(|db| {
+                StatsEngine::new(&db)
+                    .ram_scratch_notice(std::time::Duration::from_mins(35))
+                    .ok()
+                    .flatten()
             })
     } else {
         None
@@ -10184,6 +10239,9 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 } else {
                     println!("  Swap: disabled");
                 }
+            }
+            for line in ram_scratch.iter().flat_map(ram_scratch_status_lines) {
+                println!("{line}");
             }
 
             if let Some(visibility) = process_visibility {
@@ -10625,6 +10683,8 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     })
                 }),
                 "memory_pressure": memory_pressure.as_ref().map(status_memory_pressure_json),
+                // The daemon's latest RAM-scratch notice (bd-paeg), or null.
+                "ram_scratch": ram_scratch,
                 "process_attribution": {
                     "visibility": process_visibility.as_ref().map(process_attribution_visibility_json),
                 },
@@ -10946,9 +11006,9 @@ fn linux_platform_json(_capacity: &Capacity) -> Value {
 const LINUX_UNPRIVILEGED_SCANNER_NOTICE: &str = "scanner reclaim is disabled: sbh is not running as root, so it cannot inspect other users' processes for open or mapped files and refuses every deletion candidate. Ballast release still works. Run the daemon as a system service (`sudo sbh install --systemd --scope system`) to reclaim build artifacts";
 
 /// macOS hides other users' processes from a non-root sbh, so its open-file
-/// check is never complete; candidates it must walk, or that reach
-/// `active_reference_min_size_bytes`, are then refused.
-const MACOS_UNPRIVILEGED_SCANNER_NOTICE: &str = "own-user processes only: sbh is not running as root, so macOS hides other users' processes from its open-file check, which is never complete, and the scanner refuses every candidate it must walk or that is 100 MB or larger (scanner.active_reference_min_size_bytes): almost nothing is reclaimed. Ballast release still works. Run the daemon as a root LaunchDaemon (`sudo sbh install --launchd --scope system`) to reclaim build artifacts";
+/// check is never complete and every deletion candidate is refused
+/// (bd-1ouz).
+const MACOS_UNPRIVILEGED_SCANNER_NOTICE: &str = "own-user processes only: sbh is not running as root, so macOS hides other users' processes from its open-file check, which is never complete, and the scanner refuses every deletion candidate: nothing is reclaimed. Ballast release still works. Run the daemon as a root LaunchDaemon (`sudo sbh install --launchd --scope system`) to reclaim build artifacts";
 
 fn process_attribution_visibility(
     platform_name: &str,
@@ -11168,6 +11228,48 @@ fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
     // available RAM, swap usage alone doesn't indicate thrashing — the kernel
     // simply swapped out cold pages, which is normal Linux behavior.
     memory.available_bytes < MIN_AVAILABLE_RAM_BYTES
+}
+
+/// `sbh status` lines for the daemon's RAM-scratch notice (bd-paeg): only a
+/// warning prints, with the largest trees the observer attributed. The swap
+/// thrash hint above stays quiet on zram with free RAM, which is exactly
+/// when tmpfs scratch fills the swap.
+fn ram_scratch_status_lines(notice: &RamScratchNotice) -> Vec<String> {
+    if notice.state != "warning" {
+        return Vec::new();
+    }
+    let size = |bytes: Option<u64>| bytes.map_or_else(|| "?".to_string(), format_bytes);
+    let swap = match (notice.swap_free_bytes, notice.swap_total_bytes) {
+        (Some(free), Some(total)) if total > 0 => {
+            format!(
+                "{:.0}% used",
+                bytes_to_pct(total.saturating_sub(free), total)
+            )
+        }
+        _ => "?".to_string(),
+    };
+    let mut lines = vec![format!(
+        "  RAM scratch: WARNING (logged {}): tmpfs holds {}, swap {swap}, processes hold {} of it [{}]",
+        notice.logged_at,
+        size(notice.tmpfs_used_bytes),
+        size(notice.process_swap_bytes),
+        notice.reasons.join(", ")
+    )];
+    for tree in &notice.largest {
+        let idle = tree
+            .idle_hours
+            .map_or_else(|| "idle ?".to_string(), |hours| format!("idle {hours} h"));
+        lines.push(format!(
+            "    {} {} ({idle})",
+            format_bytes(tree.allocated_bytes),
+            tree.path
+        ));
+    }
+    lines.push(
+        "    Report only: sbh deletes nothing for it; `sbh check --ram-scratch` gives a fresh report."
+            .to_string(),
+    );
+    lines
 }
 
 fn status_memory_pressure_json(pressure: &MemoryPressure) -> Value {
@@ -12081,16 +12183,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     let scored_entries = entries
         .iter()
         .filter_map(|entry| {
-            let classification = if let Some(opaque_tree) = &entry.opaque_tree {
-                match opaque_tree.disposition {
-                    OpaqueTreeDisposition::CandidateOpaque => opaque_tree.classification.clone(),
-                    OpaqueTreeDisposition::SignalOnly | OpaqueTreeDisposition::ProtectedOpaque => {
-                        return None;
-                    }
-                }
-            } else {
-                registry.classify(&entry.path, entry.structural_signals)
-            };
+            let classification = entry.walk_classification(&registry)?;
             let age = now
                 .duration_since(
                     entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
@@ -13092,6 +13185,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     let registry = ArtifactPatternRegistry::default();
     let mut scoring_config = config.scoring.clone();
     scoring_config.min_score = args.min_score;
+    warn_visibility_gap("clean");
     let engine = ScoringEngine::from_config(&scoring_config, config.scanner.min_file_age_minutes);
     let sacred_paths = active_sacred_paths(&config)?;
     let now = SystemTime::now();
@@ -13101,8 +13195,9 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
 
     let scored: Vec<CandidacyScore> = entries
         .iter()
-        .map(|entry| {
-            let classification = registry.classify(&entry.path, entry.structural_signals);
+        .filter_map(|entry| {
+            // As `sbh scan` and the daemon walk classify (bd-10yj).
+            let classification = entry.walk_classification(&registry)?;
             let age = now
                 .duration_since(
                     entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
@@ -13147,7 +13242,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                 |base_score| !base_score.vetoed && base_score.total_score >= args.min_score,
             );
             score.identity = Some(entry.metadata.identity());
-            score
+            Some(score)
         })
         .filter(|score| !score.vetoed && score.total_score >= args.min_score)
         .collect();
@@ -13308,12 +13403,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
             std::time::Duration::from_millis(500),
         ));
         let pressure_check = build_pressure_check(args.target_free, collector);
-        let report = executor.execute(
-            &plan,
-            pressure_check
-                .as_ref()
-                .map(|f| f as &dyn Fn(&std::path::Path) -> bool),
-        );
+        let report = executor.execute(&plan, pressure_check.as_ref().map(|f| f as SkipCheck));
 
         match output_mode(cli) {
             OutputMode::Human => {
@@ -13601,12 +13691,13 @@ fn candidate_decision_id(candidate: &CandidacyScore) -> String {
 fn build_pressure_check(
     target_free: Option<f64>,
     collector: std::sync::Arc<FsStatsCollector>,
-) -> Option<Box<dyn Fn(&Path) -> bool>> {
+) -> Option<Box<dyn Fn(&Path) -> Option<SkipReason>>> {
     let target = target_free?;
     Some(Box::new(move |path: &Path| {
         collector
             .collect(path)
             .is_ok_and(|stats| stats.free_pct() >= target)
+            .then_some(SkipReason::TargetFreeReached)
     }))
 }
 
@@ -13628,6 +13719,31 @@ fn collect_active_reference_index_best_effort(
         })
 }
 
+/// bd-1ouz: why this CLI cannot see every process's references, if it cannot
+/// (a non-root macOS user is not shown other users' file handles). Every
+/// candidate is then refused, as the daemon refuses it.
+fn cli_visibility_gap() -> Option<&'static str> {
+    static GAP: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        detect_platform().ok().and_then(|platform| {
+            storage_ballast_helper::scanner::walker::active_reference_visibility_warning(
+                platform.as_ref(),
+            )
+        })
+    })
+}
+
+/// The one line `clean` and `emergency` print when the visibility gap
+/// refuses every candidate.
+fn warn_visibility_gap(command: &str) {
+    if let Some(gap) = cli_visibility_gap() {
+        eprintln!(
+            "sbh: {gap}, so every deletion candidate is refused; run `sudo sbh {command}` or the \
+             system-scope daemon to reclaim"
+        );
+    }
+}
+
 fn active_references_for_candidate(
     active_reference_index: &mut Option<ActiveReferenceIndex>,
     root_paths: &[PathBuf],
@@ -13638,7 +13754,12 @@ fn active_references_for_candidate(
     category: ArtifactCategory,
 ) -> (ActiveReferenceSummary, bool) {
     if !scan_config.should_probe_candidate(size_bytes, category) {
-        return (ActiveReferenceSummary::default(), false);
+        // Unprobed is not unreferenced when other users' processes are hidden.
+        let mut summary = ActiveReferenceSummary::default();
+        if let Some(gap) = cli_visibility_gap() {
+            summary.mark_incomplete(gap);
+        }
+        return (summary, false);
     }
 
     let index = active_reference_index.get_or_insert_with(|| {
@@ -14066,9 +14187,13 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
 
     let free_pct = capacity_free_pct(&capacity);
     let config = Config::load(cli.config.as_deref()).unwrap_or_default();
-    let threshold_pct = args
-        .target_free
-        .unwrap_or(config.pressure.yellow_min_free_pct);
+    // The daemon's Yellow line on this volume: absolute floors (bd-ud9s)
+    // lower it on a large disk, so `check` agrees with the daemon's level.
+    let threshold_pct = args.target_free.unwrap_or_else(|| {
+        config
+            .pressure
+            .free_pct_thresholds_for(capacity.total_bytes)[1]
+    });
 
     // Check 1: absolute free space requirement.
     if let Some(need_bytes) = args.need
@@ -14214,6 +14339,83 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         }
     }
 
+    // bd-paeg: tmpfs free blocks are a size limit, not available RAM or swap.
+    // Reuse the live report-only assessment rather than a stale daemon notice.
+    // No attribution walk is needed, and disk-backed checks do no extra I/O.
+    let ram_scratch = crate::cli_ram_scratch::preflight(
+        platform.as_ref(),
+        &capacity.fs_type,
+        &capacity.mount_point,
+    );
+    let ram_write_admission =
+        crate::cli_ram_scratch::write_admission(platform.as_ref(), &capacity.fs_type, args.need);
+    if let Some((exit_code, reason)) = crate::cli_ram_scratch::preflight_failure(
+        ram_scratch.as_ref(),
+        ram_write_admission.as_ref(),
+    ) {
+        let incomplete = exit_code == 4;
+        match output_mode(cli) {
+            OutputMode::Human => {
+                println!(
+                    "sbh: {} is RAM-backed; {}. Inspect: sbh check --ram-scratch",
+                    capacity.mount_point.display(),
+                    match reason {
+                        "ram_write_admission_incomplete" =>
+                            "memory-headroom evidence is incomplete",
+                        "ram_write_headroom" =>
+                            "the requested write exceeds observed memory headroom",
+                        "ram_scratch_incomplete" => "host RAM-scratch evidence is incomplete",
+                        _ => "host RAM-scratch pressure prevents a successful preflight",
+                    },
+                );
+                if let Some(assessment) = ram_scratch
+                    .as_ref()
+                    .and_then(|report| report.assessment.as_ref())
+                {
+                    println!(
+                        "  tmpfs occupied: {}; RAM available: {}; swap free: {}/{}; reasons: [{}]",
+                        format_bytes(assessment.tmpfs_used_bytes),
+                        format_bytes(assessment.memory.available_bytes),
+                        format_bytes(assessment.memory.swap_free_bytes),
+                        format_bytes(assessment.memory.swap_total_bytes),
+                        assessment.reasons.join(", "),
+                    );
+                }
+                for issue in ram_scratch.iter().flat_map(|report| &report.issues).take(5) {
+                    println!("  {issue}");
+                }
+                if let Some(admission) = &ram_write_admission {
+                    println!("  {}", admission.summary());
+                    for issue in admission.issues.iter().take(5) {
+                        println!("  {issue}");
+                    }
+                }
+            }
+            OutputMode::Json => {
+                write_json_line(&json!({
+                    "command": "check",
+                    "schema_version": 2,
+                    "status": if incomplete { "incomplete" } else { "warning" },
+                    "reason": reason,
+                    "path": check_path.to_string_lossy(),
+                    "mount_point": capacity.mount_point.to_string_lossy(),
+                    "free_bytes": capacity.available_bytes,
+                    "total_bytes": capacity.total_bytes,
+                    "free_pct": free_pct,
+                    "platform": capacity_platform_json(&capacity),
+                    "ram_scratch": ram_scratch,
+                    "ram_write_admission": ram_write_admission,
+                    "exit_code": exit_code,
+                }))?;
+            }
+        }
+        return Err(if incomplete {
+            CliError::Partial(reason.to_string())
+        } else {
+            CliError::User(reason.to_string())
+        });
+    }
+
     // Check 2.5: warn if state.json is stale (daemon may not be running).
     if let Ok(meta) = std::fs::metadata(&config.paths.state_file)
         && let Ok(modified) = meta.modified()
@@ -14318,6 +14520,8 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                                 "volume_role": capacity.volume_role.as_deref(),
                                 "free_excludes_purgeable": true,
                                 "platform": capacity_platform_json(&capacity),
+                                "ram_scratch": ram_scratch,
+                                "ram_write_admission": ram_write_admission,
                                 "exit_code": 1,
                             });
                             write_json_line(&payload)?;
@@ -14359,6 +14563,9 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             "volume_role": capacity.volume_role.as_deref(),
             "free_excludes_purgeable": true,
             "platform": capacity_platform_json(&capacity),
+            // Fresh host evidence only for Linux RAM-backed check targets.
+            "ram_scratch": ram_scratch,
+            "ram_write_admission": ram_write_admission,
             // The daemon's forecast when `--predict` asked for one: the rate
             // object, or a string saying why none was usable.
             "forecast": forecast_json,
@@ -14923,14 +15130,16 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     // Classify and score using default weights; the age floor is the flag's,
     // since no config is read.
     let registry = ArtifactPatternRegistry::default();
+    warn_visibility_gap("emergency");
     let engine = ScoringEngine::from_config(&config.scoring, args.min_age);
     let sacred_paths = active_sacred_paths(&config)?;
     let now = SystemTime::now();
 
     let scored: Vec<CandidacyScore> = entries
         .iter()
-        .map(|entry| {
-            let classification = registry.classify(&entry.path, entry.structural_signals);
+        .filter_map(|entry| {
+            // As `sbh scan` and the daemon walk classify (bd-10yj).
+            let classification = entry.walk_classification(&registry)?;
             let age = now
                 .duration_since(
                     entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
@@ -14977,7 +15186,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                 },
             );
             score.identity = Some(entry.metadata.identity());
-            score
+            Some(score)
         })
         .filter(|score| !score.vetoed)
         .collect();
@@ -15079,12 +15288,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             std::time::Duration::from_millis(500),
         ));
         let pressure_check = build_pressure_check(Some(args.target_free), collector);
-        let report = executor.execute(
-            &plan,
-            pressure_check
-                .as_ref()
-                .map(|f| f as &dyn Fn(&std::path::Path) -> bool),
-        );
+        let report = executor.execute(&plan, pressure_check.as_ref().map(|f| f as SkipCheck));
 
         match output_mode(cli) {
             OutputMode::Human => {
@@ -18996,7 +19200,9 @@ mod tests {
             command_docs, missing_file_references, undocumented_commands, undocumented_flags,
         };
         let root_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let cli = Cli::command();
+        // The command the binary runs (main.rs adds compress, relocate and
+        // check's RAM/agent-scratch flags to the derive-only Cli::command()).
+        let cli = crate::cli_command();
         let known: std::collections::BTreeSet<String> =
             command_docs(&cli).into_iter().map(|c| c.path).collect();
 
@@ -19295,10 +19501,12 @@ mod tests {
         let config_path = tmp.path().join("config.toml");
         let protected = tmp.path().join("critical-build");
         std::fs::create_dir_all(&protected).unwrap();
+        // macOS adds the real user temp dir as a root by default; a marker
+        // there (sbh's own quarantine) counted as a second protection.
         std::fs::write(
             &config_path,
             format!(
-                "[scanner]\nroot_paths = [\"{}\"]\nprotected_paths = [\"{}\"]\n",
+                "[scanner]\ninclude_user_temp_dir = false\nroot_paths = [\"{}\"]\nprotected_paths = [\"{}\"]\n",
                 tmp.path().to_string_lossy(),
                 protected.to_string_lossy()
             ),
@@ -19320,10 +19528,13 @@ mod tests {
         let candidate = tmp.path().join("old-target");
         let protected = candidate.join("critical-data");
         std::fs::create_dir_all(&protected).unwrap();
+        // A cargo output dir: a `<x>-target` name is a candidate only with
+        // cargo's root markers, for this count as for the walk (bd-10yj).
+        std::fs::write(candidate.join(".rustc_info.json"), "{}").unwrap();
         std::fs::write(
             &config_path,
             format!(
-                "[scanner]\nroot_paths = [\"{}\"]\nprotected_paths = [\"{}\"]\n",
+                "[scanner]\ninclude_user_temp_dir = false\nroot_paths = [\"{}\"]\nprotected_paths = [\"{}\"]\n",
                 tmp.path().to_string_lossy(),
                 protected.to_string_lossy()
             ),
@@ -20571,14 +20782,14 @@ mod tests {
     }
 
     #[test]
-    fn macos_without_root_says_the_scanner_reclaims_almost_nothing() {
+    fn macos_without_root_says_the_scanner_reclaims_nothing() {
         let visibility = process_attribution_visibility_for("macos", false)
             .expect("an unprivileged macOS sbh must say what it cannot do");
         for expected in [
             "not running as root",
             "other users' processes",
-            "refuses every candidate it must walk",
-            "almost nothing is reclaimed",
+            "refuses every deletion candidate",
+            "nothing is reclaimed",
             "Ballast release still works",
             "sudo sbh install --launchd --scope system",
         ] {
@@ -20781,6 +20992,51 @@ mod tests {
             swap_free_bytes: 10 * 1024 * 1024 * 1024,
         };
         assert!(is_swap_thrash_risk(&thrashing));
+    }
+
+    /// bd-paeg: a RAM-scratch warning prints with its numbers and the largest
+    /// trees; a recovered or incomplete notice prints nothing.
+    #[test]
+    fn status_prints_the_daemons_ram_scratch_warning() {
+        use storage_ballast_helper::logger::stats::RamScratchTree;
+        let mut notice = RamScratchNotice {
+            logged_at: "2026-10-21T00:22:22.854Z".to_string(),
+            state: "warning".to_string(),
+            tmpfs_used_bytes: Some(34_146_168_832),
+            process_swap_bytes: Some(17_808_011_264),
+            swap_free_bytes: Some(2_491_097_088),
+            swap_total_bytes: Some(68_719_472_640),
+            reasons: vec!["low_swap_tmpfs_exceeds_process_swap".to_string()],
+            largest: vec![
+                RamScratchTree {
+                    path: "/tmp/hfdt-artifacts".to_string(),
+                    allocated_bytes: 3_889_455_104,
+                    idle_hours: Some(4),
+                },
+                RamScratchTree {
+                    path: "/run/user/1000/qualification".to_string(),
+                    allocated_bytes: 309_514_240,
+                    idle_hours: None,
+                },
+            ],
+        };
+        let lines = ram_scratch_status_lines(&notice);
+        assert_eq!(lines.len(), 4, "{lines:#?}");
+        assert!(lines[0].contains("RAM scratch: WARNING"), "{lines:#?}");
+        assert!(lines[0].contains("swap 96% used"), "{lines:#?}");
+        assert!(
+            lines[0].contains("low_swap_tmpfs_exceeds_process_swap"),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[1].contains("/tmp/hfdt-artifacts") && lines[1].contains("idle 4 h"),
+            "{lines:#?}"
+        );
+        assert!(lines[2].contains("idle ?"), "{lines:#?}");
+        for state in ["recovered", "incomplete"] {
+            notice.state = state.to_string();
+            assert!(ram_scratch_status_lines(&notice).is_empty(), "{state}");
+        }
     }
 
     #[test]

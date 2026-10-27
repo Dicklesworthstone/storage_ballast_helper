@@ -82,8 +82,12 @@ pub struct DiscoveryReport {
     pub complete: bool,
     /// Why discovery stopped before all requested work was examined.
     pub stop_reason: Option<String>,
-    /// Native bytes of the last selected path as lowercase hex, when a file
-    /// limit stopped a complete sorted prefix. Pass to `--after-hex` to resume.
+    /// Native bytes, as lowercase hex, of the path a stopped walk resumes
+    /// after: the last selected file when the file limit stopped it, else the
+    /// last path visited to completion when a byte, directory, entry or time
+    /// budget or a failed entry stopped it. Everything sorted before it is done.
+    /// Absent when the walk completed or stopped before visiting anything.
+    /// Pass to `--after-hex` to resume.
     pub resume_after_hex: Option<String>,
 }
 
@@ -339,6 +343,10 @@ mod native {
         selection: Selection,
         pending: Vec<Task>,
         identities: BTreeSet<(u64, u64)>,
+        /// The last path visited to completion. The walk is depth-first in
+        /// sorted order, so everything sorted before it is done, and a
+        /// stopped run resumes after it.
+        last_visited: Option<PathBuf>,
     }
 
     impl Walker<'_> {
@@ -451,11 +459,12 @@ mod native {
                 return Ok(());
             }
             if metadata.is_dir() {
+                // Skipped, not a stop: a stop here would recur at the same
+                // directory on every resumed run and wedge the walk.
                 if task.depth > self.limits.max_depth {
-                    return Err(io::Error::other(format!(
-                        "discovery depth limit at {}",
-                        path.display()
-                    )));
+                    self.selection.report.complete = false;
+                    self.skip("depth_limit");
+                    return Ok(());
                 }
                 if self.selection.report.directories_opened >= self.limits.max_directories {
                     return Err(io::Error::other("discovery directory budget exhausted"));
@@ -507,13 +516,28 @@ mod native {
                 self.skip("young_or_future_timestamp");
             } else if super::super::already_compressed(&path) {
                 self.skip("compressed_suffix");
+            } else if stamp.size > self.policy.max_bytes {
+                // This file cannot fit even an empty pass. Skipping it is
+                // necessary for a continuation to reach its smaller siblings.
+                self.skip("exceeds_full_byte_budget");
+            } else if let Some(reason) = native_exclusion(
+                &self.selection.native.roots[task.root].file,
+                relative,
+                stamp,
+                self.deadline,
+            )? {
+                self.skip(reason);
             } else if stamp.size
                 > self
                     .policy
                     .max_bytes
                     .saturating_sub(self.selection.report.selected_bytes)
             {
-                self.skip("logical_byte_budget");
+                // The file fits a fresh pass, so it is unvisited work rather
+                // than an exclusion. A "complete" scan here would repeatedly
+                // select an earlier prefix even when execution refuses every
+                // file in that prefix. Stop BEFORE advancing last_visited.
+                return Err(io::Error::other("discovery logical-byte budget exhausted"));
             } else if !self.identities.insert((stamp.device, stamp.inode)) {
                 self.skip("duplicate_inode");
             } else {
@@ -529,6 +553,43 @@ mod native {
             }
             Ok(())
         }
+    }
+
+    /// Keep known native vetoes out of the selection budget. Probe failure is
+    /// not eligibility: the executor still performs full fresh inspection.
+    /// Discovery's own deadline, including time spent probing, still stops the
+    /// page rather than admitting more work after an uncertain late result.
+    fn native_exclusion(
+        root: &File,
+        relative: &Path,
+        expected: FileStamp,
+        deadline: Instant,
+    ) -> io::Result<Option<&'static str>> {
+        let exclusion = openat2(
+            root,
+            relative,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH
+                | ResolveFlags::NO_SYMLINKS
+                | ResolveFlags::NO_MAGICLINKS
+                | ResolveFlags::NO_XDEV,
+        )
+        .map(File::from)
+        .map_err(io::Error::from)
+        .and_then(|file| {
+            if FileStamp::read(&file)? != expected {
+                return Err(io::Error::other("file changed before discovery probing"));
+            }
+            sbh_btrfs::discovery_exclusion(&file, deadline)
+        });
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "discovery deadline exhausted",
+            ));
+        }
+        Ok(exclusion.ok().flatten())
     }
 
     pub(super) fn discover(
@@ -600,6 +661,7 @@ mod native {
             },
             pending,
             identities: BTreeSet::new(),
+            last_visited: None,
         };
         while let Some(task) = walker.pending.pop() {
             if walker.selection.report.selected_files >= policy.max_files {
@@ -614,10 +676,24 @@ mod native {
                     .map(|(path, _)| crate::core::hex_lower(path.as_os_str().as_encoded_bytes()));
                 break;
             }
-            if let Err(error) = walker.visit(&task) {
-                walker.selection.report.complete = false;
-                walker.selection.report.stop_reason = Some(error.to_string());
-                break;
+            let path = walker.selection.native.roots[task.root]
+                .path
+                .join(&task.relative);
+            match walker.visit(&task) {
+                Ok(()) => walker.last_visited = Some(path),
+                Err(error) => {
+                    walker.selection.report.complete = false;
+                    walker.selection.report.stop_reason = Some(error.to_string());
+                    // Any stop (a budget, or an entry that vanished or could
+                    // not be read) resumes after the last path visited to
+                    // completion: a truncated directory read is never
+                    // claimed, and the failed entry is simply retried.
+                    walker.selection.report.resume_after_hex = walker
+                        .last_visited
+                        .as_ref()
+                        .map(|path| crate::core::hex_lower(path.as_os_str().as_encoded_bytes()));
+                    break;
+                }
             }
         }
         Ok(walker.selection)

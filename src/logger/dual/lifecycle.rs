@@ -36,7 +36,16 @@ const ACTIVE: u8 = 0;
 const EXITED: u8 = 1;
 const TIMED_OUT: u8 = 2;
 const PANICKED: u8 = 3;
+/// How long shutdown waits for the writer to drain before detaching it.
+#[cfg(not(test))]
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+/// Unit tests read the log files as soon as shutdown returns. On a loaded
+/// build host (the full suite beside other builds) the writer could take
+/// more than the daemon's 5 s just to open SQLite, so it was detached before
+/// writing and logger tests failed with a missing or short JSONL file.
+/// Timeout behavior is tested with an explicit allowance.
+#[cfg(test)]
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(120);
 const FINISH_POLL: Duration = Duration::from_millis(1);
 
 /// Logger lifecycle state, separate from backend write success or durability.
@@ -284,6 +293,15 @@ pub(super) fn spawn_worker(
     worker: impl FnOnce() + Send + 'static,
 ) -> io::Result<JoinHandle<()>> {
     spawn_supervised(control, SHUTDOWN_WAIT, worker)
+}
+
+/// [`spawn_worker`] with a caller-chosen shutdown allowance.
+pub(super) fn spawn_worker_with_wait(
+    control: &Arc<Control>,
+    shutdown_wait: Duration,
+    worker: impl FnOnce() + Send + 'static,
+) -> io::Result<JoinHandle<()>> {
+    spawn_supervised(control, shutdown_wait, worker)
 }
 
 fn spawn_supervised(

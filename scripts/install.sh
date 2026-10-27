@@ -6,6 +6,8 @@ REPO_DEFAULT="Dicklesworthstone/storage_ballast_helper"
 
 DEST_MODE="user"
 DEST_DIR=""
+# Set by --dest: put a copy there and touch nothing else (see sync_system_service).
+DEST_EXPLICIT=0
 VERSION="latest"
 DRY_RUN=0
 JSON_MODE=0
@@ -205,7 +207,8 @@ Usage:
 
 Options:
   --version <tag|semver>  Install a specific release tag (default: latest)
-  --dest <dir>            Destination directory for sbh binary
+  --dest <dir>            Destination directory for sbh binary (an installed
+                          sbh service is left as it is)
   --user                  Install to user location (default: ~/.local/bin)
   --system                Install to system location (/usr/local/bin)
   --dry-run               Print planned actions without changing the system
@@ -250,6 +253,7 @@ parse_args() {
       --dest)
         [[ $# -ge 2 ]] || die "--dest requires a value"
         DEST_DIR="$2"
+        DEST_EXPLICIT=1
         shift 2
         ;;
       --user)
@@ -920,6 +924,50 @@ launchd_loaded_target() {
   return 1
 }
 
+# The release a binary reports (`sbh 0.7.10` -> 0.7.10), or nothing.
+binary_version() {
+  "$1" --version 2>/dev/null | awk 'NR == 1 { print $2 }' || true
+}
+
+# Whether release $1 is newer than release $2, comparing X.Y.Z numerically.
+version_newer() {
+  local -a have other
+  IFS=. read -r -a have <<<"$1"
+  IFS=. read -r -a other <<<"$2"
+  local i x y
+  for i in 0 1 2; do
+    x="${have[i]:-0}"
+    y="${other[i]:-0}"
+    x="${x%%[!0-9]*}"
+    y="${y%%[!0-9]*}"
+    if ((10#${x:-0} > 10#${y:-0})); then
+      return 0
+    fi
+    if ((10#${x:-0} < 10#${y:-0})); then
+      return 1
+    fi
+  done
+  return 1
+}
+
+# The release the installed service runs, printed when it is newer than the
+# binary this run installed and no --version was asked for. The nightly ACFS
+# update runs this installer: it found v0.7.9 "already up to date" in
+# ~/.local/bin, then copied it over the v0.7.10 /usr/local/bin/sbh and
+# restarted the daemon (ts2, 2026-10-20). `sbh update` likewise refuses an
+# unpinned downgrade; a --version is a deliberate choice and still syncs.
+newer_service_release() {
+  local service_binary="$1"
+  local installed="$2"
+  [[ "$VERSION" == "latest" ]] || return 1
+  local have new
+  have="$(binary_version "$service_binary")"
+  new="$(binary_version "$installed")"
+  [[ -n "$have" && -n "$new" ]] || return 1
+  version_newer "$have" "$new" || return 1
+  printf '%s' "$have"
+}
+
 sync_launchd_service() {
   [[ "$(uname -s)" == "Darwin" ]] || return 0
   command -v launchctl >/dev/null 2>&1 || return 0
@@ -954,6 +1002,12 @@ sync_launchd_service() {
   [[ "$service_binary" != "$target_path" ]] || return 0
 
   if [[ -f "$service_binary" ]] && cmp -s "$target_path" "$service_binary" 2>/dev/null; then
+    return 0
+  fi
+
+  local newer=""
+  if newer="$(newer_service_release "$service_binary" "$target_path")"; then
+    log_info "Service binary ${service_binary} runs v${newer}, newer than the v$(binary_version "$target_path") installed here; left as it is (--version installs an older release on purpose)"
     return 0
   fi
 
@@ -1021,8 +1075,16 @@ sync_systemd_service() {
   local service_binary=""
   local unit_scope=""
 
-  # Check system-level service
+  # Under SBH_TEST_MODE=1, SBH_SYSTEMD_UNIT_DIR stands in for both unit
+  # directories, as it does for sbh itself.
   local sys_unit="/etc/systemd/system/sbh.service"
+  local user_unit="${HOME}/.config/systemd/user/sbh.service"
+  if [[ "${SBH_TEST_MODE:-}" == "1" && -n "${SBH_SYSTEMD_UNIT_DIR:-}" ]]; then
+    sys_unit="${SBH_SYSTEMD_UNIT_DIR}/sbh.service"
+    user_unit="$sys_unit"
+  fi
+
+  # Check system-level service
   if [[ -f "$sys_unit" ]]; then
     # Strip ExecStart= prefix and optional - (systemd ignore-error marker),
     # then take the first whitespace-delimited token (the binary path).
@@ -1032,7 +1094,6 @@ sync_systemd_service() {
 
   # Fallback: check user-level service
   if [[ -z "$service_binary" ]]; then
-    local user_unit="${HOME}/.config/systemd/user/sbh.service"
     if [[ -f "$user_unit" ]]; then
       service_binary=$(grep '^ExecStart=' "$user_unit" | head -1 | sed 's/^ExecStart=-\{0,1\}//' | awk '{print $1}')
       unit_scope="user"
@@ -1047,6 +1108,13 @@ sync_systemd_service() {
 
   # If the service binary is already identical, skip
   if [[ -f "$service_binary" ]] && cmp -s "$target_path" "$service_binary" 2>/dev/null; then
+    return 0
+  fi
+
+  # Never an unpinned downgrade (see newer_service_release).
+  local newer=""
+  if newer="$(newer_service_release "$service_binary" "$target_path")"; then
+    log_info "Service binary ${service_binary} runs v${newer}, newer than the v$(binary_version "$target_path") installed here; left as it is (--version installs an older release on purpose)"
     return 0
   fi
 
@@ -1117,6 +1185,15 @@ sync_systemd_service() {
 }
 
 sync_system_service() {
+  # An explicit --dest installs a copy there and nothing else. Syncing the
+  # installed service from it once replaced /usr/local/bin/sbh with an e2e
+  # fixture's debug build and restarted the daemon, on two hosts with a system
+  # sbh.service and passwordless sudo (2026-10-19). `sbh update` and
+  # --user/--system installs still sync the service.
+  if [[ "$DEST_EXPLICIT" -eq 1 ]]; then
+    log_info "Explicit --dest: the installed sbh service is left as it is"
+    return 0
+  fi
   case "$(uname -s)" in
     Linux) sync_systemd_service ;;
     Darwin) sync_launchd_service ;;

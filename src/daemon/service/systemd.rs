@@ -185,20 +185,10 @@ impl SystemdConfig {
     /// grant (a unit without `ProtectSystem=strict` needs none).
     #[must_use]
     pub fn missing_read_write_paths(unit_contents: &str, required: &[PathBuf]) -> Vec<PathBuf> {
-        let strict = unit_contents
-            .lines()
-            .any(|line| line.trim() == "ProtectSystem=strict");
-        if !strict {
-            return Vec::new();
-        }
-        let granted: Vec<PathBuf> = unit_contents
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("ReadWritePaths="))
-            .flat_map(Self::parse_read_write_paths)
-            .collect();
+        let sandbox = ServiceSandbox::from_unit_texts(&[unit_contents]);
         required
             .iter()
-            .filter(|path| !granted.iter().any(|g| path.starts_with(g)))
+            .filter(|path| sandbox.denies_write(path))
             .cloned()
             .collect()
     }
@@ -343,12 +333,21 @@ impl SystemdServiceManager {
         writeln!(unit).ok();
 
         writeln!(unit, "# Resource limits").ok();
-        writeln!(unit, "MemoryMax=256M").ok();
+        writeln!(
+            unit,
+            "MemoryMax={}",
+            crate::daemon::service::SYSTEMD_MEMORY_MAX
+        )
+        .ok();
         // One core as the runaway backstop; the weight (plus Nice/IO idle)
         // keeps it out of the way of builds. 10% of one core starved every
         // host: throttled in up to 100% of periods, scans timing out at Critical.
         writeln!(unit, "CPUQuota=100%").ok();
         writeln!(unit, "CPUWeight=1").ok();
+        // glibc gives each walker thread its own malloc arena and keeps the
+        // freed pages: on a 500k-entry tree RSS settled at 480 MiB against
+        // ~290 MiB with two arenas, at the same scan CPU (ts2 2026-10-15).
+        writeln!(unit, "Environment=MALLOC_ARENA_MAX=2").ok();
         writeln!(unit).ok();
 
         if !self.config.user_scope {
@@ -784,6 +783,57 @@ pub fn parse_unit_directives(text: &str) -> std::collections::BTreeMap<String, V
         }
     }
     directives
+}
+
+/// What a unit's filesystem sandbox lets the service write. Under
+/// `ProtectSystem=strict` that is only the `ReadWritePaths=` entries and
+/// everything below them; otherwise the sandbox restricts nothing here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceSandbox {
+    /// The effective `ProtectSystem=` is `strict` (the last assignment wins).
+    pub strict: bool,
+    /// Every `ReadWritePaths=` grant, without its `-`/`+` modifier.
+    pub writable: Vec<PathBuf>,
+}
+
+impl ServiceSandbox {
+    /// The sandbox of a unit file followed by its drop-ins, in the order
+    /// systemd applies them: list entries accumulate, an empty assignment
+    /// resets them, and a later `ProtectSystem=` replaces an earlier one.
+    /// A grant that does not parse grants nothing.
+    #[must_use]
+    pub fn from_unit_texts<T: AsRef<str>>(texts: &[T]) -> Self {
+        let joined = texts
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>()
+            .join("\n");
+        let directives = parse_unit_directives(&joined);
+        let strict = directives
+            .get("Service/ProtectSystem")
+            .and_then(|values| values.last())
+            .is_some_and(|value| value == "strict");
+        let writable = directives
+            .get("Service/ReadWritePaths")
+            .into_iter()
+            .flatten()
+            .flat_map(|value| SystemdConfig::parse_read_write_paths(value))
+            .filter_map(|word| namespace::grant_path(&word).ok().map(|(path, _)| path))
+            .collect();
+        Self { strict, writable }
+    }
+
+    /// Whether the service cannot write `path`: the unit is strict and no
+    /// `ReadWritePaths=` entry covers it. A root CLI run outside the sandbox
+    /// can write such a path while the service cannot.
+    #[must_use]
+    pub fn denies_write(&self, path: &Path) -> bool {
+        self.strict
+            && !self
+                .writable
+                .iter()
+                .any(|granted| path.starts_with(granted))
+    }
 }
 
 /// A directive whose installed value differs from the generated one.
@@ -1494,6 +1544,37 @@ mod unit_drift_tests {
         assert!(drift.exec_start_matches);
     }
 
+    /// The kernel's cap must sit above the daemon's own hard limit, or the
+    /// OOM killer (SIGKILL, maybe mid-deletion) always beats the graceful
+    /// exit-and-restart.
+    #[test]
+    fn generated_memory_max_is_above_the_daemons_own_rss_hard_limit() {
+        let directives = parse_unit_directives(&manager().generate_unit_file());
+        let value = &directives["Service/MemoryMax"][0];
+        let mib: u64 = value
+            .strip_suffix('M')
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("MemoryMax={value} is not in M"));
+        let hard_limit = crate::core::config::Config::default()
+            .telemetry
+            .daemon_rss_hard_limit_bytes;
+        assert!(mib * 1024 * 1024 > hard_limit, "MemoryMax={value}");
+    }
+
+    #[test]
+    fn generated_units_cap_glibc_malloc_arenas_in_both_scopes() {
+        for user_scope in [false, true] {
+            let mut manager = manager();
+            manager.config.user_scope = user_scope;
+            let directives = parse_unit_directives(&manager.generate_unit_file());
+            assert_eq!(
+                directives.get("Service/Environment"),
+                Some(&vec!["MALLOC_ARENA_MAX=2".to_string()]),
+                "user_scope={user_scope}"
+            );
+        }
+    }
+
     #[test]
     fn read_write_paths_compare_as_sets() {
         let manager = manager();
@@ -1716,6 +1797,44 @@ mod read_write_paths_tests {
             Vec::<PathBuf>::new()
         );
         assert!(SystemdConfig::patch_read_write_paths(lenient, &required).is_none());
+    }
+
+    /// Drop-ins apply in order: grants accumulate, an empty assignment
+    /// resets them, and a later `ProtectSystem=` replaces an earlier one.
+    #[test]
+    fn service_sandbox_follows_dropin_order() {
+        let unit = "[Service]\nProtectSystem=strict\nReadWritePaths=/var/lib/sbh -/data/tmp\n";
+        let sandbox = ServiceSandbox::from_unit_texts(&[unit]);
+        assert!(sandbox.strict);
+        assert_eq!(
+            sandbox.writable,
+            vec![PathBuf::from("/var/lib/sbh"), PathBuf::from("/data/tmp")],
+            "an optional '-' grant still grants its path"
+        );
+        assert!(!sandbox.denies_write(Path::new("/var/lib/sbh/ballast")));
+        assert!(!sandbox.denies_write(Path::new("/data/tmp/x")));
+        assert!(sandbox.denies_write(Path::new("/.sbh/ballast")));
+
+        let extended = ServiceSandbox::from_unit_texts(&[unit, "[Service]\nReadWritePaths=/srv\n"]);
+        assert!(!extended.denies_write(Path::new("/srv/a")));
+        assert!(!extended.denies_write(Path::new("/var/lib/sbh")));
+
+        let reset = ServiceSandbox::from_unit_texts(&[
+            unit,
+            "[Service]\nReadWritePaths=\nReadWritePaths=/srv\n",
+        ]);
+        assert_eq!(reset.writable, vec![PathBuf::from("/srv")]);
+        assert!(reset.denies_write(Path::new("/var/lib/sbh")));
+
+        let relaxed = ServiceSandbox::from_unit_texts(&[unit, "[Service]\nProtectSystem=full\n"]);
+        assert!(!relaxed.strict);
+        assert!(!relaxed.denies_write(Path::new("/.sbh/ballast")));
+
+        // A unit that never sets ProtectSystem restricts nothing here.
+        assert_eq!(
+            ServiceSandbox::from_unit_texts(&["[Service]\nNoNewPrivileges=true\n"]),
+            ServiceSandbox::default()
+        );
     }
 
     #[test]

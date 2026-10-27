@@ -1554,6 +1554,7 @@ version = "0.1.0"
 name = "sbh_mach"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "dispatch2",
  "libc",
  "mach2",
@@ -1714,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "storage_ballast_helper"
-version = "0.7.4"
+version = "0.7.10"
 dependencies = [
  "bincode",
  "chrono",

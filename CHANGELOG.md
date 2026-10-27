@@ -4,7 +4,973 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
-## v0.7.5
+## Unreleased
+
+### Added
+
+- **macOS notifications enter unified logging under the `sbh` process**
+  (bd-z1nm). The journal channel uses Apple's public logging API with subsystem
+  `org.storage-ballast-helper.sbh`, category `notifications`, and structured
+  event/level fields. Native messages are bounded and UTF-8 safe; the full
+  stderr summary remains an independent fallback. Existing thresholds,
+  notification rate limits, and desktop opt-in settings remain in effect.
+- **Read-only agent-session scratch inventory** (bd-jnp9).
+  `sbh check --agent-scratch [PATH]` discovers Claude session trees, reports
+  logical and allocated sizes separately, and combines tree/transcript ages
+  with live cwd, open-file and mapped-file evidence. Only complete observations
+  meeting `--min-idle-days` (7 by default) qualify as idle; active, recent and
+  uncertain sessions remain visible. Traversal is bounded, does not follow
+  descendant symlinks or cross filesystems, and reports protection markers.
+  JSON uses `sbh.agent_scratch.v1`; incomplete reports exit 4. This is an
+  operator inventory, with no retention policy, deletion, or promised reclaim
+  from shared/reflinked blocks.
+
+### Changed
+
+- **Compression audit history has a bounded admission budget** (bd-rxq5).
+  Each apply pass reserves its full 32 MiB journal allowance within a 1 GiB,
+  4,096-file store budget. A directory lock serializes cooperating writers;
+  existing live journals, unsafe entries, capacity exhaustion, and incomplete
+  inspections refuse a new run before mutation. Logical and allocated bytes
+  both count. All history is preserved; the operator can archive reviewed
+  completed journals before retrying.
+- **Ordinary `sbh check PATH` surfaces RAM-scratch pressure** (bd-paeg).
+  Linux tmpfs/ramfs targets now require a fresh, bounded host assessment after
+  filesystem space checks pass. A complete RAM-scratch warning exits 1;
+  incomplete evidence exits 4 instead of reporting success. JSON includes the
+  assessment. Disk-backed checks avoid this collection, and no cleanup or
+  relocation policy changes.
+- **Lossless compression gets a bounded first chance before daemon cleanup**
+  (bd-rxq5). Eligible btrfs filesystems at Yellow/Orange defer pressure scans,
+  already queued deletions, and quarantine purges until the first compression
+  pass finishes or its discovery-plus-apply deadline expires. Red/Critical
+  pressure, including a known device alias's escalation, bypasses the wait.
+  Emergency cleanup is dispatched before new compression-root probes; repeated
+  passes cannot keep renewing a hold.
+- **The executor drops candidates with nothing to reclaim before the policy
+  engine.** The planner never chooses an item that frees no bytes, yet each pass
+  evaluated them and recorded an approved delete that was never executed: on
+  ts2, 99 hardlinked bun trees were "approved 99/99 ... planner chose none"
+  pass after pass, which kept the decision ledger growing even with the
+  bd-jl92 dedupe (every decision that may delete is always recorded). They are
+  now dropped first and counted in one activity line at most every 10
+  minutes. No deletion changes: such items were never chosen.
+- **The evidence ledger records a repeated verdict that deletes nothing once
+  a day, not on every scan pass** (bd-jl92). Every candidate is re-evaluated
+  each pass, and each verdict was written in full to `decision_log` and the
+  JSONL log: on fmd 1.5M rows for 153k paths filled 6.3 GB inside the 30-day
+  retention, about 21 GB across the fleet. A keep, review or veto that repeats
+  the last record for the same artifact version (stable decision id: path,
+  device, inode, size) and policy mode is now skipped for 24 hours. A changed
+  verdict, a new artifact version, and every decision that may delete are
+  always recorded, so the deletion audit trail is unchanged and `sbh explain`
+  still finds the current verdict.
+- **The daemon's scan walk no longer stats every file** (bd-gh0x;
+  `c858c27`). It stat-ed each file of every directory it listed to size the
+  directory, though only entries that classify as candidates use the size.
+  Those now read their own files, so candidates are sized as before. On a
+  180,000-file test tree a walk issued 6,580 `statx` calls instead of
+  186,537 and used about a tenth of the CPU (cold btrfs, 8 threads: 1.0 s
+  instead of 10.8 s). With file stats, CPU also grew with walker threads,
+  from btrfs's per-root inode lock; without them it stays flat. Trees with
+  fewer files per directory gain less. CLI walks are unchanged.
+- **`sbh status` shows the daemon's RAM-scratch warning** (bd-paeg). The
+  observer that relates tmpfs occupancy to RAM and swap logged its warnings
+  only to the activity log; `status` now prints the latest one from the last
+  35 minutes (tmpfs, swap and process-swap figures, reasons, and the largest
+  idle trees) and adds `ram_scratch` to its JSON. Report only: nothing is
+  deleted on its account.
+- **The I/O-history sampler reads one `/proc` file per process** (bd-du48;
+  `678707e`). Every 30 s the monitor thread listed every process with its
+  `comm`, `status` and `stat` files and `exe` and `cwd` links, though the
+  sampler uses only the pid and start time, both in `/proc/<pid>/stat`.
+
+### Fixed
+
+- **A ballast refill is no longer released seconds after it is written**
+  (#38). The provisioning floor was the Orange threshold, but the default
+  behavior matrix releases ballast from Orange, so a refill on a Yellow volume
+  could end in Orange and the next tick released part of the pool again; each
+  cycle wrote and deleted gigabytes for nothing. Every new file must now leave
+  the volume outside the least severe level whose behavior releases ballast,
+  with `pressure.controller.hysteresis_pct` to spare: 15% free with the
+  defaults (`yellow_min_free_pct + hysteresis_pct`), 21% with the v0.5 preset,
+  and never lower than the previous floor. The floor only decides whether a
+  new file is written; existing ballast files are kept.
+- **Forward relocation pins the tree it copies and is allowed to remove.**
+  Copying and checksum verification use the opened source directory. Bounded
+  descendant fingerprints detect replacements and changes hidden by matching
+  counts or coarse timestamps; source, parent, policy and stub evidence are
+  renewed before mutation. Renaming aside, publishing a privately built stub,
+  and rollback refuse to replace existing occupants, including dangling
+  recovery symlinks. Changed sources, moved parents and replaced stubs retain
+  the available original, backup and staging data with current recovery paths.
+- **Scanner reloads revoke stale target-only cleanup permission** (bd-232u).
+  Target-only batches carry the consent under which they were selected. Changes
+  to opted-in roots, idle windows, exclusions, or protection invalidate old
+  nominations; removing and re-adding a root cannot revive revoked work. The
+  executor renews permission at the mutation boundary, after purity inspection,
+  so a queued or long-running batch cannot use a withdrawn protection exception.
+- **Alternating scan scopes retain event watches and pending coverage**
+  (bd-2pi1). Subscriptions follow configured roots instead of each pass's root
+  subset. New events invalidate the index once, and work outside the current
+  request stays pending without widening that pass. Unmonitored special/catalog
+  request paths reconcile explicitly; genuine configuration changes and
+  overflows still revoke stale index evidence.
+- **Restore cannot reuse foreign staging or overwrite a concurrent occupant.**
+  Each relocation restore locks its stub and creates a private random workspace.
+  Rsync writes through the opened payload directory, so replaced parent or
+  payload pathnames cannot redirect the transfer. Bounded, non-symlink records
+  and stub identities are rechecked before publication; publication and rollback
+  refuse occupied paths. The previous stub is always retained, even when it
+  initially contains only relocation metadata, so late writes through old handles
+  survive. Human and JSON output expose its recovery path, and failed attempts
+  retain partial or verified data with explicit recovery locations.
+- **RAM-backed `check --need` honors the caller's memory limits** (bd-paeg).
+  Positive explicit byte requests on Linux tmpfs/ramfs now compare fresh host
+  `MemAvailable` with every finite visible cgroup-v2 `memory.high` and
+  `memory.max` boundary, using each ancestor's own usage. The tightest observed
+  headroom limits the request. No reserve percentage or swap allowance is added;
+  throttling and hard limits remain distinct. Known shortfalls exit 1 and
+  incomplete evidence exits 4, with a separate `ram_write_admission` JSON report.
+  Omitted/zero requests and disk-backed paths avoid this additional query.
+- **Compression admission cannot block the monitoring loop** (bd-rxq5).
+  Filesystem and device probes now run on a single bounded background worker.
+  Ready roots can start while a later probe is blocked; evidence expires after
+  60 seconds, and unknown roots cannot delay cleanup. A stuck native call keeps
+  its worker slot without preventing monitoring or spawning replacement threads.
+  Reloading compression settings, protected paths, or control-file locations
+  cancels old work and admission evidence; old discovery progress cannot leak
+  into the new scope. Unrelated UI and notification changes retain active work.
+- **Relocation honors opt-outs and excluded caches throughout a selected tree.**
+  A nested `relocatable = false` marker or excluded component now vetoes its
+  enclosing units while leaving safe siblings eligible. Ancestor opt-outs,
+  overlapping roots, and protection below `unit_depth` are checked explicitly;
+  malformed or unsafe markers cannot grant permission. Apply renews protection
+  before copy, after rename, and at source removal, using fresh file and process
+  evidence at the final boundary. Late refusals preserve the original data and
+  report the verified copy and restore-stub locations for recovery.
+- **Relocation reports preserve concurrent transfers and recovery history.**
+  Reports and apply runs now share one writer lock across the full ledger
+  load/observe/save cycle. Busy or unwritable reports remain useful and expose
+  explicit observation-save status; corrupt or unreadable history is preserved
+  and blocks applying. Ledger saves use private, exclusively created staging
+  files and synchronize both the file and containing directory. Completion
+  persistence must succeed before source removal: a failure retains the original
+  tree, verified backup, and restore stub and reports their recovery locations.
+- **Configured compression roots work on volumes outside deletion scanning**
+  (bd-rxq5). Such roots previously had no controller pressure level and never
+  started a daemon pass. The tier now samples their own free space using the
+  configured percentages and absolute floors, while monitored mounts retain
+  their controller levels. These samples do not expand deletion scope, steer
+  global pressure, or create cleanup holds through unmonitored aliases.
+  Read-only, unreadable, and unknown-capacity volumes remain ineligible.
+- **A full memory-pressure queue retains the newest observation.** A busy
+  monitor previously lost callbacks once its bounded queue filled, and a steady
+  final pressure level produced no replacement event. Overflow now evicts the
+  oldest queued observation while preserving normal FIFO delivery. Concurrent
+  callbacks are serialized; publishing never waits for queue capacity, even
+  after the monitor stops.
+- **Compression discovery preserves progress when its byte budget fills**
+  (bd-rxq5). A file that fits a fresh pass but not the remaining allowance
+  stops discovery with a continuation before that file. Later candidates remain
+  reachable even if execution refuses every earlier selection. Files exceeding
+  the whole allowance are explicitly skipped; known NOCOMP/inode-flag, shared
+  extent and fully encoded exclusions no longer consume the selection budget.
+  The executor still requires its complete, fresh admission checks.
+- **`sbh tune` says when the activity database is missing, whatever else it
+  lists.** The note appeared only when there was nothing else to report, so on
+  a host with percentage-based writeback, where tune also lists
+  kernel-writeback advice, history-based recommendations were missing without
+  explanation. JSON already reported `has_database`.
+- **Memory-pressure subscriptions deliver their initial observation.**
+  Linux event-backed and polling subscriptions, and the macOS polling fallback,
+  now correct the daemon's earlier startup sample even when pressure then stays
+  steady. The macOS fallback also reports failed reads as Unknown, clears stale
+  counters, and resumes observation after an unreadable first sample. Cancelled
+  subscriptions discard late samples; unchanged levels remain deduplicated.
+- **Compression requires fresh memory-map evidence before rewriting files**
+  (bd-rxq5). Successful scanner snapshots can no longer authorize compression
+  for up to 30 seconds after collection. Mutation checks start a new bounded
+  process sweep; concurrent sweep contention and incomplete coverage retain
+  the file. Failed observations keep a conservative retry backoff, while
+  ordinary scanner queries continue to share their existing cache.
+- **Target-only protection exceptions are renewed before every deletion**
+  (bd-232u). A target that gains a trace directory or session log while earlier
+  batch entries are being removed is retained even when its inode is unchanged.
+  The final check requires containment, recorded identity, and a complete,
+  bounded purity listing. Live policy and compression gates run after this
+  filesystem probe so changes during the probe remain effective.
+- **Evidence deduplication waits for a successful SQLite write** (bd-jl92).
+  Failed inserts remain retryable, KEEP → DELETE → KEEP records the return
+  to KEEP, and fallback/suspension/comparator changes remain visible. JSONL
+  logging and SQLite recovery continue while the database is unavailable;
+  suppressed duplicate traffic still services the JSONL durability timer.
+- **Queued deletions recheck live policy and dry-run before each mutation.**
+  Observe, FallbackSafe, dry-run, and Enforce-to-Canary transitions defer
+  candidates for fresh evaluation. These deferrals do not apply per-path
+  failure backoff.
+
+- **Daemon quarantine sweeps now respect Observe, FallbackSafe, and dry-run.**
+  These modes retain quarantined payloads while continuing to report held
+  inventory. Previously, TTL/cap sweeps and pressure-driven purges could
+  permanently remove data even while ordinary candidate deletion was disabled.
+- **macOS desktop notifications from the daemon reach the person at the
+  screen** (bd-z1nm). The daemon runs as a root LaunchDaemon, where a bare
+  `osascript display notification` reaches no one's Notification Center, so
+  the desktop channel was silent on every Mac (on 2026-10-22 a memory and disk
+  emergency was logged 40 minutes before a kernel panic, and nobody saw it).
+  As root it now runs in the console user's GUI session as that user
+  (`launchctl asuser`, `sudo -u`), and with nobody at the console it does
+  nothing. The channel is still off by default.
+- **The ballast headroom floor honors the absolute pressure floors**
+  (bd-lxga). It was one percentage for every volume, the Orange threshold but
+  at least two points above Red, so `pressure.*_min_free_bytes` lowered a large
+  volume's pressure level but not its provisioning floor. A 1.86 TB Mac that
+  the byte floors held at Yellow refused every ballast file below about 100 GB
+  free and kept an empty reserve. The floor is now worked out per volume from
+  the thresholds in force on it. The daemon (at start and on reload),
+  `sbh ballast`, the dashboard and the `ballast.reserve` doctor check use it.
+  Without byte floors nothing changes.
+- **A special-location alert no longer releases ballast, and repeats are one
+  alert** (bd-uttn). Each alert released ballast at once, on the location's
+  mount or else on the fullest pool, which bypassed the mount's own pressure
+  level. On macOS `/tmp` is a special location on the Data volume, and its
+  "filling fast" rule fired on ordinary write bursts (about 100 alerts a
+  day), so the reserve was spent and never rebuilt. A RAM-backed location
+  such as `/dev/shm` gained nothing from freeing disk at all. The alert still
+  queues a scan. It now notifies when an episode starts or escalates, with
+  the real previous level, and an episode ends only after a whole alert
+  interval without an alert.
+- **A directory named `target` under a temp root is no longer a cargo target
+  on its name alone** (bd-u9ua; `14f5b71`). Without a `Cargo.toml` beside it,
+  it now needs cargo's own markers (`CACHEDIR.TAG`, `.rustc_info.json`,
+  `debug/`, ...). hfdt stores keep a `target/` of their own: on ts2 the
+  daemon deleted it from two agent store copies (2026-09-29), and a 5 GB
+  `target/doctor-undo` scored as a 0.93 cargo target.
+- **`sbh clean`, `sbh emergency`, and the daemon's pre-scan and index replay
+  classify a directory as the walk does** (bd-10yj; `93c6c4f`). They classified by name
+  and ignored the walker's verdict, so `clean` missed a Go build cache that
+  `scan` nominated, and a tree the walk only descends into (an hfdt store's
+  own `target/`, a repo copy's scripts/build directory) could still be nominated by
+  its name. On ts2 the daemon made 472 such name-only `target` decisions
+  between 10-13 and 10-18.
+- **A scan pass that stops on its budget no longer hides unexplored ground
+  from the next one** (bd-y70k; `efc01b1`, `ad7fcaf`). After such a pass
+  (on ts2, every pass: they stop at 500,000 entries) the daemon cached as
+  barren for 30 minutes every listed directory that was not the direct
+  parent of a candidate, and the next walk skipped it. That took in a
+  candidate's grandparents and the candidate directory itself, and every
+  listed directory whose children were still queued, being listed, or
+  emitted but never read when the pass stopped. The v2 index still replayed
+  candidates it knew; new ones below those directories were not found. The
+  walker now reports what a stopped pass left unseen, and nothing at or
+  above it is cached. If the walker threads have not stopped 5 seconds
+  after the stop, the pass caches nothing.
+- **CPU scan budgets apply at Critical, and survive a failed first CPU
+  sample** (`41ad7f5`, `de7bb8a`). Sustained Critical pressure bypassed the
+  token bucket, and a pass whose first CPU reading failed ran without a CPU
+  limit.
+- **Zero-byte size hints no longer crowd real candidates out of index
+  replay** (`c707669`). Empty estimates are dropped before the replay's
+  result limit applies.
+- **The compression tier resumes after the files it processed** (`ecd7d1a`).
+  A pass that stopped early no longer moved its cursor past the files
+  discovery selected but the pass never reached.
+- **Target-only reclaim re-checks a target before deleting it** (bd-232u;
+  `715913c`). The tier nominates a cargo target dir only while its top level
+  holds nothing but cargo's own entries; the executor then checked only that
+  it was the same inode. A trace dir or log written into the target while
+  its batch waited is now noticed, and the target is kept.
+- **`install.sh --dest DIR` leaves the installed service alone** (`2e913dc`).
+  It went on to sync the system service from the copy, so an install into a
+  scratch directory replaced `/usr/local/bin/sbh` and restarted the daemon
+  (two hosts on 2026-10-19, with an e2e fixture's debug build).
+- **`install.sh` never downgrades an installed service unasked** (bd-zuuq;
+  `2931767`). Its service sync replaced the service's binary whenever it
+  differed from the one just installed. A nightly ACFS update, installing
+  the latest release (v0.7.9), so put v0.7.9 over a v0.7.10
+  `/usr/local/bin/sbh` and restarted the daemon (ts2, 2026-10-20). Without
+  `--version`, a service binary that reports a newer release is now left as
+  it is, as `sbh update` already did; `--version` still installs an older
+  release on purpose.
+- **A dropped walk stream stops its walk** (`4a6baa8`). A consumer that went
+  away without cancelling, such as a scanner thread that panicked and was
+  respawned, left its walker threads listing the rest of the tree with
+  nobody reading.
+- **The daemon no longer reads its own cgroup's stall as memory pressure**
+  (bd-90af). Since 0.7.10 the memory level took the larger of host PSI and
+  the PSI of sbh's own cgroup. In a service cgroup that holds only sbh,
+  that PSI is the daemon reclaiming its own walk's dentries and page cache
+  against `MemoryMax`: on ts2 it rose from 3% to 35% within 10 s while host
+  PSI stayed near 2%, and the daemon changed behavior mode 53-146 times an
+  hour, narrowing its scan and raising 3-8 Critical+Critical emergency
+  notifications an hour. A cgroup that holds only sbh (`cgroup.procs`, no
+  descendants in `cgroup.stat`) now defers to host PSI; a shared one, such
+  as an agent's scope or a container, still counts.
+- **The priority pre-scan no longer starves the walk at Critical**
+  (bd-6ydh). Since
+  CPU budgets apply at Critical, a pre-scan that probes each nominee's tree
+  could spend a pass's whole CPU allowance by itself: on ts2 every pass
+  after the sixth stopped inside it after 38-1,041 of /data/tmp's 23,301
+  top-level entries, and the walk did not run. The pre-scan now stops at
+  half the pass's allowance and the walk gets the rest.
+
+### Removed
+
+- **Five config keys that had no effect** (bd-65vb):
+  `scheduler.exploration_quota_fraction`, `scheduler.fp_risk_weight` and
+  `scheduler.exploration_weight` (the scheduler's hazard index replaced
+  them); `update.background_refresh`, which nothing read; and
+  `platform.macos.query_foundation_purgeable`, since the macOS code reads only
+  the `SBH_MACOS_QUERY_FOUNDATION_PURGEABLE` environment variable, which stays.
+  `update.background_refresh` defaulted to true and was refused together
+  with `update.enabled = false`, so turning updates off in `config.toml`
+  failed validation unless both lines were set. A file that still sets these
+  keys loads; each one is reported as removed (an error only with
+  `strict_config = true`). The dashboard's VOI panel no longer shows an
+  exploit/explore split computed from the dead quota; each planned path
+  still says whether it was an exploration pick. `SBH_UPDATE_BACKGROUND_REFRESH`
+  is gone, and `SBH_UPDATE_OPT_OUT` is documented as the environment switch
+  it is rather than as a config key.
+
+## v0.7.10 **[release]**
+
+Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.9...v0.7.10)
+
+On Btrfs the daemon can now compress cold files instead of deleting
+anything (opt-in `[compress]`). It also reclaims idle cargo targets inside
+agent scratch that is otherwise protected (`scanner.target_only_roots`).
+Most of the fixes come from a Linux host whose `/` sat at Critical for
+days:
+- the activity database no longer grows by about 0.4 GB a day of
+  empty-candidate records;
+- the generated unit's memory cap no longer stalls the daemon;
+- the RSS limits no longer restart it on a normal working set.
+
+On macOS, the checks for processes using a candidate now report what they
+could not see. Running them on a Mac found cases that would have held
+every deletion: zombies, unlinked files and guarded descriptors. Those are
+fixed. The dashboard leaves the terminal usable after a panic or a kill,
+and the release binaries now include it. The native Btrfs and systemd
+checks run through dsr before each release; sbh has no GitHub workflows.
+
+### Added
+
+- **Btrfs: the daemon can compress cold files instead of deleting
+  anything** (`6bc9fde`). Opt-in with `[compress] enabled = true`, a list
+  of `roots` and `allow_zstd_feature = true`. When a root's Btrfs mount
+  reaches `start_level` (default yellow), the daemon runs the same
+  discover-then-apply pass as `sbh compress --discover --apply`, at most
+  one at a time and at most every `interval_minutes` (default 30), bounded
+  by `[compress.policy]` (files idle 24 hours and at least 16 MiB, 128
+  files and 8 GiB per pass by default). Each file is rewritten losslessly:
+  open, mapped, leased, young and shared files are skipped, the file is
+  held through a read-only descriptor (running it stays possible), and the
+  result is checked against a SHA-256 read back from disk after its cached
+  pages are dropped. A started file is finished on its own allowance, not
+  the pass deadline, and one an earlier pass stopped inside is finished
+  later rather than skipped as compressed. When part of a file does not
+  compress, btrfs marks it no-compress (`m` in lsattr); the rest of that
+  file is still compressed in the same pass, and the mark stays so later
+  passes skip the file instead of rewriting the incompressible part again.
+  The tier does not run in observe or fallback-safe mode, under the kill
+  switch or in dry-run, and a pass running when the daemon enters one of
+  them stops before its next file or chunk. Outcomes go to the
+  activity log; an `[SBH-COMPRESS]` line summarizes each pass. Enabling it
+  stands in for the CLI's `--quiescent`: a snapshot or reflink made during
+  a pass keeps the old extents, so those bytes are freed only when it
+  goes. On one host the same method, run by hand, freed several hundred
+  GB in two days while deletion freed megabytes an hour.
+- **Idle cargo targets inside protected agent scratch are reclaimed**
+  (bd-232u). Operators protect a coding agent's session scratch as a
+  whole, since it holds temp clones and evidence, but agents also build
+  there with `CARGO_TARGET_DIR`. On one 3.6 TB Mac about 151 GB of such
+  targets sat untouched for over a day while the volume reached 99% and
+  sbh released nothing. Under each `scanner.target_only_roots` root
+  (macOS default `/private/tmp/claude-*`; none elsewhere), while its mount
+  is at Yellow or above, the daemon now looks every 10 minutes for
+  directories with `CACHEDIR.TAG` or `.rustc_info.json` whose top level
+  holds only cargo's own entries, with no `.sbh-protect` or `.git` in,
+  inside or above them below the root, nothing created or changed within
+  `scanner.target_only_idle_hours` (24), and no process with a file open
+  or its working directory in them. Those go to the executor as a
+  target-only batch pinned to the directories surveyed: the policy mode,
+  the decision ledger, the planner and every executor check still apply,
+  the executor drops anything outside the root, and only the
+  `protected_paths` patterns that protect the root as a whole are lifted
+  (one naming something inside it still applies). Everything else under
+  the root stays untouchable. A user-scoped macOS daemon cannot see other
+  users' processes and so keeps every candidate; the tier needs the
+  system-scope service there.
+- **macOS: browsers' leftover app copies are reclaimed** (`0bd2dbb`).
+  Chrome, Canary, Edge, Brave and Opera copy their app bundle into
+  `/var/folders/<xx>/<hash>/X` at every launch and remove the copy only
+  when they exit normally. Killed headless browsers left 1,027 of them on
+  one Mac. With the v2 engine, a configured user temp dir root
+  (`/var/folders/<xx>/<hash>/T`) now brings the `X` directory beside it,
+  where only these copies are candidates. A copy is kept while a running
+  instance of its browser may own it: one that started up to 10 minutes
+  before the copy was made, or any instance for the browser's newest
+  copy. Open files can't tell which copy is live: some browsers hold
+  nothing open in theirs, and copies made from one binary all link that
+  binary. Freed space is smaller than the sizes listed, because the copies
+  share blocks with the installed app and with each other.
+
+### Fixed
+
+- **Generated systemd units cap memory at 4096M, not 768M.** The cgroup
+  is charged for the dentry and inode cache the walker fills, not only the
+  daemon's RSS. On one large host at Critical the cgroup sat at the 768M
+  cap with about 400 MiB of that cache. The daemon spent 73-79% of its
+  time stalled on memory, and its monitor tick stretched to minutes, so
+  its CPU self-report read 220-1093% of a core against a real 100%.
+  Raised to 4G at runtime, the next pass ran with no memory stall at
+  about 1.1 GiB, and ticks were regular again; when a `daemon-reload`
+  restored the 768M drop-in 14 minutes later, the stall was back within a
+  minute and the ticks stretched again. The daemon's own RSS limit
+  still bounds its allocations; the rest of the cap only bounds
+  reclaimable cache. Existing installs keep their unit until `sudo sbh
+  service --systemd reinstall-unit` rewrites it; a drop-in that sets
+  `MemoryMax=768M` overrides the new unit and must be changed too.
+- **The daemon no longer restarts itself on a large host's normal working
+  set.** Its RSS limits default to 512 MiB (warning) and 1 GiB (exit),
+  from 256 MiB and 500 MiB. Under the 768M cap the kernel had pushed part
+  of the daemon's memory into swap, which kept RSS under 500 MiB. Under
+  4096M the same host, whose passes stop at the 500k-entry budget, settled
+  at 460-490 MiB and passed 545 MiB at the end of a pass. It exited on the
+  hard limit under Critical pressure after 52 hours, and the new process
+  climbed back to 490 MiB within two hours. Installs that set the limits in
+  `[telemetry]` keep their values.
+- **The end of a timed-out pass no longer copies every barren directory.**
+  The incremental scan cursor cloned each visited directory that had no
+  candidates, about 450k paths per pass on that host, and then kept
+  50,000. It now clones at most 50,000. Which directories it keeps is
+  unchanged: fresh ones first, then the newest cached ones.
+- **The RAM-scratch report names the largest tmpfs trees again.** `sbh
+  check --ram-scratch` and the daemon's `SBH-RAM-SCRATCH` warning split
+  a 20,000-entry budget (8192 in the daemon) evenly across the occupied
+  mounts, largest first. On one host with swap 100% full, `/tmp` held
+  45 GiB in 128k entries; the report saw a few percent of it, listed
+  trees of about 1 GiB, and missed the three of 16.8, 12.3 and 3.9 GiB
+  that filled most of it. Mounts are now probed smallest first, so what a runtime
+  mount leaves unused passes to the fullest one, and the budgets are
+  2,000,000 entries (hard limit 5,000,000) and 1,000,000 in the daemon;
+  the existing deadlines still bound the work. A budget hit by many
+  directories is reported once.
+- **A deferred behavior-mode change now takes effect when its window
+  ends.** A memory transition that came within
+  `pressure.behavior_hysteresis_secs` of the previous one in the same
+  direction was held back and then lost: the memory subscription reports
+  a level only when it changes, and the next disk tick evaluated the old
+  level, which cancelled the held transition. The daemon then ran in the
+  wrong mode until memory changed level again. On one host none of 12
+  deferrals in three days was applied, and the next logged change came up
+  to four minutes later. The held level now counts as the latest
+  reading, survives a config reload, and is retried every 500 ms while
+  the daemon sleeps and on every tick; it applies once the window has
+  passed.
+- **Btrfs compression no longer leaves large files part-compressed**
+  (`3110b29`). On Linux 6.17 one defrag call over a large uncompressed
+  extent compresses only its first 256 KiB, so `sbh compress --apply`
+  left most fresh files partial. A part-compressed file uses more space
+  than before, because btrfs keeps the whole original extent while any
+  of it is still in use, and later passes refused to touch it again. Each
+  256 KiB is now compressed and written to disk before the next, and
+  anything still uncompressed in the original extents is retried until
+  none is left. A remainder is reported, never counted as compressed. On
+  one host's test files, a pass that left both files partial now
+  compresses them fully, 20 to 1.2 MiB each.
+- **Compression discovery resumes where any budget stopped it**
+  (`4a9ed94`). Only the file limit left a continuation, so a walk stopped
+  by its directory, entry or time budget started over from the top next
+  time: on a temp root with tens of thousands of entries, the daemon tier
+  would have compressed the first part and then found nothing new on every
+  later pass. Every stop now continues after the last path it fully
+  examined, and a directory past the depth limit is skipped instead of
+  ending the walk.
+- **Empty candidates no longer fill the decision log** (`7d41487`). The
+  planner never deletes a candidate that frees nothing, but the scanner
+  still sent every one to it, and each became a decision record on every
+  pass. On one host at Critical that was 3,479 empty directories every 20
+  minutes, about 250,000 records a day kept for 30 days: the activity
+  database grew from 1.1 to 1.5 GB in a day while nothing was deleted.
+  They are no longer sent.
+- **Linux: a Cargo build without HOME keeps its home config's protection**
+  (`f0e17ac`). A build run from a systemd unit or under `env -i` has no
+  HOME, so Cargo reads the config in its account's home instead. sbh read
+  no home config at all and still treated the build as fully inspected,
+  so a `build.target-dir` set there wasn't protected. sbh now reads the
+  same home config, finding the account from the process's user ID. When
+  it can't find the account, it treats the build as not fully inspected
+  and deletions wait.
+- **Installed Python packages in uv's cache are no longer nominated one
+  directory at a time** (`4bdd857`). With `~/.cache` as a scan root, sbh
+  nominated `__pycache__` directories inside packages uv had unpacked,
+  300–600 times an hour on one host. Running interpreters had them open,
+  so every attempt was refused. sbh now leaves the inside of each uv
+  cache entry alone; the uv cache as a whole can still be reclaimed.
+- **Space freed on ext4 and btrfs is reported, and marked as an estimate**
+  (`7eee639`). These filesystems release a deleted file's blocks only when
+  they next commit, so the gain measured right after each deletion was
+  close to zero. One host reported "0.0 GB freed" while freeing 4–6 GiB
+  an hour. There, summaries, status, the dashboard and notifications now
+  use the deleted trees' allocated size and say so: "~4.2 GB freed,
+  estimated". On btrfs a snapshot or reflink can keep shared blocks, so
+  the figure reads "up to 4.2 GB". The new `freed_basis` field in the
+  status JSON and state file, and the new `sbh_bytes_freed_basis` metric,
+  say how the figure was obtained, and the measured figure is kept
+  alongside. sbh's cleanup decisions don't use these figures.
+- **"Largest directories" names the real space users on large disks**
+  (`59944ea`). When reclaim can't keep up, sbh lists the biggest
+  directories on the disk. On multi-terabyte disks it had time to look at
+  only a sliver of each, so it named whatever was quick to measure: a
+  5 GiB placeholder on one host, "/Applications" on a Mac whose space was
+  in temporary agent work. Directories too large to measure fully are now
+  estimated by sampling and shown as "~X GiB est.". On a Mac with 1.7 TiB
+  used, the home directory ranked first in every trial; before, it wasn't
+  listed at all. Estimates of very large trees tend to run low.
+- **The log's RAM copy no longer switches on and off near a limit**
+  (`12c910f`). When the disk holding sbh's log fills, sbh also writes the
+  log to RAM, but stops when RAM or swap runs short. Starting and
+  stopping used the same limit, so on one host the copy started 19 times
+  and stopped 14 times a day, and each stop lost the lines it was holding.
+  Starting now needs more headroom than keeping it running (15% instead
+  of 10% of RAM and swap, 25% instead of 20% of the destination), and
+  sbh checks that headroom about once a second instead of on every log
+  line.
+- **Linux: the log's RAM copy also needs headroom in sbh's own cgroup**
+  (`9da9e8d`, `4662995`). The host can have plenty of free RAM while the
+  service's cgroup, or one above it, sits near its `memory.high`,
+  `memory.max` or swap limit; writing the log to RAM there pushes sbh
+  toward the cgroup's reclaim or OOM killer. After the host and mount
+  checks pass, the same 10% keep and 15% start margins now apply to every
+  visible cgroup-v2 scope, each against its own usage. When that evidence
+  can't be read (a legacy hierarchy, a hidden ancestor, a limit changing
+  mid-read), sbh refuses the RAM copy and stays on disk.
+- **Linux: memory pressure inside sbh's own cgroup counts** (`772d43b`,
+  `863784f`). The daemon read only the host's memory stall (PSI), so a
+  service cgroup stalling on its own limit looked healthy. It now also
+  reads its cgroup's `memory.pressure` and uses the larger of the two
+  stall figures, never their sum; host page and swap counts are unchanged.
+  The memory subscription survives its event source breaking (it falls
+  back to sampling once a second) and a failed sample reports the level
+  as unknown instead of repeating the last one.
+- **macOS: the live-process checks report what they could not see**
+  (`16feafc`, `61a303e`, `4c0119a`, `0aaaeef`, `9c7e282`, `9585207`,
+  `0741675`, `3684721`, `a588eaf`). Before a deletion, sbh asks which
+  processes use the candidate: running builds' outputs, open files,
+  executables and memory mappings. On macOS those queries dropped
+  processes they could not read and returned what was left as the whole
+  answer. They now say when coverage is incomplete (access errors,
+  budgets, a process list that would not fit), and the deletion waits;
+  what they did see still protects. One query covers all roots under
+  shared limits, a stalled native call no longer blocks its caller, and
+  the process list grows its buffer instead of retrying at the same size.
+- **macOS: deletion no longer waits forever on processes that cannot use a
+  candidate** (`00d8b23`). On a busy Mac the new checks above never
+  reported complete coverage, even as root, so nothing would have been
+  deleted:
+  - About 20 zombie processes, children their parents never reaped, read
+    as unreadable instead of exited. The errno libproc leaves behind is
+    now read.
+  - Agent CLIs still running a version their updater had deleted (10 of
+    1,670 processes) had no executable path. An unlinked executable or
+    open file lies under no candidate root.
+  - Apple daemons' guarded descriptors refuse even root. As root, those no
+    longer count as missing coverage. Without root, missing privileges
+    still hold deletions, as on Linux.
+
+  Also fixed: the macOS build (`mappings.rs` did not compile), two clippy
+  lints, and three tests that never passed on a Mac. Measured on the
+  3.6 TB Mac these checks were written for, whose daemon runs as root.
+- **The dashboard leaves the terminal usable after a panic or a kill**
+  (`ca17048`). `sbh dashboard` now opens the terminal through one guard.
+  A SIGTERM, SIGHUP, SIGQUIT or SIGINT from another process used to make
+  the terminal library restore the screen and then wait 2 s for the
+  dashboard, which went on drawing frames over the shell and was then
+  killed. The dashboard now notices the signal within 0.2 s, stops
+  drawing, restores the terminal and exits with 128 + the signal. In
+  builds where a panic unwinds (debug and test builds; release builds
+  abort, and the library covers them), the terminal is restored before
+  the panic message is printed. The message now stays readable instead of
+  being printed on the alternate screen and wiped.
+- **`sbh config validate` reports a config that does not parse as
+  INVALID again.** Since v0.7.9 the source-root assessment that runs
+  first printed "Source-root configuration: FAIL" for a syntax error and
+  stopped there, so the real check never ran and its "Configuration is
+  INVALID" message was never printed. A load failure is now left to the
+  command: `config validate` and a targeted `doctor` report it themselves.
+  A plain `sbh doctor`, which the assessment answers alone, still reports
+  it there.
+- **Release binaries include the dashboard cockpit.** dsr built the
+  release binaries without the `tui` feature that Cargo.toml lists for
+  them, so `sbh dashboard --new-dashboard` on v0.7.9 said "TUI feature not
+  enabled". dsr's build now passes `--features cli,daemon,sqlite,tui`.
+
+## v0.7.9 **[release]**
+
+Compare: [`v0.7.8...v0.7.9`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.8...v0.7.9)
+
+The first published release since v0.7.6: v0.7.7 and v0.7.8 were tagged
+but not published, and this release carries everything listed under both.
+From those: on a host under memory pressure, a build stuck in `mmap` froze
+the daemon's monitor for 19 minutes, and neither the monitor nor scans and
+deletions now wait on another process's memory. On Linux, a live build's
+command-line output directories, its Cargo config's target and build
+directories, and its default `target/` count as in use (also for `sbh
+clean` and `sbh emergency`), and a build that can't be fully inspected
+holds the batch. Directories with more than 65,536 entries are covered over
+successive passes, the root daemon no longer reads kernel pseudo-files
+named as Cargo configuration, memory pressure no longer flaps between
+levels, scans use 16–21% less CPU, protection refusals are reported as
+refusals, and maintenance passes no longer flood the journal.
+
+New in this release, a safety and availability fix set: sbh deleted source
+directories named `build` or `dist` inside repo copies under temp roots,
+and the shipped code of packages in install caches, on the name alone; such
+a directory now counts as output only beside the manifest of a tool that
+writes it. One process with tens of thousands of open files (a `bfs`
+search) stopped every deletion on its host; the limit is higher and the
+log names the process. Under the
+hardened systemd unit `sbh install` generates, ballast was never released
+for `/`; it now is, and ballast the service can't release is named
+instead of counted. Also: `sbh compress --discover --apply` compresses a
+directory's cold files in one pass.
+
+### Added
+
+- **`sbh compress --discover --apply` compresses a directory's cold files
+  in one pass** (`74e1f93`). Discovery could only list candidates, so
+  compressing a tree meant pasting its output into an explicit-file apply.
+  With `--apply` and both consents, the same pass now runs every apply check
+  on exactly the selected files, and refuses a file that changed since
+  discovery or whose root was replaced. Automatic compression under pressure
+  is still not enabled.
+
+### Fixed
+
+- **Source directories named `build` or `dist` inside repo copies under a
+  temp root are no longer deleted** (`41bce34`). Any `build` or `dist`
+  directory under `/tmp` or `/data/tmp` counted as build output on its
+  location alone. On one host sbh chose 1,743 of them and deleted 863 from
+  agents' verify checkouts and exports, for about 12 KiB each: 711 tracked
+  scripts/build source directories and 152 golden-test fixture directories
+  (a Rust src/cmd/build module was spared only by the executor's source
+  check). Inside a project tree such a directory now needs a project
+  manifest beside it to count as output.
+- **Packages' shipped code and partial repo copies are kept too**
+  (`183fd53`). A `dist/` beside `package.json` counted as output anywhere,
+  so sbh deleted the code of three packages in a bun install cache, and a
+  partial export with no manifest at all still lost its build directories.
+  A `build/` or `dist/` now counts as output only beside the manifest of a
+  tool that writes it (JS and Python packaging for `dist/`; CMake, Make,
+  Meson, Gradle, Python and JS builds for `build/`), and never inside
+  `node_modules` or a package cache. The executor's last-line source check
+  now also recognises `.mjs`, `.cjs`, `.mts` and `.cts` files.
+- **One process with many open files no longer stops every deletion**
+  (`48c1414`, `726c9a2`). sbh reads each process's open files before
+  deleting, up to 16,384 per process; past that it couldn't vouch for any
+  candidate and held them all, logging only that inspection was
+  "incomplete". On one host a long-running `bfs` search with 65,536
+  directories open stopped all deletions for hours. The per-process limit
+  is now 131,072, and when a limit is hit the log, the scanner's
+  "incomplete" line and `sbh explain` name the process.
+- **Ballast is released for `/` under a sandboxed systemd unit**
+  (`151b50f`). With `ProtectSystem=strict` (what `sbh install` generates for
+  a system service), `/` is a read-only mount inside the service and the
+  ballast directory a writable bind mount of the same disk. sbh keyed the
+  pool to the bind mount and found no pool when `/` itself came under
+  pressure: one host logged "released 0 ballast file(s)" at Critical eight
+  times in three days. Every mount entry of a pooled disk now reaches its
+  pool.
+- **The daemon says when it can't release a ballast reserve** (`f1284a9`).
+  sbh ballast left in a former pool directory that is read-only to the
+  service (outside `ReadWritePaths=`) was skipped silently, and a root `sbh
+  ballast status`, run outside the sandbox, counted it as releasable. On
+  one host that was the entire root reserve, 10 GiB. The daemon now names
+  such directories at startup, with the remedy, and `sbh --json ballast
+  status` lists them under `unreachable_reserve`.
+- **A root `sbh ballast status` no longer counts that reserve as
+  releasable** (`54bfabb`). Outside the service's sandbox `/` is writable,
+  so the CLI still adopted the read-only reserve and reported it as
+  releasable (10.7 GB on that host, which the daemon could never release).
+  The CLI now reads the installed unit and its drop-ins, and a reserve
+  directory that no `ReadWritePaths=` entry grants under
+  `ProtectSystem=strict` is listed as unreachable instead. Human output
+  names it per volume, with the remedy.
+
+## v0.7.8
+
+Compare: [`v0.7.7...v0.7.8`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.7...v0.7.8)
+
+Tagged (`5bc148d`) but not published: v0.7.9 followed the same day with
+fixes found during its canary. Its changes ship in v0.7.9.
+
+v0.7.7 was tagged but held back, because its build-inspection rework left
+Linux `sbh clean` and `sbh emergency` without a live build's declared
+directories. This version fixed that and carried everything listed under
+v0.7.7. On a host under memory
+pressure, a build stuck in `mmap` froze the daemon's monitor for 19
+minutes: no pressure response and no ballast release on a Critical host.
+Neither the monitor nor scans and deletions now wait on another process's
+memory. On Linux, a live build's command-line output directories, its
+Cargo config's target and build directories, and its default `target/`
+count as in use, and a build that can't be fully inspected holds the
+batch. Also: directories with more than 65,536 entries are covered over
+successive passes, a local user can no longer make the root daemon read
+kernel pseudo-files as Cargo configuration, memory pressure no longer flaps
+between levels, scan workers hand over results in batches (16–21% less
+user CPU), protection refusals are reported as refusals, and maintenance
+passes no longer flood the journal with repeated "keep" lines.
+
+### Fixed
+
+- **Linux `sbh clean` and `sbh emergency` keep a live build's declared
+  directories** (`5b7faf8`). v0.7.7's build-inspection rework (`e089850`)
+  moved declared build directories (`CARGO_TARGET_DIR`, `--target-dir`,
+  Cargo config) into the checked collector the daemon uses, but left the
+  collector behind interactive `clean` and `emergency` with open-file
+  evidence only. A running build's target directory with nothing open
+  beneath it, such as the local side of an `rch` build, lost its veto and
+  could be deleted by a manual clean. That collector now uses the same
+  checked composition, and its coverage is complete only when both the
+  open-file and build observations are. v0.7.6 was not affected.
+- **`cargo d` holds its default target like `cargo doc`** (`d5dafbf`). On
+  Linux a running cargo's default `target/` counts as in use before its
+  first artifact exists, but only for known build subcommands; Cargo's
+  built-in alias `d` was missing (`b`, `c`, `t` and `r` were covered).
+
+### Changed
+
+- **Maintenance passes stop repeating the same "keep" lines** (`94a2e3d`).
+  A maintenance pass logs why each classified entry was kept, and the same
+  entries recur on every pass: on one host that was 100,000 identical lines
+  a day, 95% of sbh's journal, on a disk at 95%. Each path is now logged
+  when first seen, when its verdict changes, and otherwise hourly.
+
+## v0.7.7
+
+Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.6...v0.7.7)
+
+Tagged (`adc802a`) but not published: it carried the Linux `sbh clean` /
+`sbh emergency` regression fixed in v0.7.8. Its other changes ship in
+v0.7.8.
+
+An availability and safety release. On a host under memory pressure, a
+build stuck in `mmap` froze the daemon's monitor for 19 minutes: no pressure
+response and no ballast release on a Critical host. Neither the monitor nor
+scans and deletions now wait on another process's memory. On Linux, a live
+build's command-line output directories, its Cargo config's target and
+build directories, and its default `target/` now count as in use, and a
+build that can't be fully inspected holds the batch. Also: directories with
+more than 65,536 entries are covered over successive passes, a local user
+can no longer make the root daemon read kernel pseudo-files as Cargo
+configuration, memory pressure no longer flaps between levels, scan workers
+hand over results in batches (16–21% less user CPU), and protection
+refusals are reported as refusals.
+
+### Fixed
+
+- **A directory with more than 65,536 entries is covered over successive
+  passes** (`d1f154d`). The walker stopped at that many entries and
+  started at the top again every pass, so the rest was never visited. On
+  btrfs, which lists entries in creation order, that is the newest ones:
+  a 68,519-entry `/data/tmp` hid its newest 2,984 entries (40 GiB) from
+  every pass. Each pass now processes the next 65,536 entries, and every
+  name is still read, so a `.sbh-protect` marker anywhere in a large
+  directory protects it.
+- **On Linux, build output directories named on a live build's command
+  line count as in use** (`0c64ff6`, `a7838ef`). sbh read a build
+  process's environment but not its arguments, so it could delete a
+  running build's `cargo --target-dir` directory (also via `cargo-clippy`
+  and rch's `cargo-rch-real`), or rustc's `-C incremental=` cache outside
+  the target directory. It now also tracks `CARGO_BUILD_TARGET_DIR`,
+  `CARGO_BUILD_BUILD_DIR` and an inherited `OUT_DIR` separately from the
+  final artifacts. If a known build tool's process details can't be read
+  in full, the deletion waits; a build process caught while exiting gets
+  a few milliseconds to finish first (`8a89b93`), or busy build hosts
+  held most batches.
+- **On Linux, a running cargo's configured and default target directories
+  count as in use** (`e688393`, `5441d1a`, `8177792`). A `build.target-dir`
+  or `build-dir` set in a Cargo config file (the hierarchy above the build,
+  the cargo home's config, `--config` files and inline values, and their
+  includes) was not seen at all. Nor was a build's default `target/`
+  before its first artifact existed. sbh now reads those config files, bounded and without running
+  Cargo, and derives the default target from the package or workspace
+  manifest (`--manifest-path`, virtual and nested workspaces). A config
+  file that disappears or changes while sbh reads it counts as unreadable,
+  not absent, so the deletion waits.
+- **Build inspection that can't finish holds the batch** (`e089850`,
+  `900c47a`). The executor re-checks live builds' declared directories for
+  each batch but ignored whether that check finished. Within 20 seconds of
+  a complete open-file sweep, a build whose workspace manifest couldn't be
+  read could lose its target's protection. An incomplete check now holds
+  the batch, as an incomplete open-file sweep already did, in scoring, the
+  executor and compression.
+- **The root daemon no longer reads kernel pseudo-files a user names as
+  Cargo configuration** (`c9c971e`). Any local user could start a process
+  named `cargo` with `--config /proc/kmsg`, and every sweep then read it
+  as root, draining the kernel log; a directory swapped for a symlink
+  mid-check could even make root open a device. On Linux, configuration
+  paths are now opened without following any symlink, and files on procfs,
+  sysfs, debugfs, tracefs and similar filesystems are refused unread.
+- **A wedged process can no longer freeze the daemon's monitor**
+  (`c1d8f23`). Reading another process's command line waits for that
+  process's memory-map lock. Under memory pressure a build stuck in `mmap`
+  held it for 19 minutes, and the daemon's monitor thread, which read every
+  process's command line for its I/O history and regret checks, waited
+  with it: no logging, no pressure response, no ballast release on a
+  Critical host. Those checks never used the command line and no longer
+  read it.
+- **A wedged process can no longer stall scans or deletions either**
+  (`3b45c3d`, `bbf3867`). Two more readers waited on that lock. The
+  scanner's index of what live processes use read every process's command
+  line, for names and working directories it gets elsewhere; it no longer
+  does. The build inspection before each deletion batch must read build
+  tools' environments and arguments, so on Linux each read now runs on a
+  helper thread and is abandoned at the inspection's 30-second deadline.
+  A process whose read is stuck counts as not inspected, so the batch
+  waits as for any incomplete check. It costs one blocked thread until it
+  recovers, not one per sweep.
+- **An unexpandable `CARGO_BUILD_BUILD_DIR` holds the batch** (`3b45c3d`).
+  A build-dir template (`{workspace-root}`, `{cargo-cache-home}`, ...) in
+  a build's environment was skipped silently, though the same template in
+  a Cargo config file already held the batch. Both now do; the build's
+  other declared directories stay protected either way.
+- **Protection refusals are reported as refusals** (bd-drua; `30f55e1`).
+  A candidate the daemon's executor refused because it is protected (an
+  `.sbh-protect` marker, a sacred path, or a protection check that failed
+  and is treated as protected) was counted under `target_free_reached`,
+  documented as "not a refusal — a success". It is now `sacred_stowaway`.
+  A batch cut short by shutdown reports the new `shutting_down` reason and
+  no longer puts the rest of the batch on per-path backoff.
+- **Naming what fills an unreclaimable mount stays bounded and can't stall
+  the monitor** (`5b4bc8e`, `4e8036b`). When a mount under pressure has
+  nothing sbh can delete, the daemon reports its largest directories. That
+  probe restarted its budget for each directory and ran on the monitor
+  thread. One entry and time budget now covers the whole mount, the
+  monitor waits a bounded time and never on a stalled probe, symlinks are
+  not followed, and a cut-short inventory reports its sizes as lower
+  bounds.
+
+### Changed
+
+- **Scan workers hand their results over in batches** (bd-vf9z;
+  `7eac2c7`). Each walker thread sent one message per directory, so the
+  collector waited on the channel, spinning and then yielding, once per
+  directory; on a loaded Mac the daemon's scanner thread spent about a
+  third of its time in those yields. Workers now send up to 64 entries at
+  a time, and whatever they hold before they wait for more work. Scanning
+  a 200,000-directory tree took 82–95% fewer voluntary context switches
+  and 16–21% less user CPU, in the same wall time.
+- **Memory pressure no longer flaps between levels** (`14530fe`). On
+  Linux, memory pressure is the kernel's 10-second stall average against
+  fixed thresholds (Warn 5%, Critical 20%). With the average hovering near
+  5%, the daemon switched between Normal and Warn every few seconds (up to
+  31 behavior changes an hour on one host), changing how aggressively it
+  scans each time. A level is now left only once the average falls a
+  fifth below its threshold. And a host that goes quiet after pressure is
+  now seen to recover: the daemon checked again only when a new stall
+  occurred, so it could stay at Warn or Critical indefinitely.
+- **The RSS warning no longer repeats every minute** (`13e8d5c`). While RSS
+  stayed over the warning level (256 MiB), the daemon logged the same
+  warning on every state write, about 1,440 lines a day on a host whose
+  tree needs ~300 MiB. It is now logged when RSS crosses the level, then
+  hourly or after another 64 MiB of growth.
+
+## v0.7.6 **[release]**
+
+Compare: [`v0.7.5...v0.7.6`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.5...v0.7.6)
+
+A safety release. sbh v0.7.5 could delete the target directory of a build
+offloaded with `rch exec`, because it didn't count `rch` as a build process,
+and under Critical pressure it could choose to delete an empty directory,
+which frees nothing. A user-scoped macOS sbh could delete a small candidate
+that another user's process held open. Generated systemd units now give the
+daemon room above its own memory limit and cap glibc's malloc arenas. Also:
+`sbh check` honours the absolute free-space floors, the root `install.sh`
+honours `--dest`, a `kill -USR1` scan is no longer dropped, the activity
+log's RAM fallback keeps clear of a full RAM filesystem, and sbh's HTTP
+User-Agent names sbh.
+
+### Fixed
+
+- **An offloaded `rch` build's target directory counts as in use**
+  (`eb43d58`). `rch exec -- cargo build` compiles on a worker, so the only
+  local process is `rch`, which sbh did not treat as a build process, and
+  nothing holds the `CARGO_TARGET_DIR` open until the artifacts sync back.
+  On a dispatcher, v0.7.5 deleted a live build's fresh, empty target
+  directory eight minutes into the build, and the sync-back recreated it.
+  `rch` now counts as a Rust build process, so the `CARGO_TARGET_DIR` and
+  cargo home named in its environment are in use while it runs.
+- **The planner never deletes an empty candidate** (`eb43d58`). At
+  Critical pressure with no risk budget, it could choose a 0-byte candidate,
+  which frees nothing and still risks a live directory. That empty target
+  above was such a choice.
+- **A `kill -USR1` scan is no longer dropped while the scanner is busy**
+  (`911c776`). With the scan queue full, the forced scan was discarded
+  after 100 ms while the log said "forced scan triggered". It is now
+  retried every monitor tick until queued, and the log says when it was
+  deferred and when it was queued.
+- **`sbh check` honours the absolute free-space floors** (`bca8ba4`). It
+  compared free space with the Yellow percentage alone and ignored the
+  `*_min_free_bytes` floors that the daemon's levels use, so a large disk
+  with hundreds of gigabytes free could still fail the check: `sbh check
+  --need 20G` exited 1 on a 3.6 TiB volume with 453 GB free. `check` now
+  uses the daemon's Yellow line for that volume; `--target-free` still
+  overrides it.
+- **The root `install.sh` honours `--dest` and refuses unknown arguments**
+  (bd-fgxo; `651445a`). It never parsed its arguments, so `--dest /opt/x`
+  installed to `$SBH_INSTALL_DIR` or `/usr/local/bin` and, run as root,
+  silently replaced the system daemon's binary. It now takes `--dest`,
+  `--version` and `--help`; anything else exits 2 before downloading.
+- **A user-scoped macOS sbh no longer deletes what it cannot check**
+  (bd-1ouz; `645e0d2`). Run without root, macOS hides other users' open
+  files. The v1 scanner refused every candidate for that reason, but the v2
+  scanner, its index replay, and the CLI's `clean`, `emergency` and `scan`
+  checked open files only for large candidates outside cache categories, so
+  a small candidate could be deleted while another user's process held it.
+  Every path now refuses such candidates, and `clean`/`emergency` print a
+  hint to run `sudo sbh <command>` or the system-scope daemon. Root sbh and
+  every Linux sbh are unchanged.
+- **The activity log's fallback and mirror stay off a RAM filesystem that
+  is short of room** (`c0fa218`, `01b8cc1`, `1165983`). A fallback or
+  mirror log on tmpfs is used only while the host has at least 10% of its
+  RAM available, its filesystem 20% free and, if it has swap, 10% of the
+  swap free; counters that can't be read or don't add up count as a
+  refusal. The check runs on open, recovery, writes, flushes, idle ticks
+  and shutdown. A refused mirror stops while the primary log carries on; a
+  refused fallback sends later records to stderr and drops its pending
+  buffer instead of flushing it into RAM. sbh prints `[SBH-JSONL]
+  fallback/mirror refused` at most every 30 seconds. The 16 MiB cap on the
+  fallback and mirror now holds for a single oversized record and after a
+  failed rotation, and a handover no longer opens the same file with two
+  writers. Details in `docs/ram-scratch.md`.
+
+### Changed
+
+- **Generated systemd units cap memory at 768M, above the daemon's own
+  limit** (`cb6e62c`). `MemoryMax=256M` sat below the daemon's 500 MiB RSS
+  hard limit, so on a tree that needed more than 256 MiB the kernel
+  killed the daemon, possibly mid-deletion, before it could exit cleanly
+  and be restarted. A host scanning 500k entries per pass needs about
+  290 MiB. Existing installs keep their unit until `sudo sbh service
+  --systemd reinstall-unit` rewrites it (or a drop-in sets the two
+  `[Service]` lines `MemoryMax=768M` and `Environment=MALLOC_ARENA_MAX=2`).
+- **Generated systemd units cap glibc malloc arenas at two** (`8da899d`).
+  glibc keeps a malloc arena per scanner thread along with its freed pages,
+  so on a large tree the daemon's RSS settled at about twice its live set:
+  on a host scanning 500k entries per pass it reached 480–499 MiB and once
+  exited on the 500 MiB hard limit. With `MALLOC_ARENA_MAX=2` it held at
+  about 290 MiB for an hour at the same scan CPU. Units written by other
+  installers can add the line in a drop-in.
+- **sbh identifies itself honestly in HTTP requests** (`2eb0210`). The
+  updater, release-asset downloads and webhook notifications sent a
+  User-Agent borrowed from other companies' clients. They now send
+  `sbh (+https://github.com/Dicklesworthstone/storage_ballast_helper)`.
+
+## v0.7.5 **[release]**
 
 Compare: [`v0.7.4...v0.7.5`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.4...v0.7.5)
 
@@ -68,6 +1034,17 @@ Git repositories.
   full and swap exhausted. It now copies only while `/dev/shm` has a fifth
   of its space free and swap is not nearly full, re-checks every 30 seconds,
   and logs why when it stops or skips the copy.
+- **Locks are released when sbh lets go of them, even while it is starting
+  another process** (`b9e925f`, `ddc6a16`). A lock stayed held for as long
+  as a child process being started still had a copy of its descriptor.
+  So the daemon's next ballast replenish could find the pool "busy" right
+  after a release. And `sbh compress --recover-journal`, run just after a
+  pass, could report that pass as still running. Both locks are now
+  released explicitly, and recovery also waits up to two seconds for a lock
+  before calling a pass live.
+- `install.sh` reads the latest release tag from GitHub API responses
+  served as one-line JSON, where it took part of the release notes as the
+  version (`8023aa9`).
 
 ### Added
 

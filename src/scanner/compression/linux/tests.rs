@@ -24,6 +24,77 @@ fn incomplete_process_evidence_never_admits_compression() {
 }
 
 #[test]
+fn newly_mapped_files_are_refused_even_when_cached_evidence_is_empty() {
+    use crate::core::errors::Result;
+    use crate::platform::pal::{FsStats, MemoryInfo, MountPoint, PlatformPaths, ServiceManager};
+    use crate::platform::types::{ExecutablesResult, MappedRegion, OpenFilesResult};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct NewMapping {
+        fresh_queries: AtomicUsize,
+    }
+
+    impl Platform for NewMapping {
+        fn fs_stats(&self, path: &Path) -> Result<FsStats> {
+            MockPlatform::healthy().fs_stats(path)
+        }
+        fn mount_points(&self) -> Result<Vec<MountPoint>> {
+            Ok(Vec::new())
+        }
+        fn is_ram_backed(&self, _: &Path) -> Result<bool> {
+            Ok(false)
+        }
+        fn default_paths(&self) -> PlatformPaths {
+            PlatformPaths::default()
+        }
+        fn memory_info(&self) -> Result<MemoryInfo> {
+            MockPlatform::healthy().memory_info()
+        }
+        fn service_manager(&self) -> Box<dyn ServiceManager> {
+            panic!("activity checks must not control services")
+        }
+        fn open_files_under(&self, _: &Path) -> Result<OpenFilesResult> {
+            Ok(OpenFilesResult::complete(Vec::new()))
+        }
+        fn executables_under(&self, _: &Path) -> Result<ExecutablesResult> {
+            Ok(ExecutablesResult {
+                processes: Vec::new(),
+                complete: true,
+            })
+        }
+        fn build_directories_in_use_checked(&self) -> (Vec<(i32, PathBuf)>, bool) {
+            (Vec::new(), true)
+        }
+        fn mmap_regions_under(&self, _: &Path) -> Result<Vec<MappedRegion>> {
+            // The reader mapped the file after this cached empty observation.
+            Ok(Vec::new())
+        }
+        fn mmap_regions_under_fresh(&self, path: &Path) -> Result<Vec<MappedRegion>> {
+            if self.fresh_queries.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Ok(Vec::new());
+            }
+            Ok(vec![MappedRegion {
+                pid: 424_242,
+                path: path.to_path_buf(),
+                start_address: Some(0x1000),
+                end_address: Some(0x2000),
+                protection: Some("r--".into()),
+            }])
+        }
+    }
+
+    let platform = NewMapping::default();
+    let path = Path::new("/tmp/newly-mapped-input");
+    assert!(check_active(path, -1, &platform).is_ok());
+    assert!(platform.mmap_regions_under(path).unwrap().is_empty());
+    let error = check_active(path, -1, &platform).unwrap_err();
+    assert!(error.to_string().contains("active memory mappings"));
+    assert_eq!(platform.fresh_queries.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn fresh_marker_checks_do_not_reuse_negative_preflight_caches() {
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("cold.bin");
@@ -146,16 +217,20 @@ fn git_packfile_preview_and_apply_stop_before_hashing_or_journaling() {
         let mut identities = BTreeSet::new();
         let error = process_file(
             &path,
+            None,
             &mut item,
             &policy,
             CompressionMode {
                 apply,
                 allow_zstd_feature: true,
-                quiescent: true,
+                acknowledgement: crate::scanner::compression::ConcurrencyAcknowledgement::Quiescent,
             },
             &Config::default(),
             &platform,
-            Instant::now() + Duration::from_secs(30),
+            &PassControl {
+                deadline: Instant::now() + Duration::from_secs(30),
+                stop: None,
+            },
             &mut bytes,
             &mut identities,
             &mut audit,
@@ -190,4 +265,64 @@ fn per_chunk_protection_detects_a_new_gitfile_without_reusing_admission() {
     let error = check_protection(&path, &config, &platform).unwrap_err();
     assert!(error.to_string().contains("Git repository"));
     assert_eq!(fs::read(&path).unwrap(), b"not rewritten");
+}
+
+#[test]
+fn a_stop_ends_a_started_file_between_chunks_but_the_deadline_does_not() {
+    let stop = AtomicBool::new(false);
+    let control = PassControl {
+        deadline: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+        stop: Some(&stop),
+    };
+    // Past the pass deadline no file starts, but a started one goes on.
+    assert_eq!(control.admit().unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert!(control.check_stop().is_ok());
+    stop.store(true, Ordering::Release);
+    assert_eq!(
+        control.check_stop().unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert_eq!(
+        control.admit().unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    let unstoppable = PassControl {
+        deadline: Instant::now() + Duration::from_secs(30),
+        stop: None,
+    };
+    assert!(unstoppable.admit().is_ok());
+}
+
+#[test]
+fn a_raised_stop_ends_the_pass_before_any_file_is_opened() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("cold.bin");
+    fs::write(&path, b"untouched").unwrap();
+    let stop = AtomicBool::new(true);
+    let mut observed = 0;
+    let report = run(
+        std::slice::from_ref(&path),
+        None,
+        &CompressionPolicy::default(),
+        CompressionMode::default(),
+        &Config::default(),
+        &MockPlatform::healthy(),
+        Some(&stop),
+        &mut |_| observed += 1,
+    )
+    .unwrap();
+    assert!(report.files.is_empty());
+    assert_eq!(observed, 0);
+    assert_eq!(report.unvisited_files, 1);
+    assert_eq!(report.exit_code, 4, "unvisited files are not a clean pass");
+    assert!(
+        report
+            .stop_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no longer allows changes")),
+        "{:?}",
+        report.stop_reason
+    );
+    assert!(report.journal_path.is_none());
+    assert_eq!(fs::read(&path).unwrap(), b"untouched");
 }

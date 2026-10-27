@@ -28,7 +28,11 @@ pub struct AttributionLimits {
 impl Default for AttributionLimits {
     fn default() -> Self {
         Self {
-            max_entries: 20_000,
+            // Agent hosts hold hundreds of thousands of tmpfs entries (ts2,
+            // 2026-10-18: /tmp 128k, /dev/shm 510k); 20,000 saw a few percent
+            // of /tmp and missed its three largest trees. The deadline is the
+            // real bound on the work.
+            max_entries: 2_000_000,
             max_depth: 8,
             top: 10,
         }
@@ -38,13 +42,13 @@ impl Default for AttributionLimits {
 impl AttributionLimits {
     /// Reject unbounded output or traversal work.
     pub fn validate(self) -> io::Result<()> {
-        if !(1..=100_000).contains(&self.max_entries)
+        if !(1..=5_000_000).contains(&self.max_entries)
             || self.max_depth > 32
             || !(1..=50).contains(&self.top)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "scratch attribution requires 1..100000 entries, depth 0..32, and top 1..50",
+                "scratch attribution requires 1..5000000 entries, depth 0..32, and top 1..50",
             ));
         }
         Ok(())
@@ -92,9 +96,13 @@ pub struct MountAttribution {
 /// Inspect mount children without following symlinks or crossing mounts.
 ///
 /// Each mount receives a share of the remaining entry/time budget, so a large
-/// `/tmp` cannot consume all inspection time before `/run` is considered. The
-/// caller passes its original command deadline: collection and attribution do
-/// not each receive a fresh full timeout. No file contents are opened or read.
+/// `/tmp` cannot consume all inspection time before `/run` is considered.
+/// Mounts are probed smallest occupancy first: whatever a small runtime mount
+/// leaves unused flows on, so the fullest mount, probed last, is not cut to
+/// 1/N of the budget by mounts that needed almost none of it. Reports keep
+/// the caller's order. The caller passes its original command deadline:
+/// collection and attribution do not each receive a fresh full timeout. No
+/// file contents are opened or read.
 pub fn inspect(
     mounts: &[ScratchMount],
     limits: AttributionLimits,
@@ -108,9 +116,12 @@ pub fn inspect(
         ));
     }
     let mut remaining = limits.max_entries;
-    let mut reports = Vec::with_capacity(mounts.len());
-    for (index, mount) in mounts.iter().enumerate() {
-        let left = mounts.len() - index;
+    let mut order: Vec<usize> = (0..mounts.len()).collect();
+    order.sort_by_key(|&index| mounts[index].used_bytes);
+    let mut reports: Vec<Option<MountAttribution>> = vec![None; mounts.len()];
+    for (visited, &index) in order.iter().enumerate() {
+        let mount = &mounts[index];
+        let left = mounts.len() - visited;
         let share = remaining.div_ceil(left);
         let time = deadline.saturating_duration_since(Instant::now());
         let slice = time
@@ -128,9 +139,9 @@ pub fn inspect(
             unavailable(mount, "descriptor-based scratch attribution requires Linux")
         };
         remaining = remaining.saturating_sub(report.entries_examined);
-        reports.push(report);
+        reports[index] = Some(report);
     }
-    Ok(reports)
+    Ok(reports.into_iter().flatten().collect())
 }
 
 fn unavailable(mount: &ScratchMount, reason: &str) -> MountAttribution {

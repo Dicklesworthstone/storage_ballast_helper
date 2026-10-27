@@ -22,10 +22,13 @@ pub(super) fn check(
     // newly-full or read-only filesystem. Never turn a failed probe into zero
     // cost for the candidate file.
     let stats = manager.platform.fs_stats(&manager.ballast_dir)?;
+    // The floor in force on this volume: absolute byte floors lower it on a
+    // large volume as they lower its pressure levels.
+    let floor_pct = manager.provision_floor.pct_on(stats.total_bytes);
     evaluate(
         &stats,
         manager.config.file_size_bytes,
-        manager.provision_floor_pct,
+        floor_pct,
         caller_pct,
     )
     .map_err(|details| SbhError::FsStats {
@@ -72,9 +75,13 @@ fn evaluate(
     if cost <= available && after >= floor_bytes {
         Ok(Admission::Admit {
             free_pct_after: Some(free_pct_after),
+            floor_pct,
         })
     } else {
-        Ok(Admission::Refuse { free_pct_after })
+        Ok(Admission::Refuse {
+            free_pct_after,
+            floor_pct,
+        })
     }
 }
 
@@ -387,6 +394,170 @@ mod tests {
         assert!(!admitted(evaluate(&at_floor, 0, 10.000_000_1, None)));
         assert!(!admitted(evaluate(&ample, 1, 10.0, Some(10.099_999_9))));
         assert!(admitted(evaluate(&ample, 1, 10.0, Some(10.1))));
+    }
+
+    /// A large volume that the absolute byte floors hold at Green gets a
+    /// reserve: the floor follows the thresholds in force on that volume, not
+    /// the percentage ones, and the report names the floor actually applied.
+    #[test]
+    fn byte_floors_admit_a_reserve_the_percentage_floor_refuses_on_a_large_volume() {
+        use crate::ballast::manager::ProvisionFloor;
+        use crate::monitor::pid::PressureLevel;
+        const GIB: u64 = 1 << 30;
+        let total = 2_000_000_000_000_u64;
+        let rule = |bytes| ProvisionFloor::Thresholds {
+            pct: [10.0, 8.0, 5.0, 3.0],
+            bytes,
+            release_level: Some(PressureLevel::Orange),
+            margin_pct: 1.0,
+        };
+        // 4.95% free, ~99 GB: under the 9% percentage floor (Yellow 8 + 1).
+        let temp = tempfile::tempdir().unwrap();
+        let mut pool = manager(temp.path(), Some(stats(total, 99_000_000_000)));
+
+        pool.set_provision_floor_rule(rule([0; 4]));
+        let refused = pool.provision(None).unwrap();
+        assert_eq!(refused.files_created, 0);
+        assert_eq!(refused.skipped_for_floor, 3);
+        assert!(
+            (refused.floor_pct - 9.0).abs() < 1e-9,
+            "{}",
+            refused.floor_pct
+        );
+        assert!(!pool.file_path(1).exists());
+
+        // Byte floors put Yellow at 60 GiB (3.22%) on this volume, so the
+        // floor is 4.22% (~84 GB).
+        pool.set_provision_floor_rule(rule([80 * GIB, 60 * GIB, 40 * GIB, 25 * GIB]));
+        let built = pool.provision(None).unwrap();
+        assert_eq!(built.files_created, 3, "{built:?}");
+        assert_eq!(built.skipped_for_floor, 0);
+        #[allow(clippy::cast_precision_loss)]
+        let expected = (60 * GIB) as f64 * 100.0 / total as f64 + 1.0;
+        assert!(
+            (built.floor_pct - expected).abs() < 1e-9,
+            "{}",
+            built.floor_pct
+        );
+
+        // The same rule still refuses once the volume is under its own floor.
+        let temp = tempfile::tempdir().unwrap();
+        let mut low = manager(temp.path(), Some(stats(total, 80_000_000_000)));
+        low.set_provision_floor_rule(rule([80 * GIB, 60 * GIB, 40 * GIB, 25 * GIB]));
+        let report = low.replenish_one(None).unwrap();
+        assert_eq!(report.files_created, 0);
+        assert_eq!(report.skipped_for_floor, 3);
+    }
+
+    /// #38: a refill never leaves a volume in a level whose behavior releases
+    /// ballast. On the reported host (467 GB, ten 1 GiB files, default
+    /// thresholds) the floor was the Orange threshold, 10%. A refill at
+    /// 14.35% free (Yellow) admitted all ten files and left about 12.05%:
+    /// Orange, where the default matrix releases ballast, and the daemon
+    /// released seven of them five seconds later. The floor now stops every
+    /// refill at least `hysteresis_pct` above the first releasing level.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_refill_never_lands_the_volume_in_a_level_that_releases_ballast() {
+        use crate::ballast::manager::ProvisionFloor;
+        use crate::core::config::Config;
+        use crate::daemon::policy::{
+            BEHAVIOR_MEMORY_LEVELS, BallastAction, BehaviorDispatchTable, BehaviorPreset,
+        };
+        use crate::monitor::pid::{PressureLevel, classify_level};
+        const GIB: u64 = 1 << 30;
+
+        // Admit up to `count` files one at a time, as provision does, each
+        // against the volume as the previous file left it.
+        let refill = |floor: ProvisionFloor, total: u64, mut available: u64, count: usize| {
+            let floor_pct = floor.pct_on(total);
+            let mut created = 0;
+            while created < count
+                && admitted(evaluate(&stats(total, available), GIB, floor_pct, None))
+            {
+                available -= GIB;
+                created += 1;
+            }
+            (created, available)
+        };
+        let level_of = |config: &Config, total: u64, available: u64| {
+            let [green, yellow, orange, red] = config.pressure.free_pct_thresholds_for(total);
+            classify_level(
+                available as f64 * 100.0 / total as f64,
+                green,
+                yellow,
+                orange,
+                red,
+            )
+        };
+        let releases_at = |config: &Config, level: PressureLevel| {
+            let table = BehaviorDispatchTable::from_config(&config.behavior).unwrap();
+            BEHAVIOR_MEMORY_LEVELS.into_iter().any(|memory| {
+                table.mode_for_levels(memory, level).ballast_action != BallastAction::None
+            })
+        };
+
+        let reported = Config::default();
+        let host = 467_000_000_000_u64;
+        let free_at = |total: u64, basis_points: u64| total / 10_000 * basis_points;
+
+        // The old floor reproduces the report.
+        let legacy = ProvisionFloor::Thresholds {
+            pct: reported.pressure.free_pct_thresholds(),
+            bytes: [0; 4],
+            release_level: None,
+            margin_pct: 1.0,
+        };
+        let (created, left) = refill(legacy, host, free_at(host, 1435), 10);
+        assert_eq!(created, 10);
+        assert_eq!(level_of(&reported, host, left), PressureLevel::Orange);
+        assert!(releases_at(&reported, PressureLevel::Orange));
+
+        // The floor in force: no file at 14.35%, while the 19.23% refill of
+        // the same report still builds all ten and ends at Yellow (16.9%).
+        let rule = reported.ballast_provision_floor();
+        assert_eq!(refill(rule, host, free_at(host, 1435), 10).0, 0);
+        let (created, left) = refill(rule, host, free_at(host, 1923), 10);
+        assert_eq!(created, 10);
+        assert_eq!(level_of(&reported, host, left), PressureLevel::Yellow);
+
+        let mut rollback = Config::default();
+        rollback.behavior.preset = BehaviorPreset::V0_5;
+        let mut floored = Config::default();
+        floored.pressure.green_min_free_bytes = 80 * GIB;
+        floored.pressure.yellow_min_free_bytes = 60 * GIB;
+        floored.pressure.orange_min_free_bytes = 40 * GIB;
+        floored.pressure.red_min_free_bytes = 25 * GIB;
+        floored.validate().unwrap();
+        for (config, total) in [
+            (&reported, host),
+            (&rollback, host),
+            (&floored, host),
+            (&floored, 4_000_000_000_000),
+        ] {
+            let rule = config.ballast_provision_floor();
+            // One hysteresis step, rounded down so float error cannot
+            // carry the check across a threshold.
+            let margin = total / 100 - total / 1_000_000;
+            let mut refills = 0;
+            for basis_points in 0..=3_000 {
+                let (created, left) = refill(rule, total, free_at(total, basis_points), 10);
+                if created == 0 {
+                    continue;
+                }
+                refills += 1;
+                for after in [left, left - margin] {
+                    let level = level_of(config, total, after);
+                    assert!(
+                        !releases_at(config, level),
+                        "{:?} on {total} B: {created} file(s) from {basis_points} bp left \
+                         {after} B free, {level:?}",
+                        config.behavior.preset
+                    );
+                }
+            }
+            assert!(refills > 500, "only {refills} starting points refilled");
+        }
     }
 
     #[test]

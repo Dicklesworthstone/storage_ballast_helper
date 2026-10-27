@@ -7,7 +7,7 @@ use clap::{ArgMatches, Args, Command, FromArgMatches};
 use storage_ballast_helper::core::config::Config;
 use storage_ballast_helper::scanner::compression::journal::{self, RecoveryReport};
 use storage_ballast_helper::scanner::compression::{
-    CompressionMode, CompressionPolicy, CompressionReport,
+    CompressionMode, CompressionPolicy, CompressionReport, ConcurrencyAcknowledgement,
 };
 
 mod activity_cli;
@@ -59,7 +59,7 @@ struct Options {
 pub fn command() -> Command {
     discovery_cli::augment(Options::augment_args(Command::new("compress")
         .about("Preview or apply lossless compression to selected cold, unshared Btrfs files")
-        .after_help("Preview is the default. Linux x86-64/AArch64 and openat2 support are required for apply; extent-tree inspection normally requires root.\n\nApply preserves contents and verifies SHA-256, size and mtime. Protected, leased, open, executing, mapped, shared, already-compressed and low-headroom files are refused. There is no force override.\n\nFIEMAP inspection is not a snapshot lock. --quiescent acknowledges that concurrent writers, snapshots and reflinks have been stopped. A deadline stops between bounded calls; postflight verification may take additional time.\n\nBefore any rewrite, apply records a durable intent under compression-journal beside state.json. The state directory must already exist. Audit failures stop mutation. Prepared-file outcomes are also submitted to the shared activity log; activity_delivery reports transport separately, never proof of backend durability.\n\nExamples:\n  sudo sbh compress --json -- /data/old-debug-binary /data/old-session.jsonl\n  sudo sbh compress --apply --allow-zstd-feature --quiescent --json -- /data/old-debug-binary\n  sudo sbh compress --recover-journal /var/lib/sbh/compression-journal/RUN.jsonl --json\n  sbh compress --discover --json -- /data/cold-archive\n  sudo sbh explain --id compress:RUN:SEQUENCE --json\n\n--discover recursively selects metadata candidates without applying compression. It rejects all apply consent flags; live-use and physical-extent checks are still required by ordinary file preview/apply.\n\nRecovery is read-only, requires no daemon config, and never replays compression. Verified content after interruption is not evidence of physical reclaim. This command does not enable automatic daemon compression or change deletion policy.")))
+        .after_help("Preview is the default. Linux x86-64/AArch64 and openat2 support are required for apply; extent-tree inspection normally requires root.\n\nApply preserves contents and verifies SHA-256, size and mtime. Protected, leased, open, executing, mapped, shared, already-compressed and low-headroom files are refused. There is no force override.\n\nFIEMAP inspection is not a snapshot lock. --quiescent acknowledges that concurrent writers, snapshots and reflinks have been stopped. A deadline stops between bounded calls; postflight verification may take additional time.\n\nBefore any rewrite, apply records a durable intent under compression-journal beside state.json. The state directory must already exist. Audit failures stop mutation. Prepared-file outcomes are also submitted to the shared activity log; activity_delivery reports transport separately, never proof of backend durability.\n\nExamples:\n  sudo sbh compress --json -- /data/old-debug-binary /data/old-session.jsonl\n  sudo sbh compress --apply --allow-zstd-feature --quiescent --json -- /data/old-debug-binary\n  sudo sbh compress --recover-journal /var/lib/sbh/compression-journal/RUN.jsonl --json\n  sbh compress --discover --json -- /data/cold-archive\n  sudo sbh compress --discover --apply --allow-zstd-feature --quiescent --json -- /data/cold-archive\n  sudo sbh explain --id compress:RUN:SEQUENCE --json\n\n--discover recursively selects metadata candidates; alone it rewrites nothing. With --apply (and both consents) the same pass then runs every apply check on exactly that selection, refusing a file changed since discovery or a replaced root.\n\nRecovery is read-only, requires no daemon config, and never replays compression. Verified content after interruption is not evidence of physical reclaim. This command does not enable automatic daemon compression or change deletion policy.")))
 }
 
 pub fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
@@ -93,7 +93,11 @@ pub fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
     let mode = CompressionMode {
         apply: options.apply && !options.dry_run,
         allow_zstd_feature: options.allow_zstd_feature,
-        quiescent: options.quiescent,
+        acknowledgement: if options.quiescent {
+            ConcurrencyAcknowledgement::Quiescent
+        } else {
+            ConcurrencyAcknowledgement::None
+        },
     };
     let explicit_config = matches.get_one::<PathBuf>("config");
     let result = Config::load(explicit_config.map(PathBuf::as_path))

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::self_monitor::DaemonState;
+use crate::scanner::deletion::FreedBasis;
 
 /// File name of the export, a sibling of `state.json`.
 pub const METRICS_FILE_NAME: &str = "metrics.prom";
@@ -337,6 +338,24 @@ pub fn render(state: &DaemonState, git_sha: &str) -> String {
     freed.sample(&[], state.counters.bytes_freed);
     families.push(freed);
 
+    let mut freed_basis = Family::new(
+        "sbh_bytes_freed_basis",
+        "1 for how sbh_bytes_freed_total is known, 0 for the others: observed, or \
+         the allocated-size estimate where the filesystem frees blocks at commit.",
+        "gauge",
+    );
+    for basis in [
+        FreedBasis::Observed,
+        FreedBasis::Estimated,
+        FreedBasis::EstimatedUpperBound,
+    ] {
+        freed_basis.sample(
+            &[("basis", basis.label())],
+            u8::from(state.counters.freed_basis == basis),
+        );
+    }
+    families.push(freed_basis);
+
     let mut errors = Family::new(
         "sbh_errors_total",
         "Errors the daemon logged since it started.",
@@ -635,6 +654,8 @@ mod tests {
                 bytes_freed: 5_032_071_168,
                 errors: 0,
                 dropped_log_events: 0,
+                freed_basis: crate::scanner::deletion::FreedBasis::Observed,
+                bytes_freed_observed: None,
             },
             memory_rss_bytes: 61 * 1024 * 1024,
             policy_mode: "enforce".to_string(),
@@ -730,6 +751,8 @@ mod tests {
             "sbh_scans_total 12\n",
             "sbh_deletions_total 2\n",
             "sbh_bytes_freed_total 5032071168\n",
+            "sbh_bytes_freed_basis{basis=\"observed\"} 1\n",
+            "sbh_bytes_freed_basis{basis=\"estimated_allocated\"} 0\n",
             "sbh_policy_mode{mode=\"enforce\"} 1\n",
             "sbh_policy_mode{mode=\"observe\"} 0\n",
             "sbh_thread_up{thread=\"executor\"} 0\n",

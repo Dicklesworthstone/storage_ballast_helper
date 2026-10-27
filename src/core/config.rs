@@ -82,7 +82,8 @@ pub struct Config {
     pub behavior: BehaviorConfig,
     pub special_locations: SpecialLocationsConfig,
     pub system_tuning: SystemTuningConfig,
-    pub platform: PlatformConfig,
+    /// Opt-in lossless compression of cold btrfs files (`[compress]`).
+    pub compress: CompressConfig,
     /// Keys the loaded file contained that no section declares. Not part
     /// of the file format (never serialized; excluded from `stable_hash`).
     #[serde(skip)]
@@ -215,6 +216,15 @@ fn legacy_config_key_hint(path: &str) -> Option<&'static str> {
         "policy.canary_delete_cap_per_hour" => "use [policy] max_canary_deletes_per_hour",
         "policy.fallback_safe" => {
             "use [policy] kill_switch = true to hold the daemon in fallback-safe"
+        }
+        "scheduler.exploration_quota_fraction"
+        | "scheduler.fp_risk_weight"
+        | "scheduler.exploration_weight" => {
+            "removed: it had no effect (the scheduler's hazard index replaced it); delete the line"
+        }
+        "update.background_refresh" => "removed: nothing read it; delete the line",
+        "platform" => {
+            "removed: [platform.macos] query_foundation_purgeable had no effect; SBH_MACOS_QUERY_FOUNDATION_PURGEABLE=0 in the environment stops the Foundation query"
         }
         _ => match leaf {
             "file_size_mb" => "use file_size_bytes",
@@ -513,6 +523,17 @@ pub struct ScannerConfig {
     pub allow_source_tree_roots: bool,
     pub excluded_paths: Vec<PathBuf>,
     pub protected_paths: Vec<String>,
+    /// Roots, usually excluded or protected as a whole, inside which sbh may
+    /// still remove pure, idle cargo target directories (bd-232u). An agent's
+    /// session scratch holds temp clones and evidence, but agents also build
+    /// there with `CARGO_TARGET_DIR`. Each entry is an absolute path that may
+    /// contain `*` inside a segment, as in `log_truncation.paths`. Everything
+    /// else under the root stays untouchable; the checks are in
+    /// `src/daemon/target_tier.rs`. Empty turns the tier off. macOS default:
+    /// the agent scratch root `/private/tmp/claude-*`.
+    pub target_only_roots: Vec<PathBuf>,
+    /// Hours nothing inside a target-only candidate may have changed.
+    pub target_only_idle_hours: u64,
     pub min_file_age_minutes: u64,
     pub max_depth: usize,
     pub parallelism: usize,
@@ -592,7 +613,9 @@ pub struct ScannerConfig {
     /// `/var/folders/<x>/<y>/T`), where cargo test tempdirs and most tools
     /// write. The default roots (`/tmp`, `/var/tmp`) resolve to
     /// `/private/...` there and never reach it. Added at load unless a root
-    /// already covers it. No effect on other platforms.
+    /// already covers it. No effect on other platforms. A temp dir root,
+    /// added here or configured, also brings its sibling `X` with the v2
+    /// engine, where crashed browsers leave their app clones.
     pub include_user_temp_dir: bool,
     /// How often (seconds) a catalog scan may repeat on the same mount at the
     /// same pressure level; a rising level re-arms it immediately.
@@ -745,17 +768,8 @@ pub struct VoiConfig {
     pub enabled: bool,
     /// Maximum number of paths to scan per scheduling interval.
     pub scan_budget_per_interval: usize,
-    /// Retained for config compatibility; the hazard-driven index (Q6)
-    /// replaced the exploration quota, so this key has no effect.
-    pub exploration_quota_fraction: f64,
     /// Weight for the visit-cost penalty (`w_c` in the Q6 index).
     pub io_cost_weight: f64,
-    /// Retained for config compatibility; the Q6 index does not penalize
-    /// false positives (scoring vetoes handle them), so this key has no effect.
-    pub fp_risk_weight: f64,
-    /// Retained for config compatibility; the hazard term of the Q6 index
-    /// replaced the exploration bonus, so this key has no effect.
-    pub exploration_weight: f64,
     /// Forecast-error threshold: if MAPE exceeds this, switch to fallback.
     pub forecast_error_threshold: f64,
     /// Number of consecutive windows with high forecast error before triggering fallback.
@@ -773,10 +787,7 @@ impl Default for VoiConfig {
         Self {
             enabled: true,
             scan_budget_per_interval: 5,
-            exploration_quota_fraction: 0.20,
             io_cost_weight: 0.1,
-            fp_risk_weight: 0.15,
-            exploration_weight: 0.25,
             forecast_error_threshold: 0.5,
             fallback_trigger_windows: 3,
             recovery_trigger_windows: 5,
@@ -833,7 +844,6 @@ pub struct UpdateConfig {
     pub enabled: bool,
     pub metadata_cache_ttl_seconds: u64,
     pub metadata_cache_file: PathBuf,
-    pub background_refresh: bool,
     pub notices_enabled: bool,
 }
 
@@ -889,26 +899,165 @@ impl Default for SystemTuningConfig {
     }
 }
 
-/// Platform-specific configuration options (`[platform]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
-pub struct PlatformConfig {
-    pub macos: PlatformMacOsConfig,
-}
-
-/// macOS platform configuration (`[platform.macos]`).
+/// Daemon tier that rewrites cold files on btrfs compressed (`[compress]`).
+///
+/// Off by default. Lossless: each rewritten file's stamp is rechecked between
+/// chunks and its SHA-256 re-read from disk. Files that are open, mapped,
+/// leased, younger than `policy.min_age_secs` or share extents are skipped,
+/// and a root on another filesystem is never touched.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
-pub struct PlatformMacOsConfig {
-    /// Query Foundation for purgeable space on macOS (default: true).
-    pub query_foundation_purgeable: bool,
+pub struct CompressConfig {
+    /// Run compression passes from the daemon. Enabling it stands in for the
+    /// CLI's `--quiescent`: a snapshot or reflink made during a pass keeps
+    /// the old extents alive, so those bytes are not freed until it goes.
+    pub enabled: bool,
+    /// Directories whose cold files may be compressed (absolute, at most 32).
+    pub roots: Vec<PathBuf>,
+    /// Lowest pressure level of a root's mount at which a pass may start:
+    /// green, yellow, orange, red or critical.
+    pub start_level: String,
+    /// Minimum minutes between the starts of two passes.
+    pub interval_minutes: u64,
+    /// Consent to btrfs's COMPRESS_ZSTD incompat flag, which the first zstd
+    /// write sets for good (mounting then needs Linux 4.14 or later).
+    pub allow_zstd_feature: bool,
+    /// Admission and work limits of one pass.
+    pub policy: crate::scanner::compression::CompressionPolicy,
 }
 
-impl Default for PlatformMacOsConfig {
+impl Default for CompressConfig {
     fn default() -> Self {
         Self {
-            query_foundation_purgeable: true,
+            enabled: false,
+            roots: Vec::new(),
+            start_level: "yellow".to_string(),
+            interval_minutes: 30,
+            allow_zstd_feature: false,
+            policy: crate::scanner::compression::CompressionPolicy::default(),
         }
+    }
+}
+
+/// Whether a root a tier walks names a directory below the filesystem root:
+/// not `/` itself, and with no `..` that would walk out of the directory it
+/// names (`Path::components` already drops an inner `.`).
+fn names_a_directory_below_root(root: &Path) -> bool {
+    use std::path::Component;
+    !root
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        && root
+            .components()
+            .any(|component| matches!(component, Component::Normal(_)))
+}
+
+impl ScannerConfig {
+    /// Reject target-only roots the tier could not bound: relative paths, the
+    /// filesystem root, `.` or `..` components (which would walk outside the
+    /// directory the pattern names), and more roots or a shorter idle window
+    /// than an operator plausibly means.
+    fn validate_target_only(&self) -> Result<()> {
+        let invalid = |details: String| SbhError::InvalidConfig { details };
+        if self.target_only_roots.len() > 32 {
+            return Err(invalid(format!(
+                "scanner.target_only_roots lists at most 32 roots, got {}",
+                self.target_only_roots.len()
+            )));
+        }
+        if let Some(root) = self
+            .target_only_roots
+            .iter()
+            .find(|root| !root.is_absolute())
+        {
+            return Err(invalid(format!(
+                "scanner.target_only_roots must be absolute: {}",
+                root.display()
+            )));
+        }
+        if let Some(root) = self
+            .target_only_roots
+            .iter()
+            .find(|root| !names_a_directory_below_root(root))
+        {
+            return Err(invalid(format!(
+                "scanner.target_only_roots must name a directory below the filesystem root, without . or ..: {}",
+                root.display()
+            )));
+        }
+        if self.target_only_idle_hours == 0 {
+            return Err(invalid(
+                "scanner.target_only_idle_hours must be at least 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl CompressConfig {
+    /// `start_level` as a pressure level, if it names one.
+    #[must_use]
+    pub fn start_pressure_level(&self) -> Option<crate::monitor::pid::PressureLevel> {
+        use crate::monitor::pid::PressureLevel;
+        match self.start_level.as_str() {
+            "green" => Some(PressureLevel::Green),
+            "yellow" => Some(PressureLevel::Yellow),
+            "orange" => Some(PressureLevel::Orange),
+            "red" => Some(PressureLevel::Red),
+            "critical" => Some(PressureLevel::Critical),
+            _ => None,
+        }
+    }
+
+    /// Reject an enabled tier that could never run, or could run unbounded.
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let invalid = |details: String| SbhError::InvalidConfig { details };
+        if self.roots.is_empty() || self.roots.len() > 32 {
+            return Err(invalid(format!(
+                "compress.roots must list 1..32 directories when compress.enabled, got {}",
+                self.roots.len()
+            )));
+        }
+        if let Some(root) = self.roots.iter().find(|root| !root.is_absolute()) {
+            return Err(invalid(format!(
+                "compress.roots must be absolute: {}",
+                root.display()
+            )));
+        }
+        if let Some(root) = self
+            .roots
+            .iter()
+            .find(|root| !names_a_directory_below_root(root))
+        {
+            return Err(invalid(format!(
+                "compress.roots must name a directory below the filesystem root, without ..: {}",
+                root.display()
+            )));
+        }
+        if self.start_pressure_level().is_none() {
+            return Err(invalid(format!(
+                "compress.start_level must be green, yellow, orange, red or critical, got {:?}",
+                self.start_level
+            )));
+        }
+        if self.interval_minutes == 0 {
+            return Err(invalid(
+                "compress.interval_minutes must be at least 1".to_string(),
+            ));
+        }
+        if !self.allow_zstd_feature {
+            return Err(invalid(
+                "compress.enabled needs compress.allow_zstd_feature = true: the first zstd \
+                 write sets btrfs's COMPRESS_ZSTD incompat flag for good"
+                    .to_string(),
+            ));
+        }
+        self.policy
+            .validate()
+            .map_err(|error| invalid(format!("compress.policy: {error}")))
     }
 }
 
@@ -1229,6 +1378,15 @@ impl Default for ScannerConfig {
                 PathBuf::from("/var/log"),
             ],
             protected_paths: Vec::new(),
+            // Coding agents keep their session scratch here on macOS
+            // (`claude-<uid>`); on other hosts it is wherever the agent's
+            // temp dir points, so there is no default.
+            target_only_roots: if cfg!(target_os = "macos") {
+                vec![PathBuf::from("/private/tmp/claude-*")]
+            } else {
+                Vec::new()
+            },
+            target_only_idle_hours: 24,
             min_file_age_minutes: 5,
             max_depth: 10,
             parallelism: std::thread::available_parallelism()
@@ -1334,8 +1492,9 @@ impl Default for TelemetryConfig {
             ewma_rate_history_size: 200,
             guardrail_window_size: 500,
             guardrail_min_observations: 60,
-            daemon_rss_warning_bytes: 256 * 1024 * 1024,
-            daemon_rss_hard_limit_bytes: 500 * 1024 * 1024,
+            daemon_rss_warning_bytes: crate::daemon::self_monitor::DEFAULT_DAEMON_RSS_WARNING_BYTES,
+            daemon_rss_hard_limit_bytes:
+                crate::daemon::self_monitor::DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES,
             cpu_budget_pct: 25,
             cpu_budget_burst_secs: crate::daemon::cpu_budget::BURST_SECS,
             metrics_enabled: true,
@@ -1350,7 +1509,6 @@ impl Default for UpdateConfig {
             enabled: true,
             metadata_cache_ttl_seconds: 30 * 60,
             metadata_cache_file: default_update_metadata_cache_file(&paths),
-            background_refresh: true,
             notices_enabled: true,
         }
     }
@@ -1774,9 +1932,40 @@ fn installed_service_config() -> Option<PathBuf> {
     candidate.filter(|path| fs::File::open(path).is_ok())
 }
 
+/// The filesystem sandbox of the installed systemd service, if one is installed.
+///
+/// It is read from the unit and its drop-ins, searched in
+/// [`installed_service_config`]'s order: root sees the system unit first,
+/// another user its own user unit first. A root CLI run outside that sandbox
+/// can write paths the service cannot, so whether the service can release a
+/// reserve is judged against this.
+#[must_use]
+pub fn installed_service_sandbox() -> Option<crate::daemon::service::ServiceSandbox> {
+    if cfg!(test) || env::var_os("SBH_TEST_MODE").is_some() {
+        return None;
+    }
+    let system = Some(PathBuf::from("/etc/systemd/system"));
+    let user = env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/systemd/user"));
+    let dirs = if effective_uid_is_root() {
+        [system, user]
+    } else {
+        [user, system]
+    };
+    dirs.into_iter()
+        .flatten()
+        .find_map(|dir| systemd_unit_texts(&dir))
+        .map(|texts| crate::daemon::service::ServiceSandbox::from_unit_texts(&texts))
+}
+
 /// `--config` of the effective `ExecStart=` in `<dir>/sbh.service` and its
 /// `sbh.service.d/*.conf` drop-ins (the last assignment wins, as in systemd).
 pub(crate) fn config_from_systemd_unit_dir(dir: &Path) -> Option<PathBuf> {
+    config_from_systemd_texts(&systemd_unit_texts(dir)?)
+}
+
+/// `<dir>/sbh.service` followed by its `sbh.service.d/*.conf` drop-ins in
+/// name order, which is the order systemd applies them.
+fn systemd_unit_texts(dir: &Path) -> Option<Vec<String>> {
     let unit = fs::read_to_string(dir.join("sbh.service")).ok()?;
     let mut texts = vec![unit];
     if let Ok(entries) = fs::read_dir(dir.join("sbh.service.d")) {
@@ -1787,7 +1976,7 @@ pub(crate) fn config_from_systemd_unit_dir(dir: &Path) -> Option<PathBuf> {
         dropins.sort();
         texts.extend(dropins.iter().filter_map(|p| fs::read_to_string(p).ok()));
     }
-    config_from_systemd_texts(&texts)
+    Some(texts)
 }
 
 fn config_from_systemd_texts(texts: &[String]) -> Option<PathBuf> {
@@ -2050,6 +2239,23 @@ impl Config {
         {
             add_root_unless_covered(&mut cfg.scanner.root_paths, dir);
         }
+        // A user's temp dir root brings the browser code-sign clones beside
+        // it (bd-39da). Only v2 knows which entries there are clones: the v1
+        // walker would descend into a running browser's app copy.
+        if cfg.scanner.engine == ScannerEngineMode::V2 {
+            let clone_areas: Vec<PathBuf> = cfg
+                .scanner
+                .root_paths
+                .iter()
+                .filter_map(|root| {
+                    crate::scanner::patterns::darwin_code_sign_clone_area_for_temp_root(root)
+                })
+                .filter(|area| area.is_dir())
+                .collect();
+            for area in clone_areas {
+                add_root_unless_covered(&mut cfg.scanner.root_paths, area);
+            }
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -2306,12 +2512,6 @@ impl Config {
             &mut self.system_tuning.writeback_pool_warn_bytes,
         )?;
 
-        // platform
-        set_env_bool(
-            "SBH_MACOS_QUERY_FOUNDATION_PURGEABLE",
-            &mut self.platform.macos.query_foundation_purgeable,
-        )?;
-
         Ok(())
     }
 
@@ -2364,20 +2564,15 @@ impl Config {
             self.update.metadata_cache_file = PathBuf::from(raw);
         }
 
-        if let Some(raw) = lookup("SBH_UPDATE_BACKGROUND_REFRESH") {
-            self.update.background_refresh = parse_env_bool("SBH_UPDATE_BACKGROUND_REFRESH", &raw)?;
-        }
-
         if let Some(raw) = lookup("SBH_UPDATE_NOTICES_ENABLED") {
             self.update.notices_enabled = parse_env_bool("SBH_UPDATE_NOTICES_ENABLED", &raw)?;
         }
 
-        // Global opt-out: disables checks, background refresh, and update notices.
+        // Global opt-out: disables checks and update notices.
         if let Some(raw) = lookup("SBH_UPDATE_OPT_OUT")
             && parse_env_bool("SBH_UPDATE_OPT_OUT", &raw)?
         {
             self.update.enabled = false;
-            self.update.background_refresh = false;
             self.update.notices_enabled = false;
         }
 
@@ -2470,16 +2665,40 @@ impl Config {
     }
 
     /// Percent of a volume that must remain free after each ballast file is
-    /// created: the Orange threshold, but never closer than two points to
-    /// Red. A reserve is worth building only while the volume is still above
-    /// the level at which the daemon starts reclaiming; below Red it is
-    /// releasing, not reserving.
+    /// created, before absolute byte floors apply; on a given volume use
+    /// [`Self::ballast_provision_floor`], which honors them.
+    ///
+    /// With the default thresholds and behavior matrix this is 15%: ballast
+    /// is released from Orange (below 14% free), so a new file must leave the
+    /// volume at least `hysteresis_pct` above that.
     #[must_use]
     pub fn ballast_provision_floor_pct(&self) -> f64 {
-        self.pressure
-            .orange_min_free_pct
-            .max(self.pressure.red_min_free_pct + 2.0)
-            .clamp(0.0, 100.0)
+        self.ballast_provision_floor().pct_on(0)
+    }
+
+    /// The ballast headroom floor as a rule each volume is checked against.
+    ///
+    /// A new file must leave the volume outside the least severe level at
+    /// which the behavior matrix releases ballast (in any memory row), with
+    /// `pressure.controller.hysteresis_pct` to spare, and never below the
+    /// Orange threshold or two points above Red. Otherwise a refill can
+    /// push a volume into a releasing level and the daemon releases the
+    /// files it just wrote (#38). The thresholds are those in force on each
+    /// volume, so `pressure.*_min_free_bytes` lower the floor on a large
+    /// volume exactly as they lower that volume's pressure levels.
+    #[must_use]
+    pub fn ballast_provision_floor(&self) -> crate::ballast::manager::ProvisionFloor {
+        // The daemon runs the v0.6 matrix when this one does not resolve
+        // (`behavior_table_from_config`); validation rejects that at load.
+        let release_level = BehaviorDispatchTable::from_config(&self.behavior)
+            .unwrap_or_default()
+            .least_severe_ballast_release_level();
+        crate::ballast::manager::ProvisionFloor::Thresholds {
+            pct: self.pressure.free_pct_thresholds(),
+            bytes: self.pressure.min_free_bytes(),
+            release_level,
+            margin_pct: self.pressure.controller.hysteresis_pct,
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2492,6 +2711,7 @@ impl Config {
                 details: format!("behavior: {details}"),
             }
         })?;
+        self.compress.validate()?;
 
         // I31: Thresholds must be in 0.0..=100.0.
         for (name, val) in [
@@ -2660,10 +2880,6 @@ impl Config {
             });
         }
 
-        validate_prob(
-            "scheduler.exploration_quota_fraction",
-            self.scheduler.exploration_quota_fraction,
-        )?;
         validate_prob("scheduler.ewma_alpha", self.scheduler.ewma_alpha)?;
         if self.scheduler.scan_budget_per_interval == 0 {
             return Err(SbhError::InvalidConfig {
@@ -2677,8 +2893,6 @@ impl Config {
         }
         for (name, val) in [
             ("io_cost_weight", self.scheduler.io_cost_weight),
-            ("fp_risk_weight", self.scheduler.fp_risk_weight),
-            ("exploration_weight", self.scheduler.exploration_weight),
             (
                 "forecast_error_threshold",
                 self.scheduler.forecast_error_threshold,
@@ -2884,17 +3098,11 @@ impl Config {
             });
         }
 
-        if !self.update.enabled && self.update.background_refresh {
-            return Err(SbhError::InvalidConfig {
-                details: "update.background_refresh cannot be true when update.enabled=false"
-                    .to_string(),
-            });
-        }
-
         // Validate protected_paths glob patterns are compilable.
         for pattern in &self.scanner.protected_paths {
             crate::scanner::protection::validate_glob_pattern(pattern)?;
         }
+        self.scanner.validate_target_only()?;
 
         // System tuning (kernel writeback).
         let tuning = &self.system_tuning;
@@ -3360,6 +3568,15 @@ mod tests {
             "{:?}",
             cfg.scanner.root_paths
         );
+        // The browser code-sign clone area beside it comes along (bd-39da),
+        // when this account has one.
+        let clone_area = temp.with_file_name("X");
+        assert_eq!(
+            cfg.scanner.root_paths.contains(&clone_area),
+            clone_area.is_dir(),
+            "{:?}",
+            cfg.scanner.root_paths
+        );
         std::fs::write(
             &path,
             "[scanner]\nroot_paths = [\"/private/tmp\"]\ninclude_user_temp_dir = false\n",
@@ -3371,6 +3588,16 @@ mod tests {
             "{:?}",
             cfg.scanner.root_paths
         );
+        assert!(!cfg.scanner.root_paths.contains(&clone_area));
+        // Only v2 knows which entries there are clones.
+        std::fs::write(
+            &path,
+            "[scanner]\nroot_paths = [\"/private/tmp\"]\nengine = \"v1\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert!(cfg.scanner.root_paths.contains(&temp));
+        assert!(!cfg.scanner.root_paths.contains(&clone_area));
     }
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -3436,21 +3663,106 @@ mod tests {
         assert!(cfg.validate().is_ok());
     }
 
-    /// The ballast headroom floor follows the pressure thresholds instead of
-    /// a fixed 20%: provisioning may take a volume down to Orange but never
-    /// into Red (kept two points above it).
+    /// The ballast headroom floor follows the pressure thresholds and the
+    /// behavior matrix (#38): a new file must leave the volume outside the
+    /// least severe level that releases ballast, `hysteresis_pct` to spare,
+    /// and never below Orange or within two points of Red.
     #[test]
     fn ballast_provision_floor_tracks_pressure_thresholds() {
+        fn assert_floor(cfg: &Config, want: f64) {
+            let got = cfg.ballast_provision_floor_pct();
+            assert!((got - want).abs() < 1e-9, "floor {got}, want {want}");
+        }
+        // A custom matrix whose ballast column is `none` for `disks`, in
+        // every memory row (the never-reduce rule only raises rows).
+        fn without_release_at(disks: &[&str]) -> Config {
+            let cells: String = ["normal", "warn", "critical"]
+                .into_iter()
+                .flat_map(|memory| {
+                    disks.iter().map(move |disk| {
+                        format!(
+                            "[behavior.cells.{memory}_{disk}]\nscan = \"aggressive\"\n\
+                             cleanup = \"identify_only\"\nballast = \"none\"\nnotify = \"low\"\n"
+                        )
+                    })
+                })
+                .collect();
+            let toml = format!("[behavior]\npreset = \"custom\"\n{cells}");
+            let (cfg, unknown) = Config::parse_toml(&toml).unwrap();
+            assert!(unknown.is_empty(), "{unknown:?}");
+            cfg.validate().unwrap();
+            cfg
+        }
+
+        // v0.6 releases from Orange (below 14% free): Yellow plus 1 point.
         let mut cfg = Config::default();
-        assert!((cfg.ballast_provision_floor_pct() - 10.0).abs() < f64::EPSILON);
+        assert_floor(&cfg, 15.0);
+        cfg.pressure.controller.hysteresis_pct = 0.0;
+        assert_floor(&cfg, 14.0);
+        cfg.pressure.controller.hysteresis_pct = 2.5;
+        assert_floor(&cfg, 16.5);
 
+        // The v0.5 matrix releases from Yellow under memory pressure, so a
+        // file must leave the volume at Green: 20 plus 1 point.
+        let mut cfg = Config::default();
+        cfg.behavior.preset = BehaviorPreset::V0_5;
+        assert_floor(&cfg, 21.0);
+
+        // Released only at Critical: Red plus 1 point is under the older
+        // lower bound, the Orange threshold (10).
+        assert_floor(&without_release_at(&["orange", "red"]), 10.0);
+        // Never released by level: only the lower bound applies.
+        assert_floor(&without_release_at(&["orange", "red", "critical"]), 10.0);
+
+        // The lower bound still wins when the thresholds crowd Red: Yellow
+        // 7.5 + 1 = 8.5 is under Red 6.8 + 2 = 8.8.
+        let mut cfg = Config::default();
+        cfg.pressure.green_min_free_pct = 10.0;
+        cfg.pressure.yellow_min_free_pct = 7.5;
         cfg.pressure.orange_min_free_pct = 7.0;
-        cfg.pressure.red_min_free_pct = 6.0;
-        assert!((cfg.ballast_provision_floor_pct() - 8.0).abs() < f64::EPSILON);
-
-        cfg.pressure.orange_min_free_pct = 30.0;
+        cfg.pressure.red_min_free_pct = 6.8;
+        cfg.validate().unwrap();
+        assert_floor(&cfg, 8.8);
+        cfg.pressure.orange_min_free_pct = 7.2;
         cfg.pressure.red_min_free_pct = 5.0;
-        assert!((cfg.ballast_provision_floor_pct() - 30.0).abs() < f64::EPSILON);
+        assert_floor(&cfg, 8.5);
+    }
+
+    /// With byte floors off, the per-volume rule is the percentage floor on
+    /// every volume; with them set it follows each volume's own thresholds and
+    /// never rises above the percentage floor.
+    #[test]
+    fn ballast_provision_floor_rule_follows_each_volumes_thresholds() {
+        const GIB: u64 = 1 << 30;
+        let mut cfg = Config::default();
+        cfg.pressure.green_min_free_pct = 10.0;
+        cfg.pressure.yellow_min_free_pct = 8.0;
+        cfg.pressure.orange_min_free_pct = 5.0;
+        cfg.pressure.red_min_free_pct = 3.0;
+        let pct_floor = cfg.ballast_provision_floor_pct();
+        assert!((pct_floor - 9.0).abs() < 1e-12, "{pct_floor}");
+        for total in [0, 100_000_000_000, 2_000_000_000_000] {
+            assert!((cfg.ballast_provision_floor().pct_on(total) - pct_floor).abs() < 1e-12);
+        }
+
+        cfg.pressure.green_min_free_bytes = 80 * GIB;
+        cfg.pressure.yellow_min_free_bytes = 60 * GIB;
+        cfg.pressure.orange_min_free_bytes = 40 * GIB;
+        cfg.pressure.red_min_free_bytes = 25 * GIB;
+        cfg.validate().unwrap();
+        let rule = cfg.ballast_provision_floor();
+        // 2 TB: Yellow in force is 60 GiB (3.22%), so the floor is 4.22%
+        // (~84 GB) instead of 9% (180 GB). Orange (2.15%) and Red + 2
+        // (3.34%) sit below it.
+        let total = 2_000_000_000_000_u64;
+        #[allow(clippy::cast_precision_loss)]
+        let expected = (60 * GIB) as f64 * 100.0 / total as f64 + 1.0;
+        assert!((rule.pct_on(total) - expected).abs() < 1e-9);
+        assert!(rule.pct_on(total) < pct_floor);
+        // 100 GB: each byte floor is above its percentage, so nothing changes.
+        assert!((rule.pct_on(100_000_000_000) - pct_floor).abs() < 1e-12);
+        // Unknown capacity falls back to the percentage floor.
+        assert!((rule.pct_on(0) - pct_floor).abs() < 1e-12);
     }
 
     #[test]
@@ -3670,6 +3982,39 @@ mod tests {
         assert!(toml::from_str::<Config>(raw).is_err());
         // A genuinely malformed file is still an error, not an "unknown key".
         assert!(parse_config_lenient("[scanner]\nparallelism = \"two\"\n").is_err());
+    }
+
+    /// bd-65vb: a file written before the five no-effect keys were removed
+    /// (mac-mini-max's carried four of them) still loads, and each removed
+    /// key is reported with a note saying it did nothing.
+    #[test]
+    fn a_config_setting_the_removed_no_effect_keys_still_loads() {
+        use super::parse_config_lenient;
+        let raw = "[scheduler]\nscan_budget_per_interval = 7\nexploration_quota_fraction = 0.2\n\
+                   exploration_weight = 0.25\nfp_risk_weight = 0.15\n\n\
+                   [update]\nenabled = false\nbackground_refresh = true\n\n\
+                   [platform.macos]\nquery_foundation_purgeable = false\n";
+        let (config, unknown) = parse_config_lenient(raw).expect("lenient parse succeeds");
+        assert_eq!(config.scheduler.scan_budget_per_interval, 7);
+        assert!(!config.update.enabled);
+        config.validate().expect("what remains is a valid config");
+
+        let mut paths: Vec<&str> = unknown.iter().map(|k| k.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            [
+                "platform",
+                "scheduler.exploration_quota_fraction",
+                "scheduler.exploration_weight",
+                "scheduler.fp_risk_weight",
+                "update.background_refresh",
+            ]
+        );
+        for key in &unknown {
+            let note = key.suggestion.as_deref().unwrap_or_default();
+            assert!(note.starts_with("removed:"), "{}: {note}", key.path);
+        }
     }
 
     #[test]
@@ -4046,6 +4391,103 @@ mod tests {
     }
 
     #[test]
+    fn target_only_roots_default_to_the_macos_agent_scratch_and_must_be_bounded() {
+        let default = Config::default();
+        let expected: Vec<PathBuf> = if cfg!(target_os = "macos") {
+            vec![PathBuf::from("/private/tmp/claude-*")]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(default.scanner.target_only_roots, expected);
+        assert_eq!(default.scanner.target_only_idle_hours, 24);
+        default.validate().unwrap();
+
+        let with = |roots: Vec<PathBuf>, idle_hours: u64| {
+            let mut config = Config::default();
+            config.scanner.target_only_roots = roots;
+            config.scanner.target_only_idle_hours = idle_hours;
+            config.validate()
+        };
+        with(vec![PathBuf::from("/data/tmp/claude-*")], 1).unwrap();
+        assert!(with(vec![PathBuf::from("tmp/claude-*")], 24).is_err());
+        assert!(with(vec![PathBuf::from("/data/tmp")], 0).is_err());
+        assert!(with(vec![PathBuf::from("/data/tmp"); 33], 24).is_err());
+        // The filesystem root, and a `..` that walks out of the named dir.
+        for root in ["/", "/data/tmp/claude-501/..", "/data/../etc"] {
+            assert!(with(vec![PathBuf::from(root)], 24).is_err(), "{root}");
+        }
+
+        let parsed: Config = toml::from_str(
+            "[scanner]\ntarget_only_roots = [\"/data/tmp/claude-*\"]\ntarget_only_idle_hours = 48\n",
+        )
+        .unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(
+            parsed.scanner.target_only_roots,
+            vec![PathBuf::from("/data/tmp/claude-*")]
+        );
+        assert_eq!(parsed.scanner.target_only_idle_hours, 48);
+    }
+
+    #[test]
+    fn compress_tier_is_off_by_default_and_rejects_configs_that_could_not_run() {
+        use super::CompressConfig;
+        use crate::monitor::pid::PressureLevel;
+        use crate::scanner::compression::CompressionPolicy;
+        type Edit = fn(&mut CompressConfig);
+
+        let default = Config::default();
+        assert!(!default.compress.enabled);
+        default.validate().unwrap();
+
+        let enabled = |edit: Edit| {
+            let mut config = Config::default();
+            config.compress.enabled = true;
+            config.compress.roots = vec![PathBuf::from("/data/tmp")];
+            config.compress.allow_zstd_feature = true;
+            edit(&mut config.compress);
+            config.validate()
+        };
+        enabled(|_| {}).unwrap();
+        let rejected: [(&str, Edit); 8] = [
+            ("no roots", |c| c.roots.clear()),
+            ("relative root", |c| {
+                c.roots = vec![PathBuf::from("data/tmp")];
+            }),
+            ("the filesystem root", |c| {
+                c.roots = vec![PathBuf::from("/")];
+            }),
+            ("a root with ..", |c| {
+                c.roots = vec![PathBuf::from("/data/tmp/../etc")];
+            }),
+            ("unknown level", |c| c.start_level = "amber".to_string()),
+            ("zero interval", |c| c.interval_minutes = 0),
+            ("no zstd consent", |c| c.allow_zstd_feature = false),
+            ("policy under an hour", |c| c.policy.min_age_secs = 60),
+        ];
+        for (what, edit) in rejected {
+            assert!(enabled(edit).is_err(), "{what}");
+        }
+
+        let parsed: Config = toml::from_str(
+            "[compress]\nenabled = true\nroots = [\"/data/tmp\"]\nallow_zstd_feature = true\n\
+             start_level = \"orange\"\n[compress.policy]\nmin_age_secs = 172800\n",
+        )
+        .unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(
+            parsed.compress.start_pressure_level(),
+            Some(PressureLevel::Orange)
+        );
+        assert_eq!(parsed.compress.policy.min_age_secs, 172_800);
+        assert_eq!(
+            parsed.compress.policy.max_files,
+            CompressionPolicy::default().max_files,
+            "unset policy keys keep their defaults"
+        );
+    }
+
+    #[test]
     fn stable_hash_changes_when_config_changes() {
         let cfg = Config::default();
         let hash_before = cfg.stable_hash().expect("hash should compute");
@@ -4073,10 +4515,13 @@ mod tests {
     }
 
     #[test]
-    fn daemon_rss_hard_limit_defaults_to_500_mib() {
+    fn daemon_rss_limits_default_to_512_mib_and_1_gib() {
         let cfg = Config::default();
-        assert_eq!(cfg.telemetry.daemon_rss_warning_bytes, 256 * 1024 * 1024);
-        assert_eq!(cfg.telemetry.daemon_rss_hard_limit_bytes, 500 * 1024 * 1024);
+        assert_eq!(cfg.telemetry.daemon_rss_warning_bytes, 512 * 1024 * 1024);
+        assert_eq!(
+            cfg.telemetry.daemon_rss_hard_limit_bytes,
+            1024 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -4123,15 +4568,18 @@ mod tests {
         assert!(err.to_string().contains("metadata_cache_ttl_seconds"));
     }
 
+    /// bd-65vb: `update.enabled = false` on its own is a valid config. The
+    /// removed `update.background_refresh` defaulted to true and was refused
+    /// alongside disabled updates, so this failed validation.
     #[test]
-    fn update_disabled_disallows_background_refresh() {
+    fn disabling_updates_alone_is_a_valid_config() {
         let mut cfg = Config::default();
         cfg.update.enabled = false;
-        cfg.update.background_refresh = true;
-        let err = cfg
+        cfg.validate().expect("updates off is a valid config");
+        let parsed: Config = toml::from_str("[update]\nenabled = false\n").unwrap();
+        parsed
             .validate()
-            .expect_err("expected update background refresh validation error");
-        assert!(err.to_string().contains("background_refresh"));
+            .expect("a file that turns updates off validates");
     }
 
     #[test]
@@ -4150,7 +4598,6 @@ mod tests {
         let mut cfg = Config::default();
         let overrides = vars(&[
             ("SBH_UPDATE_ENABLED", "true"),
-            ("SBH_UPDATE_BACKGROUND_REFRESH", "true"),
             ("SBH_UPDATE_NOTICES_ENABLED", "true"),
             ("SBH_UPDATE_OPT_OUT", "true"),
         ]);
@@ -4159,7 +4606,6 @@ mod tests {
             .expect("update env overrides should parse");
 
         assert!(!cfg.update.enabled);
-        assert!(!cfg.update.background_refresh);
         assert!(!cfg.update.notices_enabled);
     }
 

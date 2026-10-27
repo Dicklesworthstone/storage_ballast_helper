@@ -5,15 +5,18 @@ use std::io::{self, Write};
 use clap::{ArgMatches, Args, Command, FromArgMatches};
 use serde::Serialize;
 use storage_ballast_helper::core::config::Config;
-use storage_ballast_helper::scanner::compression::CompressionPolicy;
 use storage_ballast_helper::scanner::compression::discovery::{
     self, DiscoveryLimits, DiscoveryReport,
+};
+use storage_ballast_helper::scanner::compression::{
+    self, CompressionMode, CompressionPolicy, ConcurrencyAcknowledgement,
 };
 
 #[derive(Debug, Args)]
 struct DiscoveryOptions {
-    /// Discover cold metadata candidates beneath explicit directories; never rewrite files.
-    #[arg(long, conflicts_with_all = ["apply", "recover_journal", "allow_zstd_feature", "quiescent"])]
+    /// Discover cold metadata candidates beneath explicit directories. Read-only
+    /// unless --apply, which then runs the full executor on that selection.
+    #[arg(long, conflicts_with = "recover_journal")]
     discover: bool,
     /// Maximum directory depth below each root (0 examines root-level files only).
     #[arg(long, requires = "discover")]
@@ -50,6 +53,10 @@ struct Output {
     mutation_attempted: bool,
     discovery: DiscoveryReport,
     candidates: Vec<CandidatePath>,
+    /// With --apply and at least one candidate: the executor's report on
+    /// exactly this selection, in the explicit-file `sbh.compression.v1` shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apply: Option<super::activity_cli::CommandReport>,
     exit_code: i32,
 }
 
@@ -64,21 +71,21 @@ pub(super) fn run(
         return Ok(None);
     }
     // Defense in depth for any future caller constructing matches directly.
-    // This route contains no call to compression::run or any mutation backend.
-    if options.apply
-        || options.recover_journal.is_some()
-        || options.allow_zstd_feature
-        || options.quiescent
-    {
+    // Without --apply this route never reaches a mutation backend; with it, the
+    // executor still requires both consent flags itself.
+    if options.recover_journal.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "directory discovery is read-only and cannot be combined with apply or recovery",
+            "directory discovery cannot be combined with journal recovery",
         ));
     }
     let result = execute(matches, options, &flags);
     let mut out = io::stdout().lock();
     let code = match result {
         Ok(report) => {
+            if let Some(apply) = &report.apply {
+                apply.activity_delivery.warn_if_incomplete();
+            }
             if matches.get_flag("json") {
                 serde_json::to_writer_pretty(&mut out, &report)?;
                 writeln!(out)?;
@@ -93,7 +100,7 @@ pub(super) fn run(
                     &mut out,
                     &serde_json::json!({
                         "schema": "sbh.compression.discovery.v1",
-                        "read_only": true, "mutation_attempted": false,
+                        "read_only": !options.apply, "mutation_attempted": false,
                         "error": error, "exit_code": code,
                     }),
                 )?;
@@ -140,14 +147,39 @@ fn execute(
     let explicit = matches.get_one::<std::path::PathBuf>("config");
     let config = Config::load(explicit.map(std::path::PathBuf::as_path))
         .map_err(|error| (1, error.to_string()))?;
-    let selection = discovery::discover(
-        &options.paths,
-        &policy,
-        &limits,
-        &config,
-        &storage_ballast_helper::platform::current(),
-    )
-    .map_err(|error| (super::io_exit_code(&error), error.to_string()))?;
+    let platform = storage_ballast_helper::platform::current();
+    let selection = discovery::discover(&options.paths, &policy, &limits, &config, &platform)
+        .map_err(|error| (super::io_exit_code(&error), error.to_string()))?;
+    // An empty selection opens no journal: there is nothing to rewrite.
+    let apply = if options.apply && selection.report().selected_files != 0 {
+        let mode = CompressionMode {
+            apply: true,
+            allow_zstd_feature: options.allow_zstd_feature,
+            acknowledgement: if options.quiescent {
+                ConcurrencyAcknowledgement::Quiescent
+            } else {
+                ConcurrencyAcknowledgement::None
+            },
+        };
+        Some(
+            super::activity_cli::execute_with(&config, |observer| {
+                compression::run_discovered(
+                    &selection, &policy, mode, &config, &platform, None, observer,
+                )
+            })
+            .map_err(|error| (super::io_exit_code(&error), error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    // Unvisited directories outrank a clean pass: resume before trusting it.
+    let exit_code = if selection.report().complete {
+        apply
+            .as_ref()
+            .map_or(0, |report| report.compression.exit_code)
+    } else {
+        4
+    };
     let candidates = selection
         .paths()
         .into_iter()
@@ -160,11 +192,18 @@ fn execute(
         .collect();
     Ok(Output {
         schema: "sbh.compression.discovery.v1",
-        read_only: true,
-        mutation_attempted: false,
-        exit_code: if selection.report().complete { 0 } else { 4 },
+        read_only: !options.apply,
+        mutation_attempted: apply.as_ref().is_some_and(|report| {
+            report
+                .compression
+                .files
+                .iter()
+                .any(|file| file.mutation_attempted)
+        }),
+        exit_code,
         discovery: selection.report().clone(),
         candidates,
+        apply,
     })
 }
 
@@ -174,10 +213,12 @@ fn write_human(out: &mut impl Write, report: &Output) -> io::Result<()> {
         "Cold-file discovery: {} candidate(s), {} logical bytes.",
         report.discovery.selected_files, report.discovery.selected_bytes
     )?;
-    writeln!(
-        out,
-        "Read-only metadata selection; filesystem compression and live-use eligibility are not yet established."
-    )?;
+    if report.read_only {
+        writeln!(
+            out,
+            "Read-only metadata selection; filesystem compression and live-use eligibility are not yet established."
+        )?;
+    }
     for candidate in &report.candidates {
         // Debug formatting escapes control characters rather than permitting
         // an unusual filename to forge another output line.
@@ -195,10 +236,16 @@ fn write_human(out: &mut impl Write, report: &Output) -> io::Result<()> {
             "Resume discovery of the same roots with --after-hex {token}"
         )?;
     }
-    writeln!(
-        out,
-        "No extents rewritten and no compression journal created."
-    )?;
+    match &report.apply {
+        Some(apply) => {
+            super::write_human(out, &apply.compression)?;
+            apply.activity_delivery.write_human(out)?;
+        }
+        None => writeln!(
+            out,
+            "No extents rewritten and no compression journal created."
+        )?,
+    }
     Ok(())
 }
 
@@ -207,15 +254,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovery_never_accepts_mutation_flags_or_recovery() {
-        for flag in ["--apply", "--allow-zstd-feature", "--quiescent"] {
+    fn discovery_apply_needs_both_consents_and_never_accepts_recovery() {
+        for consents in [&[][..], &["--allow-zstd-feature"][..], &["--quiescent"][..]] {
+            let mut args = vec!["compress", "--discover", "--apply"];
+            args.extend_from_slice(consents);
+            args.push("/tmp/input");
             assert!(
-                super::super::command()
-                    .try_get_matches_from(["compress", "--discover", flag, "/tmp/input",])
-                    .is_err(),
-                "{flag}"
+                super::super::command().try_get_matches_from(&args).is_err(),
+                "{args:?}"
             );
         }
+        let matches = super::super::command()
+            .try_get_matches_from([
+                "compress",
+                "--discover",
+                "--apply",
+                "--allow-zstd-feature",
+                "--quiescent",
+                "/tmp/input",
+            ])
+            .unwrap();
+        let options = super::super::Options::from_arg_matches(&matches).unwrap();
+        assert!(options.apply && options.allow_zstd_feature && options.quiescent);
+        assert!(
+            DiscoveryOptions::from_arg_matches(&matches)
+                .unwrap()
+                .discover
+        );
+        assert!(
+            super::super::command()
+                .try_get_matches_from([
+                    "compress",
+                    "--discover",
+                    "--dry-run",
+                    "--apply",
+                    "/tmp/input"
+                ])
+                .is_err()
+        );
         assert!(
             super::super::command()
                 .try_get_matches_from([

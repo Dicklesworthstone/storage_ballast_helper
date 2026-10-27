@@ -8,12 +8,36 @@ sbh --json compress --discover -- /data/cold-archive
 ```
 
 This is **metadata discovery**, not a compression-ratio estimate or permission
-to rewrite every reported file. It never calls the compression mutation backend,
-creates a journal, deletes files, changes service policy, or enables automatic
-compression. `--discover` conflicts with `--apply`, `--allow-zstd-feature`,
-`--quiescent`, and `--recover-journal`. Ordinary explicit-file preview and apply
-remain separate. Native discovery currently requires Linux x86-64/AArch64 with
-`openat2`; unsupported targets report an unsupported no-op.
+to rewrite every reported file. Alone it never calls the compression mutation
+backend, creates a journal, deletes files, changes service policy, or enables
+automatic compression. `--discover` conflicts with `--recover-journal`. Native
+discovery currently requires Linux x86-64/AArch64 with `openat2`; unsupported
+targets report an unsupported no-op.
+
+## Compress what discovery selected
+
+Adding `--apply` with both consents runs the explicit-file executor on exactly
+the selected candidates, in the same pass:
+
+```sh
+sudo sbh --json compress --discover --apply --allow-zstd-feature --quiescent \
+  -- /data/cold-archive
+```
+
+Every apply check in `btrfs-compression.md` still runs, including the open,
+executing and mapped-file vetoes, shared-extent exclusion, journal intent and
+content verification. On top of them, each file is refused (outcome `failed`,
+nothing rewritten) when its device, inode, size, mtime, ctime or link count
+differ from what discovery recorded, or when its root was replaced, it left the
+root, or it gained Git ancestry. Root and Git checks repeat between chunks.
+
+The JSON adds an `apply` object with the ordinary `sbh.compression.v1` report
+and its `activity_delivery`; `read_only` is false and `mutation_attempted`
+reports whether any file was rewritten. An empty selection creates no journal.
+Discovery limits still bound the selection, so a budget stop or `--max-files`
+continuation returns exit 4 even when every selected file compressed: resume
+with `--after-hex` and the same roots. Otherwise the exit code is the apply
+pass's own.
 
 ## Selection and limits
 
@@ -22,7 +46,12 @@ deduplicates overlapping roots, enumerates each directory in native pathname
 order, refuses descendant mount crossings and symlinks, and prunes protected or
 leased trees. It reuses the existing configured protection patterns, marker
 checks and sacred-path catalog. Hard-linked files, young/future-dated files,
-small files and already-compressed suffixes are excluded.
+small files and already-compressed suffixes are excluded. A bounded native probe
+also excludes NOCOW, NOCOMP, immutable or append-only flags, shared/reflinked
+extents, and files with no raw data remaining before they consume the selection
+budget. The probe does not write back dirty data or require privileged tree
+searches. If it cannot establish an exclusion, the executor still performs its
+ordinary full, fresh inspection; selection alone never establishes eligibility.
 
 ### Git content is excluded, including untracked build outputs
 
@@ -51,8 +80,13 @@ there is no compression force override, including for ignored worktree files.
 `--min-size-bytes`, `--min-age-secs`, `--max-files`, and `--max-bytes` use the
 existing compression defaults and safety floors. Logical bytes limit selected
 work and are **not** bytes that can necessarily be reclaimed. Selection does
-not yet check live process references or physical extents; ordinary file preview
-and apply still perform those checks.
+not establish physical reclaim or check live process references; ordinary file
+preview and apply still perform those checks. A file larger than the entire
+`--max-bytes` allowance is counted under `exceeds_full_byte_budget` and skipped.
+If a file fits a fresh pass but not the remaining allowance, discovery stops
+with a continuation before that file. It does not skip ahead to smaller files
+or call the remaining tree complete. Later candidates can therefore be reached
+even when the executor refuses every file selected by an earlier page.
 
 Traversal defaults are 32 levels below each root, 100,000 directory entries,
 4096 directories and a separate 30-second cooperative discovery deadline.
@@ -76,10 +110,15 @@ directory contributes no selected children: the selector must read and sort the
 whole directory before treating it as an ordered prefix. Even a completed walk
 is not a filesystem snapshot; files may change afterwards.
 
-## Continue a file-count-limited selection
+## Continue a stopped selection
 
-When `--max-files` stops an otherwise complete sorted prefix, JSON includes
-`discovery.resume_after_hex`. Continue after that exact native pathname:
+When a walk stops before covering its roots, JSON includes
+`discovery.resume_after_hex`: the last selected file if `--max-files` stopped
+it, or else the last path visited to completion when a byte, entry, directory or
+time budget or a failed entry stopped it. Everything sorted before that path
+was examined. A directory past `--max-depth` is skipped, not a stop: the walk
+continues and reports itself incomplete. Continue after that exact native
+pathname:
 
 ```sh
 sbh --json compress --discover --max-files 128 \
@@ -89,12 +128,12 @@ sbh --json compress --discover --max-files 128 \
 Use the same roots and selection filters. A continuation outside those roots is
 rejected. A continuation is only a skip hint; it never authorizes mutation or
 suppresses fresh protection checks. Rewind by omitting it to reconsider earlier
-files after the filesystem or policy changes. Entry/depth/time failures do not
-invent a continuation past unexamined work.
+files after the filesystem or policy changes. A continuation never reaches past
+unexamined work: a directory whose read was cut short is read again in full by
+the next run. The daemon tier resumes from these continuations on its own.
 
-The library selection also retains discovered file stamps and pinned roots,
-with `validate_file` and `validate_scope` checks for future executor integration.
-The current CLI deliberately exposes discovery read-only. Recursive apply,
-automatic Yellow/Orange scheduling, and persistent compression configuration
-remain unfinished. Explicit-file journal explanations are documented separately
-in `compression-explain.md`; shared activity output is separate from discovery.
+The library selection retains discovered file stamps and pinned roots; the
+executor's `validate_file` and `validate_scope` calls are the discovered-apply
+checks above. The daemon runs the same discover-then-apply pass when
+`[compress]` is enabled (`btrfs-compression.md`, Daemon tier). Explicit-file
+journal explanations are documented separately in `compression-explain.md`.

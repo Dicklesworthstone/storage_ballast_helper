@@ -18,8 +18,8 @@ use parking_lot::RwLock;
 use crate::core::errors::{Result, SbhError};
 #[cfg(target_os = "linux")]
 use crate::platform::pal::{
-    BlockDeviceInfo, FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
-    verify_preallocated_blocks,
+    BlockDeviceInfo, FsStats, MemoryHeadroom, MemoryInfo, MountPoint, Platform, PlatformPaths,
+    ServiceManager, verify_preallocated_blocks,
 };
 #[cfg(target_os = "linux")]
 use crate::platform::sacred_catalog::cross_platform_sacred_paths;
@@ -29,6 +29,8 @@ use crate::platform::types::{
     ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
 };
 
+#[cfg(target_os = "linux")]
+pub mod cgroup;
 #[cfg(target_os = "linux")]
 pub mod disk;
 #[cfg(target_os = "linux")]
@@ -143,6 +145,18 @@ impl Platform for LinuxPal {
         memory::read_memory_info()
     }
 
+    fn ram_write_memory_refusal(&self, minimum_available_percent: u8) -> Result<Option<String>> {
+        cgroup::ram_write_refusal(minimum_available_percent).map_err(|error| {
+            PalError::method_failed("linux", "ram_write_memory_refusal", error.to_string()).into()
+        })
+    }
+
+    fn ram_write_headroom(&self) -> Result<Option<MemoryHeadroom>> {
+        cgroup::ram_write_headroom().map_err(|error| {
+            PalError::method_failed("linux", "ram_write_headroom", error.to_string()).into()
+        })
+    }
+
     fn memory_pressure(&self) -> Result<MemoryPressure> {
         memory::read_memory_pressure()
     }
@@ -156,6 +170,14 @@ impl Platform for LinuxPal {
 
     fn process_list(&self) -> Result<Vec<ProcessInfo>> {
         process::read_process_list()
+    }
+
+    fn process_list_without_command_lines(&self) -> Result<Vec<ProcessInfo>> {
+        process::read_process_list_without_command_lines()
+    }
+
+    fn process_list_brief(&self) -> Result<Vec<ProcessInfo>> {
+        process::read_process_list_brief()
     }
 
     fn process_io(&self, pid: i32) -> Result<ProcessIo> {
@@ -182,8 +204,19 @@ impl Platform for LinuxPal {
         process::read_build_directories_in_use()
     }
 
+    fn build_directories_in_use_checked(&self) -> (Vec<(i32, std::path::PathBuf)>, bool) {
+        process::read_build_directory_snapshot()
+    }
+
     fn mmap_regions_under(&self, path: &Path) -> Result<Vec<crate::platform::types::MappedRegion>> {
         process::read_mmap_regions_under(path)
+    }
+
+    fn mmap_regions_under_fresh(
+        &self,
+        path: &Path,
+    ) -> Result<Vec<crate::platform::types::MappedRegion>> {
+        process::read_mmap_regions_under_fresh(path)
     }
 
     fn mmap_regions_under_roots(

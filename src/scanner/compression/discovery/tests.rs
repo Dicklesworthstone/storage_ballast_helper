@@ -136,6 +136,162 @@ mod native_tests {
     }
 
     #[test]
+    fn byte_limited_pages_reach_later_files_even_when_execution_refuses_every_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir(root.join("b")).unwrap();
+        let paths = [
+            root.join("a.bin"),
+            root.join("b/cold.bin"),
+            root.join("c.bin"),
+        ];
+        for path in &paths {
+            cold(path);
+        }
+        let policy = CompressionPolicy {
+            max_bytes: 13,
+            ..policy()
+        };
+        let mut after = None;
+        let mut visited = Vec::new();
+        for (page, expected) in paths.iter().enumerate() {
+            let selection = scan(
+                std::slice::from_ref(&root),
+                &DiscoveryLimits {
+                    after: after.clone(),
+                    ..Default::default()
+                },
+                &policy,
+            );
+            assert_eq!(selection.paths().as_slice(), std::slice::from_ref(expected));
+            assert_eq!(selection.report().selected_bytes, policy.max_bytes);
+            // The real read-only executor refuses every selected file on the
+            // mock's unsupported filesystem. Nothing changes to make this
+            // prefix disappear automatically before the next discovery pass.
+            let execution = crate::scanner::compression::run_discovered(
+                &selection,
+                &policy,
+                crate::scanner::compression::CompressionMode::default(),
+                &Config::default(),
+                &MockPlatform::healthy(),
+                None,
+                &mut |_| {},
+            )
+            .unwrap();
+            assert!(execution.dry_run);
+            assert!(execution.journal_path.is_none());
+            assert_eq!(execution.unvisited_files, 0);
+            assert_eq!(execution.files.len(), 1);
+            assert_eq!(execution.files[0].outcome, "skipped");
+            assert!(execution.files[0].detail.contains("unsupported filesystem"));
+            assert!(!execution.files[0].mutation_attempted);
+            visited.extend(selection.paths());
+            if page < 2 {
+                assert!(!selection.report().complete);
+                assert_eq!(
+                    selection.report().stop_reason.as_deref(),
+                    Some("discovery logical-byte budget exhausted")
+                );
+                let next =
+                    continuation_path(selection.report().resume_after_hex.as_deref().unwrap())
+                        .unwrap();
+                assert!(after.as_ref().is_none_or(|previous| next > *previous));
+                if page == 0 {
+                    assert_eq!(next, root.join("b"), "resume inside the visited directory");
+                }
+                after = Some(next);
+            } else {
+                assert!(selection.report().complete);
+                assert!(selection.report().resume_after_hex.is_none());
+            }
+        }
+        assert_eq!(visited, paths);
+        for path in paths {
+            assert_eq!(fs::read(path).unwrap(), b"cold contents");
+        }
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+        assert_eq!(fs::read_dir(root.join("b")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_byte_budget_stop_keeps_a_middle_file_ahead_of_a_smaller_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for name in ["a.bin", "b.bin"] {
+            cold(&root.join(name));
+        }
+        let small = root.join("c.bin");
+        fs::write(&small, b"x").unwrap();
+        filetime::set_file_mtime(&small, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        let policy = CompressionPolicy {
+            max_bytes: 20,
+            ..policy()
+        };
+        let first = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy,
+        );
+        assert_eq!(first.paths(), [root.join("a.bin")]);
+        assert!(!first.report().complete);
+        assert!(!first.report().skipped.contains_key("logical_byte_budget"));
+        let after = continuation_path(first.report().resume_after_hex.as_deref().unwrap()).unwrap();
+        assert_eq!(after, root.join("a.bin"));
+        let second = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits {
+                after: Some(after),
+                ..Default::default()
+            },
+            &policy,
+        );
+        assert_eq!(second.paths(), [root.join("b.bin"), small]);
+        assert_eq!(second.report().selected_bytes, 14);
+        assert!(second.report().complete);
+    }
+
+    #[test]
+    fn a_file_larger_than_the_entire_byte_budget_does_not_wedge_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let oversized = root.join("a-large.bin");
+        fs::write(&oversized, b"too large for a whole pass").unwrap();
+        filetime::set_file_mtime(&oversized, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        for name in ["b.bin", "c.bin"] {
+            cold(&root.join(name));
+        }
+        let policy = CompressionPolicy {
+            max_bytes: 13,
+            ..policy()
+        };
+        let first = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy,
+        );
+        assert_eq!(first.paths(), [root.join("b.bin")]);
+        assert_eq!(
+            first.report().skipped.get("exceeds_full_byte_budget"),
+            Some(&1)
+        );
+        assert!(!first.report().complete);
+        let after = continuation_path(first.report().resume_after_hex.as_deref().unwrap()).unwrap();
+        assert_eq!(after, root.join("b.bin"));
+        let second = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits {
+                after: Some(after),
+                ..Default::default()
+            },
+            &policy,
+        );
+        assert_eq!(second.paths(), [root.join("c.bin")]);
+        assert!(second.report().complete);
+        assert!(second.report().resume_after_hex.is_none());
+        assert_eq!(fs::read(oversized).unwrap(), b"too large for a whole pass");
+    }
+
+    #[test]
     fn partial_directory_enumeration_never_claims_a_sorted_prefix() {
         let dir = tempfile::tempdir().unwrap();
         cold(&dir.path().join("a.bin"));
@@ -152,6 +308,77 @@ mod native_tests {
         assert!(selection.paths().is_empty());
         assert!(selection.report().resume_after_hex.is_none());
         assert_eq!(selection.report().entries_examined, 1);
+    }
+
+    /// A directory budget stops with a cursor at the last path visited to
+    /// completion, so resumed runs (the daemon tier) cover the whole tree,
+    /// each file once. Before, only the file limit left a cursor, and a
+    /// budget-stopped walk restarted from the top on every run.
+    #[test]
+    fn a_budget_stop_resumes_until_the_tree_is_covered_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for sub in ["d1", "d2", "d3", "d4"] {
+            fs::create_dir(root.join(sub)).unwrap();
+            cold(&root.join(sub).join("f.bin"));
+        }
+        let mut after = None;
+        let mut seen = Vec::new();
+        let mut runs = 0;
+        loop {
+            runs += 1;
+            assert!(runs <= 8, "no progress after {runs} runs: {seen:?}");
+            let selection = scan(
+                std::slice::from_ref(&root),
+                &DiscoveryLimits {
+                    max_directories: 3,
+                    after: after.clone(),
+                    ..Default::default()
+                },
+                &policy(),
+            );
+            seen.extend(selection.paths());
+            let Some(hex) = selection.report().resume_after_hex.as_deref() else {
+                assert!(selection.report().complete);
+                break;
+            };
+            assert_eq!(
+                selection.report().stop_reason.as_deref(),
+                Some("discovery directory budget exhausted")
+            );
+            after = Some(continuation_path(hex).unwrap());
+        }
+        assert!(runs > 1, "the budget must actually stop the first run");
+        seen.sort();
+        assert_eq!(
+            seen,
+            ["d1", "d2", "d3", "d4"].map(|sub| root.join(sub).join("f.bin"))
+        );
+    }
+
+    /// A subtree past the depth limit is skipped and the walk goes on: a stop
+    /// there would recur at the same directory on every resumed run.
+    #[test]
+    fn a_too_deep_subtree_is_skipped_without_stopping_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("a/deep")).unwrap();
+        cold(&root.join("a/deep/f.bin"));
+        fs::create_dir(root.join("b")).unwrap();
+        cold(&root.join("b/f.bin"));
+        let selection = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits {
+                max_depth: 1,
+                ..Default::default()
+            },
+            &policy(),
+        );
+        assert_eq!(selection.paths(), [root.join("b/f.bin")]);
+        assert!(!selection.report().complete);
+        assert_eq!(selection.report().skipped.get("depth_limit"), Some(&1));
+        assert!(selection.report().stop_reason.is_none());
+        assert!(selection.report().resume_after_hex.is_none());
     }
 
     #[test]
@@ -359,6 +586,129 @@ mod native_tests {
         assert!(fresh.paths().is_empty());
         assert_eq!(fresh.report().directories_opened, 0);
         assert_eq!(fs::read(&path).unwrap(), b"cold contents");
+    }
+
+    fn btrfs_platform() -> MockPlatform {
+        use crate::platform::pal::{FsStats, MemoryInfo, MountPoint, PlatformPaths};
+        let mount = PathBuf::from("/");
+        let stats = FsStats {
+            total_bytes: 1_000_000_000_000,
+            free_bytes: 500_000_000_000,
+            available_bytes: 500_000_000_000,
+            fs_type: "btrfs".into(),
+            mount_point: mount.clone(),
+            is_readonly: false,
+        };
+        MockPlatform::new(
+            vec![MountPoint {
+                path: mount.clone(),
+                device: "mockdev".into(),
+                fs_type: "btrfs".into(),
+                is_ram_backed: false,
+            }],
+            std::collections::HashMap::from([(mount, stats)]),
+            MemoryInfo {
+                total_bytes: 64 << 30,
+                available_bytes: 32 << 30,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            },
+            PlatformPaths::default(),
+        )
+    }
+
+    fn run_selected(
+        selection: &Selection,
+        platform: &MockPlatform,
+    ) -> crate::scanner::compression::CompressionReport {
+        crate::scanner::compression::run_discovered(
+            selection,
+            &policy(),
+            crate::scanner::compression::CompressionMode::default(),
+            &Config::default(),
+            platform,
+            None,
+            &mut |_| {},
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn discovered_execution_refuses_a_replaced_root_before_opening_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let root = parent.join("root");
+        fs::create_dir(&root).unwrap();
+        cold(&root.join("a.bin"));
+        let selection = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy(),
+        );
+        assert_eq!(selection.paths(), [root.join("a.bin")]);
+        // Unchanged: the selection admits the file, and the mock filesystem
+        // type is what stops this preview.
+        let admitted = run_selected(&selection, &MockPlatform::healthy());
+        assert_eq!(admitted.files.len(), 1);
+        assert!(
+            admitted.files[0].detail.contains("unsupported filesystem"),
+            "{:?}",
+            admitted.files[0]
+        );
+        // A lookalike root holding the same name is not the discovered root.
+        fs::rename(&root, parent.join("moved")).unwrap();
+        fs::create_dir(&root).unwrap();
+        cold(&root.join("a.bin"));
+        let refused = run_selected(&selection, &MockPlatform::healthy());
+        assert_eq!(refused.files.len(), 1);
+        let file = &refused.files[0];
+        assert_eq!(file.outcome, "failed", "{file:?}");
+        assert!(file.detail.contains("root was replaced"), "{file:?}");
+        assert!(!file.mutation_attempted);
+        assert_eq!(refused.unvisited_files, 0);
+        assert_eq!(fs::read(root.join("a.bin")).unwrap(), b"cold contents");
+    }
+
+    #[test]
+    fn discovered_execution_refuses_a_file_changed_after_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        cold(&root.join("changed.bin"));
+        cold(&root.join("same.bin"));
+        let selection = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy(),
+        );
+        assert_eq!(
+            selection.paths(),
+            [root.join("changed.bin"), root.join("same.bin")]
+        );
+        // Still cold (mtime restored), so only the discovery stamp can refuse
+        // it. The length differs because ctime alone can share a coarse tick.
+        fs::write(root.join("changed.bin"), b"cold contents, edited").unwrap();
+        filetime::set_file_mtime(
+            root.join("changed.bin"),
+            filetime::FileTime::from_unix_time(1, 0),
+        )
+        .unwrap();
+        let report = run_selected(&selection, &btrfs_platform());
+        assert_eq!(report.files.len(), 2);
+        let changed = &report.files[0];
+        assert_eq!(changed.outcome, "failed", "{changed:?}");
+        assert!(
+            changed
+                .detail
+                .contains("changed after compression discovery"),
+            "{changed:?}"
+        );
+        assert!(!changed.mutation_attempted);
+        // The unchanged sibling passes the selection checks and continues to
+        // the real extent inspection, whatever this host's filesystem is.
+        let same = &report.files[1];
+        assert!(!same.detail.contains("discovery"), "{same:?}");
+        assert!(!same.mutation_attempted);
+        assert_eq!(fs::read(root.join("same.bin")).unwrap(), b"cold contents");
     }
 
     #[test]

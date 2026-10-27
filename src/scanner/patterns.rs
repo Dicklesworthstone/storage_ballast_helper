@@ -224,6 +224,10 @@ pub fn classify_opaque_tree(
         ));
     }
 
+    if let Some(opaque) = classify_code_sign_clone_area(path) {
+        return Some(opaque);
+    }
+
     // Anything strictly inside cargo's own stores (`registry/src`,
     // `registry/cache`, `registry/index`, `git/checkouts`, `git/db`) is
     // cargo-managed content — unpacked crate SOURCE, `.crate` archives, index
@@ -233,10 +237,15 @@ pub fn classify_opaque_tree(
     // that lives under a temp-like `CARGO_HOME` would otherwise be promoted to
     // a 0.93 `opaque-cargo-target` candidate purely on that name. The stores
     // themselves are excluded here: they are the opaque reclaim unit handled
-    // below (the `.cargo/registry` / `.cargo/git` roots above them are kept).
+    // below (a cargo home's `registry` / `git` roots above them are kept).
     if is_cargo_registry_internal_path(path) {
         return Some(OpaqueTreeClassification::protected(
             "cargo registry/git store content is crate source, never a build target",
+        ));
+    }
+    if is_uv_cache_internal_path(path) {
+        return Some(OpaqueTreeClassification::protected(
+            "uv cache entry content is installed packages, managed by uv",
         ));
     }
 
@@ -276,45 +285,7 @@ pub fn classify_opaque_tree(
     }
 
     if is_cargo_target_name(&name) {
-        // The broad `target-<x>` / `target_<x>` PREFIX forms are the only
-        // target-like shapes that ordinary crate and project names also
-        // satisfy (`target-triple`, `target_spec`), so temp-like placement
-        // alone is not enough to promote them: the tree must additionally
-        // carry a cargo build marker at its root. Every other shape keeps the
-        // plain temp-context promotion.
-        // Descriptive `<prefix>-target` / `<prefix>_target` names need the
-        // same corroboration: release-evidence and fixture trees name
-        // directories `invalid_target` or `ambient-target` on purpose, and on
-        // ts2 (2026-09-25) eight such directories inside non-git hfdt
-        // evidence bundles were deleted on the name alone.
-        let needs_markers = has_broad_target_prefix(&name) || has_descriptive_target_suffix(&name);
-        let has_markers = needs_markers && has_cargo_target_root_markers(path);
-        let tmp_promotes = tmp_like && (!needs_markers || has_markers);
-        if (name == "target" && context.parent_has_cargo_toml)
-            || tmp_promotes
-            || is_agent_build_target_name(&name)
-            // A descriptive suffix name WITH cargo's root markers is a
-            // `CARGO_TARGET_DIR` output, so V2 nominates it as a single opaque
-            // candidate even without tmp/agent/parent-cargo context. This is
-            // what lets a stranded `/root/cass-ft-target` be reclaimed. The
-            // broad `target-`/`target_` PREFIX forms stay SignalOnly in a
-            // source context, matching the conservative
-            // `opaque_tree_does_not_promote_broad_target_like_names_in_source_context`
-            // guarantee. All downstream deletion vetoes still apply.
-            || (has_descriptive_target_suffix(&name) && has_markers)
-        {
-            return Some(OpaqueTreeClassification::candidate(
-                "cargo/build target with regenerable context",
-                "opaque-cargo-target",
-                ArtifactCategory::RustTarget,
-                0.93,
-            ));
-        }
-        return Some(OpaqueTreeClassification::signal_only(if tmp_like {
-            "target-prefixed name under temp storage lacks cargo build markers"
-        } else {
-            "target-like directory lacks cargo/temp context"
-        }));
+        return Some(classify_cargo_target_name(path, &name, context, tmp_like));
     }
 
     if name == "node_modules" {
@@ -331,7 +302,7 @@ pub fn classify_opaque_tree(
         ));
     }
 
-    // `.cargo/registry` and `.cargo/git` themselves must survive: rch's per-job
+    // A cargo home's `registry` and `git` themselves must survive: rch's per-job
     // CARGO_HOME symlinks them, and a removed root leaves the link dangling so
     // every crates.io download fails with EEXIST (hz4, 2026-09-26: a release
     // lost 33 min). Descend and reclaim the stores inside instead.
@@ -352,15 +323,118 @@ pub fn classify_opaque_tree(
     if matches!(name.as_str(), ".next" | "dist" | "build")
         && (context.parent_has_node_manifest || tmp_like)
     {
-        return Some(OpaqueTreeClassification::candidate(
-            "build output with project/temp context",
-            "opaque-build-output",
-            ArtifactCategory::BuildOutput,
-            0.88,
-        ));
+        return Some(classify_build_output_name(path, &name, context));
     }
 
     None
+}
+
+/// Chromium browsers on macOS (Chrome, Canary, Edge, Brave, Opera) keep an
+/// APFS clone of their app bundle, made at every launch and removed only when
+/// the browser exits normally. Killed headless browsers left 1,027 of them on
+/// mac-studio (2026-10-16, bd-39da). Only the clones are candidates, and
+/// nothing else in the clone area is walked; the active-reference index marks
+/// the clones a running browser may own (`walker::code_sign_clones`).
+fn classify_code_sign_clone_area(path: &Path) -> Option<OpaqueTreeClassification> {
+    Some(match darwin_code_sign_clone_level(path)? {
+        CodeSignCloneLevel::CloneDir => OpaqueTreeClassification::candidate(
+            "browser code-sign clone: a per-launch app copy its browser did not remove",
+            "opaque-browser-code-sign-clone",
+            ArtifactCategory::TempDir,
+            0.93,
+        ),
+        CodeSignCloneLevel::Container => OpaqueTreeClassification::signal_only(
+            "browser code-sign clone container: only the clones inside are candidates",
+        ),
+        CodeSignCloneLevel::Other => OpaqueTreeClassification::protected(
+            "macOS code-sign clone area: only browser clones are candidates",
+        ),
+    })
+}
+
+/// A directory whose name is target-like ([`is_cargo_target_name`]).
+///
+/// The broad `target-<x>` / `target_<x>` PREFIX forms are the only
+/// target-like shapes that ordinary crate and project names also satisfy
+/// (`target-triple`, `target_spec`), so temp-like placement alone is not
+/// enough to promote them: the tree must additionally carry a cargo build
+/// marker at its root. Descriptive `<prefix>-target` / `<prefix>_target`
+/// names need the same corroboration: release-evidence and fixture trees name
+/// directories `invalid_target` or `ambient-target` on purpose, and on ts2
+/// (2026-09-25) eight such directories inside non-git hfdt evidence bundles
+/// were deleted on the name alone. A plain `target` with no Cargo manifest
+/// beside it needs them too: hfdt stores keep a `target/` of their own
+/// (store-doctor undo data), and on ts2 the daemon deleted two agent store
+/// copies' `target` (2026-09-29) and nominated a 4.8 GB `target/doctor-undo`
+/// on the name alone (2026-10-20, bd-u9ua). Cargo writes CACHEDIR.TAG and
+/// .rustc_info.json into every target dir it builds in.
+fn classify_cargo_target_name(
+    path: &Path,
+    name: &str,
+    context: OpaqueTreeContext,
+    tmp_like: bool,
+) -> OpaqueTreeClassification {
+    let needs_markers = has_broad_target_prefix(name)
+        || has_descriptive_target_suffix(name)
+        || (name == "target" && !context.parent_has_cargo_toml);
+    let has_markers = needs_markers && has_cargo_target_root_markers(path);
+    let tmp_promotes = tmp_like && (!needs_markers || has_markers);
+    if (name == "target" && context.parent_has_cargo_toml)
+        || tmp_promotes
+        || is_agent_build_target_name(name)
+        // A descriptive suffix name WITH cargo's root markers is a
+        // `CARGO_TARGET_DIR` output, so V2 nominates it as a single opaque
+        // candidate even without tmp/agent/parent-cargo context. This is
+        // what lets a stranded `/root/cass-ft-target` be reclaimed. The
+        // broad `target-`/`target_` PREFIX forms stay SignalOnly in a
+        // source context, matching the conservative
+        // `opaque_tree_does_not_promote_broad_target_like_names_in_source_context`
+        // guarantee. All downstream deletion vetoes still apply.
+        || (has_descriptive_target_suffix(name) && has_markers)
+    {
+        return OpaqueTreeClassification::candidate(
+            "cargo/build target with regenerable context",
+            "opaque-cargo-target",
+            ArtifactCategory::RustTarget,
+            0.93,
+        );
+    }
+    OpaqueTreeClassification::signal_only(if tmp_like {
+        "target-like name under temp storage lacks cargo build markers"
+    } else {
+        "target-like directory lacks cargo/temp context"
+    })
+}
+
+/// `build` and `dist` also name source directories and the shipped code of
+/// installed packages. They are output only beside the manifest of a tool that
+/// writes them. On ts2 (2026-10-16) temp placement alone deleted tracked
+/// `scripts/build/*.mjs` and golden-test fixtures from repo copies under
+/// /data/tmp, and a `package.json` beside them deleted the `dist/` code of
+/// packages in a bun install cache (bd-8nol).
+fn classify_build_output_name(
+    path: &Path,
+    name: &str,
+    context: OpaqueTreeContext,
+) -> OpaqueTreeClassification {
+    if name != ".next" {
+        if installed_package_content(path) {
+            return OpaqueTreeClassification::signal_only(
+                "build/dist inside an installed or cached package is its shipped code",
+            );
+        }
+        if !context.parent_has_node_manifest && !beside_producing_manifest(path, name) {
+            return OpaqueTreeClassification::signal_only(
+                "build/dist name without a manifest beside it whose tool writes it",
+            );
+        }
+    }
+    OpaqueTreeClassification::candidate(
+        "build output with project/temp context",
+        "opaque-build-output",
+        ArtifactCategory::BuildOutput,
+        0.88,
+    )
 }
 
 fn is_context_gated_dependency_tree_name(name: &str) -> bool {
@@ -667,7 +741,10 @@ pub fn is_agent_harness_dir_name(lowercase_name: &str) -> bool {
 /// scorer vetoes it outright. The store directories themselves are
 /// deliberately NOT matched: they are the opaque, whole-store reclaim unit
 /// (`opaque-cargo-cache` / the cleanup catalog). The `registry` / `git`
-/// roots above them are never reclaimed (rch symlinks them).
+/// roots above them are never nominated: `classify_opaque_tree` keeps them
+/// signal-only for every cargo home it recognises (`is_cargo_home`), because
+/// rch symlinks them. Sacred protection does not cover them; the classifier
+/// does.
 #[must_use]
 pub fn is_cargo_registry_internal_path(path: &Path) -> bool {
     // `ancestors()` yields `path` first; the store dir must be a STRICT
@@ -686,6 +763,33 @@ pub fn is_cargo_registry_internal_path(path: &Path) -> bool {
         matches!(
             (parent, name),
             ("registry", "src" | "cache" | "index") | ("git", "checkouts" | "db")
+        )
+    })
+}
+
+/// True when `path` lies strictly inside an entry of uv's unpacked-package or
+/// tool-environment buckets, `uv/archive-vN/<entry>/` or
+/// `uv/environments-vN/<entry>/`.
+///
+/// Those are installed packages that running interpreters import from. On
+/// css (2026-10-16) sbh nominated 397 `__pycache__` directories inside them
+/// on the name alone and the executor refused each one as open, 300-600
+/// times an hour (bd-p9fw). The uv cache as a whole stays a reclaim unit.
+#[must_use]
+pub fn is_uv_cache_internal_path(path: &Path) -> bool {
+    let is_bucket = |name: &str| {
+        ["archive-v", "environments-v"].iter().any(|prefix| {
+            name.strip_prefix(prefix).is_some_and(|version| {
+                !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+    };
+    // The entry must be a STRICT ancestor: the entry itself is uv's unit.
+    path.ancestors().skip(1).any(|entry| {
+        let mut above = entry.ancestors().skip(1).map(Path::file_name);
+        matches!(
+            (above.next().flatten().and_then(|n| n.to_str()), above.next().flatten()),
+            (Some(bucket), Some(uv)) if is_bucket(bucket) && uv == "uv"
         )
     })
 }
@@ -735,48 +839,112 @@ fn is_tmp_like_path(path: &Path) -> bool {
 /// is the per-user cache dir and `0` belongs to the system.
 #[must_use]
 pub fn is_darwin_user_temp_path(path: &Path) -> bool {
+    matches!(
+        darwin_per_user_folder_names(path).as_deref(),
+        Some(["T", _, ..])
+    )
+}
+
+/// The names below a macOS per-user folder, `/var/folders/<xx>/<hash>/` (or
+/// its `/private/var/...` spelling): `["T", "entry"]` for an entry in the
+/// temp dir. Only plain names count: a `.` or `..` could step out of the
+/// folder while still matching the pattern textually.
+fn darwin_per_user_folder_names(path: &Path) -> Option<Vec<&str>> {
     use std::path::Component;
     let mut components = path.components();
     if components.next() != Some(Component::RootDir) {
-        return false;
+        return None;
     }
-    // Only plain names after the root: a `.` or `..` could step out of the
-    // temp dir while still matching the pattern textually.
-    let names: Option<Vec<&str>> = components
+    let names: Vec<&str> = components
         .map(|part| match part {
             Component::Normal(name) => name.to_str(),
             _ => None,
         })
-        .collect();
-    let Some(names) = names else {
-        return false;
-    };
-    let mut parts = names.into_iter();
-    let mut first = parts.next();
-    if first == Some("private") {
-        first = parts.next();
+        .collect::<Option<_>>()?;
+    let names = names.strip_prefix(&["private"]).unwrap_or(&names);
+    match names {
+        ["var", "folders", _, _, below @ ..] => Some(below.to_vec()),
+        _ => None,
     }
-    first == Some("var")
-        && parts.next() == Some("folders")
-        && parts.next().is_some()
-        && parts.next().is_some()
-        && parts.next() == Some("T")
-        && parts.next().is_some()
 }
 
-/// `.cargo/registry` or `.cargo/git`.
+/// Where a path sits in a macOS per-user code-sign clone area,
+/// `/var/folders/<xx>/<hash>/X`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeSignCloneLevel {
+    /// `X/<bundle-id>.code_sign_clone`: one browser's clones.
+    Container,
+    /// `X/<bundle-id>.code_sign_clone/code_sign_clone.XXXXXX`: one clone.
+    CloneDir,
+    /// Anything else directly in `X` or in a container.
+    Other,
+}
+
+fn darwin_code_sign_clone_level(path: &Path) -> Option<CodeSignCloneLevel> {
+    let is_container = |name: &str| {
+        name.strip_suffix(".code_sign_clone")
+            .is_some_and(|bundle_id| !bundle_id.is_empty())
+    };
+    match darwin_per_user_folder_names(path)?.as_slice() {
+        ["X", name] if is_container(name) => Some(CodeSignCloneLevel::Container),
+        ["X", container, name] if is_container(container) && is_code_sign_clone_name(name) => {
+            Some(CodeSignCloneLevel::CloneDir)
+        }
+        ["X", _] => Some(CodeSignCloneLevel::Other),
+        ["X", container, _] if is_container(container) => Some(CodeSignCloneLevel::Other),
+        _ => None,
+    }
+}
+
+/// One browser's app clone,
+/// `/var/folders/<xx>/<hash>/X/<bundle-id>.code_sign_clone/code_sign_clone.XXXXXX`.
+#[must_use]
+pub fn is_browser_code_sign_clone(path: &Path) -> bool {
+    darwin_code_sign_clone_level(path) == Some(CodeSignCloneLevel::CloneDir)
+}
+
+/// `code_sign_clone.XXXXXX`, the `mkdtemp` name Chromium gives each clone.
+fn is_code_sign_clone_name(name: &str) -> bool {
+    name.strip_prefix("code_sign_clone.").is_some_and(|suffix| {
+        suffix.len() == 6 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
+/// The code-sign clone area beside a macOS per-user temp dir root: `X` for
+/// `/var/folders/<xx>/<hash>/T`. Scanning a user's temp dir includes the
+/// clones their browsers leave there; see [`classify_opaque_tree`].
+#[must_use]
+pub fn darwin_code_sign_clone_area_for_temp_root(root: &Path) -> Option<std::path::PathBuf> {
+    matches!(darwin_per_user_folder_names(root).as_deref(), Some(["T"]))
+        .then(|| root.with_file_name("X"))
+}
+
+/// `registry` or `git` directly inside a cargo home (see [`is_cargo_home`]).
 fn is_cargo_home_store_root(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| matches!(name, "registry" | "git"))
-        && path
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|parent| parent == ".cargo")
+        && path.parent().is_some_and(is_cargo_home)
+}
+
+/// A directory cargo uses as `CARGO_HOME`: `.cargo`, rch's shared
+/// `rch-cargo-cache-<host>` stores, or any directory holding cargo's
+/// `.package-cache` lock file.
+///
+/// Recognising only `.cargo` left the rch stores' `registry`/`git` roots to
+/// the CACHEDIR.TAG rescue, which nominated them whole: on csd (2026-10-23)
+/// Green event passes quarantined `rch-cargo-cache-csd/{git,registry}`
+/// hourly while builds re-created them, the root removal the hz4 guard
+/// below exists to prevent.
+fn is_cargo_home(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == ".cargo" || name.starts_with("rch-cargo-cache"))
+        || dir.join(".package-cache").is_file()
 }
 
 /// A regenerable store directly inside a cargo-home root:
-/// `.cargo/registry/{cache,src,index}` or `.cargo/git/{checkouts,db}`.
+/// `<cargo home>/registry/{cache,src,index}` or `<cargo home>/git/{checkouts,db}`.
 fn is_cargo_cache_store(path: &Path) -> bool {
     let (Some(name), Some(root)) = (
         path.file_name().and_then(|name| name.to_str()),
@@ -976,8 +1144,9 @@ impl ArtifactPatternRegistry {
             return ArtifactClassification::unknown();
         };
         // Crate source unpacked under a cargo store is never an artifact,
-        // whatever its basename looks like (`target-triple-1.0.0`).
-        if is_cargo_registry_internal_path(path) {
+        // whatever its basename looks like (`target-triple-1.0.0`), and
+        // neither is a package uv unpacked or installed in its cache.
+        if is_cargo_registry_internal_path(path) || is_uv_cache_internal_path(path) {
             return ArtifactClassification::unknown();
         }
         let normalized = name_os.to_string_lossy().to_lowercase();
@@ -1159,10 +1328,53 @@ fn inside_project_tree(path: &Path) -> bool {
         .take(8)
         .take_while(|dir| !is_temp_root_dir(dir))
         .any(|dir| {
-            MARKERS
-                .iter()
-                .any(|marker| dir.join(marker).symlink_metadata().is_ok())
+            // A marker that cannot be checked counts as present: being wrong
+            // here keeps scratch, being wrong the other way deletes a project.
+            MARKERS.iter().any(|marker| {
+                !matches!(
+                    dir.join(marker).symlink_metadata(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                )
+            })
         })
+}
+
+/// Whether the manifest of a tool that writes `name` sits beside it. Python
+/// and JS packaging write `dist/`; CMake, Make, Meson, Gradle, Python and JS
+/// builds write `build/`. Cargo, Go and a bare repo write neither, and a Rust
+/// repo can track its own `dist/` beside `Cargo.toml` (franken_manim).
+fn beside_producing_manifest(path: &Path, name: &str) -> bool {
+    const DIST: &[&str] = &["package.json", "pyproject.toml", "setup.cfg", "setup.py"];
+    const BUILD: &[&str] = &[
+        "CMakeLists.txt",
+        "Makefile",
+        "build.gradle",
+        "build.gradle.kts",
+        "meson.build",
+        "package.json",
+        "pyproject.toml",
+        "setup.py",
+    ];
+    let markers = if name == "dist" { DIST } else { BUILD };
+    path.parent().is_some_and(|parent| {
+        markers
+            .iter()
+            .any(|marker| parent.join(marker).metadata().is_ok())
+    })
+}
+
+/// Inside `node_modules` or a package manager's cache, a `dist/` or `build/`
+/// beside `package.json` is the published package's code, not output of a
+/// build on this host. Bun's install cache names entries
+/// `<name>@<version>@@@<n>`; Deno's npm cache sits under `registry.npmjs.org`.
+fn installed_package_content(path: &Path) -> bool {
+    path.parent().is_some_and(|parent| {
+        parent.components().any(|component| {
+            component.as_os_str().to_str().is_some_and(|part| {
+                part == "node_modules" || part == "registry.npmjs.org" || part.contains("@@@")
+            })
+        })
+    })
 }
 
 fn matches_builtin(kind: MatchKind, normalized: &str) -> bool {
@@ -1828,7 +2040,7 @@ mod tests {
         structural_score,
     };
     use crate::platform::{linux, macos};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn darwin_user_temp_dir_is_a_temp_root() {
@@ -1857,6 +2069,83 @@ mod tests {
         assert!(crate::scanner::scoring::is_volatile_temp_path(Path::new(
             "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/proj/target"
         )));
+    }
+
+    #[test]
+    fn browser_code_sign_clones_are_the_only_candidates_in_the_clone_area() {
+        let classify =
+            |path: &str| classify_opaque_tree(Path::new(path), OpaqueTreeContext::default());
+        let x = "/private/var/folders/vt/n2xy/X";
+        for clone in [
+            format!("{x}/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk"),
+            "/var/folders/vt/n2xy/X/com.brave.Browser.code_sign_clone/code_sign_clone.a1B2c3"
+                .to_string(),
+        ] {
+            let opaque = classify(&clone).unwrap();
+            assert_eq!(
+                opaque.disposition,
+                OpaqueTreeDisposition::CandidateOpaque,
+                "{clone}"
+            );
+            assert_eq!(opaque.classification.category, ArtifactCategory::TempDir);
+            assert_eq!(
+                opaque.classification.pattern_name,
+                "opaque-browser-code-sign-clone"
+            );
+        }
+        // A browser's container is walked for its clones, never scored.
+        let container = classify(&format!("{x}/com.google.Chrome.code_sign_clone")).unwrap();
+        assert_eq!(container.disposition, OpaqueTreeDisposition::SignalOnly);
+        // Nothing else in the area is walked or scored.
+        for other in [
+            format!("{x}/com.example.Other"),
+            format!("{x}/.code_sign_clone"),
+            format!("{x}/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMR"),
+            format!("{x}/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk7"),
+            format!("{x}/com.google.Chrome.code_sign_clone/code_sign_clone.R3-MRk"),
+            format!("{x}/com.google.Chrome.code_sign_clone/Google Chrome.app"),
+        ] {
+            let opaque = classify(&other).unwrap();
+            assert_eq!(
+                opaque.disposition,
+                OpaqueTreeDisposition::ProtectedOpaque,
+                "{other}"
+            );
+        }
+        // The same names anywhere else get no special treatment.
+        for elsewhere in [
+            "/private/var/folders/vt/n2xy/T/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk",
+            "/tmp/X/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk",
+            "/private/var/folders/vt/X/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk",
+            "/private/var/folders/vt/n2xy/X/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk/Google Chrome.app.bundle",
+            "/private/var/folders/vt/n2xy/X/../X/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk",
+        ] {
+            assert!(classify(elsewhere).is_none(), "{elsewhere}");
+        }
+    }
+
+    #[test]
+    fn the_clone_area_sits_beside_a_user_temp_dir_root_only() {
+        use super::darwin_code_sign_clone_area_for_temp_root as area;
+        use std::path::PathBuf;
+        for (root, want) in [
+            (
+                "/private/var/folders/vt/n2xy/T",
+                "/private/var/folders/vt/n2xy/X",
+            ),
+            ("/var/folders/vt/n2xy/T/", "/var/folders/vt/n2xy/X"),
+        ] {
+            assert_eq!(area(Path::new(root)), Some(PathBuf::from(want)), "{root}");
+        }
+        for root in [
+            "/private/var/folders/vt/n2xy/T/.tmpAbc",
+            "/private/var/folders/vt/n2xy/C",
+            "/private/var/folders/vt/n2xy",
+            "/private/var/folders",
+            "/private/tmp",
+        ] {
+            assert_eq!(area(Path::new(root)), None, "{root}");
+        }
     }
 
     fn classify_macos(
@@ -2069,6 +2358,108 @@ mod tests {
     }
 
     #[test]
+    fn temp_build_and_dist_names_inside_a_project_copy_stay_source() {
+        use std::fs;
+        // Under a temp root, like the /data/tmp verify checkouts, partial
+        // exports and bun install cache that lost source or package code on
+        // ts2 (bd-8nol).
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let tree = |root: &str, dirs: &[&str], files: &[&str]| {
+            let base = dir.path().join(root);
+            for sub in dirs {
+                fs::create_dir_all(base.join(sub)).unwrap();
+            }
+            for file in files {
+                fs::write(base.join(file), b"{}\n").unwrap();
+            }
+            base
+        };
+        let node = tree(
+            "verify-af880e0",
+            &[
+                "scripts/build",
+                "src/dist",
+                "build",
+                "app/.next",
+                "frontend/dist",
+            ],
+            &[
+                "package.json",
+                "scripts/build/cjs-shim.mjs",
+                "frontend/package.json",
+            ],
+        );
+        // A partial export: source directories, no manifest anywhere.
+        let partial = tree(
+            "tealforest-kmk",
+            &["scripts/build", "tests/golden/build"],
+            &[],
+        );
+        // A Cargo-only copy: Cargo writes neither build/ nor dist/.
+        let cargo = tree(
+            "hfdt-clean-export",
+            &["build", "dist", "crates/hfdt-cli/src/cmd/build"],
+            &["Cargo.toml", "crates/hfdt-cli/Cargo.toml"],
+        );
+        let cmake = tree("cmake-copy", &["build"], &["CMakeLists.txt"]);
+        let python = tree("py-copy", &["dist", "build"], &["pyproject.toml"]);
+        // Published packages: a bun install-cache entry and an installed
+        // dependency, each with package.json beside its dist/.
+        let bun = tree(
+            "bun-install-cache/sharp@0.35.4@@@1",
+            &["dist"],
+            &["package.json"],
+        );
+        let installed = tree("app/node_modules/unenv", &["dist"], &["package.json"]);
+        let disposition = |path: &Path, beside_node_manifest: bool| {
+            classify_opaque_tree(
+                path,
+                OpaqueTreeContext {
+                    parent_has_node_manifest: beside_node_manifest,
+                    ..OpaqueTreeContext::default()
+                },
+            )
+            .map(|opaque| opaque.disposition)
+        };
+
+        for (source, beside_node_manifest) in [
+            (node.join("scripts/build"), false),
+            (node.join("src/dist"), false),
+            (partial.join("scripts/build"), false),
+            (partial.join("tests/golden/build"), false),
+            (cargo.join("build"), false),
+            (cargo.join("dist"), false),
+            (cargo.join("crates/hfdt-cli/src/cmd/build"), false),
+            (bun.join("dist"), true),
+            (installed.join("dist"), true),
+        ] {
+            assert_eq!(
+                disposition(&source, beside_node_manifest),
+                Some(OpaqueTreeDisposition::SignalOnly),
+                "{}",
+                source.display()
+            );
+        }
+        // Beside the manifest of a tool that writes it, and `.next`
+        // anywhere, it is still output.
+        for (output, beside_node_manifest) in [
+            (node.join("build"), true),
+            (node.join("frontend/dist"), true),
+            (node.join("app/.next"), false),
+            (cmake.join("build"), false),
+            (python.join("dist"), false),
+            (python.join("build"), false),
+        ] {
+            assert_eq!(
+                disposition(&output, beside_node_manifest),
+                Some(OpaqueTreeDisposition::CandidateOpaque),
+                "{}",
+                output.display()
+            );
+        }
+    }
+
+    #[test]
     fn cargo_registry_internal_paths_are_detected_strictly_inside_stores() {
         for p in [
             "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/target-triple-1.0.0",
@@ -2094,6 +2485,107 @@ mod tests {
         ] {
             assert!(!is_cargo_registry_internal_path(Path::new(p)), "{p}");
         }
+    }
+
+    /// csd 2026-10-23: rch's shared store `rch-cargo-cache-csd` was not a
+    /// recognised cargo home, so its `git`/`registry` roots were nominated
+    /// whole. Every cargo home keeps its roots and offers its stores instead.
+    #[test]
+    fn every_cargo_home_keeps_its_roots_and_offers_its_stores() {
+        let classify = |path: &Path| classify_opaque_tree(path, OpaqueTreeContext::default());
+        let marked = tempfile::tempdir().unwrap();
+        let marked_home = marked.path().join("job-7-cargo");
+        std::fs::create_dir(&marked_home).unwrap();
+        std::fs::write(marked_home.join(".package-cache"), b"").unwrap();
+
+        for home in [
+            PathBuf::from("/root/.cargo"),
+            PathBuf::from("/data/ssd/tmp/rch-cargo-cache-csd"),
+            PathBuf::from("/scratch/tmp/rch-cargo-cache-timeout-worker"),
+            marked_home,
+        ] {
+            for root in ["registry", "git"] {
+                let path = home.join(root);
+                assert_eq!(
+                    classify(&path).map(|opaque| opaque.disposition),
+                    Some(OpaqueTreeDisposition::SignalOnly),
+                    "{}",
+                    path.display()
+                );
+            }
+            for store in ["registry/src", "registry/cache", "registry/index", "git/db"] {
+                let path = home.join(store);
+                let opaque = classify(&path).unwrap();
+                assert_eq!(
+                    opaque.disposition,
+                    OpaqueTreeDisposition::CandidateOpaque,
+                    "{}",
+                    path.display()
+                );
+                assert_eq!(opaque.classification.pattern_name, "opaque-cargo-cache");
+            }
+        }
+
+        // A `registry` or `git` that is not in a cargo home gets no cargo verdict.
+        let plain = marked.path().join("project");
+        for path in [plain.join("registry"), plain.join("git")] {
+            assert!(
+                classify(&path).is_none_or(|opaque| opaque.classification.pattern_name
+                    != "opaque-cargo-cache"
+                    && opaque.disposition != OpaqueTreeDisposition::SignalOnly),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn uv_cache_entry_content_is_never_walked_or_named_a_candidate() {
+        use super::is_uv_cache_internal_path as internal;
+        let registry = ArtifactPatternRegistry::default();
+        for inside in [
+            "/home/ubuntu/.cache/uv/archive-v0/SSbRqQhYGRnnG2bz/lib/python3.12/site-packages/torch/nn/utils/__pycache__",
+            "/home/ubuntu/.cache/uv/archive-v0/qGMYdM4VKIJ2H-It/lib",
+            "/root/.cache/uv/environments-v2/ruff-1a2b/lib/python3.12/site-packages/__pycache__",
+        ] {
+            let path = Path::new(inside);
+            assert!(internal(path), "{inside}");
+            assert_eq!(
+                registry
+                    .classify(path, StructuralSignals::default())
+                    .category,
+                ArtifactCategory::Unknown,
+                "{inside}"
+            );
+            assert_eq!(
+                classify_opaque_tree(path, OpaqueTreeContext::default())
+                    .unwrap()
+                    .disposition,
+                OpaqueTreeDisposition::ProtectedOpaque,
+                "{inside}"
+            );
+        }
+        // uv's own units, its other buckets and other caches are unchanged.
+        for outside in [
+            "/home/ubuntu/.cache/uv",
+            "/home/ubuntu/.cache/uv/archive-v0",
+            "/home/ubuntu/.cache/uv/archive-v0/SSbRqQhYGRnnG2bz",
+            "/home/ubuntu/.cache/uv/wheels-v5/pypi/__pycache__",
+            "/home/ubuntu/.cache/uv/archive-vx/entry/__pycache__",
+            "/home/ubuntu/.cache/pip/archive-v0/entry/__pycache__",
+            "/home/ubuntu/project/__pycache__",
+        ] {
+            assert!(!internal(Path::new(outside)), "{outside}");
+        }
+        assert_eq!(
+            registry
+                .classify(
+                    Path::new("/home/ubuntu/project/__pycache__"),
+                    StructuralSignals::default()
+                )
+                .category,
+            ArtifactCategory::PythonCache
+        );
     }
 
     #[test]
@@ -2396,8 +2888,8 @@ mod tests {
         let opaque = classify_opaque_tree(&forged, OpaqueTreeContext::default()).unwrap();
         assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
 
-        // Descriptive suffix shapes need the same markers (issue #34); the
-        // plain `target` keeps the temp promotion.
+        // Descriptive suffix shapes need the same markers (issue #34), and so
+        // does a plain `target` without a Cargo manifest beside it.
         let descriptive = base.path().join("cass-ft-target");
         std::fs::create_dir_all(&descriptive).unwrap();
         let opaque = classify_opaque_tree(&descriptive, OpaqueTreeContext::default()).unwrap();
@@ -2408,7 +2900,40 @@ mod tests {
         let plain = base.path().join("target");
         std::fs::create_dir_all(&plain).unwrap();
         let opaque = classify_opaque_tree(&plain, OpaqueTreeContext::default()).unwrap();
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::SignalOnly);
+        std::fs::write(plain.join(".rustc_info.json"), "{}").unwrap();
+        let opaque = classify_opaque_tree(&plain, OpaqueTreeContext::default()).unwrap();
         assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
+    }
+
+    /// An hfdt store keeps a `target/` of its own (store-doctor undo data).
+    /// Under a temp root, with no Cargo manifest beside it and no cargo
+    /// marker inside, it is not a build target; beside a Cargo.toml it still
+    /// is, as before.
+    #[test]
+    fn an_hfdt_store_target_under_tmp_is_not_a_cargo_target() {
+        let base = tempfile::tempdir_in("/tmp").expect("tempdir under /tmp");
+        let store = base.path().join("freshstore_built");
+        std::fs::create_dir_all(store.join("target/doctor-undo/10726d")).unwrap();
+        std::fs::write(store.join("hfdt.sqlite"), b"SQLite format 3\0").unwrap();
+        std::fs::write(store.join("target/doctor-undo/10726d/page.bin"), [7u8; 64]).unwrap();
+
+        let opaque =
+            classify_opaque_tree(&store.join("target"), OpaqueTreeContext::default()).unwrap();
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::SignalOnly);
+
+        let beside_manifest = classify_opaque_tree(
+            &store.join("target"),
+            OpaqueTreeContext {
+                parent_has_cargo_toml: true,
+                parent_has_node_manifest: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            beside_manifest.disposition,
+            OpaqueTreeDisposition::CandidateOpaque
+        );
     }
 
     /// A non-temp scratch parent inside the checkout (`tmp/` is gitignored and

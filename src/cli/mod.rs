@@ -296,7 +296,8 @@ pub struct VerificationOutcome {
 }
 
 /// User-Agent every outbound HTTP request from sbh must carry (AGENTS.md rule).
-pub const HTTP_USER_AGENT: &str = "OpenAI File Downloader, XaiImageApiFetch/1.0";
+pub const HTTP_USER_AGENT: &str =
+    "sbh (+https://github.com/Dicklesworthstone/storage_ballast_helper)";
 
 /// Aggregate checksum manifest published next to raw `sbh_<os>_<arch>` binaries.
 pub const RAW_CHECKSUM_MANIFEST: &str = "SHA256SUMS";
@@ -1639,11 +1640,20 @@ mod tests {
             "step_package must build the canonical asset set with the release packager"
         );
 
+        // dsr >= 0.2.3 signs a manifest only beside the release set it lists.
         let minisign = shell_function(script, "step_minisign");
-        assert!(
-            minisign.contains("dsr signing sign /tmp/${base} && dsr signing verify /tmp/${base}")
-                && minisign.contains("${base}.minisig"),
-            "step_minisign must sign and verify the manifest and fetch its .minisig"
+        assert_in_order(
+            minisign,
+            "step_minisign must stage the manifest with the artifacts it lists, check the \
+             staged bytes, sign and verify there, and fetch its .minisig",
+            &[
+                "jq -r '.artifacts[].name' \"${MANIFEST}\"",
+                "mktemp -d /tmp/sbh-minisign.XXXXXX",
+                "scp -q ${names} \"${base}\" \"${MINISIGN_HOST}:${stage}/\"",
+                "[ \"${here}\" = \"${there}\" ]",
+                "dsr signing sign ${stage}/${base} && dsr signing verify ${stage}/${base}",
+                "\"${MINISIGN_HOST}:${stage}/${base}.minisig\"",
+            ],
         );
 
         let publish = shell_function(script, "step_publish");
@@ -2293,7 +2303,7 @@ mod tests {
         let notifications = include_str!("../daemon/notifications.rs");
 
         for required in [
-            "systemd/launchd stdout and stderr capture",
+            "systemd/launchd stderr capture; macOS unified logging",
             "The registry asks the active Platform Abstraction Layer (PAL) for mount inventory.",
             "Linux reads `/proc/mounts`; macOS uses its PAL mount inventory from `statfs`/`getmntinfo` and APFS metadata.",
             "The daemon samples its own RSS through the PAL `self_stats()` method on each state file write.",

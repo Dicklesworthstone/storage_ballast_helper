@@ -53,7 +53,7 @@ fn slow_consumer_does_not_deadlock_the_walk() {
     let expected = fixture_tree(tmp.path(), 3000, 2);
 
     let walker = walker_for(tmp.path());
-    let rx = walker.stream().expect("stream starts");
+    let mut rx = walker.stream().expect("stream starts");
     let started = Instant::now();
 
     // Do not read anything for a while: every walker thread fills the
@@ -82,7 +82,7 @@ fn cancelled_walk_stops_even_with_no_consumer() {
 
     let walker = walker_for(tmp.path());
     let cancel = walker.cancel_token();
-    let rx = walker.stream().expect("stream starts");
+    let mut rx = walker.stream().expect("stream starts");
     // Nobody reads. Cancelling must release the blocked senders.
     std::thread::sleep(Duration::from_millis(300));
     cancel.store(true, Ordering::Relaxed);

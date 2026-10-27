@@ -288,6 +288,15 @@ pub struct DeletionReport {
     /// holding the blocks correctly shows 0. `None` when any removal could
     /// not be measured, so a partial sum never poses as the whole.
     pub bytes_freed_observed: Option<u64>,
+    /// The part of `bytes_freed` on filesystems that return an unlinked
+    /// file's blocks only at their next commit (ext4 ~5 s, btrfs ~30 s), so
+    /// the delta measured right after the unlink reads ~0 (bd-oj33).
+    pub bytes_freed_at_commit: u64,
+    /// The measured delta for those same removals (logging only).
+    pub bytes_freed_at_commit_observed: u64,
+    /// Some of those removals were on btrfs, where extents a snapshot or
+    /// reflink shares free nothing: their estimate is only an upper bound.
+    pub freed_at_commit_on_btrfs: bool,
     /// Bytes that would have been reclaimed in dry-run mode.
     pub bytes_would_free: u64,
     pub duration: Duration,
@@ -338,6 +347,119 @@ impl DeletionReport {
             .iter()
             .chain(self.no_space_paths.iter())
     }
+
+    /// The freed bytes to report, and how they are known: the measured gain
+    /// where the filesystem frees blocks at once, the scanner's estimate
+    /// where it frees them at commit or a removal went unmeasured (bd-oj33).
+    /// Reporting only; no control decision reads it.
+    #[must_use]
+    pub fn reported_freed(&self) -> (u64, FreedBasis) {
+        let estimated_now = self.bytes_freed.saturating_sub(self.bytes_freed_at_commit);
+        let observed_now = self
+            .bytes_freed_observed
+            .map(|observed| observed.saturating_sub(self.bytes_freed_at_commit_observed));
+        let bytes = observed_now
+            .unwrap_or(estimated_now)
+            .saturating_add(self.bytes_freed_at_commit);
+        let basis = if self.freed_at_commit_on_btrfs {
+            FreedBasis::EstimatedUpperBound
+        } else if self.bytes_freed_at_commit > 0 || observed_now.is_none() {
+            FreedBasis::Estimated
+        } else {
+            FreedBasis::Observed
+        };
+        (bytes, basis)
+    }
+}
+
+/// How a reported freed-bytes figure is known (bd-oj33).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum FreedBasis {
+    /// The free space measured around each removal.
+    #[default]
+    #[serde(rename = "observed")]
+    Observed,
+    /// The removed trees' allocated size: the filesystem returns blocks only
+    /// at its next commit (ext4), or a removal was not measured.
+    #[serde(rename = "estimated_allocated")]
+    Estimated,
+    /// The allocated size on btrfs, an upper bound: extents a snapshot or
+    /// reflink shares free nothing.
+    #[serde(rename = "estimated_upper_bound")]
+    EstimatedUpperBound,
+}
+
+impl FreedBasis {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::Estimated => "estimated_allocated",
+            Self::EstimatedUpperBound => "estimated_upper_bound",
+        }
+    }
+
+    /// The basis of a total over several figures: the weakest of them.
+    #[must_use]
+    pub fn combine(self, other: Self) -> Self {
+        self.max(other)
+    }
+
+    /// `2.0 GB freed`, `~2.0 GB freed, estimated` or `up to 2.0 GB freed,
+    /// estimated`, so an estimate never reads as a measurement.
+    #[must_use]
+    pub fn freed_phrase(self, bytes: u64) -> String {
+        #[allow(clippy::cast_precision_loss)]
+        let gb = bytes as f64 / 1_073_741_824.0;
+        match self {
+            Self::Observed => format!("{gb:.1} GB freed"),
+            Self::Estimated => format!("~{gb:.1} GB freed, estimated"),
+            Self::EstimatedUpperBound => format!("up to {gb:.1} GB freed, estimated"),
+        }
+    }
+}
+
+/// Filesystems that return an unlinked file's blocks only at their next
+/// journal or transaction commit, so free space read right after an unlink
+/// has not grown yet (bd-oj33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum CommitFreeing {
+    Ext4,
+    Btrfs,
+}
+
+/// How the filesystem holding `path` frees blocks, from its parent's
+/// `statfs` magic. `None` when it frees them at once or cannot be read.
+#[cfg(target_os = "linux")]
+fn commit_freeing_beside(path: &Path) -> Option<CommitFreeing> {
+    const EXT4_SUPER_MAGIC: u32 = 0xEF53;
+    const BTRFS_SUPER_MAGIC: u32 = 0x9123_683E;
+    let f_type = rustix::fs::statfs(path.parent()?).ok()?.f_type;
+    // The field is signed and word-sized on most targets; the magic is 32 bits.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let magic = f_type as u32;
+    match magic {
+        EXT4_SUPER_MAGIC => Some(CommitFreeing::Ext4),
+        BTRFS_SUPER_MAGIC => Some(CommitFreeing::Btrfs),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn commit_freeing_beside(_path: &Path) -> Option<CommitFreeing> {
+    None
 }
 
 /// Per-batch bookkeeping for the pre-flight sacred containment check.
@@ -486,6 +608,15 @@ pub enum SkipReason {
     /// not be fully inspected, or was removed/retargeted after this candidate
     /// was queued. Root diagnostics identify the offending path/repository.
     SourceRootDenied,
+    /// The daemon began shutting down mid-batch; the rest of the batch is
+    /// left for the next run, with no per-path backoff.
+    ShuttingDown,
+    /// Live policy or dry-run settings no longer authorize a queued mutation.
+    /// Resuming policy must not leave candidates in per-path backoff.
+    PolicyChanged,
+    /// Lossless compression has a bounded first chance on this filesystem.
+    /// This live scheduling hold must not create a per-path refusal backoff.
+    CompressionFirst,
 }
 
 impl SkipReason {
@@ -495,7 +626,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 23] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -516,6 +647,9 @@ impl SkipReason {
         Self::OpenScanIncomplete,
         Self::CategorySuspended,
         Self::SourceRootDenied,
+        Self::ShuttingDown,
+        Self::PolicyChanged,
+        Self::CompressionFirst,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -550,6 +684,9 @@ impl SkipReason {
             Self::OpenScanIncomplete => "open_scan_incomplete",
             Self::CategorySuspended => "category_suspended",
             Self::SourceRootDenied => "source_root_denied",
+            Self::ShuttingDown => "shutting_down",
+            Self::PolicyChanged => "policy_changed",
+            Self::CompressionFirst => "compression_first",
         }
     }
 
@@ -596,6 +733,9 @@ impl SkipReason {
                 "scanner root is blocked by source-tree policy; inspect doctor/status, narrow \
                  root_paths or explicitly authorize scanner.allow_source_tree_roots"
             }
+            Self::ShuttingDown => "the daemon was shutting down — left for the next run",
+            Self::PolicyChanged => "live policy or dry-run settings no longer permit changes",
+            Self::CompressionFirst => "lossless compression is running before permanent cleanup",
         }
     }
 }
@@ -641,6 +781,9 @@ fn should_backoff_skip(reason: SkipReason) -> bool {
             | SkipReason::FilesystemReadOnly
             | SkipReason::CategorySuspended
             | SkipReason::SourceRootDenied
+            | SkipReason::ShuttingDown
+            | SkipReason::PolicyChanged
+            | SkipReason::CompressionFirst
     )
 }
 
@@ -662,6 +805,10 @@ pub enum CheckedDeletion {
 
 type AuthorizationCheck<'a> = &'a dyn Fn(&CandidacyScore) -> std::result::Result<(), SkipReason>;
 type UnlinkObserver<'a> = &'a dyn Fn(&CandidacyScore, Instant);
+/// A caller's per-candidate check run before preflight: the reason to leave
+/// this path alone now (target free space reached, a protection refusal, a
+/// shutdown), or `None` to continue.
+pub type SkipCheck<'a> = &'a dyn Fn(&Path) -> Option<SkipReason>;
 
 /// The deletion executor: takes scored candidates and deletes them safely.
 pub struct DeletionExecutor {
@@ -771,11 +918,12 @@ impl DeletionExecutor {
     /// Execute a deletion plan, deleting up to `max_batch_size` candidates.
     ///
     /// Returns a report summarizing what was deleted, skipped, or failed.
-    /// If `should_skip` returns `true` for a candidate path, it is skipped.
+    /// A candidate for which `should_skip` returns a reason is skipped with
+    /// that reason.
     pub fn execute(
         &self,
         plan: &DeletionPlan,
-        should_skip: Option<&dyn Fn(&Path) -> bool>,
+        should_skip: Option<SkipCheck<'_>>,
     ) -> DeletionReport {
         self.execute_with_guard(plan, should_skip, None)
     }
@@ -791,7 +939,7 @@ impl DeletionExecutor {
     pub fn execute_with_guard(
         &self,
         plan: &DeletionPlan,
-        should_skip: Option<&dyn Fn(&Path) -> bool>,
+        should_skip: Option<SkipCheck<'_>>,
         authorize: Option<AuthorizationCheck<'_>>,
     ) -> DeletionReport {
         self.execute_with_hooks(plan, should_skip, authorize, None)
@@ -809,7 +957,7 @@ impl DeletionExecutor {
     pub fn execute_with_hooks(
         &self,
         plan: &DeletionPlan,
-        should_skip: Option<&dyn Fn(&Path) -> bool>,
+        should_skip: Option<SkipCheck<'_>>,
         authorize: Option<AuthorizationCheck<'_>>,
         on_unlinked: Option<UnlinkObserver<'_>>,
     ) -> DeletionReport {
@@ -821,6 +969,9 @@ impl DeletionExecutor {
             items_would_delete: 0,
             bytes_freed: 0,
             bytes_freed_observed: Some(0),
+            bytes_freed_at_commit: 0,
+            bytes_freed_at_commit_observed: 0,
+            freed_at_commit_on_btrfs: false,
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -865,10 +1016,7 @@ impl DeletionExecutor {
                     #[cfg(target_os = "linux")]
                     {
                         let (targets, complete) = open_targets_for_batch(&roots);
-                        (
-                            walker::open_path_ancestors_for_roots(&targets, &roots),
-                            complete,
-                        )
+                        walker::checked_open_path_ancestors_for_roots(&targets, complete, &roots)
                     }
                     #[cfg(not(target_os = "linux"))]
                     {
@@ -915,12 +1063,13 @@ impl DeletionExecutor {
                 break;
             }
 
-            // Dynamic skip check (e.g. target free space met).
-            if let Some(skip) = should_skip
-                && skip(&candidate.path)
-            {
-                report.record_skip(SkipReason::TargetFreeReached);
-                report.backoff_candidates.push(candidate.clone());
+            // Dynamic skip check: target free space met, a live protection
+            // refusal, or a shutdown. Each is recorded under its own reason.
+            if let Some(reason) = should_skip.and_then(|skip| skip(&candidate.path)) {
+                report.record_skip(reason);
+                if should_backoff_skip(reason) {
+                    report.backoff_candidates.push(candidate.clone());
+                }
                 continue;
             }
 
@@ -1041,6 +1190,15 @@ impl DeletionExecutor {
                             .bytes_freed_observed
                             .zip(gained)
                             .map(|(sum, bytes)| sum.saturating_add(bytes));
+                        if let Some(freeing) = commit_freeing_beside(&candidate.path) {
+                            report.bytes_freed_at_commit = report
+                                .bytes_freed_at_commit
+                                .saturating_add(candidate.size_bytes);
+                            report.bytes_freed_at_commit_observed = report
+                                .bytes_freed_at_commit_observed
+                                .saturating_add(gained.unwrap_or(0));
+                            report.freed_at_commit_on_btrfs |= freeing == CommitFreeing::Btrfs;
+                        }
                     }
                     consecutive_failures = 0;
 
@@ -2044,9 +2202,12 @@ pub(crate) fn source_marker_within(path: &Path, max_entries: usize) -> bool {
     ];
 
     // Source-file extensions — any one direct-child source file vetos.
+    // `mjs`/`cjs`/`mts`/`cts` too: a tracked scripts/build holding only
+    // `.mjs` passed this veto and was deleted (ts2, 2026-10-16, bd-8nol).
     const SOURCE_EXTS: &[&str] = &[
-        "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "kt", "rb", "ex", "exs", "ml", "hs",
-        "cpp", "cc", "c", "h", "hpp", "swift", "scala", "clj", "cljs", "lua", "jl", "lean",
+        "rs", "py", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "go", "java", "kt", "rb",
+        "ex", "exs", "ml", "hs", "cpp", "cc", "c", "h", "hpp", "swift", "scala", "clj", "cljs",
+        "lua", "jl", "lean",
     ];
 
     let Ok(entries) = fs::read_dir(path) else {
@@ -2135,6 +2296,17 @@ mod tests {
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
     use crate::scanner::scoring::{DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::borrow::Cow;
+
+    /// For tests about planning and execution, not live process evidence. The
+    /// live sweep reads every process on the machine and holds the batch when
+    /// one is unreadable. In a container root lacks CAP_SYS_PTRACE and cannot
+    /// read a concurrent test's child that runs under another uid.
+    fn offline_config() -> DeletionConfig {
+        DeletionConfig {
+            check_open_files: false,
+            ..Default::default()
+        }
+    }
 
     /// Fixture root for deletion tests, guaranteed to sit OUTSIDE the
     /// hardcoded source-tree roots (`/data/projects`, `/home/<u>/projects`,
@@ -2370,6 +2542,7 @@ mod tests {
 
         let executor = DeletionExecutor::new(
             DeletionConfig {
+                check_open_files: false,
                 include_review: true,
                 ..Default::default()
             },
@@ -2418,6 +2591,8 @@ mod tests {
     fn mount_incidents_get_no_per_path_backoff() {
         assert!(!should_backoff_skip(SkipReason::FilesystemReadOnly));
         assert!(!should_backoff_skip(SkipReason::CategorySuspended));
+        assert!(!should_backoff_skip(SkipReason::PolicyChanged));
+        assert!(!should_backoff_skip(SkipReason::CompressionFirst));
         assert!(!should_backoff_skip(SkipReason::SourceRootDenied));
         assert!(should_backoff_skip(SkipReason::Symlink));
         assert!(!should_backoff_skip(SkipReason::PathGone));
@@ -2451,6 +2626,9 @@ mod tests {
                 SkipReason::OpenScanIncomplete => 17,
                 SkipReason::CategorySuspended => 18,
                 SkipReason::SourceRootDenied => 19,
+                SkipReason::ShuttingDown => 20,
+                SkipReason::PolicyChanged => 21,
+                SkipReason::CompressionFirst => 22,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];
@@ -2485,6 +2663,9 @@ mod tests {
             items_would_delete: 0,
             bytes_freed: 0,
             bytes_freed_observed: None,
+            bytes_freed_at_commit: 0,
+            bytes_freed_at_commit_observed: 0,
+            freed_at_commit_on_btrfs: false,
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -2561,6 +2742,9 @@ mod tests {
             items_would_delete: 0,
             bytes_freed: 0,
             bytes_freed_observed: None,
+            bytes_freed_at_commit: 0,
+            bytes_freed_at_commit_observed: 0,
+            freed_at_commit_on_btrfs: false,
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -2594,6 +2778,60 @@ mod tests {
         dry.dry_run = true;
         dry.items_skipped = 5;
         assert!(!dry.stalled());
+    }
+
+    /// Where a filesystem frees blocks at commit the measured gain reads ~0,
+    /// so the report carries the estimate and says so; btrfs's estimate is
+    /// an upper bound (bd-oj33).
+    #[test]
+    fn reported_freed_says_how_each_part_is_known() {
+        let mut report = executor_report_template();
+        report.bytes_freed = 300;
+        report.bytes_freed_observed = Some(180);
+        assert_eq!(report.reported_freed(), (180, FreedBasis::Observed));
+        // An unmeasured removal falls back to the estimate.
+        report.bytes_freed_observed = None;
+        assert_eq!(report.reported_freed(), (300, FreedBasis::Estimated));
+        // 200 of the 300 estimated bytes went on ext4, measured as 0: the
+        // rest stays measured (180 - 0), the ext4 part is the estimate.
+        report.bytes_freed_observed = Some(180);
+        report.bytes_freed_at_commit = 200;
+        report.bytes_freed_at_commit_observed = 0;
+        assert_eq!(report.reported_freed(), (380, FreedBasis::Estimated));
+        report.freed_at_commit_on_btrfs = true;
+        assert_eq!(
+            report.reported_freed(),
+            (380, FreedBasis::EstimatedUpperBound)
+        );
+        // Totals take the weakest basis; phrases never pass an estimate off
+        // as a measurement.
+        assert_eq!(
+            FreedBasis::Observed.combine(FreedBasis::Estimated),
+            FreedBasis::Estimated
+        );
+        assert_eq!(
+            FreedBasis::EstimatedUpperBound.combine(FreedBasis::Observed),
+            FreedBasis::EstimatedUpperBound
+        );
+        let gib = 2 * 1_073_741_824;
+        assert_eq!(FreedBasis::Observed.freed_phrase(gib), "2.0 GB freed");
+        assert_eq!(
+            FreedBasis::Estimated.freed_phrase(gib),
+            "~2.0 GB freed, estimated"
+        );
+        assert_eq!(
+            FreedBasis::EstimatedUpperBound.freed_phrase(gib),
+            "up to 2.0 GB freed, estimated"
+        );
+        assert_eq!(
+            serde_json::to_string(&FreedBasis::Estimated).unwrap(),
+            "\"estimated_allocated\""
+        );
+    }
+
+    fn executor_report_template() -> DeletionReport {
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        executor.execute(&executor.plan(Vec::new()), None)
     }
 
     #[test]
@@ -2633,7 +2871,7 @@ mod tests {
         let c1 = make_candidate(&file_path, 13, 0.85);
         let c2 = make_candidate(&dir_path, 100, 0.90);
 
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c1, c2]);
         let report = executor.execute(&plan, None);
 
@@ -2678,10 +2916,38 @@ mod tests {
                 .bytes_freed_observed
                 .expect("an unlink on a local volume is measured");
             assert_ne!(observed, estimate);
+            // A filesystem that frees at commit reports the estimate, marked
+            // as one; elsewhere the measurement stands (bd-oj33).
+            let (reported, basis) = report.reported_freed();
+            if commit_freeing_beside(&blob).is_some() {
+                assert_eq!(reported, estimate);
+                assert_ne!(basis, FreedBasis::Observed);
+            } else {
+                assert_eq!((reported, basis), (observed, FreedBasis::Observed));
+            }
             if observed >= 16 * 1024 * 1024 {
                 return;
             }
             observations.push(observed);
+        }
+        // ext4 and btrfs return freed blocks when the journal or transaction
+        // commits, not at unlink, so the executor's immediate measurement can
+        // miss them. Accept that only if the space does come back later.
+        let available = || available_bytes_beside(dir.path()).unwrap_or(0);
+        let blob = dir.path().join("deferred.bin");
+        let mut file = fs::File::create(&blob).unwrap();
+        std::io::Write::write_all(&mut file, &vec![0x5a_u8; 64 * 1024 * 1024]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let before = available();
+        fs::remove_file(&blob).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        while std::time::Instant::now() < deadline {
+            if available().saturating_sub(before) >= 16 * 1024 * 1024 {
+                eprintln!("this filesystem frees space at commit, not at unlink: {observations:?}");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
         panic!("removing 64 MiB never freed most of it: observed {observations:?}");
     }
@@ -2957,7 +3223,7 @@ mod tests {
         fs::write(git_dir.join("Cargo.toml"), "[package]").unwrap();
 
         let c = make_candidate(&git_dir, 5000, 0.95);
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c]);
         let report = executor.execute(&plan, None);
 
@@ -3327,7 +3593,7 @@ mod tests {
         let gone = dir.path().join("already_gone");
 
         let c = make_candidate(&gone, 1000, 0.85);
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c]);
         let report = executor.execute(&plan, None);
 
@@ -3392,6 +3658,7 @@ mod tests {
 
         let executor = DeletionExecutor::new(
             DeletionConfig {
+                check_open_files: false,
                 max_batch_size: 3,
                 ..Default::default()
             },
@@ -3416,7 +3683,7 @@ mod tests {
             candidates.push(make_candidate(&p, 100, 0.8));
         }
 
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(candidates);
 
         // Pressure check: resolved after first deletion.
@@ -3425,12 +3692,46 @@ mod tests {
             &plan,
             Some(&|_path| {
                 let count = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                count >= 1 // Resolved after first
+                // Resolved after first
+                (count >= 1).then_some(SkipReason::TargetFreeReached)
             }),
         );
 
         // Should delete 1, then stop.
         assert_eq!(report.items_deleted, 1);
+        assert_eq!(
+            report.skipped_by_reason.get("target_free_reached"),
+            Some(&4)
+        );
+        assert_eq!(report.backoff_candidates.len(), 4);
+    }
+
+    /// A hook's refusal is recorded under the hook's own reason, and a
+    /// shutdown leaves the rest of the batch without per-path backoff
+    /// (bd-drua: protection refusals were reported as target free reached).
+    #[test]
+    fn hook_skips_keep_their_reason_and_shutdown_has_no_backoff() {
+        let dir = scratch_dir();
+        let candidates = (0..3)
+            .map(|i| {
+                let p = dir.path().join(format!("hook_{i}.txt"));
+                fs::write(&p, "x").unwrap();
+                make_candidate(&p, 10, 0.8)
+            })
+            .collect::<Vec<_>>();
+        let executor = DeletionExecutor::new(offline_config(), None);
+        let plan = executor.plan(candidates);
+
+        let protected = executor.execute(&plan, Some(&|_| Some(SkipReason::SacredStowaway)));
+        assert_eq!(protected.items_deleted, 0);
+        assert_eq!(protected.skipped_by_reason.get("sacred_stowaway"), Some(&3));
+        assert_eq!(protected.skipped_by_reason.get("target_free_reached"), None);
+        assert_eq!(protected.backoff_candidates.len(), 3);
+
+        let stopping = executor.execute(&plan, Some(&|_| Some(SkipReason::ShuttingDown)));
+        assert_eq!(stopping.items_deleted, 0);
+        assert_eq!(stopping.skipped_by_reason.get("shutting_down"), Some(&3));
+        assert!(stopping.backoff_candidates.is_empty());
     }
 
     #[test]
@@ -3449,6 +3750,7 @@ mod tests {
         // With a valid setup, all should succeed.
         let executor = DeletionExecutor::new(
             DeletionConfig {
+                check_open_files: false,
                 circuit_breaker_threshold: 3,
                 circuit_breaker_cooldown: Duration::from_millis(10),
                 ..Default::default()
@@ -3475,7 +3777,7 @@ mod tests {
         let c1 = make_candidate(&good, 2, 0.85);
         let c2 = make_candidate(&gone, 3, 0.80);
 
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c1, c2]);
 
         // Remove the file before execution to trigger skip.
@@ -3614,7 +3916,7 @@ mod tests {
         let c2 = make_candidate(&file2, 5, 0.80);
         let c3 = make_candidate(&file3, 5, 0.75);
 
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c1, c2, c3]);
         let report = executor.execute(&plan, None);
 
@@ -3762,6 +4064,17 @@ mod tests {
         let dir = scratch_dir();
         fs::write(dir.path().join("main.py"), "x = 1").unwrap();
         assert!(looks_like_source_code(dir.path()));
+    }
+
+    /// midas_edge's tracked scripts/build holds only `.mjs` files; it passed
+    /// this veto and was deleted from repo copies on ts2 (bd-8nol).
+    #[test]
+    fn looks_like_source_code_detects_esm_and_commonjs_modules() {
+        for name in ["cjs-shim.mjs", "loader.cjs", "types.mts", "config.cts"] {
+            let dir = scratch_dir();
+            fs::write(dir.path().join(name), "export {};\n").unwrap();
+            assert!(looks_like_source_code(dir.path()), "{name}");
+        }
     }
 
     #[test]
@@ -4777,6 +5090,15 @@ mod tests {
 
         // Batch 1 takes (or reuses) a sweep and deletes `first`.
         let report = executor.execute(&executor.plan(vec![make_candidate(&first, 6, 0.95)]), None);
+        if report
+            .skipped_by_reason
+            .contains_key("open_scan_incomplete")
+        {
+            // A user who cannot read other users' processes never gets a
+            // complete sweep, so every batch is held: nothing to prove here.
+            eprintln!("skipped: this user cannot see every process");
+            return;
+        }
         assert_eq!(report.items_deleted, 1, "{report:?}");
 
         // A build starts in `second` after that sweep: a file under it is

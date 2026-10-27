@@ -191,6 +191,14 @@ pub fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
     let explicit_path = matches.get_one::<PathBuf>("config");
     let assessment = match Config::load(explicit_path.map(PathBuf::as_path)) {
         Ok(config) => Assessment::from_config(diagnostic, &config),
+        // A config that does not load is not a source-root finding. The
+        // command's own handler reports it: `config validate` says
+        // "Configuration is INVALID: ...", where this assessment printed
+        // "Source-root configuration: FAIL" and stopped the real check. Only
+        // a doctor run with no other target, which this answers whole, does.
+        Err(_) if !matches!(diagnostic, Diagnostic::Doctor { source_only: true }) => {
+            return Ok(None);
+        }
         Err(error) => Assessment::load_error(diagnostic, explicit_path.cloned(), error.to_string()),
     };
     if assessment.valid && !matches!(diagnostic, Diagnostic::Doctor { source_only: true }) {
@@ -232,6 +240,26 @@ mod tests {
         assert_eq!(
             diagnostic(&parse(&["sbh", "config", "validate", "--strict"])),
             Some(Diagnostic::ConfigValidate)
+        );
+    }
+
+    #[test]
+    fn a_config_that_does_not_load_is_reported_by_the_command_itself() {
+        let directory = tempfile::tempdir().unwrap();
+        let bad = directory.path().join("bad.toml");
+        std::fs::write(&bad, "this is not valid toml [[[\n").unwrap();
+        let bad = bad.to_str().unwrap();
+        // `config validate` and a targeted doctor run their own load check.
+        for args in [
+            vec!["sbh", "--config", bad, "config", "validate"],
+            vec!["sbh", "--config", bad, "doctor", "--system"],
+        ] {
+            assert_eq!(run(&parse(&args)).unwrap(), None, "{args:?}");
+        }
+        // A doctor run with no other target is this assessment alone.
+        assert_eq!(
+            run(&parse(&["sbh", "--config", bad, "doctor", "--json"])).unwrap(),
+            Some(1)
         );
     }
 

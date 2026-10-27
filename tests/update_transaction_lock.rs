@@ -458,13 +458,14 @@ fn rollback_activation_checks_the_running_image(stale: bool) {
         assert!(Instant::now() < deadline, "rollback never reached restart");
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(digest(&fixture.binary), expected);
     let mut held = old_runtime.unwrap_or_else(|| HeldImage::start(&fixture.binary));
     fs::write(
         fixture.root().join("runtime-pid"),
         held.process.child.id().to_string(),
     )
     .unwrap();
+    // Publish the runtime PID before hashing the full image so activation can observe it.
+    assert_eq!(digest(&fixture.binary), expected);
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(status) = rollback.status() {

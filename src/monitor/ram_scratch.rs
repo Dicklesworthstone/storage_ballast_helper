@@ -169,33 +169,100 @@ pub fn swap_nearly_full(memory: &MemoryInfo) -> bool {
         && u128::from(memory.swap_free_bytes) * 10 < u128::from(memory.swap_total_bytes)
 }
 
-/// Whether a RAM-backed log destination has enough observed headroom.
+/// How much headroom a RAM log destination needs.
 ///
-/// This predicate does not write logs or change their route. It is available
-/// to callers so observing pressure never implies adding logs to that pressure.
-#[must_use]
-pub fn ram_log_destination_healthy(memory: &MemoryInfo, total: u64, available: u64) -> bool {
-    memory.total_bytes != 0
-        && memory.available_bytes <= memory.total_bytes
-        && memory.swap_free_bytes <= memory.swap_total_bytes
-        && !swap_nearly_full(memory)
-        && total > 0
-        && available <= total
-        && u128::from(available) * 5 >= u128::from(total)
+/// Starting to use one takes a margin over what keeping it takes, so headroom
+/// hovering at a threshold does not flip the mirror on and off: css
+/// (2026-10-15/16) started it 19 times and refused it 14 times a day as swap
+/// hovered at 10% free, and each refusal discards the mirror's buffered lines
+/// (bd-sz85).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RamLogHeadroom {
+    /// Keep a destination already in use: 10% RAM, 10% swap, 20% free.
+    Keep,
+    /// Start using one: 15% RAM, 15% swap, 25% free.
+    Start,
 }
 
-/// Why the daemon must not start mirroring its log to `path`, if it must not.
+impl RamLogHeadroom {
+    /// Minimum percentages of host RAM available, swap free and the
+    /// destination free.
+    const fn floors(self) -> (u128, u128, u128) {
+        match self {
+            Self::Keep => (10, 10, 20),
+            Self::Start => (15, 15, 25),
+        }
+    }
+}
+
+/// `part` is at least `pct` percent of `whole`.
+fn at_least_pct(part: u64, whole: u64, pct: u128) -> bool {
+    u128::from(part) * 100 >= u128::from(whole) * pct
+}
+
+/// Whether a RAM-backed log destination has enough observed headroom.
+///
+/// Require at least 10% host RAM available and 20% of the destination free,
+/// as well as swap headroom when swap is configured. An empty tmpfs is not
+/// evidence that the host can back new pages. These observations are not a
+/// reservation or a cgroup-specific allocation guarantee.
+#[must_use]
+pub fn ram_log_destination_healthy(memory: &MemoryInfo, total: u64, available: u64) -> bool {
+    ram_log_destination_has(memory, total, available, RamLogHeadroom::Keep)
+}
+
+/// [`ram_log_destination_healthy`] against the floors of `headroom`.
+#[must_use]
+pub fn ram_log_destination_has(
+    memory: &MemoryInfo,
+    total: u64,
+    available: u64,
+    headroom: RamLogHeadroom,
+) -> bool {
+    let (ram, swap, free) = headroom.floors();
+    memory.total_bytes != 0
+        && memory.available_bytes <= memory.total_bytes
+        && at_least_pct(memory.available_bytes, memory.total_bytes, ram)
+        && memory.swap_free_bytes <= memory.swap_total_bytes
+        && (memory.swap_total_bytes == 0
+            || at_least_pct(memory.swap_free_bytes, memory.swap_total_bytes, swap))
+        && total > 0
+        && available <= total
+        && at_least_pct(available, total, free)
+}
+
+/// Why the daemon must not use a RAM-backed log destination at `path`.
 ///
 /// The mirror exists for a pressured log volume, and on Linux it lands on
-/// `/dev/shm`. Adding it to a RAM mount that is itself short, or while swap is
-/// nearly full, moves the pressure into RAM (fmd, bd-ffjj). A mirror that is
-/// not RAM-backed is outside this check. On a RAM mount, unreadable memory or
-/// mount figures refuse.
+/// `/dev/shm`. Adding it to a RAM mount that is itself short, or while RAM or
+/// swap is nearly full, moves the pressure into RAM (fmd, bd-ffjj). A verified
+/// non-RAM destination is outside this check. Unreadable filesystem identity
+/// is not evidence of a disk destination; unreadable or inconsistent memory
+/// and mount observations on a RAM destination also refuse.
 #[must_use]
 pub fn ram_log_mirror_refusal(platform: &dyn Platform, path: &Path) -> Option<String> {
+    ram_log_mirror_refusal_for(platform, path, RamLogHeadroom::Keep)
+}
+
+/// [`ram_log_mirror_refusal`] against the floors of `headroom`: the daemon
+/// starts a mirror only with [`RamLogHeadroom::Start`]'s margin and keeps it
+/// while [`RamLogHeadroom::Keep`]'s floors hold.
+#[must_use]
+pub fn ram_log_mirror_refusal_for(
+    platform: &dyn Platform,
+    path: &Path,
+    headroom: RamLogHeadroom,
+) -> Option<String> {
     let dir = path.parent().unwrap_or(path);
-    if !platform.is_ram_backed(dir).unwrap_or(false) {
-        return None;
+    match platform.is_ram_backed(dir) {
+        Ok(false) => return None,
+        Ok(true) => {}
+        Err(error) => {
+            return Some(format!(
+                "cannot determine whether {} is RAM-backed: {error}",
+                dir.display()
+            ));
+        }
     }
     let memory = match platform.memory_info() {
         Ok(memory) => memory,
@@ -205,15 +272,43 @@ pub fn ram_log_mirror_refusal(platform: &dyn Platform, path: &Path) -> Option<St
         Ok(stats) => stats,
         Err(error) => return Some(format!("{} is unreadable: {error}", dir.display())),
     };
-    if ram_log_destination_healthy(&memory, stats.total_bytes, stats.available_bytes) {
-        return None;
+    if stats.is_readonly {
+        return Some(format!("{} is read-only", dir.display()));
     }
-    Some(if swap_nearly_full(&memory) {
+    if ram_log_destination_has(&memory, stats.total_bytes, stats.available_bytes, headroom) {
+        let minimum = match headroom {
+            RamLogHeadroom::Keep => 10,
+            RamLogHeadroom::Start => 15,
+        };
+        // Healthy host counters cannot override an exhausted service/container
+        // limit. The platform adds constraints without rewriting host memory.
+        return match platform.ram_write_memory_refusal(minimum) {
+            Ok(refusal) => refusal,
+            Err(error) => Some(format!("process memory limits are unreadable: {error}")),
+        };
+    }
+    let (ram, swap, _) = headroom.floors();
+    let reason = if memory.total_bytes == 0
+        || memory.available_bytes > memory.total_bytes
+        || memory.swap_free_bytes > memory.swap_total_bytes
+    {
+        "inconsistent host RAM or swap counters".to_owned()
+    } else if memory.swap_total_bytes > 0
+        && !at_least_pct(memory.swap_free_bytes, memory.swap_total_bytes, swap)
+    {
         format!(
             "swap is nearly full ({} of {} MiB free)",
             memory.swap_free_bytes >> 20,
             memory.swap_total_bytes >> 20
         )
+    } else if !at_least_pct(memory.available_bytes, memory.total_bytes, ram) {
+        format!(
+            "host RAM is short ({} of {} MiB available)",
+            memory.available_bytes >> 20,
+            memory.total_bytes >> 20
+        )
+    } else if stats.total_bytes == 0 || stats.available_bytes > stats.total_bytes {
+        format!("{} has inconsistent capacity counters", dir.display())
     } else {
         format!(
             "{} has {} of {} MiB free",
@@ -221,6 +316,10 @@ pub fn ram_log_mirror_refusal(platform: &dyn Platform, path: &Path) -> Option<St
             stats.available_bytes >> 20,
             stats.total_bytes >> 20
         )
+    };
+    Some(match headroom {
+        RamLogHeadroom::Keep => reason,
+        RamLogHeadroom::Start => format!("{reason}, short of the margin to start mirroring"),
     })
 }
 
@@ -334,3 +433,126 @@ fn invalid(message: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod log_headroom_tests {
+    use super::{MemoryInfo, ram_log_destination_healthy, ram_log_mirror_refusal};
+    use crate::platform::pal::{FsStats, MockPlatform, MountPoint, PlatformPaths};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    fn memory(available: u64) -> MemoryInfo {
+        MemoryInfo {
+            total_bytes: 100,
+            available_bytes: available,
+            swap_total_bytes: 0,
+            swap_free_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn empty_tmpfs_does_not_authorize_logging_under_host_ram_pressure() {
+        for available in [0, 1, 9] {
+            assert!(!ram_log_destination_healthy(&memory(available), 100, 100));
+        }
+        assert!(ram_log_destination_healthy(&memory(10), 100, 20));
+    }
+
+    #[test]
+    fn invalid_counters_and_fractional_thresholds_fail_closed() {
+        assert!(!ram_log_destination_healthy(&memory(101), 100, 100));
+        assert!(!ram_log_destination_healthy(&memory(50), 100, 101));
+        let mut sample = memory(10);
+        sample.total_bytes = 101;
+        assert!(!ram_log_destination_healthy(&sample, 100, 100));
+        sample.available_bytes = 11;
+        assert!(ram_log_destination_healthy(&sample, 100, 100));
+        sample.swap_free_bytes = 1;
+        assert!(!ram_log_destination_healthy(&sample, 100, 100));
+    }
+
+    /// Starting a RAM destination takes a margin over keeping one, so headroom
+    /// hovering at a floor does not flip the mirror (bd-sz85).
+    #[test]
+    fn starting_needs_a_margin_that_keeping_does_not() {
+        use super::{RamLogHeadroom, ram_log_destination_has};
+        let has = |memory: &MemoryInfo, free: u64, headroom| {
+            ram_log_destination_has(memory, 100, free, headroom)
+        };
+        // RAM at 12% available.
+        let ram = memory(12);
+        assert!(has(&ram, 100, RamLogHeadroom::Keep));
+        assert!(!has(&ram, 100, RamLogHeadroom::Start));
+        // Swap at 12% free.
+        let swap = MemoryInfo {
+            swap_total_bytes: 100,
+            swap_free_bytes: 12,
+            ..memory(50)
+        };
+        assert!(has(&swap, 100, RamLogHeadroom::Keep));
+        assert!(!has(&swap, 100, RamLogHeadroom::Start));
+        // The destination at 22% free.
+        assert!(has(&memory(50), 22, RamLogHeadroom::Keep));
+        assert!(!has(&memory(50), 22, RamLogHeadroom::Start));
+        // Clear of every margin, both agree.
+        assert!(has(&memory(50), 50, RamLogHeadroom::Start));
+    }
+
+    #[test]
+    fn headroom_comparisons_do_not_overflow() {
+        let sample = MemoryInfo {
+            total_bytes: u64::MAX,
+            available_bytes: u64::MAX,
+            swap_total_bytes: u64::MAX,
+            swap_free_bytes: u64::MAX,
+        };
+        assert!(ram_log_destination_healthy(&sample, u64::MAX, u64::MAX));
+    }
+
+    fn platform(ram: bool, available: u64, readonly: bool, with_stats: bool) -> MockPlatform {
+        let path = PathBuf::from("/scratch");
+        let mount = MountPoint {
+            path: path.clone(),
+            device: "scratch".into(),
+            fs_type: "tmpfs".into(),
+            is_ram_backed: ram,
+        };
+        let mut stats = HashMap::new();
+        if with_stats {
+            stats.insert(
+                path.clone(),
+                FsStats {
+                    total_bytes: 100,
+                    free_bytes: 100,
+                    available_bytes: 100,
+                    fs_type: "tmpfs".into(),
+                    mount_point: path,
+                    is_readonly: readonly,
+                },
+            );
+        }
+        MockPlatform::new(
+            vec![mount],
+            stats,
+            memory(available),
+            PlatformPaths::default(),
+        )
+    }
+
+    #[test]
+    fn ram_destination_requires_memory_and_writable_mount_evidence() {
+        let path = Path::new("/scratch/activity.jsonl");
+        let reason = ram_log_mirror_refusal(&platform(true, 9, false, true), path).unwrap();
+        assert!(reason.starts_with("host RAM is short"));
+        let reason = ram_log_mirror_refusal(&platform(true, 50, true, true), path).unwrap();
+        assert!(reason.ends_with("is read-only"));
+        assert!(ram_log_mirror_refusal(&platform(true, 50, false, false), path).is_some());
+        assert!(ram_log_mirror_refusal(&platform(true, 50, false, true), path).is_none());
+    }
+
+    #[test]
+    fn verified_disk_destination_does_not_need_host_memory_headroom() {
+        let path = Path::new("/scratch/activity.jsonl");
+        assert!(ram_log_mirror_refusal(&platform(false, 0, false, false), path).is_none());
+    }
+}

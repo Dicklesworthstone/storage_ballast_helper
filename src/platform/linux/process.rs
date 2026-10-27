@@ -40,6 +40,70 @@ struct IoCounters {
 }
 
 pub(super) fn read_process_list() -> Result<Vec<ProcessInfo>> {
+    read_processes(true)
+}
+
+/// The process list without reading any process's `cmdline`, which takes
+/// that process's memory-map lock and can block behind it indefinitely.
+pub(super) fn read_process_list_without_command_lines() -> Result<Vec<ProcessInfo>> {
+    read_processes(false)
+}
+
+/// Pid, parent, name, start time and CPU times of every visible process,
+/// each from one `/proc/<pid>/stat` read: no executable, cwd, memory
+/// counters or command line (see `Platform::process_list_brief`).
+pub(super) fn read_process_list_brief() -> Result<Vec<ProcessInfo>> {
+    let current_pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
+    let boot_time_unix_ms = read_proc_file(PROC_STAT)
+        .ok()
+        .and_then(|raw| parse_proc_boot_time_unix_ms(&raw).ok());
+    let ticks_per_second = clock_ticks_per_second();
+    let mut processes: Vec<ProcessInfo> = proc_pids()?
+        .into_iter()
+        .filter(|pid| *pid > 0 && *pid != current_pid)
+        .filter_map(|pid| {
+            let stat = fs::read_to_string(pid_proc_path(pid).join("stat")).ok()?;
+            brief_process_info(pid, &stat, boot_time_unix_ms, ticks_per_second)
+        })
+        .collect();
+    processes.sort_by_key(|process| process.pid);
+    Ok(processes)
+}
+
+/// A [`read_process_list_brief`] entry from one `/proc/<pid>/stat` line.
+/// The name sits between the first `(` and the last `)`, since a command
+/// name may contain either.
+fn brief_process_info(
+    pid: i32,
+    stat: &str,
+    boot_time_unix_ms: Option<i64>,
+    ticks_per_second: u64,
+) -> Option<ProcessInfo> {
+    let name = stat
+        .split_once('(')
+        .and_then(|(_, rest)| rest.rsplit_once(')'))
+        .map(|(name, _)| name.to_string())
+        .filter(|name| !name.is_empty())?;
+    let fields = proc_stat_fields_after_comm(stat).ok()?;
+    let cpu = parse_proc_self_stat(stat, ticks_per_second).ok();
+    Some(ProcessInfo {
+        pid,
+        parent_pid: fields.get(1).and_then(|raw| raw.parse::<i32>().ok()),
+        name,
+        command_line: Vec::new(),
+        executable: None,
+        cwd: None,
+        start_time_unix_ms: boot_time_unix_ms.and_then(|boot_time| {
+            parse_proc_start_time_unix_ms(stat, boot_time, ticks_per_second).ok()
+        }),
+        virtual_memory_bytes: None,
+        resident_memory_bytes: None,
+        cpu_user_micros: cpu.map(|times| times.user_micros),
+        cpu_system_micros: cpu.map(|times| times.system_micros),
+    })
+}
+
+fn read_processes(with_command_lines: bool) -> Result<Vec<ProcessInfo>> {
     let current_pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
     let boot_time_unix_ms = read_proc_file(PROC_STAT)
         .ok()
@@ -50,7 +114,7 @@ pub(super) fn read_process_list() -> Result<Vec<ProcessInfo>> {
         if pid <= 0 || pid == current_pid {
             continue;
         }
-        if let Some(process) = process_info_for_pid(pid, boot_time_unix_ms) {
+        if let Some(process) = process_info_for_pid(pid, boot_time_unix_ms, with_command_lines) {
             processes.push(process);
         }
     }
@@ -89,11 +153,20 @@ pub(super) fn read_build_directories_in_use() -> Vec<(i32, PathBuf)> {
     reference_scan::build_directories()
 }
 
+pub(crate) fn read_build_directory_snapshot() -> (Vec<(i32, PathBuf)>, bool) {
+    reference_scan::build_directory_snapshot()
+}
+
 /// Return mappings only when the visible process scope was fully inspected.
 /// The Vec-returning PAL interface cannot carry partial coverage, so access
 /// failures, malformed data and budget exhaustion must remain explicit errors.
 pub(super) fn read_mmap_regions_under(root: &Path) -> Result<Vec<MappedRegion>> {
     mmap_scan::read_under(root)
+}
+
+/// Mutation admission cannot reuse a successful scanner snapshot.
+pub(super) fn read_mmap_regions_under_fresh(root: &Path) -> Result<Vec<MappedRegion>> {
+    mmap_scan::read_under_fresh(root)
 }
 
 /// Inspect the mapped regions once for the complete candidate-root set.
@@ -168,7 +241,11 @@ fn pid_proc_path(pid: i32) -> PathBuf {
     PathBuf::from(PROC_ROOT).join(pid.to_string())
 }
 
-fn process_info_for_pid(pid: i32, boot_time_unix_ms: Option<i64>) -> Option<ProcessInfo> {
+fn process_info_for_pid(
+    pid: i32,
+    boot_time_unix_ms: Option<i64>,
+    with_command_line: bool,
+) -> Option<ProcessInfo> {
     let proc_path = pid_proc_path(pid);
     let name = fs::read_to_string(proc_path.join("comm"))
         .ok()?
@@ -191,7 +268,11 @@ fn process_info_for_pid(pid: i32, boot_time_unix_ms: Option<i64>) -> Option<Proc
             .as_deref()
             .and_then(|raw| parse_status_i32_field(raw, "PPid")),
         name,
-        command_line: read_command_line(&proc_path),
+        command_line: if with_command_line {
+            read_command_line(&proc_path)
+        } else {
+            Vec::new()
+        },
         executable: fs::read_link(proc_path.join("exe")).ok(),
         cwd: fs::read_link(proc_path.join("cwd")).ok(),
         start_time_unix_ms: stat
@@ -487,10 +568,11 @@ fn process_parse_error(method: &'static str, details: impl Into<String>) -> SbhE
 #[cfg(test)]
 mod tests {
     use super::{
-        mapped_region_from_maps_line, parse_fdinfo_flags, parse_proc_boot_time_unix_ms,
-        parse_proc_io, parse_proc_self_stat, parse_proc_self_status, parse_proc_start_time_unix_ms,
-        read_executables_under, read_mmap_regions_under, read_open_files_under, read_process_io,
-        read_process_list, read_self_stats, ticks_to_micros,
+        brief_process_info, mapped_region_from_maps_line, parse_fdinfo_flags,
+        parse_proc_boot_time_unix_ms, parse_proc_io, parse_proc_self_stat, parse_proc_self_status,
+        parse_proc_start_time_unix_ms, read_executables_under, read_mmap_regions_under,
+        read_open_files_under, read_process_io, read_process_list, read_process_list_brief,
+        read_process_list_without_command_lines, read_self_stats, ticks_to_micros,
     };
     use crate::core::paths::resolve_absolute_path;
     use crate::platform::types::{OpenFileKind, OpenFileMode};
@@ -588,6 +670,82 @@ mod tests {
                 .iter()
                 .any(|process| process.start_time_unix_ms.is_some())
         );
+    }
+
+    /// The monitor thread's list reads no argv, which can block behind another
+    /// process's memory-map lock; everything else is still there.
+    #[test]
+    fn linux_process_list_without_command_lines_keeps_everything_but_argv() {
+        let processes = read_process_list_without_command_lines()
+            .expect("process list should be readable from /proc");
+        assert!(!processes.is_empty());
+        assert!(
+            processes
+                .iter()
+                .all(|process| process.command_line.is_empty())
+        );
+        assert!(processes.iter().all(|process| !process.name.is_empty()));
+        assert!(processes.iter().any(|process| process.cwd.is_some()));
+    }
+
+    /// The brief list reads only `/proc/<pid>/stat`, so a command name with
+    /// parentheses and spaces must not shift the fields after it.
+    #[test]
+    fn brief_entry_parses_a_command_name_with_parentheses() {
+        let stat = "4242 (a) b (c) S 77 2 3 4 5 6 7 8 9 10 345 67 0 0 20 0 1 0 12345";
+        let entry = brief_process_info(4242, stat, Some(1_700_000_000_000), 100).unwrap();
+        assert_eq!(entry.name, "a) b (c");
+        assert_eq!(entry.parent_pid, Some(77));
+        assert_eq!(entry.start_time_unix_ms, Some(1_700_000_123_450));
+        assert_eq!(entry.cpu_user_micros, Some(3_450_000));
+        assert_eq!(
+            (entry.executable, entry.cwd, entry.resident_memory_bytes),
+            (None, None, None)
+        );
+        assert!(brief_process_info(1, "1 () S 0", None, 100).is_none());
+    }
+
+    /// The brief list names the same processes with the same pid, parent,
+    /// name and start time as the full list; a child this test spawns is in
+    /// both, with this process as its parent.
+    #[test]
+    fn linux_brief_process_list_matches_the_full_list_where_they_overlap() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let child_pid = i32::try_from(child.id()).unwrap();
+        let brief = read_process_list_brief().expect("brief list");
+        let full = read_process_list_without_command_lines().expect("full list");
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let spawned = brief
+            .iter()
+            .find(|process| process.pid == child_pid)
+            .expect("the spawned child is listed");
+        assert_eq!(
+            spawned.parent_pid,
+            Some(i32::try_from(std::process::id()).unwrap())
+        );
+        assert_eq!(spawned.name, "sleep");
+        let full_child = full
+            .iter()
+            .find(|process| process.pid == child_pid)
+            .unwrap();
+        assert_eq!(
+            (
+                &spawned.name,
+                spawned.parent_pid,
+                spawned.start_time_unix_ms
+            ),
+            (
+                &full_child.name,
+                full_child.parent_pid,
+                full_child.start_time_unix_ms
+            )
+        );
+        assert!(brief.iter().all(|process| process.cwd.is_none()));
     }
 
     #[test]

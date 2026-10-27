@@ -100,6 +100,12 @@ impl Ord for RankedRecord<'_> {
 
 fn eligible(record: &CandidateIndexRecord, generation: u64, now_nanos: u128) -> bool {
     record.event_generation == generation
+        // A zero-byte hint cannot contribute to the planner's byte objective.
+        // Exclude it BEFORE the bounded heap: rejecting it only in the planner
+        // lets high-scored empty targets starve lower-scored useful candidates.
+        // Keep the stored record and all its safety/backoff evidence unchanged;
+        // a later walk can refresh its size without an artificial cooldown.
+        && record.size_estimate_bytes > 0
         && matches!(
             record.safety_state,
             CandidateSafetyState::Safe | CandidateSafetyState::Failed
@@ -182,6 +188,185 @@ mod tests {
     }
 
     #[test]
+    fn zero_byte_high_scores_cannot_starve_a_positive_size_hint() {
+        let mut index = index();
+        for inode in 1..=100 {
+            let mut empty = record(inode);
+            empty.size_estimate_bytes = 0;
+            empty.score = Some(1.0);
+            index.upsert(empty);
+        }
+        let mut useful = record(101);
+        useful.score = Some(0.6);
+        useful.size_estimate_bytes = 1;
+        index.upsert(useful.clone());
+
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![useful.clone()]);
+        assert_eq!(
+            index.ranked_records_within(&[PathBuf::from("/cache")], UNIX_EPOCH, 1),
+            vec![useful]
+        );
+        assert_eq!(index.len(), 101, "selection must not evict empty evidence");
+        assert_eq!(index.get(record(1).identity).unwrap().fail_count, 0);
+    }
+
+    #[test]
+    fn all_zero_byte_hints_produce_no_replay_without_mutating_the_index() {
+        let mut index = index();
+        let mut empty = record(1);
+        empty.size_estimate_bytes = 0;
+        index.upsert(empty.clone());
+
+        for limit in [0, 1, 32, usize::MAX] {
+            assert!(index.ranked_records(UNIX_EPOCH, limit).is_empty());
+            assert!(
+                index
+                    .ranked_records_within(&[PathBuf::from("/cache")], UNIX_EPOCH, limit)
+                    .is_empty()
+            );
+        }
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.get(empty.identity), Some(&empty));
+    }
+
+    #[test]
+    fn new_positive_size_evidence_is_replayable_without_an_artificial_cooldown() {
+        let mut index = index();
+        let mut current = record(1);
+        current.size_estimate_bytes = 0;
+        index.upsert(current.clone());
+        assert!(index.ranked_records(UNIX_EPOCH, 1).is_empty());
+
+        // A refreshed recursive size can change while root metadata does not.
+        // This is new evidence, not a reason to evict or quarantine the record.
+        current.size_estimate_bytes = 1;
+        index.upsert(current.clone());
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![current.clone()]);
+        assert_eq!(index.get(current.identity).unwrap().fail_count, 0);
+        assert_eq!(
+            index.get(current.identity).unwrap().cooldown_until_nanos,
+            None
+        );
+
+        current.size_estimate_bytes = 0;
+        index.upsert(current.clone());
+        assert!(index.ranked_records(UNIX_EPOCH, 1).is_empty());
+        assert_eq!(index.get(current.identity), Some(&current));
+    }
+
+    #[test]
+    fn size_refresh_does_not_clear_an_existing_failed_deletion_backoff() {
+        let mut index = index();
+        let mut current = record(1);
+        current.size_estimate_bytes = 0;
+        index.upsert(current.clone());
+        index.record_failure(
+            current.identity,
+            UNIX_EPOCH,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
+        let failed = index.get(current.identity).unwrap().clone();
+        current.size_estimate_bytes = 1;
+        index.upsert(current.clone());
+        let refreshed = index.get(current.identity).unwrap();
+        assert_eq!(refreshed.fail_count, failed.fail_count);
+        assert_eq!(refreshed.cooldown_until_nanos, failed.cooldown_until_nanos);
+        assert_eq!(refreshed.safety_state, CandidateSafetyState::Failed);
+        assert!(
+            index
+                .ranked_records(UNIX_EPOCH + Duration::from_secs(9), 1)
+                .is_empty()
+        );
+        let ranked = index.ranked_records(UNIX_EPOCH + Duration::from_secs(10), 1);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].identity, current.identity);
+        assert_eq!(ranked[0].size_estimate_bytes, 1);
+        assert_eq!(ranked[0].fail_count, 1);
+    }
+
+    #[test]
+    fn positive_size_does_not_override_safety_or_revoked_evidence() {
+        for state in [
+            CandidateSafetyState::Unknown,
+            CandidateSafetyState::ActiveReference,
+            CandidateSafetyState::Vetoed,
+        ] {
+            let mut index = index();
+            let mut current = record(1);
+            current.size_estimate_bytes = 0;
+            current.safety_state = state;
+            index.upsert(current.clone());
+            current.size_estimate_bytes = 1;
+            index.upsert(current.clone());
+            assert!(index.ranked_records(UNIX_EPOCH, 1).is_empty());
+            assert_eq!(index.get(current.identity).unwrap().safety_state, state);
+        }
+
+        let mut index = index();
+        let mut current = record(1);
+        current.size_estimate_bytes = 0;
+        index.upsert(current.clone());
+        assert_eq!(index.invalidate_paths([current.path.as_path()]), 1);
+        assert_eq!(index.get(current.identity).unwrap().score, None);
+        assert_eq!(
+            index.get(current.identity).unwrap().safety_state,
+            CandidateSafetyState::Unknown
+        );
+        assert!(index.ranked_records(UNIX_EPOCH, 1).is_empty());
+        // Only a new scoring observation supplies a usable hint again.
+        current.size_estimate_bytes = 1;
+        index.upsert(current.clone());
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![current]);
+        index.mark_event_overflow();
+        assert!(index.ranked_records(UNIX_EPOCH, 1).is_empty());
+    }
+
+    #[test]
+    fn positive_size_replay_stays_inside_the_requested_roots() {
+        let mut index = index();
+        let mut empty = record(1);
+        empty.path = PathBuf::from("/cache/project/empty");
+        empty.size_estimate_bytes = 0;
+        index.upsert(empty);
+        let mut sibling = record(2);
+        sibling.path = PathBuf::from("/cache/project-other/target");
+        sibling.score = Some(1.0);
+        index.upsert(sibling);
+        let mut useful = record(3);
+        useful.path = PathBuf::from("/cache/project/target");
+        useful.score = Some(0.6);
+        index.upsert(useful.clone());
+        assert_eq!(
+            index.ranked_records_within(&[PathBuf::from("/cache/project")], UNIX_EPOCH, 1),
+            vec![useful]
+        );
+    }
+
+    #[test]
+    fn zero_size_selection_and_later_refresh_survive_checkpoint_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkpoint = temp.path().join("index.json");
+        let mut index = index();
+        let mut empty = record(1);
+        empty.size_estimate_bytes = 0;
+        empty.score = Some(1.0);
+        let useful = record(2);
+        index.upsert(empty.clone());
+        index.upsert(useful.clone());
+        index.save_checkpoint(&checkpoint).unwrap();
+        let (mut loaded, status) =
+            ScannerCandidateIndex::load_checkpoint(&checkpoint, index.context().clone());
+        assert_eq!(status, ScannerIndexLoadStatus::Loaded);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get(empty.identity), Some(&empty));
+        assert_eq!(loaded.ranked_records(UNIX_EPOCH, 1), vec![useful]);
+        empty.size_estimate_bytes = 1;
+        loaded.upsert(empty.clone());
+        assert_eq!(loaded.ranked_records(UNIX_EPOCH, 1), vec![empty]);
+    }
+
+    #[test]
     fn stale_high_scores_cannot_starve_a_reconciled_candidate() {
         let mut index = index();
         for inode in 1..=100 {
@@ -254,6 +439,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut reference = records.clone();
+        // The independent full-sort reference has the same byte objective,
+        // but does not call the production eligibility predicate or heap.
+        reference.retain(|record| record.size_estimate_bytes > 0);
         reference.sort_by(compare);
         for limit in [0, 1, 7, 32, 512, usize::MAX] {
             let expected = &reference[..limit.min(reference.len())];

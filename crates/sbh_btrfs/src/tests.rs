@@ -33,6 +33,8 @@ fn eligible_map() -> ExtentMap {
         fiemap_flags: ioctl::FIEMAP_EXTENT_LAST,
         inode_flags: 0,
         encoded: false,
+        raw: true,
+        foreign_encoding: false,
         preallocated: false,
     }
 }
@@ -87,7 +89,8 @@ fn truncated_unknown_and_overflowing_extent_items_are_rejected() {
 #[test]
 fn all_unknown_or_unsafe_fiemap_bits_fail_closed() {
     assert_eq!(eligible_map().exclusion(), None);
-    for bit in 1..32 {
+    // ENCODED is the one bit with a rule of its own, below.
+    for bit in (1..32).filter(|&bit| 1 << bit != ioctl::FIEMAP_EXTENT_ENCODED) {
         let mut map = eligible_map();
         map.fiemap_flags |= 1 << bit;
         assert!(map.exclusion().is_some(), "bit {bit} was accepted");
@@ -95,6 +98,106 @@ fn all_unknown_or_unsafe_fiemap_bits_fail_closed() {
     let mut shared = eligible_map();
     shared.fiemap_flags |= ioctl::FIEMAP_EXTENT_SHARED;
     assert_eq!(shared.exclusion(), Some("shared_or_reflinked_extents"));
+}
+
+/// A file compressed in full is done. One a pass stopped inside still holds
+/// raw data next to compressed ranges, and stays eligible so a later pass
+/// finishes it: left alone, it uses more space than before (bd-rxq5).
+#[test]
+fn a_part_compressed_file_stays_eligible_and_a_compressed_one_does_not() {
+    let mut partial = eligible_map();
+    partial.encoded = true;
+    partial.fiemap_flags |= ioctl::FIEMAP_EXTENT_ENCODED;
+    assert_eq!(partial.exclusion(), None);
+
+    let mut done = partial.clone();
+    done.raw = false;
+    assert_eq!(done.exclusion(), Some("already_encoded_or_compressed"));
+    // FIEMAP alone saying ENCODED, with no raw extent, is done too.
+    let mut flagged = eligible_map();
+    flagged.raw = false;
+    flagged.fiemap_flags |= ioctl::FIEMAP_EXTENT_ENCODED;
+    assert_eq!(flagged.exclusion(), Some("already_encoded_or_compressed"));
+
+    // Encryption or another encoding is never touched, raw data or not.
+    let mut foreign = partial;
+    foreign.foreign_encoding = true;
+    assert_eq!(foreign.exclusion(), Some("encrypted_or_foreign_encoding"));
+}
+
+#[test]
+fn discovery_excludes_incompressible_and_shared_files_before_work_admission() {
+    let raw = ioctl::MappedExtent {
+        logical: 0,
+        physical: 1_048_576,
+        length: 131_072,
+        flags: 0,
+    };
+    assert_eq!(cheap_exclusion(0, &[raw]), None);
+    for flag in [0x10, 0x20, ioctl::FS_NOCOMP_FL, 0x0080_0000] {
+        assert_eq!(
+            cheap_exclusion(flag, &[]),
+            Some("nocow_nocompress_immutable_or_append_only"),
+            "an inode veto does not need a mapping sweep"
+        );
+    }
+    let shared = ioctl::MappedExtent {
+        logical: raw.length,
+        physical: raw.physical + raw.length,
+        flags: ioctl::FIEMAP_EXTENT_LAST | ioctl::FIEMAP_EXTENT_SHARED,
+        ..raw
+    };
+    assert_eq!(
+        cheap_exclusion(0, &[raw, shared]),
+        Some("shared_or_reflinked_extents")
+    );
+}
+
+#[test]
+fn discovery_keeps_raw_remainders_but_never_claims_full_eligibility() {
+    let raw = ioctl::MappedExtent {
+        logical: 0,
+        physical: 1_048_576,
+        length: 131_072,
+        flags: 0,
+    };
+    let encoded = ioctl::MappedExtent {
+        logical: raw.length,
+        physical: raw.physical + raw.length,
+        flags: ioctl::FIEMAP_EXTENT_LAST | ioctl::FIEMAP_EXTENT_ENCODED,
+        ..raw
+    };
+    assert_eq!(cheap_exclusion(0, &[raw, encoded]), None);
+    assert_eq!(
+        cheap_exclusion(0, &[encoded]),
+        Some("already_compressed_extents")
+    );
+    assert_eq!(cheap_exclusion(0, &[]), Some("already_compressed_extents"));
+    // The cheap probe is not an admission check. Unsupported layout details
+    // still reach, and must be refused by, the executor's full inspection.
+    let unknown = ioctl::MappedExtent {
+        flags: raw.flags | 0x8000_0000,
+        ..raw
+    };
+    assert_eq!(cheap_exclusion(0, &[unknown]), None);
+    let mut full = eligible_map();
+    full.fiemap_flags = unknown.flags;
+    assert_eq!(
+        full.exclusion(),
+        Some("unknown_delayed_or_unsupported_extent_layout")
+    );
+}
+
+#[test]
+fn encryption_and_other_encodings_are_told_apart_from_compression() {
+    let compressed = parse_file_extent(&regular_item(1_048_576, 4096, 131_072, 3)).unwrap();
+    assert!(compressed.encoded && !compressed.foreign_encoding);
+    let mut encrypted = regular_item(1_048_576, 131_072, 131_072, 0);
+    encrypted[17] = 1;
+    let encrypted = parse_file_extent(&encrypted).unwrap();
+    assert!(encrypted.encoded && encrypted.foreign_encoding);
+    let raw = parse_file_extent(&regular_item(1_048_576, 131_072, 131_072, 0)).unwrap();
+    assert!(!raw.encoded && !raw.foreign_encoding);
 }
 
 #[test]
@@ -112,6 +215,22 @@ fn policy_never_overrides_nocow_hardlinks_or_preallocation() {
     let mut map = eligible_map();
     map.preallocated = true;
     assert_eq!(map.exclusion(), Some("preallocated_extents"));
+}
+
+#[test]
+fn only_a_nocompress_flag_acquired_during_the_rewrite_is_tolerated() {
+    let nocomp = ioctl::FS_NOCOMP_FL;
+    // btrfs set it after an incompressible range of this file: keep going.
+    assert_eq!(forbidden_flags(nocomp, 0), 0);
+    // The file had it before the rewrite: the user's (or btrfs's) choice.
+    assert_eq!(forbidden_flags(nocomp, nocomp), nocomp);
+    // Every other excluded flag forbids compression however it appeared.
+    for flag in [0x10, 0x20, 0x0080_0000] {
+        assert_eq!(forbidden_flags(flag | nocomp, 0), flag);
+        assert_eq!(forbidden_flags(flag, flag), flag);
+    }
+    // Flags outside the excluded set (here FS_COMPR_FL) never forbid it.
+    assert_eq!(forbidden_flags(0x4, 0), 0);
 }
 
 #[test]

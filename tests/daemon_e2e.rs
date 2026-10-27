@@ -808,6 +808,9 @@ fn test_mode_daemon_refuses_to_start_under_a_service_manager() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn injected_orange_mount_reclaims_only_the_stale_target() {
+    if !common::sees_every_process() {
+        return;
+    }
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
     // The daemon polls its configured roots plus `/`, so the rootless
@@ -1224,10 +1227,20 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
     let keep = KeepFixtures::build(dir.path(), &fixtures.root, stale_age);
     let created = Instant::now();
     let fixture_mount = dir.path().to_path_buf();
-    // 11% free of 1 TB: Orange, far above the special-location floor.
-    let table = injected_table(&[
-        (&fixture_mount, 1_000_000_000_000, 110_000_000_000, false),
-        quiet_root_mount(),
+    // Green for the first 12 s, while the pool provisions at startup, then
+    // 11% free of 1 TB: Orange, far above the special-location floor. The
+    // provisioning floor refuses ballast that would leave a volume where it
+    // is released (#38), so a pool provisioned at Orange would stay empty.
+    let (root, root_total, root_free, root_ro) = quiet_root_mount();
+    let table = table_of(&[
+        mount_entry(
+            &fixture_mount,
+            1_000_000_000_000,
+            500_000_000_000,
+            false,
+            &[(12, 110_000_000_000)],
+        ),
+        mount_entry(root, root_total, root_free, root_ro, &[]),
     ]);
     let scenario = ScenarioConfig {
         root_paths: vec![fixtures.root.clone()],
@@ -1446,6 +1459,9 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
 /// Scenario `orange-reclaim` on the default v2 engine.
 #[test]
 fn orange_reclaim_deletes_the_stale_target_and_keeps_the_guarded_siblings() {
+    if !common::sees_every_process() {
+        return;
+    }
     let deleted = run_orange_reclaim("v2");
     assert!(
         deleted.iter().any(|n| n == "stale-proj/target"),
@@ -1453,10 +1469,73 @@ fn orange_reclaim_deletes_the_stale_target_and_keeps_the_guarded_siblings() {
     );
 }
 
+/// bd-1ouz: a user-scoped macOS daemon cannot see other users' processes, so
+/// the v2 engine reclaims nothing, as v1 does: the stale target that
+/// `orange_reclaim_deletes_the_stale_target_and_keeps_the_guarded_siblings`
+/// deletes as root survives a forced pass at Orange here. Only a non-root
+/// macOS run has the gap; elsewhere this skips and says so.
+#[test]
+fn a_user_scope_daemon_without_full_visibility_reclaims_nothing_in_v2() {
+    if !common::other_users_hidden() {
+        eprintln!("skipped: needs a non-root macOS run, where the visibility gap is real");
+        return;
+    }
+    let dir = scratch();
+    let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
+    let created = Instant::now();
+    let table = injected_table(&[
+        (dir.path(), 1_000_000_000_000, 110_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![fixtures.root.clone()],
+        min_file_age_minutes: 1,
+        engine: "v2",
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    let gate = created + Duration::from_secs(66);
+    run.wait_until("the age gate", Duration::from_secs(80), |_| {
+        fixtures.touch_fresh();
+        Instant::now() >= gate
+    })
+    .unwrap();
+    let passes = run.stderr_count("[SBH-SCANNER] scan complete");
+    run.signal("-USR1");
+    run.wait_until(
+        "a pass after the age gate",
+        Duration::from_secs(60),
+        |run| {
+            fixtures.touch_fresh();
+            run.stderr_count("[SBH-SCANNER] scan complete") > passes
+        },
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_secs(10));
+    assert!(run.deleted_paths().is_empty(), "{:?}", run.deleted_paths());
+    assert!(
+        fixtures.stale_target.exists(),
+        "the stale target was reclaimed"
+    );
+    // The pass ran at Orange and found nothing it may reclaim: the veto, not
+    // the age gate or the pressure level, kept the target (with the gap
+    // ignored, this same scenario deletes it).
+    assert!(
+        run.stderr_count("no reclaimable progress this pass") > 0,
+        "{}",
+        run.stderr()
+    );
+    let status = run.stop();
+    assert!(status.success(), "{status}");
+}
+
 /// Scenario `engines`: the v1 rollback engine reclaims exactly what v2
 /// reclaims on the same fixtures (both daemons run concurrently).
 #[test]
 fn engine_v1_reclaims_the_same_set_as_v2_at_orange() {
+    if !common::sees_every_process() {
+        return;
+    }
     let v2 = std::thread::spawn(|| run_orange_reclaim("v2"));
     let v1 = run_orange_reclaim("v1");
     let v2 = v2.join().expect("v2 run");
@@ -1754,14 +1833,15 @@ fn alias_mount_release_credit_survives_state_writes_and_restart() {
 /// bd-7spb: after a release a large volume can sit at Yellow for days with
 /// nothing left to reclaim. Replenishing only after a Green cooldown left its
 /// reserve empty for good; an idle Yellow mount now rebuilds it (provisioning
-/// still keeps free space above the Orange floor).
+/// still keeps free space above the 15% floor, Yellow plus hysteresis, where
+/// the default matrix does not release ballast).
 #[test]
 fn an_idle_yellow_mount_rebuilds_an_empty_reserve() {
     let dir = scratch();
     let scan_root = dir.path().join("scan-root");
     fs::create_dir(&scan_root).unwrap();
     let mount = dir.path();
-    // 1 TB at 16% free: Yellow (green 20, yellow 14), far above Orange (10).
+    // 1 TB at 16% free: Yellow (green 20, yellow 14), above the 15% floor.
     let table = injected_table(&[
         (mount, 1_000_000_000_000, 160_000_000_000, false),
         quiet_root_mount(),
@@ -1797,8 +1877,19 @@ fn an_idle_yellow_mount_rebuilds_an_empty_reserve() {
 /// accounting, so the empty-pass cooldown never armed and a large, busy root
 /// was rescanned back to back at the CPU-budget ceiling with nothing to
 /// reclaim. Such passes are now paced by `min_rescan_interval_secs`.
+///
+/// Since bd-6ydh the pre-scan stops at its share of the pass's CPU and the
+/// walk spends the rest, so a budget-cut pass usually ends in the walk
+/// (`(timed out)`) rather than in the pre-scan (`(timed out in the priority
+/// pre-scan)`). Both kinds count: every budget-cut pass must be paced.
 #[test]
 fn prescan_timeouts_on_a_busy_root_are_paced_by_the_rescan_interval() {
+    if common::other_users_hidden() {
+        // Vetoed candidates never pay for a size probe, so the pre-scan has
+        // nothing slow to time out on.
+        eprintln!("skipped: this user cannot see every process");
+        return;
+    }
     let dir = scratch();
     let root = dir.path().join("busy-root");
     fs::create_dir(&root).unwrap();
@@ -1841,19 +1932,19 @@ fn prescan_timeouts_on_a_busy_root_are_paced_by_the_rescan_interval() {
             }
         })
     };
-    let prescan_timeouts = |run: &DaemonRun| {
+    let budget_cut_passes = |run: &DaemonRun| {
         run.stderr()
             .lines()
-            .filter(|line| line.contains("timed out in the priority pre-scan"))
+            .filter(|line| line.contains("scan complete:") && line.contains("(timed out"))
             .count()
     };
     run.wait_until(
-        "the first pre-scan timeout",
+        "the first budget-cut pass",
         Duration::from_secs(60),
-        |run| prescan_timeouts(run) >= 1,
+        |run| budget_cut_passes(run) >= 1,
     )
     .unwrap_or_else(|e| panic!("{e}"));
-    let first = prescan_timeouts(&run);
+    let first = budget_cut_passes(&run);
     let window_start = run.wall_secs();
     run.wait_until("a 60 s window", Duration::from_secs(80), |run| {
         run.wall_secs() >= window_start + 60.0
@@ -1861,14 +1952,14 @@ fn prescan_timeouts_on_a_busy_root_are_paced_by_the_rescan_interval() {
     .unwrap_or_else(|e| panic!("{e}"));
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     writer.join().unwrap();
-    let in_window = prescan_timeouts(&run) - first;
-    eprintln!("prescan timeouts in the 60 s window: {in_window}");
+    let in_window = budget_cut_passes(&run) - first;
+    eprintln!("budget-cut passes in the 60 s window: {in_window}");
     // A 20 s interval allows at most four in 60 s. Unpaced, the passes are
     // limited only by the CPU bucket refilling one CPU-second (~6.5 s at 25%),
     // about nine in 60 s.
     assert!(
         in_window <= 4,
-        "{in_window} pre-scan timeouts in 60 s; expected pacing by the 20 s interval"
+        "{in_window} budget-cut passes in 60 s; expected pacing by the 20 s interval"
     );
     assert!(run.stop().success());
 }
@@ -2040,6 +2131,9 @@ fn green_event_scopes_the_pass_to_the_changed_project() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn green_quarantine_holds_the_stale_target_and_orange_drains_it_first() {
+    if !common::sees_every_process() {
+        return;
+    }
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
     let fixture_mount = dir.path().to_path_buf();
@@ -2231,6 +2325,9 @@ fn green_quarantine_holds_the_stale_target_and_orange_drains_it_first() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn recreating_a_deleted_target_under_a_live_process_is_labelled_regret() {
+    if !common::sees_every_process() {
+        return;
+    }
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
     let fixture_mount = dir.path().to_path_buf();
@@ -2393,6 +2490,9 @@ fn recreating_a_deleted_target_under_a_live_process_is_labelled_regret() {
 /// the next maintenance pass.
 #[test]
 fn sighup_reload_scans_the_new_root_and_relogs_the_matrix() {
+    if !common::sees_every_process() {
+        return;
+    }
     let dir = scratch();
     let root_a = dir.path().join("root");
     fs::create_dir_all(&root_a).unwrap();
@@ -2492,14 +2592,14 @@ fn special_locations_stay_quiet_at_fourteen_percent_of_a_large_volume() {
 }
 
 /// Scenario `partial-provision` (privileged): a real 128 MiB ext4 volume at
-/// 22% free with the default 10% floor takes three 4 MiB ballast files of
+/// 26% free with the default 15% floor takes three 4 MiB ballast files of
 /// the five configured; the fourth would cross the floor.
 #[test]
 #[ignore = "needs passwordless sudo for a loop-mounted ext4 image; run with --ignored"]
 fn partial_provision_stops_the_pool_at_the_headroom_floor() {
     let dir = scratch();
     let vol = LoopMount::create(dir.path(), 128);
-    vol.fill_to(22.0);
+    vol.fill_to(26.0);
     let root = vol.path.join("root");
     fs::create_dir_all(&root).unwrap();
     let scenario = ScenarioConfig {
@@ -3034,10 +3134,14 @@ fn check_predict_reads_the_daemon_forecast_and_refuses_stale_state() {
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 4096);
     let fixture_mount = dir.path().to_path_buf();
-    // 1 TB volume: 50% free, falling 2.5% every 4 s (6.25 GB/s) from t=4 s
-    // down to 5% (below red) at t=72 s, then holding there.
-    let series: Vec<(u64, u64)> = (1..=18)
-        .map(|i| (i * 4, 500_000_000_000u64.saturating_sub(i * 25_000_000_000)))
+    // 1 TB volume: 50% free, falling 0.8% every 4 s (2 GB/s) from t=4 s
+    // down to 5.2% (below the 6% red) at t=224 s, then holding there. The
+    // fall must outlast the 150 s wait below: once the mount is past red there
+    // is no horizon left to publish, and under a loaded e2e run the old
+    // series (red at ~70 s) passed red before the daemon's forecast had warmed
+    // up (bd-zvmn).
+    let series: Vec<(u64, u64)> = (1..=56)
+        .map(|i| (i * 4, 500_000_000_000u64.saturating_sub(i * 8_000_000_000)))
         .collect();
     let (root, root_total, root_free, root_ro) = quiet_root_mount();
     let table = table_of(&[
@@ -3231,6 +3335,9 @@ fn orange_pressure_with_only_unclear_candidates_backs_off_instead_of_replaying()
 /// paces an unconfirmed one like an empty pass.
 #[test]
 fn dry_run_orange_pressure_backs_off_after_the_first_dispatch() {
+    if !common::sees_every_process() {
+        return;
+    }
     let scratch_base = non_temp_scratch_base();
     fs::create_dir_all(&scratch_base).unwrap();
     let dir = tempfile::tempdir_in(&scratch_base).unwrap();

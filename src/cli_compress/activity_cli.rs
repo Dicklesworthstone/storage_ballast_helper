@@ -13,6 +13,7 @@ use storage_ballast_helper::core::config::Config;
 use storage_ballast_helper::logger::compression::CompressionActivity;
 use storage_ballast_helper::logger::dual::{
     ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, LoggerShutdownStatus, spawn_logger,
+    spawn_logger_with_shutdown_wait,
 };
 use storage_ballast_helper::logger::jsonl::JsonlConfig;
 use storage_ballast_helper::platform::pal::Platform;
@@ -115,10 +116,18 @@ pub(super) fn execute(
     config: &Config,
     platform: &dyn Platform,
 ) -> io::Result<CommandReport> {
+    execute_with(config, |observer| {
+        compression::run_observed(paths, policy, mode, config, platform, observer)
+    })
+}
+
+/// Publish the per-file outcomes of `pass`, an explicit or discovered run.
+pub(super) fn execute_with(
+    config: &Config,
+    pass: impl FnOnce(&mut dyn FnMut(CompressionObservation<'_>)) -> io::Result<CompressionReport>,
+) -> io::Result<CommandReport> {
     let mut activity = Session::new(config);
-    let result = compression::run_observed(paths, policy, mode, config, platform, &mut |visit| {
-        activity.observe(visit);
-    });
+    let result = pass(&mut |visit| activity.observe(visit));
     // The existing supervisor bounds shutdown even when a backend is blocked.
     // Final activity flushing is not part of the compression rewrite budget.
     let activity_delivery = activity.finish();
@@ -132,11 +141,16 @@ struct Session {
     config: Option<DualLoggerConfig>,
     worker: Option<(ActivityLoggerHandle, JoinHandle<()>)>,
     delivery: ActivityDelivery,
+    /// `None`: the logger's own shutdown allowance (5 s). Tests read the
+    /// backends after `finish`, and on a loaded build host the writer could
+    /// need longer than that just to open SQLite (bd-363x).
+    shutdown_wait: Option<std::time::Duration>,
 }
 
 impl Session {
     fn new(config: &Config) -> Self {
         Self {
+            shutdown_wait: cfg!(test).then_some(std::time::Duration::from_secs(120)),
             config: Some(DualLoggerConfig {
                 sqlite_path: Some(config.paths.sqlite_db.clone()),
                 jsonl_config: JsonlConfig::for_daemon(config.paths.jsonl_log.clone()),
@@ -183,7 +197,11 @@ impl Session {
                 .as_deref()
                 .and_then(|id| id.rsplit_once(':'))
                 .map(|(run, _)| format!("compress:{run}"));
-            match spawn_logger(config) {
+            let spawned = match self.shutdown_wait {
+                Some(wait) => spawn_logger_with_shutdown_wait(config, wait),
+                None => spawn_logger(config),
+            };
+            match spawned {
                 Ok(worker) => self.worker = Some(worker),
                 Err(error) => {
                     self.reject(error);

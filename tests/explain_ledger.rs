@@ -375,6 +375,9 @@ fn ids_of(payload: &Value, key: &str) -> BTreeSet<String> {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn daemon_deletions_resolve_through_explain_and_the_ledger_is_pinned() {
+    if !common::sees_every_process() {
+        return;
+    }
     let dir = scratch();
     let root = dir.path().join("root");
     let stale = definite_target(
@@ -607,7 +610,14 @@ fn tree_fingerprint(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn emergency_prints_decision_ids_and_writes_no_ledger() {
+    // bd-1ouz: a non-root macOS user cannot see other users' processes, so
+    // emergency refuses every candidate and says how to reclaim instead.
+    let hidden = common::other_users_hidden();
+    if !hidden && !common::sees_every_process() {
+        return;
+    }
     let dir = scratch();
     let home = dir.path().join("home");
     let data = home.join(".local").join("share").join("sbh");
@@ -640,6 +650,21 @@ fn emergency_prints_decision_ids_and_writes_no_ledger() {
     );
     let payload = stdout_json(&output);
     assert_eq!(payload["command"], "emergency");
+    if hidden {
+        assert!(
+            payload["candidates"].as_array().is_none_or(Vec::is_empty),
+            "every candidate is refused: {payload}"
+        );
+        assert!(target.exists(), "emergency deleted nothing");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("sudo sbh emergency"), "{stderr}");
+        assert_eq!(
+            tree_fingerprint(&home),
+            untouched,
+            "emergency wrote into the user's data dir"
+        );
+        return;
+    }
     let candidates = payload["candidates"].as_array().expect("candidates array");
     assert!(
         !candidates.is_empty(),
@@ -794,6 +819,18 @@ fn why_not_names_the_first_rail_for_each_fixture_class() {
         256 * 1024,
     );
     let report = why_not(&config, &target, true);
+    let veto = report["decision"]["veto_reason"]
+        .as_str()
+        .unwrap_or_default();
+    if report["open_file_scan_complete"] == false
+        || veto.contains("other-user processes not visible")
+        || veto.contains("did not cover every visible process")
+    {
+        // Without every process visible (a non-root user) sbh vetoes the
+        // target, as it must; the rails above held, nothing more to prove.
+        eprintln!("skipped the remaining rails: this user cannot see every process");
+        return;
+    }
     let verdict = report["verdict"].as_str().unwrap();
     assert!(
         verdict.starts_with("decided ")
@@ -843,8 +880,16 @@ fn why_not_names_the_first_rail_for_each_fixture_class() {
         .iter()
         .map(|c| c["factor"].as_str().unwrap())
         .collect();
+    // Under a Linux temp root a `build/` with no manifest beside it whose
+    // tool writes it is never scored at all (SignalOnly, 183fd53): nothing
+    // can flip it, so there is nothing to counter.
+    let signal_only = report["scanner_note"]
+        .as_str()
+        .is_some_and(|note| note.contains("SignalOnly"));
     assert!(
-        factors == ["age", "size", "pressure"] || factors == ["veto"],
+        factors == ["age", "size", "pressure"]
+            || factors == ["veto"]
+            || (signal_only && factors.is_empty()),
         "{report}"
     );
     for item in counterfactuals {
@@ -913,6 +958,11 @@ fn why_not_names_the_first_rail_for_each_fixture_class() {
 
 #[test]
 fn replay_matches_the_record_until_the_config_changes() {
+    if common::other_users_hidden() {
+        // Every candidate is vetoed there, so no decision is recorded to replay.
+        eprintln!("skipped: this user cannot see every process");
+        return;
+    }
     let dir = scratch();
     let config = explain_config(dir.path(), "");
     let root = dir.path().join("root");
@@ -1000,4 +1050,54 @@ fn replay_matches_the_record_until_the_config_changes() {
     );
     let unknown = sbh(&config, &["explain", "--replay", "000000000000"]);
     assert_eq!(unknown.status.code(), Some(1));
+}
+
+/// bd-1ouz: `clean` refuses every candidate when other users' processes are
+/// hidden (a non-root macOS user) and says to run as root; elsewhere the same
+/// small definite target is a candidate. A dry run deletes nothing either way.
+#[test]
+fn clean_refuses_every_candidate_when_other_users_are_hidden() {
+    let dir = scratch();
+    let config = explain_config(dir.path(), "");
+    let root = dir.path().join("root");
+    let target = definite_target(&root.join("proj"), Duration::from_hours(48), 256 * 1024);
+    let output = sbh(
+        &config,
+        &[
+            "--json",
+            "clean",
+            "--dry-run",
+            "--yes",
+            "--min-score",
+            "0",
+            root.to_str().unwrap(),
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let payload = stdout_json(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if common::other_users_hidden() {
+        assert_eq!(payload["candidates_count"], 0, "{payload}");
+        assert!(
+            stderr.contains("every deletion candidate is refused"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("sudo sbh clean"), "{stderr}");
+        let report = why_not(&config, &target, false);
+        assert_eq!(
+            report["decision"]["veto_reason"],
+            "fd check incomplete: other-user processes not visible",
+            "{report}"
+        );
+    } else {
+        assert!(
+            payload["candidates_count"].as_u64().unwrap_or(0) >= 1,
+            "{payload}"
+        );
+        assert!(
+            !stderr.contains("every deletion candidate is refused"),
+            "{stderr}"
+        );
+    }
+    assert!(target.exists(), "a dry run deletes nothing");
 }

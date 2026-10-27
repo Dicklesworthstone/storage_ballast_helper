@@ -4,7 +4,9 @@
 //! that this sweep inspected its visible scope, not that procfs is an atomic
 //! snapshot or that hidepid/container namespaces expose every host process.
 //! Deadlines are cooperative: a single blocked kernel operation cannot be
-//! interrupted here. Caps bound discovery, descriptor work, and result memory.
+//! interrupted here, except `cmdline` and `environ` reads, which wait on the
+//! target's memory-map lock and are abandoned at the deadline
+//! (`memory_reads`). Caps bound discovery, descriptor work, and result memory.
 
 use std::ffi::OsString;
 use std::fs;
@@ -20,10 +22,18 @@ use crate::core::errors::{Result, SbhError};
 use crate::platform::types::{ExecutablesResult, OpenFile, OpenFilesResult, ProcessInfo};
 
 mod build_environment;
+mod memory_reads;
 mod unix_sockets;
 
+use build_environment::sweep as build_directory_sweep;
+
 const MAX_DESCRIPTORS: usize = 262_144;
-const MAX_DESCRIPTORS_PER_PID: usize = 16_384;
+/// Half the sweep's descriptor budget. One process past this cap makes every
+/// sweep incomplete and holds every deletion on the host: on ts2
+/// (2026-10-16) a `bfs` search kept 65,536 directory descriptors open (its
+/// limit was 1,048,576) under the old 16,384 cap, and the host deleted
+/// nothing for hours. Reading 65,536 links takes well under a second.
+const MAX_DESCRIPTORS_PER_PID: usize = 131_072;
 const MAX_PROC_ENTRIES: usize = OPEN_FILES_MAX_PIDS + 4096;
 const MAX_EXECUTABLE_COMM_BYTES: usize = 256;
 const MAX_EXECUTABLE_STAT_BYTES: usize = 8192;
@@ -46,6 +56,19 @@ trait ProcAccess {
     fn read_bounded(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
         read_proc_bytes(path, limit)
     }
+
+    /// [`Self::read_bounded`] for `cmdline` or `environ`, whose read waits for
+    /// the process's memory-map lock and so lasts as long as the process is
+    /// stuck in a fault or mmap. Production stops waiting after `wait`.
+    fn read_process_memory(
+        &self,
+        path: &Path,
+        limit: usize,
+        wait: Duration,
+    ) -> io::Result<Vec<u8>> {
+        let _ = wait;
+        self.read_bounded(path, limit)
+    }
 }
 
 struct NativeProc;
@@ -67,6 +90,17 @@ impl ProcAccess for NativeProc {
 
     fn now(&self) -> Instant {
         Instant::now()
+    }
+
+    fn read_process_memory(
+        &self,
+        path: &Path,
+        limit: usize,
+        wait: Duration,
+    ) -> io::Result<Vec<u8>> {
+        let process = path.parent().unwrap_or(path);
+        let path = path.to_path_buf();
+        memory_reads::read(process, wait, move || read_proc_bytes(&path, limit))
     }
 }
 
@@ -97,6 +131,9 @@ struct Sweep<'a, P> {
     started: Instant,
     complete: bool,
     descriptors_seen: usize,
+    /// The first process whose descriptors a cap cut short, and that cap:
+    /// otherwise the sweep is incomplete with nothing saying why.
+    descriptor_limit: Option<(i32, usize)>,
     /// Bound socket paths by inode, read once, when the first socket
     /// descriptor is seen.
     unix_sockets: Option<unix_sockets::Table>,
@@ -110,8 +147,31 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
             started: proc.now(),
             complete: true,
             descriptors_seen: 0,
+            descriptor_limit: None,
             unix_sockets: None,
         }
+    }
+
+    /// Which process a descriptor cap cut short, if one did. It also travels
+    /// as `OpenFilesResult::incomplete_reason`, so the scanner's incomplete
+    /// line and explain name the cause, not only this sweep's log line.
+    fn descriptor_limit_reason(&self, proc_root: &Path) -> Option<String> {
+        let (pid, limit) = self.descriptor_limit?;
+        let comm = self
+            .proc
+            .read_bounded(&proc_root.join(pid.to_string()).join("comm"), 64)
+            .map(|raw| String::from_utf8_lossy(&raw).trim().to_string())
+            .unwrap_or_default();
+        Some(format!(
+            "pid {pid} ({comm}) has more than {limit} open descriptors, past the sweep's limit"
+        ))
+    }
+
+    /// The `[SBH-SAFETY]` explanation for a descriptor cap, if one was hit.
+    fn descriptor_limit_note(&self, proc_root: &Path) -> Option<String> {
+        self.descriptor_limit_reason(proc_root).map(|reason| {
+            format!("[SBH-SAFETY] open-file sweep incomplete: {reason}; candidates are held")
+        })
     }
 
     /// Preserve positive bindings and propagate missing socket coverage to both
@@ -141,6 +201,16 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
         let path = table.path(inode).map(Path::to_path_buf);
         self.expired();
         path
+    }
+
+    /// Time left before the deadline.
+    fn remaining(&self) -> Duration {
+        let elapsed = self
+            .proc
+            .now()
+            .checked_duration_since(self.started)
+            .unwrap_or(self.limits.time);
+        self.limits.time.saturating_sub(elapsed)
     }
 
     fn expired(&mut self) -> bool {
@@ -229,10 +299,16 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
             }
         };
         for (seen, entry) in entries.enumerate() {
-            if self.expired()
-                || seen >= self.limits.per_pid
-                || self.descriptors_seen >= self.limits.descriptors
-            {
+            let cap = if seen >= self.limits.per_pid {
+                Some(self.limits.per_pid)
+            } else {
+                (self.descriptors_seen >= self.limits.descriptors)
+                    .then_some(self.limits.descriptors)
+            };
+            if let Some(cap) = cap {
+                self.descriptor_limit.get_or_insert((pid, cap));
+            }
+            if self.expired() || cap.is_some() {
                 self.complete = false;
                 break;
             }
@@ -367,7 +443,34 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
             .read_bounded(&process.join("stat"), MAX_EXECUTABLE_STAT_BYTES)
             .is_ok_and(|raw| stat_has_no_user_executable(&raw, pid))
     }
+
+    /// [`Self::no_user_executable`], giving an exiting process a moment to
+    /// finish. Its argv reads empty once its memory is released, shortly
+    /// before it becomes a zombie or is reaped. On a busy build host (trj,
+    /// 2,373 processes) short-lived compilers exited mid-sweep in two of
+    /// three sweeps, and each one made the whole sweep incomplete and held
+    /// the batch. A process still running after the settle, such as one
+    /// whose main thread exited while its siblings run, stays unproven.
+    fn exited_without_user_executable(&mut self, process: &Path, pid: i32) -> bool {
+        for settle in EXIT_SETTLE {
+            if self.no_user_executable(process, pid) {
+                return true;
+            }
+            if self.expired() {
+                return false;
+            }
+            std::thread::sleep(settle);
+        }
+        self.no_user_executable(process, pid)
+    }
 }
+
+/// Waits between re-checks of a process whose argv read empty.
+const EXIT_SETTLE: [Duration; 3] = [
+    Duration::from_millis(2),
+    Duration::from_millis(10),
+    Duration::from_millis(50),
+];
 
 fn read_proc_bytes(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
@@ -518,11 +621,25 @@ fn open_targets_with(
             }
         }
     }
-    // So are the external cache and output directories a live build names.
-    let (directories, build_denied) = build_directory_sweep(proc, proc_root, limits);
-    for (_, directory) in directories {
+    // The build metadata phase uses the remaining deadline, not another full
+    // proc-scan allowance. Its missing coverage must reach final preflight.
+    let elapsed = proc
+        .now()
+        .checked_duration_since(sweep.started)
+        .unwrap_or(limits.time);
+    let build = build_directory_sweep(
+        proc,
+        proc_root,
+        Limits {
+            time: limits.time.saturating_sub(elapsed),
+            ..limits
+        },
+    );
+    sweep.complete &= build.complete;
+    for (_, directory) in build.directories {
         add_target_spellings(&mut targets, directory);
     }
+    let build_denied = build.denied;
     // A process sbh may not inspect could be using any candidate: its
     // references are unknown, not absent, so the sweep certifies nothing.
     // Name a refused build tool first: an unprivileged daemon is refused
@@ -544,6 +661,9 @@ fn open_targets_with(
             }
         );
     }
+    if let Some(note) = sweep.descriptor_limit_note(proc_root) {
+        eprintln!("{note}");
+    }
     let mut targets: Vec<_> = targets.into_iter().collect();
     targets.sort_unstable();
     // Failed/empty directory reads and final ordering belong to the same
@@ -552,8 +672,8 @@ fn open_targets_with(
     Ok((targets, sweep.complete))
 }
 
-/// The first process whose working directory or build environment the sweep
-/// was refused (EACCES/EPERM).
+/// The first process whose working directory, environment or invocation
+/// metadata could not be inspected completely.
 struct UnreadableProcess {
     pid: i32,
     file: &'static str,
@@ -564,7 +684,13 @@ struct UnreadableProcess {
 const BUILD_ENVIRON_LIMIT: usize = 512 * 1024;
 
 pub(super) fn build_directories() -> Vec<(i32, PathBuf)> {
-    build_directories_with(&NativeProc, Path::new(PROC_ROOT), Limits::default())
+    build_directory_snapshot().0
+}
+
+/// Return positive build references and observation completeness together.
+pub(super) fn build_directory_snapshot() -> (Vec<(i32, PathBuf)>, bool) {
+    let result = build_directory_sweep(&NativeProc, Path::new(PROC_ROOT), Limits::default());
+    (result.directories, result.complete)
 }
 
 /// Positive directory references from live Rust, Go, Node, Python and native
@@ -572,73 +698,13 @@ pub(super) fn build_directories() -> Vec<(i32, PathBuf)> {
 /// its external cache between reads. The same bounded discovery feeds scoring
 /// and the native executor. Unreadable metadata remains best-effort evidence,
 /// not a claim of complete coverage; raw environments are never logged.
+#[cfg(test)]
 fn build_directories_with(
     proc: &impl ProcAccess,
     proc_root: &Path,
     limits: Limits,
 ) -> Vec<(i32, PathBuf)> {
-    build_directory_sweep(proc, proc_root, limits).0
-}
-
-/// [`build_directories_with`], plus the first build tool whose environment
-/// sbh was refused: its cache and output directories are unknown.
-fn build_directory_sweep(
-    proc: &impl ProcAccess,
-    proc_root: &Path,
-    limits: Limits,
-) -> (Vec<(i32, PathBuf)>, Option<UnreadableProcess>) {
-    let mut sweep = Sweep::new(proc, limits);
-    let Ok(pids) = sweep.pids(proc_root) else {
-        return (Vec::new(), None);
-    };
-    let mut denied = None;
-    let own = i32::try_from(std::process::id()).ok();
-    let mut seen = std::collections::HashSet::new();
-    let mut directories = Vec::new();
-    for pid in pids {
-        if sweep.expired() {
-            break;
-        }
-        if Some(pid) == own {
-            continue;
-        }
-        let process = proc_root.join(pid.to_string());
-        let Ok(comm) = proc.read_bounded(&process.join("comm"), 64) else {
-            continue;
-        };
-        let Some(tool) = build_environment::tool(&comm) else {
-            continue;
-        };
-        if sweep.expired() {
-            break;
-        }
-        let environ = match proc.read_bounded(&process.join("environ"), BUILD_ENVIRON_LIMIT) {
-            Ok(environ) => environ,
-            Err(error) => {
-                if error.kind() == io::ErrorKind::PermissionDenied {
-                    denied.get_or_insert(UnreadableProcess {
-                        pid,
-                        file: "environ",
-                        error,
-                    });
-                }
-                continue;
-            }
-        };
-        // Do not start another syscall after the budget expires, but retain
-        // absolute references from the environment we already observed.
-        let cwd = if sweep.expired() {
-            None
-        } else {
-            proc.link(&process.join("cwd")).ok()
-        };
-        for path in build_environment::references(tool, &environ, cwd.as_deref()) {
-            if seen.insert(path.clone()) {
-                directories.push((pid, path));
-            }
-        }
-    }
-    (directories, denied)
+    build_directory_sweep(proc, proc_root, limits).directories
 }
 
 fn add_target_spellings(targets: &mut std::collections::HashSet<PathBuf>, target: PathBuf) {
@@ -697,6 +763,10 @@ fn open_files_with_roots(
         }
         sweep.fds(proc_root, pid, &roots, &mut files);
     }
+    let incomplete_reason = sweep.descriptor_limit_reason(proc_root);
+    if let Some(reason) = &incomplete_reason {
+        eprintln!("[SBH-SAFETY] open-file sweep incomplete: {reason}; candidates are held");
+    }
     // Include time spent in a failed/empty directory read in the one budget.
     sweep.expired();
     files.sort_by(|left, right| {
@@ -708,6 +778,7 @@ fn open_files_with_roots(
     Ok(OpenFilesResult {
         files,
         complete: sweep.complete,
+        incomplete_reason,
     })
 }
 
@@ -794,6 +865,12 @@ mod tests {
             let process = self.proc_root.join(pid.to_string());
             fs::create_dir_all(process.join("fd")).unwrap();
             fs::create_dir_all(process.join("fdinfo")).unwrap();
+            // Existing transport fixtures describe a readable invocation
+            // with no CLI override; argv failures have dedicated fixtures.
+            let cmdline = process.join("cmdline");
+            if !cmdline.exists() {
+                fs::write(cmdline, b"fixture\0").unwrap();
+            }
             process
         }
 
@@ -1045,6 +1122,76 @@ mod tests {
         );
         assert!(result.complete);
         assert_eq!(result.files.len(), 3);
+    }
+
+    /// A cap that cuts a process short names that process and the cap, and a
+    /// sweep within its caps names nothing (ts2: a `bfs` with 65,536
+    /// descriptors held every batch while the logs said only "incomplete").
+    #[test]
+    fn a_descriptor_cap_names_the_process_it_cut_short() {
+        let fixture = Fixture::new();
+        fixture.fd(7, 0);
+        fixture.fd(7, 1);
+        fs::write(fixture.pid(7).join("comm"), "bfs\n").unwrap();
+        let roots = [fixture.root.clone()];
+        let mut capped = Sweep::new(
+            &NativeProc,
+            Limits {
+                per_pid: 1,
+                ..Limits::default()
+            },
+        );
+        let mut files = Vec::new();
+        capped.fds(&fixture.proc_root, 7, &roots, &mut files);
+        assert!(!capped.complete);
+        assert_eq!(capped.descriptor_limit, Some((7, 1)));
+        let note = capped.descriptor_limit_note(&fixture.proc_root).unwrap();
+        assert!(
+            note.contains("pid 7 (bfs) has more than 1 open descriptors"),
+            "{note}"
+        );
+
+        let mut whole = Sweep::new(&NativeProc, Limits::default());
+        whole.fds(&fixture.proc_root, 7, &roots, &mut Vec::new());
+        assert!(whole.complete);
+        assert_eq!(whole.descriptor_limit_note(&fixture.proc_root), None);
+
+        // The PAL result carries the same cause, for the scanner and explain.
+        let result = fixture.scan(
+            &NativeProc,
+            Limits {
+                per_pid: 1,
+                ..Limits::default()
+            },
+        );
+        assert!(!result.complete);
+        assert_eq!(
+            result.incomplete_reason.as_deref(),
+            Some("pid 7 (bfs) has more than 1 open descriptors, past the sweep's limit")
+        );
+        assert_eq!(
+            fixture
+                .scan(&NativeProc, Limits::default())
+                .incomplete_reason,
+            None
+        );
+    }
+
+    /// The ts2 incident's count fits the default limits: 65,538 descriptors in
+    /// one process no longer make the sweep incomplete (bd-qs1r).
+    #[test]
+    fn one_process_with_65538_descriptors_fits_the_default_limits() {
+        let fixture = Fixture::new();
+        let process = fixture.pid(1);
+        let walked = fixture.root.join("walked-dir");
+        fs::create_dir(&walked).unwrap();
+        for fd in 0..65_538 {
+            symlink(&walked, process.join("fd").join(fd.to_string())).unwrap();
+        }
+        let (targets, complete) =
+            open_targets_with(&Faults::default(), &fixture.proc_root, Limits::default()).unwrap();
+        assert!(complete);
+        assert!(targets.contains(&walked));
     }
 
     #[test]
@@ -1393,6 +1540,31 @@ mod tests {
             open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
         assert!(targets.contains(&home.join("registry/src")));
         assert!(targets.contains(&target));
+    }
+
+    /// ts2 2026-10-15: `rch exec -- cargo build` compiles on a worker, so the
+    /// only local process is `rch`, and its fresh mktemp target stays empty
+    /// until the artifacts sync back. Its environment names the target.
+    #[test]
+    fn an_offloaded_rch_build_names_its_target_directory() {
+        let fixture = Fixture::new();
+        let own = i32::try_from(std::process::id()).unwrap();
+        let target = fixture
+            .root
+            .join("mea-bfv-recurrence/rch-target-20261015T091718Z-p8M5L7");
+        let process = fixture.pid(own.checked_add(1).unwrap());
+        fs::write(process.join("comm"), "rch\n").unwrap();
+        fs::write(
+            process.join("environ"),
+            format!(
+                "HOME=/home/builder\0CARGO_TARGET_DIR={}\0RCH_REQUIRE_REMOTE=1\0",
+                target.display()
+            ),
+        )
+        .unwrap();
+
+        let found = build_directories_with(&NativeProc, &fixture.proc_root, Limits::default());
+        assert!(found.iter().any(|(_, path)| *path == target), "{found:?}");
     }
 
     #[test]

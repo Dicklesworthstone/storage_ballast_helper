@@ -34,6 +34,8 @@ use mach2::time_value::time_value_t;
 use mach2::traps::mach_task_self;
 use mach2::vm_types::{integer_t, natural_t};
 
+mod pid_inventory;
+
 const THREAD_BASIC_INFO: natural_t = 3;
 const THREAD_BASIC_INFO_COUNT: mach_msg_type_number_t =
     (size_of::<MachThreadBasicInfoRaw>() / size_of::<natural_t>()) as mach_msg_type_number_t;
@@ -550,59 +552,39 @@ pub fn host_vm_stats() -> Result<VmStats, MachError> {
     })
 }
 
-/// Return all process identifiers visible to the current process.
+/// Return a bounded, freshly enumerated inventory of visible process IDs.
+///
+/// A full buffer is retried with actual growth, never accepted as complete.
+/// Native failures and exhausted retry/allocation budgets remain errors.
 #[allow(unsafe_code)]
 pub fn proc_listpids_all() -> io::Result<Vec<i32>> {
-    // SAFETY: proc_listpids with null pointer and 0 size queries required buffer byte size.
-    let initial_bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, ptr::null_mut(), 0) };
-    if initial_bytes < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let pid_size = size_of::<libc::pid_t>();
-    let initial_capacity = usize::try_from(initial_bytes)
-        .ok()
-        .filter(|bytes| *bytes > 0)
-        .map_or(1024, |bytes| bytes / pid_size);
-    let mut pids = Vec::<libc::pid_t>::with_capacity(initial_capacity.max(1));
-
-    loop {
-        let buffer_bytes = pids
-            .capacity()
-            .checked_mul(pid_size)
-            .and_then(|bytes| i32::try_from(bytes).ok())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pid buffer too large"))?;
-        // SAFETY: pids has capacity for buffer_bytes, pointer is valid and writable.
-        let returned_bytes = unsafe {
-            libc::proc_listpids(
-                PROC_ALL_PIDS,
-                0,
-                pids.as_mut_ptr().cast::<c_void>(),
-                buffer_bytes,
-            )
-        };
-        if returned_bytes < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if returned_bytes == buffer_bytes {
-            pids.reserve(pids.capacity().max(1));
-            continue;
-        }
-        let returned_bytes = usize::try_from(returned_bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative pid byte count"))?;
-        if returned_bytes % pid_size != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "pid byte count is not aligned",
-            ));
-        }
-        let len = returned_bytes / pid_size;
-        // SAFETY: proc_listpids populated exactly len pid_t elements.
-        unsafe {
-            pids.set_len(len);
-        }
-        return Ok(pids);
-    }
+    let observer = i32::try_from(std::process::id())
+        .map_err(|_| io::Error::other("current process id does not fit the native ABI"))?;
+    pid_inventory::collect(
+        |buffer| {
+            let (pointer, bytes) = match buffer {
+                Some(buffer) => {
+                    let bytes = i32::try_from(std::mem::size_of_val(buffer))
+                        .map_err(|_| io::Error::other("native PID buffer size overflow"))?;
+                    (buffer.as_mut_ptr().cast::<c_void>(), bytes)
+                }
+                None => (ptr::null_mut(), 0),
+            };
+            // SAFETY: None is the documented null size probe. Every filling
+            // call receives a live initialized i32 slice and its exact byte
+            // length, not spare Vec capacity. The pointer never escapes.
+            let returned = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, pointer, bytes) };
+            // libproc returns ZERO on syscall failure. Capture errno before
+            // another native call, and never consult stale errno on success.
+            let errno = if returned <= 0 {
+                io::Error::last_os_error().raw_os_error()
+            } else {
+                None
+            };
+            pid_inventory::native_byte_count(returned, errno)
+        },
+        observer,
+    )
 }
 
 /// Return the executable path for a process.
@@ -1019,6 +1001,14 @@ mod tests {
             subscribe_memory_pressure_events(|_| {}).expect("dispatch source should start");
         assert!(!source.is_canceled());
         drop(source);
+    }
+
+    #[test]
+    fn native_pid_inventory_includes_the_running_observer() {
+        let observer = i32::try_from(std::process::id()).unwrap();
+        let pids = super::proc_listpids_all().expect("native process inventory should be readable");
+        assert!(pids.contains(&observer));
+        assert!(pids.iter().all(|pid| *pid >= 0));
     }
 
     #[test]

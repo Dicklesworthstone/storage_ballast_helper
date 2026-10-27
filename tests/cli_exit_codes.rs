@@ -42,6 +42,13 @@ fn config_in(dir: &Path) -> std::path::PathBuf {
     path
 }
 
+/// A directory on the build volume. `check` on a tmpfs or ramfs path also
+/// requires a clean host RAM-scratch assessment (bd-paeg), so a threshold
+/// test on a tempdir under a busy tmpfs `/tmp` would test the host instead.
+fn disk_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -54,7 +61,7 @@ fn stderr(output: &Output) -> String {
 /// (not the I/O class), and the report is on stdout.
 #[test]
 fn check_unmet_need_is_exit_one_with_the_report_on_stdout() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = disk_tempdir();
     let config = config_in(dir.path());
     let need = u64::MAX / 2;
     let output = sbh(
@@ -91,10 +98,62 @@ fn check_unmet_need_is_exit_one_with_the_report_on_stdout() {
     assert_eq!(payload["status"], "critical");
 }
 
+/// Plenty of apparent tmpfs blocks must not hide insufficient host/process RAM.
+/// Only mount capacity is injected; the binary reads native memory evidence.
+#[cfg(target_os = "linux")]
+#[test]
+fn ram_backed_need_checks_native_memory_after_filesystem_capacity_passes() {
+    let dir = disk_tempdir();
+    let config = config_in(dir.path());
+    let capacity = u64::MAX / 2;
+    let need = u64::MAX / 4;
+    let table = serde_json::json!({
+        "mounts": [{
+            "path": dir.path(),
+            "fs_type": "tmpfs",
+            "ram_backed": true,
+            "total": capacity,
+            "free": capacity,
+        }],
+    });
+    let output = Command::new(common::sbh_bin_path())
+        .arg("--config")
+        .arg(config)
+        .args(["--json", "check", "--target-free", "0", "--need"])
+        .arg(need.to_string())
+        .arg(dir.path())
+        .env("SBH_TEST_MODE", "1")
+        .env("SBH_TEST_FS_STATS", table.to_string())
+        .output()
+        .expect("run RAM-backed preflight");
+    // Restricted CI namespaces may make native cgroup/process evidence partial.
+    // Neither a known shortfall nor incomplete evidence may report success.
+    assert!(matches!(output.status.code(), Some(1 | 4)), "{output:?}");
+    let payload: serde_json::Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(payload["free_bytes"], capacity);
+    let admission = &payload["ram_write_admission"];
+    assert_eq!(admission["schema"], "sbh.ram_write_admission.v1");
+    assert_eq!(admission["requested_bytes"], need);
+    assert_eq!(admission["read_only"], true);
+    assert!(matches!(admission["exit_code"].as_i64(), Some(1 | 4)));
+    if let Some(available) = admission["host_available_bytes"].as_u64() {
+        assert!(available < need);
+    }
+    assert!(
+        matches!(
+            payload["reason"].as_str(),
+            Some(
+                "ram_write_headroom" | "ram_write_admission_incomplete" | "ram_scratch_incomplete"
+            )
+        ),
+        "{payload}"
+    );
+}
+
 /// `check` on a volume above its threshold is exit 0 and prints nothing.
 #[test]
 fn check_above_threshold_is_exit_zero() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = disk_tempdir();
     let config = config_in(dir.path());
     let output = sbh(
         &config,
@@ -107,6 +166,29 @@ fn check_above_threshold_is_exit_zero() {
     );
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+}
+
+/// `check` without `--target-free` uses the daemon's Yellow line, absolute
+/// floors included (bd-ud9s): a large disk well above its floor is not under
+/// pressure just because its free share is below the percentage.
+#[test]
+fn check_honours_the_absolute_free_floors() {
+    let dir = disk_tempdir();
+    let config = config_in(dir.path());
+    let base = fs::read_to_string(&config).unwrap();
+    let percentages = "[pressure]\ngreen_min_free_pct = 99.9\nyellow_min_free_pct = 99.8\n\
+                       orange_min_free_pct = 99.7\nred_min_free_pct = 99.6\n";
+    let target = dir.path().display().to_string();
+
+    fs::write(&config, format!("{base}{percentages}")).unwrap();
+    let without_floors = sbh(&config, &["check", &target]);
+    assert_eq!(without_floors.status.code(), Some(1), "{without_floors:?}");
+
+    let floors = "green_min_free_bytes = 4\nyellow_min_free_bytes = 3\n\
+                  orange_min_free_bytes = 2\nred_min_free_bytes = 1\n";
+    fs::write(&config, format!("{base}{percentages}{floors}")).unwrap();
+    let with_floors = sbh(&config, &["check", &target]);
+    assert_eq!(with_floors.status.code(), Some(0), "{with_floors:?}");
 }
 
 /// A path that cannot be stat'ed is an I/O failure: exit 2.

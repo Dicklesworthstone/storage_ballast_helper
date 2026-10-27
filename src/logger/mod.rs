@@ -1,6 +1,7 @@
 //! Dual-write logging: SQLite (WAL) + JSONL append-only with graceful degradation.
 
 pub mod compression;
+pub mod decision_dedupe;
 pub mod dual;
 pub mod jsonl;
 pub mod schema;

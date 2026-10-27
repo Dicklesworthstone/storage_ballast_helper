@@ -165,10 +165,10 @@ sbh status
 LaunchAgent, uses native Application Support paths, and provisions the default
 ballast preset. A user-scoped sbh cannot see other users' processes (macOS
 hides them), so its open-file check is never complete and the scanner refuses
-every candidate it must walk or that is 100 MB or larger: it reclaims almost
-nothing, and only ballast release works fully. `sbh status` and
-`sbh doctor --system` report this. To reclaim build artifacts, register the
-daemon in system scope:
+every deletion candidate: user-scope daemons are conservative by design (they
+veto whatever they cannot prove unused), and only ballast release works.
+`sbh status` and `sbh doctor --system` report this. The root (system-scope)
+daemon is the supported mode for reclaiming build artifacts; register it with:
 
 ```bash
 sudo sbh install --launchd --scope system --auto
@@ -231,9 +231,11 @@ gh release download --repo Dicklesworthstone/storage_ballast_helper --pattern "s
 ### Verify a Release
 
 Each release ships a manifest, `storage_ballast_helper-vX.Y.Z-manifest.json`,
-that lists every artifact's SHA-256, and a minisign signature for it
-(`.minisig`). Check the signature, then check the file you downloaded
-against the manifest:
+that lists every archive's SHA-256, and a minisign signature for it
+(`.minisig`). The raw `sbh_<os>_<arch>` binaries are not all listed under
+their published names, so verify the archive for your platform; the `sbh`
+inside it is the same file as the raw binary. Check the signature, then
+check the archive against the manifest:
 
 ```bash
 V=0.7.4
@@ -407,9 +409,11 @@ For non-interactive environments (CI, automation), `sbh install --auto` applies 
 | `sbh daemon` | Run monitoring loop and policy engine |
 | `sbh status` | Real-time health, pressure, and controller state |
 | `sbh check` | Pre-flight space check and recommendations |
+| `sbh check --agent-scratch [PATH]` | Read-only inventory of Claude session scratch, sizes, process references, and tree/transcript inactivity |
 | `sbh scan` | Manual candidate discovery and scoring report |
 | `sbh clean` | Manual cleanup with confirmation/dry-run |
 | `sbh undo` | Restore quarantined entries (`<decision-id>`, `--path`, `--all-since`, `--list`) |
+| `sbh relocate` | Report dormant protected scratch, apply verified backup relocation, or restore a relocated tree ([guide](docs/relocation.md)) |
 | `sbh emergency` | Zero-write recovery mode on critically full disks |
 
 ### Ballast and Protection
@@ -679,7 +683,13 @@ During disk pressure events, the dashboard provides guided triage shortcuts. The
 
 Use `j`/`k` to navigate entries and `Enter` to jump to the target screen.
 
-**Explainability reads the decision ledger.** The Explainability screen lists the daemon's recent decisions from the SQLite `decision_log` (every keep, delete, review and veto with its factor breakdown, veto reason, policy mode and the ledger id `sbh explain --id` takes); a database from before the ledger falls back to the deletions in the activity log and is marked `PARTIAL` with the reason. On the Timeline, an `artifact_delete` row names the decision that approved it (`→ decision <id>`, joined from the ledger for SQLite rows or carried by the JSONL line), and `Enter` on it opens that decision on the Explainability screen with its detail pane expanded.
+**Explainability reads the decision ledger.** The Explainability screen lists the daemon's recent decisions from the SQLite `decision_log` (every keep, delete, review and veto with its factor breakdown, veto reason, policy mode and the ledger id `sbh explain --id` takes; a keep, review or veto that repeats the last verdict for the same artifact is recorded once a day, every delete each time); a database from before the ledger falls back to the deletions in the activity log and is marked `PARTIAL` with the reason. On the Timeline, an `artifact_delete` row names the decision that approved it (`→ decision <id>`, joined from the ledger for SQLite rows or carried by the JSONL line), and `Enter` on it opens that decision on the Explainability screen with its detail pane expanded.
+
+Repeated-verdict suppression starts only after a successful SQLite decision
+write. Failed writes remain eligible for retry, and an intervening delete or
+changed verdict clears the older cached verdict. JSONL-only operation retains
+every observation so evidence and database recovery continue while SQLite is
+unavailable.
 
 **Quick-release** (`x` key): One-keystroke shortcut that navigates to the Ballast screen and opens a release confirmation dialog. Reduces the typical pressure-triage path from 8 steps (legacy) to 1 keystroke.
 
@@ -721,6 +731,8 @@ Configure via command palette (`:` then type `pref`) or directly in the preferen
   `docs/configs/`
 - macOS launchd troubleshooting guide: `docs/launchd-troubleshooting.md`
 - Sacred path catalog and per-pattern safety reasoning: `docs/sacred-paths.md`
+- Agent-session scratch inventory and its uncertainty/size semantics:
+  `docs/agent-scratch.md`
 - Dashboard/status baseline contract (pre-overhaul): `docs/dashboard-status-contract-baseline.md`
 - Dashboard IA + navigation map (overhaul design baseline): `docs/dashboard-information-architecture.md`
 - TUI acceptance gates + performance/error budgets: `docs/tui-acceptance-gates-and-budgets.md`
@@ -744,8 +756,7 @@ Environment overrides are available for operator automation:
 - `SBH_UPDATE_METADATA_CACHE_FILE`
 - `SBH_UPDATE_NOTICES_ENABLED`
 - `SBH_UPDATE_ENABLED`
-- `SBH_UPDATE_BACKGROUND_REFRESH`
-- `SBH_UPDATE_OPT_OUT`
+- `SBH_UPDATE_OPT_OUT` (turns both `update.enabled` and `update.notices_enabled` off)
 
 ### Update Command Flags
 
@@ -869,10 +880,7 @@ kp_scale_max = 2.0
 [scheduler]
 enabled = true
 scan_budget_per_interval = 5
-exploration_quota_fraction = 0.20
 io_cost_weight = 0.1
-fp_risk_weight = 0.15
-exploration_weight = 0.25
 forecast_error_threshold = 0.5
 fallback_trigger_windows = 3
 recovery_trigger_windows = 5
@@ -937,7 +945,7 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_SYSTEMD_UNIT_DIR` | service | Directory the systemd unit is written to and read from |
 | `SBH_ACTIVE_LEASE_TOKEN` | service | Renewal token `sbh lease run` hands the leased command (`lease renew` reads it) |
 | `SBH_ACTIVE_LEASE_TARGET` | service | Leased target `sbh lease run` hands the leased command (default for `lease status`/`renew`) |
-| `SBH_MACOS_QUERY_FOUNDATION_PURGEABLE` | config override | `platform.macos.query_foundation_purgeable` |
+| `SBH_MACOS_QUERY_FOUNDATION_PURGEABLE` | platform | `0`/`false`/`no`/`off` stops the macOS purgeable-space query to Foundation; the estimate then comes from the APFS container inventory |
 | `SBH_BEHAVIOR_PRESET` | config override | `pressure.behavior_preset` |
 | `SBH_POLICY_KILL_SWITCH` | config override | `policy.kill_switch` |
 | `SBH_PREDICTION_ENABLED` | config override | `prediction.enabled` |
@@ -1000,8 +1008,7 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_TELEMETRY_DAEMON_RSS_WARNING_BYTES` | config override | `telemetry.daemon_rss_warning_bytes` |
 | `SBH_TELEMETRY_DAEMON_RSS_HARD_LIMIT_BYTES` | config override | `telemetry.daemon_rss_hard_limit_bytes` |
 | `SBH_UPDATE_ENABLED` | config override | `update.enabled` |
-| `SBH_UPDATE_BACKGROUND_REFRESH` | config override | `update.background_refresh` |
-| `SBH_UPDATE_OPT_OUT` | config override | `update.opt_out` |
+| `SBH_UPDATE_OPT_OUT` | release | A true value turns `update.enabled` and `update.notices_enabled` off |
 | `SBH_UPDATE_METADATA_CACHE_TTL_SECONDS` | config override | `update.metadata_cache_ttl_seconds` |
 | `SBH_UPDATE_METADATA_CACHE_FILE` | config override | `update.metadata_cache_file` |
 | `SBH_UPDATE_NOTICES_ENABLED` | config override | `update.notices_enabled` |
@@ -1014,6 +1021,7 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_EXECUTABLE_REPLACEMENT_PROBE` | test | Binary the Linux self-replacement test rewrites in place to check the service restart path (#35) |
 | `SBH_UPDATE_HANDOFF_CONTEXT_PROBE` | test | Mode (`update` or another value) the update-handoff test runs its child process in, to check that a command's install-path intent is captured once (#35) |
 | `SBH_TUI_ARTIFACT_FRAMES` | test | Include rendered frame text in the TUI test artifacts |
+| `SBH_TEST_AGENT_SCRATCH_FIFO_CHILD` | test | Set in the child process the agent-scratch FIFO-marker test re-runs itself in, so a marker read that blocks cannot hang the suite |
 <!-- sbh-docs:end -->
 
 ## Architecture
@@ -1340,7 +1348,21 @@ Two protection mechanisms prevent cleanup of important directories:
   protected_at = "2026-05-07T03:50:00Z"
   ```
 - **Config globs**: Shell-style patterns in `scanner.protected_paths` (e.g., `/data/projects/production-*`). Evaluated at scan time against every candidate path.
+- **Target-only roots**: a root in `scanner.target_only_roots` (macOS default `/private/tmp/claude-*`, the coding-agent scratch root) stays protected as a whole except for pure, idle cargo target dirs. Such a dir has `CACHEDIR.TAG` or `.rustc_info.json` at its top, and its top level holds only what cargo writes there (`debug`, `release`, `release-*` profiles holding a build, `doc`, an empty `tmp`, `package`, target triples such as `wasm32-wasip1`, cargo's lock and report files, plus `.DS_Store` and `.metadata_never_index`; benchmark baselines such as `criterion/` keep it). No `.sbh-protect` or `.git` is in it, inside it or between it and the root, and it is not at or below an `excluded_paths` entry; it was not created or modified, and nothing in it was modified, within `scanner.target_only_idle_hours` (<!-- claim:constants.scanner.target_only_idle_hours -->24<!-- /claim --> by default); and no process holds a file open in it or works in it. While the root's mount is at Yellow or above, the daemon checks the roots every <!-- claim:constants.daemon.TARGET_TIER_PASS_MINUTES -->10<!-- /claim --> minutes and sends what passes through the usual policy, planner and executor checks, pinned to the directories it surveyed; the executor drops anything outside the root. Only the `protected_paths` patterns that protect the root as a whole (the root, a parent, or everything in it) are not applied; a pattern naming something inside the root, such as `**/target`, still is. A marker always wins. A root may not be `/` or contain `..`. A user-scoped macOS daemon cannot see other users' processes, so it keeps every candidate; use the system-scope service.
 - **Sacred status**: `sbh status --sacred` lists active marker/config protections, the sacred catalog size, and how many current scan candidates overlap sacred paths.
+
+For target-only batches, the executor renews the exception immediately before
+each real deletion. A trace directory or session log added while earlier batch
+entries are being removed revokes eligibility even if the target's inode stays
+the same. An unreadable or truncated purity listing retains the target. Live
+policy and compression checks follow that filesystem probe.
+
+Target-only nominations also carry revocable permission from the scanner
+configuration that selected them. Changing the opted-in roots, idle window,
+exclusions, or protection rules invalidates old work; removing and re-adding
+the same root requires a fresh selection. The executor renews that permission
+after the purity probe and before mutation, so a long batch cannot keep using
+a protection exception that the operator has withdrawn.
 
 #### Layer 2: Pre-Flight Safety Checks
 
@@ -1408,6 +1430,16 @@ Quarantined space is reclaimable on demand:
 | Orange, Red, Critical | The mount's quarantines are drained oldest-first on the tick, ahead of any new deletion: that space was decided already and costs no scoring. New candidates are removed for good (`Unlink`). |
 | `sbh emergency` | Drains every quarantine under the scan roots before it scans anything. |
 
+Daemon quarantine sweeps respect the live policy and dry-run setting. Observe,
+FallbackSafe, and dry-run retain quarantined payloads while still reporting
+their held bytes. Normal TTL/cap and pressure-driven purges resume only when
+the daemon is allowed to delete.
+
+Queued deletion batches also recheck policy and dry-run before each candidate
+mutation. Enforce-to-Canary transitions defer the remaining candidates for
+fresh quota evaluation. Temporary policy refusals do not create per-path
+backoff, and batches already planned as dry-runs retain their preview counts.
+
 Restore with `sbh undo <decision-id>` (the id is on the `[SBH-QUARANTINE]` line, in `sbh explain`, and in `sbh undo --list`), `sbh undo --path <original>`, or `sbh undo --all-since 2h`. A restore is a rename back, byte-identical; it refuses when the original path exists again unless `--force-suffix`, which restores beside it as `<name>.restored-<decision-id>`. The ledger marks the decision `restored`.
 
 A candidate that cannot be quarantined (different filesystem from the root, unusable store) is removed for good and the fallback is logged as `quarantine_unavailable` with its reason. `status` shows the bytes held per mount in the Reserve column; `stats` reports `quarantined_count` and `quarantined_bytes` and excludes held bytes from `total_bytes_freed`.
@@ -1421,6 +1453,116 @@ A candidate that cannot be quarantined (different filesystem from the root, unus
 The tracker periodically prunes entries whose last deletion is older than `max_cooldown`, preventing unbounded memory growth in long-running daemon sessions.
 
 Source: `src/daemon/loop_main.rs`
+
+### RAM-Backed Scratch Preflight
+
+On Linux, `sbh check /tmp --need 5G` also checks current host RAM-scratch
+pressure when the path is on tmpfs or ramfs. A positive explicit `--need`
+additionally compares the requested bytes with host `MemAvailable` and every
+finite `memory.high` or `memory.max` boundary in the caller's visible cgroup-v2
+ancestry. Each boundary uses its own scope's current charge. A large tmpfs size
+limit or healthy host cannot hide a smaller process allowance.
+
+The byte comparison adds no percentage reserve and does not count swap as RAM.
+It distinguishes throttling boundaries from hard limits. A known shortfall
+exits 1; incomplete evidence exits 4 ([Exit Codes](#exit-codes)). JSON includes
+the fresh `ram_scratch` report and a separate `ram_write_admission` with the
+requested bytes, observed headroom, and limiting scope. A successful check is a
+current observation, not a memory reservation. Disk-backed checks skip the RAM
+collection, and the check does not authorize cleanup or relocation.
+Use `sbh check --ram-scratch` for the fuller report and top-entry attribution.
+See [RAM-scratch headroom](docs/ram-scratch.md) for the warning rules and limits.
+
+### Agent-Session Scratch Inventory
+
+`sbh check --agent-scratch [PATH]` reports Claude session directories even when
+their contents are not regenerable artifacts. It recognizes
+`<tmp>/claude-<uid>/<project>/<session-uuid>`, correlates each session with its
+transcript, and checks live process references. Both the complete tree and its
+transcript must have been unchanged for `--min-idle-days` (<!-- claim:constants.agent_scratch.DEFAULT_MIN_IDLE_DAYS -->7<!-- /claim --> by default), with
+complete process evidence, before the report labels a session `idle`. Active,
+recent, and unknown sessions remain visible, largest observed allocations first.
+
+```bash
+sbh check --agent-scratch /data/tmp --min-idle-days 9
+sbh --json check --agent-scratch /tmp --agent-scratch-top 50
+```
+
+This command only reports evidence for manual review. It preserves protection
+markers and never emits cleanup candidates. Logical bytes and allocated blocks
+are reported separately; hardlinks are deduplicated within each session, but
+reflinks/shared blocks prevent a reclaimable-space promise. Missing transcripts,
+limited process visibility, changed trees, and exhausted scan budgets remain
+explicit uncertainty. See [the inventory guide](docs/agent-scratch.md) for roots,
+limits, JSON fields, and exit statuses.
+
+### Moving and Restoring Protected Scratch
+
+On Linux, `sbh relocate --apply` copies dormant eligible scratch through an
+opened source directory and verifies the backup before removal. It renews the
+source and parent identities, every descendant's identity and change stamps,
+relocation permission, and process-use evidence at the relevant mutation
+boundaries. Replaced sources, changed children, moved parents, and occupied
+recovery paths refuse the move while retaining the available recovery data.
+The restore stub is built privately and published without overwriting a new
+occupant of the original path.
+
+On Linux, `sbh relocate --restore /absolute/path/to/stub` copies the backup into
+a private directory unique to the attempt, verifies it, and installs it at the
+original path. The opened payload directory pins rsync's destination even if a
+parent or staging pathname moves. Concurrent restores of the same stub refuse
+immediately; changed records, replaced stubs, and newly occupied original paths
+stop the swap while preserving the available recovery trees.
+
+The backup and previous stub are retained after success. Human and JSON output
+name the saved stub, including files written there since relocation. Refused or
+interrupted transfers retain their staging for recovery. See [relocation and
+restore](docs/relocation.md) for recovery locations and evidence limits.
+
+### Lossless Reclaim Before Cleanup
+
+When the optional compression tier starts a pass on a supported btrfs mount
+at Yellow or Orange pressure, that filesystem gets one bounded opportunity
+to reclaim space losslessly before cleanup. The daemon publishes the hold
+before dispatching its pressure scans, and checks it again before executing
+already queued deletions or draining quarantine. Unrelated filesystems
+continue working. The compression tier remains off by default.
+
+`compress.roots` may live on volumes outside `scanner.root_paths`. When no
+scanner controller monitors a compression root's mount, the tier samples that
+root's current free space and applies the configured pressure percentages and
+absolute floors to decide whether `compress.start_level` is reached. Existing
+controllers retain their hysteresis and predictive levels. This sampling only
+admits compression; it does not add deletion roots, change the daemon's global
+pressure level, or grant a cleanup hold through an unmonitored mount alias.
+Read-only filesystems, failed samples, and unknown capacity cannot start a pass.
+
+Root filesystem and device probes run on one bounded background worker; the
+monitor never waits for them. Completed roots can start a pass while a later
+probe is blocked. Admission evidence expires after 60 seconds, and a root
+awaiting fresh evidence cannot hold cleanup. A stuck native probe retains its
+worker slot rather than spawning more threads, so it can delay compression
+without blocking monitoring, ballast release, or emergency cleanup.
+
+Reloading compression settings, protected paths, or control-file locations
+revokes the active pass and pending root evidence. Cancellation remains set
+until the old worker exits, and old discovery progress cannot skip work under
+the new settings. Unrelated UI and notification settings preserve active work.
+
+The hold ends when the pass finishes or its wall-clock allowance expires:
+the 60-second discovery budget plus `compress.policy.timeout_secs`, measured
+from the scheduling tick. A cancellation asks the worker to stop and retains
+the hold until it exits or the original deadline expires. Repeated passes
+cannot renew the hold within the same eligible pressure episode.
+
+Red and Critical pressure bypass the hold, including older batches scored
+before a known alias of their device escalated. Emergency quarantine cleanup
+and scan requests run before the daemon probes roots for a new compression
+pass; configured Red/Critical compression start thresholds remain supported.
+Ballast release retains its priority. Temporarily deferred candidates stay
+eligible for retry without per-path failure backoff.
+
+Source: `src/daemon/compress_tier.rs`, `src/daemon/loop_main.rs`
 
 ### The Ballast System in Depth
 
@@ -1437,7 +1579,7 @@ The data payload is written differently depending on the filesystem:
 - **ext4/xfs**: Uses `fallocate()` for near-instant allocation without writing actual data.
 - **btrfs/zfs**: Writes <!-- claim:constants.ballast.CHUNK_SIZE -->4 MiB<!-- /claim --> chunks of random data to defeat copy-on-write deduplication, which would otherwise make the ballast files share physical blocks and release nothing when deleted.
 
-All writes are fsynced every <!-- claim:constants.ballast.FSYNC_EVERY_BYTES -->64 MiB<!-- /claim --> to ensure durability. Provisioning aborts if free space drops below the provisioning floor, `max(orange_min_free_pct, red_min_free_pct + 2)` (<!-- claim:constants.ballast.ballast_provision_floor_pct() -->10<!-- /claim -->% with the default thresholds), to avoid filling the disk while trying to reserve space against future fills.
+All writes are fsynced every <!-- claim:constants.ballast.FSYNC_EVERY_BYTES -->64 MiB<!-- /claim --> to ensure durability. Provisioning stops before a file that would take free space below the provisioning floor (<!-- claim:constants.ballast.ballast_provision_floor_pct() -->15<!-- /claim -->% with the default thresholds), so it never fills the disk while reserving space against future fills. The floor keeps every new file out of the first pressure level at which the behavior matrix releases ballast, with `pressure.controller.hysteresis_pct` to spare: the default matrix releases from Orange, so the floor is `yellow_min_free_pct + hysteresis_pct`. It is never lower than `max(orange_min_free_pct, red_min_free_pct + 2)`. A lower floor let a refill on a Yellow volume end in Orange, and the daemon released the files it had just written.
 
 Per-volume configuration overrides allow different file counts and sizes for different mount points. A 2 TiB data volume might use 10 x 2 GiB ballast files (20 GiB total), while a 100 GiB root volume uses 5 x 512 MiB files (2.5 GiB).
 
@@ -1663,7 +1805,7 @@ The daemon dispatches alerts through four notification channels, each with indep
 | Desktop | `notify-send` (Linux) / `osascript` (macOS) | Orange |
 | Webhook | HTTP POST via `curl` (5-second timeout) | Red |
 | File | JSONL append to `~/.local/share/sbh/notifications.jsonl` | Info |
-| Journal | systemd/launchd stdout and stderr capture | Warning |
+| Journal | systemd/launchd stderr capture; macOS unified logging | Warning |
 
 Default active channels are `journal` and `file`. Desktop and webhook channels are opt-in.
 On macOS, the desktop channel uses `osascript -e 'display notification ...'` as the
@@ -1722,6 +1864,14 @@ What feeds the index is platform-specific, and the daemon says which at startup 
 
 On Linux and macOS, a configured root whose initial metadata lookup reports that it does not exist is tracked separately from coverage gaps. Existing roots retain their watches; absent roots are checked every 30 seconds without rebuilding healthy coverage. When one appears, the scanner immediately revokes the old index generation, reconciles the roots, and installs coverage for the new directory. Permission failures, unreadable directory listings, disappearing descendants, invalid root types, dangling root links and exhausted watch budgets still require reconciliation. macOS also follows configured directory links such as `/tmp -> /private/tmp`, preserving their configured spelling and rechecking their canonical identity; links inside the scanned tree remain excluded. Explicit reconciliation-only mode and a zero watch budget continue to disable event subscriptions. The default roots remain `/tmp`, `/data/tmp`, `/var/tmp` on Linux; other platforms default to `/tmp`, `/var/tmp` (macOS configuration loading also includes the user's temporary directory unless opted out).
 
+Subscriptions follow the configured roots, independently of which roots a
+particular pressure or maintenance pass selects. Alternating pass scopes no
+longer rebuilds watches or invalidates the whole index. Events outside the
+current request remain pending until a relevant pass covers them; pending work
+does not widen that request's scan scope. Special or catalog-derived request
+paths outside the subscription set receive explicit reconciliation. Genuine
+configuration changes and overflow recovery still invalidate stale evidence.
+
 For validation and A/B artifacts, `sbh scan --json` reports `scanner_engine`, `scanner_dispatch`, `opaque_pruning`, `opaque_pruned_dirs`, `scanned_entries`, and nullable `process_cpu_micros` alongside the existing candidate totals. Daemon `scan_complete` activity events also include the selected dispatch, pruning state, dirty event-root count, index generation, indexed-record count, candidate bytes seen, and timeout state in their `details` payload, plus `process_cpu_micros=` when the pass measured its CPU. `sbh stats --json` aggregates those events into a `scanner` block (`cpu_seconds_by_day`, `passes`, `entries_scanned`, `opaque_pruned_dirs`), and human `sbh stats` prints the scanner's 7-day CPU-seconds/day average. These fields are intended to make v1/v2 scan captures auditable without scraping human output.
 
 The in-repo scanner-v2 validation tests emit focused JSON artifacts for synthetic v1/v2 walk effort and safety parity, event-overflow reconciliation fallback, and memory-pressure transition latency. v2 has been the default engine since v0.4.32 (it is what the production fleet runs and it is required for structural detection of caches under arbitrary names, such as Go's `GOCACHE`); the A/B evidence measured on 2026-09-02 is in `docs/internal/scanner-ab-2026-09-02.md` and does not yet meet the design document's promotion criteria (a one-shot `sbh scan` of a large project tree costs v2 3.4x the CPU of v1 because of its opaque-root size probes, and the daemon's v2 steady state was a replay hot loop rather than a cheap rescan), so `engine = "v1"` remains available as the rollback.
@@ -1745,13 +1895,13 @@ The walker is the scanner's "eyes": it discovers candidate files and directories
 
 #### Work-Stealing Parallelism
 
-The walker uses an unbounded work queue shared across `N` worker threads (configurable via `scanner.parallelism`) and a bounded result channel (capacity <!-- claim:constants.walker.RESULT_CHANNEL_CAP -->10000<!-- /claim -->) back to the collector. Root paths are seeded into the queue, and each worker pulls a directory, processes its entries, and enqueues discovered subdirectories back onto the shared queue. Workers that find an empty queue wait briefly (50ms timeout) before checking whether all work is complete. This design provides natural load balancing — workers that finish fast directories steal work from threads processing slower ones — without requiring explicit work-stealing data structures.
+The walker uses an unbounded work queue shared across `N` worker threads (configurable via `scanner.parallelism`) and a bounded result channel (up to <!-- claim:constants.walker.RESULT_CHANNEL_CAP -->10000<!-- /claim --> entries) back to the collector. Root paths are seeded into the queue, and each worker pulls a directory, processes its entries, and enqueues discovered subdirectories back onto the shared queue. A worker sends its results in batches of up to <!-- claim:constants.walker.WALK_BATCH_ENTRIES -->64<!-- /claim -->, and sends whatever it holds before it waits for more work, so the collector waits once per batch instead of once per directory. Workers that find an empty queue wait briefly (50ms timeout) before checking whether all work is complete. This design provides natural load balancing — workers that finish fast directories steal work from threads processing slower ones — without requiring explicit work-stealing data structures.
 
 An atomic `in_flight` counter tracks work items that have been dequeued but not yet processed. When the last item completes (counter reaches zero), workers exit. The work queue is unbounded so workers never deadlock when enqueuing discovered subdirectories, while the result channel is bounded to prevent unbounded memory growth on deep trees.
 
 #### Per-Directory Iteration Cap
 
-Directories with tens of thousands of entries (e.g., `/data/tmp` with 60K+ children, `node_modules` flats) can monopolize a worker thread for seconds. Each directory is capped at <!-- claim:constants.walker.MAX_ENTRIES_PER_DIR -->65536<!-- /claim --> child entries. Structural signals (`.git`, `Cargo.lock`, `deps/`, `build/`) are detected early during iteration, so the cap rarely affects scoring accuracy. This prevents any single pathological directory from starving other workers.
+Directories with tens of thousands of entries (e.g., `/data/tmp` with 60K+ children, `node_modules` flats) can monopolize a worker thread for seconds. A pass stats and queues at most <!-- claim:constants.walker.MAX_ENTRIES_PER_DIR -->65536<!-- /claim --> entries of one directory. A directory with more is taken a window at a time: the next pass continues where this one stopped, and after the last entry the window starts over, so no entry is skipped on every pass. Every name in the listing, up to <!-- claim:constants.walker.MAX_NAMES_READ_PER_DIR -->1048576<!-- /claim -->, is still read: a `.sbh-protect` marker anywhere in it protects the directory, and structural signals (`.git`, `Cargo.lock`, `deps/`, `build/`) count wherever they appear. This keeps any single pathological directory from starving other workers.
 
 #### Open-File Detection
 
@@ -1861,7 +2011,7 @@ The self-monitor tracks daemon health from within, providing introspection data 
 
 With every `state.json` write (every <!-- claim:constants.daemon.DAEMON_STATE_WRITE_INTERVAL_SECS -->30<!-- /claim --> seconds, or on request from `sbh status`) the daemon also renders `metrics.prom` beside it, atomically and world-readable, in the Prometheus text exposition format. Point node_exporter's textfile collector at the data directory (`--collector.textfile.directory=/var/lib/sbh` for a system install) and the `sbh_*` families appear with no network surface and no new dependency; `sbh metrics` prints the same text for hosts without a collector.
 
-The families are a view of the state document, so they never disagree with `sbh status`: `sbh_up`, `sbh_info{version,git_sha,policy_mode,run_id}`, `sbh_daemon_uptime_seconds`, `sbh_daemon_cpu_seconds_total`, `sbh_daemon_rss_bytes`, `sbh_daemon_cpu_budget_used_ratio`, `sbh_daemon_cpu_budget_deficit_seconds`; per mount `sbh_mount_free_ratio`, `sbh_mount_pressure_level{level}` (one-hot), `sbh_mount_fill_rate_bytes_per_second`, `sbh_mount_seconds_to_red`, `sbh_mount_reclaim_capability{capability}`, `sbh_mount_controller_state{state}`, `sbh_ballast_present_bytes`, `sbh_ballast_target_bytes`, `sbh_quarantine_bytes`; `sbh_ballast_files{state}`, `sbh_ballast_releases_total`, `sbh_scans_total`, `sbh_deletions_total`, `sbh_bytes_freed_total`, `sbh_errors_total`, `sbh_log_events_dropped_total`, `sbh_last_scan_candidates`, `sbh_policy_mode{mode}` (one-hot), `sbh_policy_mode_seconds`, `sbh_thread_up{thread}`. Scan CPU seconds, per-engine scan counts and guard e-values are not exported yet because the state document does not carry them. `[telemetry] metrics_enabled = false` turns the export off and removes a stale file at startup.
+The families are a view of the state document, so they never disagree with `sbh status`: `sbh_up`, `sbh_info{version,git_sha,policy_mode,run_id}`, `sbh_daemon_uptime_seconds`, `sbh_daemon_cpu_seconds_total`, `sbh_daemon_rss_bytes`, `sbh_daemon_cpu_budget_used_ratio`, `sbh_daemon_cpu_budget_deficit_seconds`; per mount `sbh_mount_free_ratio`, `sbh_mount_pressure_level{level}` (one-hot), `sbh_mount_fill_rate_bytes_per_second`, `sbh_mount_seconds_to_red`, `sbh_mount_reclaim_capability{capability}`, `sbh_mount_controller_state{state}`, `sbh_ballast_present_bytes`, `sbh_ballast_target_bytes`, `sbh_quarantine_bytes`; `sbh_ballast_files{state}`, `sbh_ballast_releases_total`, `sbh_scans_total`, `sbh_deletions_total`, `sbh_bytes_freed_total`, `sbh_bytes_freed_basis{basis}` (one-hot: `observed`, or `estimated_allocated` / `estimated_upper_bound` where ext4 or btrfs frees blocks only at commit), `sbh_errors_total`, `sbh_log_events_dropped_total`, `sbh_last_scan_candidates`, `sbh_policy_mode{mode}` (one-hot), `sbh_policy_mode_seconds`, `sbh_thread_up{thread}`. Scan CPU seconds, per-engine scan counts and guard e-values are not exported yet because the state document does not carry them. `[telemetry] metrics_enabled = false` turns the export off and removes a stale file at startup.
 
 #### Thread Heartbeats
 
@@ -1873,9 +2023,9 @@ Thread statuses are reported in the state file and displayed on the dashboard Di
 
 #### RSS Memory Tracking
 
-The daemon samples its own RSS through the PAL `self_stats()` method on each state file write. Linux uses `/proc/self` data; macOS uses Mach task and libproc resource usage. If RSS exceeds the configured warning level (<!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> by default, matching the systemd `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->` directive on Linux), a warning is logged to stderr. The RSS value is included in the state file for external monitoring tools.
+The daemon samples its own RSS through the PAL `self_stats()` method on each state file write. Linux uses `/proc/self` data; macOS uses Mach task and libproc resource usage. If RSS exceeds the configured warning level (<!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->512 MiB<!-- /claim --> by default), a warning is logged to stderr when it crosses, then again hourly or after another 64 MiB of growth while it stays above. The RSS value is included in the state file for external monitoring tools.
 
-The daemon warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> of RSS and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim --> so the service manager restarts it clean; the generated systemd unit caps the cgroup at `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->`, which is the limit that binds in practice. Both keep `sbh` from competing with build workloads for memory; on machines with constrained RAM, lower them in the unit file (`sbh service --systemd reinstall-unit` rewrites it) or in `[telemetry]`.
+The daemon warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->512 MiB<!-- /claim --> of RSS and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->1 GiB<!-- /claim --> so the service manager restarts it clean; the generated systemd unit caps the cgroup at `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->4096M<!-- /claim -->`, above that hard limit, so the daemon's own clean exit comes before the kernel's OOM kill (which could land mid-deletion). The RSS limit is what keeps `sbh` from competing with build workloads for memory. The cgroup is also charged for the dentry and inode cache the walker fills, which is reclaimable and never shows in RSS; a cap too close to the RSS limit leaves the daemon reclaiming its own cache instead of working (one large host spent most of its time stalled on memory under `MemoryMax=768M`, and its monitor tick stretched to minutes). On machines with constrained RAM, lower the RSS limits in `[telemetry]`, or the cap in the unit file (`sbh service --systemd reinstall-unit` rewrites it).
 
 #### State File Protocol
 
@@ -1950,9 +2100,10 @@ This keeps `sbh` at background priority. System-scope systemd units also add a c
 - `LimitNOFILE=4096` — caps file descriptor count
 
 **Resource limits:**
-- `MemoryMax=256M` — hard memory ceiling enforced by the cgroup controller
+- `MemoryMax=4096M` — cgroup ceiling, set above the daemon's own 1 GiB exit so a clean restart comes first, with room for the walker's reclaimable dentry/inode cache, which the cgroup is charged for
 - `CPUQuota=100%` — caps CPU at one core as a runaway backstop
 - `CPUWeight=1` — the lowest CPU share, so builds win whenever cores are busy
+- `Environment=MALLOC_ARENA_MAX=2` — two glibc malloc arenas rather than one per scanner thread, so on a large tree RSS stays near the live set instead of settling at about twice it
 
 **Lifecycle:**
 - `Type=notify` (system scope) with `WatchdogSec=60` for automatic restart on stall
@@ -2310,8 +2461,8 @@ For test harness conventions and structured logging registration, see `docs/test
 - If using systemd with `Type=notify`, the watchdog will auto-restart after 60 seconds of no heartbeat.
 
 ### "Memory usage keeps growing"
-- The daemon warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> of RSS and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim -->; the systemd unit caps it at `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->`. Check `sbh status --json | jq '.memory_rss_bytes'`.
-- Systemd's `MemoryMax=256M` provides a hard ceiling.
+- The daemon warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->512 MiB<!-- /claim --> of RSS and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->1 GiB<!-- /claim -->; the systemd unit caps it at `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->4096M<!-- /claim -->`. Check `sbh status --json | jq '.memory_rss_bytes'`.
+- Systemd's `MemoryMax=4096M` is a backstop above the daemon's own exit. The cgroup's `memory.current` also counts the kernel's dentry/inode cache from scanning, so it runs well above RSS on large trees; that cache is reclaimable. A unit or drop-in that still sets `MemoryMax=768M` (generated before v0.7.10) can leave the daemon stalled on memory: check `memory.pressure` in its cgroup.
 - Large candidate scan indexes on machines with many directories can increase baseline memory. Consider reducing `scanner.root_paths` scope.
 
 ## Limitations
@@ -2319,7 +2470,7 @@ For test harness conventions and structured logging registration, see `docs/test
 - Process attribution relies on platform-specific process inspection and may be reduced on restricted environments.
 - Extremely bursty workloads may require tighter sample intervals and controller tuning.
 - Network and ephemeral filesystems are intentionally conservative for ballast and cleanup safety.
-- Ballast reserve cannot exceed the reserve floor (`max(orange_min_free_pct, red_min_free_pct + 2%)`); on volumes below the floor, ballast provisioning is deferred and catalog roots serve as the fallback.
+- Ballast provisioning never takes a volume below the provisioning floor (`yellow_min_free_pct + hysteresis_pct` with the default matrix; see The Ballast System in Depth); on volumes below the floor, ballast provisioning is deferred and catalog roots serve as the fallback.
 
 ## FAQ
 
@@ -2348,7 +2499,7 @@ Send `SIGUSR1` to the daemon: `kill -USR1 $(pidof sbh)`. This bypasses the VOI s
 Yes. The v2 candidate index (`src/scanner/index.rs`, persisted to `scanner-index-v2.json`) records event generations, candidate records, and SHA-256 checksums across restarts under `scanner.engine = "v2"` (default since v0.4.32). If the checkpoint is corrupt or missing, v2 rebuilds through bounded reconciliation. (The legacy `src/scanner/merkle.rs` implementation remains in the repository as reference code but is not active in the live daemon.)
 
 ### How much memory does `sbh` use?
-Under normal operation, 20-60 MB of RSS. The systemd unit's `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->` is the binding cap; the daemon's own self-monitor warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim --> (which only binds without a cgroup cap, as on launchd). Machines with hundreds of thousands of directories in watched paths will use more due to the candidate scan index.
+Under normal operation, 20-60 MB of RSS. The daemon's own self-monitor warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->512 MiB<!-- /claim --> and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->1 GiB<!-- /claim -->; the systemd unit's `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->4096M<!-- /claim -->` is a backstop above that. Machines with hundreds of thousands of directories in watched paths use more: a host scanning about 470k entries per pass ran at 260–410 MiB over six hours with two malloc arenas, and one whose passes stopped at 500k entries settled at 460–490 MiB and passed 545 MiB at the end of a pass once its cgroup no longer pushed pages into swap.
 
 ### Is this Linux-only?
 No. It is cross-platform, with service integration for `systemd` (Linux) and `launchd` (macOS). Open-file vetoes are platform-specific internally: Linux uses `/proc/*/fd`, while macOS uses PAL/libproc evidence for visible processes. Other safety layers, including age, sacred-path, protected-path, active executable/mmap, and `.git` guards, remain active on both platforms.

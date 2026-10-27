@@ -6,14 +6,14 @@
 use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::core::errors::Result;
 use crate::platform::macos::libproc::{
-    ProcFdInfo, ProcFdType, ProcRegionWithPathInfo, ProcTaskAllInfo, VnodeFdInfoWithPath,
-    proc_listpids_safe, proc_pid_command_line, proc_pid_list_fds, proc_pid_region_path,
-    proc_pid_rusage_v4_safe, proc_pidfdinfo_vnode_path, proc_pidinfo_task_all, proc_pidpath_safe,
+    ProcFdInfo, ProcFdType, ProcTaskAllInfo, VnodeFdInfoWithPath, proc_listpids_safe,
+    proc_pid_command_line, proc_pid_list_fds, proc_pid_rusage_v4_safe, proc_pidfdinfo_vnode_path,
+    proc_pidinfo_task_all, proc_pidpath_safe,
 };
 use crate::platform::macos::sacred_catalog::platform_macos_sacred_paths;
 use crate::platform::macos::sys::{
@@ -32,12 +32,15 @@ use crate::platform::types::{
 };
 use parking_lot::RwLock;
 
+mod executables;
+mod mappings;
+mod references;
+
 const FDA_CACHE_TTL_SECS: u64 = 60;
 const FDA_CACHE_TTL: Duration = Duration::from_secs(FDA_CACHE_TTL_SECS);
 const OPEN_FILES_CACHE_TTL_SECS: u64 = 30;
 const OPEN_FILES_CACHE_TTL: Duration = Duration::from_secs(OPEN_FILES_CACHE_TTL_SECS);
 const OPEN_FILES_CACHE_MAX_ENTRIES: usize = 64;
-const MMAP_REGIONS_SCAN_TIMEOUT: Duration = Duration::from_secs(12);
 const MEMORY_PRESSURE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 static FDA_STATUS_CACHE: OnceLock<RwLock<Option<(Instant, FullDiskAccessStatus)>>> =
     OnceLock::new();
@@ -199,6 +202,10 @@ impl Platform for MacOsPal {
         super::build_directories::collect()
     }
 
+    fn build_directories_in_use_checked(&self) -> (Vec<(i32, PathBuf)>, bool) {
+        super::build_directories::collect_checked()
+    }
+
     fn process_io(&self, pid: i32) -> Result<ProcessIo> {
         let usage = proc_pid_rusage_v4_safe(pid)
             .map_err(|error| macos_method_error("process_io", &error))?;
@@ -216,62 +223,33 @@ impl Platform for MacOsPal {
         cached_open_files_under(&root)
     }
 
-    fn executables_under(&self, path: &Path) -> Result<ExecutablesResult> {
-        let root = process_observed_path(path);
-        let root_variants = macos_process_path_variants(&root);
-        let mut processes: Vec<ProcessInfo> = Vec::new();
-        let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
-        let mut incomplete = false;
+    /// Mutation preflight and active-reference scoring need one fresh sweep
+    /// for the full candidate set, never cached per-root absence verdicts.
+    fn open_files_under_roots(&self, roots: &[PathBuf]) -> Result<OpenFilesResult> {
+        references::collect(roots)
+            .map_err(|error| macos_method_error("open_files_under_roots", &error))
+    }
 
-        for (pids_scanned, pid) in process_pids_current_first()
-            .map_err(|error| macos_method_error("executables_under", &error))?
-            .into_iter()
-            .enumerate()
-        {
-            if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
-                incomplete = true;
-                break;
-            }
-            if let Some(process) = process_info_for_pid_without_command_line(pid)
-                && executable_is_under(&process, &root_variants)
-            {
-                processes.push(process);
-            }
-        }
-        processes.sort_by(|left, right| {
-            left.pid
-                .cmp(&right.pid)
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        Ok(ExecutablesResult {
-            processes,
-            complete: !incomplete,
-        })
+    fn executables_under(&self, path: &Path) -> Result<ExecutablesResult> {
+        self.executables_under_roots(&[path.to_path_buf()])
+    }
+
+    /// Query executable paths once for the whole scope and preserve failures
+    /// as incomplete coverage instead of dropping unavailable process records.
+    fn executables_under_roots(&self, roots: &[PathBuf]) -> Result<ExecutablesResult> {
+        executables::collect(roots)
+            .map_err(|error| macos_method_error("executables_under_roots", &error))
     }
 
     fn mmap_regions_under(&self, path: &Path) -> Result<Vec<MappedRegion>> {
-        let root = process_observed_path(path);
-        let root_variants = macos_process_path_variants(&root);
-        let deadline = Instant::now() + MMAP_REGIONS_SCAN_TIMEOUT;
-        let mut regions = Vec::new();
-        for pid in process_pids_current_first()
-            .map_err(|error| macos_method_error("mmap_regions_under", &error))?
-        {
-            if Instant::now() >= deadline {
-                return Err(macos_scan_timeout(
-                    "mmap_regions_under",
-                    MMAP_REGIONS_SCAN_TIMEOUT,
-                ));
-            }
-            regions.extend(mapped_regions_for_pid_under(pid, &root_variants, deadline)?);
-        }
-        regions.sort_by(|left, right| {
-            left.pid
-                .cmp(&right.pid)
-                .then_with(|| left.start_address.cmp(&right.start_address))
-                .then_with(|| left.path.cmp(&right.path))
-        });
-        Ok(regions)
+        self.mmap_regions_under_roots(&[path.to_path_buf()])
+    }
+
+    /// The Vec API cannot label partial coverage. Refuse failed or truncated
+    /// observations, with one fresh budget and bounded caller wait for all roots.
+    fn mmap_regions_under_roots(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+        mappings::collect(roots)
+            .map_err(|error| macos_method_error("mmap_regions_under_roots", &error))
     }
 
     fn self_stats(&self) -> Result<SelfStats> {
@@ -381,6 +359,7 @@ fn cached_open_files_under(root: &Path) -> Result<OpenFilesResult> {
             return Ok(OpenFilesResult {
                 files: entry.open_files.clone(),
                 complete: entry.complete,
+                incomplete_reason: None,
             });
         }
     }
@@ -435,6 +414,7 @@ fn collect_open_files_under(root: &Path) -> Result<OpenFilesResult> {
     Ok(OpenFilesResult {
         files: open_files,
         complete: !incomplete,
+        incomplete_reason: None,
     })
 }
 
@@ -443,13 +423,6 @@ fn macos_method_error(
     error: &impl ToString,
 ) -> crate::core::errors::SbhError {
     PalError::method_failed("macos", method, error.to_string()).into()
-}
-
-fn macos_scan_timeout(method: &'static str, timeout: Duration) -> crate::core::errors::SbhError {
-    macos_method_error(
-        method,
-        &format!("{method} exceeded {timeout:?} scan budget"),
-    )
 }
 
 fn macos_total_memory_bytes(method: &'static str) -> Result<u64> {
@@ -549,7 +522,7 @@ fn spawn_native_memory_pressure_subscription(
 fn memory_pressure_from_dispatch_event(event: sbh_mach::MemoryPressureEvent) -> MemoryPressure {
     let dispatch_level = memory_pressure_level_from_dispatch_event(event);
     let mut pressure = read_current_memory_pressure("subscribe_memory_pressure.dispatch")
-        .unwrap_or_else(|_| empty_dispatch_memory_pressure(dispatch_level));
+        .unwrap_or_else(|_| empty_memory_pressure(dispatch_level));
     if dispatch_level != MemoryPressureLevel::Unknown {
         pressure.level = dispatch_level;
     }
@@ -567,7 +540,7 @@ fn memory_pressure_level_from_dispatch_event(
     }
 }
 
-fn empty_dispatch_memory_pressure(level: MemoryPressureLevel) -> MemoryPressure {
+fn empty_memory_pressure(level: MemoryPressureLevel) -> MemoryPressure {
     MemoryPressure {
         level,
         free_pages: None,
@@ -589,32 +562,57 @@ fn spawn_memory_pressure_subscription<F>(
 where
     F: Fn() -> Result<MemoryPressure> + Send + 'static,
 {
-    let initial = sampler()?;
+    let initial = sampler().unwrap_or_else(|_| empty_memory_pressure(MemoryPressureLevel::Unknown));
     let liveness = Arc::new(());
     let weak_liveness = Arc::downgrade(&liveness);
     let thread_name = format!("sbh-{source}");
     let thread = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let mut last_level = initial.level;
-            loop {
-                std::thread::sleep(interval);
-                if weak_liveness.upgrade().is_none() {
-                    break;
-                }
-                let Ok(pressure) = sampler() else {
-                    continue;
-                };
-                if pressure.level != last_level {
-                    last_level = pressure.level;
-                    callback(pressure);
-                }
-            }
+            polling_subscription_loop(
+                initial,
+                &weak_liveness,
+                || std::thread::sleep(interval),
+                sampler,
+                callback,
+            );
         })
         .map_err(|error| macos_method_error("subscribe_memory_pressure", &error))?;
     drop(thread);
 
     Ok(SubscriptionHandle::active_with_liveness(source, liveness))
+}
+
+/// Publish the subscription's own seed even if the daemon's earlier sample
+/// differed. Missing evidence clears stale counters and recovers on a later
+/// sample; steady levels are delivered only once.
+fn polling_subscription_loop(
+    initial: MemoryPressure,
+    liveness: &Weak<()>,
+    mut wait: impl FnMut(),
+    mut sampler: impl FnMut() -> Result<MemoryPressure>,
+    mut callback: impl FnMut(MemoryPressure),
+) {
+    let mut last_level = initial.level;
+    if liveness.upgrade().is_some() {
+        callback(initial);
+    }
+    while liveness.upgrade().is_some() {
+        wait();
+        if liveness.upgrade().is_none() {
+            break;
+        }
+        let pressure =
+            sampler().unwrap_or_else(|_| empty_memory_pressure(MemoryPressureLevel::Unknown));
+        // Sampling may finish after shutdown. Do not publish that late result.
+        if liveness.upgrade().is_none() {
+            break;
+        }
+        if pressure.level != last_level {
+            last_level = pressure.level;
+            callback(pressure);
+        }
+    }
 }
 
 fn total_pages(total_bytes: u64, page_size_bytes: u64) -> u64 {
@@ -1038,25 +1036,6 @@ fn nanos_to_micros(nanos: u64) -> u64 {
     nanos / 1_000
 }
 
-fn process_pids_current_first() -> io::Result<Vec<i32>> {
-    let current_pid = current_process_pid();
-    let mut pids: Vec<i32> = proc_listpids_safe()?
-        .into_iter()
-        .filter(|pid| *pid > 0)
-        .collect();
-    pids.sort_by_key(|pid| (*pid != current_pid, *pid));
-    pids.dedup();
-    Ok(pids)
-}
-
-fn executable_is_under(process: &ProcessInfo, root_variants: &[PathBuf]) -> bool {
-    process
-        .executable
-        .as_deref()
-        .and_then(|path| observed_process_path_under_root(path, root_variants))
-        .is_some()
-}
-
 fn open_files_for_pid_under(pid: i32, root: &Path) -> Vec<OpenFile> {
     let Ok(fds) = proc_pid_list_fds(pid) else {
         return Vec::new();
@@ -1127,61 +1106,6 @@ fn open_file_mode(open_flags: u32) -> OpenFileMode {
         (false, true) => OpenFileMode::Write,
         (false, false) => OpenFileMode::Unknown,
     }
-}
-
-fn mapped_regions_for_pid_under(
-    pid: i32,
-    root_variants: &[PathBuf],
-    deadline: Instant,
-) -> Result<Vec<MappedRegion>> {
-    const MAX_REGIONS_PER_PID: usize = 16_384;
-
-    let mut address = 0;
-    let mut regions = Vec::new();
-    for _ in 0..MAX_REGIONS_PER_PID {
-        if Instant::now() >= deadline {
-            return Err(macos_scan_timeout(
-                "mmap_regions_under",
-                MMAP_REGIONS_SCAN_TIMEOUT,
-            ));
-        }
-        let Ok(info) = proc_pid_region_path(pid, address) else {
-            break;
-        };
-        let start = info.prp_prinfo.pri_address;
-        let size = info.prp_prinfo.pri_size;
-        if size == 0 {
-            break;
-        }
-        if let Some(region) = mapped_region_under(pid, &info, root_variants) {
-            regions.push(region);
-        }
-        let Some(next_address) = start.checked_add(size) else {
-            break;
-        };
-        if next_address <= address {
-            break;
-        }
-        address = next_address;
-    }
-    Ok(regions)
-}
-
-fn mapped_region_under(
-    pid: i32,
-    info: &ProcRegionWithPathInfo,
-    root_variants: &[PathBuf],
-) -> Option<MappedRegion> {
-    let path = observed_process_path_under_root(info.prp_vip.path().ok()?, root_variants)?;
-    let start = info.prp_prinfo.pri_address;
-    let end = start.checked_add(info.prp_prinfo.pri_size);
-    Some(MappedRegion {
-        pid,
-        path,
-        start_address: Some(start),
-        end_address: end,
-        protection: Some(region_protection(info.prp_prinfo.pri_protection)),
-    })
 }
 
 #[cfg(test)]
@@ -1285,7 +1209,7 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, mpsc};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use crate::platform::macos::sys::{
         ApfsContainer, ApfsInventory, ApfsVolume, ApfsVolumeRole,
@@ -1512,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_pressure_subscription_reports_level_transitions() {
+    fn memory_pressure_subscription_reports_initial_state_and_level_transitions() {
         let samples = Arc::new(Mutex::new(VecDeque::from([
             test_memory_pressure(MemoryPressureLevel::Normal),
             test_memory_pressure(MemoryPressureLevel::Warn),
@@ -1543,6 +1467,11 @@ mod tests {
         assert_eq!(handle.source, "test-memory-pressure");
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(1))
+                .expect("initial normal observation"),
+            MemoryPressureLevel::Normal,
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
                 .expect("warn transition"),
             MemoryPressureLevel::Warn,
         );
@@ -1552,6 +1481,195 @@ mod tests {
             MemoryPressureLevel::Critical,
         );
         drop(handle);
+    }
+
+    fn polling_subscription_updates(
+        initial: MemoryPressure,
+        samples: Vec<super::Result<MemoryPressure>>,
+    ) -> Vec<MemoryPressure> {
+        use std::cell::RefCell;
+
+        let owner = RefCell::new(Some(Arc::new(())));
+        let liveness = Arc::downgrade(owner.borrow().as_ref().unwrap());
+        let samples = RefCell::new(VecDeque::from(samples));
+        let mut updates = Vec::new();
+        super::polling_subscription_loop(
+            initial,
+            &liveness,
+            || {
+                if samples.borrow().is_empty() {
+                    drop(owner.borrow_mut().take());
+                }
+            },
+            || samples.borrow_mut().pop_front().unwrap(),
+            |pressure| updates.push(pressure),
+        );
+        updates
+    }
+
+    fn unavailable_memory_pressure_sample() -> super::Result<MemoryPressure> {
+        Err(super::macos_method_error(
+            "memory_pressure_test",
+            &"injected memory read failure",
+        ))
+    }
+
+    #[test]
+    fn steady_polling_corrects_a_different_daemon_startup_sample_once() {
+        for (daemon_seed, subscription_seed) in [
+            (MemoryPressureLevel::Normal, MemoryPressureLevel::Critical),
+            (MemoryPressureLevel::Unknown, MemoryPressureLevel::Normal),
+            (MemoryPressureLevel::Critical, MemoryPressureLevel::Normal),
+        ] {
+            let updates = polling_subscription_updates(
+                test_memory_pressure(subscription_seed),
+                (0..3)
+                    .map(|_| Ok(test_memory_pressure(subscription_seed)))
+                    .collect(),
+            );
+            let mut observed = daemon_seed;
+            for sample in &updates {
+                observed = sample.level;
+            }
+            assert_eq!(observed, subscription_seed, "startup was {daemon_seed:?}");
+            assert_eq!(updates.len(), 1, "steady samples must not spam callbacks");
+            assert_eq!(updates[0].page_size_bytes, Some(4096));
+        }
+    }
+
+    #[test]
+    fn polling_failures_clear_stale_evidence_once_and_report_recovery() {
+        let initial = MemoryPressure {
+            free_pages: Some(10),
+            used_pages: Some(90),
+            compressor_used_bytes: Some(100),
+            swap_total_bytes: Some(200),
+            swap_used_bytes: Some(50),
+            ..test_memory_pressure(MemoryPressureLevel::Normal)
+        };
+        let updates = polling_subscription_updates(
+            initial.clone(),
+            vec![
+                unavailable_memory_pressure_sample(),
+                unavailable_memory_pressure_sample(),
+                Ok(initial.clone()),
+                Ok(initial.clone()),
+            ],
+        );
+        assert_eq!(updates.len(), 3);
+        assert_eq!(updates[0], initial);
+        assert_eq!(
+            updates[1],
+            MemoryPressure {
+                level: MemoryPressureLevel::Unknown,
+                free_pages: None,
+                used_pages: None,
+                page_size_bytes: None,
+                compressor_used_bytes: None,
+                swap_total_bytes: None,
+                swap_used_bytes: None,
+                linux_psi_avg10: None,
+            }
+        );
+        assert_eq!(updates[2], initial);
+    }
+
+    #[test]
+    fn polling_subscription_survives_an_unreadable_initial_sample() {
+        let samples = Arc::new(Mutex::new(VecDeque::from([
+            unavailable_memory_pressure_sample(),
+            Ok(test_memory_pressure(MemoryPressureLevel::Normal)),
+        ])));
+        let (tx, rx) = mpsc::channel();
+        let handle = super::spawn_memory_pressure_subscription(
+            "test-memory-pressure-recovery",
+            Duration::from_millis(1),
+            Box::new(move |pressure| {
+                let _ = tx.send(pressure.level);
+            }),
+            move || {
+                samples
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| Ok(test_memory_pressure(MemoryPressureLevel::Normal)))
+            },
+        )
+        .expect("a transient read failure must not prevent polling from starting");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            MemoryPressureLevel::Unknown
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            MemoryPressureLevel::Normal
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn polling_cancellation_before_start_discards_the_initial_sample() {
+        let owner = Arc::new(());
+        let liveness = Arc::downgrade(&owner);
+        drop(owner);
+        super::polling_subscription_loop(
+            test_memory_pressure(MemoryPressureLevel::Critical),
+            &liveness,
+            || panic!("an abandoned subscription must not wait"),
+            || panic!("an abandoned subscription must not sample"),
+            |_| panic!("an abandoned subscription must not publish its seed"),
+        );
+    }
+
+    #[test]
+    fn polling_cancellation_from_initial_callback_stops_before_waiting() {
+        let mut owner = Some(Arc::new(()));
+        let liveness = Arc::downgrade(owner.as_ref().unwrap());
+        let mut updates = Vec::new();
+        super::polling_subscription_loop(
+            test_memory_pressure(MemoryPressureLevel::Critical),
+            &liveness,
+            || panic!("initial callback ended the subscription before waiting"),
+            || panic!("initial callback ended the subscription before sampling"),
+            |pressure| {
+                updates.push(pressure.level);
+                drop(owner.take());
+            },
+        );
+        assert_eq!(updates, vec![MemoryPressureLevel::Critical]);
+    }
+
+    #[test]
+    fn polling_cancellation_during_wait_stops_before_sampling() {
+        let mut owner = Some(Arc::new(()));
+        let liveness = Arc::downgrade(owner.as_ref().unwrap());
+        let mut updates = Vec::new();
+        super::polling_subscription_loop(
+            test_memory_pressure(MemoryPressureLevel::Normal),
+            &liveness,
+            || drop(owner.take()),
+            || panic!("subscription ended while waiting"),
+            |pressure| updates.push(pressure.level),
+        );
+        assert_eq!(updates, vec![MemoryPressureLevel::Normal]);
+    }
+
+    #[test]
+    fn polling_cancellation_during_sampling_discards_the_late_result() {
+        let mut owner = Some(Arc::new(()));
+        let liveness = Arc::downgrade(owner.as_ref().unwrap());
+        let mut updates = Vec::new();
+        super::polling_subscription_loop(
+            test_memory_pressure(MemoryPressureLevel::Normal),
+            &liveness,
+            || {},
+            || {
+                drop(owner.take());
+                Ok(test_memory_pressure(MemoryPressureLevel::Critical))
+            },
+            |pressure| updates.push(pressure.level),
+        );
+        assert_eq!(updates, vec![MemoryPressureLevel::Normal]);
     }
 
     #[test]
@@ -2250,12 +2368,8 @@ mod tests {
             std::fs::canonicalize(&current_exe).expect("current executable should canonicalize");
 
         let root_variants = super::macos_process_path_variants(root);
-        let regions = super::mapped_regions_for_pid_under(
-            super::current_process_pid(),
-            &root_variants,
-            Instant::now() + super::MMAP_REGIONS_SCAN_TIMEOUT,
-        )
-        .expect("current process macOS mapped region scan should be readable");
+        let regions = super::mappings::collect_pid(super::current_process_pid(), &root_variants)
+            .expect("current process macOS mapped region scan should be readable");
 
         assert!(regions.iter().any(|region| {
             region.pid == super::current_process_pid()

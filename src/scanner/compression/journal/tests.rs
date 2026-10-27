@@ -32,6 +32,27 @@ fn intent_only() -> (tempfile::TempDir, PathBuf, PathBuf) {
     (temp, journal, report.path)
 }
 
+fn private_store(temp: &tempfile::TempDir) -> PathBuf {
+    let directory = temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("compression-journal");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    directory
+}
+
+fn private_history(path: &Path) -> File {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap()
+}
+
 #[test]
 fn constructing_and_finishing_an_unused_session_writes_nothing() {
     let (temp, mut session, _, _) = fixture();
@@ -205,6 +226,152 @@ fn refused_journal_creation_never_modifies_the_selected_file() {
 }
 
 #[test]
+fn store_capacity_reserves_one_full_run_and_one_file_without_overflow() {
+    use writer::{MAX_STORE_BYTES, MAX_STORE_FILES, require_store_capacity};
+
+    assert!(
+        require_store_capacity(MAX_STORE_FILES - 1, MAX_STORE_BYTES - MAX_JOURNAL_BYTES).is_ok()
+    );
+    assert!(
+        require_store_capacity(MAX_STORE_FILES, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("4096-file")
+    );
+    for bytes in [MAX_STORE_BYTES - MAX_JOURNAL_BYTES + 1, u64::MAX] {
+        assert!(
+            require_store_capacity(0, bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("1 GiB")
+        );
+    }
+}
+
+#[test]
+fn aggregate_limit_counts_sparse_history_before_creating_a_run() {
+    for excess in [0, 1] {
+        let (temp, mut session, file, mut item) = fixture();
+        let directory = private_store(&temp);
+        let path = directory.join("unfinished.jsonl");
+        let mut previous = private_history(&path);
+        let evidence = b"unfinished history must remain available";
+        previous.write_all(evidence).unwrap();
+        let size = writer::MAX_STORE_BYTES - MAX_JOURNAL_BYTES + excess;
+        previous.set_len(size).unwrap();
+        let identity = Identity::read(&previous).unwrap();
+
+        let result = session.prepare(&mut item, &file);
+        if excess == 0 {
+            result.unwrap();
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        } else {
+            assert!(result.unwrap_err().to_string().contains("1 GiB"));
+            assert!(session.failed());
+            assert!(session.path().is_none());
+            assert!(item.operation_id.is_none());
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        }
+        assert!(!item.mutation_attempted);
+        assert_eq!(fs::read(&item.path).unwrap(), b"abc");
+        assert_eq!(Identity::read(&previous).unwrap(), identity);
+        let mut retained = vec![0; evidence.len()];
+        previous.read_exact_at(&mut retained, 0).unwrap();
+        assert_eq!(retained, evidence);
+    }
+}
+
+#[test]
+fn an_active_store_reservation_refuses_a_second_writer_without_creating_a_file() {
+    let (temp, mut first, file, mut item) = fixture();
+    first.prepare(&mut item, &file).unwrap();
+    let path = first.path().unwrap().to_path_buf();
+    let history = fs::read(&path).unwrap();
+    let directory = path.parent().unwrap();
+    let mut second = AuditSession::new(directory.to_path_buf(), 1, &CompressionPolicy::default());
+    let mut other = item.clone();
+    other.operation_id = None;
+    let error = second.prepare(&mut other, &file).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert!(error.to_string().contains("live writer"));
+    assert!(second.failed());
+    assert!(other.operation_id.is_none());
+    assert_eq!(fs::read_dir(directory).unwrap().count(), 1);
+    assert_eq!(fs::read(&path).unwrap(), history);
+    assert_eq!(fs::read(temp.path().join("cold.bin")).unwrap(), b"abc");
+}
+
+#[test]
+fn a_live_legacy_file_lock_refuses_admission_and_constructor_failure_releases_the_store() {
+    let (temp, mut first, file, mut item) = fixture();
+    let directory = private_store(&temp);
+    let path = directory.join("older-writer.jsonl");
+    let mut older = private_history(&path);
+    older.write_all(b"legacy writer still running").unwrap();
+    older.lock().unwrap();
+    let error = first.prepare(&mut item, &file).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert!(error.to_string().contains("live writer"));
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+    assert!(item.operation_id.is_none());
+    older.unlock().unwrap();
+
+    let mut second = AuditSession::new(directory, 1, &CompressionPolicy::default());
+    second.prepare(&mut item, &file).unwrap();
+    assert_eq!(fs::read(path).unwrap(), b"legacy writer still running");
+    assert_eq!(fs::read(&item.path).unwrap(), b"abc");
+}
+
+#[test]
+fn uncertain_store_entries_are_never_followed_repaired_or_removed() {
+    for kind in ["symlink", "fifo", "directory", "public", "hardlink"] {
+        let (temp, mut session, file, mut item) = fixture();
+        let directory = private_store(&temp);
+        let entry = directory.join("unexpected");
+        let outside = temp.path().join("precious");
+        fs::write(&outside, b"keep unrelated data").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        match kind {
+            "symlink" => std::os::unix::fs::symlink(&outside, &entry).unwrap(),
+            "fifo" => nix::unistd::mkfifo(&entry, nix::sys::stat::Mode::S_IRUSR).unwrap(),
+            "directory" => fs::create_dir(&entry).unwrap(),
+            "public" => {
+                private_history(&entry);
+                fs::set_permissions(&entry, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            "hardlink" => fs::hard_link(&outside, &entry).unwrap(),
+            _ => unreachable!(),
+        }
+        let before = fs::symlink_metadata(&entry).unwrap();
+        assert!(session.prepare(&mut item, &file).is_err(), "{kind}");
+        assert!(session.failed());
+        assert!(item.operation_id.is_none());
+        assert!(!item.mutation_attempted);
+        let after = fs::symlink_metadata(&entry).unwrap();
+        assert_eq!(
+            (
+                after.dev(),
+                after.ino(),
+                after.mode(),
+                after.nlink(),
+                after.len()
+            ),
+            (
+                before.dev(),
+                before.ino(),
+                before.mode(),
+                before.nlink(),
+                before.len()
+            ),
+            "{kind} must remain untouched"
+        );
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 1);
+        assert_eq!(fs::read(outside).unwrap(), b"keep unrelated data");
+        assert_eq!(fs::read(&item.path).unwrap(), b"abc");
+    }
+}
+
+#[test]
 fn journal_permissions_are_private_and_are_never_repaired_by_widening() {
     let (temp, mut session, file, mut item) = fixture();
     let directory = temp.path().join("compression-journal");
@@ -352,4 +519,26 @@ fn recovery_waits_out_a_briefly_held_writer_lock_but_refuses_a_running_pass() {
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     assert!(error.to_string().contains("still running"), "{error}");
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn a_copied_writer_descriptor_does_not_make_a_finished_pass_look_live() {
+    let (_temp, mut session, file, mut item) = fixture();
+    session.prepare(&mut item, &file).unwrap();
+    let path = session.path().unwrap().to_path_buf();
+    let child_copy = session.journal_descriptor_copy().unwrap();
+    let directory_copy = session.directory_descriptor_copy().unwrap();
+    drop(session);
+    let started = Instant::now();
+    assert!(!recover(&path, 64, 30).unwrap().run_finished);
+    assert!(started.elapsed() < LIVE_LOCK_PATIENCE);
+    let mut next = AuditSession::new(
+        path.parent().unwrap().to_path_buf(),
+        1,
+        &CompressionPolicy::default(),
+    );
+    item.operation_id = None;
+    next.prepare(&mut item, &file).unwrap();
+    drop(directory_copy);
+    drop(child_copy);
 }

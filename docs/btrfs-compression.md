@@ -1,12 +1,17 @@
 # Lossless Btrfs compression
 
 `sbh compress` is an opt-in operator command for explicitly selected cold,
-unshared regular files. It does not delete files, truncate logs, change daemon
-policy, or enable automatic compression. Preview is the default:
+unshared regular files. It does not delete files, truncate logs or change daemon
+policy. The daemon compresses on its own only when `[compress]` is enabled (see
+[Daemon tier](#daemon-tier)). Preview is the default:
 
 ```sh
 sudo sbh --json compress -- /data/old-debug-binary /data/old-session.jsonl
 ```
+
+To select cold files beneath directories instead of naming them, use
+`--discover`, and add `--apply` to compress that selection in the same pass
+(`compression-discovery.md`).
 
 The native backend supports Linux x86-64 and AArch64 on Btrfs. Other filesystems
 are skipped and other operating systems report an unsupported no-op. Linux
@@ -41,6 +46,12 @@ already encoded, preallocated, inline, hard-linked, NOCOW, NOCOMP, immutable,
 append-only, and unknown extent layouts are excluded. An incomplete process
 inspection is not treated as an empty result.
 
+Compression's mmap checks require a new bounded process sweep; they never
+admit a rewrite using the scanner's cached absence evidence. Concurrent refresh
+or incomplete coverage blocks admission. Recent failed observations retain a
+30-second retry backoff to avoid repeated expensive scans, while continuing to
+refuse compression.
+
 Every apply pass holds a pinned, no-symlink descriptor. The exact inspection
 file descriptor is exempt from open-file checks; other descriptors in the same
 process, including redirected standard output, are not. Cooperating compression
@@ -58,8 +69,16 @@ chunks. Logical input limits bound work, not expected savings.
 Use `--min-size-bytes`, `--min-age-secs`, `--max-files`, `--max-bytes`,
 `--timeout-secs`, and `--min-free-bytes` to select limits. Safety floors refuse
 ages below one hour, reserves below 256 MiB, zero limits, more than 4096 files,
-or deadlines above one hour. A file larger than the remaining byte budget is
-skipped rather than partly admitted.
+or deadlines above one hour. Explicit-file execution skips any file larger than
+its remaining byte budget.
+
+Directory discovery preserves progress when its logical-byte allowance fills:
+a file that fits a fresh pass but not the remaining allowance ends the current
+page with a continuation before that file. Files larger than the whole allowance
+are explicitly excluded, so they cannot stall the walk. Known NOCOMP/inode-flag
+and shared-extent vetoes are filtered before selecting work. Other refused
+candidates also cannot hide later files indefinitely: discovery remains
+resumable even when the executor accepts none of an earlier page.
 
 An in-flight kernel operation cannot be forcibly interrupted by this deadline.
 After any attempted rewrite, content verification has its own 120-second
@@ -82,9 +101,26 @@ file's parent directory must already exist. The journal directory is private
 (mode 0700) and files are created exclusively (mode 0600); existing permissions
 are never widened. The new file, its directory, and the parent directory are
 synchronized before an intent can authorize a rewrite. Files are capped at
-32 MiB and individual records at 128 KiB. This feature does not automatically
-rotate, delete or prune audit history. Preview and no-eligible-input passes
+32 MiB and individual records at 128 KiB. Preview and no-eligible-input passes
 create no journal files or directories.
+
+A new run is admitted only when its full 32 MiB allowance fits within a 1 GiB
+store budget and the new file fits within a 4,096-file limit. Each existing file
+is charged by the larger of its logical length and allocated bytes; unfinished
+and unrecognized history counts too. A directory lock holds that budget
+reservation for the whole pass and serializes cooperating current-version
+writers. An existing journal with a live writer also blocks admission.
+Inspection uses descriptor-relative metadata without following symlinks, has a
+two-second cooperative budget, and refuses non-regular, non-private, foreign,
+multi-link or uninspectable entries. Filesystem operations themselves can take
+longer than the cooperative budget.
+
+At capacity, apply refuses before rewriting any input and asks the operator to
+archive reviewed completed journals. Existing audit history is never
+automatically rotated, deleted or pruned; interrupted-run evidence remains
+available for recovery. The reservation is an application admission limit,
+not disk-space preallocation or a filesystem quota against external writers
+or older binaries that do not honor the directory lock.
 
 The apply report includes `journal_path`, and each prepared file report includes
 an `operation_id`. To inspect a recorded or interrupted pass, as the same effective
@@ -144,10 +180,13 @@ and preserves uncertainty rather than converting verified contents into success.
 
 ## Validation and scope
 
-The dedicated Btrfs workflow contains dependency-free backend tests, application
-policy/journal/CLI tests, Linux UAPI assertions, and opt-in native tests on a
-disposable Btrfs loop mount. The native tests check byte preservation, size/mtime
-stability, physical allocation reduction, and reflink refusal. Journal tests
+The `native-btrfs` quality-gate stage (`scripts/quality-gate.sh --native`, or
+`scripts/dsr_native_checks.sh`, which dsr runs before a release) contains
+dependency-free backend tests, application policy/journal/CLI tests, Linux UAPI
+assertions, and opt-in native tests on a disposable Btrfs loop mount. The native
+tests check byte preservation, size/mtime stability, physical allocation
+reduction, reflink refusal, and that a file with an incompressible range is
+still compressed past it and keeps btrfs's no-compress mark. Journal tests
 exercise interrupted and torn records, locking, identity/hash changes, ownership,
 write/read budgets, failure poisoning, and native filename preservation. To run:
 
@@ -160,7 +199,72 @@ SBH_BTRFS_TEST_ROOT=/path/to/disposable/btrfs \
   cargo test --locked --manifest-path crates/sbh_btrfs/Cargo.toml -- --ignored
 ```
 
-Automatic Yellow/Orange pressure scheduling, persistent `[scanner.compress]`
-configuration, and integration into the shared activity-ledger/`sbh explain`
-interface remain separate unfinished work. The durable compression journal is
-not a fabricated deletion decision and does not enable automatic daemon writes.
+The durable compression journal is not a fabricated deletion decision.
+
+## Daemon tier
+
+With `[compress] enabled = true`, the daemon runs the same discover-then-apply
+pass on its own. A pass starts when a configured root sits on Btrfs whose mount
+is at or above `start_level` (default `yellow`), no pass is running, and
+`interval_minutes` (default 30) have passed since the last one started. Each
+pass is bounded by `[compress.policy]`: by default files idle for 24 hours and at
+least 16 MiB, at most 128 files and 8 GiB, and 300 seconds. Discovery resumes
+where the previous pass stopped. Every file outcome reaches the activity log, as
+for the CLI, and an `[SBH-COMPRESS]` line summarizes the pass and the referenced
+bytes saved. The tier never deletes anything, and never touches a root on another
+filesystem.
+
+```toml
+[compress]
+enabled = true
+roots = ["/data/tmp"]
+allow_zstd_feature = true   # required: the first zstd write sets COMPRESS_ZSTD
+start_level = "yellow"
+interval_minutes = 30
+
+[compress.policy]
+min_age_secs = 86400
+```
+
+Enabling the tier stands in for the CLI's `--quiescent`, which no daemon can
+promise on a shared host. Content stays protected by the checks every apply runs
+anyway:
+
+- the minimum idle age;
+- the open-file, executable and mmap vetoes, rechecked before the first chunk
+  and then at most every 5 seconds while a file is rewritten;
+- the protection markers and rules, the lease veto, the file stamp and the
+  root scope, rechecked before every chunk;
+- a SHA-256 re-read from disk after the rewrite, once the file's cached pages
+  are dropped (hashing them would compare the cache with itself); the mmap
+  veto runs once more just before it, since a mapped page is not dropped.
+
+The file is held through a read-only descriptor, which is all the defrag ioctl
+needs, so running it during the rewrite still works and closing it reports no
+modification. The tier runs only when the policy may change the filesystem: not
+in observe or fallback-safe mode, under the kill switch, or with
+`scanner.dry_run`. When the daemon enters one of these during a pass, the pass
+stops before its next file, or before the next chunk of the file it is
+rewriting.
+
+A file is started only while the pass has time left, and once started it is
+finished on its own allowance (a minute plus 4 MiB/s, at most an hour): a file
+left part-compressed can use more space than before, because the raw remainder
+of an extent keeps the whole original allocation. If a pass still stops inside
+a file (a process opens it, the free-space reserve is reached, the policy
+changes), a later pass finishes the raw remainder instead of skipping the file
+as compressed, and discovery leaves out files with nothing raw left.
+
+When part of a file does not compress, btrfs marks the inode no-compress (`m`
+in lsattr). The rest of that file is still compressed in the same pass: only
+a mark the file had before the pass started stops it. The mark is left in
+place, so later passes skip the file (NOCOMP is excluded) instead of rewriting
+its incompressible data every time. The cost: a file that got the mark and was
+then stopped part-way is not finished later.
+
+What you accept by enabling it is about space, not data: a snapshot or reflink
+made during a pass keeps the old extents alive, so those bytes are freed only
+when it goes away.
+
+The scheduling is in `src/daemon/compress_tier.rs`. `sbh daemon reload` applies
+config changes.

@@ -152,3 +152,55 @@ fn a_future_mtime_never_becomes_a_zero_hour_idle_claim() {
     assert!(report.complete);
     assert!(report.entries[0].idle_hours.is_none());
 }
+
+#[test]
+fn the_fullest_mount_is_probed_last_and_gets_what_small_mounts_leave() {
+    let small = tempfile::tempdir().unwrap();
+    let large = tempfile::tempdir().unwrap();
+    let small_root = small.path().canonicalize().unwrap();
+    let large_root = large.path().canonicalize().unwrap();
+    fs::write(small_root.join("runtime"), b"pid").unwrap();
+    let tree = large_root.join("repacked");
+    fs::create_dir(&tree).unwrap();
+    for index in 0..300 {
+        fs::write(tree.join(format!("lib{index}.rlib")), b"rlib").unwrap();
+    }
+    let mut fullest = mount(&large_root);
+    fullest.used_bytes = 1 << 30;
+    let mut runtime = mount(&small_root);
+    runtime.used_bytes = 4096;
+    // Callers pass mounts largest first. An even split of 310 entries would
+    // give the 301-entry mount 155 and an incomplete, understated tree.
+    let limits = AttributionLimits {
+        max_entries: 310,
+        ..Default::default()
+    };
+    let reports =
+        crate::monitor::ram_scratch::attribution::inspect(&[fullest, runtime], limits, deadline())
+            .unwrap();
+    assert_eq!(reports.len(), 2);
+    assert_eq!(reports[0].mount_path, large_root.to_str().unwrap());
+    assert!(reports[0].complete, "{:?}", reports[0]);
+    assert_eq!(reports[0].entries_examined, 301);
+    assert_eq!(reports[1].mount_path, small_root.to_str().unwrap());
+    assert!(reports[1].complete, "{:?}", reports[1]);
+}
+
+#[test]
+fn an_exhausted_entry_budget_is_reported_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    for name in ["a", "b", "c"] {
+        fs::create_dir(root.join(name)).unwrap();
+        fs::write(root.join(name).join("output"), b"keep").unwrap();
+    }
+    // The root's three names use the whole budget; each child then hits it.
+    let report = inspect(&mount(&root), AttributionLimits::default(), 3, deadline());
+    assert!(!report.complete);
+    let exhausted = report
+        .issues
+        .iter()
+        .filter(|issue| issue.contains("budget exhausted"))
+        .count();
+    assert_eq!(exhausted, 1, "{:?}", report.issues);
+}

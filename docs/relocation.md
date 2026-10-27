@@ -16,20 +16,46 @@ A unit becomes **eligible** when all of these hold:
   - **noatime mounts**: no read leaves a trace, so the evidence comes from the ledger. Every sweep records the units it finds unchanged and unheld. A unit qualifies once that record spans the whole window with no gap between sweeps longer than `max_gap_hours` (default 36). A gap restarts the window, because nothing was watching then. As a result, a noatime host can relocate nothing until the sweeps have run for 14 days.
 - No process holds it. This uses the same sweep the deletion executor uses: open files, working directories, executables, mappings, and the cargo home or target directory named by a live build. If the sweep is incomplete, the unit is treated as held.
 - It is readable throughout, contains no other mount, and fits in the walk budget.
-- No component of its path matches a never-relocate pattern. The built-in patterns are `.cargo`, `.rustup`, `.sbh`, `rch*`, `*cargo-cache*`, `*cargo_cache*`, `cass*`, `*agent_search*`, `*agent_mail*` and `*agent-mail*`. A quiet fortnight does not prove that a shared cache is dead.
-- Its marker does not say `relocatable = false`.
+- No component from its configured scratch root through any descendant matches a never-relocate pattern. The built-in patterns are `.cargo`, `.rustup`, `.sbh`, `rch*`, `*cargo-cache*`, `*cargo_cache*`, `cass*`, `*agent_search*`, `*agent_mail*` and `*agent-mail*`. A quiet fortnight does not prove that a shared cache is dead. A parent containing an excluded cache cannot move as a whole.
+- No marker on an ancestor within the configured scratch roots, on the unit itself, or anywhere below it says `relocatable = false`. A nested opt-out also protects every parent that would contain it in a move. A deeper `relocatable = true` cannot override it. Malformed, unreadable, oversized, and nonregular markers refuse permission rather than being treated as consent.
 
 When a whole marked tree is eligible, it moves as one unit. Otherwise, dormant children (and grandchildren) of a tree that is still in use elsewhere move on their own.
 
+Opt-outs and exclusions follow their own branch: a pinned child keeps its enclosing unit in place while a safe sibling can still qualify. Checks reach below `unit_depth`; that setting limits the units that can be selected, not how far protection is inspected. Overlapping roots cannot bypass an opt-out in their shared outer root. JSON candidate evidence includes `stats.relocation_veto` with the responsible path and reason. Empty markers and valid TOML or JSON metadata remain supported; marker reads on Linux preserve their access age.
+
 ## What `--apply` does
 
-1. rsync the unit to `<target>[/<host>]/<run stamp>/<original path>/`.
+1. Pin the source and its parent, collect bounded identity and content-change evidence, then rsync the opened source to `<target>[/<host>]/<run stamp>/<original path>/`.
 2. Verify with a checksum dry run. Any itemized difference aborts the move.
 3. Upload the relocation record next to the copy as `<copy>.sbh-relocated.json`.
-4. Rename the unit aside, so a writer that opens by path fails instead of writing into a tree that is about to go.
-5. Survey it and sweep processes again. If anything changed or holds it, the rename is undone.
-6. Put a stub at the original path: `RELOCATED.md`, `.sbh-relocated.json`, and the marker if the unit was the marked tree.
-7. Only then remove the original bytes.
+4. Renew the source evidence and rename the unit aside without replacing an existing recovery path, so a writer that opens by path fails instead of writing into a tree that is about to go.
+5. Renew relocation permission, survey it and sweep processes again. If anything changed, opted out, or holds it, the rename is undone.
+6. Build a private stub containing `RELOCATED.md`, `.sbh-relocated.json`, and the marker if the unit was the marked tree, then publish it atomically without replacing a newly occupied original path.
+7. Durably save the completed relocation in the ledger.
+8. Renew relocation permission, source evidence and stub evidence once more, then sweep processes again immediately before removing the original bytes through the pinned parent.
+
+The copy and checksum verification use the opened source directory throughout.
+Replacing the source name or moving its parent cannot redirect the transfer to
+another tree. Before renaming and removing the source, `--apply` renews its
+identity and compares a fingerprint of every descendant's name, device, inode,
+type, mode, ownership, link count, size, and nanosecond mtime/ctime. Matching file
+counts or an unchanged newest timestamp cannot hide a replaced child. Reads do
+not invalidate the evidence through atime; after the rename, only the source
+directory's expected ctime change is exempted.
+
+Evidence collection must finish within `max_entries`, 64 directory levels, and
+a 16 MiB budget for live filename storage. An exhausted budget, changed directory
+during inspection, or filesystem boundary refuses the move. These bounds limit
+the proof's working memory without retaining a manifest proportional to the
+whole tree.
+
+An existing `.<name>.sbh-relocating`, including a dangling symlink, is preserved.
+Stub files are created exclusively in a private `.sbh-relocation-stub-<random>`
+directory; publication and rollback never overwrite another occupant. A replaced
+source, moved parent, changed stub, or failed publication retains the available
+source, backup, and staging data. Error messages identify the opened directories'
+current recovery locations when their parent has moved. Only the source identity
+captured before copying is eligible for removal.
 
 Nothing is deleted before the copy verifies. To bring a tree back:
 
@@ -37,7 +63,19 @@ Nothing is deleted before the copy verifies. To bring a tree back:
 sudo sbh relocate --restore /dev/shm/old-scratch
 ```
 
-This copies the tree back next to the stub, verifies it, swaps it in, and keeps the backup copy.
+This copies the tree back next to the stub, verifies it, swaps it in, and keeps the backup copy and previous stub.
+
+Restore locks the opened stub directory for the entire attempt. A second restore of the same stub refuses immediately. Each attempt creates a private `0700` `.sbh-restore-<random>` directory beside the stub, with a `payload` directory for the copy. Existing `.name.sbh-restoring` and `.name.sbh-stub` paths are left intact. Copying uses the opened payload directory, so replacing its name or an ancestor pathname cannot redirect rsync into unrelated files.
+
+The relocation record must be a regular, non-symlink file of at most 1 MiB, name this exact stub, and use the supported schema. Before swapping, restore renews the stub identity, record contents, top-level entry evidence (bounded to 4,096 entries), and parent identity. Publication and rollback never replace a newly occupied original path. An interrupted or refused attempt retains its staging and names the recovery location, including when an ancestor was renamed.
+
+After a successful restore, the previous stub remains at `<private staging>/stub`, including any files written there since relocation. The command reports that path even for a pristine stub, because a process holding an old file or directory handle may still write into it. Failed attempts retain partial or verified data at `<private staging>/payload`; review that location when recovering or retrying a large transfer. The backup remains available throughout.
+
+If the completion ledger cannot be saved, the command reports failure and keeps all three recovery locations: the original tree at `.<name>.sbh-relocating`, the verified backup, and the restore stub. The error names those paths. Repair the state directory or ledger before continuing; the preserved original is not automatically removed.
+
+Permission is also renewed before the first copy starts. An owner can add an opt-out after planning or while a transfer runs. If a new veto appears after the stub and completion record are installed, the command reports failed removal and preserves the original aside, verified copy, and stub; its error names all three locations. No original bytes are removed on that refusal.
+
+The final policy walk also supplies the current content evidence, and the last process sweep runs after that walk. A tree changed or newly held since the earlier checks is preserved too. If content changed, the error distinguishes the earlier verified backup from the preserved source, which may now contain newer work; use the preserved source when recovering that work.
 
 ## Configuration: `/etc/sbh/relocation.toml`
 
@@ -69,11 +107,15 @@ command="/usr/bin/rrsync /bulk/sbh-relocated/<host>",restrict ssh-ed25519 AAAAâ€
 
 ## Running it
 
-- `sbh relocate` prints a report: a total per verdict, and the units that are selected.
+- `sbh relocate` prints a report: a total per verdict, the units that are selected, and whether this run saved its observations.
 - `sbh relocate --all --json` lists every unit with its evidence.
 - `sudo sbh relocate --apply` relocates the selected units. It is limited by `max_bytes_per_run`, holds a lock, and logs one JSON line per unit to stderr.
 
-The ledger is `relocation-ledger.json` in `state_dir` (`/var/lib/sbh`). A run that cannot write it, such as an unprivileged report, records no observations.
+The ledger is `relocation-ledger.json` in `state_dir` (`/var/lib/sbh`). Every writer, including report-only sweeps and disabled `--apply` runs, holds the same `relocate.lock` from before reading the ledger through its last save. Each save uses a private, exclusively created staging file, syncs the file, atomically replaces the ledger, then syncs the state directory.
+
+A report that cannot acquire the writer lock or write the state directory remains useful and records no observations. It cannot overwrite a running transfer's resumable destination or newer history, even if that transfer finishes while the report is scanning. JSON reports expose `observation_save.saved` and `observation_save.reason`; human reports print the same status.
+
+A missing ledger starts a new observation window. A corrupt or unreadable existing ledger is preserved. Reports can still survey the trees, but use no unavailable historical observations and do not save over the damaged state; noatime trees cannot qualify from missing history. `--apply` refuses an unreadable ledger, unavailable writer lock, or failed observation save before starting any transfer. Lock contention exits with status 3; other initial state failures exit with status 1.
 
 A timer that runs every 6 hours keeps the ledger's observations continuous:
 

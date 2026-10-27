@@ -624,6 +624,15 @@ pub struct BallastRow {
 /// new database gets `auto_vacuum = FULL` before its first table anyway.
 pub const VACUUM_MIN_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Size the WAL file is cut back to once a checkpoint resets it.
+///
+/// SQLite reuses a WAL file in place and never shrinks it on its own, so one
+/// large transaction (the `auto_vacuum` VACUUM, a big retention prune) or a
+/// reader pinning old frames leaves the file at its high-water mark for good.
+/// On fmd (2026-10-22) that was a 4.3 GB WAL holding 5 live frames on a root
+/// filesystem with 3.3 GB free.
+pub const WAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
 fn apply_pragmas(conn: &Connection, db_bytes: u64) -> Result<()> {
     // auto_vacuum can only be changed before the first table is created.
     // For an existing database the PRAGMA alone is silently ignored, so a
@@ -643,14 +652,15 @@ fn apply_pragmas(conn: &Connection, db_bytes: u64) -> Result<()> {
         }
     }
 
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "PRAGMA journal_mode = WAL;
+         PRAGMA journal_size_limit = {WAL_SIZE_LIMIT_BYTES};
          PRAGMA synchronous = NORMAL;
          PRAGMA cache_size = -8000;
          PRAGMA mmap_size = 67108864;
          PRAGMA temp_store = MEMORY;
-         PRAGMA busy_timeout = 5000;",
-    )?;
+         PRAGMA busy_timeout = 5000;"
+    ))?;
 
     // Verify WAL mode is active (I12).
     let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
@@ -824,6 +834,48 @@ mod tests {
     fn schema_created_and_wal_active() {
         let (_dir, logger) = temp_db();
         assert!(logger.is_wal_mode());
+    }
+
+    /// A transaction larger than `WAL_SIZE_LIMIT_BYTES` grows the WAL past
+    /// the limit; once its frames are checkpointed, the next write resets
+    /// the WAL and cuts the file back instead of keeping the high-water mark.
+    #[test]
+    fn wal_file_shrinks_back_after_a_large_transaction() {
+        let (dir, logger) = temp_db();
+        let wal = dir.path().join("test.db-wal");
+        let wal_len = || std::fs::metadata(&wal).unwrap().len();
+
+        logger
+            .conn
+            .execute_batch("CREATE TABLE filler (blob BLOB);")
+            .unwrap();
+        let chunk = vec![0x5Au8; 1024 * 1024];
+        let chunks = usize::try_from(WAL_SIZE_LIMIT_BYTES).unwrap() / chunk.len() + 8;
+        logger.conn.execute_batch("BEGIN").unwrap();
+        for _ in 0..chunks {
+            logger
+                .conn
+                .execute("INSERT INTO filler (blob) VALUES (?1)", [&chunk])
+                .unwrap();
+        }
+        logger.conn.execute_batch("COMMIT").unwrap();
+        let grown = wal_len();
+        assert!(
+            grown > WAL_SIZE_LIMIT_BYTES,
+            "fixture must outgrow the limit: {grown}"
+        );
+
+        // The commit's auto-checkpoint copied every frame into the database;
+        // this write restarts the WAL from its first frame.
+        logger
+            .conn
+            .execute("DELETE FROM filler WHERE rowid = 1", [])
+            .unwrap();
+        let after = wal_len();
+        assert!(
+            after <= WAL_SIZE_LIMIT_BYTES,
+            "WAL kept {after} bytes after a reset (grew to {grown})"
+        );
     }
 
     #[test]

@@ -7,12 +7,14 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use nix::sys::statvfs::{FsFlags, fstatvfs};
 use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
 use sbh_btrfs::{FileStamp, IdleIoPriority, MAX_CHUNK_BYTES, ZstdConsent};
 
+use super::discovery::Selection;
 use super::journal::{AuditSession, digest};
 use super::{
     CompressionFileReport, CompressionMode, CompressionObservation, CompressionPolicy,
@@ -24,17 +26,53 @@ use crate::scanner::{active_lease, protection};
 
 pub(super) mod repository;
 
-#[allow(clippy::too_many_lines)] // one bounded pass, in order
+/// The pass deadline and the daemon's stop flag, which it raises when its
+/// policy no longer allows changes (observe, fallback-safe, the kill switch,
+/// dry-run).
+struct PassControl<'a> {
+    deadline: Instant,
+    stop: Option<&'a AtomicBool>,
+}
+
+impl PassControl<'_> {
+    /// Before a new file: the stop flag and the pass deadline.
+    fn admit(&self) -> io::Result<()> {
+        self.check_stop()?;
+        budget(self.deadline)
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop.is_some_and(|stop| stop.load(Ordering::Acquire))
+    }
+
+    /// Between chunks of a started file, which has its own allowance: only
+    /// the stop flag. A file stopped here is finished by a later pass.
+    fn check_stop(&self) -> io::Result<()> {
+        if self.stop_requested() {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "stopped: the daemon's policy no longer allows changes",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // one bounded pass, in order
 pub(super) fn run(
     paths: &[std::path::PathBuf],
+    selection: Option<&Selection>,
     policy: &CompressionPolicy,
     mode: CompressionMode,
     config: &Config,
     platform: &dyn Platform,
+    stop: Option<&AtomicBool>,
     observer: &mut dyn FnMut(CompressionObservation<'_>),
 ) -> io::Result<CompressionReport> {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(policy.timeout_secs);
+    let control = PassControl { deadline, stop };
     let mut report = CompressionReport {
         schema: "sbh.compression.v1",
         dry_run: !mode.apply,
@@ -65,6 +103,10 @@ pub(super) fn run(
         None
     };
     for path in paths.iter().take(policy.max_files) {
+        if let Err(error) = control.check_stop() {
+            report.stop_reason = Some(error.to_string());
+            break;
+        }
         if Instant::now() >= deadline {
             report.stop_reason = Some("pass deadline exhausted".into());
             break;
@@ -72,19 +114,27 @@ pub(super) fn run(
         let mut item = CompressionFileReport::new(path);
         let result = process_file(
             path,
+            selection,
             &mut item,
             policy,
             mode,
             config,
             platform,
-            deadline,
+            &control,
             &mut admitted_bytes,
             &mut identities,
             &mut audit,
         );
+        let mut stopped = false;
         if let Err(error) = result {
+            // A stop before the first range leaves the file as it was.
+            stopped = error.kind() == io::ErrorKind::Interrupted
+                && control.stop_requested()
+                && !item.mutation_attempted;
             item.outcome = if item.mutation_attempted {
                 "partial"
+            } else if stopped {
+                "skipped"
             } else {
                 "failed"
             }
@@ -114,7 +164,13 @@ pub(super) fn run(
             journal_path: audit.path(),
             journal_outcome_recorded: item.operation_id.is_some() && !audit.failed(),
         });
+        if stopped {
+            report.stop_reason = Some(item.detail.clone());
+        }
         report.files.push(item);
+        if stopped && !audit.failed() {
+            break;
+        }
         if unsafe_to_continue {
             report.stop_reason = Some(if audit.failed() {
                 "stopped because durable compression auditing failed; inspect the journal and per-file report"
@@ -170,12 +226,13 @@ fn pass_exit_code(mutation_attempted: bool, failed: bool, unvisited: usize) -> i
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn process_file(
     path: &Path,
+    selection: Option<&Selection>,
     report: &mut CompressionFileReport,
     policy: &CompressionPolicy,
     mode: CompressionMode,
     config: &Config,
     platform: &dyn Platform,
-    deadline: Instant,
+    control: &PassControl<'_>,
     admitted_bytes: &mut u64,
     identities: &mut BTreeSet<(u64, u64)>,
     audit: &mut AuditSession,
@@ -205,6 +262,11 @@ fn process_file(
     }
     let canonical = path.canonicalize()?;
     report.path.clone_from(&canonical);
+    // A discovered input is refused before any descriptor is opened for
+    // writing once its root was replaced or it gained Git ancestry.
+    if let Some(selection) = selection {
+        selection.validate_scope(&canonical)?;
+    }
     let stats = platform.fs_stats(&canonical).map_err(other)?;
     if stats.fs_type != "btrfs" {
         report.detail = format!(
@@ -220,15 +282,14 @@ fn process_file(
     check_protection(&canonical, config, platform)?;
     // Resolve every component without symlinks in one kernel operation. There
     // is no fallback to a pathname-following open on unsupported kernels.
-    let flags = OFlags::CLOEXEC
-        | OFlags::NOFOLLOW
-        | OFlags::NONBLOCK
-        | OFlags::NOATIME
-        | if mode.apply {
-            OFlags::RDWR
-        } else {
-            OFlags::RDONLY
-        };
+    // Read-only even to apply: BTRFS_IOC_DEFRAG_RANGE needs write permission
+    // on the inode (or CAP_SYS_ADMIN), not a writable descriptor, on every
+    // kernel with openat2. A writable one would make running the file fail
+    // with ETXTBSY while it is compressed (cold debug binaries are what this
+    // tier mostly rewrites) and would close with IN_CLOSE_WRITE, which
+    // watchers and sync tools read as a modification.
+    let flags =
+        OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOATIME | OFlags::RDONLY;
     let file = File::from(openat2(
         CWD,
         &canonical,
@@ -249,6 +310,9 @@ fn process_file(
             "file changed while opening its pinned descriptor",
         ));
     }
+    if let Some(selection) = selection {
+        selection.validate_file(&canonical, stamp)?;
+    }
     if !identities.insert((stamp.device, stamp.inode)) {
         report.detail = "duplicate inode in this pass".into();
         return Ok(());
@@ -259,7 +323,7 @@ fn process_file(
         file.try_lock()?;
     }
     check_active(&canonical, file.as_raw_fd(), platform)?;
-    let before = sbh_btrfs::inspect(&file, deadline)?;
+    let before = sbh_btrfs::inspect(&file, control.deadline)?;
     report.physical_data_bytes_before = Some(before.physical_data_bytes);
     if let Some(reason) = before.exclusion() {
         report.detail = reason.into();
@@ -275,7 +339,15 @@ fn process_file(
         report.detail = "eligible at inspection time; preview changed no extents and promises no compression ratio".into();
         return Ok(());
     }
-    let hash_before = digest(&file, before.stamp.size, deadline)?;
+    // From here the file is finished on its own allowance, not the pass
+    // deadline: a file left part-compressed can use more space than before
+    // (see `ExtentMap::exclusion`). The pass deadline decided whether to
+    // start it; the next file waits for the next pass. Only the daemon's stop
+    // flag ends a started file early, between chunks; a later pass picks up
+    // its raw remainder.
+    control.admit()?;
+    let file_deadline = Instant::now() + file_allowance(before.stamp.size);
+    let hash_before = digest(&file, before.stamp.size, file_deadline)?;
     report.sha256_before = Some(hash_before.clone());
     if FileStamp::read(&file)? != before.stamp {
         return Err(io::Error::other("file changed during preflight hashing"));
@@ -287,18 +359,45 @@ fn process_file(
     let consent = ZstdConsent::acknowledge_filesystem_compatibility_change();
     let mut expected = before.stamp;
     let mut operation_error = None;
+    // None: the first chunk always checks, since hashing a large file can take
+    // minutes after the check before it.
+    let mut last_active_check: Option<Instant> = None;
     while report.processed_bytes < before.stamp.size {
         let offset = report.processed_bytes;
         let length = (before.stamp.size - offset).min(MAX_CHUNK_BYTES);
         let result = (|| -> io::Result<()> {
-            budget(deadline)?;
+            control.check_stop()?;
+            budget(file_deadline)?;
             check_protection(&canonical, config, platform)?;
-            check_active(&canonical, file.as_raw_fd(), platform)?;
+            if let Some(selection) = selection {
+                selection.validate_scope(&canonical)?;
+            }
+            // Three /proc sweeps per check: between chunks, at most every
+            // few seconds. A writer is caught by the stamp check on every
+            // chunk and by the final hash; this keeps users' readers and
+            // executables from sharing the file with a rewrite.
+            if last_active_check.is_none_or(|at| at.elapsed() >= ACTIVE_RECHECK_INTERVAL) {
+                check_active(&canonical, file.as_raw_fd(), platform)?;
+                last_active_check = Some(Instant::now());
+            }
             check_headroom(&file, policy.min_free_bytes)?;
             verify_path(&canonical, &file, expected)?;
-            budget(deadline)?;
-            report.mutation_attempted = true;
-            sbh_btrfs::compress_range(&file, offset, length, consent, deadline)?;
+            budget(file_deadline)?;
+            // Ranges an earlier pass compressed are left as they are: a pass
+            // that resumes a part-compressed file rewrites only what is raw.
+            for (raw_start, raw_length) in
+                sbh_btrfs::raw_ranges(&file, offset, length, file_deadline)?
+            {
+                report.mutation_attempted = true;
+                sbh_btrfs::compress_range(
+                    &file,
+                    raw_start,
+                    raw_length,
+                    before.inode_flags,
+                    consent,
+                    file_deadline,
+                )?;
+            }
             expected = FileStamp::read(&file)?;
             Ok(())
         })();
@@ -317,8 +416,21 @@ fn process_file(
     }
     // Postflight has a separate, bounded budget. A rewrite timeout must not
     // suppress content verification or erase the fact that mutation happened.
-    let verification_deadline = Instant::now() + Duration::from_secs(120);
-    match digest(&file, before.stamp.size, verification_deadline) {
+    // The hash must read what the disk now holds: the rewrite leaves the
+    // original bytes in the page cache, and hashing those compares the cache
+    // with itself. Every range ended with a fsync, so the pages are clean and
+    // the kernel drops them, except pages mapped elsewhere: the active check
+    // runs between chunks at most every few seconds, so it runs once more
+    // here, and a file mapped since is left unverified rather than hashed
+    // from its cache.
+    let verification_deadline = Instant::now() + file_allowance(before.stamp.size);
+    let from_disk = check_active(&canonical, file.as_raw_fd(), platform)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)
+                .map_err(io::Error::from)
+        });
+    match from_disk.and_then(|()| digest(&file, before.stamp.size, verification_deadline)) {
         Ok(hash_after) => {
             let stable = before
                 .stamp
@@ -487,11 +599,27 @@ fn check_active(path: &Path, own_fd: i32, platform: &dyn Platform) -> io::Result
             "executable inspection incomplete or file is executing",
         ));
     }
-    if !platform.mmap_regions_under(path).map_err(other)?.is_empty() {
+    // A scanner's cached absence verdict cannot admit a rewrite. A fresh
+    // query shares only sweep serialization and conservative failure backoff;
+    // contention is retried briefly before it vetoes the file.
+    let mut mapped = platform.mmap_regions_under_fresh(path);
+    for _ in 0..MMAP_RETRIES {
+        if mapped.is_ok() {
+            break;
+        }
+        std::thread::sleep(MMAP_RETRY_WAIT);
+        mapped = platform.mmap_regions_under_fresh(path);
+    }
+    if !mapped.map_err(other)?.is_empty() {
         return Err(io::Error::other("file has active memory mappings"));
     }
-    if platform
-        .build_directories_in_use()
+    let (build_directories, build_complete) = platform.build_directories_in_use_checked();
+    if !build_complete {
+        return Err(io::Error::other(
+            "active build-directory inspection was incomplete",
+        ));
+    }
+    if build_directories
         .iter()
         .any(|(_, root)| path.starts_with(root))
     {
@@ -544,6 +672,19 @@ fn verify_path(path: &Path, file: &File, expected: FileStamp) -> io::Result<()> 
         ));
     }
     Ok(())
+}
+
+/// Shortest gap between two open-file, executable and mapping checks of the
+/// file being rewritten.
+const ACTIVE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// Retries of a mapping query that came back incomplete, and the wait between.
+const MMAP_RETRIES: u32 = 10;
+const MMAP_RETRY_WAIT: Duration = Duration::from_millis(500);
+
+/// Time a started file gets to be hashed, rewritten and hashed again: a minute
+/// plus 4 MiB/s (idle I/O priority on a loaded disk), at most an hour.
+fn file_allowance(size: u64) -> Duration {
+    Duration::from_secs(60 + size / (4 * 1024 * 1024)).min(Duration::from_hours(1))
 }
 
 fn budget(deadline: Instant) -> io::Result<()> {

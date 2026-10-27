@@ -1,12 +1,14 @@
 //! Opt-in, lossless compression of explicitly selected cold files (bd-rxq5).
 //!
 //! This is a separate reclamation action, never a deletion admission override.
-//! The operator command is preview-only by default. Automatic daemon scheduling
-//! is deliberately not enabled here. Existing marker/config/catalog protection
-//! and active-target leases apply even when an operator names a file directly.
+//! The operator command is preview-only by default. The daemon runs it only
+//! when `[compress] enabled` is set (see `daemon::compress_tier`). Existing
+//! marker/config/catalog protection and active-target leases apply even when
+//! an operator names a file directly.
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -25,7 +27,7 @@ mod linux;
 
 /// Limits for a serial compression pass. Logical input bytes bound rewrite and
 /// verification work; they are never reported as physical bytes reclaimed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CompressionPolicy {
     /// Smallest admitted logical file length.
@@ -81,9 +83,28 @@ pub struct CompressionMode {
     pub apply: bool,
     /// Consent to COMPRESS_ZSTD's filesystem-wide compatibility consequence.
     pub allow_zstd_feature: bool,
-    /// Operator has stopped concurrent writers, snapshot and reflink creation.
-    /// Process scans are observations, not a filesystem-wide mutation lock.
-    pub quiescent: bool,
+    /// Who vouches that a rewrite may run while the filesystem is in use.
+    pub acknowledgement: ConcurrencyAcknowledgement,
+}
+
+/// The second acknowledgement an apply needs, besides the zstd consent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConcurrencyAcknowledgement {
+    /// Nobody did: an apply is refused.
+    #[default]
+    None,
+    /// The operator stopped concurrent writers, snapshot and reflink creation
+    /// (`--quiescent`). Process scans are observations, not a filesystem-wide
+    /// mutation lock.
+    Quiescent,
+    /// The daemon's `[compress] enabled` opt-in, standing in for quiescence
+    /// on a host nobody can quiesce. Content stays protected by the per-file
+    /// checks every apply runs anyway: minimum idle age, open/mmap/lease
+    /// vetoes, the stamp and scope rechecked between chunks, and a SHA-256
+    /// re-read from disk. What the operator accepts by enabling it: a
+    /// snapshot or reflink made during a pass keeps the old extents alive,
+    /// so those bytes are not freed until it goes.
+    Unattended,
 }
 
 /// A per-file result. `mutation_attempted` stays true after an ioctl failure:
@@ -250,6 +271,53 @@ pub fn run_observed(
     platform: &dyn Platform,
     observer: &mut dyn FnMut(CompressionObservation<'_>),
 ) -> io::Result<CompressionReport> {
+    run_checked(paths, None, policy, mode, config, platform, None, observer)
+}
+
+/// Execute the same pass on the files a [`discovery::discover`] walk selected.
+///
+/// Every executor check still runs. In addition, each file must be unchanged
+/// since discovery and still lie beneath its pinned, unreplaced root without
+/// new Git ancestry; this is rechecked before the rewrite and between chunks.
+/// The selection narrows what may be rewritten and never authorizes more.
+///
+/// `stop`, once raised, ends the pass before the next file and a started
+/// file before its next chunk (the daemon raises it when its policy no longer
+/// allows changes); a later pass picks up the raw remainder of a file it
+/// left part-compressed.
+pub fn run_discovered(
+    selection: &discovery::Selection,
+    policy: &CompressionPolicy,
+    mode: CompressionMode,
+    config: &Config,
+    platform: &dyn Platform,
+    stop: Option<&AtomicBool>,
+    observer: &mut dyn FnMut(CompressionObservation<'_>),
+) -> io::Result<CompressionReport> {
+    let paths = selection.paths();
+    run_checked(
+        &paths,
+        Some(selection),
+        policy,
+        mode,
+        config,
+        platform,
+        stop,
+        observer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_checked(
+    paths: &[PathBuf],
+    selection: Option<&discovery::Selection>,
+    policy: &CompressionPolicy,
+    mode: CompressionMode,
+    config: &Config,
+    platform: &dyn Platform,
+    stop: Option<&AtomicBool>,
+    observer: &mut dyn FnMut(CompressionObservation<'_>),
+) -> io::Result<CompressionReport> {
     policy.validate()?;
     if paths.is_empty() || paths.len() > 4096 {
         return Err(io::Error::new(
@@ -257,10 +325,12 @@ pub fn run_observed(
             "supply 1..4096 explicit file paths",
         ));
     }
-    if mode.apply && (!mode.allow_zstd_feature || !mode.quiescent) {
+    if mode.apply
+        && (!mode.allow_zstd_feature || mode.acknowledgement == ConcurrencyAcknowledgement::None)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "apply requires --allow-zstd-feature and --quiescent; stop concurrent writers, snapshots and reflinks first",
+            "apply requires --allow-zstd-feature and --quiescent (or the daemon's [compress] opt-in); stop concurrent writers, snapshots and reflinks first",
         ));
     }
     #[cfg(all(
@@ -268,14 +338,16 @@ pub fn run_observed(
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
-        linux::run(paths, policy, mode, config, platform, observer)
+        linux::run(
+            paths, selection, policy, mode, config, platform, stop, observer,
+        )
     }
     #[cfg(not(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     )))]
     {
-        let _ = (config, platform, observer);
+        let _ = (selection, config, platform, stop, observer);
         Ok(CompressionReport {
             schema: "sbh.compression.v1",
             dry_run: !mode.apply,

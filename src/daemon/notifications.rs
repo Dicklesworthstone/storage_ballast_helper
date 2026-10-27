@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::pid::PressureLevel;
+use crate::scanner::deletion::FreedBasis;
+
+mod journal;
 
 const DEFAULT_NOTIFY_INTERVAL_SECS: u64 = 60;
 const DEFAULT_URGENT_NOTIFY_INTERVAL_SECS: u64 = 300;
@@ -82,6 +85,9 @@ pub enum NotificationEvent {
     CleanupCompleted {
         items_deleted: usize,
         bytes_freed: u64,
+        /// How `bytes_freed` is known; an estimate is labelled as one.
+        #[serde(default)]
+        freed_basis: FreedBasis,
         mount: String,
     },
     BallastReleased {
@@ -269,11 +275,12 @@ impl NotificationEvent {
             Self::CleanupCompleted {
                 items_deleted,
                 bytes_freed,
+                freed_basis,
                 mount,
-            } => {
-                let gb = *bytes_freed as f64 / 1_073_741_824.0;
-                format!("Cleaned {items_deleted} items on {mount} ({gb:.1} GB freed)")
-            }
+            } => format!(
+                "Cleaned {items_deleted} items on {mount} ({})",
+                freed_basis.freed_phrase(*bytes_freed)
+            ),
             Self::BallastReleased {
                 mount,
                 files_released,
@@ -435,7 +442,9 @@ impl Default for FileConfig {
 /// Service-log notification settings.
 ///
 /// The channel writes structured stderr lines so systemd journals and launchd
-/// stdout/stderr capture both receive the same operator-visible events.
+/// stdout/stderr capture both receive the same operator-visible events, and on
+/// macOS also submits structured records to unified logging under the
+/// daemon's identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct JournalConfig {
@@ -493,6 +502,50 @@ fn macos_display_notification_script(summary: &str) -> String {
     )
 }
 
+/// The command that shows a macOS notification to the person at the console.
+///
+/// The daemon runs as a root LaunchDaemon in the system bootstrap context,
+/// where a bare `osascript display notification` reaches no one's
+/// Notification Center (bd-z1nm: on 2026-10-22 a Mac's daemon logged a memory
+/// and disk emergency 40 minutes before a kernel panic, and nobody saw it).
+/// As root it runs in the console user's GUI session (`launchctl asuser`) as
+/// that user (`sudo -u #uid`). With nobody at the console (no owner, or uid 0
+/// at the login window) there is no one to show it to: `None`.
+#[cfg(any(target_os = "macos", test))]
+fn macos_notification_argv(
+    script: &str,
+    euid: u32,
+    console_uid: Option<u32>,
+) -> Option<Vec<String>> {
+    let osascript = [
+        "/usr/bin/osascript".to_string(),
+        "-e".to_string(),
+        script.to_string(),
+    ];
+    if euid != 0 {
+        return Some(osascript.to_vec());
+    }
+    let uid = console_uid.filter(|uid| *uid != 0)?;
+    let mut argv = vec![
+        "/bin/launchctl".to_string(),
+        "asuser".to_string(),
+        uid.to_string(),
+        "/usr/bin/sudo".to_string(),
+        "-u".to_string(),
+        format!("#{uid}"),
+    ];
+    argv.extend(osascript);
+    Some(argv)
+}
+
+/// Owner of `/dev/console`: the user at the Mac's screen (root at the login
+/// window).
+#[cfg(target_os = "macos")]
+fn macos_console_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata("/dev/console").ok().map(|meta| meta.uid())
+}
+
 impl Channel for DesktopChannel {
     fn name(&self) -> &'static str {
         "desktop"
@@ -531,7 +584,10 @@ impl Channel for DesktopChannel {
         #[cfg(target_os = "macos")]
         {
             let script = macos_display_notification_script(&summary);
-            if let Ok(child) = Command::new("osascript").arg("-e").arg(&script).spawn() {
+            let euid = nix::unistd::geteuid().as_raw();
+            if let Some(argv) = macos_notification_argv(&script, euid, macos_console_uid())
+                && let Ok(child) = Command::new(&argv[0]).args(&argv[1..]).spawn()
+            {
                 std::thread::spawn(move || {
                     let mut c = child;
                     let _ = c.wait();
@@ -600,7 +656,7 @@ impl Channel for FileChannel {
     }
 }
 
-// ──── Journal/service log (structured stderr) ────
+// ──── Journal/service log (structured stderr) and macOS unified logging ────
 
 struct JournalChannel {
     min_level: NotificationLevel,
@@ -612,6 +668,26 @@ impl JournalChannel {
             min_level: config.min_level,
         }
     }
+
+    fn send_to(
+        &self,
+        event: &NotificationEvent,
+        sink: impl FnOnce(journal::JournalLevel, &str, &str),
+    ) {
+        let level = event.level();
+        if level < self.min_level {
+            return;
+        }
+
+        let journal_level = match level {
+            NotificationLevel::Info => journal::JournalLevel::Info,
+            NotificationLevel::Warning => journal::JournalLevel::Warning,
+            NotificationLevel::Orange => journal::JournalLevel::Orange,
+            NotificationLevel::Red => journal::JournalLevel::Red,
+            NotificationLevel::Critical => journal::JournalLevel::Critical,
+        };
+        sink(journal_level, event.type_key(), &event.summary());
+    }
 }
 
 impl Channel for JournalChannel {
@@ -620,25 +696,10 @@ impl Channel for JournalChannel {
     }
 
     fn send(&self, event: &NotificationEvent) {
-        if event.level() < self.min_level {
-            return;
-        }
-
-        let level = event.level();
-        let summary = event.summary();
-
         // systemd captures stderr in the journal, while launchd captures it in
-        // the configured StandardErrorPath. Structured fields remain stable for
-        // filtering: SBH_EVENT=..., SBH_LEVEL=...
-        let priority = match level {
-            NotificationLevel::Critical => "CRIT",
-            NotificationLevel::Red => "ERR",
-            NotificationLevel::Orange => "WARNING",
-            NotificationLevel::Warning => "NOTICE",
-            NotificationLevel::Info => "INFO",
-        };
-
-        eprintln!("[SBH-NOTIFY] [{priority}] {summary}");
+        // the configured StandardErrorPath; macOS also gets a unified-logging
+        // record with SBH_EVENT=... and SBH_LEVEL=... fields.
+        self.send_to(event, journal::send);
     }
 }
 
@@ -784,7 +845,7 @@ impl Channel for WebhookChannel {
 ///
 /// The manager is designed to be cheap to call — each channel's `send()` is
 /// fire-and-forget (spawns child processes for desktop/webhook, appends for file,
-/// and writes to stderr for journal). Notification failures never propagate.
+/// and writes to service logs for journal). Notification failures never propagate.
 pub struct NotificationManager {
     channels: Vec<Box<dyn Channel>>,
     enabled: bool,
@@ -1040,6 +1101,7 @@ mod tests {
         let event = NotificationEvent::CleanupCompleted {
             items_deleted: 15,
             bytes_freed: 20 * 1_073_741_824,
+            freed_basis: FreedBasis::Observed,
             mount: "/data".to_string(),
         };
         assert_eq!(event.level(), NotificationLevel::Warning);
@@ -1050,6 +1112,7 @@ mod tests {
         let event = NotificationEvent::CleanupCompleted {
             items_deleted: 2,
             bytes_freed: 100_000,
+            freed_basis: FreedBasis::Observed,
             mount: "/data".to_string(),
         };
         assert_eq!(event.level(), NotificationLevel::Info);
@@ -1098,11 +1161,24 @@ mod tests {
         let event = NotificationEvent::CleanupCompleted {
             items_deleted: 5,
             bytes_freed: 5_368_709_120, // 5 GB
+            freed_basis: FreedBasis::Observed,
             mount: "/data".to_string(),
         };
         let summary = event.summary();
         assert!(summary.contains("5 items"));
-        assert!(summary.contains("5.0 GB"));
+        assert!(summary.contains("(5.0 GB freed)"));
+        // On ext4 the figure is the allocated-size estimate, and says so.
+        let estimated = NotificationEvent::CleanupCompleted {
+            items_deleted: 5,
+            bytes_freed: 5_368_709_120,
+            freed_basis: FreedBasis::Estimated,
+            mount: "/data".to_string(),
+        };
+        assert!(
+            estimated.summary().contains("(~5.0 GB freed, estimated)"),
+            "{}",
+            estimated.summary()
+        );
     }
 
     #[test]
@@ -1254,20 +1330,30 @@ mod tests {
             min_level: NotificationLevel::Orange,
         };
 
-        // Info-level event should be below the threshold.
-        // We can't easily capture stderr in a unit test, but we can verify the
-        // min_level check by ensuring no panic occurs.
         let info_event = NotificationEvent::DaemonStarted {
             version: "0.1.0".to_string(),
             volumes_monitored: 1,
         };
-        channel.send(&info_event); // Should be silently dropped.
+        channel.send_to(&info_event, |_, _, _| {
+            panic!("below-threshold event must not reach either journal sink");
+        });
 
         let red_event = NotificationEvent::Error {
             code: "SBH-TEST".to_string(),
             message: "test".to_string(),
         };
-        channel.send(&red_event); // Should output to stderr.
+        let mut delivered = None;
+        channel.send_to(&red_event, |level, event_type, summary| {
+            delivered = Some((level, event_type.to_owned(), summary.to_owned()));
+        });
+        assert_eq!(
+            delivered,
+            Some((
+                journal::JournalLevel::Red,
+                "error".to_owned(),
+                red_event.summary()
+            ))
+        );
     }
 
     #[test]
@@ -1469,5 +1555,32 @@ mod tests {
         let parsed: NotificationEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.level(), NotificationLevel::Critical);
         assert!(parsed.summary().contains("critical"));
+    }
+    /// bd-z1nm: as root the notification goes through the console user's GUI
+    /// session as that user; as a user it is a plain osascript; with nobody at
+    /// the console nothing is spawned.
+    #[test]
+    fn macos_notifications_from_root_run_in_the_console_users_session() {
+        let script = macos_display_notification_script("disk critical");
+        assert_eq!(
+            macos_notification_argv(&script, 501, Some(501)).unwrap(),
+            ["/usr/bin/osascript", "-e", script.as_str()]
+        );
+        assert_eq!(
+            macos_notification_argv(&script, 0, Some(501)).unwrap(),
+            [
+                "/bin/launchctl",
+                "asuser",
+                "501",
+                "/usr/bin/sudo",
+                "-u",
+                "#501",
+                "/usr/bin/osascript",
+                "-e",
+                script.as_str()
+            ]
+        );
+        assert_eq!(macos_notification_argv(&script, 0, Some(0)), None);
+        assert_eq!(macos_notification_argv(&script, 0, None), None);
     }
 }
