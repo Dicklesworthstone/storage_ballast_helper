@@ -7,7 +7,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -249,6 +249,25 @@ impl NotificationEvent {
             Self::CpuBudgetExceeded { .. } => "cpu_budget_exceeded",
             Self::ReclaimUnavailable { .. } => "reclaim_unavailable",
             Self::PolicyTransition { .. } => "policy_transition",
+        }
+    }
+
+    /// Distinct affected mounts and error codes need independent alerts.
+    /// Host-wide events retain a single scope regardless of message text.
+    fn throttle_scope(&self) -> &str {
+        match self {
+            Self::PressureChanged { mount, .. }
+            | Self::PredictiveWarning { mount, .. }
+            | Self::CleanupCompleted { mount, .. }
+            | Self::BallastReleased { mount, .. }
+            | Self::BallastReplenished { mount, .. }
+            | Self::ReclaimUnavailable { mount, .. } => mount,
+            Self::Error { code, .. } => code,
+            Self::BehaviorEmergency { .. }
+            | Self::DaemonStarted { .. }
+            | Self::DaemonStopped { .. }
+            | Self::CpuBudgetExceeded { .. }
+            | Self::PolicyTransition { .. } => "",
         }
     }
 
@@ -849,9 +868,9 @@ impl Channel for WebhookChannel {
 pub struct NotificationManager {
     channels: Vec<Box<dyn Channel>>,
     enabled: bool,
-    /// Per-event-type throttle timestamps. Keyed by `NotificationEvent::type_key()`.
-    /// Prevents a low-priority event type from blocking unrelated higher-priority ones.
-    last_send_by_type: HashMap<&'static str, Instant>,
+    /// Dispatch history by category, affected scope and severity. Lower-level
+    /// events cannot hide an escalation or reset a previous urgent cooldown.
+    last_send_by_scope: HashMap<(&'static str, String), BTreeMap<NotificationLevel, Instant>>,
     min_interval: Duration,
     urgent_min_interval: Duration,
 }
@@ -864,7 +883,7 @@ impl NotificationManager {
             return Self {
                 channels: Vec::new(),
                 enabled: false,
-                last_send_by_type: HashMap::new(),
+                last_send_by_scope: HashMap::new(),
                 min_interval: Duration::ZERO,
                 urgent_min_interval: Duration::ZERO,
             };
@@ -895,7 +914,7 @@ impl NotificationManager {
         Self {
             channels,
             enabled: true,
-            last_send_by_type: HashMap::new(),
+            last_send_by_scope: HashMap::new(),
             min_interval: Duration::from_secs(config.min_notify_interval_secs),
             urgent_min_interval: Duration::from_secs(config.urgent_notify_interval_secs),
         }
@@ -903,12 +922,12 @@ impl NotificationManager {
 
     /// Replace this manager's configuration (e.g., after SIGHUP config reload).
     ///
-    /// Preserves per-event-type throttle state so a config reload doesn't open
+    /// Preserves scoped throttle history so a config reload doesn't open
     /// a burst window where previously throttled events can fire immediately.
     pub fn update_config(&mut self, config: &NotificationConfig) {
-        let throttle_state = std::mem::take(&mut self.last_send_by_type);
+        let throttle_state = std::mem::take(&mut self.last_send_by_scope);
         *self = Self::from_config(config);
-        self.last_send_by_type = throttle_state;
+        self.last_send_by_scope = throttle_state;
     }
 
     /// Create a disabled (no-op) manager.
@@ -917,7 +936,7 @@ impl NotificationManager {
         Self {
             channels: Vec::new(),
             enabled: false,
-            last_send_by_type: HashMap::new(),
+            last_send_by_scope: HashMap::new(),
             min_interval: Duration::ZERO,
             urgent_min_interval: Duration::ZERO,
         }
@@ -925,31 +944,44 @@ impl NotificationManager {
 
     /// Dispatch a notification event to all enabled channels.
     ///
-    /// Events are throttled per-event-type. Warning-and-below events use
+    /// Events are throttled by category and affected mount or error code.
+    /// Escalations are immediate; a lower-level event does not reset the
+    /// history that throttles repeated urgent alerts. Orange-and-below use
     /// `min_notify_interval_secs`; Red and Critical events use
-    /// `urgent_notify_interval_secs` (default five minutes). Each event type has
-    /// its own throttle window so a cleanup notification cannot block a pressure
-    /// warning, and repeated emergency desktop alerts cannot spam the operator.
+    /// `urgent_notify_interval_secs` (default five minutes).
     pub fn notify(&mut self, event: &NotificationEvent) {
+        self.notify_at(event, Instant::now());
+    }
+
+    fn notify_at(&mut self, event: &NotificationEvent, now: Instant) {
         if !self.enabled {
             return;
         }
 
+        // Mounts can disappear or change names. Retain only history that can
+        // still throttle an event, rather than accumulating obsolete scopes.
+        let retention = self.min_interval.max(self.urgent_min_interval);
+        self.last_send_by_scope.retain(|_, levels| {
+            levels.retain(|_, sent| now.saturating_duration_since(*sent) < retention);
+            !levels.is_empty()
+        });
         let level = event.level();
         let interval = if level >= NotificationLevel::Red {
             self.urgent_min_interval
         } else {
             self.min_interval
         };
-        let type_key = event.type_key();
+        let key = (event.type_key(), event.throttle_scope().to_owned());
+        let history = self.last_send_by_scope.entry(key).or_default();
         if !interval.is_zero()
-            && let Some(last) = self.last_send_by_type.get(type_key)
-            && last.elapsed() < interval
+            && history
+                .range(level..)
+                .any(|(_, sent)| now.saturating_duration_since(*sent) < interval)
         {
             return;
         }
 
-        self.last_send_by_type.insert(type_key, Instant::now());
+        history.insert(level, now);
 
         for channel in &self.channels {
             channel.send(event);
@@ -1511,6 +1543,143 @@ mod tests {
         let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(first["type"], "behavior_emergency");
         assert_eq!(second["type"], "error");
+    }
+
+    fn notification_fixture() -> (tempfile::TempDir, NotificationConfig, NotificationManager) {
+        let directory = tempfile::tempdir().unwrap();
+        let config = NotificationConfig {
+            channels: vec!["file".into()],
+            file: FileConfig {
+                path: directory.path().join("notifications.jsonl"),
+            },
+            ..NotificationConfig::default()
+        };
+        let manager = NotificationManager::from_config(&config);
+        (directory, config, manager)
+    }
+
+    fn pressure_event(mount: &str, to: NotificationLevel) -> NotificationEvent {
+        NotificationEvent::PressureChanged {
+            from: "green".into(),
+            to: match to {
+                NotificationLevel::Info => "green".into(),
+                NotificationLevel::Warning => "yellow".into(),
+                other => other.to_string(),
+            },
+            mount: mount.into(),
+            free_pct: 1.0,
+        }
+    }
+
+    fn recorded_notifications(config: &NotificationConfig) -> Vec<serde_json::Value> {
+        fs::read_to_string(&config.file.path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn pressure_escalation_bypasses_lower_level_cooldowns() {
+        let (_directory, config, mut manager) = notification_fixture();
+        let now = Instant::now();
+        for (seconds, level) in [
+            (0, NotificationLevel::Warning),
+            (1, NotificationLevel::Red),
+            (2, NotificationLevel::Critical),
+            (3, NotificationLevel::Critical),
+        ] {
+            manager.notify_at(
+                &pressure_event("/data", level),
+                now + Duration::from_secs(seconds),
+            );
+        }
+        let records = recorded_notifications(&config);
+        let levels: Vec<_> = records
+            .iter()
+            .map(|record| record["level"].as_str().unwrap())
+            .collect();
+        assert_eq!(levels, ["warning", "red", "critical"]);
+    }
+
+    #[test]
+    fn different_mounts_and_error_codes_cannot_suppress_each_other() {
+        let (_directory, config, mut manager) = notification_fixture();
+        let now = Instant::now();
+        for mount in ["/data", "/backup", "/data"] {
+            manager.notify_at(&pressure_event(mount, NotificationLevel::Critical), now);
+            manager.notify_at(
+                &NotificationEvent::ReclaimUnavailable {
+                    mount: mount.into(),
+                    level: "critical".into(),
+                    reason: "no reclaimable reserve".into(),
+                },
+                now,
+            );
+        }
+        for code in ["SBH-FIRST", "SBH-SECOND", "SBH-FIRST"] {
+            manager.notify_at(
+                &NotificationEvent::Error {
+                    code: code.into(),
+                    message: "independent subsystem failure".into(),
+                },
+                now,
+            );
+        }
+        let records = recorded_notifications(&config);
+        assert_eq!(records.len(), 6);
+        assert_eq!(records[0]["mount"], "/data");
+        assert_eq!(records[1]["mount"], "/data");
+        assert_eq!(records[2]["mount"], "/backup");
+        assert_eq!(records[3]["mount"], "/backup");
+        assert_eq!(records[4]["code"], "SBH-FIRST");
+        assert_eq!(records[5]["code"], "SBH-SECOND");
+    }
+
+    #[test]
+    fn urgent_repeat_limit_survives_deescalation_and_config_reload() {
+        let (_directory, config, mut manager) = notification_fixture();
+        let now = Instant::now();
+        let critical = pressure_event("/data", NotificationLevel::Critical);
+        manager.notify_at(&critical, now);
+        manager.notify_at(
+            &pressure_event("/data", NotificationLevel::Orange),
+            now + Duration::from_secs(61),
+        );
+        manager.update_config(&config);
+        for seconds in [62, 299, 300] {
+            manager.notify_at(&critical, now + Duration::from_secs(seconds));
+        }
+        let records = recorded_notifications(&config);
+        let levels: Vec<_> = records
+            .iter()
+            .map(|record| record["level"].as_str().unwrap())
+            .collect();
+        assert_eq!(levels, ["critical", "orange", "critical"]);
+    }
+
+    #[test]
+    fn unthrottled_regular_events_do_not_reset_urgent_history() {
+        let (_directory, mut config, mut manager) = notification_fixture();
+        config.min_notify_interval_secs = 0;
+        manager.update_config(&config);
+        let now = Instant::now();
+        let critical = pressure_event("/data", NotificationLevel::Critical);
+        manager.notify_at(&critical, now);
+        for seconds in [1, 2] {
+            manager.notify_at(
+                &pressure_event("/data", NotificationLevel::Warning),
+                now + Duration::from_secs(seconds),
+            );
+        }
+        manager.notify_at(&critical, now + Duration::from_secs(3));
+        assert_eq!(recorded_notifications(&config).len(), 3);
+
+        config.urgent_notify_interval_secs = 0;
+        manager.update_config(&config);
+        manager.notify_at(&critical, now + Duration::from_secs(4));
+        manager.notify_at(&critical, now + Duration::from_secs(4));
+        assert_eq!(recorded_notifications(&config).len(), 5);
     }
 
     #[test]
