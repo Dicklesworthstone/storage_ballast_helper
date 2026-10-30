@@ -13246,6 +13246,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
         })
         .filter(|score| !score.vetoed && score.total_score >= args.min_score)
         .collect();
+    warn_incomplete_reference_index(active_reference_index.as_ref());
 
     let scan_elapsed = start.elapsed();
 
@@ -13741,6 +13742,30 @@ fn warn_visibility_gap(command: &str) {
             "sbh: {gap}, so every deletion candidate is refused; run `sudo sbh {command}` or the \
              system-scope daemon to reclaim"
         );
+    }
+}
+
+/// A candidate checked against an incomplete active-reference index is
+/// vetoed at scoring, so it never reaches the executor sweep that prints why
+/// a batch is held. On Linux a non-root sbh cannot read `/proc/1/cwd`, so
+/// without this line `clean` reported "no cleanup candidates" and nothing
+/// else (bd-p18q). The macOS visibility-gap line already says it.
+fn incomplete_reference_index_line(
+    index: Option<&ActiveReferenceIndex>,
+    visibility_gap: Option<&str>,
+) -> Option<String> {
+    if visibility_gap.is_some() {
+        return None;
+    }
+    let reason = index?.incomplete_reason()?;
+    Some(format!(
+        "[SBH-SAFETY] {reason}; candidates it could not clear are refused"
+    ))
+}
+
+fn warn_incomplete_reference_index(index: Option<&ActiveReferenceIndex>) {
+    if let Some(line) = incomplete_reference_index_line(index, cli_visibility_gap()) {
+        eprintln!("{line}");
     }
 }
 
@@ -15190,6 +15215,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         })
         .filter(|score| !score.vetoed)
         .collect();
+    warn_incomplete_reference_index(active_reference_index.as_ref());
 
     let scan_elapsed = start.elapsed();
 
@@ -16529,6 +16555,32 @@ mod tests {
         );
         assert_eq!(parsed["scanner"]["dry_run"], false.into());
         assert_eq!(parsed["paths"]["ballast_dir"], "[not toml".into());
+    }
+
+    /// bd-p18q: an incomplete active-reference index vetoes candidates at
+    /// scoring, before the executor sweep that explains held batches.
+    #[test]
+    fn incomplete_reference_index_names_its_reason_once() {
+        let incomplete = ActiveReferenceIndex::incomplete(
+            "cannot read /proc/1/cwd (Permission denied (os error 13))",
+        );
+        assert_eq!(
+            incomplete_reference_index_line(Some(&incomplete), None).as_deref(),
+            Some(
+                "[SBH-SAFETY] cannot read /proc/1/cwd (Permission denied (os error 13)); \
+                 candidates it could not clear are refused"
+            )
+        );
+        // No index was built (nothing reached the probe), or it covered
+        // every process: nothing was refused for coverage.
+        assert_eq!(incomplete_reference_index_line(None, None), None);
+        let complete = ActiveReferenceIndex::empty();
+        assert_eq!(incomplete_reference_index_line(Some(&complete), None), None);
+        // The visibility-gap line already explains the refusal.
+        assert_eq!(
+            incomplete_reference_index_line(Some(&incomplete), Some("user-scoped sbh")),
+            None
+        );
     }
 
     #[test]
