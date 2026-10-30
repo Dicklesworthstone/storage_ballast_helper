@@ -44,3 +44,18 @@ pub mod update_handoff;
 
 #[cfg(test)]
 mod decision_plane_tests;
+
+/// A scratch directory for a test whose fixture must not sit inside a Git
+/// checkout. Under rch, `TMPDIR` is `<mirror>/.rch-tmp`, and most workers'
+/// mirrors are Git checkouts, so a fixture there is repository content to
+/// every git-aware rule (30 lib tests failed that way on 8 of 10 workers,
+/// 2026-10-29).
+#[cfg(test)]
+pub(crate) fn tempdir_outside_git() -> tempfile::TempDir {
+    let base = std::env::temp_dir();
+    if base.ancestors().any(|dir| dir.join(".git").exists()) {
+        tempfile::tempdir_in("/tmp").expect("scratch directory outside any checkout")
+    } else {
+        tempfile::tempdir().expect("scratch directory")
+    }
+}

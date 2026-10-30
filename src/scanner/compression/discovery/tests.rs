@@ -77,9 +77,9 @@ mod native_tests {
 
     #[test]
     fn sorted_discovery_prunes_markers_symlinks_hot_files_and_suffixes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let outside = crate::tempdir_outside_git();
         cold(&outside.path().join("outside.bin"));
         fs::create_dir(root.join("protected")).unwrap();
         fs::write(root.join("protected/.sbh-protect"), b"").unwrap();
@@ -106,7 +106,7 @@ mod native_tests {
 
     #[test]
     fn a_full_file_budget_has_a_native_continuation_without_duplicates() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();
         for name in ["c.bin", "a.bin", "b.bin"] {
             cold(&root.join(name));
@@ -137,7 +137,7 @@ mod native_tests {
 
     #[test]
     fn byte_limited_pages_reach_later_files_even_when_execution_refuses_every_candidate() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();
         fs::create_dir(root.join("b")).unwrap();
         let paths = [
@@ -215,7 +215,7 @@ mod native_tests {
 
     #[test]
     fn a_byte_budget_stop_keeps_a_middle_file_ahead_of_a_smaller_tail() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();
         for name in ["a.bin", "b.bin"] {
             cold(&root.join(name));
@@ -252,7 +252,7 @@ mod native_tests {
 
     #[test]
     fn a_file_larger_than_the_entire_byte_budget_does_not_wedge_continuation() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();
         let oversized = root.join("a-large.bin");
         fs::write(&oversized, b"too large for a whole pass").unwrap();
@@ -293,7 +293,7 @@ mod native_tests {
 
     #[test]
     fn partial_directory_enumeration_never_claims_a_sorted_prefix() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         cold(&dir.path().join("a.bin"));
         cold(&dir.path().join("b.bin"));
         let selection = scan(
@@ -316,7 +316,7 @@ mod native_tests {
     /// budget-stopped walk restarted from the top on every run.
     #[test]
     fn a_budget_stop_resumes_until_the_tree_is_covered_without_duplicates() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();
         for sub in ["d1", "d2", "d3", "d4"] {
             fs::create_dir(root.join(sub)).unwrap();
@@ -360,7 +360,7 @@ mod native_tests {
     /// there would recur at the same directory on every resumed run.
     #[test]
     fn a_too_deep_subtree_is_skipped_without_stopping_the_walk() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();
         fs::create_dir_all(root.join("a/deep")).unwrap();
         cold(&root.join("a/deep/f.bin"));
@@ -383,7 +383,7 @@ mod native_tests {
 
     #[test]
     fn selected_files_and_roots_are_revalidated_after_replacement() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap().join("root");
         fs::create_dir(&root).unwrap();
         let path = root.join("cold.bin");
@@ -410,7 +410,7 @@ mod native_tests {
 
     #[test]
     fn protected_roots_overlapping_roots_and_hardlinks_do_not_expand_scope() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();
         fs::create_dir(root.join("sub")).unwrap();
         cold(&root.join("sub/a.bin"));
@@ -443,7 +443,7 @@ mod native_tests {
 
     #[test]
     fn depth_and_byte_limits_are_real_and_outside_cursors_are_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();
         fs::create_dir(root.join("sub")).unwrap();
         cold(&root.join("a.bin"));
@@ -485,7 +485,7 @@ mod native_tests {
 
     #[test]
     fn repository_subtrees_are_pruned_before_depth_and_entry_budgets() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();
         for name in ["a-worktree", "b-linked", "c-bare", "d-admin"] {
             fs::create_dir_all(root.join(name).join("deep/nested")).unwrap();
@@ -523,7 +523,7 @@ mod native_tests {
 
     #[test]
     fn explicit_roots_inside_repository_scopes_are_not_enumerated() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();
         fs::create_dir_all(root.join("repo/.git/objects/pack")).unwrap();
         fs::create_dir_all(root.join("repo/src/deep")).unwrap();
@@ -556,7 +556,7 @@ mod native_tests {
 
     #[test]
     fn retained_selection_rechecks_git_ancestry_even_outside_its_root() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let parent = dir.path().canonicalize().unwrap();
         let root = parent.join("scope");
         fs::create_dir(&root).unwrap();
@@ -635,7 +635,7 @@ mod native_tests {
 
     #[test]
     fn discovered_execution_refuses_a_replaced_root_before_opening_inputs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let parent = dir.path().canonicalize().unwrap();
         let root = parent.join("root");
         fs::create_dir(&root).unwrap();
@@ -671,7 +671,7 @@ mod native_tests {
 
     #[test]
     fn discovered_execution_refuses_a_file_changed_after_discovery() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();
         cold(&root.join("changed.bin"));
         cold(&root.join("same.bin"));
@@ -713,7 +713,7 @@ mod native_tests {
 
     #[test]
     fn repository_pruning_preserves_sorted_continuation_without_duplicates() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();
         fs::create_dir_all(root.join("b-repo/.git")).unwrap();
         cold(&root.join("b-repo/cold.bin"));
