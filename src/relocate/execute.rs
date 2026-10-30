@@ -3,7 +3,8 @@
 //! Order of operations, each step a precondition of the next:
 //! 1. rsync the unit to `<target>[/<host>]/<run stamp>/<original path>/`.
 //! 2. Verify with a checksum dry run: any itemized difference aborts.
-//! 3. Upload the relocation record next to the copy.
+//! 3. Upload the relocation record next to the copy. For a local target,
+//!    synchronize the backup and parent filesystems, then renew copy evidence.
 //! 4. Rename the unit aside (`.<name>.sbh-relocating`), so a writer that
 //!    opens by path fails loudly instead of writing into a doomed tree.
 //! 5. Re-survey the renamed tree and re-sweep processes: nothing below it
@@ -104,7 +105,7 @@ pub enum Outcome {
     Failed {
         /// The original path.
         path: PathBuf,
-        /// The step that refused: precheck, copy, verify, record, rename,
+        /// The step that refused: precheck, copy, verify, record, sync, rename,
         /// postcheck, stub, remove or ledger.
         stage: String,
         /// Why.
@@ -167,6 +168,10 @@ fn rsync_command(config: &RelocationConfig, remote: bool) -> Command {
         "--sparse",
         "--one-file-system",
         "--mkpath",
+        // This flushes transferred regular files, including on remote receivers.
+        // It does not flush skipped files or directory publication: local moves
+        // additionally require the filesystem barrier in make_durable().
+        "--fsync",
     ]);
     if remote {
         let mut ssh = vec![
@@ -680,6 +685,25 @@ impl LocalDestination {
         self.check_location()
     }
 
+    fn make_durable(
+        &self,
+        evidence: &SourceEvidence,
+        max_entries: u64,
+        sync: FilesystemSync<'_>,
+    ) -> io::Result<()> {
+        self.check_location()?;
+        // A resumed rsync skips matching files, and --fsync covers only files
+        // it writes. syncfs includes all pending payload data and directory
+        // metadata, including the published names and pre-existing copy files.
+        sync(&self.directory)?;
+        // The sidecar and destination entry live here. A destination that is
+        // itself a mount point can have a parent on a different filesystem.
+        sync(&self.parent)?;
+        // Writeback may take a long time: neither a replaced destination nor
+        // a modified copy may inherit the successful durability result.
+        self.check_verified(evidence, max_entries)
+    }
+
     fn record_path(&self) -> PathBuf {
         let mut name = self.path.file_name().unwrap().to_os_string();
         name.push(RECORD_FILENAME);
@@ -873,9 +897,15 @@ impl StagedStub {
     }
 }
 
+type FilesystemSync<'a> = &'a dyn Fn(&fs::File) -> io::Result<()>;
+
+fn sync_filesystem(directory: &fs::File) -> io::Result<()> {
+    rustix::fs::syncfs(directory).map_err(io::Error::from)
+}
+
 /// Fault-injection points for tests: what another process might do between
 /// two steps. `after_rename` gets the original path, `before_remove` the
-/// renamed tree.
+/// renamed tree. The sync hook can inject a filesystem writeback failure.
 #[derive(Default)]
 struct Hooks<'a> {
     before_copy: Option<&'a dyn Fn(&Path)>,
@@ -884,6 +914,7 @@ struct Hooks<'a> {
     after_rename: Option<&'a dyn Fn(&Path)>,
     before_stub_publish: Option<&'a dyn Fn(&Path)>,
     before_remove: Option<&'a dyn Fn(&Path)>,
+    sync_filesystem: Option<FilesystemSync<'a>>,
 }
 
 /// [`relocate`] with fault-injection hooks.
@@ -1015,10 +1046,10 @@ fn relocate_with_hooks(
     if let Some(hook) = hooks.after_verify {
         hook(&path);
     }
-    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence) {
-        if let Err(error) = copy.check_verified(verified, config.max_entries) {
-            return fail("verify", retained(error.to_string()));
-        }
+    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence)
+        && let Err(error) = copy.check_verified(verified, config.max_entries)
+    {
+        return fail("verify", retained(error.to_string()));
     }
     let record = RelocationRecord {
         schema: SCHEMA.to_string(),
@@ -1075,6 +1106,20 @@ fn relocate_with_hooks(
     if let Err((stage, error)) = uploaded {
         return fail(&stage, error);
     }
+    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence)
+        && let Err(error) = copy.make_durable(
+            verified,
+            config.max_entries,
+            hooks.sync_filesystem.unwrap_or(&sync_filesystem),
+        )
+    {
+        return fail(
+            "sync",
+            retained(format!(
+                "backup durability could not be established: {error}"
+            )),
+        );
+    }
 
     if let Some(hook) = hooks.before_rename {
         hook(&path);
@@ -1082,10 +1127,10 @@ fn relocate_with_hooks(
     if let Err(error) = anchor.check_location(false) {
         return fail("rename", retained(error.to_string()));
     }
-    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence) {
-        if let Err(error) = copy.check_verified(verified, config.max_entries) {
-            return fail("postcheck", retained(error.to_string()));
-        }
+    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence)
+        && let Err(error) = copy.check_verified(verified, config.max_entries)
+    {
+        return fail("postcheck", retained(error.to_string()));
     }
     match SourceEvidence::capture(&anchor.source, config.max_entries) {
         Ok(current) if evidence.matches(&current, false) => {}
@@ -1281,10 +1326,10 @@ fn relocate_with_hooks(
         Ok(_) => return refuse_removal("restore stub changed before source removal".into()),
         Err(error) => return refuse_removal(error.to_string()),
     }
-    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence) {
-        if let Err(error) = copy.check_verified(verified, config.max_entries) {
-            return refuse_removal(error.to_string());
-        }
+    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence)
+        && let Err(error) = copy.check_verified(verified, config.max_entries)
+    {
+        return refuse_removal(error.to_string());
     }
     // Metadata walks may be large. Current content evidence and a holder
     // sweep after those walks must both pass at the final removal boundary.
@@ -1297,10 +1342,10 @@ fn relocate_with_hooks(
     {
         return refuse_removal(error.to_string());
     }
-    if let Some(copy) = &local_destination {
-        if let Err(error) = copy.check_location() {
-            return refuse_removal(error.to_string());
-        }
+    if let Some(copy) = &local_destination
+        && let Err(error) = copy.check_location()
+    {
+        return refuse_removal(error.to_string());
     }
     // Descriptor-relative, no symlinks followed, and refusing any other
     // mount (openat2 NO_XDEV): the deletion executor's own removal.
@@ -1790,6 +1835,207 @@ mod tests {
             state_dir: root.join("state"),
             roots: vec![root.join("scratch")],
             ..RelocationConfig::default()
+        }
+    }
+
+    #[test]
+    fn local_durability_covers_sidecar_and_unchanged_resumed_files() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        for resume in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            let config = local_config(tmp.path());
+            let destination = destination_for(
+                &config,
+                config.target.as_deref().unwrap(),
+                &hostname(),
+                "S",
+                &unit,
+            );
+            let copy = PathBuf::from(destination.trim_end_matches('/'));
+            let sidecar = PathBuf::from(format!("{}{RECORD_FILENAME}", copy.display()));
+            let mut ledger = Ledger::default();
+            let previous_inode = if resume {
+                copy_and_verify(
+                    &config,
+                    false,
+                    &format!("{}/", unit.display()),
+                    &destination,
+                )
+                .unwrap();
+                ledger.in_progress.insert(unit.clone(), destination.clone());
+                Some(fs::metadata(copy.join("a/b/data")).unwrap().ino())
+            } else {
+                None
+            };
+            let synchronized = std::cell::RefCell::new(Vec::new());
+            let flush = |directory: &fs::File| {
+                // Both payload and sidecar must exist before either barrier;
+                // the source has not even been renamed at this point.
+                assert!(sidecar.is_file());
+                assert!(unit.join("a/b/data").is_file());
+                assert!(!sibling(&unit, "sbh-relocating").unwrap().exists());
+                if let Some(inode) = previous_inode {
+                    // The retry skipped this already-matching file. Its
+                    // durability cannot depend on rsync's per-file --fsync.
+                    assert_eq!(fs::metadata(copy.join("a/b/data")).unwrap().ino(), inode);
+                }
+                synchronized
+                    .borrow_mut()
+                    .push(fs::read_link(descriptor_path(directory)).unwrap());
+                sync_filesystem(directory)
+            };
+            let outcome = relocate_with_hooks(
+                &config,
+                &crate::platform::pal::MockPlatform::default(),
+                &mut ledger,
+                &candidate_for(&unit),
+                "S",
+                1_000,
+                &Hooks {
+                    sync_filesystem: Some(&flush),
+                    ..Hooks::default()
+                },
+            );
+            assert!(matches!(&outcome, Outcome::Relocated { .. }), "{outcome:?}");
+            assert_eq!(
+                *synchronized.borrow(),
+                vec![copy.clone(), copy.parent().unwrap().to_path_buf()]
+            );
+            assert_eq!(fs::read(copy.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+            assert!(sidecar.is_file());
+            assert!(unit.join(RECORD_FILENAME).is_file());
+            assert!(ledger.in_progress.is_empty());
+        }
+    }
+
+    #[test]
+    fn local_sync_failure_preserves_the_original_before_rename() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        for fail_at in [0, 1] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            let original_inode = fs::metadata(&unit).unwrap().ino();
+            let config = local_config(tmp.path());
+            let calls = std::cell::Cell::new(0);
+            let fail = |directory: &fs::File| {
+                let index = calls.get();
+                calls.set(index + 1);
+                if index == fail_at {
+                    Err(io::Error::from_raw_os_error(if fail_at == 0 {
+                        libc::EIO
+                    } else {
+                        libc::ENOSPC
+                    }))
+                } else {
+                    sync_filesystem(directory)
+                }
+            };
+            let mut ledger = Ledger::default();
+            let outcome = relocate_with_hooks(
+                &config,
+                &crate::platform::pal::MockPlatform::default(),
+                &mut ledger,
+                &candidate_for(&unit),
+                "S",
+                1_000,
+                &Hooks {
+                    sync_filesystem: Some(&fail),
+                    ..Hooks::default()
+                },
+            );
+            assert!(
+                matches!(&outcome, Outcome::Failed { stage, error, .. }
+                    if stage == "sync" && error.contains("durability")),
+                "{outcome:?}"
+            );
+            assert_eq!(calls.get(), fail_at + 1);
+            assert_eq!(fs::metadata(&unit).unwrap().ino(), original_inode);
+            assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+            assert!(!unit.join(RECORD_FILENAME).exists());
+            assert!(!sibling(&unit, "sbh-relocating").unwrap().exists());
+            let destination = &ledger.in_progress[&unit];
+            assert_eq!(
+                fs::read(Path::new(destination).join("a/b/data")).unwrap(),
+                vec![7u8; 300_000]
+            );
+            assert!(
+                PathBuf::from(format!(
+                    "{}{RECORD_FILENAME}",
+                    destination.trim_end_matches('/')
+                ))
+                .is_file()
+            );
+            assert!(ledger.relocations.is_empty());
+            assert_eq!(Ledger::load(&config.state_dir).unwrap(), ledger);
+        }
+    }
+
+    #[test]
+    fn a_backup_changed_during_writeback_cannot_inherit_the_sync_result() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        for replace in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            let config = local_config(tmp.path());
+            let destination = destination_for(
+                &config,
+                config.target.as_deref().unwrap(),
+                &hostname(),
+                "S",
+                &unit,
+            );
+            let copy = PathBuf::from(destination.trim_end_matches('/'));
+            let saved_copy = tmp.path().join("saved-copy");
+            let calls = std::cell::Cell::new(0);
+            let change = |directory: &fs::File| {
+                sync_filesystem(directory)?;
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    if replace {
+                        fs::rename(&copy, &saved_copy).unwrap();
+                        std::os::unix::fs::symlink(&unit, &copy).unwrap();
+                    } else {
+                        fs::write(copy.join("a/b/data"), b"modified during sync").unwrap();
+                    }
+                }
+                Ok(())
+            };
+            let outcome = relocate_with_hooks(
+                &config,
+                &crate::platform::pal::MockPlatform::default(),
+                &mut Ledger::default(),
+                &candidate_for(&unit),
+                "S",
+                1_000,
+                &Hooks {
+                    sync_filesystem: Some(&change),
+                    ..Hooks::default()
+                },
+            );
+            assert!(
+                matches!(&outcome, Outcome::Failed { stage, .. } if stage == "sync"),
+                "{outcome:?}"
+            );
+            assert_eq!(calls.get(), 2);
+            assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+            assert!(!unit.join(RECORD_FILENAME).exists());
+            assert!(!sibling(&unit, "sbh-relocating").unwrap().exists());
+            if replace {
+                assert_eq!(
+                    fs::read(saved_copy.join("a/b/data")).unwrap(),
+                    vec![7u8; 300_000]
+                );
+            }
         }
     }
 

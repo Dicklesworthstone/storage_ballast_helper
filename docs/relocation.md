@@ -27,7 +27,7 @@ Opt-outs and exclusions follow their own branch: a pinned child keeps its enclos
 
 1. Pin the source and its parent, collect bounded identity and content-change evidence, then rsync the opened source to `<target>[/<host>]/<run stamp>/<original path>/`.
 2. Verify with a checksum dry run. Any itemized difference aborts the move.
-3. Upload the relocation record next to the copy as `<copy>.sbh-relocated.json`.
+3. Upload the relocation record next to the copy as `<copy>.sbh-relocated.json`. For local targets, synchronize the backup and parent filesystems, then renew the backup's identity and content-change evidence.
 4. Renew the source evidence and rename the unit aside without replacing an existing recovery path, so a writer that opens by path fails instead of writing into a tree that is about to go.
 5. Renew relocation permission, survey it and sweep processes again. If anything changed, opted out, or holds it, the rename is undone.
 6. Build a private stub containing `RELOCATED.md`, `.sbh-relocated.json`, and the marker if the unit was the marked tree, then publish it atomically without replacing a newly occupied original path.
@@ -42,6 +42,30 @@ type, mode, ownership, link count, size, and nanosecond mtime/ctime. Matching fi
 counts or an unchanged newest timestamp cannot hide a replaced child. Reads do
 not invalidate the evidence through atime; after the rename, only the source
 directory's expected ctime change is exempted.
+
+Local targets also pin the destination and its parent. Symlinked destinations,
+the source itself, and direct ancestor or descendant destination paths are
+refused; replacing a destination cannot redirect the transfer. Backup evidence
+is captured before checksum verification and renewed afterward, before source
+rename, and before removal. Preflight does not fully detect bind-mount aliases
+of source descendants at other paths. Those aliases can permit copying back
+into the source tree, including recursive growth; backup targets must not use
+them.
+
+After the payload and adjacent record are written, local relocation requires
+successful `syncfs` barriers on both pinned filesystems before renaming the
+source. This includes pending writes for matching files skipped by a resumed
+rsync, nested directories, the sidecar, and the destination entry. Evidence is
+renewed after writeback, so a changed copy cannot inherit that success. A
+writeback error reports stage `sync` and retains the original at its original
+path, together with the backup and resumable ledger entry.
+
+All rsync transfers request `--fsync`, including remote transfers through
+restricted `rrsync` keys. That flushes transferred regular files; it does not
+establish durability for skipped files or directory publication on a remote
+receiver. The complete filesystem barrier described above applies to local
+targets. Full remote crash durability requires a receiver-side filesystem
+barrier, which the current rsync-only protocol does not provide.
 
 Evidence collection must finish within `max_entries`, 64 directory levels, and
 a 16 MiB budget for live filename storage. An exhausted budget, changed directory
