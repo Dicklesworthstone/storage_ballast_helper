@@ -84,6 +84,13 @@ run_with_timeout() {
   "$@"
 }
 
+# clap colours its errors when the caller forces colour, and rch runs every
+# remote command with CLICOLOR_FORCE=1, so expected text is matched against
+# the visible characters.
+strip_ansi() {
+  sed $'s/\033\\[[0-9;]*[A-Za-z]//g'
+}
+
 resolve_binary_path() {
   local candidate="$1"
   if [[ "${candidate}" == */* ]]; then
@@ -179,7 +186,7 @@ run_case() {
     return 1
   fi
 
-  if ! grep -Fq "${expected}" <<< "${output}"; then
+  if ! grep -Fq "${expected}" <<< "$(strip_ansi <<< "${output}")"; then
     log "CASE FAIL: ${name} (missing expected text: ${expected}) [${elapsed_ms}ms]"
     return 1
   fi
@@ -239,7 +246,7 @@ run_case_expect_fail() {
     return 1
   fi
 
-  if [[ -n "${expected_text}" ]] && ! grep -Fq "${expected_text}" <<< "${output}"; then
+  if [[ -n "${expected_text}" ]] && ! grep -Fq "${expected_text}" <<< "$(strip_ansi <<< "${output}")"; then
     log "CASE FAIL: ${name} (missing expected text: ${expected_text}) [${elapsed_ms}ms]"
     return 1
   fi
@@ -995,15 +1002,25 @@ TOML
   # another user's processes cannot be inspected (non-root on a busy shared
   # host), the open-file sweep is incomplete and the batch is held by design
   # (bd-p18q). That is reported as a skip, never as a pass.
+  #
+  # The plan needs a candidate sbh would delete. A tree made seconds ago is
+  # young by its birth time whatever its mtimes say, and sbh rightly keeps a
+  # young target/ inside a project, so this tree lives in a temp root. Under
+  # rch, LOG_DIR is inside the project mirror, and the outcome depended on
+  # where that mirror happened to be.
+  local explain_artifacts
+  explain_artifacts="$(mktemp -d /tmp/sbh-e2e-explain.XXXXXX)"
+  register_cleanup_dir "${explain_artifacts}"
+  create_artifact_tree "${explain_artifacts}"
   local clean_probe
   clean_probe="$(env SBH_OUTPUT_FORMAT=human "${bin}" --config "${explain_dir}/sbh.toml" \
-    clean "${artifact_root}" --dry-run --yes --min-score 0.0 2>&1 || true)"
+    clean "${explain_artifacts}" --dry-run --yes --min-score 0.0 2>&1 || true)"
   if grep -Fq "candidates in this batch are held" <<< "${clean_probe}"; then
     skip_case explain_clean_dry_run_records \
       "open-file sweep incomplete on this host; the batch is held by design"
   else
     tally_case run_case explain_clean_dry_run_records "Dry run complete" \
-      "${bin}" --config "${explain_dir}/sbh.toml" clean "${artifact_root}" --dry-run --yes --min-score 0.0
+      "${bin}" --config "${explain_dir}/sbh.toml" clean "${explain_artifacts}" --dry-run --yes --min-score 0.0
   fi
 
   tally_case run_case_json explain_last_json "decisions" \

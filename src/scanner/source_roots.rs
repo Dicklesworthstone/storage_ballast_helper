@@ -710,7 +710,7 @@ mod tests {
 
     fn scratch() -> tempfile::TempDir {
         // A standalone temp root avoids inheriting the checkout's own .git.
-        tempfile::tempdir().expect("scratch directory")
+        crate::tempdir_outside_git()
     }
 
     fn mkdir(path: &Path) {

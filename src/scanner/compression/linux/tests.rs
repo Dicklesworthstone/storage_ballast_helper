@@ -96,7 +96,7 @@ fn newly_mapped_files_are_refused_even_when_cached_evidence_is_empty() {
 
 #[test]
 fn fresh_marker_checks_do_not_reuse_negative_preflight_caches() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::tempdir_outside_git();
     let file = temp.path().join("cold.bin");
     fs::write(&file, b"unchanged contents").unwrap();
     let config = Config::default();
@@ -109,7 +109,7 @@ fn fresh_marker_checks_do_not_reuse_negative_preflight_caches() {
 
 #[test]
 fn configured_parent_protection_is_a_hard_veto_for_explicit_files() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::tempdir_outside_git();
     let file = temp.path().join("cold.bin");
     fs::write(&file, b"protected").unwrap();
     let mut config = Config::default();
@@ -122,7 +122,7 @@ fn configured_parent_protection_is_a_hard_veto_for_explicit_files() {
 
 #[test]
 fn pinned_descriptor_refuses_replaced_or_symlinked_paths() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::tempdir_outside_git();
     let path = temp.path().join("cold.bin");
     fs::write(&path, b"original").unwrap();
     let file = File::open(&path).unwrap();
@@ -137,7 +137,7 @@ fn pinned_descriptor_refuses_replaced_or_symlinked_paths() {
 
 #[test]
 fn preflight_hash_is_exact_and_short_reads_or_deadlines_are_not_success() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::tempdir_outside_git();
     let path = temp.path().join("cold.bin");
     fs::write(&path, b"abc").unwrap();
     let file = File::open(path).unwrap();
@@ -155,7 +155,7 @@ fn preflight_hash_is_exact_and_short_reads_or_deadlines_are_not_success() {
 
 #[test]
 fn insufficient_headroom_never_overflows_into_admission() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::tempdir_outside_git();
     let path = temp.path().join("cold.bin");
     fs::write(&path, b"abc").unwrap();
     let file = File::open(path).unwrap();
@@ -177,7 +177,7 @@ fn git_packfile_preview_and_apply_stop_before_hashing_or_journaling() {
     use crate::platform::pal::{FsStats, MountPoint, PlatformPaths};
     use std::collections::HashMap;
 
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::tempdir_outside_git();
     let root = temp.path().canonicalize().unwrap();
     let path = root.join("repo/.git/objects/pack/old.pack");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -254,7 +254,7 @@ fn git_packfile_preview_and_apply_stop_before_hashing_or_journaling() {
 
 #[test]
 fn per_chunk_protection_detects_a_new_gitfile_without_reusing_admission() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::tempdir_outside_git();
     let root = temp.path().canonicalize().unwrap();
     let path = root.join("cold.bin");
     fs::write(&path, b"not rewritten").unwrap();
@@ -295,7 +295,7 @@ fn a_stop_ends_a_started_file_between_chunks_but_the_deadline_does_not() {
 
 #[test]
 fn a_raised_stop_ends_the_pass_before_any_file_is_opened() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::tempdir_outside_git();
     let path = temp.path().join("cold.bin");
     fs::write(&path, b"untouched").unwrap();
     let stop = AtomicBool::new(true);

@@ -3433,7 +3433,7 @@ mod tests {
 
     #[test]
     fn source_root_safety_validation_does_not_disable_ballast_configuration() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir_outside_git();
         let repository = dir.path().join("nested/project");
         std::fs::create_dir_all(repository.join(".git")).unwrap();
         let mut cfg = Config::default();

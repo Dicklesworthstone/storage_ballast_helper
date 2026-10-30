@@ -121,7 +121,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     fn scratch() -> (tempfile::TempDir, std::path::PathBuf) {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::tempdir_outside_git();
         let root = temp.path().canonicalize().unwrap();
         (temp, root)
     }
