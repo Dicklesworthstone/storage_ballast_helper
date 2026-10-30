@@ -705,6 +705,54 @@ struct PendingSelection {
     next: Option<PathBuf>,
 }
 
+/// A due root can disappear or become inaccessible after its pressure probe.
+/// Keep that root's continuation while allowing the other roots to progress.
+/// Each root still passes the ordinary strict resolver; this does not weaken
+/// explicit CLI discovery or allow a failed path's parent or symlink target.
+fn discover_roots(
+    roots: &[PathBuf],
+    config: &Config,
+    platform: &dyn Platform,
+    progress: &Mutex<PassProgress>,
+    stop: &AtomicBool,
+    budget: &mut DiscoveryBudget,
+) -> (Vec<PendingSelection>, Vec<String>) {
+    let mut canonical = Vec::new();
+    let mut messages = Vec::new();
+    for root in roots {
+        if stop.load(Ordering::Acquire) || Instant::now() >= budget.deadline {
+            messages.push(
+                "remaining roots deferred: pass stopped or discovery deadline exhausted".into(),
+            );
+            break;
+        }
+        match discovery::canonical_roots(std::slice::from_ref(root)) {
+            Ok(resolved) => canonical.extend(resolved),
+            Err(error) => messages.push(format!(
+                "compression root resolution failed for {}: {error}",
+                root.display(),
+            )),
+        }
+    }
+    canonical.sort();
+    let mut minimal: Vec<PathBuf> = Vec::new();
+    for root in canonical {
+        if !minimal.iter().any(|parent| root.starts_with(parent)) {
+            minimal.push(root);
+        }
+    }
+    let ordered = match progress.lock() {
+        Ok(mut progress) => progress.order(minimal),
+        Err(_) => {
+            messages.push("pass refused: continuation state is poisoned".into());
+            return (Vec::new(), messages);
+        }
+    };
+    let (pending, outcomes) = discover_pass(ordered, config, platform, stop, budget);
+    messages.extend(outcomes);
+    (pending, messages)
+}
+
 /// Discover all roots with one allowance. A small root does not consume a whole
 /// scheduling interval, while larger roots cannot multiply the pass's budgets.
 fn discover_pass(
@@ -771,9 +819,9 @@ fn discover_pass(
             // it; an incomplete empty page may advance, never rewind.
             if let Ok(mut resume) = cursor.lock()
                 && (report.stop_reason.is_none()
-                    || next.as_ref().is_some_and(|next| {
-                        resume.as_ref().is_none_or(|before| next > before)
-                    }))
+                    || next
+                        .as_ref()
+                        .is_some_and(|next| resume.as_ref().is_none_or(|before| next > before)))
             {
                 *resume = next;
             }
@@ -805,15 +853,8 @@ fn run_pass(
     logger: &ActivityLoggerHandle,
 ) -> String {
     let mut budget = DiscoveryBudget::new(config);
-    let roots = match discovery::canonical_roots(roots) {
-        Ok(roots) => roots,
-        Err(error) => return format!("compression root resolution failed: {error}"),
-    };
-    let ordered = match resume_after.lock() {
-        Ok(mut progress) => progress.order(roots),
-        Err(_) => return "pass refused: continuation state is poisoned".into(),
-    };
-    let (pending, mut messages) = discover_pass(ordered, config, platform, stop, &mut budget);
+    let (pending, mut messages) =
+        discover_roots(roots, config, platform, resume_after, stop, &mut budget);
     let mut deadline = None;
     let mode = CompressionMode {
         apply: true,
@@ -1081,6 +1122,133 @@ mod tests {
                 roots[0].clone(),
             ];
             assert_eq!(discovery::canonical_roots(&configured).unwrap(), roots);
+        }
+
+        #[test]
+        fn unavailable_or_invalid_roots_do_not_block_healthy_roots_or_expand_scope() {
+            let (directory, roots, config) = fixture(&[8, 8, 8]);
+            let missing = directory.path().join("missing-mount");
+            let alias = directory.path().join("foreign-link");
+            std::os::unix::fs::symlink(&roots[2], &alias).unwrap();
+            let not_directory = directory.path().join("not-a-directory");
+            fs::write(&not_directory, b"not a compression root").unwrap();
+            let child = roots[0].join("child");
+            fs::create_dir(&child).unwrap();
+            let configured = vec![
+                missing.clone(),
+                roots[0].clone(),
+                alias.clone(),
+                not_directory.clone(),
+                child,
+                roots[1].clone(),
+                roots[0].join("."),
+            ];
+            let progress = Mutex::new(PassProgress::default());
+            let (pending, messages) = discover_roots(
+                &configured,
+                &config,
+                &MockPlatform::healthy(),
+                &progress,
+                &AtomicBool::new(false),
+                &mut DiscoveryBudget::new(&config),
+            );
+            let selected: Vec<_> = pending
+                .iter()
+                .flat_map(|work| work.selection.paths())
+                .collect();
+            assert_eq!(
+                selected,
+                vec![roots[0].join("cold.bin"), roots[1].join("cold.bin")]
+            );
+            assert_eq!(progress.lock().unwrap().cursors.len(), 2);
+            assert_eq!(messages.len(), 3);
+            for failed in [missing, alias, not_directory] {
+                assert!(
+                    messages
+                        .iter()
+                        .any(|message| message.contains(&failed.display().to_string())),
+                    "missing diagnostic for {}: {messages:?}",
+                    failed.display(),
+                );
+            }
+            // The explicitly requested CLI operation still refuses invalid
+            // roots instead of silently doing only part of the request.
+            assert!(
+                discovery::discover(
+                    &configured,
+                    &config.compress.policy,
+                    &discovery::DiscoveryLimits::default(),
+                    &config,
+                    &MockPlatform::healthy(),
+                )
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn a_returning_root_resumes_its_saved_frontier_after_other_roots_progress() {
+            let (directory, roots, config) = fixture(&[8, 8]);
+            let tail = roots[1].join("z-next.bin");
+            fs::write(&tail, b"still pending").unwrap();
+            filetime::set_file_mtime(&tail, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+            let progress = Mutex::new(PassProgress::default());
+            let ordered = progress.lock().unwrap().order(roots.clone());
+            let cursor = Arc::clone(&ordered[1].1);
+            let before = roots[1].join("cold.bin");
+            *cursor.lock().unwrap() = Some(before.clone());
+            let offline = directory.path().join("temporarily-unmounted");
+            fs::rename(&roots[1], &offline).unwrap();
+
+            let (pending, messages) = discover_roots(
+                &roots,
+                &config,
+                &MockPlatform::healthy(),
+                &progress,
+                &AtomicBool::new(false),
+                &mut DiscoveryBudget::new(&config),
+            );
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].selection.paths(), [roots[0].join("cold.bin")]);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(*cursor.lock().unwrap(), Some(before));
+
+            fs::rename(&offline, &roots[1]).unwrap();
+            let (recovered, messages) = discover_roots(
+                &roots,
+                &config,
+                &MockPlatform::healthy(),
+                &progress,
+                &AtomicBool::new(false),
+                &mut DiscoveryBudget::new(&config),
+            );
+            assert!(messages.is_empty());
+            assert_eq!(recovered[0].selection.paths(), [tail]);
+            assert!(Arc::ptr_eq(&recovered[0].cursor, &cursor));
+            assert_eq!(recovered.len(), 2);
+        }
+
+        #[test]
+        fn root_resolution_obeys_cancellation_and_the_shared_discovery_deadline() {
+            let (_directory, roots, config) = fixture(&[8]);
+            let now = Instant::now();
+            for (cancelled, deadline) in [(true, now + Duration::from_secs(60)), (false, now)] {
+                let progress = Mutex::new(PassProgress::default());
+                let mut budget = DiscoveryBudget::new(&config);
+                budget.deadline = deadline;
+                let (pending, messages) = discover_roots(
+                    &roots,
+                    &config,
+                    &MockPlatform::healthy(),
+                    &progress,
+                    &AtomicBool::new(cancelled),
+                    &mut budget,
+                );
+                assert!(pending.is_empty());
+                assert!(messages.iter().any(|message| message.contains("deferred")));
+                assert!(progress.lock().unwrap().cursors.is_empty());
+                assert_eq!(budget.files, config.compress.policy.max_files);
+                assert_eq!(budget.bytes, config.compress.policy.max_bytes);
+            }
         }
 
         #[test]
