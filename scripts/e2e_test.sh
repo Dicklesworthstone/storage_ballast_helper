@@ -1001,9 +1001,7 @@ TOML
   # A dry-run clean records its plan; explain reads it back. On a host where
   # another user's processes cannot be inspected (non-root on a busy shared
   # host), the open-file sweep is incomplete and the batch is held by design
-  # (bd-p18q). That is reported as a skip, never as a pass. A candidate that
-  # reached the active-reference probe is refused at scoring instead, with
-  # its own [SBH-SAFETY] line.
+  # (bd-p18q). That is reported as a skip, never as a pass.
   #
   # The plan needs a candidate sbh would delete. A tree made seconds ago is
   # young by its birth time whatever its mtimes say, and sbh rightly keeps a
@@ -1017,8 +1015,7 @@ TOML
   local clean_probe
   clean_probe="$(env SBH_OUTPUT_FORMAT=human "${bin}" --config "${explain_dir}/sbh.toml" \
     clean "${explain_artifacts}" --dry-run --yes --min-score 0.0 2>&1 || true)"
-  if grep -Fq -e "candidates in this batch are held" \
-    -e "candidates it could not clear are refused" <<< "${clean_probe}"; then
+  if grep -Fq "candidates in this batch are held" <<< "${clean_probe}"; then
     skip_case explain_clean_dry_run_records \
       "open-file sweep incomplete on this host; the batch is held by design"
   else
