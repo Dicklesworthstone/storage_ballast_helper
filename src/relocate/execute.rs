@@ -228,9 +228,28 @@ fn copy_and_verify(
     source: &str,
     destination: &str,
 ) -> Result<(), (String, String)> {
+    copy_tree(config, remote, source, destination)?;
+    verify_copy(config, remote, source, destination)
+}
+
+fn copy_tree(
+    config: &RelocationConfig,
+    remote: bool,
+    source: &str,
+    destination: &str,
+) -> Result<(), (String, String)> {
     let mut copy = rsync_command(config, remote);
     copy.arg("--").arg(source).arg(destination);
     run(copy, "copy")?;
+    Ok(())
+}
+
+fn verify_copy(
+    config: &RelocationConfig,
+    remote: bool,
+    source: &str,
+    destination: &str,
+) -> Result<(), (String, String)> {
     let mut verify = rsync_command(config, remote);
     verify
         .args(["--checksum", "--dry-run", "--itemize-changes", "--delete"])
@@ -516,6 +535,158 @@ fn actual_directory(directory: &fs::File, fallback: &Path) -> PathBuf {
     fs::read_link(descriptor_path(directory)).unwrap_or_else(|_| fallback.to_path_buf())
 }
 
+/// A local copy must be a separate, pinned tree. In particular, rsync accepts
+/// a destination symlink to its own source and reports a clean checksum check.
+/// Following that alias would leave no backup when the source is removed.
+struct LocalDestination {
+    path: PathBuf,
+    parent: fs::File,
+    directory: fs::File,
+    source_identity: Stat,
+}
+
+impl LocalDestination {
+    fn walk(path: &Path, source: &Stat, create: bool) -> io::Result<fs::File> {
+        let mut directory = survey::open_directory(Path::new("/"))?;
+        for component in path.components() {
+            let name = match component {
+                std::path::Component::RootDir => continue,
+                std::path::Component::Normal(name) => name,
+                _ => {
+                    return Err(restore_invalid(
+                        "local destination is not an absolute confined path",
+                    ));
+                }
+            };
+            if same_restore_identity(source, &rustix::fs::fstat(&directory)?) {
+                return Err(restore_invalid(
+                    "local destination overlaps the source tree",
+                ));
+            }
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let opened = rustix::fs::openat(&directory, name, flags, Mode::empty());
+            let child = match opened {
+                Ok(child) => child,
+                Err(rustix::io::Errno::NOENT) if create => {
+                    match rustix::fs::mkdirat(&directory, name, Mode::from_raw_mode(0o700)) {
+                        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    rustix::fs::openat(&directory, name, flags, Mode::empty())?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            directory = fs::File::from(child);
+        }
+        if same_restore_identity(source, &rustix::fs::fstat(&directory)?) {
+            return Err(restore_invalid("local destination aliases the source tree"));
+        }
+        Ok(directory)
+    }
+
+    fn create(destination: &str, source: &fs::File) -> io::Result<Self> {
+        if destination.is_empty() {
+            return Err(restore_invalid("local destination is empty"));
+        }
+        let destination = Path::new(destination);
+        let path = if destination.is_absolute() {
+            destination.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(destination)
+        };
+        if path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+        {
+            return Err(restore_invalid(
+                "local destination contains parent components",
+            ));
+        }
+        let path: PathBuf = path.components().collect();
+        if path.to_str().is_none() {
+            return Err(restore_invalid(
+                "local destination cannot be represented in the restore record",
+            ));
+        }
+        let source_identity = rustix::fs::fstat(source)?;
+        let directory = Self::walk(&path, &source_identity, true)?;
+        let copy_identity = rustix::fs::fstat(&directory)?;
+        // A resumable destination from the ledger can also name a source
+        // ancestor. Refuse it before rsync can copy into the live source scope.
+        let mut ancestor = source.try_clone()?;
+        loop {
+            let current = rustix::fs::fstat(&ancestor)?;
+            if same_restore_identity(&copy_identity, &current) {
+                return Err(restore_invalid(
+                    "local destination contains the source tree",
+                ));
+            }
+            let parent = fs::File::from(rustix::fs::openat(
+                &ancestor,
+                "..",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?);
+            if same_restore_identity(&current, &rustix::fs::fstat(&parent)?) {
+                break;
+            }
+            ancestor = parent;
+        }
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| restore_invalid("local destination has no parent"))?;
+        let parent = Self::walk(parent_path, &source_identity, false)?;
+        let copy = Self {
+            path,
+            parent,
+            directory,
+            source_identity,
+        };
+        copy.check_location()?;
+        Ok(copy)
+    }
+
+    fn check_location(&self) -> io::Result<()> {
+        let check = || {
+            let current = Self::walk(&self.path, &self.source_identity, false)?;
+            let parent = Self::walk(self.path.parent().unwrap(), &self.source_identity, false)?;
+            if !same_restore_identity(
+                &rustix::fs::fstat(&self.directory)?,
+                &rustix::fs::fstat(&current)?,
+            ) || !same_restore_identity(
+                &rustix::fs::fstat(&self.parent)?,
+                &rustix::fs::fstat(&parent)?,
+            ) {
+                return Err(restore_invalid("directory identity changed"));
+            }
+            Ok(())
+        };
+        check().map_err(|error| restore_invalid(&format!(
+            "local destination is unavailable or replaced ({error}); pinned copy retained at {}",
+            actual_directory(&self.directory, &self.path).display(),
+        )))
+    }
+
+    fn check_verified(&self, evidence: &SourceEvidence, max_entries: u64) -> io::Result<()> {
+        self.check_location()?;
+        if !evidence.matches(
+            &SourceEvidence::capture(&self.directory, max_entries)?,
+            false,
+        ) {
+            return Err(restore_invalid(
+                "local backup changed after checksum verification",
+            ));
+        }
+        self.check_location()
+    }
+
+    fn record_path(&self) -> PathBuf {
+        let mut name = self.path.file_name().unwrap().to_os_string();
+        name.push(RECORD_FILENAME);
+        descriptor_path(&self.parent).join(name)
+    }
+}
+
 struct RelocationAnchor {
     parent: fs::File,
     source: fs::File,
@@ -708,6 +879,7 @@ impl StagedStub {
 #[derive(Default)]
 struct Hooks<'a> {
     before_copy: Option<&'a dyn Fn(&Path)>,
+    after_verify: Option<&'a dyn Fn(&Path)>,
     before_rename: Option<&'a dyn Fn(&Path)>,
     after_rename: Option<&'a dyn Fn(&Path)>,
     before_stub_publish: Option<&'a dyn Fn(&Path)>,
@@ -734,7 +906,6 @@ fn relocate_with_hooks(
     let Some(target) = config.target.as_deref() else {
         return fail("config", "no target configured".into());
     };
-    let remote = is_remote(target);
     let host = hostname();
     let anchor = match RelocationAnchor::open(&path) {
         Ok(anchor) => anchor,
@@ -782,11 +953,25 @@ fn relocate_with_hooks(
         return fail("precheck", error.to_string());
     }
 
-    let destination = ledger
+    let mut destination = ledger
         .in_progress
         .get(&path)
         .cloned()
         .unwrap_or_else(|| destination_for(config, target, &host, stamp, &path));
+    // A resumed transfer keeps its original destination even when the current
+    // configured target changed. Its transport follows that saved destination.
+    let remote = is_remote(&destination);
+    let local_destination = if remote {
+        None
+    } else {
+        let copy = match LocalDestination::create(&destination, &anchor.source) {
+            Ok(copy) => copy,
+            Err(error) => return fail("precheck", format!("unsafe local destination: {error}")),
+        };
+        // Persist an absolute path so restoration is independent of cwd.
+        destination = format!("{}/", copy.path.display());
+        Some(copy)
+    };
     ledger.in_progress.insert(path.clone(), destination.clone());
     if let Err(error) = ledger.save(&config.state_dir) {
         return fail("ledger", error.to_string());
@@ -801,11 +986,39 @@ fn relocate_with_hooks(
         hook(&path);
     }
     let source = format!("{}/", descriptor_path(&anchor.source).display());
-    if let Err((stage, error)) = copy_and_verify(config, remote, &source, &destination) {
+    let copy_path = local_destination.as_ref().map_or_else(
+        || destination.clone(),
+        |copy| format!("{}/", descriptor_path(&copy.directory).display()),
+    );
+    if let Err((stage, error)) = copy_tree(config, remote, &source, &copy_path) {
         return fail(&stage, retained(error));
     }
     if let Err(error) = anchor.check_location(false) {
         return fail("postcheck", retained(error.to_string()));
+    }
+    // Pin the metadata baseline before checksums. A change after rsync has
+    // checked an entry must never be blessed by a later baseline capture.
+    let local_evidence = match local_destination
+        .as_ref()
+        .map(|copy| {
+            copy.check_location()?;
+            SourceEvidence::capture(&copy.directory, config.max_entries)
+        })
+        .transpose()
+    {
+        Ok(evidence) => evidence,
+        Err(error) => return fail("postcheck", retained(error.to_string())),
+    };
+    if let Err((stage, error)) = verify_copy(config, remote, &source, &copy_path) {
+        return fail(&stage, retained(error));
+    }
+    if let Some(hook) = hooks.after_verify {
+        hook(&path);
+    }
+    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence) {
+        if let Err(error) = copy.check_verified(verified, config.max_entries) {
+            return fail("verify", retained(error.to_string()));
+        }
     }
     let record = RelocationRecord {
         schema: SCHEMA.to_string(),
@@ -844,11 +1057,19 @@ fn relocate_with_hooks(
         return fail("record", error.to_string());
     }
     let mut upload = rsync_command(config, remote);
-    upload.arg(&staging).arg(format!(
-        "{}{}",
-        destination.trim_end_matches('/'),
-        RECORD_FILENAME
-    ));
+    upload
+        .arg("--")
+        .arg(&staging)
+        .arg(local_destination.as_ref().map_or_else(
+            || {
+                PathBuf::from(format!(
+                    "{}{}",
+                    destination.trim_end_matches('/'),
+                    RECORD_FILENAME
+                ))
+            },
+            LocalDestination::record_path,
+        ));
     let uploaded = run(upload, "record");
     let _ = fs::remove_file(&staging);
     if let Err((stage, error)) = uploaded {
@@ -860,6 +1081,11 @@ fn relocate_with_hooks(
     }
     if let Err(error) = anchor.check_location(false) {
         return fail("rename", retained(error.to_string()));
+    }
+    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence) {
+        if let Err(error) = copy.check_verified(verified, config.max_entries) {
+            return fail("postcheck", retained(error.to_string()));
+        }
     }
     match SourceEvidence::capture(&anchor.source, config.max_entries) {
         Ok(current) if evidence.matches(&current, false) => {}
@@ -1055,8 +1281,13 @@ fn relocate_with_hooks(
         Ok(_) => return refuse_removal("restore stub changed before source removal".into()),
         Err(error) => return refuse_removal(error.to_string()),
     }
-    // A policy walk may be large. Its current content evidence and a holder
-    // sweep after that walk must both pass at the final removal boundary.
+    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence) {
+        if let Err(error) = copy.check_verified(verified, config.max_entries) {
+            return refuse_removal(error.to_string());
+        }
+    }
+    // Metadata walks may be large. Current content evidence and a holder
+    // sweep after those walks must both pass at the final removal boundary.
     if let Some(reason) = holder(platform, &aside) {
         return refuse_removal(format!("in use before removal: {reason}"));
     }
@@ -1065,6 +1296,11 @@ fn relocate_with_hooks(
         .and_then(|()| stub.check_name(&anchor, true))
     {
         return refuse_removal(error.to_string());
+    }
+    if let Some(copy) = &local_destination {
+        if let Err(error) = copy.check_location() {
+            return refuse_removal(error.to_string());
+        }
     }
     // Descriptor-relative, no symlinks followed, and refusing any other
     // mount (openat2 NO_XDEV): the deletion executor's own removal.
@@ -1554,6 +1790,226 @@ mod tests {
             state_dir: root.join("state"),
             roots: vec![root.join("scratch")],
             ..RelocationConfig::default()
+        }
+    }
+
+    #[test]
+    fn local_destination_symlinks_cannot_turn_the_source_into_its_own_backup() {
+        for ancestor_alias in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            let config = local_config(tmp.path());
+            let destination = destination_for(
+                &config,
+                config.target.as_deref().unwrap(),
+                &hostname(),
+                "S",
+                &unit,
+            );
+            let alias = if ancestor_alias {
+                tmp.path().join("bulk")
+            } else {
+                PathBuf::from(destination.trim_end_matches('/'))
+            };
+            fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&unit, &alias).unwrap();
+            let mut ledger = Ledger::default();
+            let outcome = relocate(
+                &config,
+                &crate::platform::pal::MockPlatform::default(),
+                &mut ledger,
+                &candidate_for(&unit),
+                "S",
+                1_000,
+            );
+            assert!(
+                matches!(&outcome, Outcome::Failed { stage, error, .. }
+                    if stage == "precheck" && error.contains("unsafe local destination")),
+                "{outcome:?}"
+            );
+            assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+            assert_eq!(fs::read_link(alias).unwrap(), unit);
+            assert!(!unit.join(RECORD_FILENAME).exists());
+            assert!(!sibling(&unit, "sbh-relocating").unwrap().exists());
+            assert!(!config.state_dir.exists());
+            assert_eq!(ledger, Ledger::default());
+        }
+    }
+
+    #[test]
+    fn resumed_local_destinations_must_not_overlap_the_source() {
+        for kind in ["same", "descendant", "ancestor"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            let config = local_config(tmp.path());
+            let destination = match kind {
+                "same" => unit.clone(),
+                "descendant" => unit.join("backup"),
+                _ => unit.parent().unwrap().to_path_buf(),
+            };
+            let mut ledger = Ledger::default();
+            ledger
+                .in_progress
+                .insert(unit.clone(), format!("{}/", destination.display()));
+            let before = ledger.clone();
+            let outcome = relocate(
+                &config,
+                &crate::platform::pal::MockPlatform::default(),
+                &mut ledger,
+                &candidate_for(&unit),
+                "S",
+                1_000,
+            );
+            assert!(
+                matches!(&outcome, Outcome::Failed { stage, error, .. }
+                    if stage == "precheck" && error.contains("source tree")),
+                "{kind}: {outcome:?}"
+            );
+            assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+            assert!(!unit.join("backup").exists());
+            assert!(!unit.join(RECORD_FILENAME).exists());
+            assert!(!config.state_dir.exists());
+            assert_eq!(ledger, before);
+        }
+    }
+
+    #[test]
+    fn destination_replacement_before_copy_does_not_redirect_rsync() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        let config = local_config(tmp.path());
+        let destination = PathBuf::from(
+            destination_for(
+                &config,
+                config.target.as_deref().unwrap(),
+                &hostname(),
+                "S",
+                &unit,
+            )
+            .trim_end_matches('/'),
+        );
+        let saved_copy = tmp.path().join("saved-copy");
+        let replace = |source: &Path| {
+            fs::rename(&destination, &saved_copy).unwrap();
+            std::os::unix::fs::symlink(source, &destination).unwrap();
+        };
+        let mut ledger = Ledger::default();
+        let outcome = relocate_with_hooks(
+            &config,
+            &crate::platform::pal::MockPlatform::default(),
+            &mut ledger,
+            &candidate_for(&unit),
+            "S",
+            1_000,
+            &Hooks {
+                before_copy: Some(&replace),
+                ..Hooks::default()
+            },
+        );
+        assert!(
+            matches!(&outcome, Outcome::Failed { stage, error, .. }
+                if stage == "postcheck" && error.contains(&saved_copy.display().to_string())),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+        assert_eq!(
+            fs::read(saved_copy.join("a/b/data")).unwrap(),
+            vec![7u8; 300_000]
+        );
+        assert_eq!(fs::read_link(destination).unwrap(), unit);
+        assert!(!unit.join(RECORD_FILENAME).exists());
+        assert!(!sibling(&unit, "sbh-relocating").unwrap().exists());
+        assert!(ledger.in_progress.contains_key(&unit));
+    }
+
+    #[test]
+    fn changed_or_replaced_local_backup_never_authorizes_source_removal() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        // A late change must fail even at checksum completion, before a
+        // post-verification metadata snapshot could accidentally bless it.
+        for phase in ["verify", "rename", "remove"] {
+            for replace in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let unit = marked_tree(tmp.path());
+                let config = local_config(tmp.path());
+                let destination = PathBuf::from(
+                    destination_for(
+                        &config,
+                        config.target.as_deref().unwrap(),
+                        &hostname(),
+                        "S",
+                        &unit,
+                    )
+                    .trim_end_matches('/'),
+                );
+                let saved_copy = tmp.path().join("saved-copy");
+                let damage = |_: &Path| {
+                    if replace {
+                        fs::rename(&destination, &saved_copy).unwrap();
+                        fs::create_dir(&destination).unwrap();
+                    } else {
+                        fs::write(destination.join("a/b/data"), b"backup changed").unwrap();
+                    }
+                };
+                let hooks = match phase {
+                    "verify" => Hooks {
+                        after_verify: Some(&damage),
+                        ..Hooks::default()
+                    },
+                    "remove" => Hooks {
+                        before_remove: Some(&damage),
+                        ..Hooks::default()
+                    },
+                    _ => Hooks {
+                        before_rename: Some(&damage),
+                        ..Hooks::default()
+                    },
+                };
+                let mut ledger = Ledger::default();
+                let outcome = relocate_with_hooks(
+                    &config,
+                    &crate::platform::pal::MockPlatform::default(),
+                    &mut ledger,
+                    &candidate_for(&unit),
+                    "S",
+                    1_000,
+                    &hooks,
+                );
+                let expected_stage = match phase {
+                    "verify" => "verify",
+                    "remove" => "remove",
+                    _ => "postcheck",
+                };
+                assert!(
+                    matches!(&outcome, Outcome::Failed { stage, error, .. }
+                        if stage == expected_stage && error.contains("local")),
+                    "{outcome:?}"
+                );
+                let preserved = if phase == "remove" {
+                    assert!(unit.join(RECORD_FILENAME).is_file());
+                    sibling(&unit, "sbh-relocating").unwrap()
+                } else {
+                    assert!(!unit.join(RECORD_FILENAME).exists());
+                    unit.clone()
+                };
+                assert_eq!(
+                    fs::read(preserved.join("a/b/data")).unwrap(),
+                    vec![7u8; 300_000]
+                );
+                if replace {
+                    assert_eq!(
+                        fs::read(saved_copy.join("a/b/data")).unwrap(),
+                        vec![7u8; 300_000]
+                    );
+                }
+            }
         }
     }
 
