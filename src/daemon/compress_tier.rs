@@ -319,11 +319,9 @@ pub struct CompressTier {
     /// before each file and between the chunks of a started one.
     stop: Arc<AtomicBool>,
     last_start: Option<Instant>,
-    /// Where discovery may resume without skipping unvisited selected files.
-    /// Execution commits only its visited prefix; after all selected files
-    /// have been considered, discovery's own frontier takes over.
-    /// `None` starts from the top. This is not a durable completion ledger.
-    resume_after: Arc<Mutex<Option<PathBuf>>>,
+    /// Independent root continuations and the next pass's starting order.
+    /// Replacing this state on scope changes isolates late worker publication.
+    resume_after: Arc<Mutex<PassProgress>>,
     first: Arc<CompressionFirst>,
     probe: Option<RootProbe>,
     probe_roots: Vec<PathBuf>,
@@ -443,7 +441,7 @@ impl CompressTier {
             // An old pass may still finish discovery or cancellation. Give
             // the new scope its own cursor so that late publication cannot
             // skip work under the new roots or newly admitted policy.
-            self.resume_after = Arc::new(Mutex::new(None));
+            self.resume_after = Arc::new(Mutex::new(PassProgress::default()));
         }
         self.scope = Some(scope);
         self.first.update_levels(mount_levels);
@@ -607,62 +605,216 @@ fn probe_root(root: PathBuf, platform: &dyn Platform) -> RootEvidence {
     }
 }
 
-/// One pass: discover, then apply to exactly what discovery selected.
-/// Returns the summary line.
+type RootCursor = Arc<Mutex<Option<PathBuf>>>;
+
+#[derive(Debug, Default)]
+struct PassProgress {
+    cursors: HashMap<PathBuf, RootCursor>,
+    previous_first: Option<PathBuf>,
+}
+
+impl PassProgress {
+    /// Canonical roots are sorted before rotation. Even if one root consumes
+    /// the whole pass, the following root gets first access next time. Roots
+    /// temporarily absent from the due set keep their individual continuation.
+    fn order(&mut self, mut roots: Vec<PathBuf>) -> Vec<(PathBuf, RootCursor)> {
+        if roots.is_empty() {
+            return Vec::new();
+        }
+        let offset = self
+            .previous_first
+            .as_ref()
+            .and_then(|previous| roots.iter().position(|root| root > previous))
+            .unwrap_or(0);
+        roots.rotate_left(offset);
+        self.previous_first = roots.first().cloned();
+        roots
+            .into_iter()
+            .map(|root| {
+                let cursor = Arc::clone(self.cursors.entry(root.clone()).or_default());
+                (root, cursor)
+            })
+            .collect()
+    }
+}
+
+struct DiscoveryBudget {
+    files: usize,
+    bytes: u64,
+    entries: usize,
+    directories: usize,
+    deadline: Instant,
+}
+
+impl DiscoveryBudget {
+    fn new(config: &Config) -> Self {
+        Self {
+            files: config.compress.policy.max_files,
+            bytes: config.compress.policy.max_bytes,
+            entries: 1_000_000,
+            directories: 8192,
+            deadline: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    fn limits(&self, after: Option<PathBuf>) -> Option<discovery::DiscoveryLimits> {
+        let timeout_secs = remaining_seconds(self.deadline);
+        if self.files == 0
+            || self.bytes == 0
+            || self.entries == 0
+            || self.directories == 0
+            || timeout_secs == 0
+        {
+            return None;
+        }
+        Some(discovery::DiscoveryLimits {
+            max_entries: self.entries,
+            max_directories: self.directories,
+            timeout_secs,
+            after,
+            ..discovery::DiscoveryLimits::default()
+        })
+    }
+
+    fn account(&mut self, report: &discovery::DiscoveryReport) {
+        self.files = self.files.saturating_sub(report.selected_files);
+        self.bytes = self.bytes.saturating_sub(report.selected_bytes);
+        self.entries = self.entries.saturating_sub(report.entries_examined);
+        self.directories = self.directories.saturating_sub(report.directories_opened);
+    }
+}
+
+/// Whole seconds rounded down never extend a shared deadline at a root boundary.
+fn remaining_seconds(deadline: Instant) -> u64 {
+    deadline.saturating_duration_since(Instant::now()).as_secs()
+}
+
+/// Start the shared execution clock with the first root. Rounding that
+/// root's new one-second allowance down would otherwise prevent all work.
+fn execution_seconds(deadline: &mut Option<Instant>, allowance: u64, now: Instant) -> u64 {
+    let Some(until) = *deadline else {
+        *deadline = Some(now + Duration::from_secs(allowance));
+        return allowance;
+    };
+    until.saturating_duration_since(now).as_secs()
+}
+
+struct PendingSelection {
+    selection: discovery::Selection,
+    cursor: RootCursor,
+    next: Option<PathBuf>,
+}
+
+/// Discover all roots with one allowance. A small root does not consume a whole
+/// scheduling interval, while larger roots cannot multiply the pass's budgets.
+fn discover_pass(
+    roots: Vec<(PathBuf, RootCursor)>,
+    config: &Config,
+    platform: &dyn Platform,
+    stop: &AtomicBool,
+    budget: &mut DiscoveryBudget,
+) -> (Vec<PendingSelection>, Vec<String>) {
+    let mut pending = Vec::new();
+    let mut messages = Vec::new();
+    for (root, cursor) in roots {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let after = match cursor.lock() {
+            Ok(after) => after.clone(),
+            Err(_) => {
+                messages.push(format!("continuation unavailable for {}", root.display()));
+                continue;
+            }
+        };
+        let Some(limits) = budget.limits(after) else {
+            break;
+        };
+        let mut policy = config.compress.policy.clone();
+        policy.max_files = budget.files;
+        let selection = match discovery::discover_with_budget(
+            std::slice::from_ref(&root),
+            &policy,
+            &limits,
+            config,
+            platform,
+            budget.bytes,
+        ) {
+            Ok(selection) => selection,
+            Err(error) => {
+                messages.push(format!(
+                    "discovery under {} failed: {error}",
+                    root.display()
+                ));
+                continue;
+            }
+        };
+        let report = selection.report();
+        budget.account(report);
+        let next = match report
+            .resume_after_hex
+            .as_deref()
+            .map(discovery::continuation_path)
+            .transpose()
+        {
+            Ok(next) => next,
+            Err(error) => {
+                messages.push(format!(
+                    "discovery returned an invalid continuation: {error}"
+                ));
+                continue;
+            }
+        };
+        if report.selected_files == 0 {
+            // Re-reading cursor ancestors can exhaust the remaining budget
+            // before reaching the old frontier. Only a completed walk resets
+            // it; an incomplete empty page may advance, never rewind.
+            if let Ok(mut resume) = cursor.lock()
+                && (report.stop_reason.is_none()
+                    || next.as_ref().is_some_and(|next| {
+                        resume.as_ref().is_none_or(|before| next > before)
+                    }))
+            {
+                *resume = next;
+            }
+            messages.push(format!(
+                "nothing eligible under {} ({} entries examined{})",
+                root.display(),
+                report.entries_examined,
+                if report.complete { "" } else { ", partial" },
+            ));
+        } else {
+            pending.push(PendingSelection {
+                selection,
+                cursor,
+                next,
+            });
+        }
+    }
+    (pending, messages)
+}
+
+/// One pass: discover, then apply to exactly what discovery selected, sharing
+/// the configured work limits and execution deadline across every root.
 fn run_pass(
     roots: &[PathBuf],
     config: &Config,
     platform: &dyn Platform,
-    resume_after: &Mutex<Option<PathBuf>>,
+    resume_after: &Mutex<PassProgress>,
     stop: &AtomicBool,
     logger: &ActivityLoggerHandle,
 ) -> String {
-    let policy = &config.compress.policy;
-    let after = resume_after.lock().ok().and_then(|resume| resume.clone());
-    // The largest budgets discovery accepts. A resumed walk re-reads the
-    // cursor's ancestors first (a temp root can hold tens of thousands of
-    // entries), so small budgets would leave little for new ground.
-    let limits = discovery::DiscoveryLimits {
-        max_entries: 1_000_000,
-        max_directories: 8192,
-        timeout_secs: 60,
-        after,
-        ..discovery::DiscoveryLimits::default()
+    let mut budget = DiscoveryBudget::new(config);
+    let roots = match discovery::canonical_roots(roots) {
+        Ok(roots) => roots,
+        Err(error) => return format!("compression root resolution failed: {error}"),
     };
-    let selection = match discovery::discover(roots, policy, &limits, config, platform) {
-        Ok(selection) => selection,
-        Err(error) => {
-            // A cursor from other roots (the due set changed) is refused; drop
-            // it so the next pass starts from the top instead of failing too.
-            if let Ok(mut resume) = resume_after.lock() {
-                *resume = None;
-            }
-            return format!("discovery under {} root(s) failed: {error}", roots.len());
-        }
+    let ordered = match resume_after.lock() {
+        Ok(mut progress) => progress.order(roots),
+        Err(_) => return "pass refused: continuation state is poisoned".into(),
     };
-    let report = selection.report();
-    let next = match report
-        .resume_after_hex
-        .as_deref()
-        .map(discovery::continuation_path)
-        .transpose()
-    {
-        Ok(next) => next,
-        Err(error) => return format!("discovery returned an invalid continuation: {error}"),
-    };
-    if report.selected_files == 0 {
-        // No selected work can be lost here. Retain discovery progress through
-        // excluded entries, including incomplete pages with no eligible files.
-        if let Ok(mut resume) = resume_after.lock() {
-            *resume = next;
-        }
-        return format!(
-            "nothing eligible under {} root(s) ({} entries examined{})",
-            roots.len(),
-            report.entries_examined,
-            if report.complete { "" } else { ", partial" }
-        );
-    }
+    let (pending, mut messages) = discover_pass(ordered, config, platform, stop, &mut budget);
+    let mut deadline = None;
     let mode = CompressionMode {
         apply: true,
         allow_zstd_feature: config.compress.allow_zstd_feature,
@@ -671,17 +823,42 @@ fn run_pass(
     let mut observer = |observation: CompressionObservation<'_>| {
         record_outcome(observation, logger);
     };
-    execute_and_resume(&selection.paths(), next, resume_after, || {
-        compression::run_discovered(
-            &selection,
-            policy,
-            mode,
-            config,
-            platform,
-            Some(stop),
-            &mut observer,
-        )
-    })
+    for PendingSelection {
+        selection,
+        cursor,
+        next,
+    } in pending
+    {
+        let mut policy = config.compress.policy.clone();
+        policy.timeout_secs = execution_seconds(&mut deadline, policy.timeout_secs, Instant::now());
+        if stop.load(Ordering::Acquire) || policy.timeout_secs == 0 {
+            messages.push(
+                "remaining roots deferred: pass stopped or execution deadline exhausted".into(),
+            );
+            break;
+        }
+        messages.push(execute_and_resume(
+            &selection.paths(),
+            next,
+            &cursor,
+            || {
+                compression::run_discovered(
+                    &selection,
+                    &policy,
+                    mode,
+                    config,
+                    platform,
+                    Some(stop),
+                    &mut observer,
+                )
+            },
+        ));
+    }
+    if messages.is_empty() {
+        "no compression work started within the shared pass budget".into()
+    } else {
+        messages.join("; ")
+    }
 }
 
 /// Commit a skip hint only after the checked executor returns. Discovery can
@@ -790,6 +967,269 @@ fn summarize(report: &CompressionReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_rotation_preserves_independent_progress_when_the_due_set_changes() {
+        let roots = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/c"),
+        ];
+        let mut progress = PassProgress::default();
+        let first = progress.order(roots.clone());
+        assert_eq!(first[0].0, roots[0]);
+        *first[0].1.lock().unwrap() = Some(roots[0].join("deep/already-visited"));
+        let second = progress.order(roots.clone());
+        assert_eq!(second[0].0, roots[1]);
+        let third = progress.order(roots.clone());
+        assert_eq!(third[0].0, roots[2]);
+        assert_eq!(progress.order(roots.clone())[0].0, roots[0]);
+
+        let only_b = progress.order(vec![roots[1].clone()]);
+        *only_b[0].1.lock().unwrap() = Some(roots[1].join("other-progress"));
+        let only_a = progress.order(vec![roots[0].clone()]);
+        assert!(Arc::ptr_eq(&first[0].1, &only_a[0].1));
+        assert_eq!(
+            *only_a[0].1.lock().unwrap(),
+            Some(roots[0].join("deep/already-visited"))
+        );
+        assert_eq!(
+            *progress.cursors[&roots[1]].lock().unwrap(),
+            Some(roots[1].join("other-progress"))
+        );
+    }
+
+    #[test]
+    fn one_second_execution_budget_starts_once_and_is_shared_by_later_roots() {
+        let start = Instant::now();
+        let mut deadline = None;
+        assert_eq!(execution_seconds(&mut deadline, 1, start), 1);
+        assert_eq!(deadline, Some(start + Duration::from_secs(1)));
+        assert_eq!(
+            execution_seconds(&mut deadline, 3600, start + Duration::from_millis(500)),
+            0,
+        );
+        assert_eq!(deadline, Some(start + Duration::from_secs(1)));
+        assert_eq!(
+            execution_seconds(&mut deadline, 3600, start + Duration::from_secs(2)),
+            0,
+        );
+        assert_eq!(deadline, Some(start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn subsecond_time_left_does_not_start_a_new_root_with_a_rounded_up_deadline() {
+        let now = Instant::now();
+        assert_eq!(remaining_seconds(now), 0);
+        assert_eq!(remaining_seconds(now + Duration::from_millis(999)), 0);
+        let mut budget = DiscoveryBudget::new(&Config::default());
+        budget.deadline = now;
+        assert!(budget.limits(None).is_none());
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    mod multi_root_discovery {
+        use super::*;
+        use crate::platform::pal::MockPlatform;
+        use crate::scanner::compression::CompressionPolicy;
+        use std::fs;
+
+        fn fixture(sizes: &[usize]) -> (tempfile::TempDir, Vec<PathBuf>, Config) {
+            let directory = crate::tempdir_outside_git();
+            let base = directory.path().canonicalize().unwrap();
+            let roots = sizes
+                .iter()
+                .enumerate()
+                .map(|(index, size)| {
+                    let root = base.join(format!("root-{index}"));
+                    fs::create_dir(&root).unwrap();
+                    let file = root.join("cold.bin");
+                    fs::write(&file, vec![b'x'; *size]).unwrap();
+                    filetime::set_file_mtime(file, filetime::FileTime::from_unix_time(1, 0))
+                        .unwrap();
+                    root
+                })
+                .collect();
+            let config = Config {
+                compress: CompressConfig {
+                    policy: CompressionPolicy {
+                        min_size_bytes: 1,
+                        min_age_secs: 3600,
+                        max_files: 8,
+                        max_bytes: 64,
+                        ..CompressionPolicy::default()
+                    },
+                    ..enabled()
+                },
+                ..Config::default()
+            };
+            (directory, roots, config)
+        }
+
+        #[test]
+        fn canonical_aliases_and_overlapping_subroots_share_one_continuation() {
+            let (_directory, roots, _config) = fixture(&[8, 8]);
+            let child = roots[0].join("child");
+            fs::create_dir(&child).unwrap();
+            let configured = vec![
+                roots[1].clone(),
+                roots[0].join("."),
+                child,
+                roots[0].clone(),
+            ];
+            assert_eq!(discovery::canonical_roots(&configured).unwrap(), roots);
+        }
+
+        #[test]
+        fn file_byte_entry_and_directory_allowances_are_shared_between_roots() {
+            let (_directory, roots, config) = fixture(&[8, 8, 8]);
+            for resource in ["files", "bytes", "entries", "directories"] {
+                let mut progress = PassProgress::default();
+                let mut budget = DiscoveryBudget::new(&config);
+                match resource {
+                    "files" => budget.files = 2,
+                    "bytes" => budget.bytes = 16,
+                    "entries" => budget.entries = 2,
+                    "directories" => budget.directories = 2,
+                    _ => unreachable!(),
+                }
+                let (pending, _) = discover_pass(
+                    progress.order(roots.clone()),
+                    &config,
+                    &MockPlatform::healthy(),
+                    &AtomicBool::new(false),
+                    &mut budget,
+                );
+                let selected: Vec<_> = pending
+                    .iter()
+                    .flat_map(|work| work.selection.paths())
+                    .collect();
+                assert_eq!(
+                    selected,
+                    vec![roots[0].join("cold.bin"), roots[1].join("cold.bin")],
+                    "{resource}"
+                );
+                assert_eq!(*progress.cursors[&roots[2]].lock().unwrap(), None);
+            }
+        }
+
+        #[test]
+        fn a_file_above_remaining_bytes_stays_pending_for_a_fresh_pass() {
+            // Small byte counts exercise the same 24 + 20 > 32 boundary as
+            // large files without allocating tens of MiB in a unit test.
+            let (_directory, roots, mut config) = fixture(&[24, 20, 1]);
+            config.compress.policy.max_bytes = 32;
+            let mut progress = PassProgress::default();
+            let (first, _) = discover_pass(
+                progress.order(roots.clone()),
+                &config,
+                &MockPlatform::healthy(),
+                &AtomicBool::new(false),
+                &mut DiscoveryBudget::new(&config),
+            );
+            let selected: Vec<_> = first
+                .iter()
+                .flat_map(|work| work.selection.paths())
+                .collect();
+            assert_eq!(
+                selected,
+                vec![roots[0].join("cold.bin"), roots[2].join("cold.bin")]
+            );
+            assert_eq!(
+                *progress.cursors[&roots[1]].lock().unwrap(),
+                Some(roots[1].clone()),
+                "the file must remain beyond the completed traversal prefix"
+            );
+
+            let (second, _) = discover_pass(
+                progress.order(roots.clone()),
+                &config,
+                &MockPlatform::healthy(),
+                &AtomicBool::new(false),
+                &mut DiscoveryBudget::new(&config),
+            );
+            assert_eq!(second[0].selection.paths(), [roots[1].join("cold.bin")]);
+            assert!(
+                !second[0]
+                    .selection
+                    .report()
+                    .skipped
+                    .contains_key("exceeds_full_byte_budget")
+            );
+        }
+
+        #[test]
+        fn an_empty_partial_page_does_not_rewind_a_previous_root_cursor() {
+            let (_directory, roots, config) = fixture(&[8]);
+            let nested = roots[0].join("z-directory");
+            fs::create_dir(&nested).unwrap();
+            fs::write(nested.join("z-next.bin"), b"still pending").unwrap();
+            let before = nested.join("a-previous.bin");
+            for entries in [1, 2] {
+                let mut progress = PassProgress::default();
+                let ordered = progress.order(roots.clone());
+                *ordered[0].1.lock().unwrap() = Some(before.clone());
+                let mut budget = DiscoveryBudget::new(&config);
+                budget.entries = entries;
+                let (pending, messages) = discover_pass(
+                    ordered,
+                    &config,
+                    &MockPlatform::healthy(),
+                    &AtomicBool::new(false),
+                    &mut budget,
+                );
+                assert!(pending.is_empty());
+                assert!(messages.iter().any(|message| message.contains("partial")));
+                assert_eq!(
+                    *progress.cursors[&roots[0]].lock().unwrap(),
+                    Some(before.clone()),
+                    "entry allowance {entries} must not discard old progress"
+                );
+            }
+        }
+
+        #[test]
+        fn a_finished_walk_with_depth_exclusions_still_wraps_the_cursor() {
+            let (_directory, roots, config) = fixture(&[8]);
+            let nested = (0..34).fold(roots[0].clone(), |path, _| path.join("z"));
+            fs::create_dir_all(nested).unwrap();
+            let mut progress = PassProgress::default();
+            let ordered = progress.order(roots.clone());
+            *ordered[0].1.lock().unwrap() = Some(roots[0].join("cold.bin"));
+            let (pending, messages) = discover_pass(
+                ordered,
+                &config,
+                &MockPlatform::healthy(),
+                &AtomicBool::new(false),
+                &mut DiscoveryBudget::new(&config),
+            );
+            assert!(pending.is_empty());
+            assert!(messages.iter().any(|message| message.contains("partial")));
+            assert_eq!(*progress.cursors[&roots[0]].lock().unwrap(), None);
+        }
+
+        #[test]
+        fn cancellation_retains_every_undispatched_root_cursor() {
+            let (_directory, roots, config) = fixture(&[8, 8]);
+            let mut progress = PassProgress::default();
+            let ordered = progress.order(roots.clone());
+            let before = roots[0].join("previous");
+            *ordered[0].1.lock().unwrap() = Some(before.clone());
+            let (pending, _) = discover_pass(
+                ordered,
+                &config,
+                &MockPlatform::healthy(),
+                &AtomicBool::new(true),
+                &mut DiscoveryBudget::new(&config),
+            );
+            assert!(pending.is_empty());
+            assert_eq!(*progress.cursors[&roots[0]].lock().unwrap(), Some(before));
+            assert_eq!(*progress.cursors[&roots[1]].lock().unwrap(), None);
+        }
+    }
 
     fn root_statuses(
         roots: &[PathBuf],
@@ -1111,7 +1551,10 @@ mod tests {
                 first: Arc::clone(&tier.first),
             };
             let old_cursor = Arc::clone(&tier.resume_after);
-            *old_cursor.lock().unwrap() = Some(root.join("already-visited"));
+            old_cursor.lock().unwrap().cursors.insert(
+                root.clone(),
+                Arc::new(Mutex::new(Some(root.join("already-visited")))),
+            );
             let mut reloaded = config.clone();
             change(&mut reloaded);
             tier.tick(
@@ -1136,9 +1579,15 @@ mod tests {
             assert!(tier.stop.load(Ordering::Acquire), "{label}");
             assert!(tier.last_start.is_none(), "{label}");
             assert!(fixture.requests.try_recv().is_err(), "{label}");
-            *old_cursor.lock().unwrap() = Some(root.join("late-old-policy-progress"));
+            old_cursor.lock().unwrap().cursors.insert(
+                root.clone(),
+                Arc::new(Mutex::new(Some(root.join("late-old-policy-progress")))),
+            );
             drop(guard);
-            assert_eq!(*tier.resume_after.lock().unwrap(), None, "{label}");
+            assert!(
+                tier.resume_after.lock().unwrap().cursors.is_empty(),
+                "{label}"
+            );
             fixture.gate.release_all();
             drain_finished_probe(&mut tier, &config.compress.roots);
             assert!(tier.evidence.is_empty(), "{label}");
@@ -1171,7 +1620,10 @@ mod tests {
             first: Arc::clone(&tier.first),
         };
         let cursor = Arc::clone(&tier.resume_after);
-        *cursor.lock().unwrap() = Some(root.join("progress"));
+        cursor.lock().unwrap().cursors.insert(
+            root.clone(),
+            Arc::new(Mutex::new(Some(root.join("progress")))),
+        );
         config.notifications.enabled = !config.notifications.enabled;
         config.notifications.min_notify_interval_secs += 30;
         config.dashboard.kill_switch = !config.dashboard.kill_switch;
@@ -1186,7 +1638,9 @@ mod tests {
         assert!(tier.running.load(Ordering::Acquire));
         assert!(Arc::ptr_eq(&cursor, &tier.resume_after));
         assert_eq!(
-            *tier.resume_after.lock().unwrap(),
+            *tier.resume_after.lock().unwrap().cursors[&root]
+                .lock()
+                .unwrap(),
             Some(root.join("progress"))
         );
         fixture.gate.release_all();
@@ -1880,7 +2334,7 @@ mod tests {
             tier.tick(now, &config, &platform, &HashMap::new(), &logger);
             assert_eq!(tier.last_start, last_start);
             assert_eq!(tier.running.load(Ordering::Acquire), running);
-            assert_eq!(*tier.resume_after.lock().unwrap(), None);
+            assert!(tier.resume_after.lock().unwrap().cursors.is_empty());
         }
         logger.shutdown();
         join.join().unwrap();

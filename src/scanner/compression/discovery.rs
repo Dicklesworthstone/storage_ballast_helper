@@ -240,10 +240,28 @@ pub fn discover(
     config: &Config,
     platform: &dyn Platform,
 ) -> io::Result<Selection> {
+    discover_with_budget(roots, policy, limits, config, platform, policy.max_bytes)
+}
+
+/// Limit this selection's share of a larger pass without changing which files
+/// can fit a fresh pass. A file above this allowance remains unvisited work.
+pub(crate) fn discover_with_budget(
+    roots: &[PathBuf],
+    policy: &CompressionPolicy,
+    limits: &DiscoveryLimits,
+    config: &Config,
+    platform: &dyn Platform,
+    selection_bytes: u64,
+) -> io::Result<Selection> {
     policy.validate()?;
     limits.validate()?;
     if roots.is_empty() || roots.len() > 32 {
         return Err(invalid("supply 1..32 explicit compression discovery roots"));
+    }
+    if selection_bytes == 0 || selection_bytes > policy.max_bytes {
+        return Err(invalid(
+            "selection byte allowance must fit the full pass budget",
+        ));
     }
     let report = DiscoveryReport {
         supported: cfg!(all(
@@ -265,7 +283,15 @@ pub fn discover(
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
-        native::discover(roots, policy, limits, config, platform, report)
+        native::discover(
+            roots,
+            policy,
+            limits,
+            config,
+            platform,
+            report,
+            selection_bytes,
+        )
     }
     #[cfg(not(all(
         target_os = "linux",
@@ -280,6 +306,40 @@ pub fn discover(
     }
 }
 
+/// Use the same canonical, non-overlapping roots for continuation ownership
+/// and native discovery. Native discovery still pins and rechecks each root.
+pub(crate) fn canonical_roots(roots: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+    let mut canonical = std::collections::BTreeSet::new();
+    for path in roots {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(invalid(
+                "discovery roots must be real directories, not symlinks or files",
+            ));
+        }
+        let resolved = path.canonicalize()?;
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let pinned = native::open_root(&resolved)?.metadata()?;
+            if pinned.dev() != metadata.dev() || pinned.ino() != metadata.ino() {
+                return Err(io::Error::other("discovery root changed during resolution"));
+            }
+        }
+        canonical.insert(resolved);
+    }
+    let mut result: Vec<PathBuf> = Vec::new();
+    for path in canonical {
+        if !result.iter().any(|root| path.starts_with(root)) {
+            result.push(path);
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -288,7 +348,6 @@ mod native {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs::{self, File};
     use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::MetadataExt as _;
     use std::time::{Duration, Instant, SystemTime};
 
     use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
@@ -335,6 +394,7 @@ mod native {
 
     struct Walker<'a> {
         policy: &'a CompressionPolicy,
+        selection_bytes: u64,
         limits: &'a DiscoveryLimits,
         deadline: Instant,
         now: SystemTime,
@@ -529,8 +589,7 @@ mod native {
                 self.skip(reason);
             } else if stamp.size
                 > self
-                    .policy
-                    .max_bytes
+                    .selection_bytes
                     .saturating_sub(self.selection.report.selected_bytes)
             {
                 // The file fits a fresh pass, so it is unvisited work rather
@@ -599,32 +658,11 @@ mod native {
         config: &Config,
         platform: &dyn Platform,
         mut report: DiscoveryReport,
+        selection_bytes: u64,
     ) -> io::Result<Selection> {
         let deadline = Instant::now() + Duration::from_secs(limits.timeout_secs);
-        let mut canonical = BTreeSet::new();
-        for path in roots {
-            let metadata = fs::symlink_metadata(path)?;
-            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err(invalid(
-                    "discovery roots must be real directories, not symlinks or files",
-                ));
-            }
-            let resolved = path.canonicalize()?;
-            let pinned = open_root(&resolved)?.metadata()?;
-            if pinned.dev() != metadata.dev() || pinned.ino() != metadata.ino() {
-                return Err(io::Error::other("discovery root changed during resolution"));
-            }
-            canonical.insert(resolved);
-        }
         let mut evidence = Evidence::default();
-        for path in canonical {
-            if evidence
-                .roots
-                .iter()
-                .any(|root| path.starts_with(&root.path))
-            {
-                continue;
-            }
+        for path in canonical_roots(roots)? {
             let file = open_root(&path)?;
             report.roots.push(path.to_string_lossy().into_owned());
             evidence.roots.push(Root { path, file });
@@ -649,6 +687,7 @@ mod native {
             .collect();
         let mut walker = Walker {
             policy,
+            selection_bytes,
             limits,
             deadline,
             now: SystemTime::now(),
