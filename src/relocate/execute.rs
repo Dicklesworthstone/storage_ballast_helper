@@ -764,6 +764,16 @@ fn relocate_with_hooks(
     if snapshot.newest_change != candidate.stats.newest_change {
         return fail("precheck", "tree changed since it was planned".into());
     }
+    // Earlier transfers can leave this candidate waiting long after planning.
+    // A closed reader no longer appears in the holder sweep, but invalidates
+    // an atime-based dormancy verdict. Renew this evidence before our own copy
+    // reads the source; noatime candidates rely on their observed quiet streak.
+    if candidate.atime_evidence && snapshot.newest_access != candidate.stats.newest_access {
+        return fail(
+            "precheck",
+            "tree read evidence changed since it was planned".into(),
+        );
+    }
     let evidence = match SourceEvidence::capture(&anchor.source, config.max_entries) {
         Ok(evidence) => evidence,
         Err(error) => return fail("precheck", error.to_string()),
@@ -2977,6 +2987,121 @@ mod tests {
         after.units[0].crosses_mount = false;
         after.units[0].unreadable = true;
         assert!(!postcheck_matches(&snapshot, &after));
+    }
+
+    #[test]
+    fn a_tree_read_after_planning_stays_put() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        if survey::atime_maintained(&unit) != Some(true) {
+            eprintln!("skipped: this mount does not maintain access times");
+            return;
+        }
+        let old_access = filetime::FileTime::from_unix_time(1, 0);
+        for relative in [MARKER_FILENAME, "a/b/data", "top"] {
+            filetime::set_file_atime(unit.join(relative), old_access).unwrap();
+        }
+        let candidate = candidate_for(&unit);
+        assert_eq!(candidate.stats.newest_access, Some(1));
+
+        // A real read changes atime without modifying the tree or leaving an
+        // open handle. The ordinary change and holder checks cannot catch it.
+        assert_eq!(fs::read(unit.join("top")).unwrap(), b"top");
+        let refreshed = candidate_for(&unit);
+        assert_eq!(refreshed.stats.newest_change, candidate.stats.newest_change);
+        assert_ne!(refreshed.stats.newest_access, candidate.stats.newest_access);
+
+        let config = local_config(tmp.path());
+        let mut ledger = Ledger::default();
+        let outcome = relocate(
+            &config,
+            &crate::platform::pal::MockPlatform::default(),
+            &mut ledger,
+            &candidate,
+            "S",
+            1_000,
+        );
+        assert!(
+            matches!(&outcome, Outcome::Failed { stage, error, .. }
+                if stage == "precheck" && error.contains("read evidence")),
+            "{outcome:?}"
+        );
+        assert_eq!(ledger, Ledger::default());
+        assert!(!config.state_dir.exists());
+        assert!(!tmp.path().join("bulk").exists());
+        assert!(!unit.join(README_FILENAME).exists());
+        assert!(!unit.join(RECORD_FILENAME).exists());
+        assert!(!sibling(&unit, "sbh-relocating").unwrap().exists());
+        assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+    }
+
+    #[test]
+    fn changed_read_evidence_is_refused_in_either_direction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        let config = local_config(tmp.path());
+        for offset in [-3600, 3600] {
+            let mut candidate = candidate_for(&unit);
+            candidate.stats.newest_access = candidate
+                .stats
+                .newest_access
+                .map(|access| access.saturating_add(offset));
+            let mut ledger = Ledger::default();
+            let outcome = relocate(
+                &config,
+                &crate::platform::pal::MockPlatform::default(),
+                &mut ledger,
+                &candidate,
+                "S",
+                1_000,
+            );
+            assert!(
+                matches!(&outcome, Outcome::Failed { stage, error, .. }
+                    if stage == "precheck" && error.contains("read evidence")),
+                "{outcome:?}"
+            );
+            assert_eq!(ledger, Ledger::default());
+            assert!(!config.state_dir.exists());
+            assert!(!tmp.path().join("bulk").exists());
+            assert!(unit.join("top").is_file());
+        }
+    }
+
+    #[test]
+    fn observed_quiet_candidates_do_not_treat_atime_as_read_evidence() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        let config = local_config(tmp.path());
+        let mut candidate = candidate_for(&unit);
+        candidate.atime_evidence = false;
+        candidate.observed_days = Some(14.0);
+        candidate.stats.newest_access = candidate
+            .stats
+            .newest_access
+            .map(|access| access.saturating_sub(1));
+        let mut ledger = Ledger::default();
+        let outcome = relocate(
+            &config,
+            &crate::platform::pal::MockPlatform::default(),
+            &mut ledger,
+            &candidate,
+            "S",
+            1_000,
+        );
+        let Outcome::Relocated { destination, .. } = outcome else {
+            panic!("not relocated: {outcome:?}");
+        };
+        assert_eq!(
+            fs::read(Path::new(&destination).join("a/b/data")).unwrap(),
+            vec![7u8; 300_000]
+        );
+        assert_eq!(ledger.relocations.len(), 1);
+        assert!(ledger.in_progress.is_empty());
+        assert!(unit.join(RECORD_FILENAME).is_file());
     }
 
     #[test]
