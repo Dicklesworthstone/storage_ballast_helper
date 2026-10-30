@@ -2882,12 +2882,10 @@ fn event_triggered_request(
     }
     *last_poll = Instant::now();
     let source = source?;
-    let Some(event_config) = current_event_source_config(Some(source), config) else {
-        // A queued event cannot revive a request's old root scope after a
-        // reload. The next monitor request configures the replacement source
-        // and supplies a fresh pressure/authorization template.
-        return None;
-    };
+    // A queued event cannot revive a request's old root scope after a
+    // reload. The next monitor request configures the replacement source
+    // and supplies a fresh pressure/authorization template.
+    let event_config = current_event_source_config(Some(source), config)?;
     pending.remember(source.drain());
     templates.next_request(pending, &event_config)
 }
@@ -17925,7 +17923,9 @@ mod tests {
             reconciliation: BTreeSet::from([root_a.clone()]),
             ..PendingScannerEvents::default()
         };
-        let mut last_poll = Instant::now() - EVENT_POLL_INTERVAL;
+        let mut last_poll = Instant::now()
+            .checked_sub(EVENT_POLL_INTERVAL)
+            .expect("event polling test interval is representable");
         let request = event_triggered_request(
             Some(&mut source),
             &mut pending,
@@ -17958,7 +17958,9 @@ mod tests {
         // A's budget-exhausted walk keeps its backlog. B still gets its
         // turn, with B's own pressure and limits.
         for expected in [&root_b, &root_a, &root_b] {
-            last_poll = Instant::now() - EVENT_POLL_INTERVAL;
+            last_poll = Instant::now()
+                .checked_sub(EVENT_POLL_INTERVAL)
+                .expect("event polling test interval is representable");
             let request = event_triggered_request(
                 Some(&mut source),
                 &mut pending,

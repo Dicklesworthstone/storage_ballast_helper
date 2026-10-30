@@ -45,12 +45,26 @@ directory's expected ctime change is exempted.
 
 Local targets also pin the destination and its parent. Symlinked destinations,
 the source itself, and direct ancestor or descendant destination paths are
-refused; replacing a destination cannot redirect the transfer. Backup evidence
-is captured before checksum verification and renewed afterward, before source
-rename, and before removal. Preflight does not fully detect bind-mount aliases
-of source descendants at other paths. Those aliases can permit copying back
-into the source tree, including recursive growth; backup targets must not use
-them.
+refused; replacing a destination cannot redirect the transfer. Before the first
+destination directory is created, a bounded source walk proves that the deepest
+existing destination directory's device/inode identity does not occur anywhere
+inside the source. The finished, pinned backup directory receives the same
+check before ledger publication or copying. These checks detect destination
+paths entering bind-mount aliases of source descendants, even at unrelated
+pathnames. A bounded reverse walk also refuses an existing destination that
+contains the source or any nested mount, including when a bind-mounted source
+parent hides a physical ancestor relationship. Every renewed source fingerprint
+must match the original evidence; destination preparation cannot establish a
+new baseline that blesses changes. Newly created destination components remain
+on the validated prefix's mount; unrelated existing destination mount roots
+remain supported.
+
+Backup evidence is captured before checksum verification and renewed afterward,
+before source rename, and before removal. At the removal boundary, the full
+backup walk precedes fresh source policy and the final source fingerprint, so
+a writer that changes and closes the source during that backup walk is still
+detected. The process sweep and final identity checks follow those content
+walks.
 
 After the payload and adjacent record are written, local relocation requires
 successful `syncfs` barriers on both pinned filesystems before renaming the
