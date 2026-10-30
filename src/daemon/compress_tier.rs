@@ -741,12 +741,11 @@ fn discover_roots(
             minimal.push(root);
         }
     }
-    let ordered = match progress.lock() {
-        Ok(mut progress) => progress.order(minimal),
-        Err(_) => {
-            messages.push("pass refused: continuation state is poisoned".into());
-            return (Vec::new(), messages);
-        }
+    let ordered = if let Ok(mut progress) = progress.lock() {
+        progress.order(minimal)
+    } else {
+        messages.push("pass refused: continuation state is poisoned".into());
+        return (Vec::new(), messages);
     };
     let (pending, outcomes) = discover_pass(ordered, config, platform, stop, budget);
     messages.extend(outcomes);
@@ -768,12 +767,11 @@ fn discover_pass(
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let after = match cursor.lock() {
-            Ok(after) => after.clone(),
-            Err(_) => {
-                messages.push(format!("continuation unavailable for {}", root.display()));
-                continue;
-            }
+        let after = if let Ok(after) = cursor.lock() {
+            after.clone()
+        } else {
+            messages.push(format!("continuation unavailable for {}", root.display()));
+            continue;
         };
         let Some(limits) = budget.limits(after) else {
             break;

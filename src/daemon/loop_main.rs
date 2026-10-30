@@ -14,7 +14,7 @@
 #![allow(clippy::cast_precision_loss)]
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -2588,8 +2588,8 @@ fn v2_pressure_candidate_byte_target(request: &ScanRequest) -> Option<u64> {
 /// How often the idle scanner polls the event source for changes.
 const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// What an event-triggered pass inherits from the last request the main
-/// loop sent: the configured roots and the mount's level and free space.
+/// What an event-triggered pass inherits from a monitor request: its
+/// authorized paths and that mount's level, free space and deletion limit.
 struct EventPassTemplate {
     paths: Vec<PathBuf>,
     event_config: EventSourceConfig,
@@ -2606,6 +2606,118 @@ impl EventPassTemplate {
             pressure_level: request.pressure_level,
             free_pct: request.free_pct,
             max_delete_batch: request.max_delete_batch,
+        }
+    }
+}
+
+/// Keep idle wakeups for every requested scope, not just the mount that
+/// happened to send the last request. Rotation also prevents one unfinished
+/// dirty scope from monopolizing event passes on a quiet monitor channel.
+#[derive(Default)]
+struct EventPassTemplates {
+    templates: VecDeque<EventPassTemplate>,
+}
+
+impl EventPassTemplates {
+    const MAX_SCOPES_PER_ROOT: usize = 64;
+
+    fn remember(&mut self, request: &ScanRequest, config: &ScannerConfig) {
+        let event_config = EventSourceConfig::from_scanner_config(&config.root_paths, config);
+        self.templates
+            .retain(|template| template.event_config == event_config);
+        // Transient requests outside the subscriptions cannot acquire idle
+        // event authority. Intersecting also preserves a requested child
+        // without widening it to its configured ancestor.
+        let configured: BTreeSet<_> = config.root_paths.iter().cloned().collect();
+        for path in event_paths_within(&request.paths, &configured) {
+            // A newer request supersedes overlapping pressure evidence.
+            // In particular, an older Green parent cannot bypass a newer
+            // Orange child merely because their path strings differ.
+            self.templates.retain(|template| {
+                !template
+                    .paths
+                    .iter()
+                    .any(|old| old.starts_with(&path) || path.starts_with(old))
+            });
+            if let Some(root) = configured
+                .iter()
+                .filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.components().count())
+            {
+                let belongs_to_root = |template: &EventPassTemplate| {
+                    template.paths.iter().any(|path| {
+                        configured
+                            .iter()
+                            .filter(|candidate| path.starts_with(candidate))
+                            .max_by_key(|candidate| candidate.components().count())
+                            == Some(root)
+                    })
+                };
+                if self
+                    .templates
+                    .iter()
+                    .filter(|template| belongs_to_root(template))
+                    .count()
+                    >= Self::MAX_SCOPES_PER_ROOT
+                    && let Some(oldest) = self.templates.iter().position(belongs_to_root)
+                {
+                    // Bound transient child requests without discarding
+                    // another configured root's idle wakeup. Its dirty work
+                    // remains pending for the next explicit request.
+                    let _ = self.templates.remove(oldest);
+                }
+            }
+            let mut template = EventPassTemplate::from_request(request, config);
+            template.paths = vec![path];
+            self.templates.push_back(template);
+        }
+    }
+
+    fn next_request(
+        &mut self,
+        pending: &PendingScannerEvents,
+        event_config: &EventSourceConfig,
+    ) -> Option<ScanRequest> {
+        for _ in 0..self.templates.len() {
+            let template = self.templates.pop_front()?;
+            let request = (template.event_config == *event_config
+                && matches!(
+                    template.pressure_level,
+                    PressureLevel::Green | PressureLevel::Yellow
+                )
+                && pending.has_work_within(&template.paths))
+            .then(|| ScanRequest {
+                paths: template.paths.clone(),
+                urgency: 0.0,
+                pressure_level: template.pressure_level,
+                free_pct: template.free_pct,
+                max_delete_batch: template.max_delete_batch,
+                force_full_scan: false,
+                config_update: None,
+                catalog_roots: Vec::new(),
+                maintenance: false,
+                target_bytes: None,
+            });
+            if request.is_some() {
+                // Pacing may defer this request. Advance only once its pass
+                // starts, or a fixed poll/cooldown cadence can repeatedly
+                // spend one root's turns while only its neighbor gets to run.
+                self.templates.push_front(template);
+                return request;
+            }
+            self.templates.push_back(template);
+        }
+        None
+    }
+
+    fn pass_started(&mut self, request: &ScanRequest) {
+        if let Some(index) = self
+            .templates
+            .iter()
+            .position(|template| template.paths == request.paths)
+            && let Some(template) = self.templates.remove(index)
+        {
+            self.templates.push_back(template);
         }
     }
 }
@@ -2740,6 +2852,19 @@ fn event_paths_within(requested: &[PathBuf], dirty_roots: &BTreeSet<PathBuf>) ->
     selected
 }
 
+fn current_event_source_config(
+    source: Option<&ScannerEventSource>,
+    config: &ScannerConfig,
+) -> Option<EventSourceConfig> {
+    if config.engine != ScannerEngineMode::V2 {
+        return None;
+    }
+    let event_config = EventSourceConfig::from_scanner_config(&config.root_paths, config);
+    source?
+        .matches_config(&event_config)
+        .then_some(event_config)
+}
+
 /// Poll the event source while the scanner is idle and, when events left
 /// scan paths dirty at Green or Yellow, build the pass that reconciles them.
 /// Under Orange and above the main loop drives passes on its own cadence.
@@ -2749,7 +2874,7 @@ fn event_triggered_request(
     source: Option<&mut ScannerEventSource>,
     pending: &mut PendingScannerEvents,
     last_poll: &mut Instant,
-    template: Option<&EventPassTemplate>,
+    templates: &mut EventPassTemplates,
     config: &ScannerConfig,
 ) -> Option<ScanRequest> {
     if last_poll.elapsed() < EVENT_POLL_INTERVAL {
@@ -2757,41 +2882,14 @@ fn event_triggered_request(
     }
     *last_poll = Instant::now();
     let source = source?;
-    let template = template?;
-    if config.engine != ScannerEngineMode::V2
-        || !source.matches_config(&template.event_config)
-        || !source.matches_config(&EventSourceConfig::from_scanner_config(
-            &config.root_paths,
-            config,
-        ))
-    {
+    let Some(event_config) = current_event_source_config(Some(source), config) else {
         // A queued event cannot revive a request's old root scope after a
         // reload. The next monitor request configures the replacement source
         // and supplies a fresh pressure/authorization template.
         return None;
-    }
-    if !matches!(
-        template.pressure_level,
-        PressureLevel::Green | PressureLevel::Yellow
-    ) {
-        return None;
-    }
+    };
     pending.remember(source.drain());
-    if !pending.has_work_within(&template.paths) {
-        return None;
-    }
-    Some(ScanRequest {
-        paths: template.paths.clone(),
-        urgency: 0.0,
-        pressure_level: template.pressure_level,
-        free_pct: template.free_pct,
-        max_delete_batch: template.max_delete_batch,
-        force_full_scan: false,
-        config_update: None,
-        catalog_roots: Vec::new(),
-        maintenance: false,
-        target_bytes: None,
-    })
+    templates.next_request(pending, &event_config)
 }
 
 /// Dirty scan paths may be unwatched frontier subtrees below a configured
@@ -8140,11 +8238,11 @@ fn scanner_thread_main(
     // bd-rc-master-ajg1.8.8: while idle the scanner drains the event source
     // itself, so a change at Green becomes a pass scoped to its project
     // instead of waiting for the next maintenance walk. The invalidation is
-    // kept until the pass that consumes it runs; the template is the last
-    // request the main loop sent, which carries the roots and the level.
+    // kept until the pass that consumes it runs; each scope retains its
+    // latest monitor request's pressure and authorization independently.
     let mut pending_event_invalidation = PendingScannerEvents::default();
     let mut last_event_poll = Instant::now();
-    let mut event_request_template: Option<EventPassTemplate> = None;
+    let mut event_request_templates = EventPassTemplates::default();
 
     // Cache of directories known to contain .git — these are valid project
     // roots that should never be deleted. Persists across scan passes to
@@ -8211,7 +8309,7 @@ fn scanner_thread_main(
                     scanner_event_source.as_mut(),
                     &mut pending_event_invalidation,
                     &mut last_event_poll,
-                    event_request_template.as_ref(),
+                    &mut event_request_templates,
                     &event_config,
                 ) else {
                     continue;
@@ -8228,11 +8326,16 @@ fn scanner_thread_main(
         // Read latest config at the start of each scan.
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
+        if request_from_events
+            && current_event_source_config(scanner_event_source.as_ref(), &current_scanner_config)
+                .is_none()
+        {
+            // Reload can land after idle polling synthesized this request.
+            // Do not execute its old paths under a new subscription scope.
+            continue;
+        }
         if !request_from_events && request.catalog_roots.is_empty() {
-            event_request_template = Some(EventPassTemplate::from_request(
-                &request,
-                &current_scanner_config,
-            ));
+            event_request_templates.remember(&request, &current_scanner_config);
         }
 
         let mut dispatch_confirmed_empty = false;
@@ -8335,6 +8438,9 @@ fn scanner_thread_main(
         if budget_allowance.is_some_and(|cpu_secs| cpu_secs <= 0.0) {
             heartbeat.beat();
             continue;
+        }
+        if request_from_events {
+            event_request_templates.pass_started(&request);
         }
         let pass_started_at = Instant::now();
         let selected_scanner_engine =
@@ -17727,40 +17833,44 @@ mod tests {
             }),
         );
         let mut last_poll = Instant::now() - EVENT_POLL_INTERVAL;
-        let template_a =
-            EventPassTemplate::from_request(&event_test_request(vec![root_a]), &config);
+        let mut templates = EventPassTemplates::default();
+        templates.remember(&event_test_request(vec![root_a]), &config);
         assert!(
             event_triggered_request(
                 Some(&mut source),
                 &mut pending,
                 &mut last_poll,
-                Some(&template_a),
+                &mut templates,
                 &config,
             )
             .is_none()
         );
         assert!(pending.has_work_within(std::slice::from_ref(&root_b)));
-        let template_b =
-            EventPassTemplate::from_request(&event_test_request(vec![root_b.clone()]), &config);
+        templates.remember(&event_test_request(vec![root_b.clone()]), &config);
         last_poll = Instant::now() - EVENT_POLL_INTERVAL;
         let request = event_triggered_request(
             Some(&mut source),
             &mut pending,
             &mut last_poll,
-            Some(&template_b),
+            &mut templates,
             &config,
         )
         .expect("the relevant request can consume retained work");
         assert_eq!(request.paths, vec![root_b]);
+        assert!(current_event_source_config(Some(&source), &config).is_some());
 
         config.root_paths = vec![temp.path().join("replacement")];
+        assert!(
+            current_event_source_config(Some(&source), &config).is_none(),
+            "a request synthesized before reload must fail admission afterward"
+        );
         last_poll = Instant::now() - EVENT_POLL_INTERVAL;
         assert!(
             event_triggered_request(
                 Some(&mut source),
                 &mut pending,
                 &mut last_poll,
-                Some(&template_b),
+                &mut templates,
                 &config,
             )
             .is_none(),
@@ -17776,12 +17886,205 @@ mod tests {
                 Some(&mut replacement),
                 &mut pending,
                 &mut last_poll,
-                Some(&template_b),
+                &mut templates,
                 &config,
             )
             .is_none(),
             "a replacement subscription still needs a fresh request template"
         );
+    }
+
+    #[test]
+    fn idle_events_wake_earlier_mounts_and_rotate_unfinished_work() {
+        use crate::core::config::ScannerEventSourceMode;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        std::fs::create_dir(&root_a).unwrap();
+        std::fs::create_dir(&root_b).unwrap();
+        let config = ScannerConfig {
+            root_paths: vec![root_a.clone(), root_b.clone()],
+            event_source: ScannerEventSourceMode::ReconciliationOnly,
+            ..ScannerConfig::default()
+        };
+        let event_config = EventSourceConfig::from_scanner_config(&config.root_paths, &config);
+        let mut source = ScannerEventSource::start(event_config.clone());
+        source.drain();
+        let mut templates = EventPassTemplates::default();
+        let mut request_a = event_test_request(vec![root_a.clone()]);
+        request_a.pressure_level = PressureLevel::Yellow;
+        request_a.free_pct = Some(20.0);
+        request_a.max_delete_batch = 3;
+        templates.remember(&request_a, &config);
+        let mut request_b = event_test_request(vec![root_b.clone()]);
+        request_b.free_pct = Some(70.0);
+        request_b.max_delete_batch = 8;
+        templates.remember(&request_b, &config);
+        let mut pending = PendingScannerEvents {
+            reconciliation: BTreeSet::from([root_a.clone()]),
+            ..PendingScannerEvents::default()
+        };
+        let mut last_poll = Instant::now() - EVENT_POLL_INTERVAL;
+        let request = event_triggered_request(
+            Some(&mut source),
+            &mut pending,
+            &mut last_poll,
+            &mut templates,
+            &config,
+        )
+        .expect("a change on an earlier mount must wake it after another mount's request");
+        assert_eq!(request.paths, vec![root_a.clone()]);
+        assert_eq!(request.pressure_level, PressureLevel::Yellow);
+        assert_eq!(request.free_pct, Some(20.0));
+        assert_eq!(request.max_delete_batch, 3);
+        assert!(!request.maintenance);
+        assert!(!request.force_full_scan);
+
+        // Polling while cooldown or CPU budget defers A must not spend its
+        // turn. Otherwise a fixed interval can starve one root forever.
+        pending.reconciliation.insert(root_b.clone());
+        for _ in 0..3 {
+            assert_eq!(
+                templates
+                    .next_request(&pending, &event_config)
+                    .unwrap()
+                    .paths,
+                vec![root_a.clone()]
+            );
+        }
+        templates.pass_started(&request);
+
+        // A's budget-exhausted walk keeps its backlog. B still gets its
+        // turn, with B's own pressure and limits.
+        for expected in [&root_b, &root_a, &root_b] {
+            last_poll = Instant::now() - EVENT_POLL_INTERVAL;
+            let request = event_triggered_request(
+                Some(&mut source),
+                &mut pending,
+                &mut last_poll,
+                &mut templates,
+                &config,
+            )
+            .unwrap();
+            assert_eq!(request.paths, vec![expected.clone()]);
+            if expected == &root_b {
+                assert_eq!(request.pressure_level, PressureLevel::Green);
+                assert_eq!(request.free_pct, Some(70.0));
+                assert_eq!(request.max_delete_batch, 8);
+            }
+            templates.pass_started(&request);
+        }
+    }
+
+    #[test]
+    fn idle_event_templates_update_pressure_without_silencing_other_mounts() {
+        let config = ScannerConfig {
+            root_paths: vec!["/a".into(), "/b".into()],
+            ..ScannerConfig::default()
+        };
+        let event_config = EventSourceConfig::from_scanner_config(&config.root_paths, &config);
+        let mut templates = EventPassTemplates::default();
+        templates.remember(&event_test_request(config.root_paths.clone()), &config);
+        let mut pressure_request = event_test_request(vec!["/a".into()]);
+        pressure_request.pressure_level = PressureLevel::Orange;
+        templates.remember(&pressure_request, &config);
+        let pending = PendingScannerEvents {
+            reconciliation: config.root_paths.iter().cloned().collect(),
+            ..PendingScannerEvents::default()
+        };
+        for _ in 0..3 {
+            let request = templates.next_request(&pending, &event_config).unwrap();
+            assert_eq!(request.paths, vec![PathBuf::from("/b")]);
+            assert_eq!(request.pressure_level, PressureLevel::Green);
+        }
+
+        pressure_request.pressure_level = PressureLevel::Yellow;
+        pressure_request.free_pct = Some(17.0);
+        pressure_request.max_delete_batch = 2;
+        templates.remember(&pressure_request, &config);
+        let only_a = PendingScannerEvents {
+            reconciliation: BTreeSet::from([PathBuf::from("/a")]),
+            ..PendingScannerEvents::default()
+        };
+        let request = templates.next_request(&only_a, &event_config).unwrap();
+        assert_eq!(request.paths, pressure_request.paths);
+        assert_eq!(request.pressure_level, PressureLevel::Yellow);
+        assert_eq!(request.free_pct, Some(17.0));
+        assert_eq!(request.max_delete_batch, 2);
+
+        // A newer pressured child revokes the overlapping parent template;
+        // an old Green/Yellow parent must not revive work in that child.
+        pressure_request.paths = vec!["/a/project".into()];
+        pressure_request.pressure_level = PressureLevel::Orange;
+        templates.remember(&pressure_request, &config);
+        assert!(templates.next_request(&only_a, &event_config).is_none());
+        pressure_request.pressure_level = PressureLevel::Green;
+        templates.remember(&pressure_request, &config);
+        let request = templates.next_request(&only_a, &event_config).unwrap();
+        assert_eq!(request.paths, vec![PathBuf::from("/a/project")]);
+    }
+
+    #[test]
+    fn idle_event_templates_bound_transient_scopes_without_evicting_other_roots() {
+        let config = ScannerConfig {
+            root_paths: vec!["/a".into(), "/a/nested".into(), "/b".into()],
+            ..ScannerConfig::default()
+        };
+        let event_config = EventSourceConfig::from_scanner_config(&config.root_paths, &config);
+        let mut templates = EventPassTemplates::default();
+        templates.remember(&event_test_request(vec!["/b".into()]), &config);
+        templates.remember(&event_test_request(vec!["/a/nested".into()]), &config);
+        for child in 0..(EventPassTemplates::MAX_SCOPES_PER_ROOT + 5) {
+            templates.remember(
+                &event_test_request(vec![PathBuf::from(format!("/a/project-{child}"))]),
+                &config,
+            );
+        }
+        templates.remember(&event_test_request(vec!["/unsubscribed".into()]), &config);
+        assert_eq!(
+            templates.templates.len(),
+            EventPassTemplates::MAX_SCOPES_PER_ROOT + 2
+        );
+        let only_b = PendingScannerEvents {
+            reconciliation: BTreeSet::from([PathBuf::from("/b")]),
+            ..PendingScannerEvents::default()
+        };
+        assert_eq!(
+            templates
+                .next_request(&only_b, &event_config)
+                .unwrap()
+                .paths,
+            vec![PathBuf::from("/b")]
+        );
+        let only_nested = PendingScannerEvents {
+            reconciliation: BTreeSet::from([PathBuf::from("/a/nested")]),
+            ..PendingScannerEvents::default()
+        };
+        assert_eq!(
+            templates
+                .next_request(&only_nested, &event_config)
+                .unwrap()
+                .paths,
+            vec![PathBuf::from("/a/nested")]
+        );
+        let outside = PendingScannerEvents {
+            reconciliation: BTreeSet::from([PathBuf::from("/unsubscribed")]),
+            ..PendingScannerEvents::default()
+        };
+        assert!(templates.next_request(&outside, &event_config).is_none());
+
+        // Replacing child templates with a whole-root request coalesces
+        // retained scopes, while a configuration reload discards old roots.
+        templates.remember(&event_test_request(vec!["/a".into()]), &config);
+        assert_eq!(templates.templates.len(), 2);
+        let reloaded = ScannerConfig {
+            root_paths: vec!["/replacement".into()],
+            ..config
+        };
+        templates.remember(&event_test_request(reloaded.root_paths.clone()), &reloaded);
+        assert_eq!(templates.templates.len(), 1);
+        assert_eq!(templates.templates[0].paths, reloaded.root_paths);
     }
 
     /// Exercise the actual scanner loop: alternating mount and special-location
