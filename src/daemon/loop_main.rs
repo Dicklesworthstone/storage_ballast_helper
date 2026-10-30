@@ -10496,6 +10496,47 @@ fn authorize_target_only_candidate(
     Ok(())
 }
 
+/// Queue admission cannot prove a target is still idle at removal time.
+/// Refresh the bounded tree survey first, then the process evidence: the
+/// executor's batch-wide open-file snapshot predates this potentially long
+/// survey. Ordinary batches do not need this target-root exception.
+fn authorize_target_only_mutation(
+    candidate: &CandidacyScore,
+    root: Option<&Path>,
+    scanner: &crate::core::config::ScannerConfig,
+    platform: Option<&dyn Platform>,
+    now: SystemTime,
+    heartbeat: &ThreadHeartbeat,
+) -> std::result::Result<(), SkipReason> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    authorize_target_only_candidate(candidate, Some(root))?;
+    if crate::daemon::target_tier::is_excluded(&candidate.path, &scanner.excluded_paths) {
+        return Err(SkipReason::SacredStowaway);
+    }
+    let identity = candidate.identity.ok_or(SkipReason::IdentityUnavailable)?;
+    if !crate::daemon::target_tier::still_idle(&candidate.path, identity, scanner, now) {
+        return Err(SkipReason::Vetoed);
+    }
+    heartbeat.beat();
+    let platform = platform.ok_or(SkipReason::OpenScanIncomplete)?;
+    let references = crate::scanner::walker::collect_active_reference_index(
+        platform,
+        std::slice::from_ref(&candidate.path),
+    );
+    heartbeat.beat();
+    if !references.is_complete() {
+        return Err(SkipReason::OpenScanIncomplete);
+    }
+    if !references.summary_for(&candidate.path).is_empty()
+        || !references.summary_for_identity(identity).is_empty()
+    {
+        return Err(SkipReason::FileOpen);
+    }
+    Ok(())
+}
+
 /// Drop candidates with nothing to reclaim. The planner never chooses an
 /// item that frees no bytes (an empty mktemp target of a live remote build
 /// was taken at Critical on ts2, 2026-10-15), so evaluating them only re-ran
@@ -10907,17 +10948,29 @@ fn executor_thread_main(
             HashMap::new()
         };
 
+        let target_only_platform = if !dry_run && batch.target_only_root.is_some() {
+            detect_platform().ok()
+        } else {
+            None
+        };
         let authorize_candidate = |candidate: &CandidacyScore| {
             // A batch planned as a dry-run cannot mutate and still owes its
             // preview counts. Real batches must obey newly restrictive policy.
             if !dry_run {
                 authorize_scanner_mutation_scope(&batch, &scanner_snapshot, shared_scanner_config)?;
-                // Renew the filesystem exception before the cheap live gates:
-                // a large purity probe must not hide a policy change while it
-                // runs or outlive a newly published compression hold.
-                authorize_target_only_candidate(candidate, batch.target_only_root.as_deref())?;
-                // A potentially large purity listing must not outlive new
-                // root, exclusion, protection or idle-window permissions.
+                // Renew recursive age and process evidence before the cheap
+                // live gates. The survey must not hide a policy change while
+                // it runs or outlive a newly published compression hold.
+                authorize_target_only_mutation(
+                    candidate,
+                    batch.target_only_root.as_deref(),
+                    &scanner_snapshot,
+                    target_only_platform.as_deref(),
+                    SystemTime::now(),
+                    heartbeat,
+                )?;
+                // The filesystem survey must not outlive new root,
+                // exclusion, protection or idle-window permissions.
                 authorize_scanner_mutation_scope(&batch, &scanner_snapshot, shared_scanner_config)?;
                 shared_config.authorize_mutation(policy_mode, policy_engine.lock().mode())?;
                 shared_config.authorize_compression_first(candidate, batch.pressure_level)?;
@@ -11446,7 +11499,6 @@ mod tests {
         use crate::platform::pal::{
             FsStats, MemoryInfo, MountPoint, PlatformPaths, ServiceManager,
         };
-        use std::sync::atomic::AtomicUsize;
 
         struct ProbeAfterEmergency {
             base: Arc<dyn Platform>,
@@ -11454,7 +11506,7 @@ mod tests {
             scan_root: PathBuf,
             quarantine_path: PathBuf,
             scans: Receiver<ScanRequest>,
-            probes: Arc<AtomicUsize>,
+            probes: Sender<()>,
         }
 
         impl Platform for ProbeAfterEmergency {
@@ -11470,7 +11522,7 @@ mod tests {
                         .expect("emergency scan must be queued before compression root I/O");
                     assert_eq!(scan.pressure_level, PressureLevel::Critical);
                     assert!(scan.paths.contains(&self.scan_root));
-                    self.probes.fetch_add(1, Ordering::Relaxed);
+                    self.probes.try_send(()).unwrap();
                 }
                 let mut stats = self.base.fs_stats(path)?;
                 // Exercise startup admission without launching a native worker.
@@ -11513,7 +11565,7 @@ mod tests {
         std::fs::create_dir(&probe_root).unwrap();
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(4);
         let (del_tx, _del_rx) = bounded::<DeletionBatch>(4);
-        let probes = Arc::new(AtomicUsize::new(0));
+        let (probes_tx, probes_rx) = bounded(1);
         let daemon = &mut fixture.daemon;
         daemon.config.compress.enabled = true;
         daemon.config.compress.start_level = "critical".into();
@@ -11534,7 +11586,7 @@ mod tests {
             scan_root: root,
             quarantine_path: record.quarantine_path.clone(),
             scans: scan_rx.clone(),
-            probes: Arc::clone(&probes),
+            probes: probes_tx,
         });
         let tick = quarantine_tick(PressureLevel::Critical, Path::new("/"));
         let response = tick.response.clone();
@@ -11542,11 +11594,11 @@ mod tests {
 
         daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
 
-        assert_eq!(
-            probes.load(Ordering::Relaxed),
-            1,
-            "Critical start levels must still reach compression admission",
-        );
+        // Admission probes run off the monitor thread. Wait for the probe's
+        // ordering assertions instead of racing the worker's scheduling.
+        probes_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Critical start levels must still reach compression admission");
         assert!(!record.quarantine_path.exists());
         assert!(store.record("held").unwrap().is_none());
     }
@@ -13667,6 +13719,149 @@ mod tests {
             outside.exists(),
             "a target-only batch stays inside its root"
         );
+    }
+
+    #[cfg(unix)]
+    fn target_mutation_candidate(root: &Path, name: &str, score: f64) -> CandidacyScore {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.join("debug/deps")).unwrap();
+        std::fs::write(path.join("debug/deps/libdemo.rlib"), [7u8; 64]).unwrap();
+        std::fs::write(path.join(".rustc_info.json"), b"{}").unwrap();
+        let mut candidate = test_candidate(&path.to_string_lossy(), score);
+        candidate.identity = Some(crate::scanner::walker::identity_for_path(&path, false).unwrap());
+        candidate.size_bytes = 66;
+        candidate
+    }
+
+    /// The batch snapshot sees no holders. While its first deletion runs, a
+    /// completed rebuild and a new reader invalidate two queued candidates;
+    /// the unchanged idle target must still be reclaimed.
+    #[cfg(unix)]
+    #[test]
+    fn target_only_mutations_renew_age_and_holders_after_queueing() {
+        use crate::platform::types::{OpenFile, OpenFileKind, OpenFileMode};
+        use std::cell::Cell;
+
+        let scratch = temp_root_scratch_dir();
+        let root = scratch.path().join("claude-501");
+        let first = target_mutation_candidate(&root, "target-first", 4.0);
+        let rebuilt = target_mutation_candidate(&root, "target-rebuilt", 3.0);
+        let held = target_mutation_candidate(&root, "target-held", 2.0);
+        let idle = target_mutation_candidate(&root, "target-idle", 1.0);
+        let first_path = first.path.clone();
+        let rebuilt_path = rebuilt.path.clone();
+        let rebuilt_identity = rebuilt.identity;
+        let held_path = held.path.clone();
+        let idle_path = idle.path.clone();
+        let quiet = MockPlatform::healthy();
+        let new_reader = MockPlatform::healthy().with_open_file(OpenFile {
+            pid: 4242,
+            path: held.path.join("debug/deps/libdemo.rlib"),
+            fd: Some(3),
+            kind: OpenFileKind::Regular,
+            mode: OpenFileMode::Read,
+        });
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                dry_run: false,
+                min_score: 0.0,
+                check_open_files: true,
+                require_identity: true,
+                mode: DeletionMode::Unlink,
+                ..Default::default()
+            },
+            None,
+        )
+        .with_platform(Arc::new(MockPlatform::healthy()));
+        let plan = executor.plan(vec![first, rebuilt, held, idle]);
+        assert_eq!(plan.candidates.len(), 4);
+        let scanner = crate::core::config::ScannerConfig::default();
+        // Birth times cannot be backdated portably.
+        let now = SystemTime::now() + Duration::from_hours(25);
+        let heartbeat = ThreadHeartbeat::new("target-mutation-test");
+        let changed = Cell::new(false);
+        let authorize = |candidate: &CandidacyScore| {
+            authorize_target_only_mutation(
+                candidate,
+                Some(&root),
+                &scanner,
+                Some(if changed.get() { &new_reader } else { &quiet }),
+                now,
+                &heartbeat,
+            )
+        };
+        let after_unlink = |candidate: &CandidacyScore, _: Instant| {
+            if candidate.path == first_path {
+                let artifact = rebuilt_path.join("debug/deps/libdemo.rlib");
+                std::fs::write(&artifact, b"fresh build output").unwrap();
+                filetime::set_file_mtime(&artifact, filetime::FileTime::from_system_time(now))
+                    .unwrap();
+                changed.set(true);
+            }
+        };
+        let report =
+            executor.execute_with_hooks(&plan, None, Some(&authorize), Some(&after_unlink));
+        assert!(
+            changed.get(),
+            "the first candidate must actually be removed"
+        );
+        assert_eq!(report.deleted_paths, vec![first_path, idle_path]);
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.skipped_by_reason.get("vetoed"), Some(&1));
+        assert_eq!(report.skipped_by_reason.get("file_open"), Some(&1));
+        assert!(crate::daemon::target_tier::still_pure(&rebuilt_path));
+        assert_eq!(
+            Some(crate::scanner::walker::identity_for_path(&rebuilt_path, false).unwrap()),
+            rebuilt_identity,
+        );
+        assert_eq!(
+            std::fs::read(rebuilt_path.join("debug/deps/libdemo.rlib")).unwrap(),
+            b"fresh build output",
+        );
+        assert!(held_path.join("debug/deps/libdemo.rlib").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_only_live_guard_requires_complete_evidence_and_respects_excluded_parents() {
+        let scratch = temp_root_scratch_dir();
+        let root = scratch.path().join("claude-501");
+        let candidate = target_mutation_candidate(&root, "session/target", 1.0);
+        let mut scanner = crate::core::config::ScannerConfig::default();
+        let now = SystemTime::now() + Duration::from_hours(25);
+        let heartbeat = ThreadHeartbeat::new("target-mutation-test");
+        let incomplete = MockPlatform::healthy().with_open_files_complete(false);
+        for platform in [None, Some(&incomplete as &dyn Platform)] {
+            assert_eq!(
+                authorize_target_only_mutation(
+                    &candidate,
+                    Some(&root),
+                    &scanner,
+                    platform,
+                    now,
+                    &heartbeat,
+                ),
+                Err(SkipReason::OpenScanIncomplete),
+            );
+        }
+        scanner.excluded_paths.push(root.join("session"));
+        assert_eq!(
+            authorize_target_only_mutation(
+                &candidate,
+                Some(&root),
+                &scanner,
+                Some(&MockPlatform::healthy()),
+                now,
+                &heartbeat,
+            ),
+            Err(SkipReason::SacredStowaway),
+        );
+        // An ordinary batch owes no target-only observation or PAL probe.
+        assert!(
+            authorize_target_only_mutation(&candidate, None, &scanner, None, now, &heartbeat,)
+                .is_ok()
+        );
+        assert!(candidate.path.join("debug/deps/libdemo.rlib").exists());
     }
 
     /// A target-only batch can outlive the purity observation that admitted

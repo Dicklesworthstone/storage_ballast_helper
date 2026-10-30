@@ -273,6 +273,42 @@ pub fn still_pure(dir: &Path) -> bool {
     matches!(first_impurity(dir, MAX_LISTING_ENTRIES), Ok(None))
 }
 
+/// Renew the recursive age evidence immediately before a queued target is
+/// removed. A completed build can change deep files without replacing the
+/// target inode, changing its top-level structure or leaving a process open.
+pub(super) fn still_idle(
+    dir: &Path,
+    expected: FsIdentity,
+    scanner: &ScannerConfig,
+    now: SystemTime,
+) -> bool {
+    let cutoff = now.checked_sub(idle_window(scanner));
+    let Some(cutoff) = cutoff else {
+        return false;
+    };
+    let facts = survey(dir, cutoff, Instant::now() + DISCOVERY_BUDGET);
+    facts.kept.is_none()
+        && facts.identity == Some(expected)
+        && current_identity(dir) == Some(expected)
+}
+
+fn idle_window(scanner: &ScannerConfig) -> Duration {
+    Duration::from_secs(
+        scanner
+            .target_only_idle_hours
+            .saturating_mul(3600)
+            .max(scanner.min_file_age_minutes.saturating_mul(60)),
+    )
+}
+
+/// Excluding a parent also excludes a configured root nested beneath it.
+pub(super) fn is_excluded(dir: &Path, excluded: &[PathBuf]) -> bool {
+    let resolved = resolve_absolute_path(dir);
+    excluded
+        .iter()
+        .any(|path| resolved.starts_with(resolve_absolute_path(path)))
+}
+
 /// The first top-level entry of `dir` that cargo did not write, or an error
 /// when the listing cannot be completed within its entry budget (which
 /// keeps the directory). A live mutation guard must not walk an unbounded
@@ -339,9 +375,11 @@ struct Survey {
 /// in with preserved mtimes (`cp -a`, `rsync -a`, `tar x`) is not idle at
 /// once. Entries inside count by modification time.
 fn touched_at(meta: &fs::Metadata) -> Option<SystemTime> {
-    let modified = meta.modified().ok();
-    let created = meta.created().ok();
-    modified.max(created)
+    let modified = meta.modified().ok()?;
+    Some(
+        meta.created()
+            .map_or(modified, |created| modified.max(created)),
+    )
 }
 
 /// Walk `dir` without following symlinks or leaving its device. Stops at the
@@ -349,12 +387,24 @@ fn touched_at(meta: &fs::Metadata) -> Option<SystemTime> {
 /// another device or an unreadable entry leaves the survey incomplete, which
 /// keeps the directory.
 fn survey(dir: &Path, idle_cutoff: SystemTime, deadline: Instant) -> Survey {
+    survey_with_limits(dir, idle_cutoff, deadline, SURVEY_MAX_ENTRIES)
+}
+
+fn survey_with_limits(
+    dir: &Path,
+    idle_cutoff: SystemTime,
+    deadline: Instant,
+    max_entries: u64,
+) -> Survey {
     let mut found = Survey {
         identity: None,
         newest: None,
         bytes: 0,
         kept: Some(Kept::Unsurveyed),
     };
+    if Instant::now() >= deadline {
+        return found;
+    }
     let Ok(top) = fs::symlink_metadata(dir) else {
         return found;
     };
@@ -364,6 +414,9 @@ fn survey(dir: &Path, idle_cutoff: SystemTime, deadline: Instant) -> Survey {
     found.identity = identity_of(&top);
     let device = device_of(&top);
     found.newest = touched_at(&top);
+    if found.newest.is_none() {
+        return found;
+    }
     if found.newest.is_some_and(|touched| touched > idle_cutoff) {
         found.kept = Some(Kept::Recent);
         return found;
@@ -371,12 +424,15 @@ fn survey(dir: &Path, idle_cutoff: SystemTime, deadline: Instant) -> Survey {
     let mut entries = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
+        if Instant::now() >= deadline {
+            return found;
+        }
         let Ok(listing) = fs::read_dir(&current) else {
             return found;
         };
         for entry in listing {
             entries += 1;
-            if entries > SURVEY_MAX_ENTRIES || Instant::now() >= deadline {
+            if entries > max_entries || Instant::now() >= deadline {
                 return found;
             }
             let Ok(entry) = entry else {
@@ -395,13 +451,14 @@ fn survey(dir: &Path, idle_cutoff: SystemTime, deadline: Instant) -> Survey {
             let Ok(meta) = fs::symlink_metadata(&path) else {
                 return found;
             };
-            if let Ok(touched) = meta.modified() {
-                if touched > idle_cutoff {
-                    found.kept = Some(Kept::Recent);
-                    return found;
-                }
-                found.newest = Some(found.newest.map_or(touched, |newest| newest.max(touched)));
+            let Ok(touched) = meta.modified() else {
+                return found;
+            };
+            if touched > idle_cutoff {
+                found.kept = Some(Kept::Recent);
+                return found;
             }
+            found.newest = Some(found.newest.map_or(touched, |newest| newest.max(touched)));
             found.bytes = found.bytes.saturating_add(allocated_bytes(&meta));
             if meta.is_dir() {
                 if device_of(&meta) != device {
@@ -411,7 +468,9 @@ fn survey(dir: &Path, idle_cutoff: SystemTime, deadline: Instant) -> Survey {
             }
         }
     }
-    found.kept = None;
+    if Instant::now() < deadline {
+        found.kept = None;
+    }
     found
 }
 
@@ -517,15 +576,15 @@ fn markers_in(dir: &Path, deadline: Instant) -> Result<(Markers, Vec<PathBuf>), 
 
 /// Directories under `root` with cargo structure at their top, shallowest
 /// first. Never the root itself, and never at or below a candidate, a marker,
-/// a `.git` entry, one of `excluded` (exact paths, as the walker takes
-/// `scanner.excluded_paths`), another device or an unreadable directory.
+/// a `.git` entry, an excluded path or its descendants, another device or an
+/// unreadable directory.
 /// Returns whether the walk covered the root.
 fn discover(root: &Path, excluded: &[PathBuf], found: &mut Vec<PathBuf>) -> bool {
     let deadline = Instant::now() + DISCOVERY_BUDGET;
     let Ok(root_meta) = fs::symlink_metadata(root) else {
         return false;
     };
-    if excluded.iter().any(|path| path == root) {
+    if is_excluded(root, excluded) {
         return true;
     }
     let device = device_of(&root_meta);
@@ -556,7 +615,7 @@ fn discover(root: &Path, excluded: &[PathBuf], found: &mut Vec<PathBuf>) -> bool
             continue;
         }
         for child in children {
-            if !excluded.contains(&child)
+            if !is_excluded(&child, excluded)
                 && fs::symlink_metadata(&child).is_ok_and(|meta| device_of(&meta) == device)
             {
                 queue.push_back((child, depth + 1));
@@ -631,7 +690,7 @@ pub fn select(
     selection.complete = discover(root, &config.scanner.excluded_paths, &mut found);
     selection.discovered = found.len();
 
-    let idle = Duration::from_secs(config.scanner.target_only_idle_hours.saturating_mul(3600));
+    let idle = idle_window(&config.scanner);
     let idle_cutoff = now.checked_sub(idle).unwrap_or(SystemTime::UNIX_EPOCH);
     let deadline = Instant::now() + SURVEY_BUDGET;
     let mut checked = Vec::new();
@@ -1147,6 +1206,92 @@ mod tests {
         assert_eq!(selection.discovered, 1);
         assert_eq!(selection.candidates.len(), 1);
         assert!(selection.candidates[0].path.ends_with("s2/target"));
+    }
+
+    #[test]
+    fn a_root_beneath_an_excluded_ancestor_is_not_walked() {
+        let (_temp, root) = scratch_root();
+        let nested_root = root.join("sessions/active");
+        cargo_target(&nested_root.join("build/target"));
+        age(&root, 48);
+        let mut config = Config::default();
+        config.scanner.excluded_paths.push(root.join("sessions"));
+
+        let selection = select(
+            &nested_root,
+            &config,
+            &MockPlatform::healthy(),
+            0.5,
+            later(),
+        );
+        assert!(selection.complete);
+        assert_eq!(selection.discovered, 0);
+        assert!(selection.candidates.is_empty());
+    }
+
+    #[test]
+    fn a_queued_target_rebuilt_in_place_is_no_longer_idle() {
+        let (_temp, root) = scratch_root();
+        let target = root.join("session/target");
+        cargo_target(&target);
+        age(&root, 48);
+        let config = Config::default();
+        let now = later();
+        let selection = select(&root, &config, &MockPlatform::healthy(), 0.5, now);
+        assert_eq!(selection.candidates.len(), 1);
+        let candidate = &selection.candidates[0];
+        let identity = candidate.identity.unwrap();
+        assert!(still_idle(&target, identity, &config.scanner, now));
+
+        let mut stricter = config.scanner.clone();
+        stricter.min_file_age_minutes = 96 * 60;
+        assert!(!still_idle(&target, identity, &stricter, now));
+
+        // The rebuild completes and closes its files while the batch waits.
+        // Neither top-level purity nor the original inode proves idleness.
+        let artifact = target.join("debug/deps/libdemo.rlib");
+        fs::write(&artifact, b"newly compiled output").unwrap();
+        touch_ahead(&artifact, 2);
+        assert!(still_pure(&target));
+        assert_eq!(current_identity(&target), Some(identity));
+        assert!(!still_idle(&target, identity, &config.scanner, now));
+    }
+
+    #[test]
+    fn incomplete_live_surveys_never_establish_idleness() {
+        let (_temp, root) = scratch_root();
+        let target = root.join("target");
+        cargo_target(&target);
+        age(&root, 48);
+        let cutoff = later() - Duration::from_hours(24);
+        assert_eq!(
+            survey_with_limits(&target, cutoff, Instant::now(), SURVEY_MAX_ENTRIES).kept,
+            Some(Kept::Unsurveyed),
+        );
+        assert_eq!(
+            survey_with_limits(&target, cutoff, Instant::now() + DISCOVERY_BUDGET, 1).kept,
+            Some(Kept::Unsurveyed),
+        );
+        assert_eq!(
+            survey(
+                &root.join("missing"),
+                cutoff,
+                Instant::now() + DISCOVERY_BUDGET,
+            )
+            .kept,
+            Some(Kept::Unsurveyed),
+        );
+
+        let identity = current_identity(&target).unwrap();
+        fs::rename(&target, root.join("old-target")).unwrap();
+        cargo_target(&target);
+        age(&target, 48);
+        assert!(!still_idle(
+            &target,
+            identity,
+            &Config::default().scanner,
+            later(),
+        ));
     }
 
     #[cfg(unix)]
