@@ -3,7 +3,8 @@
 //! Order of operations, each step a precondition of the next:
 //! 1. rsync the unit to `<target>[/<host>]/<run stamp>/<original path>/`.
 //! 2. Verify with a checksum dry run: any itemized difference aborts.
-//! 3. Upload the relocation record next to the copy.
+//! 3. Upload the relocation record next to the copy. For a local target,
+//!    synchronize the backup and parent filesystems, then renew copy evidence.
 //! 4. Rename the unit aside (`.<name>.sbh-relocating`), so a writer that
 //!    opens by path fails loudly instead of writing into a doomed tree.
 //! 5. Re-survey the renamed tree and re-sweep processes: nothing below it
@@ -104,7 +105,7 @@ pub enum Outcome {
     Failed {
         /// The original path.
         path: PathBuf,
-        /// The step that refused: precheck, copy, verify, record, rename,
+        /// The step that refused: precheck, copy, verify, record, sync, rename,
         /// postcheck, stub, remove or ledger.
         stage: String,
         /// Why.
@@ -167,6 +168,10 @@ fn rsync_command(config: &RelocationConfig, remote: bool) -> Command {
         "--sparse",
         "--one-file-system",
         "--mkpath",
+        // This flushes transferred regular files, including on remote receivers.
+        // It does not flush skipped files or directory publication: local moves
+        // additionally require the filesystem barrier in make_durable().
+        "--fsync",
     ]);
     if remote {
         let mut ssh = vec![
@@ -401,13 +406,29 @@ struct EvidenceBudget {
 
 impl SourceEvidence {
     fn capture(source: &fs::File, max_entries: u64) -> io::Result<Self> {
+        Self::capture_avoiding(source, max_entries, None)
+    }
+
+    fn capture_avoiding(
+        source: &fs::File,
+        max_entries: u64,
+        forbidden_directory: Option<&Stat>,
+    ) -> io::Result<Self> {
         let root = rustix::fs::fstat(source)?;
         let mut digest = Sha256::new();
         let mut budget = EvidenceBudget {
             entries_left: max_entries,
             names_left: SOURCE_EVIDENCE_NAME_BYTES,
         };
-        fingerprint_directory(source, Path::new(""), &root, 0, &mut budget, &mut digest)?;
+        fingerprint_directory(
+            source,
+            Path::new(""),
+            &root,
+            0,
+            &mut budget,
+            &mut digest,
+            forbidden_directory,
+        )?;
         Ok(Self {
             root,
             descendants: digest.finalize().into(),
@@ -443,6 +464,7 @@ fn fingerprint_directory(
     depth: usize,
     budget: &mut EvidenceBudget,
     digest: &mut Sha256,
+    forbidden_directory: Option<&Stat>,
 ) -> io::Result<()> {
     if depth >= SOURCE_EVIDENCE_MAX_DEPTH {
         return Err(restore_invalid(
@@ -450,6 +472,11 @@ fn fingerprint_directory(
         ));
     }
     let before = rustix::fs::fstat(directory)?;
+    if forbidden_directory.is_some_and(|forbidden| same_restore_identity(forbidden, &before)) {
+        return Err(restore_invalid(
+            "local destination aliases a directory inside the source tree",
+        ));
+    }
     if !same_restore_stamp(expected, &before) {
         return Err(restore_invalid(
             "relocation source changed during evidence collection",
@@ -511,6 +538,7 @@ fn fingerprint_directory(
                 depth + 1,
                 budget,
                 digest,
+                forbidden_directory,
             )?;
         }
     }
@@ -535,6 +563,8 @@ fn actual_directory(directory: &fs::File, fallback: &Path) -> PathBuf {
     fs::read_link(descriptor_path(directory)).unwrap_or_else(|_| fallback.to_path_buf())
 }
 
+type DestinationPrefixGuard<'a> = &'a dyn Fn(&fs::File) -> io::Result<()>;
+
 /// A local copy must be a separate, pinned tree. In particular, rsync accepts
 /// a destination symlink to its own source and reports a clean checksum check.
 /// Following that alias would leave no backup when the source is removed.
@@ -546,8 +576,13 @@ struct LocalDestination {
 }
 
 impl LocalDestination {
-    fn walk(path: &Path, source: &Stat, create: bool) -> io::Result<fs::File> {
+    fn walk(
+        path: &Path,
+        source: &Stat,
+        prepare: Option<DestinationPrefixGuard<'_>>,
+    ) -> io::Result<fs::File> {
         let mut directory = survey::open_directory(Path::new("/"))?;
+        let mut checked_prefix = false;
         for component in path.components() {
             let name = match component {
                 std::path::Component::RootDir => continue,
@@ -564,17 +599,33 @@ impl LocalDestination {
                 ));
             }
             let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            let opened = rustix::fs::openat(&directory, name, flags, Mode::empty());
+            let opened = if checked_prefix {
+                // Existing mount points above the first new directory are
+                // valid targets. New components must remain on that mount.
+                crate::scanner::quarantine::open_beneath(&directory, name, flags)
+            } else {
+                rustix::fs::openat(&directory, name, flags, Mode::empty()).map_err(io::Error::from)
+            };
             let child = match opened {
                 Ok(child) => child,
-                Err(rustix::io::Errno::NOENT) if create => {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let Some(check) = prepare else {
+                        return Err(error);
+                    };
+                    if !checked_prefix {
+                        // Validate the last existing inode before creating
+                        // anything: its pathname may be a bind alias of a
+                        // source descendant even though no symlink is present.
+                        check(&directory)?;
+                        checked_prefix = true;
+                    }
                     match rustix::fs::mkdirat(&directory, name, Mode::from_raw_mode(0o700)) {
                         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                         Err(error) => return Err(error.into()),
                     }
-                    rustix::fs::openat(&directory, name, flags, Mode::empty())?
+                    crate::scanner::quarantine::open_beneath(&directory, name, flags)?
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             };
             directory = fs::File::from(child);
         }
@@ -584,7 +635,12 @@ impl LocalDestination {
         Ok(directory)
     }
 
-    fn create(destination: &str, source: &fs::File) -> io::Result<Self> {
+    fn create(
+        destination: &str,
+        source: &fs::File,
+        evidence: &SourceEvidence,
+        max_entries: u64,
+    ) -> io::Result<Self> {
         if destination.is_empty() {
             return Err(restore_invalid("local destination is empty"));
         }
@@ -609,7 +665,17 @@ impl LocalDestination {
             ));
         }
         let source_identity = rustix::fs::fstat(source)?;
-        let directory = Self::walk(&path, &source_identity, true)?;
+        let check_source = |candidate: &fs::File| {
+            let forbidden = rustix::fs::fstat(candidate)?;
+            let current = SourceEvidence::capture_avoiding(source, max_entries, Some(&forbidden))?;
+            if !evidence.matches(&current, false) {
+                return Err(restore_invalid(
+                    "source changed during local destination preparation",
+                ));
+            }
+            Ok(())
+        };
+        let directory = Self::walk(&path, &source_identity, Some(&check_source))?;
         let copy_identity = rustix::fs::fstat(&directory)?;
         // A resumable destination from the ledger can also name a source
         // ancestor. Refuse it before rsync can copy into the live source scope.
@@ -635,7 +701,7 @@ impl LocalDestination {
         let parent_path = path
             .parent()
             .ok_or_else(|| restore_invalid("local destination has no parent"))?;
-        let parent = Self::walk(parent_path, &source_identity, false)?;
+        let parent = Self::walk(parent_path, &source_identity, None)?;
         let copy = Self {
             path,
             parent,
@@ -643,13 +709,25 @@ impl LocalDestination {
             source_identity,
         };
         copy.check_location()?;
+        // A source reached through a bind-mounted parent may physically live
+        // below this destination even when walking its namespace parents did
+        // not find that ancestor. Prove containment in the reverse direction
+        // too, and refuse mounts or incomplete evidence inside an old target.
+        SourceEvidence::capture_avoiding(&copy.directory, max_entries, Some(&copy.source_identity))
+            .map_err(|error| {
+                restore_invalid(&format!("destination independence check failed: {error}"))
+            })?;
+        // Existing destinations need the same inode proof as newly created
+        // ones. Always compare to the original baseline, never bless changes
+        // caused by destination preparation or a concurrent namespace move.
+        check_source(&copy.directory)?;
         Ok(copy)
     }
 
     fn check_location(&self) -> io::Result<()> {
         let check = || {
-            let current = Self::walk(&self.path, &self.source_identity, false)?;
-            let parent = Self::walk(self.path.parent().unwrap(), &self.source_identity, false)?;
+            let current = Self::walk(&self.path, &self.source_identity, None)?;
+            let parent = Self::walk(self.path.parent().unwrap(), &self.source_identity, None)?;
             if !same_restore_identity(
                 &rustix::fs::fstat(&self.directory)?,
                 &rustix::fs::fstat(&current)?,
@@ -678,6 +756,25 @@ impl LocalDestination {
             ));
         }
         self.check_location()
+    }
+
+    fn make_durable(
+        &self,
+        evidence: &SourceEvidence,
+        max_entries: u64,
+        sync: FilesystemSync<'_>,
+    ) -> io::Result<()> {
+        self.check_location()?;
+        // A resumed rsync skips matching files, and --fsync covers only files
+        // it writes. syncfs includes all pending payload data and directory
+        // metadata, including the published names and pre-existing copy files.
+        sync(&self.directory)?;
+        // The sidecar and destination entry live here. A destination that is
+        // itself a mount point can have a parent on a different filesystem.
+        sync(&self.parent)?;
+        // Writeback may take a long time: neither a replaced destination nor
+        // a modified copy may inherit the successful durability result.
+        self.check_verified(evidence, max_entries)
     }
 
     fn record_path(&self) -> PathBuf {
@@ -873,9 +970,15 @@ impl StagedStub {
     }
 }
 
+type FilesystemSync<'a> = &'a dyn Fn(&fs::File) -> io::Result<()>;
+
+fn sync_filesystem(directory: &fs::File) -> io::Result<()> {
+    rustix::fs::syncfs(directory).map_err(io::Error::from)
+}
+
 /// Fault-injection points for tests: what another process might do between
 /// two steps. `after_rename` gets the original path, `before_remove` the
-/// renamed tree.
+/// renamed tree. The sync hook can inject a filesystem writeback failure.
 #[derive(Default)]
 struct Hooks<'a> {
     before_copy: Option<&'a dyn Fn(&Path)>,
@@ -884,6 +987,8 @@ struct Hooks<'a> {
     after_rename: Option<&'a dyn Fn(&Path)>,
     before_stub_publish: Option<&'a dyn Fn(&Path)>,
     before_remove: Option<&'a dyn Fn(&Path)>,
+    after_final_backup_check: Option<&'a dyn Fn(&Path)>,
+    sync_filesystem: Option<FilesystemSync<'a>>,
 }
 
 /// [`relocate`] with fault-injection hooks.
@@ -964,7 +1069,12 @@ fn relocate_with_hooks(
     let local_destination = if remote {
         None
     } else {
-        let copy = match LocalDestination::create(&destination, &anchor.source) {
+        let copy = match LocalDestination::create(
+            &destination,
+            &anchor.source,
+            &evidence,
+            config.max_entries,
+        ) {
             Ok(copy) => copy,
             Err(error) => return fail("precheck", format!("unsafe local destination: {error}")),
         };
@@ -1015,10 +1125,10 @@ fn relocate_with_hooks(
     if let Some(hook) = hooks.after_verify {
         hook(&path);
     }
-    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence) {
-        if let Err(error) = copy.check_verified(verified, config.max_entries) {
-            return fail("verify", retained(error.to_string()));
-        }
+    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence)
+        && let Err(error) = copy.check_verified(verified, config.max_entries)
+    {
+        return fail("verify", retained(error.to_string()));
     }
     let record = RelocationRecord {
         schema: SCHEMA.to_string(),
@@ -1075,6 +1185,20 @@ fn relocate_with_hooks(
     if let Err((stage, error)) = uploaded {
         return fail(&stage, error);
     }
+    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence)
+        && let Err(error) = copy.make_durable(
+            verified,
+            config.max_entries,
+            hooks.sync_filesystem.unwrap_or(&sync_filesystem),
+        )
+    {
+        return fail(
+            "sync",
+            retained(format!(
+                "backup durability could not be established: {error}"
+            )),
+        );
+    }
 
     if let Some(hook) = hooks.before_rename {
         hook(&path);
@@ -1082,10 +1206,10 @@ fn relocate_with_hooks(
     if let Err(error) = anchor.check_location(false) {
         return fail("rename", retained(error.to_string()));
     }
-    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence) {
-        if let Err(error) = copy.check_verified(verified, config.max_entries) {
-            return fail("postcheck", retained(error.to_string()));
-        }
+    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence)
+        && let Err(error) = copy.check_verified(verified, config.max_entries)
+    {
+        return fail("postcheck", retained(error.to_string()));
     }
     match SourceEvidence::capture(&anchor.source, config.max_entries) {
         Ok(current) if evidence.matches(&current, false) => {}
@@ -1256,6 +1380,14 @@ fn relocate_with_hooks(
     {
         return refuse_removal(error.to_string());
     }
+    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence)
+        && let Err(error) = copy.check_verified(verified, config.max_entries)
+    {
+        return refuse_removal(error.to_string());
+    }
+    if let Some(hook) = hooks.after_final_backup_check {
+        hook(&aside);
+    }
     match plan::check_relocation_policy(config, &path, &aside) {
         Ok(current) if postcheck_matches(&snapshot, &current) => {}
         Ok(_) => {
@@ -1269,6 +1401,9 @@ fn relocate_with_hooks(
             ));
         }
     }
+    // The source proof must be the last large content walk. A writer that
+    // changes the source and closes it during backup verification must still
+    // be detected even though the following process sweep sees no holder.
     match SourceEvidence::capture(&anchor.source, config.max_entries) {
         Ok(current) if evidence.matches(&current, true) => {}
         Ok(_) => {
@@ -1281,11 +1416,6 @@ fn relocate_with_hooks(
         Ok(_) => return refuse_removal("restore stub changed before source removal".into()),
         Err(error) => return refuse_removal(error.to_string()),
     }
-    if let (Some(copy), Some(verified)) = (&local_destination, &local_evidence) {
-        if let Err(error) = copy.check_verified(verified, config.max_entries) {
-            return refuse_removal(error.to_string());
-        }
-    }
     // Metadata walks may be large. Current content evidence and a holder
     // sweep after those walks must both pass at the final removal boundary.
     if let Some(reason) = holder(platform, &aside) {
@@ -1297,10 +1427,10 @@ fn relocate_with_hooks(
     {
         return refuse_removal(error.to_string());
     }
-    if let Some(copy) = &local_destination {
-        if let Err(error) = copy.check_location() {
-            return refuse_removal(error.to_string());
-        }
+    if let Some(copy) = &local_destination
+        && let Err(error) = copy.check_location()
+    {
+        return refuse_removal(error.to_string());
     }
     // Descriptor-relative, no symlinks followed, and refusing any other
     // mount (openat2 NO_XDEV): the deletion executor's own removal.
@@ -1791,6 +1921,263 @@ mod tests {
             roots: vec![root.join("scratch")],
             ..RelocationConfig::default()
         }
+    }
+
+    #[test]
+    fn local_durability_covers_sidecar_and_unchanged_resumed_files() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        for resume in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            let config = local_config(tmp.path());
+            let destination = destination_for(
+                &config,
+                config.target.as_deref().unwrap(),
+                &hostname(),
+                "S",
+                &unit,
+            );
+            let copy = PathBuf::from(destination.trim_end_matches('/'));
+            let sidecar = PathBuf::from(format!("{}{RECORD_FILENAME}", copy.display()));
+            let mut ledger = Ledger::default();
+            let previous_inode = if resume {
+                copy_and_verify(
+                    &config,
+                    false,
+                    &format!("{}/", unit.display()),
+                    &destination,
+                )
+                .unwrap();
+                ledger.in_progress.insert(unit.clone(), destination.clone());
+                Some(fs::metadata(copy.join("a/b/data")).unwrap().ino())
+            } else {
+                None
+            };
+            let synchronized = std::cell::RefCell::new(Vec::new());
+            let flush = |directory: &fs::File| {
+                // Both payload and sidecar must exist before either barrier;
+                // the source has not even been renamed at this point.
+                assert!(sidecar.is_file());
+                assert!(unit.join("a/b/data").is_file());
+                assert!(!sibling(&unit, "sbh-relocating").unwrap().exists());
+                if let Some(inode) = previous_inode {
+                    // The retry skipped this already-matching file. Its
+                    // durability cannot depend on rsync's per-file --fsync.
+                    assert_eq!(fs::metadata(copy.join("a/b/data")).unwrap().ino(), inode);
+                }
+                synchronized
+                    .borrow_mut()
+                    .push(fs::read_link(descriptor_path(directory)).unwrap());
+                sync_filesystem(directory)
+            };
+            let outcome = relocate_with_hooks(
+                &config,
+                &crate::platform::pal::MockPlatform::default(),
+                &mut ledger,
+                &candidate_for(&unit),
+                "S",
+                1_000,
+                &Hooks {
+                    sync_filesystem: Some(&flush),
+                    ..Hooks::default()
+                },
+            );
+            assert!(matches!(&outcome, Outcome::Relocated { .. }), "{outcome:?}");
+            assert_eq!(
+                *synchronized.borrow(),
+                vec![copy.clone(), copy.parent().unwrap().to_path_buf()]
+            );
+            assert_eq!(fs::read(copy.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+            assert!(sidecar.is_file());
+            assert!(unit.join(RECORD_FILENAME).is_file());
+            assert!(ledger.in_progress.is_empty());
+        }
+    }
+
+    #[test]
+    fn local_sync_failure_preserves_the_original_before_rename() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        for fail_at in [0, 1] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            let original_inode = fs::metadata(&unit).unwrap().ino();
+            let config = local_config(tmp.path());
+            let calls = std::cell::Cell::new(0);
+            let fail = |directory: &fs::File| {
+                let index = calls.get();
+                calls.set(index + 1);
+                if index == fail_at {
+                    Err(io::Error::from_raw_os_error(if fail_at == 0 {
+                        libc::EIO
+                    } else {
+                        libc::ENOSPC
+                    }))
+                } else {
+                    sync_filesystem(directory)
+                }
+            };
+            let mut ledger = Ledger::default();
+            let outcome = relocate_with_hooks(
+                &config,
+                &crate::platform::pal::MockPlatform::default(),
+                &mut ledger,
+                &candidate_for(&unit),
+                "S",
+                1_000,
+                &Hooks {
+                    sync_filesystem: Some(&fail),
+                    ..Hooks::default()
+                },
+            );
+            assert!(
+                matches!(&outcome, Outcome::Failed { stage, error, .. }
+                    if stage == "sync" && error.contains("durability")),
+                "{outcome:?}"
+            );
+            assert_eq!(calls.get(), fail_at + 1);
+            assert_eq!(fs::metadata(&unit).unwrap().ino(), original_inode);
+            assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+            assert!(!unit.join(RECORD_FILENAME).exists());
+            assert!(!sibling(&unit, "sbh-relocating").unwrap().exists());
+            let destination = &ledger.in_progress[&unit];
+            assert_eq!(
+                fs::read(Path::new(destination).join("a/b/data")).unwrap(),
+                vec![7u8; 300_000]
+            );
+            assert!(
+                PathBuf::from(format!(
+                    "{}{RECORD_FILENAME}",
+                    destination.trim_end_matches('/')
+                ))
+                .is_file()
+            );
+            assert!(ledger.relocations.is_empty());
+            assert_eq!(Ledger::load(&config.state_dir).unwrap(), ledger);
+        }
+    }
+
+    #[test]
+    fn a_backup_changed_during_writeback_cannot_inherit_the_sync_result() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        for replace in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            let config = local_config(tmp.path());
+            let destination = destination_for(
+                &config,
+                config.target.as_deref().unwrap(),
+                &hostname(),
+                "S",
+                &unit,
+            );
+            let copy = PathBuf::from(destination.trim_end_matches('/'));
+            let saved_copy = tmp.path().join("saved-copy");
+            let calls = std::cell::Cell::new(0);
+            let change = |directory: &fs::File| {
+                sync_filesystem(directory)?;
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    if replace {
+                        fs::rename(&copy, &saved_copy).unwrap();
+                        std::os::unix::fs::symlink(&unit, &copy).unwrap();
+                    } else {
+                        fs::write(copy.join("a/b/data"), b"modified during sync").unwrap();
+                    }
+                }
+                Ok(())
+            };
+            let outcome = relocate_with_hooks(
+                &config,
+                &crate::platform::pal::MockPlatform::default(),
+                &mut Ledger::default(),
+                &candidate_for(&unit),
+                "S",
+                1_000,
+                &Hooks {
+                    sync_filesystem: Some(&change),
+                    ..Hooks::default()
+                },
+            );
+            assert!(
+                matches!(&outcome, Outcome::Failed { stage, .. } if stage == "sync"),
+                "{outcome:?}"
+            );
+            assert_eq!(calls.get(), 2);
+            assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+            assert!(!unit.join(RECORD_FILENAME).exists());
+            assert!(!sibling(&unit, "sbh-relocating").unwrap().exists());
+            if replace {
+                assert_eq!(
+                    fs::read(saved_copy.join("a/b/data")).unwrap(),
+                    vec![7u8; 300_000]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_closed_writer_during_final_backup_verification_cannot_evade_source_evidence() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        // Keep aggregate newest-change evidence unchanged when another file
+        // is written later; the final per-entry fingerprint must catch it.
+        filetime::set_file_mtime(
+            unit.join("top"),
+            filetime::FileTime::from_unix_time(Utc::now().timestamp() + 3_600, 0),
+        )
+        .unwrap();
+        let config = local_config(tmp.path());
+        let wrote = std::cell::Cell::new(false);
+        let write_and_close = |aside: &Path| {
+            fs::write(
+                aside.join("a/b/data"),
+                b"new work during the last backup walk",
+            )
+            .unwrap();
+            wrote.set(true);
+        };
+        let mut ledger = Ledger::default();
+        let outcome = relocate_with_hooks(
+            &config,
+            &crate::platform::pal::MockPlatform::default(),
+            &mut ledger,
+            &candidate_for(&unit),
+            "S",
+            1_000,
+            &Hooks {
+                after_final_backup_check: Some(&write_and_close),
+                ..Hooks::default()
+            },
+        );
+        assert!(wrote.get());
+        assert!(
+            matches!(&outcome, Outcome::Failed { stage, error, .. }
+                if stage == "remove" && error.contains("source identity or contents changed")),
+            "{outcome:?}"
+        );
+        let aside = sibling(&unit, "sbh-relocating").unwrap();
+        assert_eq!(
+            fs::read(aside.join("a/b/data")).unwrap(),
+            b"new work during the last backup walk"
+        );
+        assert!(unit.join(RECORD_FILENAME).is_file());
+        assert_eq!(
+            fs::read(Path::new(&ledger.relocations[0].destination).join("a/b/data")).unwrap(),
+            vec![7u8; 300_000],
+        );
     }
 
     #[test]
@@ -2490,10 +2877,240 @@ mod tests {
                     names_left,
                 },
                 &mut Sha256::new(),
+                None,
             )
             .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
         }
+        assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+    }
+
+    #[test]
+    fn source_evidence_rejects_forbidden_directory_identity_at_any_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        let source = survey::open_directory(&unit).unwrap();
+        let evidence = SourceEvidence::capture(&source, 100).unwrap();
+        for path in [&unit, &unit.join("a"), &unit.join("a/b")] {
+            let directory = survey::open_directory(path).unwrap();
+            let forbidden = rustix::fs::fstat(&directory).unwrap();
+            let error = SourceEvidence::capture_avoiding(&source, 100, Some(&forbidden))
+                .err()
+                .unwrap();
+            assert!(
+                error.to_string().contains("aliases a directory inside"),
+                "{error}"
+            );
+        }
+        let outside = survey::open_directory(tmp.path()).unwrap();
+        let forbidden = rustix::fs::fstat(&outside).unwrap();
+        assert!(evidence.matches(
+            &SourceEvidence::capture_avoiding(&source, 100, Some(&forbidden)).unwrap(),
+            false,
+        ));
+        let error = SourceEvidence::capture_avoiding(&source, 0, Some(&forbidden))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("entry budget exhausted"));
+        for (depth, names_left, expected) in [
+            (0, 0, "working-name budget exhausted"),
+            (
+                SOURCE_EVIDENCE_MAX_DEPTH,
+                SOURCE_EVIDENCE_NAME_BYTES,
+                "directory depth exhausted",
+            ),
+        ] {
+            let error = fingerprint_directory(
+                &source,
+                Path::new(""),
+                &rustix::fs::fstat(&source).unwrap(),
+                depth,
+                &mut EvidenceBudget {
+                    entries_left: 100,
+                    names_left,
+                },
+                &mut Sha256::new(),
+                Some(&forbidden),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn destination_preparation_cannot_bless_changed_or_incomplete_source_evidence() {
+        for changed in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            let source = survey::open_directory(&unit).unwrap();
+            let evidence = SourceEvidence::capture(&source, 100).unwrap();
+            let target = tmp.path().join("new-backup/child");
+            if changed {
+                fs::write(unit.join("a/b/data"), b"new work after planning").unwrap();
+            }
+            let error = LocalDestination::create(
+                target.to_str().unwrap(),
+                &source,
+                &evidence,
+                if changed { 100 } else { 0 },
+            )
+            .err()
+            .unwrap();
+            let expected = if changed {
+                "source changed"
+            } else {
+                "entry budget exhausted"
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(!tmp.path().join("new-backup").exists());
+            assert!(unit.join("a/b/data").is_file());
+        }
+    }
+
+    #[test]
+    fn bind_aliases_of_source_descendants_are_refused_before_mkdir_or_copy() {
+        use nix::mount::{MsFlags, mount};
+
+        for existing in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            let source = survey::open_directory(&unit).unwrap();
+            let evidence = SourceEvidence::capture(&source, 100).unwrap();
+            let alias = tmp.path().join("bound-backup");
+            fs::create_dir(&alias).unwrap();
+            let mut config = local_config(tmp.path());
+            config.target = Some(alias.join("new-backup").display().to_string());
+            let mut ledger = Ledger::default();
+            if existing {
+                ledger
+                    .in_progress
+                    .insert(unit.clone(), format!("{}/b/", alias.display()));
+            }
+            let initial_ledger = ledger.clone();
+            if let Err(error) = mount(
+                Some(&unit.join("a")),
+                &alias,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            ) {
+                eprintln!("skipped: bind mount unavailable: {error}");
+                return;
+            }
+            let outcome = relocate(
+                &config,
+                &crate::platform::pal::MockPlatform::default(),
+                &mut ledger,
+                &candidate_for(&unit),
+                "S",
+                1_000,
+            );
+            let unchanged = SourceEvidence::capture(&source, 100)
+                .is_ok_and(|current| evidence.matches(&current, false));
+            let created_inside = unit.join("a/new-backup").exists();
+            unmount(&alias);
+            assert!(
+                matches!(&outcome, Outcome::Failed { stage, error, .. }
+                    if stage == "precheck" && error.contains("aliases a directory inside")),
+                "{outcome:?}"
+            );
+            assert!(
+                unchanged,
+                "source was changed during destination preparation"
+            );
+            assert!(!created_inside);
+            assert!(!config.state_dir.exists());
+            assert_eq!(ledger, initial_ledger);
+            assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+        }
+    }
+
+    #[test]
+    fn destination_cannot_contain_a_source_reached_through_a_bind_parent() {
+        use nix::mount::{MsFlags, mount};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let destination = tmp.path().join("real");
+        let original = marked_tree(&destination);
+        let alias = tmp.path().join("alias");
+        fs::create_dir(&alias).unwrap();
+        let unit = alias.join("unit");
+        let mut config = local_config(tmp.path());
+        config.roots = vec![alias.clone()];
+        let mut ledger = Ledger::default();
+        ledger
+            .in_progress
+            .insert(unit.clone(), format!("{}/", destination.display()));
+        let initial_ledger = ledger.clone();
+        if let Err(error) = mount(
+            Some(original.parent().unwrap()),
+            &alias,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        ) {
+            eprintln!("skipped: bind mount unavailable: {error}");
+            return;
+        }
+        let source = survey::open_directory(&unit).unwrap();
+        let evidence = SourceEvidence::capture(&source, 100).unwrap();
+        let outcome = relocate(
+            &config,
+            &crate::platform::pal::MockPlatform::default(),
+            &mut ledger,
+            &candidate_for(&unit),
+            "S",
+            1_000,
+        );
+        let unchanged = SourceEvidence::capture(&source, 100)
+            .is_ok_and(|current| evidence.matches(&current, false));
+        unmount(&alias);
+        assert!(
+            matches!(&outcome, Outcome::Failed { stage, error, .. }
+                if stage == "precheck" && error.contains("destination independence check failed")),
+            "{outcome:?}"
+        );
+        assert!(unchanged);
+        assert_eq!(ledger, initial_ledger);
+        assert!(!config.state_dir.exists());
+        assert_eq!(
+            fs::read(original.join("a/b/data")).unwrap(),
+            vec![7u8; 300_000]
+        );
+    }
+
+    #[test]
+    fn mounts_inside_an_existing_destination_are_refused_before_copy() {
+        use nix::mount::{MsFlags, mount};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        let source = survey::open_directory(&unit).unwrap();
+        let evidence = SourceEvidence::capture(&source, 100).unwrap();
+        let destination = tmp.path().join("existing-backup");
+        let mounted = destination.join("a");
+        fs::create_dir_all(&mounted).unwrap();
+        if let Err(error) = mount(
+            Some(&unit.join("a")),
+            &mounted,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        ) {
+            eprintln!("skipped: bind mount unavailable: {error}");
+            return;
+        }
+        let result =
+            LocalDestination::create(destination.to_str().unwrap(), &source, &evidence, 100);
+        unmount(&mounted);
+        let error = result.err().expect("nested destination mount refused");
+        assert!(
+            error
+                .to_string()
+                .contains("destination independence check failed"),
+            "{error}"
+        );
+        assert!(evidence.matches(&SourceEvidence::capture(&source, 100).unwrap(), false));
         assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
     }
 
