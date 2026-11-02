@@ -302,11 +302,15 @@ fn idle_window(scanner: &ScannerConfig) -> Duration {
 }
 
 /// Excluding a parent also excludes a configured root nested beneath it.
+/// The filesystem root excludes only itself: the default list names `/` so
+/// the walker never walks the whole filesystem, and as a parent it would
+/// exclude everything.
 pub(super) fn is_excluded(dir: &Path, excluded: &[PathBuf]) -> bool {
     let resolved = resolve_absolute_path(dir);
-    excluded
-        .iter()
-        .any(|path| resolved.starts_with(resolve_absolute_path(path)))
+    excluded.iter().any(|path| {
+        let path = resolve_absolute_path(path);
+        resolved == path || (path.parent().is_some() && resolved.starts_with(&path))
+    })
 }
 
 /// The first top-level entry of `dir` that cargo did not write, or an error
@@ -1215,18 +1219,38 @@ mod tests {
         cargo_target(&nested_root.join("build/target"));
         age(&root, 48);
         let mut config = Config::default();
-        config.scanner.excluded_paths.push(root.join("sessions"));
+        let select_now =
+            |config: &Config| select(&nested_root, config, &MockPlatform::healthy(), 0.5, later());
+        // The default exclusions, `/` among them, leave the root walkable.
+        assert_eq!(select_now(&config).discovered, 1);
 
-        let selection = select(
-            &nested_root,
-            &config,
-            &MockPlatform::healthy(),
-            0.5,
-            later(),
-        );
+        config.scanner.excluded_paths.push(root.join("sessions"));
+        let selection = select_now(&config);
         assert!(selection.complete);
         assert_eq!(selection.discovered, 0);
         assert!(selection.candidates.is_empty());
+    }
+
+    #[test]
+    fn an_excluded_path_covers_what_is_below_it_but_the_filesystem_root_only_itself() {
+        let defaults = Config::default().scanner.excluded_paths;
+        assert!(defaults.contains(&PathBuf::from("/")));
+        assert!(is_excluded(Path::new("/"), &defaults));
+        assert!(is_excluded(Path::new("/usr/local/lib"), &defaults));
+        assert!(is_excluded(Path::new("/var/log/syslog"), &defaults));
+        for kept in [
+            "/tmp/claude-501",
+            "/data/tmp/rch",
+            "/var/tmp",
+            "/home/u/.cache",
+        ] {
+            assert!(!is_excluded(Path::new(kept), &defaults), "{kept}");
+        }
+        let excluded = [PathBuf::from("/data/tmp/rch/keep")];
+        assert!(is_excluded(Path::new("/data/tmp/rch/keep"), &excluded));
+        assert!(is_excluded(Path::new("/data/tmp/rch/keep/tree"), &excluded));
+        assert!(!is_excluded(Path::new("/data/tmp/rch/keeper"), &excluded));
+        assert!(!is_excluded(Path::new("/data/tmp/rch"), &excluded));
     }
 
     #[test]
@@ -1362,27 +1386,27 @@ mod tests {
         let cases: [(&str, ScopeChange); 10] = [
             ("disabled", |scanner| scanner.target_only_roots.clear()),
             ("different roots", |scanner| {
-                scanner.target_only_roots = vec!["/different".into()]
+                scanner.target_only_roots = vec!["/different".into()];
             }),
             ("idle window", |scanner| scanner.target_only_idle_hours += 1),
             ("minimum age", |scanner| scanner.min_file_age_minutes += 1),
             ("excluded path", |scanner| {
-                scanner.excluded_paths.push("/scratch/new-work".into())
+                scanner.excluded_paths.push("/scratch/new-work".into());
             }),
             ("protected path", |scanner| {
-                scanner.protected_paths.push("/scratch/new-work/**".into())
+                scanner.protected_paths.push("/scratch/new-work/**".into());
             }),
             ("scanner roots", |scanner| {
-                scanner.root_paths.push("/new-scan-root".into())
+                scanner.root_paths.push("/new-scan-root".into());
             }),
             ("source permission", |scanner| {
-                scanner.allow_source_tree_roots = !scanner.allow_source_tree_roots
+                scanner.allow_source_tree_roots = !scanner.allow_source_tree_roots;
             }),
             ("symlinks", |scanner| {
-                scanner.follow_symlinks = !scanner.follow_symlinks
+                scanner.follow_symlinks = !scanner.follow_symlinks;
             }),
             ("devices", |scanner| {
-                scanner.cross_devices = !scanner.cross_devices
+                scanner.cross_devices = !scanner.cross_devices;
             }),
         ];
         let root = Path::new("/scratch");

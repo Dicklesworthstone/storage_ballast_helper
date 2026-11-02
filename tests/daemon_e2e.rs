@@ -229,6 +229,7 @@ orange_min_free_pct = {orange}
 red_min_free_pct = {red}
 [scanner]
 include_user_temp_dir = false
+rch_staging_bases = []
 engine = {engine:?}
 dry_run = {dry_run}
 cross_devices = {cross}

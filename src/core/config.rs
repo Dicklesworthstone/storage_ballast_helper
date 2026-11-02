@@ -957,6 +957,19 @@ impl Default for CompressConfig {
     }
 }
 
+/// The rch staging bases the daemon prunes by default.
+///
+/// This is where rch workers on this fleet stage synced sources
+/// (`transfer.remote_base`). An absent base is skipped.
+#[must_use]
+pub fn default_rch_staging_bases() -> Vec<PathBuf> {
+    if cfg!(target_os = "linux") {
+        vec![PathBuf::from("/data/tmp/rch")]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Whether a root a tier walks names a directory below the filesystem root:
 /// not `/` itself, and with no `..` that would walk out of the directory it
 /// names (`Path::components` already drops an inner `.`).
@@ -1438,12 +1451,12 @@ impl Default for ScannerConfig {
                 Vec::new()
             },
             target_only_idle_hours: 24,
-            // rch workers on this fleet stage synced sources here (rch's
-            // default `transfer.remote_base`). An absent base is skipped.
-            rch_staging_bases: if cfg!(target_os = "linux") {
-                vec![PathBuf::from("/data/tmp/rch")]
-            } else {
+            // Unit tests build daemons from this default on rch workers, where
+            // the real base exists; they start with none.
+            rch_staging_bases: if cfg!(test) {
                 Vec::new()
+            } else {
+                default_rch_staging_bases()
             },
             rch_binary: None,
             min_file_age_minutes: 5,
@@ -4491,15 +4504,20 @@ mod tests {
 
     #[test]
     fn rch_staging_defaults_to_the_fleet_base_on_linux_and_must_be_bounded() {
-        let default = Config::default();
         let expected: Vec<PathBuf> = if cfg!(target_os = "linux") {
             vec![PathBuf::from("/data/tmp/rch")]
         } else {
             Vec::new()
         };
-        assert_eq!(default.scanner.rch_staging_bases, expected);
+        assert_eq!(super::default_rch_staging_bases(), expected);
+        // A unit-test daemon on an rch worker must not reach its real base.
+        let default = Config::default();
+        assert!(default.scanner.rch_staging_bases.is_empty());
         assert_eq!(default.scanner.rch_binary, None);
         default.validate().unwrap();
+        let mut production = Config::default();
+        production.scanner.rch_staging_bases = super::default_rch_staging_bases();
+        production.validate().unwrap();
 
         let with = |bases: Vec<PathBuf>, binary: Option<&str>| {
             let mut config = Config::default();

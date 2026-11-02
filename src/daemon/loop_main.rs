@@ -48,6 +48,7 @@ use crate::daemon::policy::{
     CleanupAction, NotificationPriority, PolicyEngine, ScanAggressiveness,
 };
 use crate::daemon::process_io_history::ProcessIoHistory;
+use crate::daemon::rch_staging::RchStagingTier;
 use crate::daemon::self_monitor::{
     DaemonLock, LoggingState, MountPressure, MountRateState, PolicyStateRecord, SelfMonitor,
     SelfMonitorTick, ThreadHeartbeat, ThreadState, ThreadStatus, ThreadsState,
@@ -2180,6 +2181,8 @@ pub struct MonitoringDaemon {
     compress_tier: CompressTier,
     /// Pure idle cargo targets inside `scanner.target_only_roots` (bd-232u).
     target_tier: TargetTier,
+    /// rch staging trees under `scanner.rch_staging_bases`, pruned through rch.
+    rch_staging: RchStagingTier,
     last_summary_report: Instant,
     summary_scans: u64,
     summary_scan_timeouts: u64,
@@ -3785,6 +3788,7 @@ impl MonitoringDaemon {
             attribution_pressured_since: HashMap::new(),
             compress_tier,
             target_tier: TargetTier::default(),
+            rch_staging: RchStagingTier::default(),
             last_summary_report: Instant::now(),
             summary_scans: 0,
             summary_scan_timeouts: 0,
@@ -5973,21 +5977,19 @@ impl MonitoringDaemon {
         }
         self.emit_reclaim_unavailable(&unprotected_mounts, now);
         self.report_unreclaimable_growth(now);
+        let mounts: HashMap<PathBuf, (PressureLevel, f64)> = self
+            .mount_controllers
+            .iter()
+            .filter(|(mount, controller)| {
+                !self.shared_executor_config.compression_first.defers_mount(
+                    mount,
+                    controller.level(),
+                    Instant::now(),
+                )
+            })
+            .map(|(mount, controller)| (mount.clone(), (controller.level(), controller.urgency())))
+            .collect();
         if !self.config.scanner.target_only_roots.is_empty() {
-            let mounts: HashMap<PathBuf, (PressureLevel, f64)> = self
-                .mount_controllers
-                .iter()
-                .filter(|(mount, controller)| {
-                    !self.shared_executor_config.compression_first.defers_mount(
-                        mount,
-                        controller.level(),
-                        Instant::now(),
-                    )
-                })
-                .map(|(mount, controller)| {
-                    (mount.clone(), (controller.level(), controller.urgency()))
-                })
-                .collect();
             self.target_tier.tick(
                 now,
                 &self.config,
@@ -5997,6 +5999,15 @@ impl MonitoringDaemon {
                 &self.logger_handle,
             );
         }
+        let mode = self.policy_engine.lock().mode();
+        self.rch_staging.tick(
+            now,
+            &self.config,
+            &self.platform,
+            &mounts,
+            mode,
+            &self.logger_handle,
+        );
 
         global_tick(cadence, base_poll)
     }
@@ -7464,6 +7475,7 @@ impl MonitoringDaemon {
         // 1. Broadcast cancellation, then drop channel senders to signal worker threads to exit.
         self.signal_handler.request_shutdown();
         self.compress_tier.stop_running_pass();
+        self.rch_staging.stop_running_pass();
         drop(scan_tx);
         drop(del_tx);
 
@@ -13466,7 +13478,7 @@ mod tests {
         let mut other_root = batch.clone();
         other_root.target_only_consent = Some(test_target_only_consent(scratch.path(), &scanner));
         invalid_cases.push((other_root, scanner.clone()));
-        let mut older_policy = scanner.clone();
+        let mut older_policy = scanner;
         older_policy.target_only_idle_hours += 24;
         invalid_cases.push((batch, older_policy));
         for (mut refused, current) in invalid_cases {
@@ -13649,7 +13661,7 @@ mod tests {
                         .daemon
                         .shared_scanner_config
                         .write()
-                        .target_only_idle_hours += 24
+                        .target_only_idle_hours += 24;
                 }
                 _ => {}
             }
@@ -17830,7 +17842,7 @@ mod tests {
                 path: Some(root_b.clone()),
             }),
         );
-        let mut last_poll = Instant::now() - EVENT_POLL_INTERVAL;
+        let mut last_poll = Instant::now().checked_sub(EVENT_POLL_INTERVAL).unwrap();
         let mut templates = EventPassTemplates::default();
         templates.remember(&event_test_request(vec![root_a]), &config);
         assert!(
@@ -17845,7 +17857,7 @@ mod tests {
         );
         assert!(pending.has_work_within(std::slice::from_ref(&root_b)));
         templates.remember(&event_test_request(vec![root_b.clone()]), &config);
-        last_poll = Instant::now() - EVENT_POLL_INTERVAL;
+        last_poll = Instant::now().checked_sub(EVENT_POLL_INTERVAL).unwrap();
         let request = event_triggered_request(
             Some(&mut source),
             &mut pending,
@@ -17862,7 +17874,7 @@ mod tests {
             current_event_source_config(Some(&source), &config).is_none(),
             "a request synthesized before reload must fail admission afterward"
         );
-        last_poll = Instant::now() - EVENT_POLL_INTERVAL;
+        last_poll = Instant::now().checked_sub(EVENT_POLL_INTERVAL).unwrap();
         assert!(
             event_triggered_request(
                 Some(&mut source),
@@ -17878,7 +17890,7 @@ mod tests {
             &config.root_paths,
             &config,
         ));
-        last_poll = Instant::now() - EVENT_POLL_INTERVAL;
+        last_poll = Instant::now().checked_sub(EVENT_POLL_INTERVAL).unwrap();
         assert!(
             event_triggered_request(
                 Some(&mut replacement),
@@ -18203,7 +18215,9 @@ mod tests {
                         assert_eq!(&root_stats[0].path, path);
                         assert_eq!(root_stats[0].dirty, dirty, "{}", path.display());
                     }
-                    other => panic!("unexpected scanner report: {other:?}"),
+                    other @ WorkerReport::DeletionCompleted { .. } => {
+                        panic!("unexpected scanner report: {other:?}")
+                    }
                 }
             }
             drop(scan_tx);

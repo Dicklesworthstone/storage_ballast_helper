@@ -126,6 +126,7 @@ file_size_bytes = 1048576
 poll_interval_ms = 500
 [scanner]
 include_user_temp_dir = false
+rch_staging_bases = []
 root_paths = ["{root}"]
 min_file_age_minutes = 0
 min_rescan_interval_secs = 5
@@ -742,6 +743,7 @@ sqlite_db = "{sqlite}"
 state_file = "{state}"
 [scanner]
 include_user_temp_dir = false
+rch_staging_bases = []
 min_file_age_minutes = 0
 [notifications]
 enabled = false

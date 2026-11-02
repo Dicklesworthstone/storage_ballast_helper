@@ -2285,6 +2285,7 @@ enabled = false
 
 [scanner]
 include_user_temp_dir = false
+rch_staging_bases = []
 root_paths = ["{}"]
 min_file_age_minutes = 60
 max_depth = 1
@@ -4445,6 +4446,7 @@ poll_interval_ms = 15000
 
 [scanner]
 include_user_temp_dir = false
+rch_staging_bases = []
 root_paths = ["{}"]
 min_file_age_minutes = 60
 max_depth = 1
@@ -4946,6 +4948,7 @@ enabled = false
 
 [scanner]
 include_user_temp_dir = false
+rch_staging_bases = []
 root_paths = ["{}"]
 min_file_age_minutes = 60
 max_depth = 1

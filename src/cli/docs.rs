@@ -1648,6 +1648,7 @@ pub fn constants() -> Vec<ConstantDoc> {
 }
 
 #[cfg(feature = "daemon")]
+#[allow(clippy::too_many_lines)] // one row per constant; splitting hides nothing
 fn daemon_constants() -> Vec<ConstantDoc> {
     use crate::daemon::loop_main as daemon;
     const SOURCE: &str = "src/daemon/loop_main.rs";
@@ -1743,7 +1744,40 @@ fn daemon_constants() -> Vec<ConstantDoc> {
             "Shortest gap between two target-only passes",
             "src/daemon/target_tier.rs",
         ),
+        constant(
+            "daemon",
+            "RCH_STAGING_PASS_MINUTES",
+            crate::daemon::rch_staging::BASE_INTERVAL.as_secs() / 60,
+            "Shortest gap between two rch staging passes over one base",
+            "src/daemon/rch_staging.rs",
+        ),
+        constant(
+            "daemon",
+            "RCH_STAGING_ORANGE_IDLE_HOURS",
+            rch_staging_idle_hours(PressureLevel::Orange),
+            "Idle hours before the rch staging tier prunes a tree at Orange",
+            "src/daemon/rch_staging.rs",
+        ),
+        constant(
+            "daemon",
+            "RCH_STAGING_RED_IDLE_HOURS",
+            rch_staging_idle_hours(PressureLevel::Red),
+            "Idle hours before the rch staging tier prunes a tree at Red",
+            "src/daemon/rch_staging.rs",
+        ),
+        constant(
+            "daemon",
+            "RCH_STAGING_CRITICAL_IDLE_HOURS",
+            rch_staging_idle_hours(PressureLevel::Critical),
+            "Idle hours before the rch staging tier prunes a tree at Critical",
+            "src/daemon/rch_staging.rs",
+        ),
     ]
+}
+
+#[cfg(feature = "daemon")]
+fn rch_staging_idle_hours(level: PressureLevel) -> u64 {
+    crate::daemon::rch_staging::min_idle_for(level).map_or(0, |idle| idle.as_secs() / 3600)
 }
 
 #[cfg(not(feature = "daemon"))]

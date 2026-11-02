@@ -8,6 +8,21 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Added
 
+- **The daemon prunes idle rch staging trees through rch itself.** An rch
+  worker keeps a source copy of every project it builds under
+  `transfer.remote_base`. sbh rightly keeps project source, so on 2026-11-02
+  about 140 GB of these trees, idle for days, sat on workers at 96-99% full
+  with their ballast spent, until an operator ran `rch cache clean` by hand.
+  They refilled within hours. While a base in `scanner.rch_staging_bases`
+  (Linux default `/data/tmp/rch`) is on a mount at Orange or worse, the
+  Enforce-mode daemon now asks rch which trees have been idle for 72/48/24
+  hours (Orange/Red/Critical). It checks each one for `.sbh-protect` markers
+  (above it and at any depth inside), `protected_paths`, `excluded_paths`,
+  source trees and processes using it, and has rch prune only the project
+  directories whose every tree passes. The `rch` binary it runs must be owned
+  by root or the daemon's user, together with every directory above it, and
+  be writable by no one else.
+
 - **macOS notifications enter unified logging under the `sbh` process**
   (bd-z1nm). The journal channel uses Apple's public logging API with subsystem
   `org.storage-ballast-helper.sbh`, category `notifications`, and structured

@@ -2605,7 +2605,7 @@ mod tests {
             fs::File::open(unit.join("a/b/data"))
                 .unwrap()
                 .set_times(fs::FileTimes::new().set_modified(
-                    std::time::SystemTime::now() + std::time::Duration::from_secs(86_400),
+                    std::time::SystemTime::now() + std::time::Duration::from_hours(24),
                 ))
                 .unwrap();
             let root_mtime = fs::metadata(&unit).unwrap().modified().unwrap();
