@@ -87,6 +87,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **`sbh protect` reports useful marker protection when sacred registration
+  fails** (#39). A marker that was created or already exists is retained when
+  the active `sacred.toml` is unwritable. Human and JSON results distinguish the
+  two steps, and the command uses the existing exit code 4 for partial success
+  instead of reporting an undifferentiated I/O failure. JSON also reports
+  failures before mutation. Repeated protection requests preserve existing
+  marker metadata and symlinks, including `relocatable = false`, and retry
+  registration without requiring marker write access.
 - **A ballast refill is no longer released seconds after it is written**
   (#38). The provisioning floor was the Orange threshold, but the default
   behavior matrix releases ballast from Orange, so a refill on a Yellow volume

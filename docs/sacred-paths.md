@@ -132,6 +132,73 @@ That writes a `.sbh-protect` marker. The marker protects the directory and all
 descendants. It also acts as a stowaway marker if a parent cleanup candidate
 would contain the protected directory.
 
+`protect` also registers the canonical path in `sacred.toml` beside the active
+configuration file. The daemon loads that additional protection on startup or
+configuration reload. Marker protection takes effect independently: live
+deletion checks inspect the marker, and it remains effective across daemon
+restarts for as long as the marker is present.
+
+The two steps have separate outcomes. For example, an unprivileged caller can
+create a marker in its build directory while being unable to update the
+system-owned `sacred.toml`. In that case the marker is retained, the command
+reports the active protection and failed registration, and the exit code is
+**4 (partial success)**. No permissions or ownership are changed. Repeating the
+request reuses the existing marker without rewriting metadata (including a
+`relocatable = false` opt-out) and retries registration. An already registered
+path needs no config write and succeeds even if the sacred file is read-only.
+
+### Protection command outcomes
+
+`sbh --json protect PATH` emits one result object for successful, partial, and
+failed requests. Existing fields (`command`, `action`, `path`, `marker`,
+`sacred_config`, `sacred_config_added`) are retained. The additional fields are:
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `success`, `partial_success`, or `failed` for this request |
+| `exit_code` | The command's exit status, provided the report can be written |
+| `marker_created` | `true` for a newly written marker, `false` when an existing marker was reused, `null` when creation did not complete or was not attempted |
+| `marker_present` | `true` when marker presence is established, `false` when a failed creation leaves no marker, `null` when presence was not inspected or could not be determined |
+| `sacred_config_registered` | `true` when registration was added or already present; `null` when it was not confirmed or not attempted |
+| `sacred_config_error` | The original registration error, including its SBH code and path when supplied, or `null` |
+| `error` | The overall failure or partial-success diagnostic, or `null` |
+
+`sacred_config_added: false` alone does not imply failure: a repeated successful
+request has `sacred_config_registered: true`. After a write failure, registration
+is unconfirmed because an I/O error can occur after some data has been written.
+
+| Result | Exit | Marker | Registration |
+| --- | --- | --- | --- |
+| Full success | `0` | Created or reused | Added or already present |
+| Registration failure after marker success | `4` | Active | Not confirmed; original error reported |
+| Marker metadata write fails after creating the entry | `4` | Active; metadata may be incomplete | Not attempted |
+| Invalid path | `1` | No marker created by this request | Not attempted |
+| Configuration or marker-creation I/O failure | `2` | Absent or unconfirmed; inspect `marker_present` | Not attempted |
+
+An unreadable or malformed configuration still fails before mutation. A
+`failed` result does not claim that pre-existing protection is absent; unknown
+state is represented by `null`. Human reports go to stdout, and error details
+go to stderr. A failure to write the report itself retains the existing output
+error exit status.
+
+Automation that requires both layers should require exit `0`. Release jobs
+whose policy permits marker protection alone can explicitly accept exit `4`
+after checking the structured marker state, including under `set -e`:
+
+```bash
+if sbh --json protect "$build_dir" >protect-result.json; then
+    : # Marker and persistent registration are confirmed.
+else
+    rc=$?
+    if [ "$rc" -ne 4 ]; then
+        exit "$rc"
+    fi
+    jq -e '.status == "partial_success" and .marker_present == true' \
+        protect-result.json >/dev/null || exit 4
+    # Marker protection is active; retain the report's registration diagnostic.
+fi
+```
+
 Operators can also set `scanner.protected_paths` in config. These patterns are
 converted to sacred path entries at runtime:
 

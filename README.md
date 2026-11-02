@@ -1351,6 +1351,18 @@ Two protection mechanisms prevent cleanup of important directories:
 - **Target-only roots**: a root in `scanner.target_only_roots` (macOS default `/private/tmp/claude-*`, the coding-agent scratch root) stays protected as a whole except for pure, idle cargo target dirs. Such a dir has `CACHEDIR.TAG` or `.rustc_info.json` at its top, and its top level holds only what cargo writes there (`debug`, `release`, `release-*` profiles holding a build, `doc`, an empty `tmp`, `package`, target triples such as `wasm32-wasip1`, cargo's lock and report files, plus `.DS_Store` and `.metadata_never_index`; benchmark baselines such as `criterion/` keep it). No `.sbh-protect` or `.git` is in it, inside it or between it and the root, and it is not at or below an `excluded_paths` entry; it was not created or modified, and nothing in it was modified, within `scanner.target_only_idle_hours` (<!-- claim:constants.scanner.target_only_idle_hours -->24<!-- /claim --> by default); and no process holds a file open in it or works in it. While the root's mount is at Yellow or above, the daemon checks the roots every <!-- claim:constants.daemon.TARGET_TIER_PASS_MINUTES -->10<!-- /claim --> minutes and sends what passes through the usual policy, planner and executor checks, pinned to the directories it surveyed; the executor drops anything outside the root. Only the `protected_paths` patterns that protect the root as a whole (the root, a parent, or everything in it) are not applied; a pattern naming something inside the root, such as `**/target`, still is. A marker always wins. A root may not be `/` or contain `..`. A user-scoped macOS daemon cannot see other users' processes, so it keeps every candidate; use the system-scope service.
 - **Sacred status**: `sbh status --sacred` lists active marker/config protections, the sacred catalog size, and how many current scan candidates overlap sacred paths.
 
+`sbh protect` reports marker creation separately from persistent registration.
+If a marker is created or already present but the active `sacred.toml` cannot be
+updated (for example, a non-root caller using system configuration), the marker
+remains active and the command returns **4 (partial success)** with the
+registration error. Full success remains **0**; user and runtime failures retain
+their existing exit codes. JSON includes `status`, `exit_code`, `marker_created`,
+`marker_present`, `sacred_config_registered`, and `sacred_config_error`, alongside
+the existing fields. Repeated requests preserve existing marker contents and
+retry registration. Marker protection needs no daemon reload and lasts while
+the marker is present. See [Protection command outcomes](docs/sacred-paths.md#protection-command-outcomes)
+for the complete result contract and a release-automation example.
+
 For target-only batches, the executor renews the exception immediately before
 each real deletion. A trace directory or session log added while earlier batch
 entries are being removed revokes eligibility even if the target's inode stays

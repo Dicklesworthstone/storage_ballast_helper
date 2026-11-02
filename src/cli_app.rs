@@ -11410,12 +11410,116 @@ fn run_protect_list(cli: &Cli) -> Result<(), CliError> {
     Ok(())
 }
 
-fn run_protect_create(cli: &Cli, path: &Path) -> Result<(), CliError> {
+/// Observations from this request, not a claim that an uninspected path is
+/// unprotected. In particular, a failed config load leaves marker state unknown.
+struct ProtectCreateReport {
+    command: &'static str,
+    action: &'static str,
+    path: PathBuf,
+    marker: PathBuf,
+    status: &'static str,
+    exit_code: i32,
+    marker_created: Option<bool>,
+    marker_present: Option<bool>,
+    sacred_config: Option<PathBuf>,
+    sacred_config_added: bool,
+    sacred_config_registered: Option<bool>,
+    sacred_config_error: Option<String>,
+    error: Option<String>,
+}
+
+impl ProtectCreateReport {
+    fn new(path: &Path) -> Self {
+        Self {
+            command: "protect",
+            action: "create",
+            path: path.to_path_buf(),
+            marker: path.join(protection::MARKER_FILENAME),
+            status: "failed",
+            exit_code: 2,
+            marker_created: None,
+            marker_present: None,
+            sacred_config: None,
+            sacred_config_added: false,
+            sacred_config_registered: None,
+            sacred_config_error: None,
+            error: None,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        // Preserve the CLI's existing lossy path rendering, including paths
+        // that are valid on Unix but cannot be serialized as UTF-8 PathBufs.
+        json!({
+            "command": self.command,
+            "action": self.action,
+            "path": self.path.to_string_lossy(),
+            "marker": self.marker.to_string_lossy(),
+            "status": self.status,
+            "exit_code": self.exit_code,
+            "marker_created": self.marker_created,
+            "marker_present": self.marker_present,
+            "sacred_config": self.sacred_config.as_ref().map(|path| path.to_string_lossy()),
+            "sacred_config_added": self.sacred_config_added,
+            "sacred_config_registered": self.sacred_config_registered,
+            "sacred_config_error": self.sacred_config_error,
+            "error": self.error,
+        })
+    }
+
+    fn write_human(&self, out: &mut impl Write) -> io::Result<()> {
+        if self.marker_present != Some(true) {
+            return Ok(());
+        }
+        let marker_action = match self.marker_created {
+            Some(true) => "created",
+            Some(false) => "already present",
+            None => "present after marker write error",
+        };
+        writeln!(
+            out,
+            "Protected: {} ({marker_action} {})",
+            self.path.display(),
+            self.marker.display(),
+        )?;
+        if let Some(sacred_config) = &self.sacred_config {
+            if self.sacred_config_registered == Some(true) {
+                let registration = if self.sacred_config_added {
+                    "Added persistent protection"
+                } else {
+                    "Persistent protection already present"
+                };
+                writeln!(out, "  {registration}: {}", sacred_config.display())?;
+            } else {
+                writeln!(
+                    out,
+                    "  Persistent registration not confirmed: {}",
+                    sacred_config.display()
+                )?;
+                writeln!(
+                    out,
+                    "  Marker protection remains active while {} is present.",
+                    self.marker.display()
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn apply_protect_create(cli: &Cli, report: &mut ProtectCreateReport) -> Result<(), CliError> {
+    // Validate the active configuration (including existing sacred policy)
+    // before mutation. A malformed/unreadable policy is not a reason to bypass
+    // configuration validation or write a different, daemon-invisible file.
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
-    let canonical = path
-        .canonicalize()
-        .map_err(|e| CliError::User(format!("cannot resolve path {}: {e}", path.display())))?;
+    report.sacred_config = Some(sacred_config_path_for(&config.paths.config_file));
+    let canonical = report.path.canonicalize().map_err(|e| {
+        CliError::User(format!(
+            "cannot resolve path {}: {e}",
+            report.path.display()
+        ))
+    })?;
 
     if !canonical.is_dir() {
         return Err(CliError::User(format!(
@@ -11424,44 +11528,70 @@ fn run_protect_create(cli: &Cli, path: &Path) -> Result<(), CliError> {
         )));
     }
 
-    let metadata = default_protection_metadata();
-    protection::create_marker(&canonical, Some(&metadata))
-        .map_err(|e| CliError::Runtime(e.to_string()))?;
-    let (sacred_config_path, sacred_added) = add_sacred_protected_path(&config, &canonical)?;
-
-    match output_mode(cli) {
-        OutputMode::Human => {
-            println!(
-                "Protected: {} (created {})",
-                canonical.display(),
-                canonical.join(protection::MARKER_FILENAME).display(),
-            );
-            if sacred_added {
-                println!(
-                    "  Added persistent protection: {}",
-                    sacred_config_path.display()
-                );
-            } else {
-                println!(
-                    "  Persistent protection already present: {}",
-                    sacred_config_path.display()
-                );
-            }
+    report.path = canonical;
+    report.marker = report.path.join(protection::MARKER_FILENAME);
+    match protection::create_marker(&report.path, Some(&default_protection_metadata())) {
+        Ok(created) => {
+            report.marker_created = Some(created);
+            report.marker_present = Some(true);
         }
-        OutputMode::Json => {
-            let payload = json!({
-                "command": "protect",
-                "action": "create",
-                "path": canonical.to_string_lossy(),
-                "marker": canonical.join(protection::MARKER_FILENAME).to_string_lossy(),
-                "sacred_config": sacred_config_path.to_string_lossy(),
-                "sacred_config_added": sacred_added,
-            });
-            write_json_line(&payload)?;
+        Err(error) => {
+            // A metadata write can fail after create_new has installed an
+            // empty marker. Presence alone is protective, even for a dangling
+            // symlink, so report the observed state without following it.
+            report.marker_present = match std::fs::symlink_metadata(&report.marker) {
+                Ok(_) => Some(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Some(false),
+                Err(_) => None,
+            };
+            return if report.marker_present == Some(true) {
+                Err(CliError::Partial(format!(
+                    "protection marker is present at {}, but marker creation could not complete; \
+                     persistent registration was not attempted: {error}",
+                    report.marker.display()
+                )))
+            } else {
+                Err(CliError::Runtime(error.to_string()))
+            };
         }
     }
 
-    Ok(())
+    match add_sacred_protected_path(&config, &report.path) {
+        Ok((_, added)) => {
+            report.sacred_config_added = added;
+            report.sacred_config_registered = Some(true);
+            Ok(())
+        }
+        Err(error) => {
+            report.sacred_config_error = Some(error.to_string());
+            // Registration is a second protection layer. Never remove a useful
+            // marker or disguise the failed step as a complete success. Keep
+            // C-EXIT's established partial-success class for exit-code callers.
+            Err(CliError::Partial(format!(
+                "marker protection is active at {}, but persistent registration failed: {error}",
+                report.marker.display()
+            )))
+        }
+    }
+}
+
+fn run_protect_create(cli: &Cli, path: &Path) -> Result<(), CliError> {
+    let mut report = ProtectCreateReport::new(path);
+    let result = apply_protect_create(cli, &mut report);
+    report.status = match &result {
+        Ok(()) => "success",
+        Err(CliError::Partial(_)) => "partial_success",
+        Err(_) => "failed",
+    };
+    report.exit_code = result.as_ref().err().map_or(0, CliError::exit_code);
+    report.error = result.as_ref().err().map(ToString::to_string);
+
+    match output_mode(cli) {
+        OutputMode::Human => report.write_human(&mut io::stdout().lock())?,
+        OutputMode::Json => write_json_line(&report.to_json())?,
+    }
+
+    result
 }
 
 fn run_unprotect(cli: &Cli, args: &UnprotectArgs) -> Result<(), CliError> {

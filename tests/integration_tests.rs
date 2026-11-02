@@ -145,6 +145,526 @@ fn subcommand_help_flags_work() {
 }
 
 #[cfg(unix)]
+mod protect_cli_regressions {
+    use super::{common, toml_path};
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+    use std::os::unix::process::CommandExt as _;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output, Stdio};
+
+    use nix::unistd::{Gid, Uid, User, chown, getegid, geteuid};
+    use serde_json::Value;
+    use storage_ballast_helper::core::config::{Config, load_sacred_config};
+    use storage_ballast_helper::scanner::protection::ProtectionRegistry;
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        binary: PathBuf,
+        config: PathBuf,
+        target: PathBuf,
+        caller_uid: Uid,
+        caller_gid: Gid,
+    }
+
+    fn mode(path: &Path, bits: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(bits)).unwrap();
+    }
+
+    fn ownership_and_mode(path: &Path) -> (u32, u32, u32) {
+        let metadata = fs::metadata(path).unwrap();
+        (metadata.uid(), metadata.gid(), metadata.mode())
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            // Drop credentials only in the child.
+            let (user_id, group_id) = if geteuid().is_root() {
+                User::from_name("nobody")
+                    .unwrap()
+                    .map_or((Uid::from_raw(65534), Gid::from_raw(65534)), |user| {
+                        (user.uid, user.gid)
+                    })
+            } else {
+                (geteuid(), getegid())
+            };
+            assert!(!user_id.is_root());
+            let temp = tempfile::Builder::new()
+                .prefix("sbh-protect-cli-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            mode(&root, 0o755);
+            let config = root.join("config/config.toml");
+            let target = root.join("build");
+            for directory in [&target, &root.join("home"), config.parent().unwrap()] {
+                fs::create_dir(directory).unwrap();
+                mode(directory, 0o755);
+                if geteuid().is_root() {
+                    chown(directory, Some(user_id), Some(group_id)).unwrap();
+                }
+            }
+            fs::write(
+                &config,
+                format!(
+                    "[scanner]\ninclude_user_temp_dir = false\nroot_paths = [\"{}\"]\nprotected_paths = []\nexcluded_paths = []\n",
+                    toml_path(&target)
+                ),
+            )
+            .unwrap();
+            mode(&config, 0o644);
+            let source = common::sbh_bin_path();
+            let binary = root.join("sbh");
+            if fs::metadata(&source).unwrap().mode() & 0o005 != 0o005
+                || fs::hard_link(&source, &binary).is_err()
+            {
+                fs::copy(&source, &binary).unwrap();
+                mode(&binary, 0o755);
+            }
+            Self {
+                _temp: temp,
+                root,
+                binary,
+                config,
+                target,
+                caller_uid: user_id,
+                caller_gid: group_id,
+            }
+        }
+
+        fn marker(&self) -> PathBuf {
+            self.target.join(".sbh-protect")
+        }
+
+        fn sacred(&self) -> PathBuf {
+            self.config.with_file_name("sacred.toml")
+        }
+
+        fn configure(&self, command: &mut Command, json: bool) {
+            command
+                .env_clear()
+                .env("HOME", self.root.join("home"))
+                .env("XDG_CONFIG_HOME", self.root.join("home/.config"))
+                .env("XDG_DATA_HOME", self.root.join("home/.local/share"))
+                .env("XDG_CACHE_HOME", self.root.join("home/.cache"))
+                .env("PATH", "/usr/bin:/bin")
+                .env("USER", "sbh-protect-regression")
+                .env("SBH_OUTPUT_FORMAT", "human")
+                .env("NO_COLOR", "1")
+                .current_dir(&self.root)
+                .stdin(Stdio::null())
+                .arg("--config")
+                .arg(&self.config)
+                .arg("--no-color");
+            if let Some(path) = std::env::var_os("LD_LIBRARY_PATH") {
+                command.env("LD_LIBRARY_PATH", path);
+            }
+            if json {
+                command.arg("--json");
+            }
+            if geteuid().is_root() {
+                command
+                    .gid(self.caller_gid.as_raw())
+                    .uid(self.caller_uid.as_raw());
+            }
+        }
+
+        fn run_at(&self, target: &Path, json: bool) -> Output {
+            let mut command = Command::new(&self.binary);
+            self.configure(&mut command, json);
+            command.arg("protect").arg(target).output().unwrap()
+        }
+
+        fn run(&self, json: bool) -> Output {
+            self.run_at(&self.target, json)
+        }
+
+        fn deny_directory_registration(&self) {
+            let directory = self.config.parent().unwrap();
+            if geteuid().is_root() {
+                chown(directory, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+                mode(directory, 0o755);
+            } else {
+                mode(directory, 0o555);
+            }
+        }
+
+        fn deny_file_registration(&self) {
+            if geteuid().is_root() {
+                chown(
+                    &self.sacred(),
+                    Some(Uid::from_raw(0)),
+                    Some(Gid::from_raw(0)),
+                )
+                .unwrap();
+                mode(&self.sacred(), 0o644);
+            } else {
+                mode(&self.sacred(), 0o444);
+            }
+        }
+
+        fn allow_registration(&self) {
+            for path in [self.config.parent().unwrap().to_path_buf(), self.sacred()] {
+                if path.exists() {
+                    if geteuid().is_root() {
+                        chown(&path, Some(self.caller_uid), Some(self.caller_gid)).unwrap();
+                    }
+                    mode(&path, if path.is_dir() { 0o755 } else { 0o644 });
+                }
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(
+                self.config.parent().unwrap(),
+                fs::Permissions::from_mode(0o755),
+            );
+            let _ = fs::set_permissions(&self.target, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    fn report(output: &Output, exit_code: i32) -> Value {
+        assert_eq!(
+            output.status.code(),
+            Some(exit_code),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("invalid protect JSON: {error}; {output:?}"));
+        assert_eq!(report["command"], "protect");
+        assert_eq!(report["action"], "create");
+        assert_eq!(report["exit_code"], exit_code);
+        assert_eq!(
+            report["status"],
+            match exit_code {
+                0 => "success",
+                4 => "partial_success",
+                _ => "failed",
+            }
+        );
+        for key in [
+            "path",
+            "marker",
+            "sacred_config",
+            "sacred_config_added",
+            "marker_created",
+            "marker_present",
+            "sacred_config_registered",
+            "sacred_config_error",
+            "error",
+        ] {
+            assert!(report.get(key).is_some(), "missing {key}: {report}");
+        }
+        report
+    }
+
+    fn assert_success(report: &Value, created: bool, added: bool) {
+        assert_eq!(report["marker_created"], created);
+        assert_eq!(report["marker_present"], true);
+        assert_eq!(report["sacred_config_added"], added);
+        assert_eq!(report["sacred_config_registered"], true);
+        assert!(report["sacred_config_error"].is_null());
+        assert!(report["error"].is_null());
+    }
+
+    fn assert_registration_partial(fixture: &Fixture, report: &Value, created: bool) {
+        assert_eq!(report["marker_created"], created);
+        assert_eq!(report["marker_present"], true);
+        assert_eq!(report["sacred_config_added"], false);
+        assert!(report["sacred_config_registered"].is_null());
+        let error = report["sacred_config_error"].as_str().unwrap();
+        assert!(error.contains("SBH-3002"), "{error}");
+        assert!(
+            error.contains(fixture.sacred().to_str().unwrap()),
+            "{error}"
+        );
+        assert_eq!(report["path"], fixture.target.to_str().unwrap());
+        assert_eq!(report["marker"], fixture.marker().to_str().unwrap());
+        assert_eq!(report["sacred_config"], fixture.sacred().to_str().unwrap());
+    }
+
+    fn assert_marker_only_protection(fixture: &Fixture) {
+        let mut registry = ProtectionRegistry::marker_only();
+        registry.discover_ancestor_markers(&fixture.target).unwrap();
+        assert!(registry.is_protected(&fixture.target));
+        assert!(registry.is_protected(&fixture.target.join("nested-artifacts")));
+        assert!(
+            registry
+                .list_protections()
+                .iter()
+                .any(|entry| entry.path == fixture.target),
+            "marker-only protection must include this directory"
+        );
+    }
+
+    #[test]
+    fn protect_writable_config_reports_registration_and_repeated_success() {
+        let fixture = Fixture::new();
+        let first = report(&fixture.run(true), 0);
+        assert_success(&first, true, true);
+        let marker = fs::read(fixture.marker()).unwrap();
+        assert!(!marker.is_empty());
+        let again = report(&fixture.run(true), 0);
+        assert_success(&again, false, false);
+        assert_eq!(fs::read(fixture.marker()).unwrap(), marker);
+        let sacred = load_sacred_config(&fixture.sacred()).unwrap();
+        let expected = fixture.target.to_string_lossy().into_owned();
+        assert_eq!(sacred.protected_paths, vec![expected.clone()]);
+        assert!(
+            Config::load(Some(&fixture.config))
+                .unwrap()
+                .scanner
+                .protected_paths
+                .contains(&expected),
+            "the daemon's config loader must consume the registration"
+        );
+    }
+
+    #[test]
+    fn protect_nonroot_reports_marker_when_system_directory_denies_registration() {
+        let fixture = Fixture::new();
+        fixture.deny_directory_registration();
+        let directory_before = ownership_and_mode(fixture.config.parent().unwrap());
+        let first = report(&fixture.run(true), 4);
+        assert_registration_partial(&fixture, &first, true);
+        assert_eq!(
+            fs::metadata(fixture.marker()).unwrap().uid(),
+            fixture.caller_uid.as_raw(),
+            "marker owner must be non-root"
+        );
+        let marker = fs::read(fixture.marker()).unwrap();
+        let again = report(&fixture.run(true), 4);
+        assert_registration_partial(&fixture, &again, false);
+        assert_eq!(fs::read(fixture.marker()).unwrap(), marker);
+        assert!(!fixture.sacred().exists());
+        assert_marker_only_protection(&fixture);
+        assert_eq!(
+            ownership_and_mode(fixture.config.parent().unwrap()),
+            directory_before,
+            "config permissions must be unchanged"
+        );
+    }
+
+    #[test]
+    fn protect_nonroot_preserves_readonly_sacred_file_and_retry_repairs_registration() {
+        let fixture = Fixture::new();
+        let original = "protected_paths = [\"/already-protected\"]\n";
+        fs::write(fixture.sacred(), original).unwrap();
+        // Writable parent: denial must come from the existing file's mode.
+        fixture.deny_file_registration();
+        let file_before = ownership_and_mode(&fixture.sacred());
+        let partial = report(&fixture.run(true), 4);
+        assert_registration_partial(&fixture, &partial, true);
+        assert_eq!(fs::read_to_string(fixture.sacred()).unwrap(), original);
+        assert_eq!(ownership_and_mode(&fixture.sacred()), file_before);
+        let marker = fs::read(fixture.marker()).unwrap();
+
+        fixture.allow_registration();
+        let repaired = report(&fixture.run(true), 0);
+        assert_success(&repaired, false, true);
+        let repeated = report(&fixture.run(true), 0);
+        assert_success(&repeated, false, false);
+        assert_eq!(fs::read(fixture.marker()).unwrap(), marker);
+        let sacred = load_sacred_config(&fixture.sacred()).unwrap();
+        assert_eq!(sacred.protected_paths.len(), 2);
+        assert!(
+            sacred
+                .protected_paths
+                .contains(&"/already-protected".to_owned())
+        );
+        assert!(
+            sacred
+                .protected_paths
+                .contains(&fixture.target.to_string_lossy().into_owned())
+        );
+    }
+
+    #[test]
+    fn protect_already_registered_readonly_system_config_needs_no_write() {
+        let fixture = Fixture::new();
+        let original = format!("protected_paths = [\"{}\"]\n", toml_path(&fixture.target));
+        fs::write(fixture.sacred(), &original).unwrap();
+        fixture.deny_directory_registration();
+        fixture.deny_file_registration();
+        let file_before = ownership_and_mode(&fixture.sacred());
+        assert_success(&report(&fixture.run(true), 0), true, false);
+        assert_success(&report(&fixture.run(true), 0), false, false);
+        assert_eq!(fs::read_to_string(fixture.sacred()).unwrap(), original);
+        assert_eq!(ownership_and_mode(&fixture.sacred()), file_before);
+    }
+
+    #[test]
+    fn protect_preserves_existing_readonly_marker_metadata() {
+        let fixture = Fixture::new();
+        let original = "reason = \"long release build\"\nrelocatable = false\n";
+        fs::write(fixture.marker(), original).unwrap();
+        mode(&fixture.marker(), 0o444);
+        let marker_before = ownership_and_mode(&fixture.marker());
+        assert_success(&report(&fixture.run(true), 0), false, true);
+        assert_success(&report(&fixture.run(true), 0), false, false);
+        assert_eq!(fs::read_to_string(fixture.marker()).unwrap(), original);
+        assert_eq!(ownership_and_mode(&fixture.marker()), marker_before);
+    }
+
+    #[test]
+    fn protect_existing_symlink_marker_never_writes_through_it() {
+        for destination_exists in [false, true] {
+            let fixture = Fixture::new();
+            let destination = fixture.root.join("marker-destination");
+            if destination_exists {
+                fs::write(&destination, "keep these bytes\n").unwrap();
+                mode(&destination, 0o444);
+            }
+            symlink(&destination, fixture.marker()).unwrap();
+            assert_success(&report(&fixture.run(true), 0), false, true);
+            assert_eq!(fs::read_link(fixture.marker()).unwrap(), destination);
+            assert_eq!(destination.exists(), destination_exists);
+            if destination_exists {
+                assert_eq!(
+                    fs::read_to_string(&destination).unwrap(),
+                    "keep these bytes\n"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protect_human_partial_result_acknowledges_new_and_existing_markers() {
+        let fixture = Fixture::new();
+        fixture.deny_directory_registration();
+        for marker_state in ["created", "already present"] {
+            let output = fixture.run(false);
+            assert_eq!(output.status.code(), Some(4), "{output:?}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stdout.contains("Protected:"), "{stdout}");
+            assert!(
+                stdout.contains(fixture.target.to_str().unwrap()),
+                "{stdout}"
+            );
+            assert!(stdout.contains(marker_state), "{stdout}");
+            assert!(stderr.contains("marker"), "{stderr}");
+            assert!(stderr.contains("registration"), "{stderr}");
+            assert!(
+                stderr.contains(fixture.sacred().to_str().unwrap()),
+                "{stderr}"
+            );
+            assert!(stderr.contains("SBH-3002"), "{stderr}");
+        }
+    }
+
+    #[test]
+    fn protect_config_read_and_parse_failures_report_no_attempted_marker() {
+        for unreadable in [false, true] {
+            let fixture = Fixture::new();
+            let original = if unreadable {
+                "protected_paths = []\n"
+            } else {
+                "protected_paths = [\n"
+            };
+            fs::write(fixture.sacred(), original).unwrap();
+            if unreadable {
+                mode(&fixture.sacred(), 0o000);
+            }
+            let file_before = ownership_and_mode(&fixture.sacred());
+            let failure = report(&fixture.run(true), 2);
+            assert!(failure["marker_created"].is_null());
+            assert!(failure["marker_present"].is_null());
+            assert!(failure["sacred_config_registered"].is_null());
+            assert!(
+                failure["error"]
+                    .as_str()
+                    .is_some_and(|error| !error.is_empty())
+            );
+            assert!(!fixture.marker().exists());
+            assert_eq!(ownership_and_mode(&fixture.sacred()), file_before);
+            mode(&fixture.sacred(), 0o644);
+            assert_eq!(fs::read_to_string(fixture.sacred()).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn protect_invalid_targets_keep_user_error_exit_code_and_do_not_register() {
+        let fixture = Fixture::new();
+        let file = fixture.root.join("ordinary-file");
+        fs::write(&file, "keep\n").unwrap();
+        for path in [fixture.root.join("missing"), file.clone()] {
+            let failure = report(&fixture.run_at(&path, true), 1);
+            assert!(failure["marker_created"].is_null());
+            assert!(failure["marker_present"].is_null());
+            assert!(failure["sacred_config_registered"].is_null());
+            assert!(
+                failure["error"]
+                    .as_str()
+                    .is_some_and(|error| !error.is_empty())
+            );
+            assert!(!fixture.sacred().exists());
+        }
+        assert_eq!(fs::read_to_string(file).unwrap(), "keep\n");
+        assert!(!fixture.marker().exists());
+    }
+
+    #[test]
+    fn protect_marker_permission_failure_reports_total_failure_without_registration() {
+        let fixture = Fixture::new();
+        mode(&fixture.target, 0o555);
+        let failure = report(&fixture.run(true), 2);
+        assert!(failure["marker_created"].is_null());
+        assert_eq!(failure["marker_present"], false);
+        assert!(failure["sacred_config_registered"].is_null());
+        assert!(failure["sacred_config_error"].is_null());
+        assert!(
+            failure["error"]
+                .as_str()
+                .unwrap()
+                .contains(fixture.marker().to_str().unwrap())
+        );
+        assert!(!fixture.marker().exists());
+        assert!(!fixture.sacred().exists());
+    }
+
+    #[test]
+    fn protect_failed_metadata_write_reports_the_empty_marker_left_in_place() {
+        let fixture = Fixture::new();
+        // Child-only EFBIG after open; ignore SIGXFSZ so sbh can report it.
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "ulimit -f 0; trap '' XFSZ; exec \"$@\"",
+                "protect-metadata-write",
+            ])
+            .arg(&fixture.binary);
+        fixture.configure(&mut command, true);
+        let output = command
+            .arg("protect")
+            .arg(&fixture.target)
+            .output()
+            .unwrap();
+        let partial = report(&output, 4);
+        assert!(partial["marker_created"].is_null());
+        assert_eq!(partial["marker_present"], true);
+        assert!(partial["sacred_config_registered"].is_null());
+        assert!(partial["sacred_config_error"].is_null());
+        assert!(
+            partial["error"]
+                .as_str()
+                .unwrap()
+                .contains(fixture.marker().to_str().unwrap())
+        );
+        assert_eq!(fs::metadata(fixture.marker()).unwrap().len(), 0);
+        assert!(!fixture.sacred().exists());
+        assert_marker_only_protection(&fixture);
+        assert_success(&report(&fixture.run(true), 0), false, true);
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn active_target_lease_cli_binds_lifetime_renewal_and_machine_status() {
     let fixture = tempfile::tempdir().expect("create active lease fixture");
