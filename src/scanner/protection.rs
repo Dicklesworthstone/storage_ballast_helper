@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -630,7 +630,12 @@ impl ProtectionRegistry {
 /// Create a `.sbh-protect` marker file at the given directory path.
 ///
 /// If `metadata` is provided, writes it as TOML. Otherwise creates an empty file.
-pub fn create_marker(dir: &Path, metadata: Option<&ProtectionMetadata>) -> Result<()> {
+/// Returns `true` when created and `false` when a marker already exists. Existing
+/// entries are never opened or overwritten: their presence already protects the
+/// directory, and their metadata may carry policy such as `relocatable = false`.
+/// A metadata write failure may leave a newly created marker in place; even an
+/// empty or incomplete marker still protects the directory.
+pub fn create_marker(dir: &Path, metadata: Option<&ProtectionMetadata>) -> Result<bool> {
     let marker_path = normalize_path_for_protection(dir).join(MARKER_FILENAME);
     let content = match metadata {
         Some(meta) => toml::to_string_pretty(meta).map_err(|source| SbhError::Serialization {
@@ -639,10 +644,27 @@ pub fn create_marker(dir: &Path, metadata: Option<&ProtectionMetadata>) -> Resul
         })?,
         None => String::new(),
     };
-    fs::write(&marker_path, content).map_err(|source| SbhError::Io {
-        path: marker_path,
-        source,
-    })
+    let mut marker = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path)
+    {
+        Ok(marker) => marker,
+        Err(source) if source.kind() == ErrorKind::AlreadyExists => return Ok(false),
+        Err(source) => {
+            return Err(SbhError::Io {
+                path: marker_path,
+                source,
+            });
+        }
+    };
+    marker
+        .write_all(content.as_bytes())
+        .map_err(|source| SbhError::Io {
+            path: marker_path,
+            source,
+        })?;
+    Ok(true)
 }
 
 /// Remove a `.sbh-protect` marker file from the given directory.
@@ -1445,7 +1467,7 @@ mod tests {
     #[test]
     fn create_empty_marker_file() {
         let tmp = TempDir::new().unwrap();
-        create_marker(tmp.path(), None).unwrap();
+        assert!(create_marker(tmp.path(), None).unwrap());
 
         let marker = tmp.path().join(MARKER_FILENAME);
         assert!(marker.exists());
@@ -1454,6 +1476,7 @@ mod tests {
             content.is_empty(),
             "expected an empty marker file, got {content:?}"
         );
+        assert!(!create_marker(tmp.path(), None).unwrap());
     }
 
     #[test]
@@ -1464,7 +1487,7 @@ mod tests {
             protected_by: Some("jeff".to_string()),
             protected_at: Some("2026-02-14T10:00:00Z".to_string()),
         };
-        create_marker(tmp.path(), Some(&meta)).unwrap();
+        assert!(create_marker(tmp.path(), Some(&meta)).unwrap());
 
         let marker = tmp.path().join(MARKER_FILENAME);
         let content = fs::read_to_string(&marker).unwrap();
@@ -1472,6 +1495,78 @@ mod tests {
         assert!(content.contains("added_by = \"jeff\""));
         let parsed: ProtectionMetadata = toml::from_str(&content).unwrap();
         assert_eq!(parsed, meta);
+    }
+
+    #[test]
+    fn repeated_protection_preserves_existing_marker_policy() {
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join(MARKER_FILENAME);
+        let original =
+            "reason = \"keep this build\"\nadded_by = \"operator\"\nrelocatable = false\n";
+        fs::write(&marker, original).unwrap();
+        let replacement = ProtectionMetadata {
+            reason: Some("another request".to_string()),
+            protected_by: Some("automation".to_string()),
+            protected_at: Some("2026-11-01T20:37:47Z".to_string()),
+        };
+
+        for metadata in [None, Some(&replacement), Some(&replacement)] {
+            assert!(!create_marker(tmp.path(), metadata).unwrap());
+            assert_eq!(fs::read_to_string(&marker).unwrap(), original);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_marker_does_not_need_read_or_write_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for mode in [0o444, 0o000] {
+            let tmp = TempDir::new().unwrap();
+            let marker = tmp.path().join(MARKER_FILENAME);
+            fs::write(&marker, "relocatable = false\n").unwrap();
+            fs::set_permissions(&marker, fs::Permissions::from_mode(mode)).unwrap();
+
+            assert!(!create_marker(tmp.path(), None).unwrap());
+            assert_eq!(
+                fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(
+                fs::read_to_string(&marker).unwrap(),
+                "relocatable = false\n"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_symlink_marker_never_opens_its_target() {
+        use std::os::unix::fs::symlink;
+
+        for target_exists in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let protected = tmp.path().join("protected");
+            fs::create_dir(&protected).unwrap();
+            let target = tmp.path().join("marker-target");
+            if target_exists {
+                fs::write(&target, "unrelated contents\n").unwrap();
+            }
+            let marker = protected.join(MARKER_FILENAME);
+            symlink(&target, &marker).unwrap();
+
+            assert!(!create_marker(&protected, None).unwrap());
+            assert_eq!(fs::read_link(marker).unwrap(), target);
+            if target_exists {
+                assert_eq!(fs::read_to_string(&target).unwrap(), "unrelated contents\n");
+            } else {
+                assert!(
+                    !target.exists(),
+                    "a dangling marker must not create its target"
+                );
+            }
+        }
     }
 
     #[test]
