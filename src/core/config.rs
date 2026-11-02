@@ -534,6 +534,24 @@ pub struct ScannerConfig {
     pub target_only_roots: Vec<PathBuf>,
     /// Hours nothing inside a target-only candidate may have changed.
     pub target_only_idle_hours: u64,
+    /// rch staging bases (rch's `transfer.remote_base` on a worker) that the
+    /// daemon prunes through rch itself when their mount is at Orange or
+    /// worse. rch keeps a copy of each synced project's source under
+    /// `<base>/<project>/<tree>`; sbh rightly keeps any project source it
+    /// finds, so these trees only go through `rch cache clean`, which keeps
+    /// trees modified within its `--older` window and validates every path.
+    /// sbh first checks each tree rch would prune for `.sbh-protect` markers,
+    /// protected paths and processes using it, and leaves any project
+    /// directory holding one. Linux default `/data/tmp/rch`; empty turns the
+    /// tier off. See `src/daemon/rch_staging.rs`.
+    pub rch_staging_bases: Vec<PathBuf>,
+    /// The `rch` binary for the staging tier. Unset: the first trusted one of
+    /// `/usr/local/bin/rch`, `/usr/bin/rch`, `/root/.local/bin/rch`,
+    /// `/root/.cargo/bin/rch` (and the daemon user's `~/.local/bin` and
+    /// `~/.cargo/bin` when it is not root). Trusted means the file and every
+    /// directory above it belong to root or the daemon's user and are not
+    /// group- or world-writable; anything else is never run.
+    pub rch_binary: Option<PathBuf>,
     pub min_file_age_minutes: u64,
     pub max_depth: usize,
     pub parallelism: usize,
@@ -992,6 +1010,39 @@ impl ScannerConfig {
         }
         Ok(())
     }
+
+    /// Reject rch staging settings the tier could not bound: more than a
+    /// handful of bases, relative paths, the filesystem root, `.` or `..`.
+    fn validate_rch_staging(&self) -> Result<()> {
+        let invalid = |details: String| SbhError::InvalidConfig { details };
+        if self.rch_staging_bases.len() > 8 {
+            return Err(invalid(format!(
+                "scanner.rch_staging_bases lists at most 8 bases, got {}",
+                self.rch_staging_bases.len()
+            )));
+        }
+        if let Some(base) = self
+            .rch_staging_bases
+            .iter()
+            .find(|base| !base.is_absolute() || !names_a_directory_below_root(base))
+        {
+            return Err(invalid(format!(
+                "scanner.rch_staging_bases must be absolute directories below the filesystem root, without . or ..: {}",
+                base.display()
+            )));
+        }
+        if let Some(binary) = self
+            .rch_binary
+            .as_ref()
+            .filter(|binary| !binary.is_absolute() || !names_a_directory_below_root(binary))
+        {
+            return Err(invalid(format!(
+                "scanner.rch_binary must be an absolute path without . or ..: {}",
+                binary.display()
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl CompressConfig {
@@ -1387,6 +1438,14 @@ impl Default for ScannerConfig {
                 Vec::new()
             },
             target_only_idle_hours: 24,
+            // rch workers on this fleet stage synced sources here (rch's
+            // default `transfer.remote_base`). An absent base is skipped.
+            rch_staging_bases: if cfg!(target_os = "linux") {
+                vec![PathBuf::from("/data/tmp/rch")]
+            } else {
+                Vec::new()
+            },
+            rch_binary: None,
             min_file_age_minutes: 5,
             max_depth: 10,
             parallelism: std::thread::available_parallelism()
@@ -3103,6 +3162,7 @@ impl Config {
             crate::scanner::protection::validate_glob_pattern(pattern)?;
         }
         self.scanner.validate_target_only()?;
+        self.scanner.validate_rch_staging()?;
 
         // System tuning (kernel writeback).
         let tuning = &self.system_tuning;
@@ -4427,6 +4487,54 @@ mod tests {
             vec![PathBuf::from("/data/tmp/claude-*")]
         );
         assert_eq!(parsed.scanner.target_only_idle_hours, 48);
+    }
+
+    #[test]
+    fn rch_staging_defaults_to_the_fleet_base_on_linux_and_must_be_bounded() {
+        let default = Config::default();
+        let expected: Vec<PathBuf> = if cfg!(target_os = "linux") {
+            vec![PathBuf::from("/data/tmp/rch")]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(default.scanner.rch_staging_bases, expected);
+        assert_eq!(default.scanner.rch_binary, None);
+        default.validate().unwrap();
+
+        let with = |bases: Vec<PathBuf>, binary: Option<&str>| {
+            let mut config = Config::default();
+            config.scanner.rch_staging_bases = bases;
+            config.scanner.rch_binary = binary.map(PathBuf::from);
+            config.validate()
+        };
+        with(
+            vec![PathBuf::from("/tmp/rch-sync")],
+            Some("/usr/local/bin/rch"),
+        )
+        .unwrap();
+        with(Vec::new(), None).unwrap();
+        assert!(with(vec![PathBuf::from("data/tmp/rch")], None).is_err());
+        assert!(with(vec![PathBuf::from("/data/tmp/rch"); 9], None).is_err());
+        for base in ["/", "/data/tmp/rch/..", "/data/../etc"] {
+            assert!(with(vec![PathBuf::from(base)], None).is_err(), "{base}");
+        }
+        for binary in ["rch", "bin/rch", "/usr/local/bin/../rch"] {
+            assert!(with(Vec::new(), Some(binary)).is_err(), "{binary}");
+        }
+
+        let parsed: Config = toml::from_str(
+            "[scanner]\nrch_staging_bases = [\"/tmp/rch-sync\"]\nrch_binary = \"/usr/local/bin/rch\"\n",
+        )
+        .unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(
+            parsed.scanner.rch_staging_bases,
+            vec![PathBuf::from("/tmp/rch-sync")]
+        );
+        assert_eq!(
+            parsed.scanner.rch_binary,
+            Some(PathBuf::from("/usr/local/bin/rch"))
+        );
     }
 
     #[test]
