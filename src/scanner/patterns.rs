@@ -252,11 +252,13 @@ pub fn classify_opaque_tree(
     // Go toolchain caches (GOCACHE build cache / GOMODCACHE module cache).
     // Detected structurally because on the fleet they sit under arbitrarily
     // named roots in /data/tmp that no name pattern matches. The cheap
-    // `go`/`mod` substring pre-filter keeps the extra `read_dir` to plausibly-Go
-    // directories — real roots are `go-build`, `*go*cache*`, `mod`, `*modcache*`
-    // — while `detect_go_cache` is the authoritative structural test. Scored as
-    // one opaque candidate (no descent) so a 100k-file cache costs a single probe.
-    if (name.contains("go") || name.contains("mod"))
+    // `go`/`mod`/`cache` substring pre-filter keeps the extra `read_dir` to
+    // plausibly-Go directories — real roots are `go-build`, `*go*cache*`, `mod`,
+    // `*modcache*`, and rch's per-job `.rch-go/cache` — while `detect_go_cache`
+    // is the authoritative structural test. Without `cache`, rch's GOCACHE fell
+    // through to `generic-cache-exact` (0.435) and was kept at Critical. Scored
+    // as one opaque candidate (no descent) so a 100k-file cache costs one probe.
+    if (name.contains("go") || name.contains("mod") || name.contains("cache"))
         && let Some(kind) = detect_go_cache(path)
     {
         let (reason, label) = match kind {
@@ -3846,6 +3848,44 @@ mod tests {
         assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
         assert_eq!(opaque.classification.category, ArtifactCategory::GoCache);
         assert_eq!(opaque.classification.pattern_name, "opaque-go-mod-cache");
+    }
+
+    #[test]
+    fn detects_rch_job_go_build_cache_named_plain_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        // rch runs Go jobs with GOCACHE=<job>/.rch-go/cache: the cache root's
+        // own name carries no `go`/`mod`, only its parent's does.
+        let root = dir.path().join("lgl/.rch-go/cache");
+        std::fs::create_dir_all(root.join("00")).unwrap();
+        std::fs::create_dir_all(root.join("ff")).unwrap();
+        std::fs::write(root.join("trim.txt"), "1793000000\n").unwrap();
+        std::fs::write(
+            root.join("README"),
+            "This directory holds cached build artifacts from the Go build system.\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("00/0011223344-a"), "entry").unwrap();
+
+        let opaque = classify_opaque_tree(&root, OpaqueTreeContext::default())
+            .expect("rch's GOCACHE should be an opaque candidate");
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
+        assert_eq!(opaque.classification.category, ArtifactCategory::GoCache);
+        assert_eq!(opaque.classification.pattern_name, "opaque-go-build-cache");
+    }
+
+    #[test]
+    fn plain_cache_dir_without_go_structure_is_not_a_go_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        // Passes the widened `cache` pre-filter, but has hex-named shards
+        // without trim.txt (a content-addressed store that is not Go's).
+        let root = dir.path().join("app/cache");
+        std::fs::create_dir_all(root.join("ab")).unwrap();
+        std::fs::write(root.join("ab/blob"), "x").unwrap();
+        std::fs::write(root.join("index.json"), "{}").unwrap();
+
+        let category = classify_opaque_tree(&root, OpaqueTreeContext::default())
+            .map(|o| o.classification.category);
+        assert_ne!(category, Some(ArtifactCategory::GoCache));
     }
 
     #[test]
