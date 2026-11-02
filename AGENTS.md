@@ -743,6 +743,11 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | daemon | `CATALOG_PROBE_MAX_DEPTH` | `5` | Depth of a catalog freshness probe | `src/daemon/loop_main.rs` |
 | daemon | `CANARY_REPROVE_MINUTES` | `30` | Clean minutes an automatic Canary needs to return to the intended mode | `src/daemon/policy.rs` |
 | daemon | `TARGET_TIER_PASS_MINUTES` | `10` | Shortest gap between two target-only passes | `src/daemon/target_tier.rs` |
+| daemon | `RCH_STAGING_PASS_MINUTES` | `30` | Shortest gap between two rch staging passes over one base | `src/daemon/rch_staging.rs` |
+| daemon | `RCH_STAGING_ORANGE_IDLE_HOURS` | `72` | Idle hours before the rch staging tier prunes a tree at Orange | `src/daemon/rch_staging.rs` |
+| daemon | `RCH_STAGING_RED_IDLE_HOURS` | `48` | Idle hours before the rch staging tier prunes a tree at Red | `src/daemon/rch_staging.rs` |
+| daemon | `RCH_STAGING_CRITICAL_IDLE_HOURS` | `24` | Idle hours before the rch staging tier prunes a tree at Critical | `src/daemon/rch_staging.rs` |
+| daemon | `COMPRESS_ROOT_PROBE_SECS` | `60` | Seconds a compression root's admission probe stays fresh | `src/daemon/compress_tier.rs` |
 | agent_scratch | `DEFAULT_MIN_IDLE_DAYS` | `7` | Days a session tree and transcript must be unchanged before check --agent-scratch calls it idle | `src/monitor/agent_scratch.rs` |
 <!-- sbh-docs:end -->
 

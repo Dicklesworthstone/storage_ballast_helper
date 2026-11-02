@@ -19260,9 +19260,12 @@ mod tests {
 
         let readme_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
         let readme = std::fs::read_to_string(&readme_path).expect("README.md");
+        // Commands are checked against what the binary runs (main.rs adds
+        // compress and relocate); the regions against what `sbh docs
+        // --render` builds them from.
         let root = Cli::command();
         let known: std::collections::BTreeSet<String> =
-            storage_ballast_helper::cli::docs::command_docs(&root)
+            storage_ballast_helper::cli::docs::command_docs(&crate::cli_command())
                 .into_iter()
                 .map(|c| c.path)
                 .collect();

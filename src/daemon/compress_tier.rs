@@ -53,7 +53,7 @@ pub struct RootStatus {
 
 /// Freshness is measured from probe completion, using monotonic time. A probe
 /// which itself exceeds this window supplies unknown evidence instead.
-const ROOT_PROBE_MAX_AGE: Duration = Duration::from_secs(60);
+pub const ROOT_PROBE_MAX_AGE: Duration = Duration::from_secs(60);
 /// Matches the validated configuration limit and bounds queued snapshots.
 const ROOT_PROBE_LIMIT: usize = 32;
 

@@ -1355,8 +1355,8 @@ Two protection mechanisms prevent cleanup of important directories:
 `sbh protect` reports marker creation separately from persistent registration.
 If a marker is created or already present but the active `sacred.toml` cannot be
 updated (for example, a non-root caller using system configuration), the marker
-remains active and the command returns **4 (partial success)** with the
-registration error. Full success remains **0**; user and runtime failures retain
+remains active and the command returns exit status `4` (<!-- claim:exit.4 -->partial success<!-- /claim -->) with the
+registration error. Full success remains `0` (<!-- claim:exit.0 -->ok<!-- /claim -->); user and runtime failures retain
 their existing exit codes. JSON includes `status`, `exit_code`, `marker_created`,
 `marker_present`, `sacred_config_registered`, and `sacred_config_error`, alongside
 the existing fields. Repeated requests preserve existing marker contents and
@@ -1478,7 +1478,7 @@ limit or healthy host cannot hide a smaller process allowance.
 
 The byte comparison adds no percentage reserve and does not count swap as RAM.
 It distinguishes throttling boundaries from hard limits. A known shortfall
-exits 1; incomplete evidence exits 4 ([Exit Codes](#exit-codes)). JSON includes
+exits `1` (<!-- claim:exit.1 -->user error, or a pressure condition<!-- /claim -->); incomplete evidence exits `4` (<!-- claim:exit.4 -->partial success<!-- /claim -->) ([Exit Codes](#exit-codes)). JSON includes
 the fresh `ram_scratch` report and a separate `ram_write_admission` with the
 requested bytes, observed headroom, and limiting scope. A successful check is a
 current observation, not a memory reservation. Disk-backed checks skip the RAM
@@ -1552,7 +1552,7 @@ Read-only filesystems, failed samples, and unknown capacity cannot start a pass.
 
 Root filesystem and device probes run on one bounded background worker; the
 monitor never waits for them. Completed roots can start a pass while a later
-probe is blocked. Admission evidence expires after 60 seconds, and a root
+probe is blocked. Admission evidence expires after <!-- claim:constants.daemon.COMPRESS_ROOT_PROBE_SECS -->60<!-- /claim --> seconds, and a root
 awaiting fresh evidence cannot hold cleanup. A stuck native probe retains its
 worker slot rather than spawning more threads, so it can delay compression
 without blocking monitoring, ballast release, or emergency cleanup.

@@ -1772,6 +1772,13 @@ fn daemon_constants() -> Vec<ConstantDoc> {
             "Idle hours before the rch staging tier prunes a tree at Critical",
             "src/daemon/rch_staging.rs",
         ),
+        constant(
+            "daemon",
+            "COMPRESS_ROOT_PROBE_SECS",
+            crate::daemon::compress_tier::ROOT_PROBE_MAX_AGE.as_secs(),
+            "Seconds a compression root's admission probe stays fresh",
+            "src/daemon/compress_tier.rs",
+        ),
     ]
 }
 
