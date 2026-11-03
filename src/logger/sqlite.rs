@@ -6,9 +6,10 @@
 #![allow(missing_docs)]
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::core::errors::{Result, SbhError};
 use crate::scanner::decision_record::DecisionRecord;
@@ -439,6 +440,96 @@ impl SqliteLogger {
         Ok(deleted)
     }
 
+    // ──────────────────── size cap ────────────────────
+
+    /// Bytes in the database file, and bytes in the pages that hold data.
+    fn page_bytes(&self) -> Result<(u64, u64)> {
+        let pragma = |name: &str| -> Result<u64> {
+            let value: i64 = self
+                .conn
+                .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))?;
+            Ok(u64::try_from(value).unwrap_or(0))
+        };
+        let (size, pages, free) = (
+            pragma("page_size")?,
+            pragma("page_count")?,
+            pragma("freelist_count")?,
+        );
+        Ok((pages * size, pages.saturating_sub(free) * size))
+    }
+
+    /// Keep the database under its size cap by deleting its oldest rows.
+    ///
+    /// Starts once the file passes `cap`, or when `resume` says an earlier
+    /// call stopped short, and deletes [`TRIM_BATCH_ROWS`] at a time from
+    /// whichever table holds the oldest row, so every table keeps the same
+    /// recent window, until the data fits in `target`. Stops at `deadline`
+    /// so the caller can keep logging. Returns whether the data is still
+    /// over `target`, i.e. whether to call again with `resume`.
+    pub fn enforce_size_cap(
+        &self,
+        cap: u64,
+        target: u64,
+        resume: bool,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let (file, mut live) = self.page_bytes()?;
+        if !resume && file <= cap {
+            return Ok(false);
+        }
+        while live > target {
+            if Instant::now() >= deadline {
+                return Ok(true);
+            }
+            if !self.delete_oldest_batch()? {
+                break;
+            }
+            live = self.page_bytes()?.1;
+        }
+        // Without FULL auto_vacuum the deletes leave free pages behind
+        // instead of shrinking the file; one VACUUM gives them back and
+        // converts the database so later trims shrink it directly.
+        let (file, live) = self.page_bytes()?;
+        if file > cap && file > live {
+            self.conn
+                .execute_batch("PRAGMA auto_vacuum = FULL; VACUUM; PRAGMA journal_mode = WAL;")?;
+        }
+        Ok(false)
+    }
+
+    /// Delete up to [`TRIM_BATCH_ROWS`] of the oldest rows of the table whose
+    /// first row is the oldest, none of them newer than the first row of any
+    /// other table. Returns false when every trimmed table is empty.
+    fn delete_oldest_batch(&self) -> Result<bool> {
+        let mut firsts: Vec<(String, &str, &str, i64)> = Vec::new();
+        for (table, column) in TRIMMED_TABLES {
+            let first: Option<(String, i64)> = self
+                .conn
+                .query_row(
+                    &format!("SELECT {column}, id FROM {table} ORDER BY id LIMIT 1"),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((stamp, id)) = first {
+                firsts.push((stamp, table, column, id));
+            }
+        }
+        firsts.sort();
+        let Some((_, table, column, first_id)) = firsts.first() else {
+            return Ok(false);
+        };
+        // The first row always goes, so every batch makes progress.
+        let horizon = firsts.get(1).map(|(stamp, ..)| stamp.as_str());
+        self.conn.execute(
+            &format!(
+                "DELETE FROM {table} WHERE id < ?1 AND (id = ?2 OR ?3 IS NULL OR {column} <= ?3)"
+            ),
+            params![first_id.saturating_add(TRIM_BATCH_ROWS), first_id, horizon],
+        )?;
+        Ok(true)
+    }
+
     // ──────────────────── ballast_inventory ────────────────────
 
     /// Upsert a ballast file record.
@@ -632,6 +723,32 @@ pub const VACUUM_MIN_BYTES: u64 = 64 * 1024 * 1024;
 /// On fmd (2026-10-22) that was a 4.3 GB WAL holding 5 live frames on a root
 /// filesystem with 3.3 GB free.
 pub const WAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Size past which the logger trims the database: it must never grow past
+/// 1 GB (operator rule, 2026-11-02). With the WAL held to
+/// [`WAL_SIZE_LIMIT_BYTES`], file plus WAL stays under 900 MB.
+///
+/// The 30-day retention alone did not bound it: on one Mac the daemon wrote
+/// 1.2M DELETE decisions a day (~2.5 KB each, always recorded) and the file
+/// reached 28 GB, 25 GB of it `decision_log`.
+pub const DB_SIZE_CAP_BYTES: u64 = 768 * 1024 * 1024;
+
+/// Size a trim brings the data back down to, so the cap is not re-crossed
+/// on the next few writes.
+pub const DB_TRIM_TARGET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Tables a trim deletes from, oldest rows first, with their time column.
+/// `ballast_inventory` is one row per ballast file and is never trimmed.
+const TRIMMED_TABLES: [(&str, &str); 4] = [
+    ("decision_log", "timestamp"),
+    ("decision_outcome", "observed_at"),
+    ("activity_log", "timestamp"),
+    ("pressure_history", "timestamp"),
+];
+
+/// Rows a trim deletes per transaction: about 12 MB of decision records, so
+/// it never builds a large WAL or holds the write lock past `busy_timeout`.
+const TRIM_BATCH_ROWS: i64 = 5_000;
 
 fn apply_pragmas(conn: &Connection, db_bytes: u64) -> Result<()> {
     // auto_vacuum can only be changed before the first table is created.
@@ -876,6 +993,175 @@ mod tests {
             after <= WAL_SIZE_LIMIT_BYTES,
             "WAL kept {after} bytes after a reset (grew to {grown})"
         );
+    }
+
+    fn stamp(seconds: u32) -> String {
+        chrono::DateTime::from_timestamp(1_790_000_000 + i64::from(seconds), 0)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    /// `count` decision rows with ~`record_bytes` of JSON each, one second
+    /// apart starting `start` seconds into the fixture's clock.
+    fn fill_decisions(logger: &SqliteLogger, start: u32, count: u32, record_bytes: usize) {
+        let record = "x".repeat(record_bytes);
+        logger.conn.execute_batch("BEGIN").unwrap();
+        for i in start..start + count {
+            logger
+                .conn
+                .execute(
+                    "INSERT INTO decision_log (
+                        decision_id, timestamp, path, action, policy_mode, total_score,
+                        posterior_abandoned, expected_loss_keep, expected_loss_delete, record
+                    ) VALUES (?1, ?2, ?3, 'delete', 'live', 0.9, 0.9, 1.0, 0.1, ?4)",
+                    params![format!("d{i}"), stamp(i), format!("/data/t{i}"), record],
+                )
+                .unwrap();
+        }
+        logger.conn.execute_batch("COMMIT").unwrap();
+    }
+
+    fn fill_activity(logger: &SqliteLogger, start: u32, count: u32) {
+        for i in start..start + count {
+            logger
+                .conn
+                .execute(
+                    "INSERT INTO activity_log (timestamp, event_type, severity)
+                     VALUES (?1, 'scan_complete', 'info')",
+                    params![stamp(i)],
+                )
+                .unwrap();
+        }
+    }
+
+    fn ids(logger: &SqliteLogger, table: &str) -> (i64, i64, i64) {
+        logger
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT count(*), coalesce(min(id), 0), coalesce(max(id), 0) FROM {table}"
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    fn far_deadline() -> Instant {
+        Instant::now() + std::time::Duration::from_secs(600)
+    }
+
+    /// Past the cap, the oldest rows go first across tables: activity rows
+    /// older than every decision are deleted before any decision, activity
+    /// rows newer than the trimmed window survive, the newest decisions stay
+    /// contiguous, and the file shrinks to the target.
+    #[test]
+    fn size_cap_trims_oldest_rows_first_across_tables() {
+        let (_dir, logger) = temp_db();
+        fill_activity(&logger, 0, 100);
+        fill_decisions(&logger, 1_000, 20_000, 1_024);
+        fill_activity(&logger, 1_000_000, 100);
+        logger
+            .upsert_ballast(&BallastRow {
+                file_index: 1,
+                path: "/data/.sbh/ballast/SBH_BALLAST_FILE_00001.dat".to_string(),
+                size_bytes: 1_073_741_824,
+                created_at: stamp(0),
+                released_at: None,
+                replenished_at: None,
+                integrity_hash: None,
+            })
+            .unwrap();
+        let (file, live) = logger.page_bytes().unwrap();
+        let (decisions, _, newest) = ids(&logger, "decision_log");
+
+        assert!(
+            !logger
+                .enforce_size_cap(file, live / 2, false, far_deadline())
+                .unwrap(),
+            "at the cap nothing is trimmed"
+        );
+        assert_eq!(ids(&logger, "decision_log").0, decisions);
+
+        let (cap, target) = (file / 2, live / 2);
+        assert!(
+            !logger
+                .enforce_size_cap(cap, target, false, far_deadline())
+                .unwrap()
+        );
+        let (file_after, live_after) = logger.page_bytes().unwrap();
+        assert!(live_after <= target, "{live_after} > {target}");
+        assert!(
+            file_after <= cap,
+            "FULL auto_vacuum shrinks the file: {file_after}"
+        );
+
+        let (kept, first, last) = ids(&logger, "decision_log");
+        assert!(kept > 0 && kept < decisions, "kept {kept} of {decisions}");
+        assert_eq!(last, newest, "the newest decision survives");
+        assert_eq!(
+            kept,
+            last - first + 1,
+            "survivors are the newest, contiguous"
+        );
+        let (activity, first_activity, _) = ids(&logger, "activity_log");
+        assert_eq!(
+            activity, 100,
+            "only the activity rows newer than every decision remain"
+        );
+        assert_eq!(first_activity, 101);
+        assert_eq!(logger.ballast_inventory().unwrap().len(), 1);
+    }
+
+    /// A trim stops at its deadline and reports the data still over the
+    /// target; the resumed call finishes it even though the file no longer
+    /// passes the cap that started it.
+    #[test]
+    fn size_cap_stops_at_the_deadline_and_resumes() {
+        let (_dir, logger) = temp_db();
+        fill_decisions(&logger, 0, 20_000, 1_024);
+        let (_, live) = logger.page_bytes().unwrap();
+        let (decisions, _, _) = ids(&logger, "decision_log");
+
+        assert!(
+            logger
+                .enforce_size_cap(0, live / 2, false, Instant::now())
+                .unwrap(),
+            "a spent deadline leaves the trim unfinished"
+        );
+        assert_eq!(ids(&logger, "decision_log").0, decisions);
+
+        assert!(
+            !logger
+                .enforce_size_cap(u64::MAX, live / 2, true, far_deadline())
+                .unwrap()
+        );
+        assert!(logger.page_bytes().unwrap().1 <= live / 2);
+    }
+
+    /// A small legacy database keeps `auto_vacuum = NONE`, so deletes alone
+    /// leave the file at its size; the trim then VACUUMs it to FULL and
+    /// stays in WAL mode.
+    #[test]
+    fn size_cap_vacuums_a_database_without_auto_vacuum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        legacy_db(&path, 1024 * 1024);
+        let logger = SqliteLogger::open(&path).unwrap();
+        assert_eq!(auto_vacuum(&logger), 0);
+        fill_decisions(&logger, 0, 20_000, 1_024);
+        let (file, live) = logger.page_bytes().unwrap();
+
+        let cap = file / 2;
+        assert!(
+            !logger
+                .enforce_size_cap(cap, live / 4, false, far_deadline())
+                .unwrap()
+        );
+        assert_eq!(auto_vacuum(&logger), 1);
+        assert!(logger.is_wal_mode());
+        let (file_after, _) = logger.page_bytes().unwrap();
+        assert!(file_after <= cap, "{file_after} > {cap}");
     }
 
     #[test]
