@@ -1525,14 +1525,15 @@ mod tests {
         assert_eq!(report.entries_examined, baseline.entries_examined);
     }
 
+    // APFS refuses a file name that is not UTF-8 (EILSEQ), so only Linux can hold one.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn ignores_unrecognized_layouts_and_preserves_non_utf8_display_identity() {
+    fn preserves_non_utf8_display_identity() {
         let mut fixture = Fixture::new();
         let renamed = fixture.root.with_file_name(OsStr::from_bytes(b"tmp-\xff"));
         fs::rename(&fixture.root, &renamed).unwrap();
         fixture.root = renamed;
         fixture.session(IDLE);
-        fs::create_dir_all(fixture.root.join("claude-not-a-uid/project/session")).unwrap();
         let report = fixture.run(MockPlatform::healthy(), Limits::default());
         assert_eq!(report.sessions_found, 1);
         let json = serde_json::to_value(&report).unwrap();
@@ -1542,6 +1543,15 @@ mod tests {
                 .unwrap()
                 .contains("ff")
         );
+    }
+
+    #[test]
+    fn ignores_unrecognized_layouts() {
+        let fixture = Fixture::new();
+        fixture.session(IDLE);
+        fs::create_dir_all(fixture.root.join("claude-not-a-uid/project/session")).unwrap();
+        let report = fixture.run(MockPlatform::healthy(), Limits::default());
+        assert_eq!(report.sessions_found, 1);
         assert!(session_uuid(OsStr::new("not-a-session")).is_none());
         assert!(session_uuid(OsStr::new("11111111/1111-4111-8111-111111111111")).is_none());
         assert_eq!(claude_uid(OsStr::new("claude-1000")), Some(1000));
