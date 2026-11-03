@@ -32,6 +32,15 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   `Not a directory (os error 20)`. On css these were 16 relocation stubs
   pointing into an archive (bd-jnp9).
 
+- **The memory level no longer blips to Unknown when one service-local PSI read
+  is slow.** The cgroup observation has a 100 ms budget. Under heavy load, a
+  read that missed it turned a healthy Normal into Unknown for one sample: 9
+  times an hour on trj (load 141) and 5 on yto and vmi1227854. Unknown counts
+  as Warn, so each blip briefly narrowed the scan. The live subscription now
+  keeps the last successful local read for up to 30 s when a read fails. A
+  failure that lasts longer still reads as Unknown, and a carried positive stall
+  still raises the level (bd-krwm, follow-up to bd-90af).
+
 ## v0.7.11 **[release]**
 
 Compare: [`v0.7.9...v0.7.11`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.9...v0.7.11)

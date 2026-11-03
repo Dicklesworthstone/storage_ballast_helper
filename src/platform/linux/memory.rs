@@ -8,7 +8,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
@@ -36,19 +36,69 @@ pub(super) fn read_memory_info() -> Result<MemoryInfo> {
 }
 
 pub(super) fn read_memory_pressure() -> Result<MemoryPressure> {
+    sample_memory_pressure(|local| local)
+}
+
+/// One sample, with the service-local PSI result passed through `local` first.
+fn sample_memory_pressure(
+    local: impl FnOnce(io::Result<Option<u64>>) -> io::Result<Option<u64>>,
+) -> Result<MemoryPressure> {
     let info = read_memory_info()?;
+    let host = read_memory_psi_avg10().ok();
     Ok(memory_pressure_with_local(
         &info,
-        read_memory_psi_avg10().ok(),
-        super::cgroup::pressure::read(),
+        host,
+        local(super::cgroup::pressure::read()),
         system_page_size_bytes(),
     ))
+}
+
+/// How long a failed service-local PSI read may stand on the last successful one.
+///
+/// The cgroup observation has a 100 ms budget. Under heavy load (trj
+/// 2026-11-03: load 141 on 32 visible CPUs) a read sometimes misses it, and
+/// each miss turned a healthy Normal into Unknown for one sample. That was 9
+/// blips an hour on trj and 5 on yto and vmi1227854, and each one narrowed the
+/// scan (bd-krwm, the follow-up bd-90af named). A success this recent is still
+/// evidence about the same cgroup. A failure that lasts longer is not hidden.
+const LOCAL_PSI_GRACE: Duration = Duration::from_secs(30);
+
+/// The last service-local PSI read that succeeded, kept by one subscription.
+#[derive(Debug, Default)]
+struct LocalPsiMemo {
+    last_ok: Option<(Instant, Option<u64>)>,
+}
+
+impl LocalPsiMemo {
+    /// `local`, or the last success within [`LOCAL_PSI_GRACE`] when `local`
+    /// failed. A carried-forward sample keeps its original time, so sustained
+    /// failure still becomes an error once the grace runs out.
+    fn observe(&mut self, now: Instant, local: io::Result<Option<u64>>) -> io::Result<Option<u64>> {
+        match local {
+            Ok(sample) => {
+                self.last_ok = Some((now, sample));
+                Ok(sample)
+            }
+            Err(error) => match self.last_ok {
+                Some((at, sample))
+                    if now
+                        .checked_duration_since(at)
+                        .is_some_and(|age| age <= LOCAL_PSI_GRACE) =>
+                {
+                    Ok(sample)
+                }
+                _ => Err(error),
+            },
+        }
+    }
 }
 
 /// Use the stronger observed stall signal, without adding percentages from
 /// overlapping task populations. Byte/page counters remain host-wide. The PSI
 /// value is the maximum known host/process-cgroup sample, also used by the exit
 /// band. Missing v2 evidence can retain positive pressure but cannot say Normal.
+/// A subscription first bridges a brief local read failure with
+/// [`LocalPsiMemo`].
 fn memory_pressure_with_local(
     info: &MemoryInfo,
     host: Option<u64>,
@@ -68,17 +118,19 @@ pub(super) fn subscribe_memory_pressure(
     callback: MemoryPressureCallback,
 ) -> Result<SubscriptionHandle> {
     let callback: Arc<dyn Fn(MemoryPressure) + Send + Sync + 'static> = Arc::from(callback);
-    spawn_memory_pressure_epoll_subscription(Arc::clone(&callback), read_memory_pressure).or_else(
-        |_| {
-            let callback = Arc::clone(&callback);
-            spawn_memory_pressure_subscription(
-                "linux-memory-pressure-poll",
-                MEMORY_PRESSURE_POLL_INTERVAL,
-                Box::new(move |pressure| callback(pressure)),
-                read_memory_pressure,
-            )
-        },
-    )
+    // Shared by both samplers: the fallback starts only if the epoll one fails to.
+    let memo = Arc::new(parking_lot::Mutex::new(LocalPsiMemo::default()));
+    let sampler =
+        move || sample_memory_pressure(|local| memo.lock().observe(Instant::now(), local));
+    spawn_memory_pressure_epoll_subscription(Arc::clone(&callback), sampler.clone()).or_else(|_| {
+        let callback = Arc::clone(&callback);
+        spawn_memory_pressure_subscription(
+            "linux-memory-pressure-poll",
+            MEMORY_PRESSURE_POLL_INTERVAL,
+            Box::new(move |pressure| callback(pressure)),
+            sampler,
+        )
+    })
 }
 
 pub(super) fn parse_meminfo(raw: &str) -> Result<MemoryInfo> {
@@ -681,6 +733,73 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn a_brief_local_read_failure_keeps_the_last_success_but_a_lasting_one_is_unknown() {
+        use std::time::{Duration, Instant};
+
+        let info = super::MemoryInfo {
+            total_bytes: 100,
+            available_bytes: 50,
+            swap_total_bytes: 0,
+            swap_free_bytes: 0,
+        };
+        let timed_out =
+            || -> std::io::Result<Option<u64>> { Err(std::io::ErrorKind::TimedOut.into()) };
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut memo = super::LocalPsiMemo::default();
+        let level = |memo: &mut super::LocalPsiMemo, now: Instant, local| {
+            let local = memo.observe(now, local);
+            super::memory_pressure_with_local(&info, Some(0), local, 1).level
+        };
+
+        // trj's pattern: alone in its cgroup (Ok(None)), one read misses the
+        // 100 ms budget, then reads succeed again. Normal throughout.
+        assert_eq!(
+            level(&mut memo, at(0), Ok(None)),
+            MemoryPressureLevel::Normal
+        );
+        assert_eq!(
+            level(&mut memo, at(1), timed_out()),
+            MemoryPressureLevel::Normal
+        );
+        assert_eq!(
+            level(&mut memo, at(2), Ok(None)),
+            MemoryPressureLevel::Normal
+        );
+        // The same failure without the memo is the Unknown blip (bd-krwm).
+        assert_eq!(
+            super::memory_pressure_with_local(&info, Some(0), timed_out(), 1).level,
+            MemoryPressureLevel::Unknown
+        );
+        // Failures that outlast the grace are not hidden: the carried sample
+        // keeps the time of the last success (2 s).
+        assert_eq!(
+            level(&mut memo, at(32), timed_out()),
+            MemoryPressureLevel::Normal
+        );
+        assert_eq!(
+            level(&mut memo, at(33), timed_out()),
+            MemoryPressureLevel::Unknown
+        );
+        // A failure with no earlier success is Unknown.
+        let mut fresh = super::LocalPsiMemo::default();
+        assert_eq!(
+            level(&mut fresh, at(0), timed_out()),
+            MemoryPressureLevel::Unknown
+        );
+        // A carried positive local stall still raises the level.
+        let mut stalled = super::LocalPsiMemo::default();
+        assert_eq!(
+            level(&mut stalled, at(0), Ok(Some(2_500))),
+            MemoryPressureLevel::Critical
+        );
+        assert_eq!(
+            level(&mut stalled, at(5), timed_out()),
+            MemoryPressureLevel::Critical
+        );
     }
 
     #[test]
