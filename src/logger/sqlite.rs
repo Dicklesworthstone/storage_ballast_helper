@@ -762,7 +762,9 @@ pub const DB_SIZE_CAP_BYTES: u64 = 768 * 1024 * 1024;
 pub const DB_TRIM_TARGET_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Tables a trim deletes from, oldest rows first, with their time column.
-/// `ballast_inventory` is one row per ballast file and is never trimmed.
+/// Each time column must lead an index: a batch finds its cutoff and
+/// deletes through it. `ballast_inventory` is one row per ballast file and
+/// is never trimmed.
 const TRIMMED_TABLES: [(&str, &str); 4] = [
     ("decision_log", "timestamp"),
     ("decision_outcome", "observed_at"),
@@ -1245,6 +1247,7 @@ mod tests {
         assert!(logger.delete_oldest_batch().unwrap());
         assert_eq!(ids(&logger, "decision_log"), (2_500, 2_501, 5_000));
 
+        // Down to two rows: the older one goes.
         logger
             .conn
             .execute(
@@ -1260,9 +1263,9 @@ mod tests {
         assert!(!logger.delete_oldest_batch().unwrap());
     }
 
-    /// Rows stamped while the clock ran ahead do not hold back the rows
-    /// written after it was corrected: those go first, and activity rows
-    /// newer than them survive.
+    /// Rows stamped while the clock ran ahead (the lowest ids here) do not
+    /// hold back the rows written after it was corrected: the corrected rows
+    /// go first, oldest first, and activity rows newer than them survive.
     #[test]
     fn size_cap_rows_from_a_clock_that_ran_ahead_do_not_stall_the_trim() {
         let (_dir, logger) = temp_db();
@@ -1302,12 +1305,12 @@ mod tests {
         assert_eq!(ids(&logger, "activity_log").0, 70);
     }
 
-    /// With two dense tables the cutoff is the earlier boundary: decisions
+    /// With two dense tables the cutoff is the earlier step time: decisions
     /// reach t=4999 in 5000 rows, activity (one row every 2 s) only reaches
     /// t=9998, so activity keeps everything after t=4999 instead of losing
     /// rows newer than the decisions that remain.
     #[test]
-    fn size_cap_cutoff_is_the_earliest_boundary() {
+    fn size_cap_cutoff_is_the_earliest_step_time() {
         let (_dir, logger) = temp_db();
         fill_decisions(&logger, 0, 12_000, 64);
         logger.conn.execute_batch("BEGIN").unwrap();
@@ -1320,6 +1323,31 @@ mod tests {
         assert_eq!(ids(&logger, "decision_log").0, 7_000);
         // Rows at t = 0, 2, ..., 4998 go; 9500 remain, from t = 5000.
         assert_eq!(ids(&logger, "activity_log"), (9_500, 2_501, 12_000));
+    }
+
+    /// Every trimmed time column leads an index, so a batch never sorts or
+    /// scans a whole table.
+    #[test]
+    fn size_cap_time_columns_lead_an_index() {
+        let (_dir, logger) = temp_db();
+        let leads_an_index = |table: &str, column: &str| -> bool {
+            logger
+                .conn
+                .query_row(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM pragma_index_list(?1) AS l
+                        JOIN pragma_index_info(l.name) AS i
+                        WHERE i.seqno = 0 AND i.name = ?2
+                    )",
+                    params![table, column],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        for (table, column) in TRIMMED_TABLES {
+            assert!(leads_an_index(table, column), "{table}.{column}");
+        }
+        assert!(!leads_an_index("decision_log", "record"));
     }
 
     #[test]
