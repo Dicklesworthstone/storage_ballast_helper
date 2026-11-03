@@ -6,6 +6,16 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.7.12 **[release]**
+
+Compare: [`v0.7.11...v0.7.12`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.11...v0.7.12)
+
+Fixes found while v0.7.11 rolled out across the fleet. sbh stops deleting the
+same rch warm cache over and over. The macOS target-only tier works with the
+scratch-root exclusion that Macs actually deploy. `sbh check --agent-scratch`
+can label a session idle. A slow cgroup read no longer drops the memory level
+to Unknown. The size-cap trim deletes rows oldest first.
+
 ### Fixed
 
 - **An rch warm cache that sbh keeps deleting is held longer each time.**
