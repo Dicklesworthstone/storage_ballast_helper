@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, params};
 
 use crate::core::errors::{Result, SbhError};
 use crate::scanner::decision_record::DecisionRecord;
@@ -494,60 +494,60 @@ impl SqliteLogger {
         Ok(false)
     }
 
-    /// Delete, in one transaction, every trimmed row up to a cutoff time:
-    /// the earliest time any table reaches at its boundary row, the last row
-    /// within its step. A table's step is [`TRIM_BATCH_ROWS`] ids, or half
-    /// its id span if that is smaller, so each table loses at most one step,
-    /// never its newest row while it holds two, and all keep the same recent
-    /// window. The table that sets the cutoff always loses its boundary row,
-    /// so a batch makes progress even if timestamps run out of order.
-    /// Returns false when every trimmed table is empty.
+    /// Delete, in one transaction, every trimmed row at or before a cutoff
+    /// time: the earliest of the tables' step times. A table's step time is
+    /// that of its [`TRIM_BATCH_ROWS`]-th oldest row, or, when it holds no
+    /// more rows than that, of the last row in its oldest half (rounded up).
+    /// So rows leave in time order whatever order they were written in, all
+    /// tables keep the same recent window, each loses at most one step
+    /// (plus rows sharing the cutoff time), a table keeps its newest row
+    /// unless that row shares the cutoff time, and the table that sets the
+    /// cutoff loses at least one row. Returns false when every trimmed table
+    /// is empty.
     ///
-    /// The boundary is a rowid lookup, not a scan of the batch. Ids can
-    /// have gaps (a retention purge after a clock jump); a gap only
-    /// shortens a step.
+    /// The lookups and the delete walk each table's time index; only a table
+    /// within one step of empty is counted.
     fn delete_oldest_batch(&self) -> Result<bool> {
-        // (table, time column, boundary id)
-        let mut spans: Vec<(&str, &str, i64)> = Vec::new();
+        let mut present: Vec<(&str, &str)> = Vec::new();
         let mut cutoff: Option<String> = None;
         for (table, column) in TRIMMED_TABLES {
-            // Two subqueries: SQLite finds a lone min() or max() by rowid,
-            // but `SELECT min(id), max(id)` scans the whole table.
-            let (first_id, last_id): (Option<i64>, Option<i64>) = self.conn.query_row(
-                &format!("SELECT (SELECT min(id) FROM {table}), (SELECT max(id) FROM {table})"),
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let (Some(first_id), Some(last_id)) = (first_id, last_id) else {
-                continue;
+            let sql = format!("SELECT {column} FROM {table} ORDER BY {column} LIMIT 2 OFFSET ?1");
+            // The time at `offset` in time order, and the next one if any.
+            let nth_oldest = |offset: i64| -> rusqlite::Result<Vec<String>> {
+                self.conn
+                    .prepare(&sql)?
+                    .query_map([offset], |row| row.get(0))?
+                    .collect()
             };
-            let step = TRIM_BATCH_ROWS.min((last_id - first_id) / 2 + 1);
-            let Some((end_id, stamp)) = self
-                .conn
-                .query_row(
-                    &format!(
-                        "SELECT id, {column} FROM {table} WHERE id <= ?1 ORDER BY id DESC LIMIT 1"
-                    ),
-                    params![first_id + step - 1],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()?
-            else {
+            let mut stamps = nth_oldest(TRIM_BATCH_ROWS - 1)?;
+            if stamps.len() < 2 {
+                // A full step would empty the table: take its oldest half.
+                let rows: i64 =
+                    self.conn
+                        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                            row.get(0)
+                        })?;
+                if rows == 0 {
+                    continue;
+                }
+                stamps = nth_oldest((rows - 1) / 2)?;
+            }
+            let Some(stamp) = stamps.into_iter().next() else {
                 continue;
             };
             if cutoff.as_ref().is_none_or(|earliest| stamp < *earliest) {
                 cutoff = Some(stamp);
             }
-            spans.push((table, column, end_id));
+            present.push((table, column));
         }
         let Some(cutoff) = cutoff else {
             return Ok(false);
         };
         let tx = self.conn.unchecked_transaction()?;
-        for (table, column, end_id) in &spans {
+        for (table, column) in &present {
             tx.execute(
-                &format!("DELETE FROM {table} WHERE id <= ?1 AND {column} <= ?2"),
-                params![end_id, cutoff],
+                &format!("DELETE FROM {table} WHERE {column} <= ?1"),
+                params![cutoff],
             )?;
         }
         tx.commit()?;
@@ -1194,11 +1194,12 @@ mod tests {
         assert_eq!(logger.page_bytes().unwrap().0, file, "freed pages reused");
     }
 
-    /// Timestamps that run backwards still cost every batch the row that
-    /// sets the cutoff, so a trim to an unreachable target ends with every
-    /// trimmed table empty instead of spinning.
+    /// Rows leave in time order, not id order: with timestamps running
+    /// backwards the highest ids go first, half the table per batch, and a
+    /// trim to an unreachable target ends with the table empty instead of
+    /// spinning.
     #[test]
-    fn size_cap_makes_progress_with_out_of_order_timestamps() {
+    fn size_cap_trims_by_time_when_timestamps_run_backwards() {
         let (_dir, logger) = temp_db();
         logger.conn.execute_batch("BEGIN").unwrap();
         for i in 0..300u32 {
@@ -1215,11 +1216,10 @@ mod tests {
         }
         logger.conn.execute_batch("COMMIT").unwrap();
 
-        // The step is 150 ids; the cutoff is decision 150's time, the
-        // earliest within the step, and only decision 150 qualifies.
+        // The 150 oldest times belong to ids 151..=300.
         assert!(logger.delete_oldest_batch().unwrap());
-        let mut left = ids(&logger, "decision_log").0;
-        assert_eq!(left, 299);
+        assert_eq!(ids(&logger, "decision_log"), (150, 1, 150));
+        let mut left = 150;
         while logger.delete_oldest_batch().unwrap() {
             let now = ids(&logger, "decision_log").0;
             assert!(now < left, "a batch deleted nothing at {left} rows");
@@ -1235,28 +1235,49 @@ mod tests {
         );
     }
 
-    /// A table smaller than two batches loses at most half its rows per
-    /// batch and never its newest row while it holds two, even across id
-    /// gaps, so the trim can stop at its target instead of emptying small
-    /// tables in one step.
+    /// A table that one full step would empty loses its oldest half
+    /// instead, and a table of two rows keeps its newest, so the trim can
+    /// stop at its target instead of emptying small tables in one step.
     #[test]
     fn size_cap_batch_never_takes_the_newest_row() {
         let (_dir, logger) = temp_db();
-        fill_decisions(&logger, 0, 100, 64);
+        fill_decisions(&logger, 0, 5_000, 64);
         assert!(logger.delete_oldest_batch().unwrap());
-        assert_eq!(ids(&logger, "decision_log"), (50, 51, 100));
+        assert_eq!(ids(&logger, "decision_log"), (2_500, 2_501, 5_000));
 
-        // The boundary is the last id within the step, not the first past it.
         logger
             .conn
-            .execute("DELETE FROM decision_log WHERE id BETWEEN 52 AND 99", [])
+            .execute(
+                "DELETE FROM decision_log WHERE id BETWEEN 2502 AND 4999",
+                [],
+            )
             .unwrap();
         assert!(logger.delete_oldest_batch().unwrap());
-        assert_eq!(ids(&logger, "decision_log"), (1, 100, 100));
+        assert_eq!(ids(&logger, "decision_log"), (1, 5_000, 5_000));
 
         assert!(logger.delete_oldest_batch().unwrap());
         assert_eq!(ids(&logger, "decision_log").0, 0);
         assert!(!logger.delete_oldest_batch().unwrap());
+    }
+
+    /// Rows stamped while the clock ran ahead do not hold back the rows
+    /// written after it was corrected: those go first, and activity rows
+    /// newer than them survive.
+    #[test]
+    fn size_cap_rows_from_a_clock_that_ran_ahead_do_not_stall_the_trim() {
+        let (_dir, logger) = temp_db();
+        fill_decisions(&logger, 1_000_000, 1_000, 64);
+        fill_decisions(&logger, 0, 11_000, 64);
+        fill_activity(&logger, 20_000, 100);
+
+        assert!(logger.delete_oldest_batch().unwrap());
+        assert_eq!(ids(&logger, "decision_log"), (7_000, 1, 12_000));
+        assert!(logger.delete_oldest_batch().unwrap());
+        assert_eq!(ids(&logger, "decision_log"), (2_000, 1, 12_000));
+        // The corrected rows left now go as the table's oldest half.
+        assert!(logger.delete_oldest_batch().unwrap());
+        assert_eq!(ids(&logger, "decision_log"), (1_000, 1, 1_000));
+        assert_eq!(ids(&logger, "activity_log").0, 100);
     }
 
     /// One batch shares a cutoff across tables: rows interleaved in time
