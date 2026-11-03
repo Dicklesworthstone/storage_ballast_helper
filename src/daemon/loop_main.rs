@@ -107,7 +107,8 @@ use crate::scanner::regret::{
     certainty_from_name,
 };
 use crate::scanner::scoring::{
-    ActiveReferenceSummary, ArtifactCertainty, CandidacyScore, ScoringEngine,
+    ActiveReferenceSummary, ArtifactCertainty, CandidacyScore, RCH_REDELETION_MEMORY,
+    ScoringEngine, is_rch_warm_cache, rch_redeletion_counts,
 };
 use crate::scanner::walker::{
     ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkEntry, WalkStream,
@@ -339,6 +340,9 @@ impl SharedExecutorConfig {
 struct SharedRegret {
     detector: Mutex<RegretDetector>,
     calibrator: Mutex<RegretCalibrator>,
+    /// When sbh deleted each rch warm-cache path, which sets that path's
+    /// re-deletion backoff (bd-tz67). Pruned past [`RCH_REDELETION_MEMORY`].
+    rch_deletions: Mutex<Vec<(PathBuf, SystemTime)>>,
 }
 
 impl SharedRegret {
@@ -347,7 +351,24 @@ impl SharedRegret {
         Self {
             detector: Mutex::new(RegretDetector::new(regret.window)),
             calibrator: Mutex::new(RegretCalibrator::new(regret)),
+            rch_deletions: Mutex::new(Vec::new()),
         }
+    }
+
+    /// sbh's earlier deletions of each rch warm-cache path still inside
+    /// [`RCH_REDELETION_MEMORY`], for [`ScoringEngine::set_rch_redeletions`].
+    fn rch_redeletions(&self, now: SystemTime) -> HashMap<PathBuf, u32> {
+        let mut deletions = self.rch_deletions.lock();
+        deletions.retain(|(_, deleted_at)| {
+            !now.duration_since(*deleted_at)
+                .is_ok_and(|age| age > RCH_REDELETION_MEMORY)
+        });
+        rch_redeletion_counts(
+            deletions
+                .iter()
+                .map(|(path, deleted_at)| (path, *deleted_at)),
+            now,
+        )
     }
 
     /// Reconfigure both feedback components while retaining pending
@@ -423,6 +444,11 @@ impl SharedRegret {
             deleted_at: completed_at,
         };
         self.detector.lock().watch(watch);
+        if is_rch_warm_cache(&candidate.path) {
+            self.rch_deletions
+                .lock()
+                .push((candidate.path.clone(), SystemTime::now()));
+        }
     }
 }
 
@@ -448,6 +474,18 @@ fn replay_regret_outcomes(regret: &SharedRegret, sqlite_db: &Path) {
         return;
     };
     let count = outcomes.len();
+    // Every outcome closes one deletion, at `observed_at - after_secs`.
+    let rch_deletions: Vec<(PathBuf, SystemTime)> = outcomes
+        .iter()
+        .filter_map(|stored| {
+            let path = PathBuf::from(&stored.path);
+            let observed_at = chrono::DateTime::parse_from_rfc3339(&stored.observed_at).ok()?;
+            let deleted_at = SystemTime::from(observed_at)
+                .checked_sub(Duration::from_secs(stored.after_secs))?;
+            is_rch_warm_cache(&path).then_some((path, deleted_at))
+        })
+        .collect();
+    regret.rch_deletions.lock().extend(rch_deletions);
     regret.calibrator.lock().replay(
         outcomes.into_iter().filter_map(|stored| {
             Outcome::from_name(&stored.outcome).map(|outcome| {
@@ -8640,6 +8678,8 @@ fn scanner_thread_main(
         // pre-scan).
         let regret_view = regret.scoring_view(Instant::now());
         engine.set_regret(regret_view.0.clone(), regret_view.1.clone());
+        let rch_redeletions = regret.rch_redeletions(SystemTime::now());
+        engine.set_rch_redeletions(rch_redeletions.clone());
 
         // If no paths to scan, skip.
         if request.paths.is_empty() {
@@ -8834,6 +8874,7 @@ fn scanner_thread_main(
                     current_scanner_config.min_file_age_minutes,
                 );
                 replay_engine.set_regret(regret_view.0.clone(), regret_view.1.clone());
+                replay_engine.set_rch_redeletions(rch_redeletions.clone());
                 for record in &records {
                     match replay_indexed_record(
                         record,
@@ -9037,6 +9078,7 @@ fn scanner_thread_main(
                 current_scanner_config.min_file_age_minutes,
             );
             prescan_engine.set_regret(regret_view.0.clone(), regret_view.1.clone());
+            prescan_engine.set_rch_redeletions(rch_redeletions.clone());
             let prescan_root_order: Vec<PathBuf> = cursor
                 .root_order(&active_scan_paths)
                 .into_iter()
@@ -12080,6 +12122,59 @@ mod tests {
             certainty: ArtifactCertainty::Definite,
             deleted_at: now,
         }
+    }
+
+    /// bd-tz67: a restart keeps each rch warm cache's deletion history from
+    /// the ledger, dated at the deletion rather than the observation, and
+    /// nothing else.
+    #[test]
+    fn regret_replay_seeds_rch_redeletions_from_the_ledger() {
+        use crate::logger::sqlite::SqliteLogger;
+        use crate::scanner::regret::DecisionOutcome as Labelled;
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("activity.sqlite3");
+        let now = SystemTime::now();
+        let unix = |at: SystemTime| at.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let pool = PathBuf::from("/data/projects/ft/.rch-target-hz3-pool-abc");
+        let go = PathBuf::from("/data/projects/lvr/.rch-go/mod");
+        let plain = PathBuf::from("/data/projects/ft/target");
+        {
+            let db = SqliteLogger::open(&db_path).unwrap();
+            for (id, path, observed, after_secs) in [
+                ("a", &pool, now - Duration::from_hours(1), 600),
+                ("b", &pool, now - Duration::from_hours(50), 1_800),
+                ("c", &go, now - Duration::from_mins(5), 300),
+                // Not an rch warm cache.
+                ("d", &plain, now - Duration::from_mins(5), 300),
+                // Observed inside the memory window, deleted before it.
+                (
+                    "e",
+                    &go,
+                    now - RCH_REDELETION_MEMORY + Duration::from_hours(1),
+                    7_200,
+                ),
+            ] {
+                db.log_outcome(&Labelled {
+                    decision_id: id.to_string(),
+                    path: path.clone(),
+                    category: "RustTarget".to_string(),
+                    certainty: "definite".to_string(),
+                    outcome: Outcome::Regret,
+                    observed_at: unix(observed),
+                    after_secs,
+                    detail: String::new(),
+                })
+                .unwrap();
+            }
+        }
+
+        let regret = SharedRegret::new(&Config::default());
+        replay_regret_outcomes(&regret, &db_path);
+        let counts = regret.rch_redeletions(now);
+        assert_eq!(counts.get(&pool), Some(&2));
+        assert_eq!(counts.get(&go), Some(&1));
+        assert_eq!(counts.get(&plain), None);
+        assert_eq!(counts.len(), 2);
     }
 
     #[cfg(unix)]

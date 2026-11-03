@@ -419,9 +419,19 @@ pub struct ScoringEngine {
     category_calibration: HashMap<String, f64>,
     /// Categories whose deletions are paused after a regret alarm.
     suspended_categories: HashSet<String>,
+    /// sbh's earlier deletions of each rch warm-cache path within
+    /// [`RCH_REDELETION_MEMORY`]; absent means none (bd-tz67).
+    rch_redeletions: HashMap<PathBuf, u32>,
 }
 
 impl ScoringEngine {
+    /// Apply sbh's own deletion history of rch warm caches (see
+    /// [`rch_redeletion_counts`]): each earlier deletion of a path doubles
+    /// its pressure idle floor.
+    pub fn set_rch_redeletions(&mut self, counts: HashMap<PathBuf, u32>) {
+        self.rch_redeletions = counts;
+    }
+
     /// Apply the regret calibrator's view: a factor per category that
     /// multiplies the classification calibration, and the categories whose
     /// `Delete` verdicts become `Review` for now.
@@ -458,6 +468,7 @@ impl ScoringEngine {
             posterior_floor_definite: scoring.posterior_floor_definite.clamp(0.0, 1.0),
             category_calibration: HashMap::new(),
             suspended_categories: HashSet::new(),
+            rch_redeletions: HashMap::new(),
         }
     }
 
@@ -670,10 +681,11 @@ impl ScoringEngine {
                 "inside a uv cache entry: installed packages, managed by uv",
             ));
         }
-        if let Some(reason) = rch_target_veto_reason(&input.path, urgency) {
+        let earlier_deletions = self.rch_redeletions.get(&input.path).copied().unwrap_or(0);
+        if let Some(reason) = rch_target_veto_reason(&input.path, urgency, earlier_deletions) {
             return Some(reason);
         }
-        if let Some(reason) = rch_go_veto_reason(&input.path, urgency) {
+        if let Some(reason) = rch_go_veto_reason(&input.path, urgency, earlier_deletions) {
             return Some(reason);
         }
         // The executor refuses symlinks (removal would follow them out of the
@@ -834,6 +846,26 @@ impl RchTargetKind {
         }
     }
 
+    /// [`Self::idle_floor`] after `earlier_deletions` sbh deletions of the
+    /// same path within [`RCH_REDELETION_MEMORY`]: the floor doubles per
+    /// deletion, up to rch's own floor (bd-tz67).
+    ///
+    /// A path that keeps coming back is a warm cache in use. Deleting it
+    /// again at the short floor buys a cold rebuild every cycle and frees
+    /// nothing for long: hz3 deleted one frankenterm release pool three times
+    /// in three days, each at about 1 h idle, and rch rebuilt it 20-29 minutes
+    /// later every time. The repeat-deletion dampener cannot stop this,
+    /// because it stands aside at Red and Critical, where 774 GB workers sit
+    /// permanently.
+    fn idle_floor_after(self, urgency: f64, earlier_deletions: u32) -> Duration {
+        let floor = self.idle_floor(urgency);
+        let factor = 1u32.checked_shl(earlier_deletions).unwrap_or(u32::MAX);
+        floor
+            .saturating_mul(factor)
+            .min(self.required_idle())
+            .max(floor)
+    }
+
     const fn label(self) -> &'static str {
         match self {
             Self::PerJob => "per-job",
@@ -862,6 +894,49 @@ pub(crate) const RCH_PRESSURE_PER_JOB_IDLE_MINUTES: u64 = 30;
 
 /// Pooled idle floor once urgency reaches [`RCH_PRESSURE_URGENCY`].
 pub(crate) const RCH_PRESSURE_POOLED_IDLE_MINUTES: u64 = 60;
+
+/// How long sbh remembers deleting an rch warm cache when it sets that
+/// path's idle floor: rch's own pooled floor, so a cache left alone that long
+/// starts over at the short floor.
+pub const RCH_REDELETION_MEMORY: Duration = Duration::from_hours(RCH_POOLED_IDLE_HOURS);
+
+/// Whether a path's pressure idle floor backs off per repeat deletion: an rch
+/// target dir, or anything in a `.rch-go` dir.
+#[must_use]
+pub fn is_rch_warm_cache(path: &Path) -> bool {
+    classify_rch_target(path).is_some() || rch_go_root(path).is_some()
+}
+
+/// sbh's earlier deletions per rch warm-cache path, from `(path, deleted at)`
+/// records, counting those within [`RCH_REDELETION_MEMORY`] of `now` (a
+/// record stamped after `now` counts too). Other paths are ignored.
+#[must_use]
+pub fn rch_redeletion_counts<P: AsRef<Path>>(
+    deletions: impl IntoIterator<Item = (P, std::time::SystemTime)>,
+    now: std::time::SystemTime,
+) -> HashMap<PathBuf, u32> {
+    let mut counts: HashMap<PathBuf, u32> = HashMap::new();
+    for (path, deleted_at) in deletions {
+        let path = path.as_ref();
+        let recent = !now
+            .duration_since(deleted_at)
+            .is_ok_and(|age| age > RCH_REDELETION_MEMORY);
+        if recent && is_rch_warm_cache(path) {
+            let count = counts.entry(path.to_path_buf()).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+    }
+    counts
+}
+
+/// The note a veto adds when earlier deletions raised the floor.
+fn redeletion_note(earlier_deletions: u32, raised: bool) -> String {
+    if !raised {
+        return String::new();
+    }
+    let plural = if earlier_deletions == 1 { "" } else { "s" };
+    format!(", raised by {earlier_deletions} earlier deletion{plural} of this path")
+}
 
 /// Classify a path as an rch-managed target dir by its basename.
 ///
@@ -970,14 +1045,19 @@ fn rch_tree_activity(root: &Path, window: Duration, max_entries: usize) -> TreeA
 }
 
 /// Hard-veto rch target dirs unless they are idle past the floor for this
-/// urgency (see [`RchTargetKind::idle_floor`]).
+/// urgency and this path's earlier deletions (see
+/// [`RchTargetKind::idle_floor_after`]).
 ///
 /// Deleting a live pool dir does not reclaim reusable space — it forces every
 /// subsequent dispatch sharing those build dimensions to rebuild the whole
 /// crate graph from cold, and can clip a build already in flight.
-fn rch_target_veto_reason(path: &Path, urgency: f64) -> Option<Cow<'static, str>> {
+fn rch_target_veto_reason(
+    path: &Path,
+    urgency: f64,
+    earlier_deletions: u32,
+) -> Option<Cow<'static, str>> {
     let kind = classify_rch_target(path)?;
-    let required = kind.idle_floor(urgency);
+    let required = kind.idle_floor_after(urgency, earlier_deletions);
     let max_entries = if urgency < RCH_PRESSURE_URGENCY {
         RCH_IDLE_PROBE_MAX_ENTRIES
     } else {
@@ -986,9 +1066,10 @@ fn rch_target_veto_reason(path: &Path, urgency: f64) -> Option<Cow<'static, str>
     match rch_tree_activity(path, required, max_entries) {
         TreeActivity::IdleThroughout => None,
         TreeActivity::Active => Some(Cow::Owned(format!(
-            "rch {} target dir has file activity within the {}m idle floor",
+            "rch {} target dir has file activity within the {}m idle floor{}",
             kind.label(),
-            required.as_secs() / 60
+            required.as_secs() / 60,
+            redeletion_note(earlier_deletions, required > kind.idle_floor(urgency))
         ))),
         TreeActivity::Unknown => Some(Cow::Owned(format!(
             "rch {} target dir idleness could not be established",
@@ -1022,10 +1103,14 @@ fn rch_go_root(path: &Path) -> Option<&Path> {
 /// Activity is the project's: anything written in the whole `.rch-go` tree,
 /// or in `<project>/.rch-tmp`, the TMPDIR rch forces on every job, whose own
 /// mtime moves whenever a job's tool makes and removes a temp dir there.
-fn rch_go_veto_reason(path: &Path, urgency: f64) -> Option<Cow<'static, str>> {
+fn rch_go_veto_reason(
+    path: &Path,
+    urgency: f64,
+    earlier_deletions: u32,
+) -> Option<Cow<'static, str>> {
     let go_root = rch_go_root(path)?;
     let kind = RchTargetKind::Pooled;
-    let required = kind.idle_floor(urgency);
+    let required = kind.idle_floor_after(urgency, earlier_deletions);
     let max_entries = if urgency < RCH_PRESSURE_URGENCY {
         RCH_IDLE_PROBE_MAX_ENTRIES
     } else {
@@ -1048,8 +1133,9 @@ fn rch_go_veto_reason(path: &Path, urgency: f64) -> Option<Cow<'static, str>> {
     match activity {
         TreeActivity::IdleThroughout => None,
         TreeActivity::Active => Some(Cow::Owned(format!(
-            "rch project Go cache (pooled) has job activity within the {}m idle floor",
-            required.as_secs() / 60
+            "rch project Go cache (pooled) has job activity within the {}m idle floor{}",
+            required.as_secs() / 60,
+            redeletion_note(earlier_deletions, required > kind.idle_floor(urgency))
         ))),
         TreeActivity::Unknown => Some(Cow::Borrowed(
             "rch project Go cache (pooled) idleness could not be established",
@@ -1783,7 +1869,7 @@ mod tests {
 
             for urgency in [0.0, 1.0] {
                 assert!(
-                    rch_target_veto_reason(&pool, urgency).is_some(),
+                    rch_target_veto_reason(&pool, urgency, 0).is_some(),
                     "active pool dir must be vetoed at urgency {urgency}"
                 );
             }
@@ -1836,7 +1922,7 @@ mod tests {
             filetime::set_file_mtime(pool.join("debug"), ft).unwrap();
 
             assert!(
-                rch_target_veto_reason(&pool, 0.0).is_none(),
+                rch_target_veto_reason(&pool, 0.0, 0).is_none(),
                 "a pool dir idle beyond rch's floor must remain reclaimable"
             );
         }
@@ -1865,26 +1951,153 @@ mod tests {
             // Idle two hours: past the 1h pressure floor, inside rch's 168h.
             let idle = make(".rch-target-hz1-pool-idle2h", Duration::from_hours(2));
             assert!(
-                rch_target_veto_reason(&idle, 0.5).is_some(),
+                rch_target_veto_reason(&idle, 0.5, 0).is_some(),
                 "below pressure urgency keeps 168h"
             );
             assert!(
-                rch_target_veto_reason(&idle, 0.7).is_none(),
+                rch_target_veto_reason(&idle, 0.7, 0).is_none(),
                 "pressure urgency uses 1h"
             );
             assert!(
-                rch_target_veto_reason(&idle, 1.0).is_none(),
+                rch_target_veto_reason(&idle, 1.0, 0).is_none(),
                 "maximum urgency uses 1h"
             );
 
             // Written 10 minutes ago: in use, whatever the pressure.
             let busy = make(".rch-target-hz1-pool-busy", Duration::from_mins(10));
-            assert!(rch_target_veto_reason(&busy, 1.0).is_some());
+            assert!(rch_target_veto_reason(&busy, 1.0, 0).is_some());
 
             // Per-job dirs: 30 minutes under pressure, 12h otherwise.
             let job = make(".rch-target-hz1-job-7-1-1", Duration::from_mins(45));
-            assert!(rch_target_veto_reason(&job, 0.0).is_some());
-            assert!(rch_target_veto_reason(&job, 0.9).is_none());
+            assert!(rch_target_veto_reason(&job, 0.0, 0).is_some());
+            assert!(rch_target_veto_reason(&job, 0.9, 0).is_none());
+        }
+
+        /// bd-tz67: hz3's frankenterm pool was deleted, rebuilt by the next
+        /// job, and deleted again inside the 1h pressure floor, all at
+        /// Critical where the repeat-deletion dampener stands aside. Each
+        /// earlier deletion of the same path doubles its pressure floor, up
+        /// to rch's own warm-cache floor.
+        #[test]
+        fn each_earlier_deletion_doubles_the_pressure_floor_up_to_rch_s() {
+            let tmp = tempfile::tempdir().unwrap();
+            let make = |name: &str, age: Duration| {
+                let pool = tmp.path().join(name);
+                std::fs::create_dir_all(pool.join("debug")).unwrap();
+                std::fs::write(pool.join("debug/old.rlib"), b"x").unwrap();
+                let stamp =
+                    filetime::FileTime::from_system_time(std::time::SystemTime::now() - age);
+                filetime::set_file_mtime(pool.join("debug/old.rlib"), stamp).unwrap();
+                filetime::set_file_mtime(pool.join("debug"), stamp).unwrap();
+                pool
+            };
+
+            // Idle 90 minutes: past the 1h floor, inside 2h.
+            let pool = make(".rch-target-hz3-pool-rebuilt", Duration::from_mins(90));
+            assert!(
+                rch_target_veto_reason(&pool, 1.0, 0).is_none(),
+                "no history keeps the 1h pressure floor"
+            );
+            let reason = rch_target_veto_reason(&pool, 1.0, 1);
+            assert!(
+                reason.as_deref().is_some_and(|r| r.contains("120m")
+                    && r.contains("raised by 1 earlier deletion of this path")),
+                "one earlier deletion raises the floor to 2h: {reason:?}"
+            );
+
+            // Idle 5 hours: two deletions (4h) let it go, three (8h) hold it.
+            let pool = make(".rch-target-hz3-pool-five", Duration::from_hours(5));
+            assert!(rch_target_veto_reason(&pool, 1.0, 2).is_none());
+            assert!(rch_target_veto_reason(&pool, 1.0, 3).is_some());
+
+            // The cap: however many deletions, a pool idle past rch's 168h
+            // floor stays reclaimable, and the shift cannot overflow.
+            let pool = make(".rch-target-hz3-pool-cold", Duration::from_hours(170));
+            for earlier in [8, 31, 32, u32::MAX] {
+                assert!(
+                    rch_target_veto_reason(&pool, 1.0, earlier).is_none(),
+                    "{earlier} earlier deletions must not exceed 168h"
+                );
+            }
+
+            // Per-job dirs double from 30 minutes and cap at 12h.
+            let job = make(".rch-target-hz3-job-9-1-1", Duration::from_mins(45));
+            assert!(rch_target_veto_reason(&job, 0.9, 0).is_none());
+            assert!(rch_target_veto_reason(&job, 0.9, 1).is_some());
+            let job = make(".rch-target-hz3-job-9-1-2", Duration::from_hours(13));
+            assert!(rch_target_veto_reason(&job, 0.9, 20).is_none());
+        }
+
+        /// Only rch warm-cache paths are counted, only inside the memory
+        /// window, and each path only against its own history.
+        #[test]
+        fn redeletion_counts_cover_recent_rch_warm_caches_only() {
+            use super::super::{RCH_REDELETION_MEMORY, rch_redeletion_counts};
+            let now = std::time::SystemTime::now();
+            let pool = PathBuf::from("/data/projects/ft/.rch-target-hz3-pool-abc");
+            let go = PathBuf::from("/data/projects/lvr/.rch-go/mod");
+            let plain = PathBuf::from("/data/projects/ft/target");
+            let other_pool = PathBuf::from("/data/projects/fs/.rch-target-hz3-pool-def");
+            let counts = rch_redeletion_counts(
+                [
+                    (&pool, now - Duration::from_hours(2)),
+                    (&pool, now - Duration::from_hours(30)),
+                    // Outside the window: forgotten.
+                    (&pool, now - RCH_REDELETION_MEMORY - Duration::from_mins(1)),
+                    (&go, now - Duration::from_mins(5)),
+                    // Not an rch warm cache: never counted.
+                    (&plain, now - Duration::from_mins(5)),
+                    // A clock-skewed future stamp still counts as recent.
+                    (&other_pool, now + Duration::from_mins(5)),
+                ],
+                now,
+            );
+            assert_eq!(counts.get(&pool), Some(&2));
+            assert_eq!(counts.get(&go), Some(&1));
+            assert_eq!(counts.get(&other_pool), Some(&1));
+            assert_eq!(counts.get(&plain), None);
+            assert_eq!(counts.len(), 3);
+        }
+
+        /// The engine applies a path's own history and nobody else's.
+        #[test]
+        fn engine_raises_the_floor_only_for_the_redeleted_path() {
+            let tmp = tempfile::tempdir().unwrap();
+            let make = |name: &str| {
+                let pool = tmp.path().join(name);
+                std::fs::create_dir_all(pool.join("debug")).unwrap();
+                std::fs::write(pool.join("debug/old.rlib"), b"x").unwrap();
+                let stamp = filetime::FileTime::from_system_time(
+                    std::time::SystemTime::now() - Duration::from_mins(90),
+                );
+                filetime::set_file_mtime(pool.join("debug/old.rlib"), stamp).unwrap();
+                filetime::set_file_mtime(pool.join("debug"), stamp).unwrap();
+                pool
+            };
+            let redeleted = make(".rch-target-hz3-pool-again");
+            let fresh = make(".rch-target-hz3-pool-first");
+            let input = |path: &Path| CandidateInput {
+                path: path.to_path_buf(),
+                size_bytes: 9_000_000_000,
+                age: Duration::from_mins(90),
+                classification: classification(0.92, ArtifactCategory::RustTarget),
+                signals: StructuralSignals::default(),
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            };
+
+            let mut engine = default_engine();
+            engine.set_rch_redeletions(std::collections::HashMap::from([(redeleted.clone(), 1)]));
+            let held = engine.score_candidate(&input(&redeleted), 1.0);
+            assert!(held.vetoed, "redeleted pool must be held at 90m idle");
+            assert_eq!(held.decision.action, DecisionAction::Keep);
+            let free = engine.score_candidate(&input(&fresh), 1.0);
+            assert!(
+                !free.vetoed,
+                "another path's history must not hold this pool: {:?}",
+                free.veto_reason
+            );
         }
 
         /// `<project>/.rch-go` with a Go build cache and module cache, and the
@@ -1932,12 +2145,12 @@ mod tests {
             let (cache, module) = (project.join(".rch-go/cache"), project.join(".rch-go/mod"));
             for path in [&cache, &module, &project.join(".rch-go")] {
                 assert!(
-                    rch_go_veto_reason(path, 1.0).is_none(),
+                    rch_go_veto_reason(path, 1.0, 0).is_none(),
                     "idle past the pressure floor: {}",
                     path.display()
                 );
                 assert!(
-                    rch_go_veto_reason(path, 0.5).is_some(),
+                    rch_go_veto_reason(path, 0.5, 0).is_some(),
                     "below pressure urgency keeps the 168h pooled floor: {}",
                     path.display()
                 );
@@ -1951,7 +2164,7 @@ mod tests {
             )
             .unwrap();
             for path in [&cache, &module] {
-                let reason = rch_go_veto_reason(path, 1.0);
+                let reason = rch_go_veto_reason(path, 1.0, 0);
                 assert!(
                     reason
                         .as_deref()
@@ -1970,7 +2183,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let project = rch_go_project(tmp.path(), "lrq", Duration::from_hours(3));
             std::fs::write(project.join(".rch-go/cache/00/00bb-d"), b"y").unwrap();
-            assert!(rch_go_veto_reason(&project.join(".rch-go/mod"), 1.0).is_some());
+            assert!(rch_go_veto_reason(&project.join(".rch-go/mod"), 1.0, 0).is_some());
 
             let engine = default_engine();
             let score = engine.score_candidate(
@@ -2002,8 +2215,10 @@ mod tests {
             std::fs::write(build.join("trim.txt"), b"1").unwrap();
             std::fs::create_dir_all(tmp.path().join(".rch-tmp")).unwrap();
             for urgency in [0.0, 1.0] {
-                assert!(rch_go_veto_reason(&build, urgency).is_none());
-                assert!(rch_go_veto_reason(&tmp.path().join("job/go/pkg/mod"), urgency).is_none());
+                assert!(rch_go_veto_reason(&build, urgency, 0).is_none());
+                assert!(
+                    rch_go_veto_reason(&tmp.path().join("job/go/pkg/mod"), urgency, 0).is_none()
+                );
             }
         }
 
@@ -2012,7 +2227,7 @@ mod tests {
             // If we cannot establish idleness we must refuse to delete.
             let missing = Path::new("/nonexistent-rch-root/.rch-target-hz1-pool-abc");
             for urgency in [0.0, 1.0] {
-                assert!(rch_target_veto_reason(missing, urgency).is_some());
+                assert!(rch_target_veto_reason(missing, urgency, 0).is_some());
             }
         }
 

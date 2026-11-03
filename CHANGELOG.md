@@ -6,6 +6,21 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+### Fixed
+
+- **An rch warm cache that sbh keeps deleting is held longer each time.**
+  From Orange urgency up, an idle rch target pool or `.rch-go` cache becomes
+  reclaimable after 1 hour (per-job dirs after 30 minutes). hz3 deleted one
+  frankenterm release pool three times in three days, each time at about 1 h
+  idle, and rch rebuilt it 20-29 minutes later every time: one cold rebuild per
+  cycle, and no space freed for long. The repeat-deletion dampener cannot stop
+  this, because it stands aside at Red and Critical, where those workers sit.
+  Now each earlier deletion of the same path within the last 7 days doubles that
+  path's pressure idle floor, up to rch's own floor (168 h pooled, 12 h
+  per-job). Other paths are unaffected. The daemon counts deletions as it makes
+  them, and on start it reads them from the regret ledger's outcomes. `sbh
+  explain` scores at zero urgency, where this floor never applies (bd-tz67).
+
 ## v0.7.11 **[release]**
 
 Compare: [`v0.7.9...v0.7.11`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.9...v0.7.11)
