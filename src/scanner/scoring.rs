@@ -673,6 +673,9 @@ impl ScoringEngine {
         if let Some(reason) = rch_target_veto_reason(&input.path, urgency) {
             return Some(reason);
         }
+        if let Some(reason) = rch_go_veto_reason(&input.path, urgency) {
+            return Some(reason);
+        }
         // The executor refuses symlinks (removal would follow them out of the
         // tree) and unlinking one frees nothing, so a symlink nominated by
         // name (a pnpm-style `node_modules` link) was re-proposed and refused
@@ -991,6 +994,90 @@ fn rch_target_veto_reason(path: &Path, urgency: f64) -> Option<Cow<'static, str>
             "rch {} target dir idleness could not be established",
             kind.label()
         ))),
+    }
+}
+
+/// The `.rch-go` dir holding `path` (the dir itself or anything inside it).
+///
+/// rch pins GOCACHE, GOMODCACHE and GOPATH of every job to
+/// `<project>/.rch-go/{cache,mod,path}` on the worker (rch `transfer.rs`,
+/// `managed_remote_env_value`), where `<project>` is the synced project root
+/// that every later job of the same project reuses. That makes them warm
+/// caches shared across jobs, like `.rch-target-*-pool-*`, not per-job output.
+fn rch_go_root(path: &Path) -> Option<&Path> {
+    path.ancestors()
+        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == ".rch-go"))
+}
+
+/// Hard-veto rch's per-project Go caches while the project is in use, at the
+/// pooled idle floors (bd-q0ms).
+///
+/// Their own age misjudges them: a module cache is written only when a module
+/// is downloaded, and Go refreshes a build-cache entry's mtime at most hourly,
+/// so both look idle while every job reads them. hz4 and hz2 deleted
+/// `.rch-go/mod` at 0.8 h and 0.5 h of age and the project's next job fetched
+/// it again 7 and 15 minutes later (regrets, 2026-10-31); each regret then
+/// locked the whole GoCache category on that host for 30 days.
+///
+/// Activity is the project's: anything written in the whole `.rch-go` tree,
+/// or in `<project>/.rch-tmp`, the TMPDIR rch forces on every job, whose own
+/// mtime moves whenever a job's tool makes and removes a temp dir there.
+fn rch_go_veto_reason(path: &Path, urgency: f64) -> Option<Cow<'static, str>> {
+    let go_root = rch_go_root(path)?;
+    let kind = RchTargetKind::Pooled;
+    let required = kind.idle_floor(urgency);
+    let max_entries = if urgency < RCH_PRESSURE_URGENCY {
+        RCH_IDLE_PROBE_MAX_ENTRIES
+    } else {
+        RCH_IDLE_PROBE_MAX_ENTRIES_UNDER_PRESSURE
+    };
+    let job_tmp = go_root.parent().map(|project| project.join(".rch-tmp"));
+    let tmp_activity = job_tmp
+        .as_deref()
+        .map_or(TreeActivity::IdleThroughout, |tmp| {
+            rch_job_tmp_activity(tmp, required, max_entries)
+        });
+    let activity = match tmp_activity {
+        TreeActivity::Active => TreeActivity::Active,
+        tmp => match (rch_tree_activity(go_root, required, max_entries), tmp) {
+            (TreeActivity::Active, _) => TreeActivity::Active,
+            (TreeActivity::Unknown, _) | (_, TreeActivity::Unknown) => TreeActivity::Unknown,
+            _ => TreeActivity::IdleThroughout,
+        },
+    };
+    match activity {
+        TreeActivity::IdleThroughout => None,
+        TreeActivity::Active => Some(Cow::Owned(format!(
+            "rch project Go cache (pooled) has job activity within the {}m idle floor",
+            required.as_secs() / 60
+        ))),
+        TreeActivity::Unknown => Some(Cow::Borrowed(
+            "rch project Go cache (pooled) idleness could not be established",
+        )),
+    }
+}
+
+/// Activity of an rch job TMPDIR: its own mtime (a job's temp dirs come and
+/// go, leaving only that) and anything still written inside it. A project
+/// without one has no evidence either way, so it does not hold the cache.
+fn rch_job_tmp_activity(tmp: &Path, window: Duration, max_entries: usize) -> TreeActivity {
+    let meta = match std::fs::symlink_metadata(tmp) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return TreeActivity::IdleThroughout;
+        }
+        Err(_) => return TreeActivity::Unknown,
+    };
+    if !meta.is_dir() {
+        return TreeActivity::IdleThroughout;
+    }
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(window) else {
+        return TreeActivity::Unknown;
+    };
+    match meta.modified() {
+        Ok(modified) if modified > cutoff => TreeActivity::Active,
+        Ok(_) => rch_tree_activity(tmp, window, max_entries),
+        Err(_) => TreeActivity::Unknown,
     }
 }
 
@@ -1798,6 +1885,126 @@ mod tests {
             let job = make(".rch-target-hz1-job-7-1-1", Duration::from_mins(45));
             assert!(rch_target_veto_reason(&job, 0.0).is_some());
             assert!(rch_target_veto_reason(&job, 0.9).is_none());
+        }
+
+        /// `<project>/.rch-go` with a Go build cache and module cache, and the
+        /// job TMPDIR `<project>/.rch-tmp`, every entry `age` old.
+        fn rch_go_project(root: &Path, name: &str, age: Duration) -> PathBuf {
+            let project = root.join(name);
+            let go = project.join(".rch-go");
+            std::fs::create_dir_all(go.join("cache/00")).unwrap();
+            std::fs::write(go.join("cache/trim.txt"), b"1").unwrap();
+            std::fs::write(go.join("cache/00/00aa-d"), b"x").unwrap();
+            std::fs::create_dir_all(go.join("mod/cache/download/example.com/m/@v")).unwrap();
+            std::fs::write(
+                go.join("mod/cache/download/example.com/m/@v/v1.0.0.zip"),
+                b"z",
+            )
+            .unwrap();
+            std::fs::create_dir_all(project.join(".rch-tmp")).unwrap();
+            age_tree(&project, age);
+            project
+        }
+
+        fn age_tree(root: &Path, age: Duration) {
+            fn set(path: &Path, stamp: filetime::FileTime) {
+                if path.is_dir() {
+                    for entry in std::fs::read_dir(path).unwrap() {
+                        set(&entry.unwrap().path(), stamp);
+                    }
+                }
+                filetime::set_file_mtime(path, stamp).unwrap();
+            }
+            set(
+                root,
+                filetime::FileTime::from_system_time(std::time::SystemTime::now() - age),
+            );
+        }
+
+        /// bd-q0ms: hz4 deleted `/tmp/lvr/.rch-go/mod` at 0.8 h of age and the
+        /// project's next rch job fetched it again 428 s later. Neither cache
+        /// is written by a job that only reads it; the job TMPDIR is.
+        #[test]
+        fn rch_go_caches_are_held_while_the_project_runs_jobs() {
+            use super::super::rch_go_veto_reason;
+            let tmp = tempfile::tempdir().unwrap();
+            let project = rch_go_project(tmp.path(), "lvr", Duration::from_hours(3));
+            let (cache, module) = (project.join(".rch-go/cache"), project.join(".rch-go/mod"));
+            for path in [&cache, &module, &project.join(".rch-go")] {
+                assert!(
+                    rch_go_veto_reason(path, 1.0).is_none(),
+                    "idle past the pressure floor: {}",
+                    path.display()
+                );
+                assert!(
+                    rch_go_veto_reason(path, 0.5).is_some(),
+                    "below pressure urgency keeps the 168h pooled floor: {}",
+                    path.display()
+                );
+            }
+
+            // A job ran 10 minutes ago: its tool made and removed a temp dir.
+            let job = std::time::SystemTime::now() - Duration::from_mins(10);
+            filetime::set_file_mtime(
+                project.join(".rch-tmp"),
+                filetime::FileTime::from_system_time(job),
+            )
+            .unwrap();
+            for path in [&cache, &module] {
+                let reason = rch_go_veto_reason(path, 1.0);
+                assert!(
+                    reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains("rch project Go cache")),
+                    "a job inside the floor holds {} at maximum urgency: {reason:?}",
+                    path.display()
+                );
+            }
+        }
+
+        /// The module cache of a project whose build cache was just written is
+        /// in use, however old its own files are.
+        #[test]
+        fn a_fresh_go_build_cache_holds_its_old_module_cache() {
+            use super::super::rch_go_veto_reason;
+            let tmp = tempfile::tempdir().unwrap();
+            let project = rch_go_project(tmp.path(), "lrq", Duration::from_hours(3));
+            std::fs::write(project.join(".rch-go/cache/00/00bb-d"), b"y").unwrap();
+            assert!(rch_go_veto_reason(&project.join(".rch-go/mod"), 1.0).is_some());
+
+            let engine = default_engine();
+            let score = engine.score_candidate(
+                &CandidateInput {
+                    path: project.join(".rch-go/mod"),
+                    size_bytes: 2_700_000_000,
+                    // The module files' age, as the scan measured hz2's.
+                    age: Duration::from_mins(30),
+                    classification: classification(0.93, ArtifactCategory::GoCache),
+                    signals: StructuralSignals::default(),
+                    active_references: ActiveReferenceSummary::default(),
+                    is_open: false,
+                    excluded: false,
+                },
+                1.0,
+            );
+            assert!(score.vetoed, "expected veto, got {}", score.total_score);
+            assert_eq!(score.decision.action, DecisionAction::Keep);
+        }
+
+        /// Planted negative: a Go cache outside rch's `.rch-go` keeps its
+        /// existing scoring, even beside a fresh `.rch-tmp`.
+        #[test]
+        fn go_caches_outside_rch_go_get_no_rch_hold() {
+            use super::super::rch_go_veto_reason;
+            let tmp = tempfile::tempdir().unwrap();
+            let build = tmp.path().join("go-build");
+            std::fs::create_dir_all(build.join("00")).unwrap();
+            std::fs::write(build.join("trim.txt"), b"1").unwrap();
+            std::fs::create_dir_all(tmp.path().join(".rch-tmp")).unwrap();
+            for urgency in [0.0, 1.0] {
+                assert!(rch_go_veto_reason(&build, urgency).is_none());
+                assert!(rch_go_veto_reason(&tmp.path().join("job/go/pkg/mod"), urgency).is_none());
+            }
         }
 
         #[test]

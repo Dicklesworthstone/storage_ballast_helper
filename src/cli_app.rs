@@ -2006,7 +2006,8 @@ fn smallest_flip(lo: u64, hi: u64, flips: impl Fn(u64) -> bool) -> Option<u64> {
 
 /// For a candidate that is not Delete, the smallest single change of age,
 /// size, or pressure urgency that would make the current engine say Delete.
-/// A vetoed candidate has no such change: vetoes are hard rails.
+/// A vetoed candidate has none, unless the engine lifts its veto under
+/// pressure (the rch idle floors): then the urgency that does.
 #[allow(clippy::cast_precision_loss)]
 fn explain_counterfactuals(
     engine: &ScoringEngine,
@@ -2015,7 +2016,40 @@ fn explain_counterfactuals(
 ) -> Vec<Counterfactual> {
     use storage_ballast_helper::scanner::scoring::DecisionAction;
 
+    let deletes = |modified: &CandidateInput, urgency: f64| {
+        engine.score_candidate(modified, urgency).decision.action == DecisionAction::Delete
+    };
+    let urgency_of = |hundredths: u64| f64::from(u32::try_from(hundredths).unwrap_or(100)) / 100.0;
+
     if current.vetoed {
+        // Some engine vetoes lift under pressure: the rch idle floors drop
+        // from rch's warm-cache floors to short ones at urgency 0.70. Those
+        // are a pressure counterfactual, not a hard rail.
+        let at_green = engine.score_candidate(input, 0.0);
+        if at_green.vetoed
+            && at_green.veto_reason == current.veto_reason
+            && !engine.score_candidate(input, 1.0).vetoed
+        {
+            let needed = smallest_flip(1, 100, |hundredths| deletes(input, urgency_of(hundredths)));
+            return vec![Counterfactual {
+                factor: "pressure",
+                current: format!(
+                    "urgency 0.00 (Green), vetoed: {}",
+                    current.veto_reason.as_deref().unwrap_or("unspecified")
+                ),
+                needed: needed.map(|hundredths| format!("urgency {:.2}", urgency_of(hundredths))),
+                needed_value: needed.map(urgency_of),
+                action_after: needed.map(|_| "Delete"),
+                note: Some(
+                    needed
+                        .map_or(
+                            "the veto lifts under pressure, but the score still keeps it",
+                            |_| "the veto lifts under pressure",
+                        )
+                        .to_string(),
+                ),
+            }];
+        }
         return vec![Counterfactual {
             factor: "veto",
             current: current
@@ -2039,9 +2073,6 @@ fn explain_counterfactuals(
             note: Some("already Delete".to_string()),
         }];
     }
-    let deletes = |modified: &CandidateInput, urgency: f64| {
-        engine.score_candidate(modified, urgency).decision.action == DecisionAction::Delete
-    };
 
     let mut out = Vec::new();
     let year = 365 * 24 * 60 * 60;
@@ -2078,7 +2109,6 @@ fn explain_counterfactuals(
             .then(|| "size alone cannot flip it below 1 TiB".to_string()),
     });
 
-    let urgency_of = |hundredths: u64| f64::from(u32::try_from(hundredths).unwrap_or(100)) / 100.0;
     let urgency_needed = smallest_flip(0, 100, |hundredths| deletes(input, urgency_of(hundredths)));
     out.push(Counterfactual {
         factor: "pressure",
@@ -19820,6 +19850,69 @@ mod tests {
         assert_eq!(none.len(), 1);
         assert_eq!(none[0].factor, "veto");
         assert!(none[0].needed.is_none());
+    }
+
+    /// An rch idle floor relaxes at pressure urgency, so a pool vetoed at
+    /// Green is a pressure counterfactual, and applying it flips to Delete
+    /// (`explain --why-not` used to call every veto a hard rail).
+    #[test]
+    fn counterfactual_reports_the_urgency_that_lifts_an_rch_idle_floor() {
+        use storage_ballast_helper::scanner::patterns::{
+            ArtifactPatternRegistry, StructuralSignals,
+        };
+        use storage_ballast_helper::scanner::scoring::{
+            ActiveReferenceSummary, CandidateInput, DecisionAction, ScoringEngine,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = tmp.path().join(".rch-target-hz1-pool-cf");
+        std::fs::create_dir_all(pool.join("debug/deps")).unwrap();
+        std::fs::write(pool.join("debug/deps/libx.rlib"), b"x").unwrap();
+        let three_hours = std::time::Duration::from_hours(3);
+        let stamp =
+            filetime::FileTime::from_system_time(std::time::SystemTime::now() - three_hours);
+        for path in ["debug/deps/libx.rlib", "debug/deps", "debug"] {
+            filetime::set_file_mtime(pool.join(path), stamp).unwrap();
+        }
+        let signals = StructuralSignals {
+            has_incremental: true,
+            has_deps: true,
+            has_build: true,
+            has_fingerprint: true,
+            ..StructuralSignals::default()
+        };
+        let engine = ScoringEngine::from_config(&Config::default().scoring, 0);
+        let input = CandidateInput {
+            path: pool.clone(),
+            size_bytes: 1 << 30,
+            age: three_hours,
+            classification: ArtifactPatternRegistry::default().classify(&pool, signals),
+            signals,
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+        let current = engine.score_candidate(&input, 0.0);
+        assert!(current.vetoed, "168h pooled floor at Green: {current:?}");
+
+        let suggestions = super::explain_counterfactuals(&engine, &input, &current);
+        assert_eq!(suggestions.len(), 1, "{suggestions:?}");
+        assert_eq!(suggestions[0].factor, "pressure", "{suggestions:?}");
+        let urgency = suggestions[0]
+            .needed_value
+            .unwrap_or_else(|| panic!("no urgency flips it: {suggestions:?}"));
+        assert!((0.7..=1.0).contains(&urgency), "{urgency}");
+        assert_eq!(
+            engine.score_candidate(&input, urgency).decision.action,
+            DecisionAction::Delete
+        );
+        assert_ne!(
+            engine
+                .score_candidate(&input, urgency - 0.01)
+                .decision
+                .action,
+            DecisionAction::Delete
+        );
     }
 
     #[test]
