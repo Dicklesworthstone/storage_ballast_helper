@@ -6,6 +6,20 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.7.11 **[release]**
+
+Compare: [`v0.7.9...v0.7.11`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.9...v0.7.11)
+
+This is the first published release since v0.7.9. v0.7.10 was tagged and
+canaried but never published, so the changes listed under it ship here as
+well. Most of this release comes from rch build workers that sat at 96-99%
+full while sbh kept the space it should have freed:
+- the daemon now prunes idle rch staging trees through rch itself;
+- rch's per-project Go caches are recognized, and held only while the
+  project is in use;
+- the activity database is capped at 768 MiB;
+- the scan walk no longer stats every file.
+
 ### Added
 
 - **The daemon prunes idle rch staging trees through rch itself.** An rch
@@ -41,6 +55,22 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   from shared/reflinked blocks.
 
 ### Changed
+
+- **The activity database stays under 768 MiB.** The 30-day retention never
+  bounded the file. One Mac's daemon wrote about 1.2M decisions a day, and
+  its `activity.sqlite3` reached 28 GB. The logger now checks the size at
+  startup and every minute. Past 768 MiB it deletes the oldest rows of every
+  table except `ballast_inventory`, up to one shared cutoff so the tables keep
+  the same recent window, and stops at 512 MiB. The work runs in 500 ms
+  slices and is skipped while the daemon stops. The regret ledger
+  (`decision_outcome`) is one of the trimmed tables. On a host whose database
+  is over the cap, regret calibration therefore remembers less than its 30-day
+  window.
+
+- **`sbh explain --why-not --counterfactual` names the pressure that lifts an
+  rch idle floor.** It used to report every veto as a hard rail. A pool or Go
+  cache that the rch floors hold at Green but release at urgency 0.70 now gets
+  a pressure counterfactual with the urgency that flips it.
 
 - **Compression audit history has a bounded admission budget** (bd-rxq5).
   Each apply pass reserves its full 32 MiB journal allowance within a 1 GiB,
@@ -101,6 +131,19 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   sampler uses only the pid and start time, both in `/proc/<pid>/stat`.
 
 ### Fixed
+
+- **rch's Go caches are no longer deleted between a project's jobs**
+  (bd-q0ms). rch points GOCACHE, GOMODCACHE and GOPATH of every job at
+  `<project>/.rch-go/{cache,mod,path}` in the synced project, which later jobs
+  reuse. A module cache is written only when a module is downloaded, so it
+  looked idle while builds read it. Workers deleted these caches about 30 min
+  after their last download, and the next job fetched them again within
+  7-15 minutes. Each such regret locked the Go cache category on that host
+  for 30 days. Anything under a `.rch-go` dir now gets the rch pool floors
+  (168 h, or 60 min at urgency 0.70 and above), measured over the project's
+  `.rch-go` tree and `.rch-tmp` (the TMPDIR rch forces on every job). A Go
+  build cache named plain `cache` is now recognized as one too. Before, it
+  scored as a generic cache and was kept even at Critical.
 
 - **`sbh protect` reports useful marker protection when sacred registration
   fails** (#39). A marker that was created or already exists is retained when
@@ -357,9 +400,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   is gone, and `SBH_UPDATE_OPT_OUT` is documented as the environment switch
   it is rather than as a config key.
 
-## v0.7.10 **[release]**
+## v0.7.10
 
 Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.9...v0.7.10)
+
+Tagged on 2026-10-19 and canaried on a few hosts, but never published as a
+GitHub Release. These changes first ship in v0.7.11.
 
 On Btrfs the daemon can now compress cold files instead of deleting
 anything (opt-in `[compress]`). It also reclaims idle cargo targets inside
