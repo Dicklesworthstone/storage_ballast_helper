@@ -20,7 +20,8 @@
 //!    baselines included, makes it work, not output;
 //! 3. no `.sbh-protect` marker in it, inside it or in a directory between it
 //!    and the root, no `.git` inside it, and not at or below one of
-//!    `scanner.excluded_paths`;
+//!    `scanner.excluded_paths` other than the root itself (operators exclude
+//!    the scratch root to keep the main scanner out of it);
 //! 4. within `scanner.target_only_idle_hours`, the directory was neither
 //!    created nor modified (the walker's age rule) and nothing inside it was
 //!    modified;
@@ -313,6 +314,22 @@ pub(super) fn is_excluded(dir: &Path, excluded: &[PathBuf]) -> bool {
     })
 }
 
+/// `excluded_paths` as the tier applies them under `root`: every entry except
+/// one naming the root itself. Operators exclude an agent scratch root so the
+/// main scanner never walks it. The deployed macOS config lists
+/// `/private/tmp/claude-501` in `excluded_paths`, and with that entry applied
+/// the tier found no targets on that Mac (2026-11-03). `target_only_roots` exists to
+/// look inside exactly such a root. An excluded ancestor of the root, and an
+/// entry inside it, still exclude.
+pub(super) fn exclusions_under(root: &Path, excluded: &[PathBuf]) -> Vec<PathBuf> {
+    let root = resolve_absolute_path(root);
+    excluded
+        .iter()
+        .filter(|path| resolve_absolute_path(path) != root)
+        .cloned()
+        .collect()
+}
+
 /// The first top-level entry of `dir` that cargo did not write, or an error
 /// when the listing cannot be completed within its entry budget (which
 /// keeps the directory). A live mutation guard must not walk an unbounded
@@ -588,7 +605,8 @@ fn discover(root: &Path, excluded: &[PathBuf], found: &mut Vec<PathBuf>) -> bool
     let Ok(root_meta) = fs::symlink_metadata(root) else {
         return false;
     };
-    if is_excluded(root, excluded) {
+    let excluded = exclusions_under(root, excluded);
+    if is_excluded(root, &excluded) {
         return true;
     }
     let device = device_of(&root_meta);
@@ -619,7 +637,7 @@ fn discover(root: &Path, excluded: &[PathBuf], found: &mut Vec<PathBuf>) -> bool
             continue;
         }
         for child in children {
-            if !is_excluded(&child, excluded)
+            if !is_excluded(&child, &excluded)
                 && fs::symlink_metadata(&child).is_ok_and(|meta| device_of(&meta) == device)
             {
                 queue.push_back((child, depth + 1));
@@ -1226,6 +1244,29 @@ mod tests {
 
         config.scanner.excluded_paths.push(root.join("sessions"));
         let selection = select_now(&config);
+        assert!(selection.complete);
+        assert_eq!(selection.discovered, 0);
+        assert!(selection.candidates.is_empty());
+    }
+
+    #[test]
+    fn an_excluded_root_is_still_searched_but_exclusions_inside_it_apply() {
+        // The deployed macOS config excludes the scratch root itself so the
+        // main scanner never walks it. With that entry applied, the tier
+        // reported `target dirs=0` on a Mac with cargo targets in session
+        // scratchpads (2026-11-03).
+        let (_temp, root) = scratch_root();
+        cargo_target(&root.join("session/scratchpad/target"));
+        age(&root, 48);
+        let mut config = Config::default();
+        config.scanner.excluded_paths.push(root.clone());
+        let selection = select(&root, &config, &MockPlatform::healthy(), 0.5, later());
+        assert!(selection.complete);
+        assert_eq!(selection.discovered, 1);
+        assert_eq!(selection.candidates.len(), 1);
+
+        config.scanner.excluded_paths.push(root.join("session"));
+        let selection = select(&root, &config, &MockPlatform::healthy(), 0.5, later());
         assert!(selection.complete);
         assert_eq!(selection.discovered, 0);
         assert!(selection.candidates.is_empty());

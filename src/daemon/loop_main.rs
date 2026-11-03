@@ -10670,7 +10670,10 @@ fn authorize_target_only_mutation(
         return Ok(());
     };
     authorize_target_only_candidate(candidate, Some(root))?;
-    if crate::daemon::target_tier::is_excluded(&candidate.path, &scanner.excluded_paths) {
+    if crate::daemon::target_tier::is_excluded(
+        &candidate.path,
+        &crate::daemon::target_tier::exclusions_under(root, &scanner.excluded_paths),
+    ) {
         return Err(SkipReason::SacredStowaway);
     }
     let identity = candidate.identity.ok_or(SkipReason::IdentityUnavailable)?;
@@ -14055,6 +14058,20 @@ mod tests {
                 Err(SkipReason::OpenScanIncomplete),
             );
         }
+        // Excluding the root itself (the deployed macOS config does, to keep
+        // the main scanner out) leaves the tier's exception in force.
+        scanner.excluded_paths.push(root.clone());
+        assert_eq!(
+            authorize_target_only_mutation(
+                &candidate,
+                Some(&root),
+                &scanner,
+                Some(&MockPlatform::healthy()),
+                now,
+                &heartbeat,
+            ),
+            Ok(()),
+        );
         scanner.excluded_paths.push(root.join("session"));
         assert_eq!(
             authorize_target_only_mutation(

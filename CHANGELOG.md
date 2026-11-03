@@ -41,6 +41,16 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   failure that lasts longer still reads as Unknown, and a carried positive stall
   still raises the level (bd-krwm, follow-up to bd-90af).
 
+- **The macOS target-only tier now works when the scratch root itself is
+  excluded.** Operators list the agent scratch root (`/private/tmp/claude-501`)
+  in `scanner.excluded_paths` so the main scanner never walks it. The tier
+  honored that entry too, so on such a Mac it logged
+  `root=/private/tmp/claude-501 target dirs=0` while cargo target dirs sat in
+  session scratchpads. That is the exact setup `target_only_roots` exists for. An
+  `excluded_paths` entry naming the root itself now applies only to the main
+  scanner, at discovery and at the executor's last check. An excluded ancestor
+  of the root, and an entry inside it, still exclude (bd-232u).
+
 ## v0.7.11 **[release]**
 
 Compare: [`v0.7.9...v0.7.11`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.9...v0.7.11)
