@@ -461,11 +461,16 @@ impl SqliteLogger {
     /// Keep the database under its size cap by deleting its oldest rows.
     ///
     /// Starts once the file passes `cap`, or when `resume` says an earlier
-    /// call stopped short, and deletes [`TRIM_BATCH_ROWS`] at a time from
-    /// whichever table holds the oldest row, so every table keeps the same
-    /// recent window, until the data fits in `target`. Stops at `deadline`
-    /// so the caller can keep logging. Returns whether the data is still
-    /// over `target`, i.e. whether to call again with `resume`.
+    /// call stopped short, and deletes the oldest rows across the trimmed
+    /// tables in batches, so every table keeps the same recent window,
+    /// until the data fits in `target`. Stops at `deadline` so the caller
+    /// can keep logging. Returns whether the data is still over `target`,
+    /// i.e. whether to call again with `resume`.
+    ///
+    /// With FULL `auto_vacuum` (every database the logger creates, and any
+    /// it opens above [`VACUUM_MIN_BYTES`]) each batch shrinks the file. A
+    /// small legacy database without it keeps its size, but later rows reuse
+    /// the freed pages, so it stops growing; the next open converts it.
     pub fn enforce_size_cap(
         &self,
         cap: u64,
@@ -486,47 +491,62 @@ impl SqliteLogger {
             }
             live = self.page_bytes()?.1;
         }
-        // Without FULL auto_vacuum the deletes leave free pages behind
-        // instead of shrinking the file; one VACUUM gives them back and
-        // converts the database so later trims shrink it directly.
-        let (file, live) = self.page_bytes()?;
-        if file > cap && file > live {
-            self.conn
-                .execute_batch("PRAGMA auto_vacuum = FULL; VACUUM; PRAGMA journal_mode = WAL;")?;
-        }
         Ok(false)
     }
 
-    /// Delete up to [`TRIM_BATCH_ROWS`] of the oldest rows of the table whose
-    /// first row is the oldest, none of them newer than the first row of any
-    /// other table. Returns false when every trimmed table is empty.
+    /// Delete, in one transaction, every trimmed row up to a cutoff time:
+    /// the earliest time any table reaches within its first
+    /// [`TRIM_BATCH_ROWS`] ids (no cutoff once every table holds fewer).
+    /// Each table loses at most that many rows, and all keep the same recent
+    /// window. The table that sets the cutoff always loses its row at the
+    /// cutoff, so a batch makes progress even if timestamps run out of
+    /// order. Returns false when every trimmed table is empty.
+    ///
+    /// Ids are AUTOINCREMENT and rows only ever leave from the oldest end,
+    /// so the batch boundary is a rowid lookup, not a scan of the batch.
     fn delete_oldest_batch(&self) -> Result<bool> {
-        let mut firsts: Vec<(String, &str, &str, i64)> = Vec::new();
+        // (table, time column, last id this batch may reach)
+        let mut spans: Vec<(&str, &str, i64)> = Vec::new();
+        let mut cutoff: Option<String> = None;
         for (table, column) in TRIMMED_TABLES {
-            let first: Option<(String, i64)> = self
+            let first_id: Option<i64> =
+                self.conn
+                    .query_row(&format!("SELECT min(id) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+            let Some(first_id) = first_id else {
+                continue;
+            };
+            let boundary = self
                 .conn
                 .query_row(
-                    &format!("SELECT {column}, id FROM {table} ORDER BY id LIMIT 1"),
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    &format!("SELECT id, {column} FROM {table} WHERE id >= ?1 ORDER BY id LIMIT 1"),
+                    params![first_id.saturating_add(TRIM_BATCH_ROWS - 1)],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()?;
-            if let Some((stamp, id)) = first {
-                firsts.push((stamp, table, column, id));
-            }
+            let end_id = match boundary {
+                Some((id, stamp)) => {
+                    if cutoff.as_ref().is_none_or(|earliest| stamp < *earliest) {
+                        cutoff = Some(stamp);
+                    }
+                    id
+                }
+                None => i64::MAX,
+            };
+            spans.push((table, column, end_id));
         }
-        firsts.sort();
-        let Some((_, table, column, first_id)) = firsts.first() else {
+        if spans.is_empty() {
             return Ok(false);
-        };
-        // The first row always goes, so every batch makes progress.
-        let horizon = firsts.get(1).map(|(stamp, ..)| stamp.as_str());
-        self.conn.execute(
-            &format!(
-                "DELETE FROM {table} WHERE id < ?1 AND (id = ?2 OR ?3 IS NULL OR {column} <= ?3)"
-            ),
-            params![first_id.saturating_add(TRIM_BATCH_ROWS), first_id, horizon],
-        )?;
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for (table, column, end_id) in &spans {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE id <= ?1 AND (?2 IS NULL OR {column} <= ?2)"),
+                params![end_id, cutoff],
+            )?;
+        }
+        tx.commit()?;
         Ok(true)
     }
 
@@ -746,8 +766,9 @@ const TRIMMED_TABLES: [(&str, &str); 4] = [
     ("pressure_history", "timestamp"),
 ];
 
-/// Rows a trim deletes per transaction: about 12 MB of decision records, so
-/// it never builds a large WAL or holds the write lock past `busy_timeout`.
+/// Rows a trim batch deletes from each table at most: about 12 MB of
+/// decision records, so one transaction never builds a large WAL or holds
+/// the write lock past `busy_timeout`.
 const TRIM_BATCH_ROWS: i64 = 5_000;
 
 fn apply_pragmas(conn: &Connection, db_bytes: u64) -> Result<()> {
@@ -1139,11 +1160,11 @@ mod tests {
         assert!(logger.page_bytes().unwrap().1 <= live / 2);
     }
 
-    /// A small legacy database keeps `auto_vacuum = NONE`, so deletes alone
-    /// leave the file at its size; the trim then VACUUMs it to FULL and
-    /// stays in WAL mode.
+    /// A small legacy database keeps `auto_vacuum = NONE`: the trim brings
+    /// its data under the target without rewriting it, and later rows reuse
+    /// the freed pages, so the file stops growing at its high-water mark.
     #[test]
-    fn size_cap_vacuums_a_database_without_auto_vacuum() {
+    fn size_cap_bounds_a_database_without_auto_vacuum() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.db");
         legacy_db(&path, 1024 * 1024);
@@ -1152,16 +1173,102 @@ mod tests {
         fill_decisions(&logger, 0, 20_000, 1_024);
         let (file, live) = logger.page_bytes().unwrap();
 
-        let cap = file / 2;
+        let target = live / 4;
         assert!(
             !logger
-                .enforce_size_cap(cap, live / 4, false, far_deadline())
+                .enforce_size_cap(file / 2, target, false, far_deadline())
                 .unwrap()
         );
-        assert_eq!(auto_vacuum(&logger), 1);
-        assert!(logger.is_wal_mode());
-        let (file_after, _) = logger.page_bytes().unwrap();
-        assert!(file_after <= cap, "{file_after} > {cap}");
+        let (file_after, live_after) = logger.page_bytes().unwrap();
+        assert!(live_after <= target, "{live_after} > {target}");
+        assert_eq!(file_after, file, "no VACUUM: the file keeps its size");
+        assert_eq!(auto_vacuum(&logger), 0);
+
+        // The trim freed at least three quarters of the rows; refilling half
+        // of them fits in the freed pages.
+        fill_decisions(&logger, 20_000, 10_000, 1_024);
+        assert_eq!(logger.page_bytes().unwrap().0, file, "freed pages reused");
+    }
+
+    /// Timestamps that run backwards still cost every batch at least the row
+    /// that sets the cutoff, so a trim to an unreachable target ends with
+    /// every trimmed table empty instead of spinning.
+    #[test]
+    fn size_cap_makes_progress_with_out_of_order_timestamps() {
+        let (_dir, logger) = temp_db();
+        logger.conn.execute_batch("BEGIN").unwrap();
+        for i in 0..5_100u32 {
+            logger
+                .conn
+                .execute(
+                    "INSERT INTO decision_log (
+                        decision_id, timestamp, path, action, policy_mode, total_score,
+                        posterior_abandoned, expected_loss_keep, expected_loss_delete, record
+                    ) VALUES (?1, ?2, '/data/t', 'delete', 'live', 0.9, 0.9, 1.0, 0.1, '{}')",
+                    params![format!("d{i}"), stamp(20_000 - i)],
+                )
+                .unwrap();
+        }
+        logger.conn.execute_batch("COMMIT").unwrap();
+        fill_activity(&logger, 0, 10);
+
+        // The cutoff is decision 5000's time, the earliest of its first
+        // 5000; only it qualifies, and every older activity row goes.
+        assert!(logger.delete_oldest_batch().unwrap());
+        assert_eq!(ids(&logger, "decision_log").0, 5_099);
+        assert_eq!(ids(&logger, "activity_log").0, 0);
+        // The next batch's cutoff is decision 5001's time: one more row.
+        assert!(logger.delete_oldest_batch().unwrap());
+        assert_eq!(ids(&logger, "decision_log").0, 5_098);
+
+        assert!(
+            !logger
+                .enforce_size_cap(0, 0, false, far_deadline())
+                .unwrap()
+        );
+        assert_eq!(ids(&logger, "decision_log").0, 0);
+    }
+
+    /// One batch shares a cutoff across tables: rows interleaved in time
+    /// leave together, so a dense table is not cut into one-row batches by
+    /// a sparse table between its rows.
+    #[test]
+    fn size_cap_batch_removes_interleaved_rows_together() {
+        let (_dir, logger) = temp_db();
+        fill_decisions(&logger, 0, 12_000, 64);
+        for i in 0..120u32 {
+            fill_activity(&logger, i * 100 + 50, 1);
+        }
+
+        assert!(logger.delete_oldest_batch().unwrap());
+        let (decisions, first_decision, _) = ids(&logger, "decision_log");
+        assert_eq!(
+            decisions, 7_000,
+            "one batch takes TRIM_BATCH_ROWS decisions"
+        );
+        assert_eq!(first_decision, 5_001);
+        // Activity rows at 50, 150, ..., 4950 precede decision 5000's time.
+        assert_eq!(ids(&logger, "activity_log").0, 70);
+    }
+
+    /// With two dense tables the cutoff is the earlier boundary: decisions
+    /// reach t=4999 in 5000 rows, activity (one row every 2 s) only reaches
+    /// t=9998, so activity keeps everything after t=4999 instead of losing
+    /// rows newer than the decisions that remain.
+    #[test]
+    fn size_cap_cutoff_is_the_earliest_boundary() {
+        let (_dir, logger) = temp_db();
+        fill_decisions(&logger, 0, 12_000, 64);
+        logger.conn.execute_batch("BEGIN").unwrap();
+        for i in 0..6_000u32 {
+            fill_activity(&logger, i * 2, 1);
+        }
+        logger.conn.execute_batch("COMMIT").unwrap();
+
+        assert!(logger.delete_oldest_batch().unwrap());
+        assert_eq!(ids(&logger, "decision_log").0, 7_000);
+        // Rows at t = 0, 2, ..., 4998 go; 3500 remain, from t = 5000.
+        assert_eq!(ids(&logger, "activity_log"), (3_500, 2_501, 6_000));
     }
 
     #[test]

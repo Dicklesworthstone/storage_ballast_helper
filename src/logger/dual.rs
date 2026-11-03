@@ -501,8 +501,9 @@ fn logger_thread_main(
         // idle, and on every event while busy.
         last_beat.store(epoch_ms(), Ordering::Relaxed);
         let now = Instant::now();
+        // A trim never delays shutdown; the next start resumes it.
         #[cfg(feature = "sqlite")]
-        if let Some(db) = &sqlite {
+        if !stopping && let Some(db) = &sqlite {
             let interval = if trimming {
                 TRIM_INTERVAL
             } else {
