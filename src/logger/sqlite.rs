@@ -511,8 +511,10 @@ impl SqliteLogger {
         let mut spans: Vec<(&str, &str, i64)> = Vec::new();
         let mut cutoff: Option<String> = None;
         for (table, column) in TRIMMED_TABLES {
+            // Two subqueries: SQLite finds a lone min() or max() by rowid,
+            // but `SELECT min(id), max(id)` scans the whole table.
             let (first_id, last_id): (Option<i64>, Option<i64>) = self.conn.query_row(
-                &format!("SELECT min(id), max(id) FROM {table}"),
+                &format!("SELECT (SELECT min(id) FROM {table}), (SELECT max(id) FROM {table})"),
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
