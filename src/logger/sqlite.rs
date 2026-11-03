@@ -495,54 +495,56 @@ impl SqliteLogger {
     }
 
     /// Delete, in one transaction, every trimmed row up to a cutoff time:
-    /// the earliest time any table reaches within its first
-    /// [`TRIM_BATCH_ROWS`] ids (no cutoff once every table holds fewer).
-    /// Each table loses at most that many rows, and all keep the same recent
-    /// window. The table that sets the cutoff always loses its row at the
-    /// cutoff, so a batch makes progress even if timestamps run out of
-    /// order. Returns false when every trimmed table is empty.
+    /// the earliest time any table reaches at its boundary row, the last row
+    /// within its step. A table's step is [`TRIM_BATCH_ROWS`] ids, or half
+    /// its id span if that is smaller, so each table loses at most one step,
+    /// never its newest row while it holds two, and all keep the same recent
+    /// window. The table that sets the cutoff always loses its boundary row,
+    /// so a batch makes progress even if timestamps run out of order.
+    /// Returns false when every trimmed table is empty.
     ///
-    /// Ids are AUTOINCREMENT and rows only ever leave from the oldest end,
-    /// so the batch boundary is a rowid lookup, not a scan of the batch.
+    /// The boundary is a rowid lookup, not a scan of the batch. Ids can
+    /// have gaps (a retention purge after a clock jump); a gap only
+    /// shortens a step.
     fn delete_oldest_batch(&self) -> Result<bool> {
-        // (table, time column, last id this batch may reach)
+        // (table, time column, boundary id)
         let mut spans: Vec<(&str, &str, i64)> = Vec::new();
         let mut cutoff: Option<String> = None;
         for (table, column) in TRIMMED_TABLES {
-            let first_id: Option<i64> =
-                self.conn
-                    .query_row(&format!("SELECT min(id) FROM {table}"), [], |row| {
-                        row.get(0)
-                    })?;
-            let Some(first_id) = first_id else {
+            let (first_id, last_id): (Option<i64>, Option<i64>) = self.conn.query_row(
+                &format!("SELECT min(id), max(id) FROM {table}"),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let (Some(first_id), Some(last_id)) = (first_id, last_id) else {
                 continue;
             };
-            let boundary = self
+            let step = TRIM_BATCH_ROWS.min((last_id - first_id) / 2 + 1);
+            let Some((end_id, stamp)) = self
                 .conn
                 .query_row(
-                    &format!("SELECT id, {column} FROM {table} WHERE id >= ?1 ORDER BY id LIMIT 1"),
-                    params![first_id.saturating_add(TRIM_BATCH_ROWS - 1)],
+                    &format!(
+                        "SELECT id, {column} FROM {table} WHERE id <= ?1 ORDER BY id DESC LIMIT 1"
+                    ),
+                    params![first_id + step - 1],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
                 )
-                .optional()?;
-            let end_id = match boundary {
-                Some((id, stamp)) => {
-                    if cutoff.as_ref().is_none_or(|earliest| stamp < *earliest) {
-                        cutoff = Some(stamp);
-                    }
-                    id
-                }
-                None => i64::MAX,
+                .optional()?
+            else {
+                continue;
             };
+            if cutoff.as_ref().is_none_or(|earliest| stamp < *earliest) {
+                cutoff = Some(stamp);
+            }
             spans.push((table, column, end_id));
         }
-        if spans.is_empty() {
+        let Some(cutoff) = cutoff else {
             return Ok(false);
-        }
+        };
         let tx = self.conn.unchecked_transaction()?;
         for (table, column, end_id) in &spans {
             tx.execute(
-                &format!("DELETE FROM {table} WHERE id <= ?1 AND (?2 IS NULL OR {column} <= ?2)"),
+                &format!("DELETE FROM {table} WHERE id <= ?1 AND {column} <= ?2"),
                 params![end_id, cutoff],
             )?;
         }
@@ -1190,14 +1192,14 @@ mod tests {
         assert_eq!(logger.page_bytes().unwrap().0, file, "freed pages reused");
     }
 
-    /// Timestamps that run backwards still cost every batch at least the row
-    /// that sets the cutoff, so a trim to an unreachable target ends with
-    /// every trimmed table empty instead of spinning.
+    /// Timestamps that run backwards still cost every batch the row that
+    /// sets the cutoff, so a trim to an unreachable target ends with every
+    /// trimmed table empty instead of spinning.
     #[test]
     fn size_cap_makes_progress_with_out_of_order_timestamps() {
         let (_dir, logger) = temp_db();
         logger.conn.execute_batch("BEGIN").unwrap();
-        for i in 0..5_100u32 {
+        for i in 0..300u32 {
             logger
                 .conn
                 .execute(
@@ -1210,23 +1212,49 @@ mod tests {
                 .unwrap();
         }
         logger.conn.execute_batch("COMMIT").unwrap();
-        fill_activity(&logger, 0, 10);
 
-        // The cutoff is decision 5000's time, the earliest of its first
-        // 5000; only it qualifies, and every older activity row goes.
+        // The step is 150 ids; the cutoff is decision 150's time, the
+        // earliest within the step, and only decision 150 qualifies.
         assert!(logger.delete_oldest_batch().unwrap());
-        assert_eq!(ids(&logger, "decision_log").0, 5_099);
-        assert_eq!(ids(&logger, "activity_log").0, 0);
-        // The next batch's cutoff is decision 5001's time: one more row.
-        assert!(logger.delete_oldest_batch().unwrap());
-        assert_eq!(ids(&logger, "decision_log").0, 5_098);
+        let mut left = ids(&logger, "decision_log").0;
+        assert_eq!(left, 299);
+        while logger.delete_oldest_batch().unwrap() {
+            let now = ids(&logger, "decision_log").0;
+            assert!(now < left, "a batch deleted nothing at {left} rows");
+            left = now;
+        }
+        assert_eq!(left, 0);
 
         assert!(
             !logger
                 .enforce_size_cap(0, 0, false, far_deadline())
-                .unwrap()
+                .unwrap(),
+            "nothing left to trim ends the trim"
         );
+    }
+
+    /// A table smaller than two batches loses at most half its rows per
+    /// batch and never its newest row while it holds two, even across id
+    /// gaps, so the trim can stop at its target instead of emptying small
+    /// tables in one step.
+    #[test]
+    fn size_cap_batch_never_takes_the_newest_row() {
+        let (_dir, logger) = temp_db();
+        fill_decisions(&logger, 0, 100, 64);
+        assert!(logger.delete_oldest_batch().unwrap());
+        assert_eq!(ids(&logger, "decision_log"), (50, 51, 100));
+
+        // The boundary is the last id within the step, not the first past it.
+        logger
+            .conn
+            .execute("DELETE FROM decision_log WHERE id BETWEEN 52 AND 99", [])
+            .unwrap();
+        assert!(logger.delete_oldest_batch().unwrap());
+        assert_eq!(ids(&logger, "decision_log"), (1, 100, 100));
+
+        assert!(logger.delete_oldest_batch().unwrap());
         assert_eq!(ids(&logger, "decision_log").0, 0);
+        assert!(!logger.delete_oldest_batch().unwrap());
     }
 
     /// One batch shares a cutoff across tables: rows interleaved in time
@@ -1260,15 +1288,15 @@ mod tests {
         let (_dir, logger) = temp_db();
         fill_decisions(&logger, 0, 12_000, 64);
         logger.conn.execute_batch("BEGIN").unwrap();
-        for i in 0..6_000u32 {
+        for i in 0..12_000u32 {
             fill_activity(&logger, i * 2, 1);
         }
         logger.conn.execute_batch("COMMIT").unwrap();
 
         assert!(logger.delete_oldest_batch().unwrap());
         assert_eq!(ids(&logger, "decision_log").0, 7_000);
-        // Rows at t = 0, 2, ..., 4998 go; 3500 remain, from t = 5000.
-        assert_eq!(ids(&logger, "activity_log"), (3_500, 2_501, 6_000));
+        // Rows at t = 0, 2, ..., 4998 go; 9500 remain, from t = 5000.
+        assert_eq!(ids(&logger, "activity_log"), (9_500, 2_501, 12_000));
     }
 
     #[test]
