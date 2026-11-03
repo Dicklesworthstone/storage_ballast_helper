@@ -21,6 +21,17 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   them, and on start it reads them from the regret ledger's outcomes. `sbh
   explain` scores at zero urgency, where this floor never applies (bd-tz67).
 
+- **`sbh check --agent-scratch` can now label a real session idle.** Any
+  symlink inside a session used to make its tree age unknown. Claude Code
+  records each background task as a `tasks/<id>.output` symlink (two css
+  sessions held 475 and 887), so on css, even as root, 0 of 40 sessions were
+  idle, including sessions whose transcripts had been idle for 10 days. A link now counts by its own
+  timestamps and is listed as a caveat. Its target was never followed, and
+  removing the session would not touch it. A session dir that is itself a
+  symlink is reported as "session symlink not inspected" instead of
+  `Not a directory (os error 20)`. On css these were 16 relocation stubs
+  pointing into an archive (bd-jnp9).
+
 ## v0.7.11 **[release]**
 
 Compare: [`v0.7.9...v0.7.11`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.9...v0.7.11)

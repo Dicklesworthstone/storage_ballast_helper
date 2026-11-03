@@ -63,8 +63,11 @@ only observed lower bounds.
 Caller-supplied root aliases such as macOS `/tmp` are resolved once. Descendant
 traversal is relative to open directory descriptors, does not follow symlinks,
 and does not cross filesystem boundaries. Changed directory identities,
-inaccessible entries, skipped symlinks and mount boundaries produce explicit
-uncertainty. Protection-marker contents are not read, including markers that
+inaccessible entries, symlinked projects or sessions and mount boundaries
+produce explicit uncertainty. A symlink inside a session counts by its own
+timestamps and is listed as a caveat. Its target is outside the tree that a
+removal would touch, so it does not block an `idle` label. Protection-marker
+contents are not read, including markers that
 are FIFOs. The process collector is bounded by the shared report deadline;
 missing visibility is not treated as an empty process list.
 

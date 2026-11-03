@@ -122,7 +122,8 @@ pub struct Session {
     pub state: SessionState,
     /// Positive references or the reason inactivity could not be established.
     pub reasons: Vec<String>,
-    /// Protection or source-control markers observed during the tree walk.
+    /// Protection or source-control markers and symlinks observed during the
+    /// tree walk: caveats for review that do not prevent an idle observation.
     pub protections: Vec<String>,
     /// Whether tree, transcript and process observations were all complete.
     pub complete: bool,
@@ -503,6 +504,17 @@ fn discover_user(
                     return Err(io::Error::other("agent scratch session limit reached"));
                 }
                 let session_path = project_path.join(&name);
+                // A relocated session leaves a symlink stub (css: 16 links
+                // into /data/ssd/archive); name it rather than ENOTDIR.
+                if statat(&project_dir, &name, AtFlags::SYMLINK_NOFOLLOW)
+                    .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Symlink)
+                {
+                    issue(
+                        issues,
+                        format!("{}: session symlink not inspected", session_path.display()),
+                    );
+                    continue;
+                }
                 let metadata =
                     match open_child(&project_dir, &name).and_then(|session| session.metadata()) {
                         Ok(metadata) => metadata,
@@ -657,11 +669,17 @@ fn walk(
                 }
             }
             FileType::RegularFile => observe_stat(&stat, observation),
+            // The link's own times count; its target is not part of this
+            // tree (removing the tree removes the link, never the target).
+            // A caveat for the reviewer, not missing evidence: Claude Code
+            // links every background task's `tasks/<id>.output`, and as
+            // missing evidence that kept every css session Unknown,
+            // including transcripts idle 10 days.
             FileType::Symlink => {
                 observe_stat(&stat, observation);
                 issue(
-                    &mut observation.issues,
-                    "symlink target not inspected".into(),
+                    &mut observation.protections,
+                    "contains symlinks; their targets were not inspected".into(),
                 );
             }
             _ => issue(
@@ -1084,19 +1102,34 @@ mod tests {
         fs::write(outside.join("private"), vec![99_u8; 65_536]).unwrap();
         symlink(&outside, path.join("outside-link")).unwrap();
         let report = fixture.run(MockPlatform::healthy(), Limits::default());
+        // The target's bytes are not counted and its contents are untouched.
         assert_eq!(report.sessions[0].observed_logical_bytes, 8192);
-        assert_eq!(report.sessions[0].state, SessionState::Unknown);
         assert_eq!(
             fs::read(outside.join("private")).unwrap(),
             vec![99_u8; 65_536]
         );
         assert_eq!(fs::read(path.join("work.bin")).unwrap(), vec![42_u8; 8192]);
+        // An old link is a caveat for the reviewer, not missing evidence.
+        assert_eq!(report.sessions[0].state, SessionState::Idle);
         assert!(
             report.sessions[0]
+                .protections
+                .iter()
+                .any(|note| note.contains("symlink"))
+        );
+        assert!(
+            !report.sessions[0]
                 .reasons
                 .iter()
                 .any(|reason| reason.contains("symlink"))
         );
+
+        // Planted negative: the link's own times count as tree activity.
+        let recent = FileTime::from_system_time(fixture.now - Duration::from_hours(1));
+        filetime::set_symlink_file_times(path.join("outside-link"), recent, recent).unwrap();
+        let report = fixture.run(MockPlatform::healthy(), Limits::default());
+        assert_eq!(report.sessions[0].state, SessionState::Recent);
+        assert_eq!(report.sessions[0].tree_idle_hours, Some(1));
     }
 
     #[test]
@@ -1229,7 +1262,10 @@ mod tests {
             report
                 .issues
                 .iter()
-                .any(|reason| reason.contains("00000000-0000"))
+                .any(|reason| reason.contains("00000000-0000")
+                    && reason.contains("session symlink not inspected")),
+            "{:?}",
+            report.issues
         );
         assert!(fs::symlink_metadata(bad).unwrap().file_type().is_symlink());
     }
