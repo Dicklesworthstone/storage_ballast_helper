@@ -772,9 +772,10 @@ const TRIMMED_TABLES: [(&str, &str); 4] = [
     ("pressure_history", "timestamp"),
 ];
 
-/// Rows a trim batch deletes from each table at most: about 12 MB of
-/// decision records, so one transaction never builds a large WAL or holds
-/// the write lock past `busy_timeout`.
+/// Rows a trim batch deletes from each table, plus any that share the
+/// cutoff's millisecond: about 12 MB of decision records, so one
+/// transaction never builds a large WAL or holds the write lock past
+/// `busy_timeout`.
 const TRIM_BATCH_ROWS: i64 = 5_000;
 
 fn apply_pragmas(conn: &Connection, db_bytes: u64) -> Result<()> {
@@ -1238,10 +1239,11 @@ mod tests {
     }
 
     /// A table that one full step would empty loses its oldest half
-    /// instead, and a table of two rows keeps its newest, so the trim can
-    /// stop at its target instead of emptying small tables in one step.
+    /// (rounded up) instead: 2,500 of 5,000 rows, the older of two, and a
+    /// last row only once it is alone. So a trim can stop at its target
+    /// instead of emptying small tables in one step.
     #[test]
-    fn size_cap_batch_never_takes_the_newest_row() {
+    fn size_cap_batch_halves_a_table_one_step_would_empty() {
         let (_dir, logger) = temp_db();
         fill_decisions(&logger, 0, 5_000, 64);
         assert!(logger.delete_oldest_batch().unwrap());

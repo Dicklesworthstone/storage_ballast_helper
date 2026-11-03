@@ -51,6 +51,20 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   scanner, at discovery and at the executor's last check. An excluded ancestor
   of the root, and an entry inside it, still exclude (bd-232u).
 
+- **The size-cap trim deletes rows in time order and never empties a table in
+  one batch.** v0.7.11 trimmed each table in windows of 5,000 ids. Review
+  found two flaws in that, neither seen on a host. Rows stamped while the clock
+  ran ahead stayed at the low end of their table and anchored its window there:
+  after the first batch, a batch took only about one row from that table, and
+  when such rows filled a whole window, the other trimmed tables were emptied
+  first. And once every trimmed table held fewer than 5,000 ids, one batch
+  deleted all their rows, though the 512 MiB target stops a trim long before
+  that in practice. Each batch now looks up, through each table's
+  time index, that table's 5,000th-oldest time, or the end of its oldest half
+  when a full batch would empty it, and deletes every trimmed row up to the
+  earliest of those times. Rows leave oldest first whatever order they were
+  written in, and every table keeps the same recent window.
+
 ## v0.7.11 **[release]**
 
 Compare: [`v0.7.9...v0.7.11`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.9...v0.7.11)
