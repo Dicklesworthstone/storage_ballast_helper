@@ -11,7 +11,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -31,6 +33,9 @@ mod build_scopes;
 use build_scopes::BuildDirectoryScopes;
 mod code_sign_clones;
 use code_sign_clones::AppInstance;
+mod work_queue;
+pub use work_queue::MAX_ACTIVE_BTRFS_DIRECTORIES;
+use work_queue::{WalkFilesystem, WorkQueue};
 
 pub const DEFAULT_ACTIVE_REFERENCE_CACHE_TTL_SECS: u64 = 30;
 pub const DEFAULT_ACTIVE_REFERENCE_MIN_SIZE_BYTES: u64 = 100 * 1024 * 1024;
@@ -211,6 +216,10 @@ struct WorkItem {
     depth: usize,
     root_device_id: u64,
     opaque_tree: Option<OpaqueTreeClassification>,
+    filesystem: WalkFilesystem,
+    /// Roots, opaque candidates, and crossed mounts retain their observed
+    /// identity while waiting. Admission refuses a changed object.
+    expected_metadata: Option<Box<fs::Metadata>>,
 }
 
 /// Entries of a running walk, one at a time.
@@ -223,7 +232,7 @@ pub struct WalkStream {
     rx: channel::Receiver<Vec<WalkEntry>>,
     pending: std::vec::IntoIter<WalkEntry>,
     /// The walk's work queue: what is still in it was never listed.
-    work: Option<channel::Receiver<WorkItem>>,
+    work: Option<Arc<WorkQueue>>,
     /// Paths the workers recorded as unfinished (see [`ResultBatch`]).
     unfinished: Arc<parking_lot::Mutex<Vec<PathBuf>>>,
     /// The walk's cancel flag (the walker's [`DirectoryWalker::cancel_token`]).
@@ -233,7 +242,7 @@ pub struct WalkStream {
 impl WalkStream {
     fn new(
         rx: channel::Receiver<Vec<WalkEntry>>,
-        work: Option<channel::Receiver<WorkItem>>,
+        work: Option<Arc<WorkQueue>>,
         unfinished: Arc<parking_lot::Mutex<Vec<PathBuf>>>,
         cancel: Arc<AtomicBool>,
     ) -> Self {
@@ -281,10 +290,7 @@ impl WalkStream {
         // Every worker has exited, so the queue and the record are final.
         // A wide queue holds many siblings: their parent stands for them.
         if let Some(work) = &self.work {
-            unfinished.extend(
-                work.try_iter()
-                    .filter_map(|item| item.path.parent().map(Path::to_path_buf)),
-            );
+            unfinished.extend(work.unfinished_paths());
         }
         unfinished.extend(self.unfinished.lock().drain(..));
         Some(unfinished.into_iter().collect())
@@ -826,6 +832,8 @@ pub struct DirectoryWalker {
     dir_window: u32,
     /// Whether a walked directory's entry carries its immediate files' size.
     measure_files: bool,
+    #[cfg(test)]
+    btrfs_devices: HashSet<u64>,
 }
 
 impl DirectoryWalker {
@@ -837,6 +845,8 @@ impl DirectoryWalker {
             cancel: Arc::new(AtomicBool::new(false)),
             dir_window: MAX_ENTRIES_PER_DIR,
             measure_files: true,
+            #[cfg(test)]
+            btrfs_devices: HashSet::new(),
         }
     }
 
@@ -857,6 +867,12 @@ impl DirectoryWalker {
     #[cfg(test)]
     fn with_dir_window(mut self, entries: u32) -> Self {
         self.dir_window = entries.max(1);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_btrfs_device(mut self, device: u64) -> Self {
+        self.btrfs_devices.insert(device);
         self
     }
 
@@ -895,22 +911,22 @@ impl DirectoryWalker {
     pub fn stream(&self) -> Result<WalkStream> {
         let parallelism = self.config.parallelism.max(1);
 
-        // Channels: work items (unbounded) and results (bounded for memory safety).
-        // Worker threads both produce and consume directory work. A bounded work queue
-        // can deadlock when every worker is trying to enqueue child directories into a
-        // full queue and no worker is left to drain it. Keep only the result channel
-        // bounded; callers drain it while the walk runs.
+        // Work is unbounded: a bounded queue can deadlock when every worker
+        // enqueues children and none can drain it. Device admission keeps
+        // blocked btrfs work outside the ready channel; unrelated filesystems
+        // retain this worker pool's configured concurrency.
         //
         // Per-directory iteration cap (MAX_ENTRIES_PER_DIR) prevents any single huge
         // directory (e.g. /data/tmp with 60K+ children) from monopolizing traversal.
         // Result channel bounded to 10,000 entries, in batches, to prevent unbounded
         // memory growth on large trees (previously unbounded, causing 14GB+ RSS on trj).
-        let (work_tx, work_rx) = channel::unbounded::<WorkItem>();
+        let work = Arc::new(WorkQueue::new());
+        #[cfg(test)]
+        for device in &self.btrfs_devices {
+            work.mark_btrfs(*device);
+        }
         let (result_tx, result_rx) =
             channel::bounded::<Vec<WalkEntry>>(RESULT_CHANNEL_CAP / WALK_BATCH_ENTRIES);
-
-        // Track in-flight work items so workers know when to stop.
-        let in_flight = Arc::new(AtomicUsize::new(0));
 
         // Seed work queue with root paths.
         for root in &self.config.root_paths {
@@ -935,12 +951,13 @@ impl DirectoryWalker {
                 continue;
             }
             let dev = device_id(&meta);
-            in_flight.fetch_add(1, Ordering::Release);
-            let _ = work_tx.send(WorkItem {
+            work.enqueue(WorkItem {
                 path: root.clone(),
                 depth: 0,
                 root_device_id: dev,
                 opaque_tree: None,
+                filesystem: work.filesystem(root, dev),
+                expected_metadata: Some(Box::new(meta)),
             });
         }
 
@@ -952,10 +969,8 @@ impl DirectoryWalker {
 
         // Clone sender for workers; drop original so channel closes when workers finish.
         for _ in 0..parallelism {
-            let work_rx = work_rx.clone();
-            let work_tx = work_tx.clone();
+            let work = Arc::clone(&work);
             let result_tx = result_tx.clone();
-            let in_flight = Arc::clone(&in_flight);
             let config = self.config.clone();
             let protection = Arc::clone(&self.protection);
             let heartbeat = self.heartbeat.clone();
@@ -966,10 +981,8 @@ impl DirectoryWalker {
 
             thread::spawn(move || {
                 walker_thread(
-                    &work_rx,
-                    &work_tx,
+                    &work,
                     &result_tx,
-                    &in_flight,
                     &config,
                     &windows,
                     &protection,
@@ -981,11 +994,11 @@ impl DirectoryWalker {
             });
         }
 
-        // The stream keeps a receiver of the work queue, so what a cancelled
-        // walk never listed can still be read once the workers are gone.
+        // Retain ready and deferred work so cancellation can report every
+        // directory the workers never listed.
         Ok(WalkStream::new(
             result_rx,
-            Some(work_rx),
+            Some(work),
             unfinished,
             Arc::clone(&self.cancel),
         ))
@@ -1001,10 +1014,8 @@ impl DirectoryWalker {
 /// sends results and new subdirectories back.
 #[allow(clippy::too_many_arguments)]
 fn walker_thread(
-    work_rx: &channel::Receiver<WorkItem>,
-    work_tx: &channel::Sender<WorkItem>,
+    work: &WorkQueue,
     result_tx: &channel::Sender<Vec<WalkEntry>>,
-    in_flight: &AtomicUsize,
     config: &WalkerConfig,
     windows: &DirWindows,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
@@ -1027,20 +1038,17 @@ fn walker_thread(
 
         // Send what this worker holds before waiting for work, so the
         // collector never waits on entries an idle worker is sitting on.
-        if work_rx.is_empty() && !results.flush(cancel) {
+        if work.ready_is_empty() && !results.flush(cancel) {
             return;
         }
 
-        match work_rx.recv_timeout(WORK_RECV_TIMEOUT) {
+        match work.recv_timeout(WORK_RECV_TIMEOUT) {
             Ok(item) => {
+                let filesystem = item.filesystem;
                 process_directory(
-                    &item.path,
-                    item.depth,
-                    item.root_device_id,
-                    item.opaque_tree,
-                    work_tx,
+                    item,
+                    work,
                     &mut results,
-                    in_flight,
                     config,
                     windows,
                     protection,
@@ -1048,12 +1056,7 @@ fn walker_thread(
                     cancel,
                     measure_files,
                 );
-                // Mark this work item as completed.
-                let remaining = in_flight.fetch_sub(1, Ordering::AcqRel);
-                if remaining == 1 {
-                    // We were the last in-flight item. Signal termination by
-                    // dropping our sender (happens when thread exits).
-                }
+                work.complete(filesystem);
             }
             Err(channel::RecvTimeoutError::Timeout) => {
                 // Check cancel on timeout too, so threads don't linger waiting for work.
@@ -1062,7 +1065,7 @@ fn walker_thread(
                 }
                 // Another worker may have taken the item this one saw queued,
                 // so entries can still be held here when the walk finishes.
-                if in_flight.load(Ordering::Acquire) == 0 {
+                if work.is_finished() {
                     results.flush(cancel);
                     return;
                 }
@@ -1084,13 +1087,9 @@ fn walker_thread(
 /// tens of thousands of syscalls per scan pass.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn process_directory(
-    dir_path: &Path,
-    depth: usize,
-    root_dev: u64,
-    opaque_tree: Option<OpaqueTreeClassification>,
-    work_tx: &channel::Sender<WorkItem>,
+    item: WorkItem,
+    work: &WorkQueue,
     results: &mut ResultBatch<'_>,
-    in_flight: &AtomicUsize,
     config: &WalkerConfig,
     windows: &DirWindows,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
@@ -1098,6 +1097,15 @@ fn process_directory(
     cancel: &AtomicBool,
     measure_files: bool,
 ) {
+    let WorkItem {
+        path,
+        depth,
+        root_device_id: root_dev,
+        opaque_tree,
+        filesystem,
+        expected_metadata,
+    } = item;
+    let dir_path = path.as_path();
     // Check exclusion list.
     if config.excluded_paths.contains(dir_path) {
         return;
@@ -1110,17 +1118,30 @@ fn process_directory(
         return;
     }
 
-    // Stat the directory once (at depth > 0) — used for both cross-device guard
-    // and WalkEntry emission. At depth 0 (root paths), device was already checked
-    // at seed time in stream().
-    let dir_meta = if depth > 0 {
-        match metadata_for_path(dir_path, config.follow_symlinks) {
-            Ok(m) => Some(m),
-            Err(_) => return,
-        }
+    // The usual child gets its existing single metadata read. A configured
+    // root, opaque candidate, or crossed-mount handoff also refreshes metadata
+    // after waiting: cached evidence cannot authorize a replaced object.
+    // Root aliases are intentionally followed, as they are at seed time.
+    let current = if depth == 0 {
+        fs::metadata(dir_path)
     } else {
-        None
+        metadata_for_path(dir_path, config.follow_symlinks)
     };
+    let Ok(meta) = current else {
+        if expected_metadata.is_some() {
+            results.mark_unfinished(dir_path);
+        }
+        return;
+    };
+    if !meta.is_dir()
+        || expected_metadata.as_ref().is_some_and(|expected| {
+            entry_metadata(expected).identity() != entry_metadata(&meta).identity()
+        })
+    {
+        results.mark_unfinished(dir_path);
+        return;
+    }
+    let dir_meta = Some(meta);
 
     // Cross-device guard: if this directory is on a different filesystem than
     // its root path, skip the entire subtree. This catches mount points that
@@ -1129,6 +1150,47 @@ fn process_directory(
         && let Some(ref meta) = dir_meta
         && device_id(meta) != root_dev
     {
+        return;
+    }
+
+    // A child inherits its parent's admission until the existing metadata
+    // read identifies a crossed mount. Hand it off once, retaining its
+    // expected identity. The rare handoff revalidates after admission; a
+    // changed path stops above instead of entering a requeue loop.
+    if let Some(ref meta) = dir_meta
+        && device_id(meta) != filesystem.device_id
+    {
+        let actual = work.filesystem(dir_path, device_id(meta));
+        work.enqueue(WorkItem {
+            path,
+            depth,
+            root_device_id: root_dev,
+            opaque_tree,
+            filesystem: actual,
+            expected_metadata: dir_meta.map(Box::new),
+        });
+        return;
+    }
+
+    // Opaque-tree sizing is directory work too. Giving it its own task
+    // keeps probes on their actual device's admission, including a child
+    // that is a mount point, without occupying the parent device's slot.
+    if opaque_tree
+        .as_ref()
+        .is_some_and(|opaque| opaque.disposition == OpaqueTreeDisposition::CandidateOpaque)
+    {
+        if let Some(meta) = dir_meta {
+            emit_opaque_candidate(
+                path,
+                depth,
+                root_dev,
+                opaque_tree,
+                &meta,
+                config,
+                results,
+                cancel,
+            );
+        }
         return;
     }
 
@@ -1308,10 +1370,8 @@ fn process_directory(
     // ─── Deferred Recursion Dispatch ───
     // No .sbh-protect marker was in the listing (we would have returned
     // above), so queue collected child dirs for worker threads.
-    //
-    // Use send_timeout + cancel check instead of blocking send to prevent
-    // thread leaks: when the scanner times out and sets the cancel flag,
-    // threads stuck on a full work channel will notice within 100ms and exit.
+    // Enqueue is unbounded and does not wait for a device's admission. A
+    // parent and its children therefore cannot deadlock on the same slot.
     for child_path in pending_children {
         if cancel.load(Ordering::Relaxed) {
             results.mark_unfinished(dir_path);
@@ -1328,91 +1388,38 @@ fn process_directory(
         } else {
             None
         };
-        if let Some(opaque) = opaque_tree.clone() {
-            match opaque.disposition {
-                OpaqueTreeDisposition::CandidateOpaque => {
-                    let Ok(meta) = metadata_for_path(&child_path, config.follow_symlinks) else {
-                        continue;
-                    };
-                    if !config.cross_devices && device_id(&meta) != root_dev {
-                        continue;
-                    }
-                    let mut emeta = entry_metadata(&meta);
-                    let mut probe_signals = StructuralSignals::default();
-                    if emeta.is_dir {
-                        // The tree is pruned from the main walk, so measure it
-                        // here: without this every opaque candidate reported
-                        // exactly the floor and nothing could be ranked by size.
-                        // Only a truncated probe (budget or cancel: the rest
-                        // could be any size) keeps the floor. A probe that
-                        // merely skipped unreadable entries measured nearly
-                        // everything; flooring it inflated small fixture dirs
-                        // to exactly 100 MiB each (vmi1264463: 1,076 of 1,117
-                        // logged deletions, `bytes_freed` pure fiction).
-                        let probe = opaque_tree_probe(
-                            &child_path,
-                            config.cross_devices,
-                            root_dev,
-                            OPAQUE_SIZE_PROBE_BUDGET,
-                            cancel,
-                        );
-                        let (measured, truncated) = (probe.allocated_bytes, probe.truncated);
-                        // Same pass, no extra syscalls: the newest mtime inside
-                        // the tree is what "age" means for a build cache.
-                        emeta.tree_last_modified = probe.newest_mtime;
-                        probe_signals = probe.signals;
-                        let measured = emeta.content_size_bytes.saturating_add(measured);
-                        emeta.content_size_bytes = if truncated {
-                            measured.max(OPAQUE_CANDIDATE_SIZE_FLOOR)
-                        } else {
-                            measured
-                        };
-                    }
-                    let walk_entry = WalkEntry {
-                        path: child_path,
-                        metadata: emeta,
-                        depth: depth + 1,
-                        structural_signals: probe_signals,
-                        is_open: false,
-                        opaque_tree: Some(opaque),
-                    };
-                    if !results.push(walk_entry, cancel) {
-                        results.mark_unfinished(dir_path);
-                        return;
-                    }
-                    continue;
-                }
-                OpaqueTreeDisposition::ProtectedOpaque => continue,
-                OpaqueTreeDisposition::SignalOnly => {}
-            }
+        if opaque_tree
+            .as_ref()
+            .is_some_and(|opaque| opaque.disposition == OpaqueTreeDisposition::ProtectedOpaque)
+        {
+            continue;
         }
-        in_flight.fetch_add(1, Ordering::Release);
-        loop {
-            match work_tx.send_timeout(
-                WorkItem {
-                    path: child_path.clone(),
-                    depth: depth + 1,
-                    root_device_id: root_dev,
-                    opaque_tree: opaque_tree.clone(),
-                },
-                SEND_TIMEOUT,
-            ) {
-                Ok(()) => break,
-                Err(channel::SendTimeoutError::Timeout(_)) => {
-                    // Channel full — check cancel before retrying.
-                    if cancel.load(Ordering::Relaxed) {
-                        in_flight.fetch_sub(1, Ordering::Release);
-                        results.mark_unfinished(dir_path);
-                        return;
-                    }
-                }
-                Err(channel::SendTimeoutError::Disconnected(_)) => {
-                    in_flight.fetch_sub(1, Ordering::Release);
-                    results.mark_unfinished(dir_path);
-                    return;
-                }
+        let expected_metadata = if opaque_tree
+            .as_ref()
+            .is_some_and(|opaque| opaque.disposition == OpaqueTreeDisposition::CandidateOpaque)
+        {
+            // Classification may have read structural cache evidence. Bind
+            // it to this object before the queue can defer its sizing probe,
+            // as the former inline probe did immediately after classifying.
+            let Ok(meta) = metadata_for_path(&child_path, config.follow_symlinks) else {
+                results.mark_unfinished(&child_path);
+                continue;
+            };
+            if !config.cross_devices && device_id(&meta) != root_dev {
+                continue;
             }
-        }
+            Some(Box::new(meta))
+        } else {
+            None
+        };
+        work.enqueue(WorkItem {
+            path: child_path,
+            depth: depth + 1,
+            root_device_id: root_dev,
+            opaque_tree,
+            filesystem,
+            expected_metadata,
+        });
     }
 
     // Finalize structural signals.
@@ -1443,6 +1450,53 @@ fn process_directory(
 
         results.push(walk_entry, cancel);
     }
+}
+
+/// Preserve the opaque probe's allocated-byte, freshness, and structural
+/// evidence while running it under the candidate's device admission.
+#[allow(clippy::too_many_arguments)]
+fn emit_opaque_candidate(
+    path: PathBuf,
+    depth: usize,
+    root_dev: u64,
+    opaque_tree: Option<OpaqueTreeClassification>,
+    meta: &fs::Metadata,
+    config: &WalkerConfig,
+    results: &mut ResultBatch<'_>,
+    cancel: &AtomicBool,
+) {
+    let mut emeta = entry_metadata(meta);
+    let mut probe_signals = StructuralSignals::default();
+    if emeta.is_dir {
+        let probe = opaque_tree_probe(
+            &path,
+            config.cross_devices,
+            root_dev,
+            OPAQUE_SIZE_PROBE_BUDGET,
+            cancel,
+        );
+        emeta.tree_last_modified = probe.newest_mtime;
+        probe_signals = probe.signals;
+        let measured = emeta
+            .content_size_bytes
+            .saturating_add(probe.allocated_bytes);
+        // Only a budget- or cancellation-truncated probe retains the size
+        // floor. Flooring an otherwise complete small tree invents bytes.
+        emeta.content_size_bytes = if probe.truncated {
+            measured.max(OPAQUE_CANDIDATE_SIZE_FLOOR)
+        } else {
+            measured
+        };
+    }
+    let walk_entry = WalkEntry {
+        path,
+        metadata: emeta,
+        depth,
+        structural_signals: probe_signals,
+        is_open: false,
+        opaque_tree,
+    };
+    results.push(walk_entry, cancel);
 }
 
 /// The parent-directory context [`classify_opaque_tree`] needs for `path`,
@@ -4737,7 +4791,7 @@ mod tests {
     fn process_directory_exits_when_result_channel_is_backpressured_and_cancelled() {
         use crossbeam_channel as channel;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
         use std::time::{Duration, Instant};
 
@@ -4746,9 +4800,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("file.bin"), b"payload").unwrap();
 
-        let (work_tx, work_rx) = channel::bounded::<WorkItem>(1);
+        let work = WorkQueue::new();
         let (result_tx, result_rx) = channel::bounded::<Vec<WalkEntry>>(1);
-        drop(work_rx);
 
         // Fill the result channel so the directory emitter must wait.
         result_tx
@@ -4773,7 +4826,6 @@ mod tests {
             }])
             .unwrap();
 
-        let in_flight = AtomicUsize::new(0);
         let protection = parking_lot::RwLock::new(ProtectionRegistry::marker_only());
         let config = WalkerConfig {
             root_paths: vec![tmp.path().to_path_buf()],
@@ -4803,13 +4855,16 @@ mod tests {
                 starts: HashMap::new(),
             };
             process_directory(
-                &dir_clone,
-                1,
-                root_dev,
-                None,
-                &work_tx,
+                WorkItem {
+                    filesystem: work.filesystem(&dir_clone, root_dev),
+                    path: dir_clone,
+                    depth: 1,
+                    root_device_id: root_dev,
+                    opaque_tree: None,
+                    expected_metadata: None,
+                },
+                &work,
                 &mut results,
-                &in_flight,
                 &config,
                 &windows,
                 &protection,
@@ -4944,6 +4999,343 @@ mod tests {
         }
     }
 
+    #[test]
+    fn btrfs_admission_preserves_entries_opaque_sizes_and_protection() {
+        let tmp = TempDir::new().unwrap();
+        let target = synthetic_large_cargo_tree(tmp.path(), 8);
+        for index in 0..12 {
+            let dir = tmp.path().join(format!("ordinary-{index}/leaf"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("payload"), vec![1u8; 8192]).unwrap();
+        }
+        let protected = tmp.path().join("protected");
+        fs::create_dir_all(protected.join("child")).unwrap();
+        fs::write(protected.join(".sbh-protect"), "keep").unwrap();
+        let excluded = tmp.path().join("excluded");
+        fs::create_dir_all(excluded.join("child")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(tmp.path(), tmp.path().join("loop")).unwrap();
+
+        let dev = device_id(&fs::metadata(tmp.path()).unwrap());
+        for opaque_pruning in [false, true] {
+            let mut config = test_config(tmp.path());
+            config.parallelism = 16;
+            config.opaque_pruning = opaque_pruning;
+            config.excluded_paths.insert(excluded.clone());
+            let expected: HashMap<_, _> =
+                DirectoryWalker::new(config.clone(), ProtectionRegistry::marker_only())
+                    .walk()
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| (entry.path.clone(), entry))
+                    .collect();
+            let entries = DirectoryWalker::new(config, ProtectionRegistry::marker_only())
+                .with_btrfs_device(dev)
+                .walk()
+                .unwrap();
+            let paths: HashSet<_> = entries.iter().map(|entry| entry.path.clone()).collect();
+            assert_eq!(entries.len(), paths.len(), "no repeated directory results");
+            assert_eq!(paths, expected.keys().cloned().collect());
+            assert!(paths.iter().all(|path| !path.starts_with(&protected)));
+            assert!(paths.iter().all(|path| !path.starts_with(&excluded)));
+            for entry in &entries {
+                let baseline = &expected[&entry.path];
+                assert_eq!(entry.metadata, baseline.metadata);
+                assert_eq!(entry.structural_signals, baseline.structural_signals);
+                assert_eq!(entry.opaque_tree, baseline.opaque_tree);
+                assert_eq!(entry.depth, baseline.depth);
+            }
+            if opaque_pruning {
+                let entry = entries.iter().find(|entry| entry.path == target).unwrap();
+                let meta = fs::metadata(&target).unwrap();
+                let probe = opaque_tree_probe(
+                    &target,
+                    false,
+                    dev,
+                    OPAQUE_SIZE_PROBE_BUDGET,
+                    &AtomicBool::new(false),
+                );
+                assert!(!probe.truncated);
+                assert_eq!(
+                    entry.metadata.content_size_bytes,
+                    allocated_size(&meta).saturating_add(probe.allocated_bytes)
+                );
+                assert_eq!(entry.metadata.tree_last_modified, probe.newest_mtime);
+                assert!(
+                    paths
+                        .iter()
+                        .all(|path| path == &target || !path.starts_with(&target))
+                );
+            }
+        }
+    }
+
+    fn process_queued_directory_for_test(
+        item: WorkItem,
+        work: &WorkQueue,
+        config: &WalkerConfig,
+    ) -> (Vec<WalkEntry>, Vec<PathBuf>) {
+        let (tx, rx) = channel::unbounded();
+        let unfinished = parking_lot::Mutex::new(Vec::new());
+        let mut results = ResultBatch::new(&tx, 1, &unfinished);
+        let windows = DirWindows {
+            size: MAX_ENTRIES_PER_DIR,
+            starts: HashMap::new(),
+        };
+        let protection = parking_lot::RwLock::new(ProtectionRegistry::marker_only());
+        let cancel = AtomicBool::new(false);
+        let filesystem = item.filesystem;
+        process_directory(
+            item,
+            work,
+            &mut results,
+            config,
+            &windows,
+            &protection,
+            None,
+            &cancel,
+            true,
+        );
+        work.complete(filesystem);
+        assert!(results.flush(&cancel));
+        drop(results);
+        (rx.try_iter().flatten().collect(), unfinished.into_inner())
+    }
+
+    #[test]
+    fn an_opaque_cache_replaced_while_deferred_is_not_emitted() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("scan");
+        let cache = root.join("build-cache");
+        fs::create_dir_all(cache.join("a1")).unwrap();
+        fs::write(cache.join("trim.txt"), "cache").unwrap();
+        fs::write(cache.join("a1/cached-output"), b"regenerable").unwrap();
+        let seed_metadata = fs::metadata(&root).unwrap();
+        let dev = device_id(&seed_metadata);
+        let work = WorkQueue::new();
+        work.mark_btrfs(dev);
+        let filesystem = work.filesystem(&root, dev);
+        work.enqueue(WorkItem {
+            path: root.clone(),
+            depth: 0,
+            root_device_id: dev,
+            opaque_tree: None,
+            filesystem,
+            expected_metadata: Some(Box::new(seed_metadata)),
+        });
+        let parent = work.recv_timeout(Duration::from_secs(1)).unwrap();
+        // This task is ahead of the parent's children in the device queue.
+        // Holding it gives the structurally classified cache a real wait.
+        work.enqueue(WorkItem {
+            path: root.join("occupies-device"),
+            depth: 1,
+            root_device_id: dev,
+            opaque_tree: None,
+            filesystem,
+            expected_metadata: None,
+        });
+        let mut config = test_config(&root);
+        config.opaque_pruning = true;
+        let (entries, unfinished) = process_queued_directory_for_test(parent, &work, &config);
+        assert!(entries.is_empty());
+        assert!(unfinished.is_empty());
+        let occupied = work.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(occupied.path, root.join("occupies-device"));
+        assert!(work.ready_is_empty());
+
+        fs::rename(&cache, tmp.path().join("original-cache")).unwrap();
+        fs::create_dir_all(cache.join("private-data")).unwrap();
+        fs::write(cache.join("private-data/keep"), b"user data").unwrap();
+        work.complete(occupied.filesystem);
+        let admitted = work.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(admitted.path, cache);
+        assert_eq!(
+            admitted
+                .opaque_tree
+                .as_ref()
+                .map(|tree| tree.classification.category),
+            Some(crate::scanner::patterns::ArtifactCategory::GoCache)
+        );
+        assert!(admitted.expected_metadata.is_some());
+        let (entries, unfinished) = process_queued_directory_for_test(admitted, &work, &config);
+        assert!(
+            entries.is_empty(),
+            "replacement cannot inherit the cache verdict"
+        );
+        assert_eq!(unfinished.as_slice(), std::slice::from_ref(&cache));
+        assert!(work.is_finished());
+        assert!(work.ready_is_empty());
+        assert_eq!(
+            fs::read(cache.join("private-data/keep")).unwrap(),
+            b"user data"
+        );
+    }
+
+    fn crossed_mount_after_handoff(replace: impl FnOnce(&Path), expect_emission: bool) {
+        let tmp = TempDir::new().unwrap();
+        let target = synthetic_large_cargo_tree(tmp.path(), 4);
+        let actual_dev = device_id(&fs::metadata(&target).unwrap());
+        let parent_dev = actual_dev.wrapping_add(1);
+        let work = WorkQueue::new();
+        work.mark_btrfs(actual_dev);
+        let actual_filesystem = work.filesystem(&target, actual_dev);
+        let parent_filesystem = work.filesystem(Path::new("/absent-sbh-device"), parent_dev);
+        work.enqueue(WorkItem {
+            path: tmp.path().join("occupies-device"),
+            depth: 1,
+            root_device_id: actual_dev,
+            opaque_tree: None,
+            filesystem: actual_filesystem,
+            expected_metadata: None,
+        });
+        let running = work.recv_timeout(Duration::from_secs(1)).unwrap();
+        let opaque = classify_opaque_tree(&target, opaque_context_for_path(&target));
+        assert!(
+            opaque
+                .as_ref()
+                .is_some_and(|tree| { tree.disposition == OpaqueTreeDisposition::CandidateOpaque })
+        );
+        work.enqueue(WorkItem {
+            path: target.clone(),
+            depth: 1,
+            root_device_id: parent_dev,
+            opaque_tree: opaque,
+            filesystem: parent_filesystem,
+            expected_metadata: None,
+        });
+        let item = work.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut config = test_config(tmp.path());
+        config.cross_devices = true;
+        let (entries, unfinished) = process_queued_directory_for_test(item, &work, &config);
+        assert!(
+            entries.is_empty(),
+            "no opaque probe result before admission"
+        );
+        assert!(unfinished.is_empty());
+        assert!(work.ready_is_empty(), "the actual device is still occupied");
+        assert!(!work.is_finished());
+
+        replace(&target);
+        work.complete(running.filesystem);
+        let admitted = work.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(admitted.filesystem, actual_filesystem);
+        assert!(
+            admitted.expected_metadata.is_some(),
+            "the handoff retains the identity that admission must revalidate"
+        );
+        let (entries, unfinished) = process_queued_directory_for_test(admitted, &work, &config);
+        assert!(work.is_finished());
+        assert!(work.ready_is_empty(), "no repeated mount handoff");
+        if expect_emission {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].path, target);
+            assert!(entries[0].metadata.content_size_bytes > 0);
+            assert!(unfinished.is_empty());
+        } else {
+            assert!(
+                entries.is_empty(),
+                "a changed path is never probed or emitted"
+            );
+            assert_eq!(unfinished, [target]);
+        }
+    }
+
+    #[test]
+    fn a_crossed_mount_waits_for_its_own_device_before_opaque_sizing() {
+        crossed_mount_after_handoff(|_| {}, true);
+    }
+
+    #[test]
+    fn a_directory_replaced_during_device_handoff_is_not_walked() {
+        crossed_mount_after_handoff(
+            |path| {
+                fs::rename(path, path.with_file_name("original-target")).unwrap();
+                fs::create_dir_all(path.join("unrelated-data")).unwrap();
+                fs::write(path.join("unrelated-data/keep"), b"keep").unwrap();
+            },
+            false,
+        );
+    }
+
+    #[test]
+    fn a_directory_removed_during_device_handoff_is_unfinished() {
+        crossed_mount_after_handoff(
+            |path| fs::rename(path, path.with_file_name("original-target")).unwrap(),
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_planted_during_device_handoff_is_not_followed() {
+        crossed_mount_after_handoff(
+            |path| {
+                let original = path.with_file_name("original-target");
+                fs::rename(path, &original).unwrap();
+                std::os::unix::fs::symlink(original, path).unwrap();
+            },
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_deferred_root_alias_is_revalidated_before_listing() {
+        for retarget in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let original = tmp.path().join("original");
+            let replacement = tmp.path().join("replacement");
+            fs::create_dir_all(original.join("allowed-child")).unwrap();
+            fs::create_dir_all(replacement.join("unexpected-child")).unwrap();
+            let alias = tmp.path().join("root-alias");
+            std::os::unix::fs::symlink(&original, &alias).unwrap();
+            let seed_metadata = fs::metadata(&alias).unwrap();
+            let dev = device_id(&seed_metadata);
+            let work = WorkQueue::new();
+            work.mark_btrfs(dev);
+            let filesystem = work.filesystem(&alias, dev);
+            work.enqueue(WorkItem {
+                path: tmp.path().join("occupies-device"),
+                depth: 1,
+                root_device_id: dev,
+                opaque_tree: None,
+                filesystem,
+                expected_metadata: None,
+            });
+            let running = work.recv_timeout(Duration::from_secs(1)).unwrap();
+            work.enqueue(WorkItem {
+                path: alias.clone(),
+                depth: 0,
+                root_device_id: dev,
+                opaque_tree: None,
+                filesystem,
+                expected_metadata: Some(Box::new(seed_metadata)),
+            });
+            assert!(work.ready_is_empty());
+            if retarget {
+                fs::rename(&alias, tmp.path().join("old-alias")).unwrap();
+                std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+            }
+            work.complete(running.filesystem);
+            let mut paths = Vec::new();
+            let mut unfinished = Vec::new();
+            let config = test_config(&alias);
+            while !work.is_finished() {
+                let item = work.recv_timeout(Duration::from_secs(1)).unwrap();
+                let (entries, pending) = process_queued_directory_for_test(item, &work, &config);
+                paths.extend(entries.into_iter().map(|entry| entry.path));
+                unfinished.extend(pending);
+            }
+            if retarget {
+                assert!(paths.is_empty());
+                assert_eq!(unfinished, [alias]);
+            } else {
+                assert_eq!(paths, [alias.join("allowed-child")]);
+                assert!(unfinished.is_empty());
+            }
+        }
+    }
+
     /// bd-y70k: whenever a consumer stops early, every directory it took
     /// that has unseen directories below it lies at or above a path the
     /// stream reports unfinished, however the stop falls against the workers.
@@ -4970,11 +5362,15 @@ mod tests {
         }
         assert_eq!(tree.len(), 780);
 
-        for parallelism in [1, 4] {
+        for (parallelism, btrfs) in [(1, false), (4, false), (8, true)] {
             for take in [1, 7, 60, 400, 779, 780] {
                 let mut config = test_config(tmp.path());
                 config.parallelism = parallelism;
-                let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+                let mut walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+                if btrfs {
+                    walker =
+                        walker.with_btrfs_device(device_id(&fs::metadata(tmp.path()).unwrap()));
+                }
                 let cancel = walker.cancel_token();
                 let mut stream = walker.stream().unwrap();
                 let seen: HashSet<PathBuf> =

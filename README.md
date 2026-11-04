@@ -1026,6 +1026,9 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_UPDATE_HANDOFF_CONTEXT_PROBE` | test | Mode (`update` or another value) the update-handoff test runs its child process in, to check that a command's install-path intent is captured once (#35) |
 | `SBH_TUI_ARTIFACT_FRAMES` | test | Include rendered frame text in the TUI test artifacts |
 | `SBH_TEST_AGENT_SCRATCH_FIFO_CHILD` | test | Set in the child process the agent-scratch FIFO-marker test re-runs itself in, so a marker read that blocks cannot hang the suite |
+| `SBH_TEST_GUIDED_CONFIG_DESTINATION` | test | Fixture directory for the isolated installer test that checks relative config destinations and CLI-over-environment precedence |
+| `SBH_TEST_EXPLICIT_INSTALL_CONFIG` | test | Fixture directory for the isolated systemd test that publishes a unit with an explicit config path |
+| `SBH_TEST_SYSTEMCTL_CALLS` | test | Fixture log where the isolated systemd installer test records its stub systemctl calls |
 <!-- sbh-docs:end -->
 
 ## Architecture
@@ -1924,7 +1927,9 @@ The walker is the scanner's "eyes": it discovers candidate files and directories
 
 The walker uses an unbounded work queue shared across `N` worker threads (configurable via `scanner.parallelism`) and a bounded result channel (up to <!-- claim:constants.walker.RESULT_CHANNEL_CAP -->10000<!-- /claim --> entries) back to the collector. Root paths are seeded into the queue, and each worker pulls a directory, processes its entries, and enqueues discovered subdirectories back onto the shared queue. A worker sends its results in batches of up to <!-- claim:constants.walker.WALK_BATCH_ENTRIES -->64<!-- /claim -->, and sends whatever it holds before it waits for more work, so the collector waits once per batch instead of once per directory. Workers that find an empty queue wait briefly (50ms timeout) before checking whether all work is complete. This design provides natural load balancing — workers that finish fast directories steal work from threads processing slower ones — without requiring explicit work-stealing data structures.
 
-An atomic `in_flight` counter tracks work items that have been dequeued but not yet processed. When the last item completes (counter reaches zero), workers exit. The work queue is unbounded so workers never deadlock when enqueuing discovered subdirectories, while the result channel is bounded to prevent unbounded memory growth on deep trees.
+On Linux, each detected btrfs device admits at most <!-- claim:constants.walker.MAX_ACTIVE_BTRFS_DIRECTORIES -->1<!-- /claim --> directory task at a time. Deferred directories wait outside the ready queue, leaving workers available for other devices and filesystems. Opaque candidate sizing uses the same admission queue, and directories crossing a mount are assigned to their actual device before traversal. Configured roots, opaque candidates, and crossed mounts are checked again after waiting so a replaced path cannot inherit an earlier directory's identity or classification.
+
+An atomic `in_flight` counter tracks ready, deferred, and running work. When the last item completes (counter reaches zero), workers exit. The work queue is unbounded so workers never deadlock when enqueuing discovered subdirectories, while the result channel is bounded to prevent unbounded memory growth on deep trees. Cancellation reports both ready and deferred directories as unfinished.
 
 #### Per-Directory Iteration Cap
 

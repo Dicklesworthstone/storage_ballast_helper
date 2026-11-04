@@ -400,6 +400,21 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
         EnvArea::Test,
         "Set in the child process the agent-scratch FIFO-marker test re-runs itself in, so a marker read that blocks cannot hang the suite",
     ),
+    var(
+        "SBH_TEST_GUIDED_CONFIG_DESTINATION",
+        EnvArea::Test,
+        "Fixture directory for the isolated installer test that checks relative config destinations and CLI-over-environment precedence",
+    ),
+    var(
+        "SBH_TEST_EXPLICIT_INSTALL_CONFIG",
+        EnvArea::Test,
+        "Fixture directory for the isolated systemd test that publishes a unit with an explicit config path",
+    ),
+    var(
+        "SBH_TEST_SYSTEMCTL_CALLS",
+        EnvArea::Test,
+        "Fixture log where the isolated systemd installer test records its stub systemctl calls",
+    ),
 ];
 
 /// `SBH_*` string literals in the source that are not environment
@@ -1197,6 +1212,13 @@ pub fn constants() -> Vec<ConstantDoc> {
             walker::WALK_BATCH_ENTRIES,
             "Entries a worker sends the collector at once",
             "src/scanner/walker.rs",
+        ),
+        constant(
+            "walker",
+            "MAX_ACTIVE_BTRFS_DIRECTORIES",
+            walker::MAX_ACTIVE_BTRFS_DIRECTORIES,
+            "Concurrent directory tasks on one detected btrfs device",
+            "src/scanner/walker/work_queue.rs",
         ),
         constant(
             "walker",

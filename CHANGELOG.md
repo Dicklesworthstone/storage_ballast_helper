@@ -8,6 +8,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Large btrfs walks limit competing directory work per device.** CLI and
+  daemon scans now admit one directory task at a time on each detected btrfs
+  device while keeping other devices and filesystems available to the worker
+  pool. Deferred work waits outside the ready queue. Opaque candidate sizing
+  uses the same admission, queued identities are rechecked before traversal,
+  and cancellation retains both ready and deferred unfinished paths. The live
+  constants report exposes the device limit (bd-gh0x).
+
 - **Automatic privileged installs register a system service.** Running
   `sudo sbh install --auto` now selects systemd system scope or a launchd
   LaunchDaemon, with the corresponding configuration and data paths. Explicit

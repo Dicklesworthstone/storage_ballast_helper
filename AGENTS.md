@@ -668,6 +668,7 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | scanner | `active_reference_min_size_bytes` | `100 MiB` | Smallest entry checked for active references | `src/core/config.rs` |
 | walker | `RESULT_CHANNEL_CAP` | `10000` | Worker → collector channel bound | `src/scanner/walker.rs` |
 | walker | `WALK_BATCH_ENTRIES` | `64` | Entries a worker sends the collector at once | `src/scanner/walker.rs` |
+| walker | `MAX_ACTIVE_BTRFS_DIRECTORIES` | `1` | Concurrent directory tasks on one detected btrfs device | `src/scanner/walker/work_queue.rs` |
 | walker | `WORK_RECV_TIMEOUT` | `50 ms` | Idle wait before a worker re-checks shutdown | `src/scanner/walker.rs` |
 | walker | `SEND_TIMEOUT` | `100 ms` | Wait on a full channel between cancellation checks | `src/scanner/walker.rs` |
 | walker | `MAX_ENTRIES_PER_DIR` | `65536` | Entries of one directory processed per pass; the window moves on each pass | `src/scanner/walker.rs` |
