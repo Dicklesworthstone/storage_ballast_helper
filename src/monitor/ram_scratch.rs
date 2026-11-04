@@ -406,6 +406,8 @@ impl ScratchReport {
     pub fn push_issue(&mut self, issue: ScratchIssue) {
         self.issues.push(issue.message.clone());
         self.issue_details.push(issue);
+        self.complete = false;
+        self.exit_code = 4;
     }
 }
 
@@ -414,7 +416,8 @@ impl ScratchReport {
 /// `kind` is one of `mount_covered`, `mount_not_addressable`, `mount_vanished`,
 /// `mount_replaced`, `permission_denied`, `mount_inspection_failed`,
 /// `mount_counters_inconsistent`, `mount_topology_unresolved`,
-/// `ramfs_unmeasurable`, `mount_budget_exhausted`, `process_swap_failed`,
+/// `mount_identity_unavailable`, `mount_table_failed`,
+/// `ramfs_unmeasurable`, `mount_budget_exhausted`, `mount_table_budget_exhausted`, `process_swap_failed`,
 /// `process_swap_incomplete`, `collection_failed`, `target_not_observed` or
 /// `attribution_incomplete`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -425,7 +428,11 @@ pub struct ScratchIssue {
     pub path: Option<String>,
     /// Kernel mount ID from `/proc/self/mountinfo`, when one mount is concerned.
     pub mount_id: Option<u64>,
-    /// For `mount_covered`: the mount that path lookup reaches instead.
+    /// Mount ID reached by the opened descriptor, when identity was available.
+    pub observed_mount_id: Option<u64>,
+    /// Failed inspection stage, such as `open`, `identity`, or `capacity`.
+    pub operation: Option<&'static str>,
+    /// For `mount_covered`: a mount hiding it in the observed mount table.
     pub covered_by: Option<CoveringMount>,
     /// `errno` of the failed system call, when there was one.
     pub os_error: Option<i32>,
@@ -441,6 +448,8 @@ impl ScratchIssue {
             kind,
             path: None,
             mount_id: None,
+            observed_mount_id: None,
+            operation: None,
             covered_by: None,
             os_error: None,
             message,
@@ -448,7 +457,8 @@ impl ScratchIssue {
     }
 }
 
-/// A mount that hides a listed tmpfs from path lookup.
+/// A mount that hides a listed tmpfs in the observed topology. This covering
+/// mount may itself be hidden by another mount.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CoveringMount {
     /// Kernel mount ID from `/proc/self/mountinfo`.
@@ -470,7 +480,7 @@ pub fn inspect(
     limits.validate()?;
     #[cfg(target_os = "linux")]
     {
-        linux::inspect(platform, limits)
+        Ok(linux::inspect(platform, limits))
     }
     #[cfg(not(target_os = "linux"))]
     {

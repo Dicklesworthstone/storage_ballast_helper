@@ -632,6 +632,11 @@ fn write_human(out: &mut impl Write, report: &Report) -> io::Result<()> {
             "RAM-SCRATCH"
         };
         writeln!(out, "[{label}] {}", assessment.summary())?;
+    } else if report.host.supported {
+        writeln!(
+            out,
+            "RAM scratch inspection incomplete: resource accounting is unknown."
+        )?;
     } else {
         writeln!(
             out,
@@ -1184,6 +1189,57 @@ mod tests {
         assert!(matches.get_flag("json"));
         assert!(matches.subcommand().unwrap().1.get_flag("ram_scratch"));
         assert!(!crate::update_mutates_binary(&matches));
+    }
+
+    #[test]
+    fn failed_collection_without_assessment_is_incomplete_in_human_output() {
+        let mut host = preflight_fixture(64 << 30);
+        host.assessment = None;
+        host.push_issue(ram_scratch::ScratchIssue::new(
+            "collection_failed",
+            "host memory is unreadable: meminfo denied".into(),
+        ));
+        let report = Report {
+            host,
+            attribution_requested: false,
+            attribution: Vec::new(),
+        };
+        let mut output = Vec::new();
+        write_human(&mut output, &report).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(
+            text.lines().next(),
+            Some("RAM scratch inspection incomplete: resource accounting is unknown.")
+        );
+        assert!(text.contains("Incomplete: host memory is unreadable: meminfo denied"));
+        assert!(!text.contains("unsupported"));
+        assert!(!text.contains("occupied tmpfs bytes"));
+    }
+
+    #[test]
+    fn unsupported_collector_keeps_its_distinct_human_output() {
+        let mut host = preflight_fixture(64 << 30);
+        host.supported = false;
+        host.complete = false;
+        host.assessment = None;
+        host.exit_code = 0;
+        host.scope = "Linux tmpfs collector unavailable on this platform";
+        let report = Report {
+            host,
+            attribution_requested: false,
+            attribution: Vec::new(),
+        };
+        let mut output = Vec::new();
+        write_human(&mut output, &report).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(
+            text.lines().next(),
+            Some(
+                "RAM scratch collector unsupported: Linux tmpfs collector unavailable on this platform"
+            )
+        );
+        assert!(!text.contains("inspection incomplete"));
+        assert!(!text.contains("occupied tmpfs bytes"));
     }
 
     #[test]
