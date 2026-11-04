@@ -16,7 +16,7 @@
 #   --stage STAGE    Run only the named stage (e.g., "lint", "unit", "tui")
 #   --skip STAGE     Skip the named stage (repeatable)
 #   --native         Also run the native-* stages (Linux, passwordless sudo:
-#                    a loop-mounted Btrfs image, systemd-run as root). Off by
+#                    Btrfs, systemd, and private RAM-scratch namespaces). Off by
 #                    default; --stage native-X runs that one stage either way.
 #                    scripts/dsr_native_checks.sh runs them on a dsr host.
 #   --print-stages   Print the stage table (what would run) and exit
@@ -140,6 +140,7 @@ STAGES=(
   "e2e|HARD|e2e|E2E & Installer|user-experience|./scripts/e2e_test.sh|E2E failure — check the e2e/ artifact dir for per-case logs and summary.json"
   "native-btrfs|HARD|native|Native Linux (--native, dsr)|btrfs-compression|./scripts/quality-gate.sh --stage native-btrfs|The C UAPI check, the sbh_btrfs or compression tests, or the root-only compression and reflink-refusal proof on a loop-mounted Btrfs image failed — check the stage log (needs passwordless sudo, btrfs-progs and a C compiler)"
   "native-systemd|HARD|native|Native Linux (--native, dsr)|systemd-namespace|./scripts/quality-gate.sh --stage native-systemd|The systemd service tests or the root-only strict-namespace startup proof (systemd-run) failed — check the stage log (needs passwordless sudo and systemd)"
+  "native-ram-scratch|HARD|native|Native Linux (--native, dsr)|ram-scratch-mount-identity|./scripts/quality-gate.sh --stage native-ram-scratch|The visible, covered, stacked, replaced or permission-denied tmpfs proof failed — check the stage log (needs Linux private mount namespaces, CAP_SYS_ADMIN and root or passwordless sudo); denied namespaces are a failure, not a passing skip"
 )
 
 stage_field() {
@@ -337,8 +338,9 @@ stage_e2e() {
 # The native stages took over the retired btrfs-compression and
 # systemd-namespace GitHub workflows, step for step. They build locally
 # (never through rch: the root-only step runs the test binary this host
-# built) in a scratch dir under target/ with its own CARGO_TARGET_DIR, and
-# remove it again.
+# built) in a scratch dir under target/ with its own CARGO_TARGET_DIR.
+# RAM-scratch keeps its scratch directory for diagnostics; the older stages
+# retain their existing cleanup.
 native_scratch() {
   mkdir -p "${ROOT_DIR}/target"
   mktemp -d "${ROOT_DIR}/target/qg-native.XXXXXX"
@@ -419,6 +421,34 @@ stage_native_systemd() {
   ) > "${logfile}" 2>&1
 }
 
+stage_native_ram_scratch() {
+  local logfile="$1"
+  (
+    set -euo pipefail
+    cd "${ROOT_DIR}"
+    as_root() {
+      if [[ "${EUID}" -eq 0 ]]; then "$@"; else sudo -n "$@"; fi
+    }
+    echo "== require disposable, private Linux mount namespaces"
+    if [[ "$(uname -s)" != Linux ]] \
+        || ! as_root unshare --mount --propagation private -- true; then
+      echo "native-ram-scratch: private mount namespaces unavailable; qualification FAILED (not skipped). Linux needs CAP_SYS_ADMIN and root or passwordless sudo." >&2
+      exit 1
+    fi
+    work="$(native_scratch)" || exit 1
+    trap 'echo "native-ram-scratch: artifacts retained at ${work}"' EXIT
+    export CARGO_TARGET_DIR="${work}/target" RCH_CARGO_WRAPPER_BYPASS=1
+    echo "== visible, covered, stacked, replaced and denied tmpfs; library and CLI"
+    if ! bin="$(native_test_executable ram_scratch_native --locked --no-default-features --features cli,daemon,sqlite --test ram_scratch_native)"; then
+      exit 1
+    fi
+    # Every test creates its own private namespace before mounting anything,
+    # and its parent verifies that no fixture mount escaped. Inherited host
+    # visibility failures remain incomplete; the fixture is checked separately.
+    as_root "${bin}" --ignored --nocapture --test-threads=1
+  ) > "${logfile}" 2>&1
+}
+
 # Run one stage record: run the command, count executed tests, classify.
 #   pass      exit 0 and (kind=check or executed > 0)
 #   vacuous   exit 0 but a test/e2e stage executed zero tests (a failure)
@@ -456,6 +486,7 @@ run_stage() {
     e2e) stage_e2e "${logfile}" || rc=$? ;;
     native-btrfs) stage_native_btrfs "${logfile}" || rc=$? ;;
     native-systemd) stage_native_systemd "${logfile}" || rc=$? ;;
+    native-ram-scratch) stage_native_ram_scratch "${logfile}" || rc=$? ;;
     *)   run_cargo "${logfile}" "${command}" || rc=$? ;;
   esac
 

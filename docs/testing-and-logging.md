@@ -286,8 +286,9 @@ clippy) have no tests.
 | 31 | `e2e` | HARD | e2e | E2E & Installer | user-experience | `./scripts/e2e_test.sh` |
 | 32 | `native-btrfs` | HARD | native | Native Linux (--native, dsr) | btrfs-compression | `./scripts/quality-gate.sh --stage native-btrfs` |
 | 33 | `native-systemd` | HARD | native | Native Linux (--native, dsr) | systemd-namespace | `./scripts/quality-gate.sh --stage native-systemd` |
+| 34 | `native-ram-scratch` | HARD | native | Native Linux (--native, dsr) | ram-scratch-mount-identity | `./scripts/quality-gate.sh --stage native-ram-scratch` |
 
-33 stages: 24 HARD, 9 SOFT.
+34 stages: 25 HARD, 9 SOFT.
 <!-- sbh-qg:stages:end -->
 
 **Output artifacts:**
@@ -304,16 +305,25 @@ tests or for releases. The gates above, `cargo fmt --check`,
 whoever changes the code, through rch, before pushing. Releases go through
 `dsr build` and `scripts/dsr_release.sh` (see `docs/macos.md`).
 
-**Native stages:** `native-btrfs` (the C UAPI check, the `sbh_btrfs` and
-compression tests, then real zstd compression and reflink refusal as root on a
-loop-mounted 1 GiB Btrfs image) and `native-systemd` (the systemd service
-tests, then the root-only strict-namespace startup proof through
-`systemd-run`) need Linux with passwordless sudo. They run only with
-`--native` or by name (`--stage native-btrfs`), build with rustup's cargo in a
-scratch dir under `target/` that they remove, and never go through rch.
-`scripts/dsr_native_checks.sh [HOST]` runs both for `git archive HEAD` on a dsr
-build host (default `trj`) and removes its remote copy; dsr runs it as a
-required check before every sbh build.
+**Native stages:** `native-btrfs` checks the C UAPI and compression tests,
+then real zstd compression and reflink refusal on a loop-mounted 1 GiB Btrfs
+image. `native-systemd` checks the systemd service contracts and root-only
+strict-namespace startup through `systemd-run`. `native-ram-scratch` checks
+visible tmpfs, a file bind alias, a covered child, stacked and replaced mounts,
+and EACCES; covered mounts must retain `complete=false` and CLI exit 4.
+Each RAM-scratch case first creates a disposable private mount namespace,
+uses only fresh tiny fixture mounts, and verifies that no fixture mount
+appeared in its parent's namespace. Namespace creation denied by the host is
+a failed qualification, never a successful skip.
+
+These stages need Linux with root or passwordless sudo and their native
+dependencies. They run only with `--native` or by name (for example,
+`--stage native-ram-scratch`), build with rustup's cargo in a scratch directory
+under `target/`, and never go through rch. The RAM-scratch stage retains its
+scratch directory for diagnostics; the older stages keep their existing
+cleanup. `scripts/dsr_native_checks.sh [HOST]` runs all three for
+`git archive HEAD` on a dsr build host (default `trj`) and removes its remote
+copy; dsr runs it as a required check before every sbh build.
 
 **Docs update lint:** `scripts/ci_docs_update_check.sh` compares a head
 revision against a base and fails when user-facing source, installer,

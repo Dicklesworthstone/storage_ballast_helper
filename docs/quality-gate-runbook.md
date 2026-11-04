@@ -67,8 +67,9 @@ and in docs/testing-and-logging.md after a change to the script, and
 | 31 | `e2e` | HARD | e2e | E2E & Installer | user-experience | `./scripts/e2e_test.sh` |
 | 32 | `native-btrfs` | HARD | native | Native Linux (--native, dsr) | btrfs-compression | `./scripts/quality-gate.sh --stage native-btrfs` |
 | 33 | `native-systemd` | HARD | native | Native Linux (--native, dsr) | systemd-namespace | `./scripts/quality-gate.sh --stage native-systemd` |
+| 34 | `native-ram-scratch` | HARD | native | Native Linux (--native, dsr) | ram-scratch-mount-identity | `./scripts/quality-gate.sh --stage native-ram-scratch` |
 
-33 stages: 24 HARD, 9 SOFT.
+34 stages: 25 HARD, 9 SOFT.
 <!-- sbh-qg:stages:end -->
 
 `tui` is a default feature since
