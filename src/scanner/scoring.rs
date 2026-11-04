@@ -419,17 +419,17 @@ pub struct ScoringEngine {
     category_calibration: HashMap<String, f64>,
     /// Categories whose deletions are paused after a regret alarm.
     suspended_categories: HashSet<String>,
-    /// sbh's earlier deletions of each rch warm-cache path within
-    /// [`RCH_REDELETION_MEMORY`]; absent means none (bd-tz67).
-    rch_redeletions: HashMap<PathBuf, u32>,
+    /// sbh's earlier deletions of each warm-cache path within
+    /// [`CACHE_REDELETION_MEMORY`]; absent means none (bd-tz67).
+    cache_redeletions: HashMap<PathBuf, u32>,
 }
 
 impl ScoringEngine {
-    /// Apply sbh's own deletion history of rch warm caches (see
-    /// [`rch_redeletion_counts`]): each earlier deletion of a path doubles
-    /// its pressure idle floor.
-    pub fn set_rch_redeletions(&mut self, counts: HashMap<PathBuf, u32>) {
-        self.rch_redeletions = counts;
+    /// Apply sbh's own deletion history of warm caches (see
+    /// [`cache_redeletion_counts`]): each earlier deletion of a path doubles
+    /// its idle floor, including under Red/Critical pressure.
+    pub fn set_cache_redeletions(&mut self, counts: HashMap<PathBuf, u32>) {
+        self.cache_redeletions = counts;
     }
 
     /// Apply the regret calibrator's view: a factor per category that
@@ -468,7 +468,7 @@ impl ScoringEngine {
             posterior_floor_definite: scoring.posterior_floor_definite.clamp(0.0, 1.0),
             category_calibration: HashMap::new(),
             suspended_categories: HashSet::new(),
-            rch_redeletions: HashMap::new(),
+            cache_redeletions: HashMap::new(),
         }
     }
 
@@ -681,11 +681,20 @@ impl ScoringEngine {
                 "inside a uv cache entry: installed packages, managed by uv",
             ));
         }
-        let earlier_deletions = self.rch_redeletions.get(&input.path).copied().unwrap_or(0);
+        let earlier_deletions = self
+            .cache_redeletions
+            .get(&input.path)
+            .copied()
+            .unwrap_or(0);
         if let Some(reason) = rch_target_veto_reason(&input.path, urgency, earlier_deletions) {
             return Some(reason);
         }
         if let Some(reason) = rch_go_veto_reason(&input.path, urgency, earlier_deletions) {
+            return Some(reason);
+        }
+        if let Some(reason) =
+            go_cache_redeletion_veto_reason(input, self.min_file_age, urgency, earlier_deletions)
+        {
             return Some(reason);
         }
         // The executor refuses symlinks (removal would follow them out of the
@@ -847,7 +856,7 @@ impl RchTargetKind {
     }
 
     /// [`Self::idle_floor`] after `earlier_deletions` sbh deletions of the
-    /// same path within [`RCH_REDELETION_MEMORY`]: the floor doubles per
+    /// same path within [`CACHE_REDELETION_MEMORY`]: the floor doubles per
     /// deletion, up to rch's own floor (bd-tz67).
     ///
     /// A path that keeps coming back is a warm cache in use. Deleting it
@@ -895,33 +904,37 @@ pub(crate) const RCH_PRESSURE_PER_JOB_IDLE_MINUTES: u64 = 30;
 /// Pooled idle floor once urgency reaches [`RCH_PRESSURE_URGENCY`].
 pub(crate) const RCH_PRESSURE_POOLED_IDLE_MINUTES: u64 = 60;
 
-/// How long sbh remembers deleting an rch warm cache when it sets that
-/// path's idle floor: rch's own pooled floor, so a cache left alone that long
-/// starts over at the short floor.
-pub const RCH_REDELETION_MEMORY: Duration = Duration::from_hours(RCH_POOLED_IDLE_HOURS);
+/// How long sbh remembers deleting a warm cache when it sets that path's
+/// idle floor: rch's own pooled floor, so a cache left alone that long
+/// starts over with its first-deletion behavior.
+pub const CACHE_REDELETION_MEMORY: Duration = Duration::from_hours(RCH_POOLED_IDLE_HOURS);
 
-/// Whether a path's pressure idle floor backs off per repeat deletion: an rch
-/// target dir, or anything in a `.rch-go` dir.
+/// Whether a path's idle floor backs off per repeat deletion: an rch target
+/// dir, anything in a `.rch-go` dir, or a structurally identified Go cache.
+/// `GoCache` is produced by the classifier only for a cache's on-disk layout;
+/// a cache-like name or the generic `CacheDir` category is not sufficient.
 #[must_use]
-pub fn is_rch_warm_cache(path: &Path) -> bool {
-    classify_rch_target(path).is_some() || rch_go_root(path).is_some()
+pub fn is_warm_cache(path: &Path, category: ArtifactCategory) -> bool {
+    classify_rch_target(path).is_some()
+        || rch_go_root(path).is_some()
+        || category == ArtifactCategory::GoCache
 }
 
-/// sbh's earlier deletions per rch warm-cache path, from `(path, deleted at)`
-/// records, counting those within [`RCH_REDELETION_MEMORY`] of `now` (a
+/// sbh's earlier deletions per warm-cache path, from `(path, category, deleted
+/// at)` records, counting those within [`CACHE_REDELETION_MEMORY`] of `now` (a
 /// record stamped after `now` counts too). Other paths are ignored.
 #[must_use]
-pub fn rch_redeletion_counts<P: AsRef<Path>>(
-    deletions: impl IntoIterator<Item = (P, std::time::SystemTime)>,
+pub fn cache_redeletion_counts<P: AsRef<Path>>(
+    deletions: impl IntoIterator<Item = (P, ArtifactCategory, std::time::SystemTime)>,
     now: std::time::SystemTime,
 ) -> HashMap<PathBuf, u32> {
     let mut counts: HashMap<PathBuf, u32> = HashMap::new();
-    for (path, deleted_at) in deletions {
+    for (path, category, deleted_at) in deletions {
         let path = path.as_ref();
         let recent = !now
             .duration_since(deleted_at)
-            .is_ok_and(|age| age > RCH_REDELETION_MEMORY);
-        if recent && is_rch_warm_cache(path) {
+            .is_ok_and(|age| age > CACHE_REDELETION_MEMORY);
+        if recent && is_warm_cache(path, category) {
             let count = counts.entry(path.to_path_buf()).or_insert(0);
             *count = count.saturating_add(1);
         }
@@ -1139,6 +1152,68 @@ fn rch_go_veto_reason(
         ))),
         TreeActivity::Unknown => Some(Cow::Borrowed(
             "rch project Go cache (pooled) idleness could not be established",
+        )),
+    }
+}
+
+/// A shared Go cache rebuilt after sbh deleted it is useful even when the
+/// outcome window called that deletion clean (bd-tz67). Go refreshes build
+/// cache mtimes at most hourly and does not refresh module files on reads.
+/// Require progressively longer idleness of that exact tree before deleting
+/// it again; an old root with a newly written descendant is still active.
+///
+/// First deletions keep their existing scoring and perform no extra probe.
+/// Subsequent ones double the configured minimum age (at least the normal
+/// 30-minute floor), up to the history window. A configured floor longer
+/// than that window still wins. rch Go caches keep their project-wide probe
+/// and their existing pooled floors instead.
+fn go_cache_redeletion_veto_reason(
+    input: &CandidateInput,
+    min_file_age: Duration,
+    urgency: f64,
+    earlier_deletions: u32,
+) -> Option<Cow<'static, str>> {
+    if earlier_deletions == 0
+        || input.classification.category != ArtifactCategory::GoCache
+        || classify_rch_target(&input.path).is_some()
+        || rch_go_root(&input.path).is_some()
+    {
+        return None;
+    }
+    let base = min_file_age.max(Duration::from_mins(30));
+    let factor = 1u32.checked_shl(earlier_deletions).unwrap_or(u32::MAX);
+    let required = base
+        .saturating_mul(factor)
+        .min(CACHE_REDELETION_MEMORY)
+        .max(base);
+    let max_entries = if urgency < RCH_PRESSURE_URGENCY {
+        RCH_IDLE_PROBE_MAX_ENTRIES
+    } else {
+        RCH_IDLE_PROBE_MAX_ENTRIES_UNDER_PRESSURE
+    };
+    let activity = if input.age < required {
+        TreeActivity::Active
+    } else {
+        match std::fs::symlink_metadata(&input.path) {
+            Ok(metadata) if metadata.is_dir() => match metadata.modified() {
+                Ok(modified) if modified.elapsed().is_ok_and(|age| age >= required) => {
+                    rch_tree_activity(&input.path, required, max_entries)
+                }
+                Ok(_) => TreeActivity::Active,
+                Err(_) => TreeActivity::Unknown,
+            },
+            _ => TreeActivity::Unknown,
+        }
+    };
+    match activity {
+        TreeActivity::IdleThroughout => None,
+        TreeActivity::Active => Some(Cow::Owned(format!(
+            "Go cache has file activity within the {}m idle floor{}",
+            required.as_secs() / 60,
+            redeletion_note(earlier_deletions, required > min_file_age)
+        ))),
+        TreeActivity::Unknown => Some(Cow::Borrowed(
+            "Go cache idleness could not be established after an earlier deletion",
         )),
     }
 }
@@ -2028,35 +2103,80 @@ mod tests {
             assert!(rch_target_veto_reason(&job, 0.9, 20).is_none());
         }
 
-        /// Only rch warm-cache paths are counted, only inside the memory
-        /// window, and each path only against its own history.
+        /// Only rch or structurally identified Go cache paths are counted,
+        /// only inside the memory window, against their own exact history.
         #[test]
-        fn redeletion_counts_cover_recent_rch_warm_caches_only() {
-            use super::super::{RCH_REDELETION_MEMORY, rch_redeletion_counts};
+        fn redeletion_counts_cover_recent_warm_caches_only() {
+            use super::super::{CACHE_REDELETION_MEMORY, cache_redeletion_counts};
             let now = std::time::SystemTime::now();
             let pool = PathBuf::from("/data/projects/ft/.rch-target-hz3-pool-abc");
             let go = PathBuf::from("/data/projects/lvr/.rch-go/mod");
             let plain = PathBuf::from("/data/projects/ft/target");
             let other_pool = PathBuf::from("/data/projects/fs/.rch-target-hz3-pool-def");
-            let counts = rch_redeletion_counts(
+            let shared_go = PathBuf::from("/data/tmp/go-build");
+            let named_only = PathBuf::from("/data/tmp/go-build-without-markers");
+            let counts = cache_redeletion_counts(
                 [
-                    (&pool, now - Duration::from_hours(2)),
-                    (&pool, now - Duration::from_hours(30)),
+                    (
+                        &pool,
+                        ArtifactCategory::RustTarget,
+                        now - Duration::from_hours(2),
+                    ),
+                    (
+                        &pool,
+                        ArtifactCategory::RustTarget,
+                        now - Duration::from_hours(30),
+                    ),
                     // Outside the window: forgotten.
-                    (&pool, now - RCH_REDELETION_MEMORY - Duration::from_mins(1)),
-                    (&go, now - Duration::from_mins(5)),
-                    // Not an rch warm cache: never counted.
-                    (&plain, now - Duration::from_mins(5)),
+                    (
+                        &pool,
+                        ArtifactCategory::RustTarget,
+                        now - CACHE_REDELETION_MEMORY - Duration::from_mins(1),
+                    ),
+                    (&go, ArtifactCategory::GoCache, now - Duration::from_mins(5)),
+                    // A plain target or cache-like name is not enough.
+                    (
+                        &plain,
+                        ArtifactCategory::RustTarget,
+                        now - Duration::from_mins(5),
+                    ),
+                    (
+                        &named_only,
+                        ArtifactCategory::CacheDir,
+                        now - Duration::from_mins(5),
+                    ),
                     // A clock-skewed future stamp still counts as recent.
-                    (&other_pool, now + Duration::from_mins(5)),
+                    (
+                        &other_pool,
+                        ArtifactCategory::RustTarget,
+                        now + Duration::from_mins(5),
+                    ),
+                    (
+                        &shared_go,
+                        ArtifactCategory::GoCache,
+                        now - Duration::from_mins(5),
+                    ),
+                    // The inclusive boundary counts; older Go history expires.
+                    (
+                        &shared_go,
+                        ArtifactCategory::GoCache,
+                        now - CACHE_REDELETION_MEMORY,
+                    ),
+                    (
+                        &shared_go,
+                        ArtifactCategory::GoCache,
+                        now - CACHE_REDELETION_MEMORY - Duration::from_secs(1),
+                    ),
                 ],
                 now,
             );
             assert_eq!(counts.get(&pool), Some(&2));
             assert_eq!(counts.get(&go), Some(&1));
             assert_eq!(counts.get(&other_pool), Some(&1));
+            assert_eq!(counts.get(&shared_go), Some(&2));
             assert_eq!(counts.get(&plain), None);
-            assert_eq!(counts.len(), 3);
+            assert_eq!(counts.get(&named_only), None);
+            assert_eq!(counts.len(), 4);
         }
 
         /// The engine applies a path's own history and nobody else's.
@@ -2088,7 +2208,7 @@ mod tests {
             };
 
             let mut engine = default_engine();
-            engine.set_rch_redeletions(std::collections::HashMap::from([(redeleted.clone(), 1)]));
+            engine.set_cache_redeletions(std::collections::HashMap::from([(redeleted.clone(), 1)]));
             let held = engine.score_candidate(&input(&redeleted), 1.0);
             assert!(held.vetoed, "redeleted pool must be held at 90m idle");
             assert_eq!(held.decision.action, DecisionAction::Keep);
@@ -2220,6 +2340,165 @@ mod tests {
                     rch_go_veto_reason(&tmp.path().join("job/go/pkg/mod"), urgency, 0).is_none()
                 );
             }
+        }
+
+        fn shared_go_cache(root: &Path, name: &str, age: Duration, module: bool) -> CandidateInput {
+            use crate::scanner::patterns::{OpaqueTreeContext, classify_opaque_tree};
+            let path = root.join(name);
+            if module {
+                std::fs::create_dir_all(path.join("cache/download")).unwrap();
+                std::fs::write(path.join("cache/download/module.zip"), b"module").unwrap();
+            } else {
+                std::fs::create_dir_all(path.join("00")).unwrap();
+                std::fs::write(path.join("trim.txt"), b"1").unwrap();
+                std::fs::write(path.join("00/00aa-d"), b"build output").unwrap();
+            }
+            age_tree(&path, age);
+            let classification = classify_opaque_tree(&path, OpaqueTreeContext::default())
+                .unwrap()
+                .classification;
+            assert_eq!(classification.category, ArtifactCategory::GoCache);
+            CandidateInput {
+                path,
+                size_bytes: 9_000_000_000,
+                age,
+                classification,
+                signals: StructuralSignals::default(),
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            }
+        }
+
+        /// The original churn was outside rch too: build and module caches
+        /// returned after a "clean" outcome and were deleted every 30m pass.
+        #[test]
+        fn shared_go_cache_history_holds_only_the_recreated_path() {
+            let tmp = tempfile::tempdir().unwrap();
+            for module in [false, true] {
+                let input = shared_go_cache(
+                    tmp.path(),
+                    &format!("reused-go-cache-{module}"),
+                    Duration::from_mins(45),
+                    module,
+                );
+                let first = shared_go_cache(
+                    tmp.path(),
+                    &format!("first-go-cache-{module}"),
+                    Duration::from_mins(45),
+                    module,
+                );
+                let mut engine = default_engine();
+                assert_eq!(
+                    engine.score_candidate(&input, 1.0).decision.action,
+                    DecisionAction::Delete,
+                    "first deletion retains the existing scoring"
+                );
+                engine.set_cache_redeletions(std::collections::HashMap::from([(
+                    input.path.clone(),
+                    1,
+                )]));
+                for urgency in [0.0, 0.7, 1.0] {
+                    let held = engine.score_candidate(&input, urgency);
+                    assert!(held.vetoed, "repeat must be held even at urgency {urgency}");
+                    assert_eq!(held.decision.action, DecisionAction::Keep);
+                    assert!(held.veto_reason.as_deref().is_some_and(|reason| {
+                        reason.contains("60m") && reason.contains("1 earlier deletion of this path")
+                    }));
+                    assert!(
+                        !engine.score_candidate(&first, urgency).vetoed,
+                        "another cache's history must not hold a first deletion"
+                    );
+                }
+
+                // A later tree at that path must still classify as GoCache.
+                // A cache-like name alone cannot apply the Go-specific floor.
+                let mut generic = input;
+                generic.classification.category = ArtifactCategory::CacheDir;
+                assert!(!engine.score_candidate(&generic, 1.0).vetoed);
+            }
+        }
+
+        #[test]
+        fn shared_go_cache_floors_double_and_cap_without_shortening_configured_age() {
+            use super::super::go_cache_redeletion_veto_reason;
+            let tmp = tempfile::tempdir().unwrap();
+            let input = shared_go_cache(
+                tmp.path(),
+                "shared-go-build",
+                Duration::from_hours(5),
+                false,
+            );
+            let base = Duration::from_mins(30);
+            assert!(go_cache_redeletion_veto_reason(&input, base, 1.0, 3).is_none());
+            assert!(go_cache_redeletion_veto_reason(&input, base, 1.0, 4).is_some());
+            assert!(
+                go_cache_redeletion_veto_reason(&input, Duration::from_hours(3), 1.0, 1).is_some(),
+                "the configured 3h floor doubles to 6h"
+            );
+
+            let cold = shared_go_cache(
+                tmp.path(),
+                "cold-go-mod-cache",
+                Duration::from_hours(170),
+                true,
+            );
+            for count in [9, 31, 32, u32::MAX] {
+                assert!(
+                    go_cache_redeletion_veto_reason(&cold, base, 1.0, count).is_none(),
+                    "{count} earlier deletions must not raise the floor past 168h"
+                );
+                assert!(
+                    go_cache_redeletion_veto_reason(&cold, Duration::from_hours(200), 1.0, count)
+                        .is_some(),
+                    "the history cap cannot shorten an explicit 200h minimum"
+                );
+            }
+
+            let recent = shared_go_cache(
+                tmp.path(),
+                "go-zero-minimum",
+                Duration::from_mins(45),
+                false,
+            );
+            assert!(go_cache_redeletion_veto_reason(&recent, Duration::ZERO, 1.0, 0).is_none());
+            assert!(
+                go_cache_redeletion_veto_reason(&recent, Duration::ZERO, 1.0, 1).is_some(),
+                "an explicitly short first-deletion age must not disable churn protection"
+            );
+        }
+
+        #[test]
+        fn shared_go_cache_backoff_rechecks_descendants_and_missing_trees() {
+            let tmp = tempfile::tempdir().unwrap();
+            let input = shared_go_cache(tmp.path(), "go-build", Duration::from_hours(3), false);
+            let mut engine = default_engine();
+            engine
+                .set_cache_redeletions(std::collections::HashMap::from([(input.path.clone(), 2)]));
+            assert!(!engine.score_candidate(&input, 1.0).vetoed);
+
+            // Writing an existing file leaves the directory mtimes alone,
+            // and the caller still holds its earlier 3h age observation.
+            std::fs::write(input.path.join("00/00aa-d"), b"fresh output").unwrap();
+            let active = engine.score_candidate(&input, 1.0);
+            assert!(active.vetoed, "fresh nested writes must hold an old cache");
+            assert!(
+                active
+                    .veto_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("120m"))
+            );
+
+            // A vanished or replaced cache cannot establish idleness either.
+            std::fs::rename(&input.path, tmp.path().join("moved-go-build")).unwrap();
+            let unknown = engine.score_candidate(&input, 1.0);
+            assert!(unknown.vetoed);
+            assert!(
+                unknown
+                    .veto_reason
+                    .as_deref()
+                    .is_some_and(|reason| { reason.contains("idleness could not be established") })
+            );
         }
 
         #[test]
