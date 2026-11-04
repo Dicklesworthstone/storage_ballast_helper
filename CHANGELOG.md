@@ -8,6 +8,15 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Recreated shared Go caches no longer return to a short deletion cycle.**
+  Structurally recognized build and module caches outside rch now share its
+  exact-path deletion history. Each repeat doubles the minimum idle window,
+  capped at one week without shortening a longer configured minimum. Fresh
+  descendant writes hold the cache even under Critical pressure, and clean
+  or unknown outcomes still restore that history after a daemon restart.
+  First deletions and unrelated cache paths keep their existing behavior
+  (bd-tz67).
+
 - **A tmpfs hidden under another mount is unknown, not counted as the mount
   above it.** `sbh check --ram-scratch` and the daemon's RAM-scratch observer
   now read `/proc/self/mountinfo` and measure a tmpfs only through a path that
@@ -18,6 +27,16 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   ([#40](https://github.com/Dicklesworthstone/storage_ballast_helper/issues/40))
 
 ### Added
+
+- **Low swap can trigger bounded reclaim on otherwise Green tmpfs mounts.**
+  Linux mounts on existing scanner roots now evaluate swap headroom separately
+  from their nominal filesystem capacity. Below 10% free swap, a worse backing
+  level schedules definite artifacts with a shared per-pass byte target. Fresh
+  pre-deletion checks stop work on recovery or missing evidence; same-device
+  checks prevent cross-device fallback from reaching unrelated disk caches.
+  Filesystem counters stay truthful and `sbh status` explains the backing
+  pressure. Existing deletion guards, observe mode and dry-run remain in force
+  (bd-paeg).
 
 - **Missing RAM-scratch evidence says why.** Reports gain `issue_details`, one
   per `issues` entry, with a stable `kind` (`mount_covered`,

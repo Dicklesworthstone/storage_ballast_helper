@@ -10454,6 +10454,19 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                             format!("UNPROTECTED, {note}")
                         };
                     }
+                    if let Some(pressure) = record.and_then(|record| record.backing_pressure) {
+                        let backing = format!(
+                            "swap backing: {}/{} free, relief target {}",
+                            format_bytes(pressure.swap_free_bytes),
+                            format_bytes(pressure.swap_total_bytes),
+                            format_bytes(pressure.target_bytes),
+                        );
+                        note = if note.is_empty() {
+                            backing
+                        } else {
+                            format!("{note}, {backing}")
+                        };
+                    }
                     println!(
                         "  {:<20}  {:<12}  {:<8}  {:<12}  {reserve:<22}  {note}",
                         field("mount"),
@@ -11285,8 +11298,9 @@ fn read_ram_scratch_status(database: &Path) -> RamScratchStatus {
 /// Show incomplete and recovered notices as well as pressure warnings. Ages
 /// describe recorded evidence only; even a recent notice is not a live sample.
 fn ram_scratch_status_lines(status: &RamScratchStatus) -> Vec<String> {
-    const FRESH_CHECK: &str =
-        "    Report only; `sbh check --ram-scratch` collects a fresh read-only report.";
+    const FRESH_CHECK: &str = "    Diagnostic report; `sbh check --ram-scratch` collects a fresh read-only report. \
+         Under low swap, the daemon may reclaim definite artifacts on configured tmpfs roots \
+         within a bounded relief pass.";
     let mut lines = match status {
         RamScratchStatus::Recorded { notice } => recorded_ram_scratch_status_lines(notice),
         RamScratchStatus::NoNotice => {

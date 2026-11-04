@@ -149,6 +149,46 @@ fn thresholds_are_strict_and_no_swap_is_not_full_swap() {
 }
 
 #[test]
+fn swap_reclaim_uses_a_bounded_deficit_without_inventing_backing_capacity() {
+    let pressure = swap_reclaim_pressure(&memory(64, 64, 0)).unwrap();
+    assert_eq!(pressure.swap_total_bytes, 64 * GIB);
+    assert_eq!(pressure.swap_free_bytes, 0);
+    assert_eq!(pressure.target_bytes, (64 * GIB).div_ceil(10));
+
+    // At the boundary there is no relief request. A one-byte deficit stays
+    // one byte, rather than becoming an unbounded planner request.
+    let mut sample = memory(64, 10, 1);
+    assert!(swap_reclaim_pressure(&sample).is_none());
+    sample.swap_free_bytes -= 1;
+    assert_eq!(swap_reclaim_pressure(&sample).unwrap().target_bytes, 1);
+    sample.swap_total_bytes = u64::MAX;
+    sample.swap_free_bytes = 0;
+    assert_eq!(
+        swap_reclaim_pressure(&sample).unwrap().target_bytes,
+        u64::MAX.div_ceil(10),
+    );
+}
+
+#[test]
+fn swap_reclaim_ignores_absent_healthy_and_inconsistent_memory_evidence() {
+    for sample in [
+        memory(64, 0, 0),
+        memory(64, 64, 64),
+        memory(0, 64, 0),
+        MemoryInfo {
+            available_bytes: 65 * GIB,
+            ..memory(64, 64, 0)
+        },
+        MemoryInfo {
+            swap_free_bytes: 65 * GIB,
+            ..memory(64, 64, 0)
+        },
+    ] {
+        assert!(swap_reclaim_pressure(&sample).is_none(), "{sample:?}");
+    }
+}
+
+#[test]
 fn contradictory_or_overflowing_observations_are_not_healthy() {
     let mut bad = memory(64, 32, 32);
     bad.swap_free_bytes += 1;

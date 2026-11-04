@@ -666,6 +666,7 @@ mod tests {
                 surface: SurfaceKind::Configured,
                 level: "orange".to_string(),
                 urgency: 0.87,
+                backing_pressure: None,
                 rescan_in_secs: Some(20),
                 reclaim_capability: ReclaimCapability::Configured,
                 reserve_state: Some(ReserveState {

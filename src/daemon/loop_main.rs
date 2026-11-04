@@ -48,6 +48,7 @@ use crate::daemon::policy::{
     CleanupAction, NotificationPriority, PolicyEngine, ScanAggressiveness,
 };
 use crate::daemon::process_io_history::ProcessIoHistory;
+use crate::daemon::ram_reclaim::RamReclaimRequest;
 use crate::daemon::rch_staging::RchStagingTier;
 use crate::daemon::self_monitor::{
     DaemonLock, LoggingState, MountPressure, MountRateState, PolicyStateRecord, SelfMonitor,
@@ -73,6 +74,7 @@ use crate::monitor::pid::{
     PidConfig, PidPressureController, PressureLevel, PressureReading, PressureResponse,
 };
 use crate::monitor::predictive::{PredictiveAction, PredictiveActionPolicy};
+use crate::monitor::ram_scratch::{SwapReclaimPressure, swap_reclaim_pressure};
 use crate::monitor::special_locations::{
     AlertThrottle, HorizonRule, SpecialAlert, SpecialLocationRegistry,
 };
@@ -217,6 +219,12 @@ struct SharedExecutorConfig {
     /// Minimum [`ArtifactCertainty`] rank the current behavior cell dispatches
     /// (set from the cleanup action on every behavior transition).
     min_certainty_rank: AtomicU8,
+    /// Physical-pressure certainty floor while backing pressure drives the
+    /// global cell. Swap relief must not loosen unrelated disk batches.
+    ram_reclaim_certainty_floor: AtomicU8,
+    /// Physical None/IdentifyOnly cells forbid ordinary deletion even when
+    /// swap pressure selects a cleanup-capable global behavior cell.
+    ram_reclaim_blocks_ordinary_deletion: AtomicBool,
     /// Layer 7: Green batches quarantine instead of removing.
     quarantine_enabled: AtomicBool,
     quarantine_ttl_secs: AtomicU64,
@@ -246,6 +254,8 @@ impl SharedExecutorConfig {
             repeat_base_cooldown_secs: AtomicU64::new(repeat_base_cooldown),
             repeat_max_cooldown_secs: AtomicU64::new(repeat_max_cooldown),
             min_certainty_rank: AtomicU8::new(ArtifactCertainty::Unclear.rank()),
+            ram_reclaim_certainty_floor: AtomicU8::new(ArtifactCertainty::Unclear.rank()),
+            ram_reclaim_blocks_ordinary_deletion: AtomicBool::new(false),
             quarantine_enabled: AtomicBool::new(quarantine_enabled),
             quarantine_ttl_secs: AtomicU64::new(quarantine_ttl_secs),
             reclaim_events: AtomicU64::new(0),
@@ -262,6 +272,43 @@ impl SharedExecutorConfig {
 
     fn min_certainty(&self) -> ArtifactCertainty {
         ArtifactCertainty::from_rank(self.min_certainty_rank.load(Ordering::Relaxed))
+    }
+
+    fn set_ram_reclaim_certainty_floor(&self, certainty: ArtifactCertainty) {
+        self.ram_reclaim_certainty_floor
+            .store(certainty.rank(), Ordering::Relaxed);
+    }
+
+    fn set_ram_reclaim_physical_mode(&self, mode: Option<BehaviorMode>) {
+        self.ram_reclaim_blocks_ordinary_deletion.store(
+            mode.is_some_and(|mode| !behavior_allows_delete_dispatch(mode)),
+            Ordering::Release,
+        );
+        self.set_ram_reclaim_certainty_floor(mode.map_or(ArtifactCertainty::Unclear, |mode| {
+            min_certainty_for(mode.cleanup_action)
+        }));
+    }
+
+    fn authorize_dispatch(&self, ram_reclaim: bool) -> std::result::Result<(), SkipReason> {
+        if !ram_reclaim
+            && self
+                .ram_reclaim_blocks_ordinary_deletion
+                .load(Ordering::Acquire)
+        {
+            Err(SkipReason::PolicyChanged)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn dispatch_certainty(&self, ram_reclaim: bool) -> ArtifactCertainty {
+        if ram_reclaim {
+            ArtifactCertainty::Definite
+        } else {
+            self.min_certainty().max(ArtifactCertainty::from_rank(
+                self.ram_reclaim_certainty_floor.load(Ordering::Relaxed),
+            ))
+        }
     }
 
     /// Number of executor batches that removed at least one item for real
@@ -678,6 +725,9 @@ pub struct ScanRequest {
     /// W1 planner: the bytes this pass should reclaim to bring the pressured
     /// mount back to Green; `None` while the mount is not pressured.
     pub target_bytes: Option<u64>,
+    /// Swap-driven relief on one already-admitted tmpfs filesystem. Its finite
+    /// allowance is shared by every batch from this request.
+    pub ram_reclaim: Option<RamReclaimRequest>,
 }
 
 /// How a long startup step keeps a `Type=notify` unit from timing out.
@@ -1067,6 +1117,8 @@ pub struct DeletionBatch {
     pub urgency: f64,
     /// W1 planner: the byte target of the pass that produced the batch.
     pub target_bytes: Option<u64>,
+    /// Renewed at each mutation boundary; never authorizes unrelated filesystems.
+    pub ram_reclaim: Option<RamReclaimRequest>,
     /// Set by the target-only tier alone (bd-232u): the resolved
     /// `scanner.target_only_roots` root whose pure, idle cargo target dirs
     /// the batch holds. The executor drops any candidate that is not strictly
@@ -1405,6 +1457,15 @@ enum BehaviorUpdate {
     },
 }
 
+/// Why ordinary dispatch needs a physical-filesystem behavior gate. Recovery
+/// retains it after swap improves while the global behavior cell catches up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RamReclaimBehavior {
+    FilesystemOnly,
+    BackingPressure,
+    Recovering,
+}
+
 #[derive(Debug, Clone)]
 struct PressureBehaviorState {
     table: BehaviorDispatchTable,
@@ -1658,6 +1719,9 @@ impl Default for DaemonArgs {
 struct MountMonitor {
     rate_estimator: DiskRateEstimator,
     pressure_controller: PidPressureController,
+    /// Swap has its own capacity and percentage thresholds. Disk byte floors,
+    /// forecasts and filesystem fill-rate observations never apply to it.
+    swap_pressure_controller: PidPressureController,
     guard: AdaptiveGuard,
     last_guard_sample: Option<GuardSample>,
     /// Conformal calibration of the time-to-red forecast.
@@ -1669,6 +1733,13 @@ struct MountMonitor {
 #[derive(Debug, Clone)]
 struct MountTickResponse {
     response: crate::monitor::pid::PressureResponse,
+    /// Actual filesystem pressure, before any swap-only promotion. Auxiliary
+    /// cleanup tiers do not carry bounded RAM relief authority.
+    filesystem_response: PressureResponse,
+    /// Present only when backing-store pressure raised this mount's level.
+    backing_pressure: Option<SwapReclaimPressure>,
+    /// Scoped, bounded authority carried through the scanner and executor.
+    ram_reclaim: Option<RamReclaimRequest>,
     seconds_to_red: Option<f64>,
     prediction_confident: bool,
     /// The predictive policy put this mount itself in imminent danger this
@@ -1961,10 +2032,21 @@ impl MountMonitor {
         Self {
             rate_estimator,
             pressure_controller,
+            swap_pressure_controller: Self::swap_controller(config),
             guard: AdaptiveGuard::new(guard_config),
             last_guard_sample: None,
             conformal: ConformalCalibrator::new(conformal_config(config)),
         }
+    }
+
+    fn swap_controller(config: &Config) -> PidPressureController {
+        PidPressureController::new(
+            &PidConfig {
+                min_free_bytes: [0; 4],
+                ..PidConfig::from(&config.pressure)
+            },
+            Duration::from_millis(config.pressure.poll_interval_ms),
+        )
     }
 
     /// The conformal lower bound for a point estimate, from this mount's
@@ -1987,6 +2069,12 @@ impl MountMonitor {
         self.pressure_controller
             .apply_config(&PidConfig::from(&config.pressure));
         self.pressure_controller
+            .set_base_poll_interval(Duration::from_millis(config.pressure.poll_interval_ms));
+        self.swap_pressure_controller.apply_config(&PidConfig {
+            min_free_bytes: [0; 4],
+            ..PidConfig::from(&config.pressure)
+        });
+        self.swap_pressure_controller
             .set_base_poll_interval(Duration::from_millis(config.pressure.poll_interval_ms));
 
         if config.pressure.prediction.enabled {
@@ -2259,6 +2347,9 @@ pub struct MonitoringDaemon {
     pending_control: Vec<MainLoopCommand>,
     pending_state_replies: Vec<Sender<()>>,
     behavior_state: PressureBehaviorState,
+    /// A swap-raised behavior cell still needs its filesystem-only certainty
+    /// floor until recovery hysteresis has caught up with physical pressure.
+    ram_reclaim_behavior: RamReclaimBehavior,
     shared_guard_diagnostics: Arc<RwLock<Option<GuardDiagnostics>>>,
     scanner_heartbeat: Arc<ThreadHeartbeat>,
     executor_heartbeat: Arc<ThreadHeartbeat>,
@@ -2626,6 +2717,9 @@ fn v2_pressure_candidate_byte_target(request: &ScanRequest) -> Option<u64> {
     if request.pressure_level < PressureLevel::Orange || request.max_delete_batch == 0 {
         return None;
     }
+    if let Some(relief) = &request.ram_reclaim {
+        return Some(relief.remaining_bytes());
+    }
     Some(
         V2_PRESSURE_RECLAIM_BYTES_PER_CANDIDATE
             .saturating_mul(request.max_delete_batch.max(1) as u64),
@@ -2686,6 +2780,12 @@ impl EventPassTemplates {
                     .iter()
                     .any(|old| old.starts_with(&path) || path.starts_with(old))
             });
+            // A fresh backing-pressure observation authorizes only its
+            // bounded pass. Do not retain a stale Green template for this
+            // scope or turn this request into unbounded idle event work.
+            if request.ram_reclaim.is_some() {
+                continue;
+            }
             if let Some(root) = configured
                 .iter()
                 .filter(|root| path.starts_with(root))
@@ -2744,6 +2844,7 @@ impl EventPassTemplates {
                 catalog_roots: Vec::new(),
                 maintenance: false,
                 target_bytes: None,
+                ram_reclaim: None,
             });
             if request.is_some() {
                 // Pacing may defer this request. Advance only once its pass
@@ -3856,6 +3957,7 @@ impl MonitoringDaemon {
             pending_control: Vec::new(),
             pending_state_replies: Vec::new(),
             behavior_state,
+            ram_reclaim_behavior: RamReclaimBehavior::FilesystemOnly,
             scanner_heartbeat,
             executor_heartbeat,
             shared_guard_diagnostics,
@@ -4622,6 +4724,11 @@ impl MonitoringDaemon {
         let inventory = self.ballast_coordinator.inventory();
         for record in &mut controllers {
             let mount = PathBuf::from(&record.mount);
+            record.backing_pressure = self
+                .mount_responses
+                .iter()
+                .find(|tick| tick.response.causing_mount == mount)
+                .and_then(|tick| tick.backing_pressure);
             let quarantined_bytes = self.quarantine_held.get(&mount).copied().unwrap_or(0);
             let Some(pool) = inventory
                 .iter()
@@ -4848,6 +4955,10 @@ impl MonitoringDaemon {
                     continue;
                 }
             };
+            // handle_pressure consumes the per-mount ticks. Keep this tick's
+            // actual filesystem response for all-root forced scans and their
+            // retries; swap relief has its own narrower request authority.
+            let forced_scan_response = self.worst_filesystem_response();
             self.watchdog.maybe_notify("pressure checked");
 
             // 4. Log pressure transitions.
@@ -5053,17 +5164,21 @@ impl MonitoringDaemon {
                     && !Self::trigger_forced_scan(
                         &self.config.scanner.root_paths,
                         &scan_tx,
-                        &response,
+                        forced_scan_response.as_ref(),
                     )
                 {
                     self.forced_scan_pending_since = Some(Instant::now());
                     eprintln!(
-                        "[SBH-DAEMON] forced scan deferred (SIGUSR1): scan queue full, retrying every tick"
+                        "[SBH-DAEMON] forced scan deferred (SIGUSR1): awaiting queue space or filesystem pressure evidence, retrying every tick"
                     );
                 }
                 self.wake_next_tick.forced_scan = true;
             } else if let Some(since) = self.forced_scan_pending_since
-                && Self::trigger_forced_scan(&self.config.scanner.root_paths, &scan_tx, &response)
+                && Self::trigger_forced_scan(
+                    &self.config.scanner.root_paths,
+                    &scan_tx,
+                    forced_scan_response.as_ref(),
+                )
             {
                 self.forced_scan_pending_since = None;
                 eprintln!(
@@ -5303,15 +5418,52 @@ impl MonitoringDaemon {
 
         let now = Instant::now();
         let mut worst_response: Option<crate::monitor::pid::PressureResponse> = None;
+        let mut worst_filesystem_level = PressureLevel::Green;
+        let mut worst_filesystem_urgency = 0.0;
         let mut worst_guard_diag: Option<GuardDiagnostics> = None;
         // Reset per-tick predictive action so we track the worst across mounts.
         self.last_predictive_action = PredictiveAction::Clear;
         self.mount_responses.clear();
 
+        // One host observation serves all tmpfs mounts. Missing or invalid
+        // evidence leaves filesystem control unchanged; an empty swap device
+        // is not an exhausted one. macOS /tmp is disk-backed and this Linux
+        // tmpfs relief policy does not reinterpret its dynamic swap supply.
+        let swap_pressure = if cfg!(target_os = "linux") {
+            self.platform
+                .memory_info()
+                .ok()
+                .as_ref()
+                .and_then(swap_reclaim_pressure)
+        } else {
+            None
+        };
+
         // Update monitors for each active mount.
         for (mount_path, stats) in stats_by_mount {
             self.release_controller
                 .update_effectiveness(&mount_path, stats.available_bytes, now);
+
+            let backing_candidate = swap_pressure.and_then(|mut pressure| {
+                if stats.is_readonly
+                    || stats.fs_type != "tmpfs"
+                    || stats.total_bytes == 0
+                    || stats.free_bytes > stats.total_bytes
+                    || stats.available_bytes > stats.free_bytes
+                    || stats.free_bytes == stats.total_bytes
+                    || !self.platform.is_ram_backed(&mount_path).unwrap_or(false)
+                {
+                    return None;
+                }
+                let metadata = std::fs::symlink_metadata(&mount_path).ok()?;
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return None;
+                }
+                pressure.target_bytes = pressure
+                    .target_bytes
+                    .min(stats.total_bytes - stats.free_bytes);
+                Some((pressure, crate::scanner::walker::device_id(&metadata)))
+            });
 
             let monitor = self
                 .mount_monitors
@@ -5377,9 +5529,59 @@ impl MonitoringDaemon {
                     )
                 });
             monitor.pressure_controller.freeze_integral(frozen);
-            let response = monitor
+            let mut response = monitor
                 .pressure_controller
                 .update(reading, predicted_seconds, now);
+            // Guard evidence belongs to filesystem predictions. A healthy
+            // tmpfs with exhausted swap must not replace a troubled disk's
+            // calibration window in the shared policy engine.
+            if worst_guard_diag.is_none()
+                || response.level > worst_filesystem_level
+                || (response.level == worst_filesystem_level
+                    && response.urgency > worst_filesystem_urgency)
+            {
+                worst_filesystem_level = response.level;
+                worst_filesystem_urgency = response.urgency;
+                worst_guard_diag = Some(guard_diag);
+            }
+            let filesystem_response = response.clone();
+
+            let mut backing_pressure = None;
+            let mut ram_reclaim = None;
+            if let Some((pressure, device_id)) = backing_candidate {
+                monitor.swap_pressure_controller.freeze_integral(frozen);
+                let backing_response = monitor.swap_pressure_controller.update(
+                    PressureReading {
+                        free_bytes: pressure.swap_free_bytes,
+                        total_bytes: pressure.swap_total_bytes,
+                        mount: mount_path.clone(),
+                    },
+                    None,
+                    now,
+                );
+                if backing_response.level > response.level {
+                    response.level = backing_response.level;
+                    response.urgency = response.urgency.max(backing_response.urgency);
+                    response.scan_interval =
+                        response.scan_interval.min(backing_response.scan_interval);
+                    response.max_delete_batch = response
+                        .max_delete_batch
+                        .max(backing_response.max_delete_batch);
+                    // A disk reserve cannot relieve swap pressure. The real
+                    // filesystem free percentage and forecast stay intact.
+                    response.release_ballast_files = 0;
+                    backing_pressure = Some(pressure);
+                    ram_reclaim = Some(RamReclaimRequest::new(
+                        mount_path.clone(),
+                        device_id,
+                        pressure.target_bytes,
+                    ));
+                }
+            } else {
+                // Recovery or lost evidence revokes backing-only authority
+                // immediately, without retaining an old PID Critical level.
+                monitor.swap_pressure_controller = MountMonitor::swap_controller(&self.config);
+            }
 
             // Evaluate predictive policy with full confidence/trend gating.
             let free_pct = stats.free_pct();
@@ -5419,6 +5621,9 @@ impl MonitoringDaemon {
             self.note_logging_mount_level(&mount_path, response.level);
             self.mount_responses.push(MountTickResponse {
                 response: response.clone(),
+                filesystem_response,
+                backing_pressure,
+                ram_reclaim,
                 seconds_to_red: predicted_seconds,
                 prediction_confident: rate_estimate.confidence >= effective_min_conf,
                 imminent_danger,
@@ -5441,7 +5646,6 @@ impl MonitoringDaemon {
             match worst_response {
                 None => {
                     worst_response = Some(response);
-                    worst_guard_diag = Some(guard_diag);
                     self.last_ewma_confidence = rate_estimate.confidence;
                 }
                 Some(ref worst) => {
@@ -5451,12 +5655,40 @@ impl MonitoringDaemon {
                         || (response.level == worst.level && response.urgency > worst.urgency)
                     {
                         worst_response = Some(response);
-                        worst_guard_diag = Some(guard_diag);
                         self.last_ewma_confidence = rate_estimate.confidence;
                     }
                 }
             }
         }
+
+        // Backing-only pressure must not relax the global certainty gate for
+        // queued work on unrelated disk mounts. Recovery can leave the applied
+        // behavior cell elevated after swap is healthy, so retain its physical
+        // floor until that cell catches up. Filesystem-only hysteresis keeps
+        // its existing behavior; relief itself is always Definite-only.
+        let backing_raised_pressure = self
+            .mount_responses
+            .iter()
+            .any(|tick| tick.ram_reclaim.is_some());
+        self.ram_reclaim_behavior = if backing_raised_pressure {
+            RamReclaimBehavior::BackingPressure
+        } else if self.ram_reclaim_behavior != RamReclaimBehavior::FilesystemOnly
+            && self.behavior_state.disk_level > worst_filesystem_level
+        {
+            RamReclaimBehavior::Recovering
+        } else {
+            RamReclaimBehavior::FilesystemOnly
+        };
+        let physical_mode = match self.ram_reclaim_behavior {
+            RamReclaimBehavior::FilesystemOnly => None,
+            RamReclaimBehavior::BackingPressure | RamReclaimBehavior::Recovering => Some(
+                self.behavior_state
+                    .table()
+                    .mode_for(self.behavior_state.memory_level, worst_filesystem_level),
+            ),
+        };
+        self.shared_executor_config
+            .set_ram_reclaim_physical_mode(physical_mode);
 
         // Record prediction scorecard outcome: was the previous tick's prediction
         // realized? An actionable prediction (severity >= 2) is "realized" if the
@@ -5464,9 +5696,9 @@ impl MonitoringDaemon {
         // The cleanup_ran flag distinguishes successful interventions (prediction
         // triggered cleanup that prevented the problem) from false alarms (prediction
         // said danger but nothing was happening).
-        if let Some(ref response) = worst_response {
+        if worst_response.is_some() {
             let was_actionable = self.last_predictive_action.severity() >= 2;
-            let was_realized = response.level >= PressureLevel::Red;
+            let was_realized = worst_filesystem_level >= PressureLevel::Red;
             self.prediction_scorecard.record(
                 was_actionable,
                 was_realized,
@@ -5478,16 +5710,13 @@ impl MonitoringDaemon {
 
         if let Some(diag) = worst_guard_diag.as_ref() {
             let mut policy = self.policy_engine.lock();
-            let pressure_level = worst_response
-                .as_ref()
-                .map_or(PressureLevel::Green, |r| r.level);
-            policy.set_pressure_level(pressure_level);
+            policy.set_pressure_level(worst_filesystem_level);
             policy.observe_window(diag);
 
             // Emergency escalation: break fallback_safe deadlock when pressure
             // has been at Yellow+ for too long and recovery can't trigger.
-            if let Some(ref response) = worst_response {
-                let pressure_is_critical = response.level >= PressureLevel::Yellow;
+            if worst_response.is_some() {
+                let pressure_is_critical = worst_filesystem_level >= PressureLevel::Yellow;
                 if policy.check_emergency_escalation(pressure_is_critical) {
                     let landed = policy.mode();
                     drop(policy);
@@ -5606,6 +5835,10 @@ impl MonitoringDaemon {
 
         for tick in &responses {
             let mount = tick.response.causing_mount.clone();
+            // Disk caches cannot relieve a tmpfs backing-store shortage.
+            // The observer's list of RAM mounts is never a source of new
+            // cleanup roots, and cross_devices cannot widen this request.
+            let cross_device_fallback = cross_device_fallback && tick.ram_reclaim.is_none();
             let roots_here: Vec<PathBuf> = root_mounts
                 .iter()
                 .filter(|(_, root_mount)| root_mount.as_deref() == Some(mount.as_path()))
@@ -5625,6 +5858,7 @@ impl MonitoringDaemon {
             // still has a bounded surface: the known-safe caches on it.
             let catalog = if roots_here.is_empty()
                 && !cross_device_fallback
+                && tick.ram_reclaim.is_none()
                 && self.config.scanner.catalog_roots_on_pressured_device
             {
                 self.catalog_roots_for(&mount, now)
@@ -5671,6 +5905,18 @@ impl MonitoringDaemon {
                 );
                 eprintln!("[SBH-MOUNT] {message}");
                 self.logger_handle.send(ActivityEvent::Info { message });
+                if let Some(pressure) = tick.backing_pressure {
+                    let message = format!(
+                        "RAM-backed pressure on {}: filesystem {:.1}% free, swap free={}/{} bytes; definite-artifact relief target={} bytes",
+                        mount.display(),
+                        tick.response.free_pct,
+                        pressure.swap_free_bytes,
+                        pressure.swap_total_bytes,
+                        pressure.target_bytes,
+                    );
+                    eprintln!("[SBH-RAM-RECLAIM] {message}");
+                    self.logger_handle.send(ActivityEvent::Info { message });
+                }
             }
             if decision
                 .transition
@@ -5706,6 +5952,7 @@ impl MonitoringDaemon {
             // The danger is this mount's own forecast: last_predictive_action
             // names only the most severe mount, and two mounts can fill at once.
             let release_here = release_ballast
+                && tick.ram_reclaim.is_none()
                 && (behavior_should_release_ballast(
                     self.behavior_state
                         .table()
@@ -5728,7 +5975,12 @@ impl MonitoringDaemon {
                             );
                             let previous = self.catalog_epochs.get(&mount).copied();
                             if catalog_epoch_due(previous, tick.response.level, now, rescan) {
-                                pending_scans.push((&tick.response, Vec::new(), Some(catalog)));
+                                pending_scans.push((
+                                    &tick.response,
+                                    Vec::new(),
+                                    Some(catalog),
+                                    None,
+                                ));
                             }
                         } else {
                             // A mount with no root of its own only gets here
@@ -5743,7 +5995,12 @@ impl MonitoringDaemon {
                             // level's; the scheduler only orders the roots
                             // (dirty first, then by hazard index).
                             let paths = self.voi_scheduler.rank_paths(&paths, now);
-                            pending_scans.push((&tick.response, paths, None));
+                            pending_scans.push((
+                                &tick.response,
+                                paths,
+                                None,
+                                tick.ram_reclaim.clone(),
+                            ));
                         }
                     }
                 }
@@ -5817,22 +6074,22 @@ impl MonitoringDaemon {
         // Both sweep phases share the same maintenance cadence decision.
         let sweep_due = self.quarantine_sweep_due(now);
         let attempted_emergency_sweep = self.sweep_quarantine_entries(
-            responses
-                .iter()
-                .filter(|tick| tick.response.level >= PressureLevel::Red),
+            responses.iter().filter(|tick| {
+                tick.response.level >= PressureLevel::Red && tick.ram_reclaim.is_none()
+            }),
             &root_mounts,
             sweep_due,
         );
         let (emergency_scans, pending_scans): (Vec<_>, Vec<_>) = pending_scans
             .into_iter()
-            .partition(|(response, _, _)| response.level >= PressureLevel::Red);
-        for (response, paths, catalog) in emergency_scans {
+            .partition(|(response, _, _, _)| response.level >= PressureLevel::Red);
+        for (response, paths, catalog, ram_reclaim) in emergency_scans {
             if let Some(catalog) = catalog {
                 self.catalog_epochs
                     .insert(response.causing_mount.clone(), (response.level, now));
                 self.send_catalog_scan_request(scan_tx, scan_rx, response, catalog);
             } else {
-                self.send_scan_request(scan_tx, scan_rx, response, paths);
+                self.send_scan_request(scan_tx, scan_rx, response, paths, ram_reclaim);
             }
             self.last_tick_cleanup_ran = true;
         }
@@ -5852,16 +6109,16 @@ impl MonitoringDaemon {
         }
 
         self.sweep_quarantines(
-            responses
-                .iter()
-                .filter(|tick| tick.response.level < PressureLevel::Red),
+            responses.iter().filter(|tick| {
+                tick.response.level < PressureLevel::Red && tick.ram_reclaim.is_none()
+            }),
             &root_mounts,
             now,
         );
         if sweep_due && attempted_emergency_sweep {
             self.last_quarantine_sweep = Some(now);
         }
-        for (response, paths, catalog) in pending_scans {
+        for (response, paths, catalog, ram_reclaim) in pending_scans {
             if self.shared_executor_config.compression_first.defers_mount(
                 &response.causing_mount,
                 response.level,
@@ -5875,7 +6132,7 @@ impl MonitoringDaemon {
                     .insert(response.causing_mount.clone(), (response.level, now));
                 self.send_catalog_scan_request(scan_tx, scan_rx, response, catalog);
             } else {
-                self.send_scan_request(scan_tx, scan_rx, response, paths);
+                self.send_scan_request(scan_tx, scan_rx, response, paths, ram_reclaim);
             }
             self.last_tick_cleanup_ran = true;
         }
@@ -5951,6 +6208,7 @@ impl MonitoringDaemon {
                     catalog_roots: Vec::new(),
                     maintenance: true,
                     target_bytes: None,
+                    ram_reclaim: None,
                 };
                 let response = response.clone();
                 self.enqueue_scan_logged(scan_tx, scan_rx, &response, request);
@@ -5987,7 +6245,7 @@ impl MonitoringDaemon {
             // trigger. Without this, FallbackSafe at green is permanent.
             let in_fallback = self.policy_engine.lock().mode() == ActiveMode::FallbackSafe;
             if scan_allowed && (needs_scan || in_fallback) {
-                self.send_scan_request(scan_tx, scan_rx, response, root_paths);
+                self.send_scan_request(scan_tx, scan_rx, response, root_paths, None);
                 if needs_scan {
                     self.last_tick_cleanup_ran = true;
                 }
@@ -6021,18 +6279,7 @@ impl MonitoringDaemon {
         }
         self.emit_reclaim_unavailable(&unprotected_mounts, now);
         self.report_unreclaimable_growth(now);
-        let mounts: HashMap<PathBuf, (PressureLevel, f64)> = self
-            .mount_controllers
-            .iter()
-            .filter(|(mount, controller)| {
-                !self.shared_executor_config.compression_first.defers_mount(
-                    mount,
-                    controller.level(),
-                    Instant::now(),
-                )
-            })
-            .map(|(mount, controller)| (mount.clone(), (controller.level(), controller.urgency())))
-            .collect();
+        let mounts = self.filesystem_tier_mounts(&responses, now);
         if !self.config.scanner.target_only_roots.is_empty() {
             self.target_tier.tick(
                 now,
@@ -6054,6 +6301,51 @@ impl MonitoringDaemon {
         );
 
         global_tick(cadence, base_poll)
+    }
+
+    /// The current physical sample for operations that do not carry bounded
+    /// RAM relief authority. Missing observations defer work; they never
+    /// borrow the swap-raised response or stale mount controller state.
+    fn worst_filesystem_response(&self) -> Option<PressureResponse> {
+        self.mount_responses
+            .iter()
+            .map(|tick| &tick.filesystem_response)
+            .max_by(|left, right| {
+                left.level
+                    .cmp(&right.level)
+                    .then_with(|| left.urgency.total_cmp(&right.urgency))
+            })
+            .cloned()
+    }
+
+    /// Dedicated cleanup tiers do not carry RAM relief's finite allowance or
+    /// live swap checks. Admit them only from this tick's filesystem pressure,
+    /// preserving its level and urgency even when backing pressure raises the
+    /// ordinary mount controller. Missing observations authorize no new pass.
+    fn filesystem_tier_mounts(
+        &self,
+        responses: &[MountTickResponse],
+        now: Instant,
+    ) -> HashMap<PathBuf, (PressureLevel, f64)> {
+        responses
+            .iter()
+            .filter(|tick| {
+                !self.shared_executor_config.compression_first.defers_mount(
+                    &tick.filesystem_response.causing_mount,
+                    tick.filesystem_response.level,
+                    now,
+                )
+            })
+            .map(|tick| {
+                (
+                    tick.filesystem_response.causing_mount.clone(),
+                    (
+                        tick.filesystem_response.level,
+                        tick.filesystem_response.urgency,
+                    ),
+                )
+            })
+            .collect()
     }
 
     /// For a mount that has stayed at Red or worse for
@@ -6511,6 +6803,7 @@ impl MonitoringDaemon {
         scan_rx: &Receiver<ScanRequest>,
         response: &crate::monitor::pid::PressureResponse,
         paths: Vec<PathBuf>,
+        ram_reclaim: Option<RamReclaimRequest>,
     ) {
         // Under Green/Yellow pressure, skip enqueue entirely if the channel is
         // already full — a scan is already in progress and there's no urgency.
@@ -6526,15 +6819,21 @@ impl MonitoringDaemon {
         // roots, so the next build burst found them at Orange again with no
         // margin (fleet audit 2026-09-24: most hosts lived at 80-94% used).
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let target_bytes = (response.level >= PressureLevel::Orange)
-            .then(|| self.fs_collector.collect(&response.causing_mount).ok())
-            .flatten()
-            .map(|stats| {
-                let wanted = (stats.total_bytes as f64 * self.config.pressure.green_min_free_pct
-                    / 100.0) as u64;
-                wanted.saturating_sub(stats.available_bytes)
-            })
-            .filter(|bytes| *bytes > 0);
+        let target_bytes = ram_reclaim
+            .as_ref()
+            .map(RamReclaimRequest::remaining_bytes)
+            .or_else(|| {
+                (response.level >= PressureLevel::Orange)
+                    .then(|| self.fs_collector.collect(&response.causing_mount).ok())
+                    .flatten()
+                    .map(|stats| {
+                        let wanted = (stats.total_bytes as f64
+                            * self.config.pressure.green_min_free_pct
+                            / 100.0) as u64;
+                        wanted.saturating_sub(stats.available_bytes)
+                    })
+                    .filter(|bytes| *bytes > 0)
+            });
         let request = ScanRequest {
             paths,
             urgency: response.urgency,
@@ -6549,6 +6848,7 @@ impl MonitoringDaemon {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes,
+            ram_reclaim,
         };
         self.enqueue_scan_logged(scan_tx, scan_rx, response, request);
     }
@@ -6609,6 +6909,7 @@ impl MonitoringDaemon {
             catalog_roots,
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         self.enqueue_scan_logged(scan_tx, scan_rx, response, request);
     }
@@ -6655,13 +6956,17 @@ impl MonitoringDaemon {
         }
     }
 
-    /// Queue the SIGUSR1 scan. `false` means the scan queue is full and the
-    /// caller retries next tick; a disconnected queue is logged and given up.
+    /// Queue the SIGUSR1 scan from physical filesystem pressure. `false` means
+    /// the queue is full or a fresh physical sample is missing, so the caller
+    /// retries next tick; a disconnected queue is logged and given up.
     fn trigger_forced_scan(
         root_paths: &[PathBuf],
         scan_tx: &Sender<ScanRequest>,
-        response: &crate::monitor::pid::PressureResponse,
+        response: Option<&PressureResponse>,
     ) -> bool {
+        let Some(response) = response else {
+            return false;
+        };
         let request = ScanRequest {
             paths: root_paths.to_vec(),
             urgency: response.urgency.max(0.5), // at least moderate urgency for forced scans
@@ -6673,6 +6978,7 @@ impl MonitoringDaemon {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         // Block briefly: the scanner may be about to take the next request.
         match scan_tx.send_timeout(request, Duration::from_millis(100)) {
@@ -6963,6 +7269,7 @@ impl MonitoringDaemon {
                     catalog_roots: Vec::new(),
                     maintenance: false,
                     target_bytes: None,
+                    ram_reclaim: None,
                 };
 
                 match enqueue_scan_request(scan_tx, scan_rx, request, true) {
@@ -7608,6 +7915,25 @@ struct PassDispatch {
     paths: HashSet<PathBuf>,
 }
 
+/// Renew the physical behavior gate at every scanner dispatch, including
+/// passes that began before swap changed the global behavior cell. Keep the
+/// candidates local when held so callers do not count a removal as dispatch.
+fn dispatch_with_behavior_gate(
+    scored: &mut Vec<CandidacyScore>,
+    request: &ScanRequest,
+    del_tx: &Sender<DeletionBatch>,
+    dispatched: &mut PassDispatch,
+    executor_config: &SharedExecutorConfig,
+) -> bool {
+    if executor_config
+        .authorize_dispatch(request.ram_reclaim.is_some())
+        .is_err()
+    {
+        return true;
+    }
+    dispatch_top_candidates(scored, request, del_tx, dispatched)
+}
+
 fn dispatch_top_candidates(
     scored: &mut Vec<CandidacyScore>,
     request: &ScanRequest,
@@ -7625,6 +7951,10 @@ fn dispatch_top_candidates(
     // ~250,000 rows (~0.6 GB) a day kept for 30 days.
     scored.retain(|candidate| {
         candidate.size_bytes > 0
+            && request
+                .ram_reclaim
+                .as_ref()
+                .is_none_or(|relief| relief.accepts_candidate(candidate))
             && !dispatched
                 .paths
                 .iter()
@@ -7655,6 +7985,7 @@ fn dispatch_top_candidates(
         pressure_level: request.pressure_level,
         urgency: request.urgency,
         target_bytes: request.target_bytes,
+        ram_reclaim: request.ram_reclaim.clone(),
         target_only_root: None,
         target_only_consent: None,
     };
@@ -7940,7 +8271,11 @@ fn replay_indexed_record(
     let size_estimate = if meta.is_dir()
         && record.size_estimate_bytes == crate::scanner::walker::OPAQUE_CANDIDATE_SIZE_FLOOR
     {
-        prescan_dir_size(path, scanner_config.cross_devices, &AtomicBool::new(false))
+        prescan_dir_size(
+            path,
+            scanner_config.cross_devices && request.ram_reclaim.is_none(),
+            &AtomicBool::new(false),
+        )
     } else {
         record.size_estimate_bytes
     };
@@ -8349,7 +8684,7 @@ fn scanner_thread_main(
         }
 
         let request_from_events;
-        let request = match scan_rx.recv_timeout(WORKER_SHUTDOWN_POLL_INTERVAL) {
+        let mut request = match scan_rx.recv_timeout(WORKER_SHUTDOWN_POLL_INTERVAL) {
             Ok(request) => {
                 request_from_events = false;
                 request
@@ -8380,6 +8715,26 @@ fn scanner_thread_main(
         // Read latest config at the start of each scan.
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
+        if executor_config
+            .authorize_dispatch(request.ram_reclaim.is_some())
+            .is_err()
+        {
+            request.max_delete_batch = 0;
+        }
+        if let Some(relief) = &request.ram_reclaim
+            && (relief.authorize_mount(platform.as_ref()).is_err()
+                || request.paths.iter().any(|path| {
+                    !relief.contains_path(path)
+                        || !current_scanner_config
+                            .root_paths
+                            .iter()
+                            .any(|root| path_is_same_or_descendant(path, root))
+                }))
+        {
+            // The pressure and configured roots are renewed when a queued
+            // pass starts. Report-only tmpfs inventory is never scan authority.
+            continue;
+        }
         if request_from_events
             && current_event_source_config(scanner_event_source.as_ref(), &current_scanner_config)
                 .is_none()
@@ -8745,7 +9100,7 @@ fn scanner_thread_main(
         // scan cycle. Uses the actual triggering free-pct when available so
         // the policy's pressure_free_pct_ceiling gate keeps its configured
         // meaning across Yellow/Orange boundary conditions.
-        if current_scanner_config.log_truncation.enabled {
+        if current_scanner_config.log_truncation.enabled && request.ram_reclaim.is_none() {
             let truncation_free_pct = log_truncation_free_pct_for_request(&request);
             let trunc_report = crate::scanner::log_truncator::truncate_oversized_logs(
                 &current_scanner_config.log_truncation,
@@ -8832,7 +9187,7 @@ fn scanner_thread_main(
         // root), and must not make the pass look productive to the B6
         // cooldown. Measured before this: 574 zero-duration replay passes in
         // five minutes, each re-dispatching the same two `unclear` records.
-        let pass_min_certainty = executor_config.min_certainty();
+        let pass_min_certainty = executor_config.dispatch_certainty(request.ram_reclaim.is_some());
         // Counted once per path: the index replay, the priority pre-scan and
         // the walk can each hold the same directory in one pass.
         let mut held_paths: BTreeSet<PathBuf> = BTreeSet::new();
@@ -8882,6 +9237,13 @@ fn scanner_thread_main(
                 replay_engine.set_regret(regret_view.0.clone(), regret_view.1.clone());
                 replay_engine.set_cache_redeletions(cache_redeletions.clone());
                 for record in &records {
+                    if request
+                        .ram_reclaim
+                        .as_ref()
+                        .is_some_and(|relief| !relief.contains_path(&record.path))
+                    {
+                        continue;
+                    }
                     match replay_indexed_record(
                         record,
                         index_generation,
@@ -8899,7 +9261,12 @@ fn scanner_thread_main(
                             // bd-8aeq: a record the executor would only hold
                             // back is not re-dispatched; it stays in the index
                             // (no cooldown) for a cell that accepts it.
-                            if score.decision.certainty < pass_min_certainty {
+                            if score.decision.certainty < pass_min_certainty
+                                || request
+                                    .ram_reclaim
+                                    .as_ref()
+                                    .is_some_and(|relief| !relief.accepts_candidate(&score))
+                            {
                                 if held_paths.insert(record.path.clone()) {
                                     held_by_certainty += 1;
                                 }
@@ -8957,11 +9324,12 @@ fn scanner_thread_main(
             let indexed_count = indexed_candidates.len();
             if indexed_count > 0 {
                 let indexed_before_dispatch = indexed_candidates.len();
-                if !dispatch_top_candidates(
+                if !dispatch_with_behavior_gate(
                     &mut indexed_candidates,
                     &request,
                     del_tx,
                     &mut dispatched_this_pass,
+                    executor_config,
                 ) {
                     break;
                 }
@@ -9092,6 +9460,13 @@ fn scanner_thread_main(
                 .collect();
             'priority_roots: for root in &prescan_root_order {
                 let root = root.as_path();
+                if request
+                    .ram_reclaim
+                    .as_ref()
+                    .is_some_and(|relief| !relief.contains_path(root))
+                {
+                    continue;
+                }
                 if shutdown.load(Ordering::Relaxed) {
                     scanner_should_exit = true;
                     break;
@@ -9124,7 +9499,12 @@ fn scanner_thread_main(
                     // `cursor_before_entry` so the entry is retried whole.
                     let cursor_before_entry = cursor.clone();
                     cursor.advance(root, &path);
-                    if !path.is_dir() {
+                    if !path.is_dir()
+                        || request
+                            .ram_reclaim
+                            .as_ref()
+                            .is_some_and(|relief| !relief.contains_path(&path))
+                    {
                         continue;
                     }
                     let _ = protection.discover_ancestor_markers(&path);
@@ -9172,6 +9552,13 @@ fn scanner_thread_main(
                                 break 'priority_roots;
                             }
                             let sub_path = sub_entry.path();
+                            if request
+                                .ram_reclaim
+                                .as_ref()
+                                .is_some_and(|relief| !relief.contains_path(&sub_path))
+                            {
+                                continue;
+                            }
                             if sub_path.is_dir() {
                                 let _ = protection.discover_ancestor_markers(&sub_path);
                                 if protection.is_protected(&sub_path) {
@@ -9204,6 +9591,11 @@ fn scanner_thread_main(
                                                 break 'priority_roots;
                                             }
                                             let d3_path = d3_entry.path();
+                                            if request.ram_reclaim.as_ref().is_some_and(|relief| {
+                                                !relief.contains_path(&d3_path)
+                                            }) {
+                                                continue;
+                                            }
                                             if d3_path.is_dir() {
                                                 let _ =
                                                     protection.discover_ancestor_markers(&d3_path);
@@ -9331,7 +9723,8 @@ fn scanner_thread_main(
                         .then(|| {
                             prescan_dir_size(
                                 &candidate_path,
-                                current_scanner_config.cross_devices,
+                                current_scanner_config.cross_devices
+                                    && request.ram_reclaim.is_none(),
                                 shutdown,
                             )
                         });
@@ -9446,7 +9839,12 @@ fn scanner_thread_main(
                                     }),
                                 }
                             }
-                            if score.decision.certainty < pass_min_certainty {
+                            if score.decision.certainty < pass_min_certainty
+                                || request
+                                    .ram_reclaim
+                                    .as_ref()
+                                    .is_some_and(|relief| !relief.accepts_candidate(&score))
+                            {
                                 // bd-8aeq: same gate as the walk below.
                                 if held_paths.insert(candidate_path.clone()) {
                                     held_by_certainty += 1;
@@ -9546,11 +9944,12 @@ fn scanner_thread_main(
                 );
             } else {
                 let remaining_before_dispatch = priority_candidates.len();
-                if dispatch_top_candidates(
+                if dispatch_with_behavior_gate(
                     &mut priority_candidates,
                     &request,
                     del_tx,
                     &mut dispatched_this_pass,
+                    executor_config,
                 ) {
                     let dispatched_count =
                         remaining_before_dispatch.saturating_sub(priority_candidates.len());
@@ -9731,8 +10130,9 @@ fn scanner_thread_main(
         let walker_config = WalkerConfig {
             root_paths: active_scan_paths.clone(),
             max_depth: current_scanner_config.max_depth,
-            follow_symlinks: current_scanner_config.follow_symlinks,
-            cross_devices: current_scanner_config.cross_devices,
+            follow_symlinks: current_scanner_config.follow_symlinks
+                && request.ram_reclaim.is_none(),
+            cross_devices: current_scanner_config.cross_devices && request.ram_reclaim.is_none(),
             parallelism: if scanner_index_enabled {
                 v2_effective_parallelism(&current_scanner_config, request.pressure_level)
             } else {
@@ -10101,7 +10501,7 @@ fn scanner_thread_main(
             {
                 score.size_bytes = score.size_bytes.max(prescan_dir_size(
                     &entry.path,
-                    current_scanner_config.cross_devices,
+                    current_scanner_config.cross_devices && request.ram_reclaim.is_none(),
                     shutdown,
                 ));
             }
@@ -10143,7 +10543,13 @@ fn scanner_thread_main(
             let deletable = score.decision.action
                 == crate::scanner::scoring::DecisionAction::Delete
                 && !score.vetoed;
-            if deletable && score.decision.certainty < pass_min_certainty {
+            if deletable
+                && (score.decision.certainty < pass_min_certainty
+                    || request
+                        .ram_reclaim
+                        .as_ref()
+                        .is_some_and(|relief| !relief.accepts_candidate(&score)))
+            {
                 // bd-8aeq: indexed above (a cell that accepts this certainty
                 // can replay it) but neither dispatched nor counted toward
                 // the byte target, so the walk keeps looking for a root the
@@ -10175,11 +10581,12 @@ fn scanner_thread_main(
             let should_dispatch = !scored.is_empty()
                 && (scored.len() >= dispatch_threshold || Instant::now() >= next_dispatch_deadline);
             if should_dispatch {
-                if !dispatch_top_candidates(
+                if !dispatch_with_behavior_gate(
                     &mut scored,
                     &request,
                     del_tx,
                     &mut dispatched_this_pass,
+                    executor_config,
                 ) {
                     scanner_should_exit = true;
                     break;
@@ -10189,11 +10596,12 @@ fn scanner_thread_main(
             if let Some(target_bytes) = v2_candidate_byte_target
                 && v2_candidate_bytes_seen >= target_bytes
             {
-                if !dispatch_top_candidates(
+                if !dispatch_with_behavior_gate(
                     &mut scored,
                     &request,
                     del_tx,
                     &mut dispatched_this_pass,
+                    executor_config,
                 ) {
                     scanner_should_exit = true;
                 }
@@ -10333,7 +10741,13 @@ fn scanner_thread_main(
                 break;
             }
             let pending_before = scored.len();
-            if !dispatch_top_candidates(&mut scored, &request, del_tx, &mut dispatched_this_pass) {
+            if !dispatch_with_behavior_gate(
+                &mut scored,
+                &request,
+                del_tx,
+                &mut dispatched_this_pass,
+                executor_config,
+            ) {
                 scanner_should_exit = true;
                 break;
             }
@@ -10590,6 +11004,25 @@ fn authorize_scanner_mutation_scope(
     }
 }
 
+/// Backing relief has no catalog or target-only exception: the candidate
+/// must still be inside a configured root and outside its exclusions when
+/// the executor takes the batch, including after a queued config reload.
+fn authorize_ram_reclaim_scope(
+    candidate: &CandidacyScore,
+    scanner: &crate::core::config::ScannerConfig,
+) -> std::result::Result<(), SkipReason> {
+    if scanner
+        .root_paths
+        .iter()
+        .any(|root| path_is_same_or_descendant(&candidate.path, root))
+        && !crate::daemon::target_tier::is_excluded(&candidate.path, &scanner.excluded_paths)
+    {
+        Ok(())
+    } else {
+        Err(SkipReason::PolicyChanged)
+    }
+}
+
 /// The operator's `protected_paths` as the executor applies them to a batch.
 /// A target-only batch (bd-232u) goes without the patterns that protect its
 /// root as a whole, which is why the tier exists; one naming something inside
@@ -10789,7 +11222,27 @@ fn executor_thread_main(
         heartbeat.beat();
         batch_count += 1;
 
+        if shared_config
+            .authorize_dispatch(batch.ram_reclaim.is_some())
+            .is_err()
+        {
+            continue;
+        }
         let scanner_snapshot = shared_scanner_config.read().clone();
+        if let Some(relief) = &batch.ram_reclaim {
+            if batch.target_only_root.is_some() {
+                // Swap pressure cannot borrow the target-only protection
+                // exception, even if a malformed queued batch carries both.
+                continue;
+            }
+            batch.candidates.retain(|candidate| {
+                relief.accepts_candidate(candidate)
+                    && authorize_ram_reclaim_scope(candidate, &scanner_snapshot).is_ok()
+            });
+            if batch.candidates.is_empty() {
+                continue;
+            }
+        }
         let outside = retain_target_only_candidates(&mut batch, &scanner_snapshot);
         if outside > 0 {
             let message = format!(
@@ -10936,7 +11389,7 @@ fn executor_thread_main(
         // Behavior-cell certainty gate (v0.6 matrix): Green/Yellow cells dispatch
         // only structurally definite artifacts; Orange adds likely ones; Red and
         // Critical dispatch every Delete verdict.
-        let min_certainty = shared_config.min_certainty();
+        let min_certainty = shared_config.dispatch_certainty(batch.ram_reclaim.is_some());
         let (approved_candidates, held_back_by_certainty) =
             retain_dispatchable_by_certainty(approved_candidates, min_certainty);
         if held_back_by_certainty > 0 {
@@ -10962,7 +11415,11 @@ fn executor_thread_main(
                 approved_candidates,
                 &PlanRequest {
                     level: batch.pressure_level,
-                    target_bytes: batch.target_bytes,
+                    target_bytes: batch
+                        .ram_reclaim
+                        .as_ref()
+                        .map(RamReclaimRequest::remaining_bytes)
+                        .or(batch.target_bytes),
                     max_items: max_batch_size,
                     risk_budget: table.budget(batch.pressure_level, false_positive_loss),
                     false_positive_loss,
@@ -11005,6 +11462,7 @@ fn executor_thread_main(
                 // A target-only batch is pinned to the inodes the tier
                 // surveyed, whatever the engine.
                 require_identity: batch.target_only_root.is_some()
+                    || batch.ram_reclaim.is_some()
                     || matches!(scanner_snapshot.engine, ScannerEngineMode::V2),
                 sacred_paths: executor_sacred_paths,
                 // Layer 7: at Green there is time to keep the bytes around,
@@ -11115,11 +11573,12 @@ fn executor_thread_main(
             HashMap::new()
         };
 
-        let target_only_platform = if !dry_run && batch.target_only_root.is_some() {
-            detect_platform().ok()
-        } else {
-            None
-        };
+        let target_only_platform =
+            if !dry_run && (batch.target_only_root.is_some() || batch.ram_reclaim.is_some()) {
+                detect_platform().ok()
+            } else {
+                None
+            };
         let authorize_candidate = |candidate: &CandidacyScore| {
             // A batch planned as a dry-run cannot mutate and still owes its
             // preview counts. Real batches must obey newly restrictive policy.
@@ -11136,15 +11595,28 @@ fn executor_thread_main(
                     SystemTime::now(),
                     heartbeat,
                 )?;
+                if let Some(relief) = &batch.ram_reclaim {
+                    authorize_ram_reclaim_scope(candidate, &scanner_snapshot)?;
+                    relief.authorize(
+                        candidate,
+                        target_only_platform
+                            .as_deref()
+                            .ok_or(SkipReason::PolicyChanged)?,
+                    )?;
+                }
                 // The filesystem survey must not outlive new root,
                 // exclusion, protection or idle-window permissions.
                 authorize_scanner_mutation_scope(&batch, &scanner_snapshot, shared_scanner_config)?;
+                shared_config.authorize_dispatch(batch.ram_reclaim.is_some())?;
                 shared_config.authorize_mutation(policy_mode, policy_engine.lock().mode())?;
                 shared_config.authorize_compression_first(candidate, batch.pressure_level)?;
             }
             regret.authorize_deletion(candidate, logger)
         };
         let on_unlinked = |candidate: &CandidacyScore, completed_at: Instant| {
+            if let Some(relief) = &batch.ram_reclaim {
+                relief.record_unlinked(candidate);
+            }
             if let Some(identity) = watch_identities.get(&candidate.path) {
                 regret.watch_unlinked(candidate, identity, completed_at);
             }
@@ -11451,22 +11923,765 @@ mod tests {
 
     #[cfg(unix)]
     fn quarantine_tick(level: PressureLevel, mount: &Path) -> MountTickResponse {
+        let response = PressureResponse {
+            level,
+            urgency: 0.7,
+            scan_interval: Duration::from_secs(1),
+            release_ballast_files: 0,
+            max_delete_batch: 10,
+            fallback_active: false,
+            causing_mount: mount.to_path_buf(),
+            free_pct: 12.0,
+            predicted_seconds: None,
+        };
         MountTickResponse {
-            response: crate::monitor::pid::PressureResponse {
-                level,
-                urgency: 0.7,
-                scan_interval: Duration::from_secs(1),
-                release_ballast_files: 0,
-                max_delete_batch: 10,
-                fallback_active: false,
-                causing_mount: mount.to_path_buf(),
-                free_pct: 12.0,
-                predicted_seconds: None,
-            },
+            filesystem_response: response.clone(),
+            response,
+            backing_pressure: None,
+            ram_reclaim: None,
             seconds_to_red: None,
             prediction_confident: false,
             imminent_danger: false,
             rate: MountRateState::default(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_tmpfs_pressure_probe(
+        fixture: &mut RegretDaemonFixture,
+        memory: MemoryInfo,
+        ram_type: &str,
+        ram_free: u64,
+        readonly: bool,
+    ) -> (PathBuf, PathBuf) {
+        use crate::platform::pal::{FsStats, MountPoint, PlatformPaths};
+
+        let ram = fixture.directory.path().join("ram");
+        let disk = fixture.directory.path().join("project");
+        std::fs::create_dir_all(&ram).unwrap();
+        let mounts = vec![
+            MountPoint {
+                path: ram.clone(),
+                device: "mock-tmpfs".into(),
+                fs_type: ram_type.into(),
+                is_ram_backed: ram_type == "tmpfs",
+            },
+            MountPoint {
+                path: disk.clone(),
+                device: "mock-disk".into(),
+                fs_type: "ext4".into(),
+                is_ram_backed: false,
+            },
+        ];
+        let stats = HashMap::from([
+            (
+                ram.clone(),
+                FsStats {
+                    total_bytes: 100 << 30,
+                    free_bytes: ram_free,
+                    available_bytes: ram_free,
+                    fs_type: ram_type.into(),
+                    mount_point: ram.clone(),
+                    is_readonly: readonly,
+                },
+            ),
+            (
+                disk.clone(),
+                FsStats {
+                    total_bytes: 100 << 30,
+                    free_bytes: 50 << 30,
+                    available_bytes: 50 << 30,
+                    fs_type: "ext4".into(),
+                    mount_point: disk.clone(),
+                    is_readonly: false,
+                },
+            ),
+        ]);
+        let platform: Arc<dyn Platform> = Arc::new(
+            MockPlatform::new(mounts, stats, memory, PlatformPaths::default())
+                .with_home(fixture.directory.path())
+                .with_temp_dirs(Vec::new())
+                .with_cache_roots(Vec::new()),
+        );
+        fixture.daemon.platform = Arc::clone(&platform);
+        fixture.daemon.fs_collector = FsStatsCollector::new(platform, Duration::ZERO);
+        fixture.daemon.config.scanner.root_paths = vec![ram.clone(), disk.clone()];
+        fixture.daemon.config.pressure.maintenance_interval_secs = 0;
+        fixture.daemon.config.pressure.prediction.enabled = false;
+        (ram, disk)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exhausted_swap_sample() -> MemoryInfo {
+        MemoryInfo {
+            total_bytes: 64 << 30,
+            available_bytes: 16 << 30,
+            swap_total_bytes: 64 << 30,
+            swap_free_bytes: 0,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tmpfs_backing_pressure_dispatches_bounded_relief_and_preserves_real_free_space() {
+        let mut fixture = RegretDaemonFixture::new();
+        let (ram, disk) = install_tmpfs_pressure_probe(
+            &mut fixture,
+            exhausted_swap_sample(),
+            "tmpfs",
+            29 << 30,
+            false,
+        );
+        let daemon = &mut fixture.daemon;
+        // Disk byte floors cannot make the independent swap sample Green.
+        daemon.config.pressure.green_min_free_bytes = 4;
+        daemon.config.pressure.yellow_min_free_bytes = 3;
+        daemon.config.pressure.orange_min_free_bytes = 2;
+        daemon.config.pressure.red_min_free_bytes = 1;
+        daemon.config.scanner.cross_devices = true;
+        let response = daemon.check_pressure().unwrap();
+        assert_eq!(response.causing_mount, ram);
+        assert_eq!(response.level, PressureLevel::Critical);
+        assert!((response.free_pct - 29.0).abs() < f64::EPSILON);
+        assert_eq!(response.release_ballast_files, 0);
+        let disk_tick = daemon
+            .mount_responses
+            .iter()
+            .find(|tick| tick.response.causing_mount == disk)
+            .unwrap();
+        assert_eq!(disk_tick.response.level, PressureLevel::Green);
+        assert!(disk_tick.ram_reclaim.is_none());
+
+        daemon.behavior_state.mode = mock_behavior_mode(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::Release,
+            NotificationPriority::Low,
+        );
+        let (scan_tx, scan_rx) = bounded(4);
+        let (del_tx, _del_rx) = bounded(4);
+        daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+        let request = scan_rx.try_recv().expect("swap must wake the tmpfs scan");
+        assert_eq!(request.paths, vec![ram.clone()]);
+        assert_eq!(request.free_pct, Some(29.0));
+        assert_eq!(request.pressure_level, PressureLevel::Critical);
+        assert_eq!(request.target_bytes, Some((64_u64 << 30).div_ceil(10)));
+        assert_eq!(
+            request.ram_reclaim.unwrap().remaining_bytes(),
+            request.target_bytes.unwrap(),
+        );
+        assert!(
+            scan_rx.try_recv().is_err(),
+            "healthy disk roots must stay idle"
+        );
+
+        // The normal state path reports both the real filesystem capacity
+        // and the independent backing evidence used to raise its level.
+        let response = daemon.check_pressure().unwrap();
+        daemon.maybe_write_self_monitor_state(&response);
+        let state = SelfMonitor::read_state(&daemon.config.paths.state_file).unwrap();
+        let recorded = state
+            .mount_controllers
+            .iter()
+            .find(|record| record.mount == ram.to_string_lossy())
+            .unwrap();
+        assert_eq!(recorded.backing_pressure.unwrap().swap_free_bytes, 0);
+        assert!(state.pressure.mounts.iter().any(|mount| {
+            mount.path == ram.to_string_lossy() && (mount.free_pct - 29.0).abs() < f64::EPSILON
+        }));
+
+        install_tmpfs_pressure_probe(
+            &mut fixture,
+            MemoryInfo {
+                swap_free_bytes: 64 << 30,
+                ..exhausted_swap_sample()
+            },
+            "tmpfs",
+            29 << 30,
+            false,
+        );
+        let recovered = fixture.daemon.check_pressure().unwrap();
+        assert_eq!(recovered.level, PressureLevel::Green);
+        assert!(
+            fixture
+                .daemon
+                .mount_responses
+                .iter()
+                .all(|tick| { tick.ram_reclaim.is_none() && tick.backing_pressure.is_none() })
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tmpfs_backing_pressure_preserves_the_pressured_disks_guard_evidence() {
+        use crate::monitor::guardrails::GuardStatus;
+        use crate::platform::pal::PlatformPaths;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let (ram, disk) = install_tmpfs_pressure_probe(
+            &mut fixture,
+            exhausted_swap_sample(),
+            "tmpfs",
+            29 << 30,
+            false,
+        );
+        let daemon = &mut fixture.daemon;
+        let mounts = daemon.platform.mount_points().unwrap();
+        let mut stats: HashMap<_, _> = mounts
+            .iter()
+            .map(|mount| {
+                (
+                    mount.path.clone(),
+                    daemon.platform.fs_stats(&mount.path).unwrap(),
+                )
+            })
+            .collect();
+        let disk_stats = stats.get_mut(&disk).unwrap();
+        disk_stats.free_bytes = 7 << 30;
+        disk_stats.available_bytes = 7 << 30;
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::new(
+            mounts,
+            stats,
+            exhausted_swap_sample(),
+            PlatformPaths::default(),
+        ));
+        daemon.platform = Arc::clone(&platform);
+        daemon.fs_collector = FsStatsCollector::new(platform, Duration::ZERO);
+
+        let mut disk_monitor = MountMonitor::new(&daemon.config);
+        for _ in 0..64 {
+            disk_monitor.guard.observe(CalibrationObservation {
+                predicted_rate: 1.0,
+                actual_rate: 100_000_000.0,
+                predicted_tte: 600.0,
+                actual_tte: 1.0,
+                burst_outlier: false,
+            });
+        }
+        assert_eq!(disk_monitor.guard.status(), GuardStatus::Fail);
+        daemon.mount_monitors.insert(disk.clone(), disk_monitor);
+        let response = daemon.check_pressure().unwrap();
+        assert_eq!(response.causing_mount, ram);
+        assert_eq!(response.level, PressureLevel::Critical);
+        let disk_tick = daemon
+            .mount_responses
+            .iter()
+            .find(|tick| tick.response.causing_mount == disk)
+            .unwrap();
+        assert_eq!(disk_tick.filesystem_response.level, PressureLevel::Red);
+        let physical = daemon.worst_filesystem_response().unwrap();
+        assert_eq!(physical.causing_mount, disk);
+        assert_eq!(physical.level, PressureLevel::Red);
+        assert!((physical.free_pct - 7.0).abs() < f64::EPSILON);
+        let guard = daemon.shared_guard_diagnostics.read();
+        assert_eq!(guard.as_ref().unwrap().status, GuardStatus::Fail);
+        assert_eq!(
+            guard.as_ref().unwrap().observation_count,
+            daemon.mount_monitors[&disk]
+                .guard
+                .diagnostics()
+                .observation_count,
+        );
+        assert_eq!(
+            daemon.mount_monitors[&ram]
+                .guard
+                .diagnostics()
+                .observation_count,
+            0
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tmpfs_backing_pressure_does_not_authorize_dedicated_cleanup_tiers() {
+        let mut fixture = RegretDaemonFixture::new();
+        let (ram, disk) = install_tmpfs_pressure_probe(
+            &mut fixture,
+            exhausted_swap_sample(),
+            "tmpfs",
+            29 << 30,
+            false,
+        );
+        let daemon = &mut fixture.daemon;
+        let response = daemon.check_pressure().unwrap();
+        let responses = daemon.mount_responses.clone();
+        daemon.behavior_state.mode = mock_behavior_mode(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::None,
+            NotificationPriority::Low,
+        );
+        let (scan_tx, scan_rx) = bounded(4);
+        let (del_tx, _del_rx) = bounded(4);
+        daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(
+            daemon.mount_controllers.get(&ram).unwrap().level(),
+            PressureLevel::Critical,
+        );
+        // handle_pressure consumes this field before delivering the current
+        // tick's local vector to the dedicated tiers.
+        assert!(daemon.mount_responses.is_empty());
+        let mounts = daemon.filesystem_tier_mounts(&responses, Instant::now());
+        for mount in [&ram, &disk] {
+            let &(level, _) = mounts.get(mount).unwrap();
+            assert_eq!(level, PressureLevel::Green);
+            assert!(crate::daemon::rch_staging::min_idle_for(level).is_none());
+        }
+        assert!(
+            daemon
+                .filesystem_tier_mounts(&[], Instant::now())
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dedicated_cleanup_tiers_keep_physical_pressure_after_tick_responses_are_taken() {
+        let mut fixture = RegretDaemonFixture::new();
+        let mount = fixture.directory.path().join("project");
+        let mut tick = quarantine_tick(PressureLevel::Orange, &mount);
+        tick.filesystem_response.urgency = 0.6;
+        fixture.daemon.mount_responses = vec![tick.clone()];
+        let mut responses = std::mem::take(&mut fixture.daemon.mount_responses);
+        assert!(fixture.daemon.mount_responses.is_empty());
+        let mounts = fixture
+            .daemon
+            .filesystem_tier_mounts(&responses, Instant::now());
+        assert_eq!(mounts.get(&mount).unwrap().0, PressureLevel::Orange);
+
+        // Promotion must not shorten rch's ordinary Orange idle requirement
+        // or escalate target-only candidates to Critical urgency.
+        tick.response.level = PressureLevel::Critical;
+        tick.response.urgency = 1.0;
+        tick.ram_reclaim = Some(RamReclaimRequest::new(mount.clone(), 17, 100));
+        responses[0] = tick;
+        let mounts = fixture
+            .daemon
+            .filesystem_tier_mounts(&responses, Instant::now());
+        let &(level, urgency) = mounts.get(&mount).unwrap();
+        assert_eq!(level, PressureLevel::Orange);
+        assert!((urgency - 0.6).abs() < f64::EPSILON);
+        assert_eq!(
+            crate::daemon::rch_staging::min_idle_for(level),
+            Some(Duration::from_hours(72)),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tmpfs_forced_scans_and_retries_keep_physical_pressure_after_tick_dispatch() {
+        let mut fixture = RegretDaemonFixture::new();
+        let (forced_tx, forced_rx) = bounded(1);
+        for (free, level) in [
+            (29_u64 << 30, PressureLevel::Green),
+            (12_u64 << 30, PressureLevel::Orange),
+        ] {
+            install_tmpfs_pressure_probe(
+                &mut fixture,
+                exhausted_swap_sample(),
+                "tmpfs",
+                free,
+                false,
+            );
+            let daemon = &mut fixture.daemon;
+            let effective = daemon.check_pressure().unwrap();
+            assert_eq!(effective.level, PressureLevel::Critical);
+            // Capture where run() does, before the normal pressure handler
+            // takes the ticks. Keep the entire physical response, including
+            // its batch limit, not just its less urgent pressure level.
+            let physical = daemon.worst_filesystem_response().unwrap();
+            assert_eq!(physical.level, level);
+            let (scan_tx, scan_rx) = bounded(4);
+            let (del_tx, _del_rx) = bounded(4);
+            daemon.handle_pressure(&effective, &scan_tx, &scan_rx, &del_tx);
+            assert!(daemon.worst_filesystem_response().is_none());
+            let roots = &daemon.config.scanner.root_paths;
+
+            // A full queue leaves the signal pending. When room returns,
+            // both the first attempt and its retry use physical pressure.
+            assert!(MonitoringDaemon::trigger_forced_scan(
+                roots,
+                &forced_tx,
+                Some(&physical),
+            ));
+            assert!(!MonitoringDaemon::trigger_forced_scan(
+                roots,
+                &forced_tx,
+                Some(&physical),
+            ));
+            for retry in [false, true] {
+                if retry {
+                    assert!(MonitoringDaemon::trigger_forced_scan(
+                        roots,
+                        &forced_tx,
+                        Some(&physical),
+                    ));
+                }
+                let queued = forced_rx.try_recv().unwrap();
+                assert!(queued.force_full_scan);
+                assert_eq!(queued.paths, *roots);
+                assert_eq!(queued.pressure_level, level);
+                assert_eq!(queued.max_delete_batch, physical.max_delete_batch);
+                assert_eq!(queued.free_pct, Some(physical.free_pct));
+                assert_eq!(
+                    queued.urgency.to_bits(),
+                    physical.urgency.max(0.5).to_bits(),
+                );
+                assert!(queued.ram_reclaim.is_none());
+                assert!(queued.target_bytes.is_none());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tmpfs_backing_pressure_requires_valid_occupied_writable_tmpfs_evidence() {
+        for (kind, free, readonly, memory) in [
+            ("ext4", 29 << 30, false, exhausted_swap_sample()),
+            ("apfs", 29 << 30, false, exhausted_swap_sample()),
+            ("tmpfs", 100 << 30, false, exhausted_swap_sample()),
+            ("tmpfs", 29 << 30, true, exhausted_swap_sample()),
+            (
+                "tmpfs",
+                29 << 30,
+                false,
+                MemoryInfo {
+                    swap_total_bytes: 0,
+                    ..exhausted_swap_sample()
+                },
+            ),
+            (
+                "tmpfs",
+                29 << 30,
+                false,
+                MemoryInfo {
+                    available_bytes: 65 << 30,
+                    ..exhausted_swap_sample()
+                },
+            ),
+        ] {
+            let mut fixture = RegretDaemonFixture::new();
+            install_tmpfs_pressure_probe(&mut fixture, memory, kind, free, readonly);
+            assert_eq!(
+                fixture.daemon.check_pressure().unwrap().level,
+                PressureLevel::Green
+            );
+            assert!(
+                fixture
+                    .daemon
+                    .mount_responses
+                    .iter()
+                    .all(|tick| tick.ram_reclaim.is_none())
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tmpfs_backing_pressure_cannot_fall_back_to_unrelated_disk_roots() {
+        let mut fixture = RegretDaemonFixture::new();
+        let (ram, disk) = install_tmpfs_pressure_probe(
+            &mut fixture,
+            exhausted_swap_sample(),
+            "tmpfs",
+            29 << 30,
+            false,
+        );
+        let daemon = &mut fixture.daemon;
+        let response = daemon.check_pressure().unwrap();
+        // Root authorization can change after the monitor sample. Even with
+        // cross-device scans enabled, disk roots are not a relief surface.
+        daemon.config.scanner.root_paths = vec![disk];
+        daemon.config.scanner.cross_devices = true;
+        daemon.config.scanner.catalog_roots_on_pressured_device = true;
+        daemon.behavior_state.mode = mock_behavior_mode(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::None,
+            NotificationPriority::Low,
+        );
+        let (scan_tx, scan_rx) = bounded(4);
+        let (del_tx, _del_rx) = bounded(4);
+        daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(
+            daemon.mount_controllers[&ram].state(),
+            MountState::ObserveOnly
+        );
+        assert!(scan_rx.try_recv().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tmpfs_recovery_keeps_disk_certainty_until_behavior_hysteresis_catches_up() {
+        let mut fixture = RegretDaemonFixture::new();
+        install_tmpfs_pressure_probe(
+            &mut fixture,
+            exhausted_swap_sample(),
+            "tmpfs",
+            29 << 30,
+            false,
+        );
+        let daemon = &mut fixture.daemon;
+        daemon.config.pressure.behavior_hysteresis_secs = 60;
+        daemon.behavior_state = PressureBehaviorState::new(
+            behavior_table_from_config(&daemon.config),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Critical,
+        );
+        // A recent recovery makes the next one wait in the real behavior
+        // update path; there is no clock sleep in this regression.
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        let response = daemon.check_pressure().unwrap();
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Critical);
+        assert_eq!(
+            daemon.shared_executor_config.min_certainty(),
+            ArtifactCertainty::Unclear,
+        );
+        assert_eq!(
+            daemon.shared_executor_config.dispatch_certainty(false),
+            ArtifactCertainty::Definite,
+        );
+
+        install_tmpfs_pressure_probe(
+            &mut fixture,
+            MemoryInfo {
+                swap_free_bytes: 64 << 30,
+                ..exhausted_swap_sample()
+            },
+            "tmpfs",
+            29 << 30,
+            false,
+        );
+        let daemon = &mut fixture.daemon;
+        let response = daemon.check_pressure().unwrap();
+        assert_eq!(response.level, PressureLevel::Green);
+        assert!(
+            daemon
+                .mount_responses
+                .iter()
+                .all(|tick| tick.ram_reclaim.is_none())
+        );
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        assert!(daemon.behavior_state.has_pending_target());
+        assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Critical);
+        assert_eq!(daemon.ram_reclaim_behavior, RamReclaimBehavior::Recovering);
+        assert_eq!(
+            daemon.shared_executor_config.dispatch_certainty(false),
+            ArtifactCertainty::Definite,
+            "healthy swap must not reopen unrelated disk candidates during deferred recovery",
+        );
+
+        daemon.behavior_state.last_recovery_at =
+            Instant::now().checked_sub(Duration::from_secs(61));
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Green);
+        daemon.check_pressure().unwrap();
+        assert_eq!(
+            daemon.ram_reclaim_behavior,
+            RamReclaimBehavior::FilesystemOnly
+        );
+        assert_eq!(
+            daemon.shared_executor_config.dispatch_certainty(false),
+            ArtifactCertainty::Definite,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn filesystem_only_recovery_keeps_its_existing_certainty_hysteresis() {
+        let mut fixture = RegretDaemonFixture::new();
+        install_tmpfs_pressure_probe(
+            &mut fixture,
+            MemoryInfo {
+                swap_free_bytes: 64 << 30,
+                ..exhausted_swap_sample()
+            },
+            "tmpfs",
+            29 << 30,
+            false,
+        );
+        let daemon = &mut fixture.daemon;
+        daemon.config.pressure.behavior_hysteresis_secs = 60;
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            PressureLevel::Critical,
+            "startup",
+            Duration::ZERO,
+        );
+        daemon.behavior_state.last_recovery_at = Some(Instant::now());
+        let response = daemon.check_pressure().unwrap();
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        assert!(daemon.behavior_state.has_pending_target());
+        assert_eq!(
+            daemon.ram_reclaim_behavior,
+            RamReclaimBehavior::FilesystemOnly
+        );
+        assert_eq!(
+            daemon.shared_executor_config.dispatch_certainty(false),
+            ArtifactCertainty::Unclear,
+            "filesystem-only pressure must retain its existing recovery policy",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn tmpfs_pressure_preserves_legacy_no_cleanup_cells_and_recovery() {
+        use crate::daemon::policy::BehaviorPreset;
+
+        for (free, level, cleanup) in [
+            (29_u64 << 30, PressureLevel::Green, CleanupAction::None),
+            (
+                12_u64 << 30,
+                PressureLevel::Orange,
+                CleanupAction::IdentifyOnly,
+            ),
+        ] {
+            let mut fixture = RegretDaemonFixture::new();
+            let (ram, disk) = install_tmpfs_pressure_probe(
+                &mut fixture,
+                exhausted_swap_sample(),
+                "tmpfs",
+                free,
+                false,
+            );
+            let daemon = &mut fixture.daemon;
+            daemon.behavior_state = PressureBehaviorState::new(
+                BehaviorDispatchTable::from_preset(BehaviorPreset::V0_5),
+                MemoryPressureLevel::Normal,
+                PressureLevel::Green,
+            );
+            let response = daemon.check_pressure().unwrap();
+            assert_eq!(response.level, PressureLevel::Critical);
+            assert_eq!(
+                daemon.ram_reclaim_behavior,
+                RamReclaimBehavior::BackingPressure
+            );
+            assert_eq!(
+                daemon
+                    .behavior_state
+                    .table()
+                    .mode_for(MemoryPressureLevel::Normal, level)
+                    .cleanup_action,
+                cleanup,
+            );
+            daemon.update_behavior_mode(
+                MemoryPressureLevel::Normal,
+                response.level,
+                "startup",
+                Duration::ZERO,
+            );
+            assert!(behavior_allows_delete_dispatch(daemon.behavior_state.mode));
+            let (scan_tx, scan_rx) = bounded(4);
+            let (del_tx, del_rx) = bounded(4);
+            daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+            let relief = scan_rx.try_recv().unwrap();
+            assert!(relief.ram_reclaim.is_some());
+            assert!(relief.max_delete_batch > 0);
+
+            let mut ordinary = relief.clone();
+            ordinary.paths = vec![disk.clone()];
+            ordinary.ram_reclaim = None;
+            let mut scored = vec![test_candidate(&disk.join("target").to_string_lossy(), 0.9)];
+            let mut dispatched = PassDispatch::default();
+            let shared = &daemon.shared_executor_config;
+            assert!(dispatch_with_behavior_gate(
+                &mut scored,
+                &ordinary,
+                &del_tx,
+                &mut dispatched,
+                shared,
+            ));
+            assert_eq!(dispatched.count, 0);
+            assert_eq!(scored.len(), 1);
+            assert!(del_rx.try_recv().is_err());
+            assert_eq!(
+                shared.authorize_dispatch(false),
+                Err(SkipReason::PolicyChanged)
+            );
+            assert_eq!(shared.authorize_dispatch(true), Ok(()));
+
+            let path = ram.join("target");
+            std::fs::create_dir(&path).unwrap();
+            let mut candidate = test_candidate(&path.to_string_lossy(), 0.9);
+            candidate.identity = crate::scanner::walker::identity_for_path(&path, false).ok();
+            assert!(dispatch_with_behavior_gate(
+                &mut vec![candidate],
+                &relief,
+                &del_tx,
+                &mut dispatched,
+                shared,
+            ));
+            assert!(del_rx.try_recv().unwrap().ram_reclaim.is_some());
+
+            daemon.config.pressure.behavior_hysteresis_secs = 60;
+            daemon.behavior_state.last_recovery_at = Some(Instant::now());
+            install_tmpfs_pressure_probe(
+                &mut fixture,
+                MemoryInfo {
+                    swap_free_bytes: 64 << 30,
+                    ..exhausted_swap_sample()
+                },
+                "tmpfs",
+                free,
+                false,
+            );
+            let daemon = &mut fixture.daemon;
+            let recovered = daemon.check_pressure().unwrap();
+            daemon.update_behavior_mode(
+                MemoryPressureLevel::Normal,
+                recovered.level,
+                "disk_pressure",
+                Duration::ZERO,
+            );
+            assert!(daemon.behavior_state.has_pending_target());
+            assert_eq!(daemon.ram_reclaim_behavior, RamReclaimBehavior::Recovering);
+            assert_eq!(
+                daemon.shared_executor_config.authorize_dispatch(false),
+                Err(SkipReason::PolicyChanged)
+            );
+            daemon.config.pressure.behavior_hysteresis_secs = 0;
+            daemon.update_behavior_mode(
+                MemoryPressureLevel::Normal,
+                recovered.level,
+                "disk_pressure",
+                Duration::ZERO,
+            );
+            daemon.check_pressure().unwrap();
+            assert_eq!(
+                daemon.ram_reclaim_behavior,
+                RamReclaimBehavior::FilesystemOnly
+            );
+            assert_eq!(
+                daemon.shared_executor_config.authorize_dispatch(false),
+                Ok(())
+            );
         }
     }
 
@@ -11528,14 +12743,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn executor_live_policy_stops_a_previously_approved_batch_without_backoff() {
-        use crate::daemon::policy::PolicyConfig;
+        use crate::daemon::policy::{BehaviorPreset, PolicyConfig};
 
-        for (mode, dry_run) in [
-            (ActiveMode::Observe, false),
-            (ActiveMode::FallbackSafe, false),
-            (ActiveMode::Canary, false),
-            (ActiveMode::Enforce, true),
+        let legacy = BehaviorDispatchTable::from_preset(BehaviorPreset::V0_5);
+        for (mode, dry_run, physical_mode) in [
+            (ActiveMode::Observe, false, None),
+            (ActiveMode::FallbackSafe, false, None),
+            (ActiveMode::Canary, false, None),
+            (ActiveMode::Enforce, true, None),
+            (
+                ActiveMode::Enforce,
+                false,
+                Some(legacy.mode_for(MemoryPressureLevel::Normal, PressureLevel::Green)),
+            ),
+            (
+                ActiveMode::Enforce,
+                false,
+                Some(legacy.mode_for(MemoryPressureLevel::Normal, PressureLevel::Orange)),
+            ),
         ] {
             let fixture = RegretDaemonFixture::new();
             let candidates_dir = temp_root_scratch_dir();
@@ -11571,6 +12798,7 @@ mod tests {
             let authorize = |_candidate: &CandidacyScore| {
                 // Previously approved work must obey a live operator pause
                 // or fallback before its next mutation.
+                shared.authorize_dispatch(false)?;
                 shared.authorize_mutation(ActiveMode::Enforce, policy.lock().mode())
             };
             let pause_after_unlink = |candidate: &CandidacyScore, _: Instant| {
@@ -11581,6 +12809,7 @@ mod tests {
                     ..PolicyConfig::default()
                 });
                 shared.dry_run.store(dry_run, Ordering::Relaxed);
+                shared.set_ram_reclaim_physical_mode(physical_mode);
             };
             let report = executor.execute_with_hooks(
                 &plan,
@@ -11599,6 +12828,7 @@ mod tests {
                 ..PolicyConfig::default()
             });
             shared.dry_run.store(false, Ordering::Relaxed);
+            shared.set_ram_reclaim_physical_mode(None);
             let retry = executor.plan(vec![plan.candidates[1].clone()]);
             let released = executor.execute_with_guard(&retry, None, Some(&authorize));
             assert_eq!(released.items_deleted, 1, "{mode:?} dry_run={dry_run}");
@@ -12675,6 +13905,7 @@ mod tests {
                 catalog_roots: Vec::new(),
                 maintenance: false,
                 target_bytes: None,
+                ram_reclaim: None,
             })
             .unwrap();
         drop(scan_tx);
@@ -12801,6 +14032,7 @@ mod tests {
                     catalog_roots: Vec::new(),
                     maintenance: false,
                     target_bytes: None,
+                    ram_reclaim: None,
                 })
                 .unwrap();
             drop(scan_tx);
@@ -12911,6 +14143,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         let identity = identity_for_path(&target, false).unwrap();
         let record = |generation: u64| CandidateIndexRecord {
@@ -13630,6 +14863,7 @@ mod tests {
             pressure_level: PressureLevel::Red,
             urgency: 0.8,
             target_bytes: None,
+            ram_reclaim: None,
             target_only_root: Some(root.clone()),
             target_only_consent: Some(test_target_only_consent(&root, &scanner)),
         };
@@ -13698,6 +14932,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             urgency: 0.9,
             target_bytes: None,
+            ram_reclaim: None,
             target_only_root: target_only.then(|| root.clone()),
             target_only_consent: target_only.then(|| test_target_only_consent(&root, &scanner)),
         };
@@ -13814,6 +15049,7 @@ mod tests {
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.9,
                 target_bytes: None,
+                ram_reclaim: None,
                 target_only_root: Some(root),
                 target_only_consent: (case != "missing").then_some(consent),
             })
@@ -13941,6 +15177,7 @@ mod tests {
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.9,
                 target_bytes: None,
+                ram_reclaim: None,
                 target_only_root: target_only_root.map(Path::to_path_buf),
                 target_only_consent: target_only_root
                     .map(|root| test_target_only_consent(root, &scanner)),
@@ -14198,6 +15435,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             urgency: 0.9,
             target_bytes: None,
+            ram_reclaim: None,
             target_only_root: Some(root.clone()),
             target_only_consent: Some(test_target_only_consent(&root, &scanner)),
         };
@@ -14302,6 +15540,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             urgency: 0.9,
             target_bytes: None,
+            ram_reclaim: None,
             target_only_consent: target_only_root
                 .as_deref()
                 .map(|root| test_target_only_consent(root, &scanner)),
@@ -14385,6 +15624,7 @@ mod tests {
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.9,
                 target_bytes: None,
+                ram_reclaim: None,
                 target_only_root: Some(root),
                 target_only_consent: Some(consent),
             })
@@ -14450,6 +15690,7 @@ mod tests {
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.9,
                 target_bytes: None,
+                ram_reclaim: None,
                 target_only_root: None,
                 target_only_consent: None,
             })
@@ -14485,6 +15726,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             urgency: 0.9,
             target_bytes: None,
+            ram_reclaim: None,
             target_only_root: None,
             target_only_consent: None,
         };
@@ -14877,6 +16119,7 @@ mod tests {
                 catalog_roots: Vec::new(),
                 maintenance: false,
                 target_bytes: None,
+                ram_reclaim: None,
             })
             .unwrap();
         drop(scan_tx);
@@ -15069,6 +16312,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         let dirty: BTreeSet<PathBuf> =
             std::iter::once(PathBuf::from("/data/projects/one")).collect();
@@ -15170,6 +16414,7 @@ mod tests {
                 catalog_roots: Vec::new(),
                 maintenance: false,
                 target_bytes: None,
+                ram_reclaim: None,
             })
             .unwrap();
         drop(scan_tx);
@@ -15302,6 +16547,7 @@ mod tests {
                     catalog_roots: Vec::new(),
                     maintenance: false,
                     target_bytes: None,
+                    ram_reclaim: None,
                 })
                 .unwrap();
             drop(scan_tx);
@@ -15549,6 +16795,7 @@ mod tests {
                 catalog_roots: Vec::new(),
                 maintenance: false,
                 target_bytes: None,
+                ram_reclaim: None,
             })
             .unwrap();
         drop(scan_tx);
@@ -15635,6 +16882,7 @@ mod tests {
                 surface: crate::daemon::mount_controller::SurfaceKind::Configured,
                 level: "green".to_string(),
                 urgency: 0.0,
+                backing_pressure: None,
                 rescan_in_secs: None,
                 reclaim_capability: crate::daemon::mount_controller::ReclaimCapability::Configured,
                 reserve_state: None,
@@ -15763,6 +17011,7 @@ mod tests {
                 catalog_roots: Vec::new(),
                 maintenance: false,
                 target_bytes: None,
+                ram_reclaim: None,
             })
             .unwrap();
         drop(scan_tx);
@@ -16003,6 +17252,7 @@ mod tests {
                     catalog_roots: Vec::new(),
                     maintenance: false,
                     target_bytes: None,
+                    ram_reclaim: None,
                 })
                 .unwrap();
             drop(scan_tx);
@@ -16144,6 +17394,7 @@ mod tests {
                         catalog_roots: Vec::new(),
                         maintenance: false,
                         target_bytes: None,
+                        ram_reclaim: None,
                     })
                     .unwrap();
             }
@@ -16415,6 +17666,7 @@ mod tests {
                 catalog_roots: Vec::new(),
                 maintenance: false,
                 target_bytes: None,
+                ram_reclaim: None,
             })
             .unwrap();
         drop(scan_tx);
@@ -17179,6 +18431,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         let mut scored = vec![test_candidate("/tmp/a", 0.4), test_candidate("/tmp/b", 0.6)];
 
@@ -17194,6 +18447,114 @@ mod tests {
             scored.len()
         );
         assert!(del_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ram_reclaim_dispatch_keeps_one_allowance_and_refuses_uncertain_or_foreign_items() {
+        use crate::scanner::walker::{FsEntryKind, FsIdentity};
+
+        let (send, receive) = bounded(4);
+        let relief = RamReclaimRequest::new(PathBuf::from("/tmp"), 17, 2);
+        let request = ScanRequest {
+            paths: vec![PathBuf::from("/tmp")],
+            urgency: 1.0,
+            pressure_level: PressureLevel::Red,
+            free_pct: Some(29.0),
+            max_delete_batch: 1,
+            force_full_scan: false,
+            config_update: None,
+            catalog_roots: Vec::new(),
+            maintenance: false,
+            target_bytes: Some(2),
+            ram_reclaim: Some(relief.clone()),
+        };
+        let mut first = test_candidate("/tmp/first", 0.9);
+        first.identity = Some(FsIdentity {
+            device_id: 17,
+            inode: 1,
+            kind: FsEntryKind::Directory,
+        });
+        let mut second = first.clone();
+        second.path = PathBuf::from("/tmp/second");
+        second.identity.as_mut().unwrap().inode = 2;
+        let mut foreign = first.clone();
+        foreign.path = PathBuf::from("/tmp/disk/target");
+        foreign.identity.as_mut().unwrap().device_id = 23;
+        let mut uncertain = first.clone();
+        uncertain.path = PathBuf::from("/tmp/uncertain");
+        uncertain.decision.certainty = ArtifactCertainty::Likely;
+        let mut scored = vec![foreign, uncertain, first.clone(), second];
+        let mut dispatch = PassDispatch::default();
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut dispatch
+        ));
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut dispatch
+        ));
+        let first_batch = receive.try_recv().unwrap();
+        let second_batch = receive.try_recv().unwrap();
+        assert_eq!(first_batch.candidates.len(), 1);
+        assert_eq!(second_batch.candidates.len(), 1);
+        assert!(receive.try_recv().is_err());
+        first_batch.ram_reclaim.unwrap().record_unlinked(&first);
+        assert_eq!(second_batch.ram_reclaim.unwrap().remaining_bytes(), 1);
+        assert_eq!(relief.remaining_bytes(), 1);
+        assert_eq!(v2_pressure_candidate_byte_target(&request), Some(1));
+    }
+
+    #[test]
+    fn ram_reclaim_does_not_inherit_idle_event_authority_or_expand_roots() {
+        let scanner = ScannerConfig {
+            root_paths: vec![PathBuf::from("/tmp/allowed")],
+            excluded_paths: vec![PathBuf::from("/tmp/allowed/keep")],
+            ..ScannerConfig::default()
+        };
+        let mut request = event_test_request(scanner.root_paths.clone());
+        let mut templates = EventPassTemplates::default();
+        templates.remember(&request, &scanner);
+        assert_eq!(templates.templates.len(), 1);
+        request.ram_reclaim = Some(RamReclaimRequest::new(PathBuf::from("/tmp"), 17, 100));
+        templates.remember(&request, &scanner);
+        assert!(templates.templates.is_empty());
+        let allowed = test_candidate("/tmp/allowed/target", 0.9);
+        assert!(authorize_ram_reclaim_scope(&allowed, &scanner).is_ok());
+        for path in ["/tmp/unconfigured/target", "/tmp/allowed/keep/target"] {
+            assert_eq!(
+                authorize_ram_reclaim_scope(&test_candidate(path, 0.9), &scanner),
+                Err(SkipReason::PolicyChanged)
+            );
+        }
+        let revoked = ScannerConfig {
+            root_paths: Vec::new(),
+            ..scanner
+        };
+        assert_eq!(
+            authorize_ram_reclaim_scope(&allowed, &revoked),
+            Err(SkipReason::PolicyChanged)
+        );
+    }
+
+    #[test]
+    fn backing_pressure_cannot_lower_unrelated_disk_certainty() {
+        let shared = SharedExecutorConfig::new(false, 10, 0.5, 300, 3600, true, 86_400);
+        shared.set_min_certainty(ArtifactCertainty::Unclear);
+        shared.set_ram_reclaim_certainty_floor(ArtifactCertainty::Definite);
+        assert_eq!(
+            shared.dispatch_certainty(false),
+            ArtifactCertainty::Definite
+        );
+        assert_eq!(shared.dispatch_certainty(true), ArtifactCertainty::Definite);
+        shared.set_ram_reclaim_certainty_floor(ArtifactCertainty::Likely);
+        assert_eq!(shared.dispatch_certainty(false), ArtifactCertainty::Likely);
+        assert_eq!(shared.dispatch_certainty(true), ArtifactCertainty::Definite);
+        shared.set_ram_reclaim_certainty_floor(ArtifactCertainty::Unclear);
+        assert_eq!(shared.dispatch_certainty(false), ArtifactCertainty::Unclear);
     }
 
     /// Empty candidates are never sent to the executor: the planner never
@@ -17213,6 +18574,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         let empty = |path: &str| CandidacyScore {
             size_bytes: 0,
@@ -17369,6 +18731,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         assert_eq!(request.paths.len(), 2);
         assert_eq!(request.urgency.to_bits(), 0.7_f64.to_bits());
@@ -17408,6 +18771,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         assert_eq!(
             log_truncation_free_pct_for_request(&request).to_bits(),
@@ -17449,11 +18813,19 @@ mod tests {
         };
         let roots = [PathBuf::from("/data/tmp")];
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+        assert!(!MonitoringDaemon::trigger_forced_scan(
+            &roots, &scan_tx, None,
+        ));
+        assert!(scan_rx.try_recv().is_err(), "missing evidence must defer");
         assert!(MonitoringDaemon::trigger_forced_scan(
-            &roots, &scan_tx, &response
+            &roots,
+            &scan_tx,
+            Some(&response)
         ));
         assert!(!MonitoringDaemon::trigger_forced_scan(
-            &roots, &scan_tx, &response
+            &roots,
+            &scan_tx,
+            Some(&response)
         ));
         let queued = scan_rx.try_recv().unwrap();
         assert!(queued.force_full_scan);
@@ -17463,7 +18835,9 @@ mod tests {
             "the full-queue attempt queued nothing"
         );
         assert!(MonitoringDaemon::trigger_forced_scan(
-            &roots, &scan_tx, &response
+            &roots,
+            &scan_tx,
+            Some(&response)
         ));
         assert_eq!(
             scan_reason_for_request(&scan_rx.try_recv().unwrap()),
@@ -17472,7 +18846,9 @@ mod tests {
         drop(scan_rx);
         // Disconnected: given up (true) rather than retried forever.
         assert!(MonitoringDaemon::trigger_forced_scan(
-            &roots, &scan_tx, &response
+            &roots,
+            &scan_tx,
+            Some(&response)
         ));
     }
 
@@ -17568,6 +18944,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         // With capacity 0, send blocks until recv is called.
         // We use thread to unblock.
@@ -17584,6 +18961,7 @@ mod tests {
             pressure_level: PressureLevel::Orange,
             urgency: 0.5,
             target_bytes: None,
+            ram_reclaim: None,
             target_only_root: None,
             target_only_consent: None,
         };
@@ -17723,6 +19101,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
 
         assert_eq!(v2_pressure_candidate_byte_target(&request), None);
@@ -17750,6 +19129,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         let mut dirty = BTreeSet::new();
 
@@ -17778,6 +19158,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         }
     }
 
@@ -18448,6 +19829,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         let dirty = BTreeSet::new();
 
@@ -18565,6 +19947,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         }
     }
 
@@ -19268,6 +20651,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
 
         // Fill the channel to capacity.
@@ -19297,6 +20681,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
 
         // Fill queue with stale requests.
@@ -19368,6 +20753,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         for _ in 0..SCANNER_CHANNEL_CAP {
             tx.try_send(make_request())
@@ -19391,6 +20777,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         let (del_tx, del_rx) = bounded::<DeletionBatch>(4);
         let mut scored = vec![
@@ -19426,6 +20813,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         let (del_tx, del_rx) = bounded::<DeletionBatch>(1);
         del_tx
@@ -19434,6 +20822,7 @@ mod tests {
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.5,
                 target_bytes: None,
+                ram_reclaim: None,
                 target_only_root: None,
                 target_only_consent: None,
             })
@@ -19475,6 +20864,7 @@ mod tests {
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes: None,
+            ram_reclaim: None,
         };
         let (del_tx, del_rx) = bounded::<DeletionBatch>(4);
         let mut pass = PassDispatch::default();

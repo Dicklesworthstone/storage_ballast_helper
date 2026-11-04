@@ -1688,6 +1688,16 @@ The daemon monitors swap usage relative to available RAM. When swap utilization 
 
 Swap-thrash warnings are rate-limited to one per 15-minute window to avoid log noise during sustained pressure.
 
+On Linux, less than 10% free swap also supplies an independent pressure signal
+for occupied tmpfs mounts covered by scanner roots. A mount can therefore
+reclaim eligible artifacts while its own filesystem free percentage is still
+Green. Each relief pass has a finite byte target, accepts only structurally
+definite artifacts on the same tmpfs device, and rechecks swap headroom before
+each removal. Existing protection, active-use and policy checks remain in
+force. `sbh status` shows the swap backing separately from real filesystem
+free space. See [RAM-scratch relief](docs/ram-scratch.md#daemon-relief-when-tmpfs-backing-runs-short)
+for its scope and accounting limits.
+
 ```bash
 # View swap status in the status report
 sbh status --json | jq '.memory'

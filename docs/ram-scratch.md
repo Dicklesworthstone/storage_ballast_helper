@@ -387,6 +387,38 @@ namespaces and under the same access restrictions when investigating the
 daemon's visibility; a successful control in another namespace does not resolve
 the daemon's incomplete observation.
 
+## Daemon relief when tmpfs backing runs short
+
+On Linux, an occupied, writable tmpfs on an existing scanner root can need
+reclaim even while its own size limit shows plenty of free blocks. When a
+valid host sample has less than 10% of configured swap free, the daemon also
+evaluates that mount against swap headroom. The swap controller uses the
+configured pressure percentages independently of disk byte floors. It raises
+the effective mount level only when that signal is worse than the filesystem
+reading. No configured swap, unavailable memory counters, empty tmpfs and
+read-only mounts do not create this extra reclaim request.
+
+Each relief pass carries the bytes needed to reach 10% free swap, capped at
+the tmpfs's occupied bytes. Its batches share that target. Whole artifacts are
+indivisible, so the last selected artifact can exceed the remaining target;
+subsequent candidates stop. File allocation is a work bound, not proof that
+those pages were swapped or that the same number of swap bytes will become
+free. The executor samples backing pressure again before each removal and
+stops if swap recovered or evidence became unavailable.
+
+Relief uses structurally definite artifacts on the same verified tmpfs
+device. `cross_devices` does not widen it to disk caches or nested foreign
+mounts. Source-tree, marker, lease, active-reference, identity, age, regret,
+observe-mode and dry-run checks still apply. The diagnostic's attribution
+list adds no scan roots and does not make arbitrary scratch trees disposable.
+The separate filesystem-pressure path continues to operate normally.
+
+The filesystem free percentage, fill rate and forecast remain actual
+filesystem observations. `sbh status` explains a raised level with its swap
+backing and relief target; JSON exposes the same evidence in
+`mount_controllers[].backing_pressure`. A mount transition logs
+`[SBH-RAM-RECLAIM]`, and successful removals use the ordinary deletion ledger.
+
 ## RAM-backed log destination protection
 
 The JSONL writer checks fallback and mirror destinations independently of the

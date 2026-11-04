@@ -1,14 +1,16 @@
-//! Report-only accounting for tmpfs scratch against host RAM and swap (bd-ffjj).
+//! Accounting for tmpfs scratch against host RAM and swap (bd-ffjj).
 //!
 //! Mount capacity is a limit, not reserved physical memory. Count occupied
 //! filesystems once, including runtime mounts, without adding deletion roots.
 //! The VmSwap comparison is a risk heuristic, not attribution of swapped pages.
+//! The daemon may use validated swap headroom to schedule bounded reclaim on
+//! existing tmpfs scan roots; the report itself never grants cleanup authority.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::platform::pal::{MemoryInfo, Platform};
 
@@ -167,6 +169,47 @@ pub fn assess(
 pub fn swap_nearly_full(memory: &MemoryInfo) -> bool {
     memory.swap_total_bytes > 0
         && u128::from(memory.swap_free_bytes) * 10 < u128::from(memory.swap_total_bytes)
+}
+
+/// Validated host swap pressure that can raise an occupied tmpfs mount's level.
+///
+/// These are backing-store observations, not filesystem free-space counters or
+/// proof that a particular file has swapped pages. Reclaim still requires an
+/// authorized root, a definite artifact and all ordinary mutation checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwapReclaimPressure {
+    /// Configured host swap capacity; always nonzero.
+    pub swap_total_bytes: u64,
+    /// Observed free swap, strictly below ten percent of capacity.
+    pub swap_free_bytes: u64,
+    /// Bytes needed to restore ten percent free swap. A mount's request caps
+    /// this further at its occupied bytes; this is a work bound, not a promise
+    /// that unlinking that many file bytes frees the same amount of swap.
+    pub target_bytes: u64,
+}
+
+/// A bounded relief target only when consistent host counters show low swap.
+///
+/// No configured swap, missing observations and malformed counters must never
+/// fabricate a reclaim emergency. Use integer arithmetic at the threshold and
+/// round the recovery floor up, including on very small swap devices.
+#[must_use]
+pub fn swap_reclaim_pressure(memory: &MemoryInfo) -> Option<SwapReclaimPressure> {
+    if memory.total_bytes == 0
+        || memory.available_bytes > memory.total_bytes
+        || memory.swap_free_bytes > memory.swap_total_bytes
+        || !swap_nearly_full(memory)
+    {
+        return None;
+    }
+    Some(SwapReclaimPressure {
+        swap_total_bytes: memory.swap_total_bytes,
+        swap_free_bytes: memory.swap_free_bytes,
+        target_bytes: memory
+            .swap_total_bytes
+            .div_ceil(10)
+            .saturating_sub(memory.swap_free_bytes),
+    })
 }
 
 /// How much headroom a RAM log destination needs.

@@ -921,9 +921,10 @@ pub fn is_warm_cache(path: &Path, category: ArtifactCategory) -> bool {
         || category == ArtifactCategory::GoCache
 }
 
-/// sbh's earlier deletions per warm-cache path, from `(path, category, deleted
-/// at)` records, counting those within [`CACHE_REDELETION_MEMORY`] of `now` (a
-/// record stamped after `now` counts too).
+/// Count sbh's recent deletions of each warm-cache path.
+///
+/// Read `(path, category, deleted at)` records within [`CACHE_REDELETION_MEMORY`]
+/// of `now`; a record stamped after `now` counts too.
 ///
 /// Other paths are ignored.
 #[must_use]

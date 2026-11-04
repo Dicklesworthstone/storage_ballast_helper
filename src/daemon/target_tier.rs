@@ -962,6 +962,7 @@ fn run_root(
         pressure_level: due.level,
         urgency: due.urgency,
         target_bytes: None,
+        ram_reclaim: None,
         // Resolved like the candidates' paths, so the executor's containment
         // check compares like with like.
         target_only_root: Some(root.clone()),

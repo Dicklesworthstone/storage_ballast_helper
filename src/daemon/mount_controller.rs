@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::monitor::burst::ReserveMethod;
 use crate::monitor::pid::PressureLevel;
+use crate::monitor::ram_scratch::SwapReclaimPressure;
 
 mod idle_wake;
 use idle_wake::IdleWake;
@@ -769,6 +770,10 @@ pub struct MountStateRecord {
     pub level: String,
     /// Urgency (0.0–1.0).
     pub urgency: f64,
+    /// Host swap evidence when backing pressure raised this RAM-backed
+    /// mount's level. The filesystem's real free percentage is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backing_pressure: Option<SwapReclaimPressure>,
     /// Seconds until an idle mount rescans on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rescan_in_secs: Option<u64>,
@@ -792,6 +797,7 @@ impl MountController {
             surface: self.surface.kind(),
             level: format!("{:?}", self.level).to_lowercase(),
             urgency: self.urgency,
+            backing_pressure: None,
             rescan_in_secs: self
                 .idle_until
                 .map(|until| until.saturating_duration_since(now).as_secs()),
@@ -1361,6 +1367,7 @@ mod tests {
                 surface: SurfaceKind::None,
                 level: level.to_string(),
                 urgency: 0.5,
+                backing_pressure: None,
                 rescan_in_secs: None,
                 reclaim_capability: capability,
                 reserve_state: reserve.map(|present_bytes| ReserveState {
