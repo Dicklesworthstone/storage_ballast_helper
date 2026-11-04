@@ -33,6 +33,18 @@ struct Observation {
     attribution_error: Option<String>,
 }
 
+/// Coverage actually published, including any activity-payload truncation.
+#[derive(Debug, PartialEq, Eq)]
+struct Coverage {
+    complete: bool,
+    issue_kinds: BTreeSet<&'static str>,
+}
+
+struct NoticeDetails {
+    text: String,
+    coverage: Coverage,
+}
+
 impl Observation {
     fn attribution_complete(&self) -> bool {
         self.attribution_mounts_omitted == 0
@@ -41,7 +53,7 @@ impl Observation {
     }
 
     fn complete(&self) -> bool {
-        self.host.complete && self.attribution_complete()
+        self.host.complete && self.host.assessment.is_some() && self.attribution_complete()
     }
 
     /// Distinct kinds of missing evidence, so a monitor need not parse text.
@@ -55,10 +67,17 @@ impl Observation {
         if !self.attribution_complete() {
             kinds.insert("attribution_incomplete");
         }
+        if self.host.assessment.is_none() {
+            kinds.insert("assessment_unavailable");
+        }
         kinds
     }
 
-    fn details(&self, state: &str) -> String {
+    fn details(&self, state: &str) -> NoticeDetails {
+        let mut coverage = Coverage {
+            complete: self.complete(),
+            issue_kinds: self.issue_kinds(),
+        };
         let summary = self.host.assessment.as_ref().map_or_else(
             || "RAM-scratch headroom is unavailable".to_string(),
             ram_scratch::ScratchAssessment::summary,
@@ -67,8 +86,8 @@ impl Observation {
             "schema": "sbh.ram_scratch.observation.v1",
             "read_only": true,
             "state": state,
-            "complete": self.complete(),
-            "issue_kinds": self.issue_kinds(),
+            "complete": coverage.complete,
+            "issue_kinds": coverage.issue_kinds,
             "summary": summary,
             "observation": self,
             "details_truncated": false,
@@ -76,23 +95,28 @@ impl Observation {
         if let Ok(text) = serde_json::to_string(&full)
             && text.len() <= MAX_DETAILS_BYTES
         {
-            return text;
+            return NoticeDetails { text, coverage };
         }
         // Even very long native mount/entry names must not turn a bounded
         // observation into an unbounded activity payload. Do not silently claim
         // this smaller projection contains every mount or attribution entry.
-        serde_json::json!({
+        coverage.complete = false;
+        coverage
+            .issue_kinds
+            .insert("activity_payload_budget_exhausted");
+        let text = serde_json::json!({
             "schema": "sbh.ram_scratch.observation.v1",
             "read_only": true,
-            "state": state,
+            "state": if state == "recovered" { "incomplete" } else { state },
             "complete": false,
-            "issue_kinds": self.issue_kinds(),
+            "issue_kinds": coverage.issue_kinds,
             "observed_at": self.observed_at,
             "summary": shorten(&summary, 8192),
             "details_truncated": true,
             "detail": "activity payload budget exceeded; use sbh check --ram-scratch for a fresh bounded report",
         })
-        .to_string()
+        .to_string();
+        NoticeDetails { text, coverage }
     }
 }
 
@@ -152,6 +176,9 @@ fn collect() -> io::Result<Observation> {
 #[derive(Default)]
 struct Notices {
     last_notice: Option<Instant>,
+    // Compare emitted coverage, not pressure alone. An incomplete sample or
+    // restored visibility must remain observable while pressure persists.
+    last_coverage: Option<Coverage>,
     // Keep the union through a pressure episode. A threshold flapping down and
     // back up must not mint a new warning every five-minute sample.
     seen_risks: BTreeSet<&'static str>,
@@ -164,11 +191,21 @@ impl Notices {
     }
 
     /// A notice without an observation; `kind` is `probe_failed` or `probe_stalled`.
-    fn incomplete(&mut self, now: Instant, kind: &str, detail: &str) -> Option<ActivityEvent> {
-        if !self.due(now) {
+    fn incomplete(
+        &mut self,
+        now: Instant,
+        kind: &'static str,
+        detail: &str,
+    ) -> Option<ActivityEvent> {
+        let coverage = Coverage {
+            complete: false,
+            issue_kinds: BTreeSet::from([kind]),
+        };
+        if self.last_coverage.as_ref() == Some(&coverage) && !self.due(now) {
             return None;
         }
         self.last_notice = Some(now);
+        self.last_coverage = Some(coverage);
         Some(ActivityEvent::Warning {
             code: "SBH-RAM-SCRATCH-INCOMPLETE".to_string(),
             message: serde_json::json!({
@@ -188,6 +225,20 @@ impl Notices {
         if !observation.host.supported {
             return None;
         }
+        let pressured = observation
+            .host
+            .assessment
+            .as_ref()
+            .is_some_and(ram_scratch::ScratchAssessment::warning);
+        let state = if pressured {
+            "warning"
+        } else if observation.complete() {
+            "recovered"
+        } else {
+            "incomplete"
+        };
+        let details = observation.details(state);
+        let coverage_changed = self.last_coverage.as_ref() != Some(&details.coverage);
         if let Some(assessment) = &observation.host.assessment
             && assessment.warning()
         {
@@ -195,30 +246,33 @@ impl Notices {
                 .reasons
                 .iter()
                 .any(|reason| !self.seen_risks.contains(reason));
-            if !new_risk && !self.due(now) {
+            if !new_risk && !coverage_changed && !self.due(now) {
                 return None;
             }
             self.seen_risks.extend(assessment.reasons.iter().copied());
             self.last_notice = Some(now);
+            self.last_coverage = Some(details.coverage);
             return Some(ActivityEvent::Warning {
                 code: "SBH-RAM-SCRATCH".to_string(),
-                message: observation.details("warning"),
+                message: details.text,
             });
         }
-        if !observation.complete() || observation.host.assessment.is_none() {
-            if !self.due(now) {
+        if !details.coverage.complete {
+            if !coverage_changed && !self.due(now) {
                 return None;
             }
             self.last_notice = Some(now);
+            self.last_coverage = Some(details.coverage);
             return Some(ActivityEvent::Warning {
                 code: "SBH-RAM-SCRATCH-INCOMPLETE".to_string(),
-                message: observation.details("incomplete"),
+                message: details.text,
             });
         }
         self.seen_risks.clear();
+        self.last_coverage = None;
         // Only a complete healthy sample can clear a warning/visibility issue.
         self.last_notice.take().map(|_| ActivityEvent::Info {
-            message: observation.details("recovered"),
+            message: details.text,
         })
     }
 }

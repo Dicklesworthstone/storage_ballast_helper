@@ -62,6 +62,16 @@ fn observation(pressured: bool, complete: bool) -> Observation {
     }
 }
 
+fn missing_evidence(pressured: bool, kind: &'static str) -> Observation {
+    let mut sample = observation(pressured, true);
+    sample.host.complete = false;
+    sample.host.exit_code = 4;
+    sample
+        .host
+        .push_issue(ScratchIssue::new(kind, format!("{kind} fixture")));
+    sample
+}
+
 fn warning(event: ActivityEvent) -> (String, serde_json::Value) {
     let ActivityEvent::Warning { code, message } = event else {
         panic!("expected warning");
@@ -126,22 +136,34 @@ fn recurring_risk_is_coalesced_and_missing_evidence_cannot_clear_it() {
             .finish(Ok(observation(true, true)), now + SAMPLE_INTERVAL)
             .is_none()
     );
-    assert!(
-        notices
-            .finish(Ok(observation(false, false)), now + SAMPLE_INTERVAL * 2)
-            .is_none()
-    );
+    let incomplete_at = now + SAMPLE_INTERVAL * 2;
     let (_, payload) = warning(
         notices
-            .finish(Ok(observation(false, false)), now + NOTICE_INTERVAL)
+            .finish(Ok(observation(false, false)), incomplete_at)
             .unwrap(),
     );
     assert_eq!(payload["state"], "incomplete");
+    assert_eq!(payload["complete"], false);
+    assert!(
+        notices
+            .finish(
+                Ok(observation(false, false)),
+                incomplete_at + SAMPLE_INTERVAL
+            )
+            .is_none()
+    );
+    let (_, repeated) = warning(
+        notices
+            .finish(
+                Ok(observation(false, false)),
+                incomplete_at + NOTICE_INTERVAL,
+            )
+            .unwrap(),
+    );
+    assert_eq!(repeated["state"], "incomplete");
+    let recovered_at = incomplete_at + NOTICE_INTERVAL + SAMPLE_INTERVAL;
     let recovered = notices
-        .finish(
-            Ok(observation(false, true)),
-            now + NOTICE_INTERVAL + SAMPLE_INTERVAL,
-        )
+        .finish(Ok(observation(false, true)), recovered_at)
         .unwrap();
     let ActivityEvent::Info { message } = recovered else {
         panic!("expected recovery");
@@ -152,12 +174,121 @@ fn recurring_risk_is_coalesced_and_missing_evidence_cannot_clear_it() {
     );
     assert!(
         notices
-            .finish(Ok(observation(false, true)), now + NOTICE_INTERVAL * 2)
+            .finish(Ok(observation(false, true)), recovered_at + SAMPLE_INTERVAL)
             .is_none()
     );
     assert!(
         notices
-            .finish(Ok(observation(true, true)), now + NOTICE_INTERVAL * 2)
+            .finish(Ok(observation(true, true)), recovered_at + SAMPLE_INTERVAL)
+            .is_some()
+    );
+}
+
+#[test]
+fn coverage_changes_are_visible_during_continuing_pressure() {
+    let now = Instant::now();
+    let mut notices = Notices::default();
+    assert!(notices.finish(Ok(observation(true, true)), now).is_some());
+    let (code, missing) = warning(
+        notices
+            .finish(
+                Ok(missing_evidence(true, "mount_covered")),
+                now + SAMPLE_INTERVAL,
+            )
+            .unwrap(),
+    );
+    assert_eq!(code, "SBH-RAM-SCRATCH");
+    assert_eq!(missing["state"], "warning");
+    assert_eq!(missing["complete"], false);
+    assert_eq!(missing["issue_kinds"], serde_json::json!(["mount_covered"]));
+    assert_eq!(missing["observation"]["host"]["exit_code"], 4);
+    assert!(
+        notices
+            .finish(
+                Ok(missing_evidence(true, "mount_covered")),
+                now + SAMPLE_INTERVAL * 2
+            )
+            .is_none()
+    );
+    let (_, changed_reason) = warning(
+        notices
+            .finish(
+                Ok(missing_evidence(true, "permission_denied")),
+                now + SAMPLE_INTERVAL * 3,
+            )
+            .unwrap(),
+    );
+    assert_eq!(changed_reason["complete"], false);
+    assert_eq!(
+        changed_reason["issue_kinds"],
+        serde_json::json!(["permission_denied"])
+    );
+    let visible_at = now + SAMPLE_INTERVAL * 4;
+    let (code, visible) = warning(
+        notices
+            .finish(Ok(observation(true, true)), visible_at)
+            .unwrap(),
+    );
+    assert_eq!(code, "SBH-RAM-SCRATCH");
+    assert_eq!(visible["state"], "warning");
+    assert_eq!(visible["complete"], true);
+    assert_eq!(visible["issue_kinds"], serde_json::json!([]));
+    assert!(
+        notices
+            .finish(Ok(observation(true, true)), visible_at + SAMPLE_INTERVAL)
+            .is_none()
+    );
+    assert!(
+        notices
+            .finish(Ok(observation(true, true)), visible_at + NOTICE_INTERVAL)
+            .is_some()
+    );
+}
+
+#[test]
+fn probe_failure_transitions_are_visible_without_repeating_unchanged_notices() {
+    let now = Instant::now();
+    let mut notices = Notices::default();
+    assert!(notices.finish(Ok(observation(true, true)), now).is_some());
+    let stalled_at = now + STALL_AFTER;
+    let (code, stalled) = warning(
+        notices
+            .incomplete(stalled_at, "probe_stalled", "still running")
+            .unwrap(),
+    );
+    assert_eq!(code, "SBH-RAM-SCRATCH-INCOMPLETE");
+    assert_eq!(stalled["issue_kinds"], serde_json::json!(["probe_stalled"]));
+    assert!(
+        notices
+            .incomplete(
+                stalled_at + Duration::from_secs(1),
+                "probe_stalled",
+                "still running"
+            )
+            .is_none()
+    );
+    let failed_at = stalled_at + Duration::from_secs(2);
+    let (_, failed) = warning(
+        notices
+            .finish(Err(io::Error::other("probe failed")), failed_at)
+            .unwrap(),
+    );
+    assert_eq!(failed["complete"], false);
+    assert_eq!(failed["issue_kinds"], serde_json::json!(["probe_failed"]));
+    assert!(
+        notices
+            .finish(
+                Err(io::Error::other("probe failed")),
+                failed_at + SAMPLE_INTERVAL
+            )
+            .is_none()
+    );
+    assert!(
+        notices
+            .finish(
+                Err(io::Error::other("probe failed")),
+                failed_at + NOTICE_INTERVAL
+            )
             .is_some()
     );
 }
@@ -235,14 +366,82 @@ fn incomplete_records_name_the_kind_and_mount_of_the_missing_evidence() {
 
 #[test]
 fn oversized_detail_is_explicitly_truncated_not_silently_claimed_complete() {
-    let mut sample = observation(true, true);
-    sample.host.assessment.as_mut().unwrap().mounts[0].path = "x".repeat(MAX_DETAILS_BYTES);
-    let details = sample.details("warning");
-    assert!(details.len() <= MAX_DETAILS_BYTES);
-    let value: serde_json::Value = serde_json::from_str(&details).unwrap();
-    assert_eq!(value["state"], "warning");
-    assert_eq!(value["complete"], false);
-    assert_eq!(value["details_truncated"], true);
+    for already_incomplete in [false, true] {
+        let mut sample = if already_incomplete {
+            missing_evidence(true, "mount_covered")
+        } else {
+            observation(true, true)
+        };
+        sample.host.assessment.as_mut().unwrap().mounts[0].path = "x".repeat(MAX_DETAILS_BYTES);
+        let details = sample.details("warning");
+        assert!(details.text.len() <= MAX_DETAILS_BYTES);
+        let value: serde_json::Value = serde_json::from_str(&details.text).unwrap();
+        assert_eq!(value["state"], "warning");
+        assert_eq!(value["complete"], false);
+        assert_eq!(value["details_truncated"], true);
+        let expected = if already_incomplete {
+            serde_json::json!(["activity_payload_budget_exhausted", "mount_covered"])
+        } else {
+            serde_json::json!(["activity_payload_budget_exhausted"])
+        };
+        assert_eq!(value["issue_kinds"], expected);
+    }
+}
+
+#[test]
+fn truncated_recovery_keeps_the_notice_until_complete_evidence_is_published() {
+    let now = Instant::now();
+    let mut notices = Notices::default();
+    assert!(notices.finish(Ok(observation(true, true)), now).is_some());
+    let oversized = || {
+        let mut sample = observation(false, true);
+        sample.host.assessment.as_mut().unwrap().mounts[0].path = "x".repeat(MAX_DETAILS_BYTES);
+        sample
+    };
+    let (code, partial) = warning(
+        notices
+            .finish(Ok(oversized()), now + SAMPLE_INTERVAL)
+            .unwrap(),
+    );
+    assert_eq!(code, "SBH-RAM-SCRATCH-INCOMPLETE");
+    assert_eq!(partial["state"], "incomplete");
+    assert_eq!(partial["complete"], false);
+    assert_eq!(
+        partial["issue_kinds"],
+        serde_json::json!(["activity_payload_budget_exhausted"])
+    );
+    assert!(
+        notices
+            .finish(Ok(oversized()), now + SAMPLE_INTERVAL * 2)
+            .is_none()
+    );
+    let recovered = notices
+        .finish(Ok(observation(false, true)), now + SAMPLE_INTERVAL * 3)
+        .unwrap();
+    let ActivityEvent::Info { message } = recovered else {
+        panic!("expected recovery only after a complete projection");
+    };
+    let value: serde_json::Value = serde_json::from_str(&message).unwrap();
+    assert_eq!(value["state"], "recovered");
+    assert_eq!(value["complete"], true);
+    assert_eq!(value["issue_kinds"], serde_json::json!([]));
+}
+
+#[test]
+fn an_absent_assessment_cannot_publish_complete_recovery() {
+    let mut sample = observation(false, true);
+    sample.host.assessment = None;
+    let (code, payload) = warning(
+        Notices::default()
+            .finish(Ok(sample), Instant::now())
+            .unwrap(),
+    );
+    assert_eq!(code, "SBH-RAM-SCRATCH-INCOMPLETE");
+    assert_eq!(payload["complete"], false);
+    assert_eq!(
+        payload["issue_kinds"],
+        serde_json::json!(["assessment_unavailable"])
+    );
 }
 
 fn armed(now: Instant) -> Observer {

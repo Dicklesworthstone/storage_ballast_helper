@@ -110,10 +110,21 @@ Large empty tmpfs limits do not by themselves generate a warning.
 
 ## Why evidence is missing
 
-Mounts come from `/proc/self/mountinfo`. A tmpfs is measured only through a path
-whose device is that tmpfs's own device, so another filesystem is never measured
-in its place. When lookup fails or reaches another device, the kernel mount IDs
-and parent links say why. A mount attached later at or above the mount point
+Mounts come from `/proc/self/mountinfo`. A visible tmpfs is opened with `O_PATH`
+and measured through that retained descriptor. Its kernel mount ID and device
+must match the listed mount, and `fstatfs` must identify the opened filesystem
+as tmpfs. Capacity never comes from a separate pathname lookup or cached
+filesystem-type label. Replacing a pathname between checks cannot substitute
+another filesystem's counters. Mount IDs come from descriptor-relative `statx`
+or bounded `/proc/self/fdinfo` when the kernel does not supply `STATX_MNT_ID`;
+unavailable identity keeps the observation incomplete. Successfully measured
+descriptors stay open until alias accounting finishes, preventing their device
+numbers from being recycled during that observation.
+A final pathname identity check detects a replacement that remains visible
+after sampling; it never supplies capacity counters.
+
+Kernel mount IDs and parent links also explain coverage. A mount attached at or
+above the mount point
 (for example, a bind mount over a parent directory, or a second tmpfs stacked
 on the same mount point) **covers** it. A covered tmpfs is still listed and
 still occupies memory, but its usage cannot be read by path. It is reported as
@@ -123,24 +134,34 @@ that was measured through another listed path (a bind or propagated copy):
 it is an alias, and it is listed with that filesystem's usage.
 
 Every entry of `issues` has a matching `issue_details` entry, in the same order,
-with a stable `kind`, the mount point `path`, the kernel `mount_id`, `os_error`
-(the errno of a failed lookup) and, for a cover, `covered_by` (its `mount_id`,
-`path` and `fs_type`):
+with a stable `kind`, the mount point `path`, the expected kernel `mount_id`,
+`observed_mount_id` when a descriptor supplied identity, `operation` (for example
+`open`, `identity`, `capacity`, `verify_path` or `topology`), and `os_error` when a syscall
+failed. A cover includes `covered_by` (its `mount_id`, `path` and `fs_type`).
+Coverage refers to the observed mount-table snapshot. Known-covered paths do
+not need to be opened, so these diagnostics do not invent an ENOENT errno.
+An overmount can itself be hidden by another overmount; the named cover is
+evidence of why the original mount is inaccessible, not a claim that it is the
+currently visible topmost mount.
 
 | `kind` | Meaning |
 |---|---|
 | `mount_covered` | Another listed mount hides this tmpfs from path lookup |
 | `mount_not_addressable` | Still listed and nothing listed covers it, yet its path does not resolve |
 | `mount_vanished` | Lookup failed and a fresh mount-table read no longer lists it |
-| `mount_replaced` | Its path reaches another device, or changed during inspection |
-| `permission_denied` | Lookup was denied (`EACCES`), e.g. by a sandbox |
+| `mount_replaced` | The opened mount ID/device differs from the record, the pathname changed during sampling, or the descriptor is not tmpfs |
+| `permission_denied` | Opening, identity verification, or capacity inspection was denied; errno and operation are retained |
 | `mount_inspection_failed` | Any other lookup or capacity-read failure |
-| `mount_counters_inconsistent` | Free bytes exceed the size limit |
+| `mount_counters_inconsistent` | Block counters are inconsistent or their byte conversion overflows |
 | `mount_topology_unresolved` | Its parent links loop in the mount table |
+| `mount_identity_unavailable` | Neither supported descriptor identity mechanism established the mount ID |
+| `mount_table_failed` | The mount table could not be read or parsed completely |
 | `ramfs_unmeasurable` | ramfs has no block accounting |
 | `mount_budget_exhausted` | The mount limit or deadline was reached |
+| `mount_table_budget_exhausted` | Mount-table input exceeded its byte budget |
 | `process_swap_failed`, `process_swap_incomplete` | Process VmSwap evidence is missing |
-| `collection_failed`, `target_not_observed` | `sbh check PATH` only: no report, or the checked mount is absent |
+| `collection_failed` | Host memory collection or assessment failed, or `sbh check PATH` could not obtain a report; no complete assessment is available |
+| `target_not_observed` | `sbh check PATH` only: the checked mount is absent from the report |
 | `attribution_incomplete` | On a warning: top-entry diagnostics are partial (see below) |
 
 None of these is treated as healthy. An operator decides whether a stable
@@ -212,27 +233,111 @@ observed entries per mount. Omitted or incomplete work is explicit. These limits
 are not a hard real-time guarantee and do not establish a filesystem snapshot.
 
 `SBH-RAM-SCRATCH` is one combined warning, not one event per mount or entry.
-Unchanged warnings repeat at most every 15 minutes; newly observed risk reasons
-can be reported at the next sample. Reasons remain remembered across threshold
-flapping until a complete healthy sample. `SBH-RAM-SCRATCH-INCOMPLETE` identifies
-missing evidence or a stalled/failed probe. Missing evidence cannot clear an
-existing warning. A complete healthy sample emits one recovery event, then
-healthy observations are silent.
+Unchanged warnings repeat at most every 15 minutes. New pressure reasons, changes
+to completeness, and changes to the set of missing-evidence kinds are reported
+at the next sample. Pressure reasons remain remembered across threshold flapping
+until a complete healthy sample. A pressure warning can also have
+`complete=false`: `state=warning` does not establish complete visibility.
+`SBH-RAM-SCRATCH-INCOMPLETE` identifies missing evidence without a pressure
+warning, or a stalled/failed probe. Missing evidence cannot clear an existing
+warning. A complete healthy sample whose activity payload is complete emits one
+recovery event, then healthy observations are silent.
 
 The versioned `sbh.ram_scratch.observation.v1` JSON object in activity `details`
 contains the assessment, collection timestamp, sampled entry ownership/age,
 coverage flags and scope limitations. Its `issue_kinds` lists the distinct
-`kind`s of missing evidence: those above and, for a notice with no
-observation, `probe_failed` or `probe_stalled`. The daemon's
-operational counters (`errors`, dropped logs) do not cover this observer: zero
-errors is not a complete RAM-scratch report. To monitor completeness, read the
-newest `SBH-RAM-SCRATCH-INCOMPLETE` warning and the `recovered` info record in
-the activity log (its timestamp gives the age; `issue_kinds` the reason), or run
-`sbh --json check --ram-scratch` on a schedule and alert on exit 4. Payloads exceeding 128 KiB use an explicitly
-truncated summary with `complete=false`. Generic deletion size/decision fields
-remain unset; no reclaimed bytes or cleanup authority are invented. Logging is
-best-effort; RAM-route refusal and its buffered-record tradeoff are described
-below.
+`kind`s of missing evidence: those above, `assessment_unavailable` when no host
+assessment exists, and `probe_failed` or `probe_stalled` for a notice without an
+observation. Payloads exceeding 128 KiB use a truncated summary with
+`complete=false` and `activity_payload_budget_exhausted`, retaining the original
+issue kinds. A truncated healthy sample remains incomplete and cannot publish
+a recovery. Generic deletion size/decision fields remain unset; no reclaimed
+bytes or cleanup authority are invented. Logging is best-effort; RAM-route
+refusal and its buffered-record tradeoff are described below.
+
+### Monitoring diagnostic completeness
+
+The daemon's operational counters (`errors`, dropped logs) do not cover this
+observer: zero errors is not a complete RAM-scratch report. Select **all**
+activity payloads with schema `sbh.ram_scratch.observation.v1` and inspect their
+`complete` field. Filtering only `SBH-RAM-SCRATCH-INCOMPLETE` misses incomplete
+pressure warnings and visibility restored while pressure continues. A later
+`state=warning, complete=true` restores diagnostic coverage while retaining the
+pressure warning; only `state=recovered, complete=true` establishes a complete
+healthy observation.
+
+These read-only queries show the latest emitted notice, in append order rather
+than wall-clock order. Substitute the configured active log paths. JSONL stores
+the payload as a JSON string in `details`:
+
+```sh
+jq -n '
+  def seconds_ago:
+    if . == null then null
+    else (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) as $at
+      | now - $at
+    end;
+  reduce inputs as $row (null;
+    (($row.details // "" | fromjson? | objects) // {}) as $d
+    | if $d.schema == "sbh.ram_scratch.observation.v1" then
+        ($d.observation.observed_at // $d.observed_at) as $observed_at
+        | {notice_at: $row.ts,
+           observed_at: $observed_at,
+           notice_age_seconds: ($row.ts | seconds_ago),
+           observation_age_seconds: ($observed_at | seconds_ago),
+           state: $d.state,
+           complete: $d.complete,
+           issue_kinds: $d.issue_kinds,
+           details_truncated: ($d.details_truncated // false)}
+      else . end)
+' /path/to/activity.jsonl
+```
+
+The SQLite equivalent guards non-JSON activity messages before extracting fields.
+Here `complete=0` means incomplete and `complete=1` means complete:
+
+```sh
+sqlite3 -readonly -header -column /path/to/activity.sqlite3 <<'SQL'
+WITH parsed AS (
+  SELECT id, timestamp,
+         CASE WHEN json_valid(details) THEN details ELSE '{}' END AS payload
+  FROM activity_log
+), latest AS (
+  SELECT timestamp, payload,
+         coalesce(json_extract(payload, '$.observation.observed_at'),
+                  json_extract(payload, '$.observed_at')) AS observed_at
+  FROM parsed
+  WHERE json_extract(payload, '$.schema') = 'sbh.ram_scratch.observation.v1'
+  ORDER BY id DESC
+  LIMIT 1
+)
+SELECT timestamp AS notice_at, observed_at,
+       unixepoch('now') - unixepoch(timestamp) AS notice_age_seconds,
+       unixepoch('now') - unixepoch(observed_at) AS observation_age_seconds,
+       json_extract(payload, '$.state') AS state,
+       json_extract(payload, '$.complete') AS complete,
+       json_extract(payload, '$.issue_kinds') AS issue_kinds,
+       json_extract(payload, '$.details_truncated') AS details_truncated
+FROM latest;
+SQL
+```
+
+`notice_age_seconds` is time since the log record was emitted. When present,
+`observation_age_seconds` is time since the reported probe began, not proof that
+the evidence remains current. Failed or stalled probes have no new observation
+timestamp. Unchanged warnings are coalesced and healthy samples are silent, so
+neither log query is a five-minute heartbeat. No matching record, an old record
+from an earlier daemon run, or missing logs must not be interpreted as healthy.
+Correlate notices with the daemon lifecycle and monitor log delivery separately.
+Clock changes can affect both ages; append order still selects the last notice.
+
+For a fresh report, run `sbh --json check --ram-scratch` on a schedule: exit 4
+means incomplete evidence, exit 2 means collection/output failure, and exit 1
+reports a pressure warning or invalid limits. Check `supported` as well as the
+exit status on other platforms. Run the check in the same mount/process
+namespaces and under the same access restrictions when investigating the
+daemon's visibility; a successful control in another namespace does not resolve
+the daemon's incomplete observation.
 
 ## RAM-backed log destination protection
 
