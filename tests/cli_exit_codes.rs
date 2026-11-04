@@ -233,3 +233,154 @@ fn user_errors_are_exit_one() {
     let output = sbh(&config, &["explain", "--id", "not-a-decision-id"]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
 }
+
+/// Status is a read-only view of recorded evidence. A missing database must
+/// be explicit without becoming an operational error or creating a log.
+#[test]
+fn status_ram_scratch_unavailable_is_explicit_and_does_not_create_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(dir.path());
+    let database = dir.path().join("data/activity.sqlite3");
+    let output = sbh(&config, &["--json", "status"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let json: serde_json::Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(json["ram_scratch"]["availability"], "unavailable");
+    assert!(json["ram_scratch"]["detail"].is_string());
+    assert!(!database.exists());
+    let human = sbh(&config, &["status"]);
+    assert_eq!(human.status.code(), Some(0), "{human:?}");
+    assert!(stdout(&human).contains("RAM scratch: UNKNOWN (activity evidence unavailable)"));
+    assert!(!database.exists());
+}
+
+fn append_ram_scratch_notice(database: &Path, timestamp: &str, details: &serde_json::Value) {
+    use storage_ballast_helper::logger::sqlite::{ActivityRow, SqliteLogger};
+
+    let db = SqliteLogger::open(database).unwrap();
+    db.log_activity(&ActivityRow {
+        timestamp: timestamp.to_string(),
+        event_type: "info".to_string(),
+        severity: "warning".to_string(),
+        path: None,
+        size_bytes: None,
+        score: None,
+        score_factors: None,
+        pressure_level: None,
+        free_pct: None,
+        duration_ms: None,
+        success: 1,
+        error_code: None,
+        error_message: None,
+        details: Some(serde_json::to_string_pretty(details).unwrap()),
+    })
+    .unwrap();
+}
+
+fn assert_ram_scratch_status(
+    config: &Path,
+    database: &Path,
+    payload: &serde_json::Value,
+    expected: &str,
+) {
+    let before = fs::read(database).unwrap();
+    let output = sbh(config, &["--json", "status"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let json: serde_json::Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    let notice = &json["ram_scratch"];
+    assert_eq!(notice["availability"], "recorded");
+    assert_eq!(notice["state"], payload["state"]);
+    assert_eq!(notice["complete"], false);
+    assert_eq!(notice["freshness"], "stale");
+    assert_eq!(notice["issue_kinds"], payload["issue_kinds"]);
+    assert!(notice["notice_age_seconds"].as_u64().unwrap() > 2100);
+    let human = sbh(config, &["status"]);
+    assert_eq!(human.status.code(), Some(0), "{human:?}");
+    let rendered = stdout(&human);
+    assert!(rendered.contains(expected), "{rendered}");
+    assert!(
+        rendered.contains("latest recorded notice; freshness stale"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(payload["issue_kinds"][0].as_str().unwrap()),
+        "{rendered}"
+    );
+    if payload["state"] == "warning" {
+        assert_eq!(notice["tmpfs_used_bytes"], 4096);
+        assert!(rendered.contains("tmpfs_exceeds_half_ram"), "{rendered}");
+    } else {
+        assert!(notice["tmpfs_used_bytes"].is_null());
+        assert!(rendered.contains("Observed tmpfs unknown"), "{rendered}");
+    }
+    assert_eq!(
+        fs::read(database).unwrap(),
+        before,
+        "status changed the database"
+    );
+}
+
+/// A later appended incomplete notice wins even if its clock moved backward
+/// and it is older than the freshness threshold. Human and JSON status retain
+/// incomplete evidence, including pressure warnings and failed probes.
+#[test]
+fn status_ram_scratch_retains_incomplete_notices_in_human_and_json_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(dir.path());
+    let database = dir.path().join("data/activity.sqlite3");
+    append_ram_scratch_notice(
+        &database,
+        "2001-01-01T00:00:00Z",
+        &serde_json::json!({
+            "schema": "sbh.ram_scratch.observation.v1",
+            "state": "recovered", "complete": true,
+            "observation": {"host": {"complete": true, "assessment": {
+                "tmpfs_used_bytes": 0,
+                "process_swap": {"bytes": 0, "complete": true},
+                "memory": {"swap_free_bytes": 0, "swap_total_bytes": 0}
+            }}}
+        }),
+    );
+
+    for (payload, expected) in [
+        (
+            serde_json::json!({
+                "schema": "sbh.ram_scratch.observation.v1",
+                "state": "incomplete", "complete": false,
+                "issue_kinds": ["mount_covered"],
+                "observation": {
+                    "observed_at": "2000-01-01T00:00:00Z",
+                    "host": {"complete": false, "assessment": null}
+                }
+            }),
+            "RAM scratch: INCOMPLETE",
+        ),
+        (
+            serde_json::json!({
+                "schema": "sbh.ram_scratch.observation.v1",
+                "state": "warning", "complete": false,
+                "issue_kinds": ["mount_covered"],
+                "observation": {
+                    "observed_at": "2000-01-01T00:00:00Z",
+                    "host": {"complete": false, "assessment": {
+                        "tmpfs_used_bytes": 4096,
+                        "process_swap": {"bytes": 0},
+                        "memory": {"swap_free_bytes": 0, "swap_total_bytes": 0},
+                        "reasons": ["tmpfs_exceeds_half_ram"]
+                    }}
+                }
+            }),
+            "RAM scratch: WARNING; INCOMPLETE",
+        ),
+        (
+            serde_json::json!({
+                "schema": "sbh.ram_scratch.observation.v1",
+                "state": "incomplete", "complete": false,
+                "issue_kinds": ["probe_stalled"], "detail": "probe is still running"
+            }),
+            "RAM scratch: INCOMPLETE",
+        ),
+    ] {
+        append_ram_scratch_notice(&database, "2000-01-01T00:00:01Z", &payload);
+        assert_ram_scratch_status(&config, &database, &payload, expected);
+    }
+}

@@ -41,7 +41,9 @@ use storage_ballast_helper::daemon::service::{
     launchd_system_plist_path_for_label, launchd_user_plist_path_for_label,
 };
 use storage_ballast_helper::logger::sqlite::SqliteLogger;
-use storage_ballast_helper::logger::stats::{RamScratchNotice, StatsEngine, window_label};
+use storage_ballast_helper::logger::stats::{
+    RamScratchFreshness, RamScratchNotice, StatsEngine, window_label,
+};
 use storage_ballast_helper::monitor::burst::BurstStats;
 use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
 use storage_ballast_helper::monitor::pid::{PressureLevel, classify_level};
@@ -10127,21 +10129,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     } else {
         None
     };
-    // bd-paeg: the daemon's RAM-scratch warning, which repeats every 15
-    // minutes while the risk lasts; one older than two repeats (plus a
-    // 5-minute sample) is stale.
-    let ram_scratch = if config.paths.sqlite_db.exists() {
-        SqliteLogger::open_read_only(&config.paths.sqlite_db)
-            .ok()
-            .and_then(|db| {
-                StatsEngine::new(&db)
-                    .ram_scratch_notice(std::time::Duration::from_mins(35))
-                    .ok()
-                    .flatten()
-            })
-    } else {
-        None
-    };
+    // Notice age is evidence about the log, not a live observer heartbeat.
+    // Keep old incomplete notices visible and distinguish missing evidence
+    // from an examined database with no recorded notice (GitHub #40).
+    let ram_scratch = read_ram_scratch_status(&config.paths.sqlite_db);
     let memory_info = platform.memory_info().ok();
     let memory_pressure = platform.memory_pressure().ok();
     let process_visibility =
@@ -10270,7 +10261,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     println!("  Swap: disabled");
                 }
             }
-            for line in ram_scratch.iter().flat_map(ram_scratch_status_lines) {
+            for line in ram_scratch_status_lines(&ram_scratch) {
                 println!("{line}");
             }
 
@@ -10713,7 +10704,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     })
                 }),
                 "memory_pressure": memory_pressure.as_ref().map(status_memory_pressure_json),
-                // The daemon's latest RAM-scratch notice (bd-paeg), or null.
+                // Latest recorded notice with explicit availability and age.
                 "ram_scratch": ram_scratch,
                 "process_attribution": {
                     "visibility": process_visibility.as_ref().map(process_attribution_visibility_json),
@@ -11260,31 +11251,126 @@ fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
     memory.available_bytes < MIN_AVAILABLE_RAM_BYTES
 }
 
-/// `sbh status` lines for the daemon's RAM-scratch notice (bd-paeg): only a
-/// warning prints, with the largest trees the observer attributed. The swap
-/// thrash hint above stays quiet on zram with free RAM, which is exactly
-/// when tmpfs scratch fills the swap.
-fn ram_scratch_status_lines(notice: &RamScratchNotice) -> Vec<String> {
-    if notice.state != "warning" {
-        return Vec::new();
+/// Recorded diagnostic evidence is separate from daemon liveness. Healthy
+/// samples are intentionally silent, so absence cannot establish completeness.
+#[derive(Debug, Serialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+enum RamScratchStatus {
+    Recorded {
+        #[serde(flatten)]
+        notice: Box<RamScratchNotice>,
+    },
+    NoNotice,
+    Unavailable {
+        detail: String,
+    },
+}
+
+fn read_ram_scratch_status(database: &Path) -> RamScratchStatus {
+    // Two 15-minute repeats plus one 5-minute sample make a notice stale.
+    // The query retains older notices instead of silently hiding them.
+    match SqliteLogger::open_read_only(database)
+        .and_then(|db| StatsEngine::new(&db).ram_scratch_notice(std::time::Duration::from_mins(35)))
+    {
+        Ok(Some(notice)) => RamScratchStatus::Recorded {
+            notice: Box::new(notice),
+        },
+        Ok(None) => RamScratchStatus::NoNotice,
+        Err(error) => RamScratchStatus::Unavailable {
+            detail: error.to_string(),
+        },
     }
-    let size = |bytes: Option<u64>| bytes.map_or_else(|| "?".to_string(), format_bytes);
-    let swap = match (notice.swap_free_bytes, notice.swap_total_bytes) {
-        (Some(free), Some(total)) if total > 0 => {
-            format!(
-                "{:.0}% used",
-                bytes_to_pct(total.saturating_sub(free), total)
-            )
+}
+
+/// Show incomplete and recovered notices as well as pressure warnings. Ages
+/// describe recorded evidence only; even a recent notice is not a live sample.
+fn ram_scratch_status_lines(status: &RamScratchStatus) -> Vec<String> {
+    const FRESH_CHECK: &str =
+        "    Report only; `sbh check --ram-scratch` collects a fresh read-only report.";
+    let mut lines = match status {
+        RamScratchStatus::Recorded { notice } => recorded_ram_scratch_status_lines(notice),
+        RamScratchStatus::NoNotice => {
+            vec!["  RAM scratch: UNKNOWN (no recorded diagnostic notice)".to_string()]
         }
-        _ => "?".to_string(),
+        RamScratchStatus::Unavailable { detail } => vec![format!(
+            "  RAM scratch: UNKNOWN (activity evidence unavailable): {}",
+            detail.escape_debug()
+        )],
     };
-    let mut lines = vec![format!(
-        "  RAM scratch: WARNING (logged {}): tmpfs holds {}, swap {swap}, processes hold {} of it [{}]",
-        notice.logged_at,
-        size(notice.tmpfs_used_bytes),
-        size(notice.process_swap_bytes),
-        notice.reasons.join(", ")
-    )];
+    lines.push(FRESH_CHECK.to_string());
+    lines
+}
+
+fn recorded_ram_scratch_status_lines(notice: &RamScratchNotice) -> Vec<String> {
+    let state = match notice.state.as_str() {
+        "warning" => "WARNING",
+        "incomplete" => "INCOMPLETE",
+        "recovered" => "RECOVERED",
+        _ => "UNKNOWN",
+    };
+    let completeness = match notice.complete {
+        Some(true) => "COMPLETE",
+        Some(false) => "INCOMPLETE",
+        None => "COMPLETENESS UNKNOWN",
+    };
+    let label = if state == completeness {
+        state.to_string()
+    } else {
+        format!("{state}; {completeness}")
+    };
+    let freshness = match notice.freshness {
+        RamScratchFreshness::Recent => "recent",
+        RamScratchFreshness::Stale => "stale",
+        RamScratchFreshness::Unknown => "unknown",
+    };
+    let age = |seconds: Option<u64>| {
+        seconds.map_or_else(|| "unknown".to_string(), |seconds| format!("{seconds}s"))
+    };
+    let size = |bytes: Option<u64>| bytes.map_or_else(|| "unknown".to_string(), format_bytes);
+    let swap = match (notice.swap_free_bytes, notice.swap_total_bytes) {
+        (Some(free), Some(total)) if total > 0 && free <= total => {
+            format!("{:.0}% used", bytes_to_pct(total - free, total))
+        }
+        (Some(0), Some(0)) => "disabled".to_string(),
+        _ => "unknown".to_string(),
+    };
+    let mut lines = vec![
+        format!("  RAM scratch: {label} (latest recorded notice; freshness {freshness})"),
+        format!(
+            "    Logged {} (notice age {}); observed {} (observation age {}).",
+            notice.logged_at.escape_debug(),
+            age(notice.notice_age_seconds),
+            notice
+                .observed_at
+                .as_deref()
+                .unwrap_or("unknown")
+                .escape_debug(),
+            age(notice.observation_age_seconds)
+        ),
+        format!(
+            "    Observed tmpfs {}, swap {swap}, process VmSwap {}.",
+            size(notice.tmpfs_used_bytes),
+            size(notice.process_swap_bytes)
+        ),
+    ];
+    if !notice.reasons.is_empty() {
+        lines.push(format!(
+            "    Pressure reasons: {}",
+            notice.reasons.join(", ").escape_debug()
+        ));
+    }
+    if !notice.issue_kinds.is_empty() {
+        lines.push(format!(
+            "    Missing evidence: {}",
+            notice.issue_kinds.join(", ").escape_debug()
+        ));
+    }
+    if let Some(detail) = &notice.detail {
+        lines.push(format!("    Detail: {}", detail.escape_debug()));
+    }
+    if notice.details_truncated {
+        lines.push("    Activity payload truncated; detailed evidence is incomplete.".to_string());
+    }
     for tree in &notice.largest {
         let idle = tree
             .idle_hours
@@ -11292,13 +11378,9 @@ fn ram_scratch_status_lines(notice: &RamScratchNotice) -> Vec<String> {
         lines.push(format!(
             "    {} {} ({idle})",
             format_bytes(tree.allocated_bytes),
-            tree.path
+            tree.path.escape_debug()
         ));
     }
-    lines.push(
-        "    Report only: sbh deletes nothing for it; `sbh check --ram-scratch` gives a fresh report."
-            .to_string(),
-    );
     lines
 }
 
@@ -21220,14 +21302,21 @@ mod tests {
         assert!(is_swap_thrash_risk(&thrashing));
     }
 
-    /// bd-paeg: a RAM-scratch warning prints with its numbers and the largest
-    /// trees; a recovered or incomplete notice prints nothing.
+    /// A pressure warning retains its missing-evidence reasons and both ages.
     #[test]
-    fn status_prints_the_daemons_ram_scratch_warning() {
+    fn status_prints_the_daemons_incomplete_ram_scratch_warning() {
         use storage_ballast_helper::logger::stats::RamScratchTree;
-        let mut notice = RamScratchNotice {
+        let notice = RamScratchNotice {
             logged_at: "2026-10-21T00:22:22.854Z".to_string(),
+            observed_at: Some("2026-10-21T00:22:20.854Z".to_string()),
+            notice_age_seconds: Some(10),
+            observation_age_seconds: Some(12),
+            freshness: RamScratchFreshness::Recent,
             state: "warning".to_string(),
+            complete: Some(false),
+            issue_kinds: vec!["mount_covered".to_string()],
+            details_truncated: false,
+            detail: None,
             tmpfs_used_bytes: Some(34_146_168_832),
             process_swap_bytes: Some(17_808_011_264),
             swap_free_bytes: Some(2_491_097_088),
@@ -21246,23 +21335,174 @@ mod tests {
                 },
             ],
         };
-        let lines = ram_scratch_status_lines(&notice);
-        assert_eq!(lines.len(), 4, "{lines:#?}");
-        assert!(lines[0].contains("RAM scratch: WARNING"), "{lines:#?}");
-        assert!(lines[0].contains("swap 96% used"), "{lines:#?}");
-        assert!(
-            lines[0].contains("low_swap_tmpfs_exceeds_process_swap"),
-            "{lines:#?}"
-        );
-        assert!(
-            lines[1].contains("/tmp/hfdt-artifacts") && lines[1].contains("idle 4 h"),
-            "{lines:#?}"
-        );
-        assert!(lines[2].contains("idle ?"), "{lines:#?}");
-        for state in ["recovered", "incomplete"] {
-            notice.state = state.to_string();
-            assert!(ram_scratch_status_lines(&notice).is_empty(), "{state}");
+        let status = RamScratchStatus::Recorded {
+            notice: Box::new(notice),
+        };
+        let rendered = ram_scratch_status_lines(&status).join("\n");
+        for expected in [
+            "RAM scratch: WARNING; INCOMPLETE",
+            "latest recorded notice; freshness recent",
+            "notice age 10s",
+            "observation age 12s",
+            "swap 96% used",
+            "process VmSwap",
+            "low_swap_tmpfs_exceeds_process_swap",
+            "Missing evidence: mount_covered",
+            "/tmp/hfdt-artifacts (idle 4 h)",
+            "/run/user/1000/qualification (idle ?)",
+            "sbh check --ram-scratch",
+        ] {
+            assert!(rendered.contains(expected), "{expected}: {rendered}");
         }
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json["availability"], "recorded");
+        assert_eq!(json["complete"], false);
+        assert_eq!(json["issue_kinds"], json!(["mount_covered"]));
+        assert_eq!(json["observation_age_seconds"], 12);
+    }
+
+    #[test]
+    fn status_keeps_stalled_and_truncated_ram_scratch_evidence_visible() {
+        for payload in [
+            json!({
+                "schema": "sbh.ram_scratch.observation.v1",
+                "state": "incomplete", "complete": false,
+                "issue_kinds": ["probe_stalled"],
+                "detail": "probe still running",
+            }),
+            json!({
+                "schema": "sbh.ram_scratch.observation.v1",
+                "state": "warning", "complete": false,
+                "issue_kinds": ["mount_covered", "activity_payload_budget_exhausted"],
+                "details_truncated": true,
+            }),
+        ] {
+            let notice =
+                RamScratchNotice::from_details("2026-11-04T00:00:00Z", &payload.to_string())
+                    .unwrap();
+            let status = RamScratchStatus::Recorded {
+                notice: Box::new(notice),
+            };
+            let rendered = ram_scratch_status_lines(&status).join("\n");
+            assert!(rendered.contains("INCOMPLETE"), "{rendered}");
+            assert!(rendered.contains("Observed tmpfs unknown"), "{rendered}");
+            assert!(rendered.contains("process VmSwap unknown"), "{rendered}");
+            assert!(rendered.contains("observation age unknown"), "{rendered}");
+            for kind in payload["issue_kinds"].as_array().unwrap() {
+                assert!(rendered.contains(kind.as_str().unwrap()), "{rendered}");
+            }
+            if payload["details_truncated"] == true {
+                assert!(
+                    rendered.contains("Activity payload truncated"),
+                    "{rendered}"
+                );
+            } else {
+                assert!(rendered.contains("probe still running"), "{rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn status_labels_old_ram_scratch_recovery_as_recorded_stale_evidence() {
+        let mut notice = RamScratchNotice::from_details(
+            "2026-11-03T00:00:00Z",
+            &json!({
+                "schema": "sbh.ram_scratch.observation.v1",
+                "state": "recovered", "complete": true,
+                "observation": {
+                    "observed_at": "2026-11-03T00:00:00Z",
+                    "host": {"complete": true, "assessment": {
+                        "tmpfs_used_bytes": 0,
+                        "process_swap": {"bytes": 0, "complete": true},
+                        "memory": {"swap_free_bytes": 0, "swap_total_bytes": 0}
+                    }}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        notice.refresh_freshness(
+            "2026-11-04T00:00:00Z".parse().unwrap(),
+            std::time::Duration::from_mins(35),
+        );
+        let status = RamScratchStatus::Recorded {
+            notice: Box::new(notice),
+        };
+        let rendered = ram_scratch_status_lines(&status).join("\n");
+        assert!(rendered.contains("RECOVERED; COMPLETE"), "{rendered}");
+        assert!(
+            rendered.contains("latest recorded notice; freshness stale"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("notice age 86400s"), "{rendered}");
+        assert!(
+            rendered.contains("collects a fresh read-only report"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn status_distinguishes_missing_ram_scratch_database_from_no_notice_read_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("activity.sqlite3");
+        let missing = read_ram_scratch_status(&path);
+        assert!(matches!(missing, RamScratchStatus::Unavailable { .. }));
+        assert!(
+            !path.exists(),
+            "read-only status must not create a database"
+        );
+        let rendered = ram_scratch_status_lines(&missing).join("\n");
+        assert!(rendered.contains("UNKNOWN (activity evidence unavailable)"));
+        assert_eq!(
+            serde_json::to_value(missing).unwrap()["availability"],
+            "unavailable"
+        );
+
+        drop(SqliteLogger::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+        let empty = read_ram_scratch_status(&path);
+        assert!(matches!(empty, RamScratchStatus::NoNotice));
+        assert!(
+            ram_scratch_status_lines(&empty)
+                .join("\n")
+                .contains("UNKNOWN (no recorded")
+        );
+        assert_eq!(
+            serde_json::to_value(empty).unwrap()["availability"],
+            "no_notice"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let corrupt = dir.path().join("corrupt.sqlite3");
+        std::fs::write(&corrupt, b"not a database").unwrap();
+        assert!(matches!(
+            read_ram_scratch_status(&corrupt),
+            RamScratchStatus::Unavailable { .. }
+        ));
+        assert_eq!(std::fs::read(&corrupt).unwrap(), b"not a database");
+    }
+
+    #[test]
+    fn status_keeps_legacy_ram_scratch_completeness_unknown_and_escapes_details() {
+        let notice = RamScratchNotice::from_details(
+            "2026-11-04T00:00:00Z",
+            &json!({
+                "schema": "sbh.ram_scratch.observation.v1",
+                "state": "warning",
+                "detail": "untrusted\n\u{1b}[2J",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let status = RamScratchStatus::Recorded {
+            notice: Box::new(notice),
+        };
+        let lines = ram_scratch_status_lines(&status);
+        assert!(lines[0].contains("COMPLETENESS UNKNOWN"));
+        assert!(lines.iter().all(|line| !line.contains(['\n', '\u{1b}'])));
+        let json = serde_json::to_value(status).unwrap();
+        assert!(json["complete"].is_null());
+        assert!(json["notice_age_seconds"].is_null());
     }
 
     #[test]

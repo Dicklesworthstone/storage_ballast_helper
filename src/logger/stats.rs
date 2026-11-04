@@ -10,9 +10,9 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 
-use crate::core::errors::Result;
+use crate::core::errors::{Result, SbhError};
 use crate::logger::sqlite::SqliteLogger;
 
 // ──────────────────── standard time windows ────────────────────
@@ -218,20 +218,47 @@ pub struct DeletionDetail {
 
 // ──────────────────── RAM-scratch notices ────────────────────
 
-/// The daemon's latest RAM-scratch observation, as its activity log holds it.
+const RAM_SCRATCH_NOTICE_SCHEMA: &str = "sbh.ram_scratch.observation.v1";
+const RAM_SCRATCH_NOTICE_MAX_ROWS: usize = 4096;
+const RAM_SCRATCH_NOTICE_MAX_DETAIL_BYTES: usize = 4 * 1024 * 1024;
+const RAM_SCRATCH_NOTICE_MAX_PAYLOAD_BYTES: usize = 128 * 1024;
+
+/// Whether the logged notice and any supplied observation time are recent.
+/// This describes age, independently of whether resource accounting is complete.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RamScratchFreshness {
+    Recent,
+    Stale,
+    Unknown,
+}
+
+/// The latest recorded RAM-scratch notice, including coverage and evidence age.
 ///
-/// The observer samples tmpfs occupancy against RAM, swap and the swap
-/// processes hold every 5 minutes and logs a warning (repeated every 15
-/// minutes while the risk lasts), an incomplete reading, or a recovery. Nothing
-/// read them back (bd-paeg): on ts2 (2026-10-20) swap sat at 97% with 34 GB in
-/// tmpfs and processes holding 17.8 GB of it, and the warning reached only the
-/// log.
+/// Unchanged warnings are coalesced and healthy observations are silent, so a
+/// logged notice is not a heartbeat or a fresh inspection of current headroom.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RamScratchNotice {
     /// When the daemon logged it (RFC 3339).
     pub logged_at: String,
     /// `warning`, `incomplete` or `recovered`.
     pub state: String,
+    /// Explicit coverage from the payload; older notices may not supply it.
+    pub complete: Option<bool>,
+    /// Distinct reasons that evidence is missing, without parsing prose.
+    pub issue_kinds: Vec<String>,
+    /// When the probe began; failed or stalled probes may have no timestamp.
+    pub observed_at: Option<String>,
+    /// Whether the observer omitted details to stay within its payload budget.
+    pub details_truncated: bool,
+    /// Explanation from a failed, stalled, or truncated observer notice.
+    pub detail: Option<String>,
+    /// Elapsed whole seconds since logging, unknown for invalid/future times.
+    pub notice_age_seconds: Option<u64>,
+    /// Elapsed whole seconds since probing, unknown when missing/invalid/future.
+    pub observation_age_seconds: Option<u64>,
+    /// Age of the available evidence, separate from diagnostic completeness.
+    pub freshness: RamScratchFreshness,
     /// Occupied tmpfs bytes, one sample per filesystem.
     pub tmpfs_used_bytes: Option<u64>,
     /// Swap the visible processes hold (their `VmSwap`).
@@ -257,13 +284,67 @@ impl RamScratchNotice {
     /// The notice in an observer activity payload; `None` for anything else.
     #[must_use]
     pub fn from_details(logged_at: &str, details: &str) -> Option<Self> {
+        let value = serde_json::from_str(details).ok()?;
+        Self::from_value(logged_at, &value)
+    }
+
+    fn from_value(logged_at: &str, value: &serde_json::Value) -> Option<Self> {
         use serde_json::Value;
-        let value: Value = serde_json::from_str(details).ok()?;
-        if value.get("schema")?.as_str()? != "sbh.ram_scratch.observation.v1" {
+        if value.get("schema")?.as_str()? != RAM_SCRATCH_NOTICE_SCHEMA {
             return None;
         }
         let state = value.get("state")?.as_str()?.to_string();
+        if !matches!(state.as_str(), "warning" | "incomplete" | "recovered") {
+            return None;
+        }
+        let mut complete = optional_notice_field::<bool>(value.get("complete")).ok()?;
+        let mut issue_kinds: Vec<String> = match value.get("issue_kinds") {
+            Some(Value::Array(kinds)) => kinds
+                .iter()
+                .map(|kind| kind.as_str().map(str::to_string))
+                .collect::<Option<_>>()?,
+            None | Some(Value::Null) => Vec::new(),
+            _ => return None,
+        };
+        issue_kinds.sort();
+        issue_kinds.dedup();
+        let details_truncated = optional_notice_field::<bool>(value.get("details_truncated"))
+            .ok()?
+            .unwrap_or(false);
+        let observed_at = optional_notice_field::<String>(
+            value
+                .pointer("/observation/observed_at")
+                .filter(|at| !at.is_null())
+                .or_else(|| value.get("observed_at")),
+        )
+        .ok()?;
+        let detail = optional_notice_field::<String>(value.get("detail")).ok()?;
         let assessment = value.pointer("/observation/host/assessment");
+        if assessment.is_some_and(|assessment| !assessment.is_object() && !assessment.is_null()) {
+            return None;
+        }
+        let host_complete =
+            optional_notice_field::<bool>(value.pointer("/observation/host/complete")).ok()?;
+        let process_complete = optional_notice_field::<bool>(
+            value.pointer("/observation/host/assessment/process_swap/complete"),
+        )
+        .ok()?;
+        if state == "incomplete"
+            || !issue_kinds.is_empty()
+            || details_truncated
+            || host_complete == Some(false)
+            || process_complete == Some(false)
+            || assessment.is_some_and(Value::is_null)
+        {
+            complete = Some(false);
+        }
+        if complete == Some(true)
+            && (host_complete != Some(true)
+                || process_complete != Some(true)
+                || !complete_ram_scratch_counters(assessment))
+        {
+            return None;
+        }
         let number = |pointer: &str| {
             assessment
                 .and_then(|a| a.pointer(pointer))
@@ -276,37 +357,108 @@ impl RamScratchNotice {
             .flatten()
             .filter_map(|reason| reason.as_str().map(str::to_string))
             .collect();
-        let mut largest: Vec<RamScratchTree> = value
-            .pointer("/observation/attribution")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|mount| mount.get("entries").and_then(Value::as_array))
-            .flatten()
-            .filter_map(|entry| {
-                Some(RamScratchTree {
-                    path: entry.get("path")?.as_str()?.to_string(),
-                    allocated_bytes: entry.get("observed_allocated_bytes")?.as_u64()?,
-                    idle_hours: entry.get("idle_hours").and_then(Value::as_u64),
-                })
-            })
-            .collect();
-        largest.sort_by(|a, b| {
-            b.allocated_bytes
-                .cmp(&a.allocated_bytes)
-                .then_with(|| a.path.cmp(&b.path))
-        });
-        largest.truncate(5);
         Some(Self {
             logged_at: logged_at.to_string(),
             state,
+            complete,
+            issue_kinds,
+            observed_at,
+            details_truncated,
+            detail,
+            notice_age_seconds: None,
+            observation_age_seconds: None,
+            freshness: RamScratchFreshness::Unknown,
             tmpfs_used_bytes: number("/tmpfs_used_bytes"),
             process_swap_bytes: number("/process_swap/bytes"),
             swap_free_bytes: number("/memory/swap_free_bytes"),
             swap_total_bytes: number("/memory/swap_total_bytes"),
             reasons,
-            largest,
+            largest: largest_ram_scratch_trees(value),
         })
+    }
+
+    /// Evaluate ages against one clock reading. An explicit invalid or future
+    /// timestamp cannot become recent evidence by rounding its age to zero.
+    pub fn refresh_freshness(&mut self, now: chrono::DateTime<chrono::Utc>, max_age: Duration) {
+        let notice_age = notice_timestamp_age(&self.logged_at, now);
+        let observation_age = self
+            .observed_at
+            .as_deref()
+            .and_then(|at| notice_timestamp_age(at, now));
+        self.notice_age_seconds = notice_age.map(|age| age.as_secs());
+        self.observation_age_seconds = observation_age.map(|age| age.as_secs());
+        self.freshness =
+            if notice_age.is_none() || (self.observed_at.is_some() && observation_age.is_none()) {
+                RamScratchFreshness::Unknown
+            } else if notice_age
+                .into_iter()
+                .chain(observation_age)
+                .any(|age| age > max_age)
+            {
+                RamScratchFreshness::Stale
+            } else {
+                RamScratchFreshness::Recent
+            };
+    }
+}
+
+fn complete_ram_scratch_counters(assessment: Option<&serde_json::Value>) -> bool {
+    let number = |pointer| {
+        assessment
+            .and_then(|assessment| assessment.pointer(pointer))
+            .and_then(serde_json::Value::as_u64)
+    };
+    match (
+        number("/tmpfs_used_bytes"),
+        number("/process_swap/bytes"),
+        number("/memory/swap_free_bytes"),
+        number("/memory/swap_total_bytes"),
+    ) {
+        (Some(_), Some(_), Some(free), Some(total)) => free <= total,
+        _ => false,
+    }
+}
+
+fn largest_ram_scratch_trees(value: &serde_json::Value) -> Vec<RamScratchTree> {
+    use serde_json::Value;
+    let mut largest: Vec<RamScratchTree> = value
+        .pointer("/observation/attribution")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|mount| mount.get("entries").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|entry| {
+            Some(RamScratchTree {
+                path: entry.get("path")?.as_str()?.to_string(),
+                allocated_bytes: entry.get("observed_allocated_bytes")?.as_u64()?,
+                idle_hours: entry.get("idle_hours").and_then(Value::as_u64),
+            })
+        })
+        .collect();
+    largest.sort_by(|a, b| {
+        b.allocated_bytes
+            .cmp(&a.allocated_bytes)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    largest.truncate(5);
+    largest
+}
+
+fn optional_notice_field<T: serde::de::DeserializeOwned>(
+    value: Option<&serde_json::Value>,
+) -> serde_json::Result<Option<T>> {
+    value.map_or(Ok(None), serde::Deserialize::deserialize)
+}
+
+fn notice_timestamp_age(at: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let at = chrono::DateTime::parse_from_rfc3339(at).ok()?;
+    now.signed_duration_since(at).to_std().ok()
+}
+
+fn ram_scratch_notice_error(details: &str) -> SbhError {
+    SbhError::Runtime {
+        details: format!("RAM-scratch notice query incomplete: {details}"),
     }
 }
 
@@ -331,23 +483,95 @@ impl<'a> StatsEngine<'a> {
             .collect()
     }
 
-    /// The RAM-scratch observer's latest notice logged within `window`.
-    pub fn ram_scratch_notice(&self, window: Duration) -> Result<Option<RamScratchNotice>> {
-        let since = since_timestamp(window);
+    /// The latest RAM-scratch notice in append order, including stale evidence.
+    /// `max_age` classifies freshness; it never filters away the latest notice.
+    /// A bounded query that cannot establish the latest notice returns an error.
+    pub fn ram_scratch_notice(&self, max_age: Duration) -> Result<Option<RamScratchNotice>> {
+        self.ram_scratch_notice_at(max_age, chrono::Utc::now())
+    }
+
+    fn ram_scratch_notice_at(
+        &self,
+        max_age: Duration,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<RamScratchNotice>> {
         let conn = self.db.connection();
-        let row = conn
-            .query_row(
-                "SELECT timestamp, details FROM activity_log
-                 WHERE event_type = 'info' AND timestamp >= ?1
-                   AND details LIKE '%\"schema\":\"sbh.ram_scratch.observation.v1\"%'
-                 ORDER BY id DESC LIMIT 1",
-                params![since],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
-            .optional()?;
-        Ok(row.and_then(|(logged_at, details)| {
-            RamScratchNotice::from_details(&logged_at, details.as_deref()?)
-        }))
+        // CAST to BLOB makes substr's bound bytes, not Unicode code points.
+        // One extra row distinguishes an exhausted search from an empty one;
+        // one extra byte distinguishes an oversized payload from a full one.
+        let mut statement = conn.prepare_cached(
+            "SELECT timestamp, substr(CAST(details AS BLOB), 1, ?1),
+                    coalesce(error_code IN ('SBH-RAM-SCRATCH', 'SBH-RAM-SCRATCH-INCOMPLETE'), 0)
+             FROM activity_log WHERE event_type = 'info'
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let mut rows = statement.query(params![
+            i64::try_from(RAM_SCRATCH_NOTICE_MAX_PAYLOAD_BYTES + 1)
+                .map_err(|_| ram_scratch_notice_error("invalid query byte budget"))?,
+            i64::try_from(RAM_SCRATCH_NOTICE_MAX_ROWS + 1)
+                .map_err(|_| ram_scratch_notice_error("invalid query row budget"))?,
+        ])?;
+        let mut examined = 0;
+        let mut detail_bytes = 0_usize;
+        while let Some(row) = rows.next()? {
+            if examined == RAM_SCRATCH_NOTICE_MAX_ROWS {
+                return Err(ram_scratch_notice_error(
+                    "info-row inspection budget exhausted",
+                ));
+            }
+            examined += 1;
+            let observer_code: bool = row.get(2)?;
+            let Some(details) = row.get::<_, Option<Vec<u8>>>(1)? else {
+                if observer_code {
+                    return Err(ram_scratch_notice_error("missing observer payload"));
+                }
+                continue;
+            };
+            if details.len() > RAM_SCRATCH_NOTICE_MAX_PAYLOAD_BYTES {
+                return Err(ram_scratch_notice_error(
+                    "activity payload byte budget exhausted",
+                ));
+            }
+            detail_bytes = detail_bytes.saturating_add(details.len());
+            if detail_bytes > RAM_SCRATCH_NOTICE_MAX_DETAIL_BYTES {
+                return Err(ram_scratch_notice_error(
+                    "total detail byte budget exhausted",
+                ));
+            }
+            let value: serde_json::Value = match serde_json::from_slice(&details) {
+                Ok(value) => value,
+                Err(error) => {
+                    if observer_code
+                        || details
+                            .windows(b"sbh.ram_scratch".len())
+                            .any(|part| part == b"sbh.ram_scratch")
+                    {
+                        return Err(ram_scratch_notice_error(&format!(
+                            "malformed observer payload: {error}"
+                        )));
+                    }
+                    continue;
+                }
+            };
+            let schema = value.get("schema").and_then(serde_json::Value::as_str);
+            if schema != Some(RAM_SCRATCH_NOTICE_SCHEMA) {
+                if observer_code
+                    || schema
+                        .is_some_and(|schema| schema.starts_with("sbh.ram_scratch.observation."))
+                {
+                    return Err(ram_scratch_notice_error(
+                        "missing or unsupported observer payload schema",
+                    ));
+                }
+                continue;
+            }
+            let logged_at: String = row.get(0)?;
+            let mut notice = RamScratchNotice::from_value(&logged_at, &value)
+                .ok_or_else(|| ram_scratch_notice_error("malformed observer payload fields"))?;
+            notice.refresh_freshness(now, max_age);
+            return Ok(Some(notice));
+        }
+        Ok(None)
     }
 
     /// Get stats for a specific time window.
@@ -1029,9 +1253,8 @@ mod tests {
         }
     }
 
-    /// bd-paeg: the RAM-scratch observer's latest notice in the window comes
-    /// back parsed, its largest trees first; a notice older than the window
-    /// and another event's info row do not.
+    /// bd-paeg: return the latest notice with its largest trees, preserving an
+    /// old notice as stale instead of confusing age with absent evidence.
     #[test]
     fn ram_scratch_notice_reads_the_observers_latest_notice() {
         let (_dir, db) = temp_db();
@@ -1087,10 +1310,17 @@ mod tests {
         };
         let window = Duration::from_mins(35);
         let engine = StatsEngine::new(&db);
+        assert_eq!(engine.ram_scratch_notice(window).unwrap(), None);
 
         db.log_activity(&row(50, Some("SBH-RAM-SCRATCH"), payload("warning", 1)))
             .unwrap();
-        assert_eq!(engine.ram_scratch_notice(window).unwrap(), None);
+        let stale = engine.ram_scratch_notice(window).unwrap().unwrap();
+        assert_eq!(stale.state, "warning");
+        assert_eq!(stale.freshness, RamScratchFreshness::Stale);
+        assert_eq!(
+            stale.complete, None,
+            "legacy payload does not prove coverage"
+        );
 
         db.log_activity(&row(10, Some("SBH-RAM-SCRATCH"), payload("warning", 7)))
             .unwrap();
@@ -1101,6 +1331,7 @@ mod tests {
             .unwrap()
             .expect("the warning 10 minutes ago");
         assert_eq!(notice.state, "warning");
+        assert_eq!(notice.freshness, RamScratchFreshness::Recent);
         assert_eq!(notice.tmpfs_used_bytes, Some(34_146_168_832));
         assert_eq!(notice.process_swap_bytes, Some(17_808_011_264));
         assert_eq!(notice.swap_free_bytes, Some(2_491_097_088));
@@ -1115,6 +1346,436 @@ mod tests {
         assert_eq!(latest.state, "recovered");
         assert!(latest.largest.is_empty());
         assert_eq!(RamScratchNotice::from_details("t", "not json"), None);
+    }
+
+    fn ram_scratch_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-11-04T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn ram_scratch_payload(state: &str) -> serde_json::Value {
+        let reasons = if state == "warning" {
+            vec!["tmpfs_exceeds_half_ram"]
+        } else {
+            Vec::new()
+        };
+        serde_json::json!({
+            "schema": RAM_SCRATCH_NOTICE_SCHEMA,
+            "state": state,
+            "complete": state != "incomplete",
+            "issue_kinds": [],
+            "details_truncated": false,
+            "observation": {
+                "observed_at": "2026-11-04T11:59:00Z",
+                "host": {
+                    "complete": state != "incomplete",
+                    "assessment": {
+                        "tmpfs_used_bytes": if state == "warning" { 600 } else { 40 },
+                        "process_swap": {"bytes": 20, "complete": true},
+                        "memory": {"swap_free_bytes": 900, "swap_total_bytes": 1000},
+                        "reasons": reasons,
+                    },
+                },
+                "attribution": [],
+            },
+        })
+    }
+
+    fn insert_notice_rows(db: &SqliteLogger, at: &str, details: &str, count: usize) {
+        let transaction = db.connection().unchecked_transaction().unwrap();
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO activity_log (timestamp, event_type, severity, success, details)
+                     VALUES (?1, 'info', 'info', 1, ?2)",
+                )
+                .unwrap();
+            for _ in 0..count {
+                statement.execute(params![at, details]).unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn ram_scratch_notice_retains_incomplete_pressure_evidence() {
+        let mut payload = ram_scratch_payload("warning");
+        payload["issue_kinds"] =
+            serde_json::json!(["permission_denied", "mount_covered", "mount_covered"]);
+        let notice =
+            RamScratchNotice::from_details("2026-11-04T11:59:30Z", &payload.to_string()).unwrap();
+        assert_eq!(notice.state, "warning");
+        assert_eq!(notice.complete, Some(false));
+        assert_eq!(notice.issue_kinds, ["mount_covered", "permission_denied"]);
+        assert_eq!(notice.tmpfs_used_bytes, Some(600));
+        assert_eq!(notice.process_swap_bytes, Some(20));
+        assert_eq!(notice.reasons, ["tmpfs_exceeds_half_ram"]);
+        assert_eq!(notice.observed_at.as_deref(), Some("2026-11-04T11:59:00Z"));
+        assert!(!notice.details_truncated);
+        let json = serde_json::to_value(notice).unwrap();
+        assert_eq!(json["complete"], false);
+        assert_eq!(json["freshness"], "unknown");
+        assert!(json["notice_age_seconds"].is_null());
+    }
+
+    #[test]
+    fn ram_scratch_notice_preserves_stalls_truncation_and_missing_assessments() {
+        for (kind, truncated) in [
+            ("probe_stalled", false),
+            ("activity_payload_budget_exhausted", true),
+        ] {
+            let payload = serde_json::json!({
+                "schema": RAM_SCRATCH_NOTICE_SCHEMA,
+                "state": if truncated { "warning" } else { "incomplete" },
+                "complete": false,
+                "issue_kinds": [kind],
+                "details_truncated": truncated,
+                "observed_at": if truncated { Some("2026-11-04T11:58:00Z") } else { None },
+                "detail": "fresh accounting is unavailable; run sbh check --ram-scratch",
+            });
+            let mut notice =
+                RamScratchNotice::from_details("2026-11-04T11:59:30Z", &payload.to_string())
+                    .unwrap();
+            notice.refresh_freshness(ram_scratch_now(), Duration::from_mins(35));
+            assert_eq!(notice.complete, Some(false));
+            assert_eq!(notice.issue_kinds, [kind]);
+            assert_eq!(notice.details_truncated, truncated);
+            assert_eq!(notice.tmpfs_used_bytes, None);
+            assert_eq!(notice.process_swap_bytes, None);
+            assert!(
+                notice
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("fresh accounting")
+            );
+            assert_eq!(notice.notice_age_seconds, Some(30));
+            assert_eq!(notice.observation_age_seconds, truncated.then_some(120));
+            assert_eq!(notice.freshness, RamScratchFreshness::Recent);
+        }
+        let mut payload = ram_scratch_payload("recovered");
+        payload["observation"]["host"]["assessment"] = serde_json::Value::Null;
+        let notice = RamScratchNotice::from_details("t", &payload.to_string()).unwrap();
+        assert_eq!(
+            notice.complete,
+            Some(false),
+            "absent assessment cannot prove recovery"
+        );
+        assert_eq!(notice.tmpfs_used_bytes, None);
+        assert_eq!(notice.swap_total_bytes, None);
+    }
+
+    #[test]
+    fn ram_scratch_notice_does_not_invent_legacy_completeness() {
+        let mut payload = ram_scratch_payload("warning");
+        payload.as_object_mut().unwrap().remove("complete");
+        let notice = RamScratchNotice::from_details("t", &payload.to_string()).unwrap();
+        assert_eq!(notice.complete, None);
+        assert!(notice.issue_kinds.is_empty());
+        let json = serde_json::to_value(notice).unwrap();
+        assert!(json["complete"].is_null());
+
+        payload["observation"]["host"]["complete"] = serde_json::json!(false);
+        let notice = RamScratchNotice::from_details("t", &payload.to_string()).unwrap();
+        assert_eq!(
+            notice.complete,
+            Some(false),
+            "explicit incomplete host evidence is retained"
+        );
+    }
+
+    #[test]
+    fn ram_scratch_notice_freshness_rejects_invalid_and_future_times() {
+        let now = ram_scratch_now();
+        let maximum = Duration::from_mins(35);
+        for bad_time in ["invalid", "2026-11-04T12:00:00.001Z"] {
+            let mut notice = RamScratchNotice::from_details(
+                bad_time,
+                &ram_scratch_payload("recovered").to_string(),
+            )
+            .unwrap();
+            notice.refresh_freshness(now, maximum);
+            assert_eq!(notice.notice_age_seconds, None, "{bad_time}");
+            assert_eq!(notice.observation_age_seconds, Some(60));
+            assert_eq!(notice.freshness, RamScratchFreshness::Unknown);
+
+            let mut payload = ram_scratch_payload("recovered");
+            payload["observation"]["observed_at"] = serde_json::json!(bad_time);
+            let mut notice =
+                RamScratchNotice::from_details("2026-11-04T11:59:30Z", &payload.to_string())
+                    .unwrap();
+            notice.refresh_freshness(now, maximum);
+            assert_eq!(notice.notice_age_seconds, Some(30));
+            assert_eq!(notice.observation_age_seconds, None, "{bad_time}");
+            assert_eq!(notice.freshness, RamScratchFreshness::Unknown);
+        }
+        let mut payload = ram_scratch_payload("recovered");
+        payload["observation"]["observed_at"] = serde_json::json!("2026-11-04T11:25:00Z");
+        let mut notice =
+            RamScratchNotice::from_details("2026-11-04T11:59:30Z", &payload.to_string()).unwrap();
+        notice.refresh_freshness(now, maximum);
+        assert_eq!(notice.freshness, RamScratchFreshness::Recent);
+        assert_eq!(notice.observation_age_seconds, Some(2100));
+        notice.observed_at = Some("2026-11-04T11:24:59.999Z".into());
+        notice.refresh_freshness(now, maximum);
+        assert_eq!(notice.freshness, RamScratchFreshness::Stale);
+        assert_eq!(notice.observation_age_seconds, Some(2100));
+    }
+
+    #[test]
+    fn ram_scratch_notice_keeps_latest_append_after_clock_rollback_and_json_whitespace() {
+        let (_dir, db) = temp_db();
+        insert_notice_rows(
+            &db,
+            "2026-11-04T11:59:30Z",
+            &ram_scratch_payload("recovered").to_string(),
+            1,
+        );
+        let mut payload = ram_scratch_payload("incomplete");
+        payload["issue_kinds"] = serde_json::json!(["mount_covered"]);
+        payload["observation"]["observed_at"] = serde_json::json!("2026-11-04T10:59:00Z");
+        insert_notice_rows(
+            &db,
+            "2026-11-04T11:00:00Z",
+            &serde_json::to_string_pretty(&payload).unwrap(),
+            1,
+        );
+        insert_notice_rows(&db, "2026-11-04T12:00:00Z", "ordinary unrelated info", 1);
+        let notice = StatsEngine::new(&db)
+            .ram_scratch_notice_at(Duration::from_mins(35), ram_scratch_now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(notice.state, "incomplete");
+        assert_eq!(notice.complete, Some(false));
+        assert_eq!(notice.issue_kinds, ["mount_covered"]);
+        assert_eq!(notice.logged_at, "2026-11-04T11:00:00Z");
+        assert_eq!(notice.notice_age_seconds, Some(3600));
+        assert_eq!(notice.observation_age_seconds, Some(3660));
+        assert_eq!(notice.freshness, RamScratchFreshness::Stale);
+    }
+
+    #[test]
+    fn ram_scratch_notice_malformed_newest_payload_blocks_older_complete_evidence() {
+        for malformed in [
+            r#"{"schema" : "sbh.ram_scratch.observation.v1", "state":"incomplete""#,
+            r#"{"schema":"sbh.ram_scratch.observation.v1","state":"warning","complete":"true"}"#,
+            r#"{"schema":"sbh.ram_scratch.observation.v1","state":"invalid"}"#,
+            r#"{"schema":"sbh.ram_scratch.observation.v2","state":"recovered"}"#,
+        ] {
+            let (_dir, db) = temp_db();
+            insert_notice_rows(
+                &db,
+                "2026-11-04T11:59:30Z",
+                &ram_scratch_payload("recovered").to_string(),
+                1,
+            );
+            insert_notice_rows(&db, "2026-11-04T11:59:45Z", malformed, 1);
+            let error = StatsEngine::new(&db)
+                .ram_scratch_notice_at(Duration::from_mins(35), ram_scratch_now())
+                .unwrap_err();
+            assert!(error.to_string().contains("observer payload"), "{error}");
+        }
+    }
+
+    #[test]
+    fn ram_scratch_notice_coded_corruption_cannot_expose_an_older_recovery() {
+        for code in ["SBH-RAM-SCRATCH", "SBH-RAM-SCRATCH-INCOMPLETE"] {
+            for details in [
+                None,
+                Some("not json"),
+                Some(r#"{"complete":false}"#),
+                Some(r#"{"schema":"other","complete":false}"#),
+            ] {
+                let (_dir, db) = temp_db();
+                insert_notice_rows(
+                    &db,
+                    "2026-11-04T11:59:00Z",
+                    &ram_scratch_payload("recovered").to_string(),
+                    1,
+                );
+                db.connection()
+                    .execute(
+                        "INSERT INTO activity_log
+                         (timestamp, event_type, severity, success, error_code, details)
+                         VALUES ('2026-11-04T11:59:30Z', 'info', 'warning', 1, ?1, ?2)",
+                        params![code, details],
+                    )
+                    .unwrap();
+                let error = StatsEngine::new(&db)
+                    .ram_scratch_notice_at(Duration::from_mins(35), ram_scratch_now())
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("observer payload"),
+                    "{code}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ram_scratch_notice_complete_claim_requires_usable_assessment_evidence() {
+        for defect in [
+            "empty_assessment",
+            "host_complete_string",
+            "process_complete_string",
+            "missing_process_complete",
+            "missing_counter",
+            "inconsistent_swap",
+        ] {
+            let mut payload = ram_scratch_payload("recovered");
+            match defect {
+                "empty_assessment" => {
+                    payload["observation"]["host"]["assessment"] = serde_json::json!({});
+                }
+                "host_complete_string" => {
+                    payload["observation"]["host"]["complete"] = serde_json::json!("false");
+                }
+                "process_complete_string" => {
+                    payload["observation"]["host"]["assessment"]["process_swap"]["complete"] =
+                        serde_json::json!("false");
+                }
+                "missing_process_complete" => {
+                    payload["observation"]["host"]["assessment"]["process_swap"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("complete");
+                }
+                "missing_counter" => {
+                    payload["observation"]["host"]["assessment"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("tmpfs_used_bytes");
+                }
+                "inconsistent_swap" => {
+                    payload["observation"]["host"]["assessment"]["memory"]["swap_free_bytes"] =
+                        serde_json::json!(1001);
+                }
+                _ => unreachable!(),
+            }
+            let (_dir, db) = temp_db();
+            insert_notice_rows(
+                &db,
+                "2026-11-04T11:59:00Z",
+                &ram_scratch_payload("recovered").to_string(),
+                1,
+            );
+            insert_notice_rows(&db, "2026-11-04T11:59:30Z", &payload.to_string(), 1);
+            let error = StatsEngine::new(&db)
+                .ram_scratch_notice_at(Duration::from_mins(35), ram_scratch_now())
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("malformed observer payload fields"),
+                "{defect}: {error}"
+            );
+        }
+        let mut payload = ram_scratch_payload("recovered");
+        payload["observation"]["host"]["assessment"]["process_swap"]["complete"] =
+            serde_json::json!(false);
+        let notice = RamScratchNotice::from_details("t", &payload.to_string()).unwrap();
+        assert_eq!(
+            notice.complete,
+            Some(false),
+            "partial process coverage cannot claim recovery"
+        );
+    }
+
+    #[test]
+    fn ram_scratch_notice_row_budget_does_not_publish_an_older_healthy_notice() {
+        let (_dir, db) = temp_db();
+        insert_notice_rows(
+            &db,
+            "2026-11-04T11:59:00Z",
+            &ram_scratch_payload("recovered").to_string(),
+            1,
+        );
+        insert_notice_rows(
+            &db,
+            "2026-11-04T11:59:30Z",
+            "{}",
+            RAM_SCRATCH_NOTICE_MAX_ROWS - 1,
+        );
+        let engine = StatsEngine::new(&db);
+        let notice = engine
+            .ram_scratch_notice_at(Duration::from_mins(35), ram_scratch_now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(notice.complete, Some(true));
+        insert_notice_rows(&db, "2026-11-04T11:59:45Z", "{}", 1);
+        let error = engine
+            .ram_scratch_notice_at(Duration::from_mins(35), ram_scratch_now())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("info-row inspection budget"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ram_scratch_notice_total_byte_budget_blocks_an_older_healthy_notice() {
+        let (_dir, db) = temp_db();
+        insert_notice_rows(
+            &db,
+            "2026-11-04T11:59:00Z",
+            &ram_scratch_payload("recovered").to_string(),
+            1,
+        );
+        let unrelated = serde_json::json!({
+            "padding": "x".repeat(RAM_SCRATCH_NOTICE_MAX_PAYLOAD_BYTES - 14),
+        })
+        .to_string();
+        assert_eq!(unrelated.len(), RAM_SCRATCH_NOTICE_MAX_PAYLOAD_BYTES);
+        let whole_rows = RAM_SCRATCH_NOTICE_MAX_DETAIL_BYTES / unrelated.len();
+        insert_notice_rows(&db, "2026-11-04T11:59:30Z", &unrelated, whole_rows - 1);
+        let engine = StatsEngine::new(&db);
+        assert!(
+            engine
+                .ram_scratch_notice_at(Duration::from_mins(35), ram_scratch_now())
+                .unwrap()
+                .is_some()
+        );
+        insert_notice_rows(&db, "2026-11-04T11:59:45Z", &unrelated, 1);
+        let error = engine
+            .ram_scratch_notice_at(Duration::from_mins(35), ram_scratch_now())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("total detail byte budget"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ram_scratch_notice_payload_budget_is_bytes_and_keeps_the_exact_boundary() {
+        let (_dir, db) = temp_db();
+        let mut payload = ram_scratch_payload("recovered");
+        payload["detail"] = serde_json::json!("");
+        let overhead = payload.to_string().len();
+        payload["detail"] =
+            serde_json::json!("x".repeat(RAM_SCRATCH_NOTICE_MAX_PAYLOAD_BYTES - overhead));
+        let exact = payload.to_string();
+        assert_eq!(exact.len(), RAM_SCRATCH_NOTICE_MAX_PAYLOAD_BYTES);
+        insert_notice_rows(&db, "2026-11-04T11:59:30Z", &exact, 1);
+        let engine = StatsEngine::new(&db);
+        assert!(
+            engine
+                .ram_scratch_notice_at(Duration::from_mins(35), ram_scratch_now())
+                .unwrap()
+                .is_some()
+        );
+        payload["detail"] = serde_json::json!("é".repeat(RAM_SCRATCH_NOTICE_MAX_PAYLOAD_BYTES / 2));
+        let oversized = payload.to_string();
+        assert!(oversized.chars().count() < RAM_SCRATCH_NOTICE_MAX_PAYLOAD_BYTES);
+        assert!(oversized.len() > RAM_SCRATCH_NOTICE_MAX_PAYLOAD_BYTES);
+        insert_notice_rows(&db, "2026-11-04T11:59:45Z", &oversized, 1);
+        let error = engine
+            .ram_scratch_notice_at(Duration::from_mins(35), ram_scratch_now())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("activity payload byte budget"),
+            "{error}"
+        );
     }
 
     fn scan_complete_row(timestamp: String, details: Option<String>) -> ActivityRow {

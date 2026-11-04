@@ -911,6 +911,7 @@ pub const CACHE_REDELETION_MEMORY: Duration = Duration::from_hours(RCH_POOLED_ID
 
 /// Whether a path's idle floor backs off per repeat deletion: an rch target
 /// dir, anything in a `.rch-go` dir, or a structurally identified Go cache.
+///
 /// `GoCache` is produced by the classifier only for a cache's on-disk layout;
 /// a cache-like name or the generic `CacheDir` category is not sufficient.
 #[must_use]
@@ -922,7 +923,9 @@ pub fn is_warm_cache(path: &Path, category: ArtifactCategory) -> bool {
 
 /// sbh's earlier deletions per warm-cache path, from `(path, category, deleted
 /// at)` records, counting those within [`CACHE_REDELETION_MEMORY`] of `now` (a
-/// record stamped after `now` counts too). Other paths are ignored.
+/// record stamped after `now` counts too).
+///
+/// Other paths are ignored.
 #[must_use]
 pub fn cache_redeletion_counts<P: AsRef<Path>>(
     deletions: impl IntoIterator<Item = (P, ArtifactCategory, std::time::SystemTime)>,

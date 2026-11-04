@@ -266,6 +266,36 @@ pressure warnings and visibility restored while pressure continues. A later
 pressure warning; only `state=recovered, complete=true` establishes a complete
 healthy observation.
 
+`sbh status` displays the latest recorded RAM-scratch notice, including
+incomplete observations without pressure, incomplete pressure warnings, and
+recoveries. It reads the configured SQLite activity database without writing
+to it. `sbh --json status` exposes the same evidence under `ram_scratch`:
+
+| Field | Meaning |
+| --- | --- |
+| `availability` | `recorded` when a notice was found, `no_notice` when the bounded query completed without one, or `unavailable` when the database or query could not be read reliably |
+| `state`, `complete`, `issue_kinds` | Recorded pressure state and diagnostic coverage; missing legacy completeness stays null, and explicit missing evidence forces false |
+| `logged_at`, `observed_at` | Notice time and, when available, probe start time |
+| `notice_age_seconds`, `observation_age_seconds` | Independent ages; absent, invalid, or future timestamps have null age |
+| `freshness` | `recent`, `stale`, or `unknown`; a valid notice or observation older than 35 minutes is stale, and an invalid/future timestamp makes freshness unknown |
+| `details_truncated`, `detail` | Payload truncation and an available probe-failure explanation |
+| `tmpfs_used_bytes`, `process_swap_bytes`, swap counters, `reasons`, `largest` | Available recorded quantities and pressure/attribution evidence; missing quantities stay null |
+
+An unresolved incomplete notice remains visible when it becomes stale. The
+newest appended notice wins even if the wall clock moved backward. Status
+examines at most 4096 recent info rows, 4 MiB of payloads, and 128 KiB per
+payload. Reaching a lookup budget, finding a malformed matching payload, or
+encountering an unsupported observer schema reports `availability=unavailable`
+with a reason; it does not select an older healthy notice. JSON whitespace does
+not affect schema recognition. Status retains its ordinary exit contract and
+does not alter daemon-health counters.
+
+These fields describe **the latest recorded notice**, not the latest sample or
+a live health check. Healthy samples are silent, notices can outlive a daemon
+run, and `no_notice` or `unavailable` does not establish completeness. A recent
+recovery describes the recorded observation only. Use `sbh check --ram-scratch`
+for a fresh inspection under the daemon's namespace and permissions.
+
 These read-only queries show the latest emitted notice, in append order rather
 than wall-clock order. Substitute the configured active log paths. JSONL stores
 the payload as a JSON string in `details`:
