@@ -6,6 +6,30 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+### Fixed
+
+- **A tmpfs hidden under another mount is unknown, not counted as the mount
+  above it.** `sbh check --ram-scratch` and the daemon's RAM-scratch observer
+  now read `/proc/self/mountinfo` and measure a tmpfs only through a path that
+  reaches its own device. A tmpfs stacked under a second tmpfs on the same
+  mount point used to be measured through the upper one and dropped as its
+  alias: its memory went uncounted in a report that said `complete=true`. It
+  is now reported as covered and the report is incomplete (exit 4).
+  ([#40](https://github.com/Dicklesworthstone/storage_ballast_helper/issues/40))
+
+### Added
+
+- **Missing RAM-scratch evidence says why.** Reports gain `issue_details`, one
+  per `issues` entry, with a stable `kind` (`mount_covered`,
+  `mount_not_addressable`, `mount_vanished`, `mount_replaced`,
+  `permission_denied`, and others), the kernel mount ID, the errno, and for a
+  covered mount the mount that covers it. A mount listed in the mount table
+  whose path ends under a later bind mount was a bare `No such file or
+  directory`; it is now `mount_covered` with the covering mount's ID, path and
+  type. Activity records carry `issue_kinds`. Completeness semantics are
+  unchanged: none of these is treated as healthy. See `docs/ram-scratch.md`.
+  ([#40](https://github.com/Dicklesworthstone/storage_ballast_helper/issues/40))
+
 ## v0.7.12 **[release]**
 
 Compare: [`v0.7.11...v0.7.12`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.11...v0.7.12)

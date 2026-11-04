@@ -394,8 +394,69 @@ pub struct ScratchReport {
     pub assessment: Option<ScratchAssessment>,
     /// Bounded diagnostics for missing evidence.
     pub issues: Vec<String>,
+    /// The same issues, in the same order, with a stable `kind` and the mount
+    /// they concern. Any entry keeps the report incomplete.
+    pub issue_details: Vec<ScratchIssue>,
     /// 0 healthy/unsupported, 1 warning, 4 incomplete inspection.
     pub exit_code: i32,
+}
+
+impl ScratchReport {
+    /// Record one more reason the inspection is incomplete.
+    pub fn push_issue(&mut self, issue: ScratchIssue) {
+        self.issues.push(issue.message.clone());
+        self.issue_details.push(issue);
+    }
+}
+
+/// Why one piece of RAM-scratch evidence is missing.
+///
+/// `kind` is one of `mount_covered`, `mount_not_addressable`, `mount_vanished`,
+/// `mount_replaced`, `permission_denied`, `mount_inspection_failed`,
+/// `mount_counters_inconsistent`, `mount_topology_unresolved`,
+/// `ramfs_unmeasurable`, `mount_budget_exhausted`, `process_swap_failed`,
+/// `process_swap_incomplete`, `collection_failed`, `target_not_observed` or
+/// `attribution_incomplete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScratchIssue {
+    /// Stable machine-readable reason.
+    pub kind: &'static str,
+    /// Mount point as the mount table lists it, when one mount is concerned.
+    pub path: Option<String>,
+    /// Kernel mount ID from `/proc/self/mountinfo`, when one mount is concerned.
+    pub mount_id: Option<u64>,
+    /// For `mount_covered`: the mount that path lookup reaches instead.
+    pub covered_by: Option<CoveringMount>,
+    /// `errno` of the failed system call, when there was one.
+    pub os_error: Option<i32>,
+    /// Human-readable text, identical to the matching `issues` entry.
+    pub message: String,
+}
+
+impl ScratchIssue {
+    /// An issue that concerns no particular mount.
+    #[must_use]
+    pub fn new(kind: &'static str, message: String) -> Self {
+        Self {
+            kind,
+            path: None,
+            mount_id: None,
+            covered_by: None,
+            os_error: None,
+            message,
+        }
+    }
+}
+
+/// A mount that hides a listed tmpfs from path lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CoveringMount {
+    /// Kernel mount ID from `/proc/self/mountinfo`.
+    pub mount_id: u64,
+    /// Where it is mounted: the listed tmpfs's mount point or a parent of it.
+    pub path: String,
+    /// Its filesystem type.
+    pub fs_type: String,
 }
 
 /// Collect visible Linux tmpfs mount usage, host memory, and process swap.
@@ -422,6 +483,7 @@ pub fn inspect(
             scope: "Linux tmpfs collector unavailable on this platform",
             assessment: None,
             issues: Vec::new(),
+            issue_details: Vec::new(),
             exit_code: 0,
         })
     }

@@ -108,6 +108,45 @@ uses RAM, and host counters do not establish a container's cgroup headroom.
 Unmeasurable ramfs occupancy or missing mount/process observations is explicit.
 Large empty tmpfs limits do not by themselves generate a warning.
 
+## Why evidence is missing
+
+Mounts come from `/proc/self/mountinfo`. A tmpfs is measured only through a path
+whose device is that tmpfs's own device, so another filesystem is never measured
+in its place. When lookup fails or reaches another device, the kernel mount IDs
+and parent links say why. A mount attached later at or above the mount point
+(for example, a bind mount over a parent directory, or a second tmpfs stacked
+on the same mount point) **covers** it. A covered tmpfs is still listed and
+still occupies memory, but its usage cannot be read by path. It is reported as
+unknown and keeps the report incomplete. Its usage is never taken as zero or
+borrowed from the cover. The one exception is a covered copy of a filesystem
+that was measured through another listed path (a bind or propagated copy):
+it is an alias, and it is listed with that filesystem's usage.
+
+Every entry of `issues` has a matching `issue_details` entry, in the same order,
+with a stable `kind`, the mount point `path`, the kernel `mount_id`, `os_error`
+(the errno of a failed lookup) and, for a cover, `covered_by` (its `mount_id`,
+`path` and `fs_type`):
+
+| `kind` | Meaning |
+|---|---|
+| `mount_covered` | Another listed mount hides this tmpfs from path lookup |
+| `mount_not_addressable` | Still listed and nothing listed covers it, yet its path does not resolve |
+| `mount_vanished` | Lookup failed and a fresh mount-table read no longer lists it |
+| `mount_replaced` | Its path reaches another device, or changed during inspection |
+| `permission_denied` | Lookup was denied (`EACCES`), e.g. by a sandbox |
+| `mount_inspection_failed` | Any other lookup or capacity-read failure |
+| `mount_counters_inconsistent` | Free bytes exceed the size limit |
+| `mount_topology_unresolved` | Its parent links loop in the mount table |
+| `ramfs_unmeasurable` | ramfs has no block accounting |
+| `mount_budget_exhausted` | The mount limit or deadline was reached |
+| `process_swap_failed`, `process_swap_incomplete` | Process VmSwap evidence is missing |
+| `collection_failed`, `target_not_observed` | `sbh check PATH` only: no report, or the checked mount is absent |
+| `attribution_incomplete` | On a warning: top-entry diagnostics are partial (see below) |
+
+None of these is treated as healthy. An operator decides whether a stable
+`mount_covered` or `permission_denied` entry is expected for the namespace sbh
+runs in; sbh does not suppress any of them.
+
 ## Top-entry diagnostics
 
 On a warning, the command samples top-level entries on occupied mounts using
@@ -182,7 +221,14 @@ healthy observations are silent.
 
 The versioned `sbh.ram_scratch.observation.v1` JSON object in activity `details`
 contains the assessment, collection timestamp, sampled entry ownership/age,
-coverage flags and scope limitations. Payloads exceeding 128 KiB use an explicitly
+coverage flags and scope limitations. Its `issue_kinds` lists the distinct
+`kind`s of missing evidence: those above and, for a notice with no
+observation, `probe_failed` or `probe_stalled`. The daemon's
+operational counters (`errors`, dropped logs) do not cover this observer: zero
+errors is not a complete RAM-scratch report. To monitor completeness, read the
+newest `SBH-RAM-SCRATCH-INCOMPLETE` warning and the `recovered` info record in
+the activity log (its timestamp gives the age; `issue_kinds` the reason), or run
+`sbh --json check --ram-scratch` on a schedule and alert on exit 4. Payloads exceeding 128 KiB use an explicitly
 truncated summary with `complete=false`. Generic deletion size/decision fields
 remain unset; no reclaimed bytes or cleanup authority are invented. Logging is
 best-effort; RAM-route refusal and its buffered-record tradeoff are described

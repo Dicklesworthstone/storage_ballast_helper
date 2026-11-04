@@ -283,15 +283,26 @@ fn preflight_with(
     if !fs_type.eq_ignore_ascii_case("tmpfs") && !fs_type.eq_ignore_ascii_case("ramfs") {
         return None;
     }
-    let mut report = collect().unwrap_or_else(|error| ScratchReport {
-        schema: "sbh.ram_scratch.v1",
-        read_only: true,
-        supported: true,
-        complete: false,
-        scope: "visible mount and process namespaces; host meminfo; not cgroup headroom or swap attribution",
-        assessment: None,
-        issues: vec![format!("RAM scratch collection failed: {error}")],
-        exit_code: 4,
+    let mut report = collect().unwrap_or_else(|error| {
+        let mut report = ScratchReport {
+            schema: "sbh.ram_scratch.v1",
+            read_only: true,
+            supported: true,
+            complete: false,
+            scope: "visible mount and process namespaces; host meminfo; not cgroup headroom or swap attribution",
+            assessment: None,
+            issues: Vec::new(),
+            issue_details: Vec::new(),
+            exit_code: 4,
+        };
+        report.push_issue(ram_scratch::ScratchIssue {
+            os_error: error.raw_os_error(),
+            ..ram_scratch::ScratchIssue::new(
+                "collection_failed",
+                format!("RAM scratch collection failed: {error}"),
+            )
+        });
+        report
     });
     // A disappearing/changed mount must not turn an empty inventory into a
     // healthy verdict for the path the caller actually asked about.
@@ -302,10 +313,16 @@ fn preflight_with(
             .any(|mount| Path::new(&mount.path) == mount_point)
     });
     if !target_observed {
-        report.issues.push(format!(
-            "checked RAM-backed mount {} was not observed in the host assessment",
-            mount_point.display()
-        ));
+        report.push_issue(ram_scratch::ScratchIssue {
+            path: Some(mount_point.to_string_lossy().into_owned()),
+            ..ram_scratch::ScratchIssue::new(
+                "target_not_observed",
+                format!(
+                    "checked RAM-backed mount {} was not observed in the host assessment",
+                    mount_point.display()
+                ),
+            )
+        });
     }
     report.complete &= report.supported && target_observed && report.issues.is_empty();
     report.exit_code = if report.complete {
@@ -595,7 +612,10 @@ fn execute(
     if attribution.iter().any(|report| !report.complete) {
         host.complete = false;
         host.exit_code = 4;
-        host.issues.push("top-entry attribution is incomplete; sampled sizes are not full totals and missing ages are unknown".into());
+        host.push_issue(ram_scratch::ScratchIssue::new(
+            "attribution_incomplete",
+            "top-entry attribution is incomplete; sampled sizes are not full totals and missing ages are unknown".into(),
+        ));
     }
     Ok(Report {
         host,
@@ -691,6 +711,7 @@ mod tests {
             exit_code: i32::from(assessment.warning()),
             assessment: Some(assessment),
             issues: Vec::new(),
+            issue_details: Vec::new(),
         }
     }
 
@@ -1204,6 +1225,7 @@ mod tests {
                 scope: "fixture",
                 assessment: Some(assessment),
                 issues: vec!["bounded attribution".into()],
+                issue_details: Vec::new(),
                 exit_code: 4,
             },
             attribution_requested: true,

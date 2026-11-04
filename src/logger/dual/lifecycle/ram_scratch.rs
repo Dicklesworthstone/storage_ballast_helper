@@ -34,11 +34,28 @@ struct Observation {
 }
 
 impl Observation {
-    fn complete(&self) -> bool {
-        self.host.complete
-            && self.attribution_mounts_omitted == 0
+    fn attribution_complete(&self) -> bool {
+        self.attribution_mounts_omitted == 0
             && self.attribution_error.is_none()
             && self.attribution.iter().all(|mount| mount.complete)
+    }
+
+    fn complete(&self) -> bool {
+        self.host.complete && self.attribution_complete()
+    }
+
+    /// Distinct kinds of missing evidence, so a monitor need not parse text.
+    fn issue_kinds(&self) -> BTreeSet<&'static str> {
+        let mut kinds: BTreeSet<_> = self
+            .host
+            .issue_details
+            .iter()
+            .map(|issue| issue.kind)
+            .collect();
+        if !self.attribution_complete() {
+            kinds.insert("attribution_incomplete");
+        }
+        kinds
     }
 
     fn details(&self, state: &str) -> String {
@@ -51,6 +68,7 @@ impl Observation {
             "read_only": true,
             "state": state,
             "complete": self.complete(),
+            "issue_kinds": self.issue_kinds(),
             "summary": summary,
             "observation": self,
             "details_truncated": false,
@@ -68,6 +86,7 @@ impl Observation {
             "read_only": true,
             "state": state,
             "complete": false,
+            "issue_kinds": self.issue_kinds(),
             "observed_at": self.observed_at,
             "summary": shorten(&summary, 8192),
             "details_truncated": true,
@@ -144,7 +163,8 @@ impl Notices {
             .is_none_or(|last| now.saturating_duration_since(last) >= NOTICE_INTERVAL)
     }
 
-    fn incomplete(&mut self, now: Instant, detail: &str) -> Option<ActivityEvent> {
+    /// A notice without an observation; `kind` is `probe_failed` or `probe_stalled`.
+    fn incomplete(&mut self, now: Instant, kind: &str, detail: &str) -> Option<ActivityEvent> {
         if !self.due(now) {
             return None;
         }
@@ -153,7 +173,7 @@ impl Notices {
             code: "SBH-RAM-SCRATCH-INCOMPLETE".to_string(),
             message: serde_json::json!({
                 "schema": "sbh.ram_scratch.observation.v1", "read_only": true,
-                "state": "incomplete", "complete": false,
+                "state": "incomplete", "complete": false, "issue_kinds": [kind],
                 "detail": shorten(detail, 1024),
             })
             .to_string(),
@@ -163,7 +183,7 @@ impl Notices {
     fn finish(&mut self, result: io::Result<Observation>, now: Instant) -> Option<ActivityEvent> {
         let observation = match result {
             Ok(observation) => observation,
-            Err(error) => return self.incomplete(now, &error.to_string()),
+            Err(error) => return self.incomplete(now, "probe_failed", &error.to_string()),
         };
         if !observation.host.supported {
             return None;
@@ -256,7 +276,7 @@ impl Observer {
         if let Some(job) = &self.job {
             if !job.worker.is_finished() {
                 return if now.saturating_duration_since(job.started) >= STALL_AFTER {
-                    self.notices.incomplete(now,
+                    self.notices.incomplete(now, "probe_stalled",
                         "RAM-scratch probe remains in flight; no replacement probe was started; cleanup and logging continue independently")
                 } else {
                     None
@@ -296,9 +316,11 @@ impl Observer {
                 });
                 None
             }
-            Err(error) => self
-                .notices
-                .incomplete(now, &format!("cannot start RAM-scratch probe: {error}")),
+            Err(error) => self.notices.incomplete(
+                now,
+                "probe_failed",
+                &format!("cannot start RAM-scratch probe: {error}"),
+            ),
         }
     }
 }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::monitor::ram_scratch::{ProcessSwap, ScratchMount, assess};
+use crate::monitor::ram_scratch::{CoveringMount, ProcessSwap, ScratchIssue, ScratchMount, assess};
 use crate::platform::pal::MemoryInfo;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -53,6 +53,7 @@ fn observation(pressured: bool, complete: bool) -> Observation {
             scope: "fixture host counters, not deletion authority",
             assessment: Some(assessment),
             issues: Vec::new(),
+            issue_details: Vec::new(),
             exit_code: if complete { i32::from(pressured) } else { 4 },
         },
         attribution: Vec::new(),
@@ -187,6 +188,51 @@ fn new_risks_are_reported_without_rearming_for_threshold_flapping() {
     );
 }
 
+/// A monitor can tell a covered mount from a failed probe without parsing
+/// text, and the record keeps the mount's identity (GitHub #40).
+#[test]
+fn incomplete_records_name_the_kind_and_mount_of_the_missing_evidence() {
+    let mut sample = observation(false, true);
+    sample.host.complete = false;
+    sample.host.exit_code = 4;
+    sample.host.push_issue(ScratchIssue {
+        path: Some("/run/credentials/a.service".into()),
+        mount_id: Some(50),
+        covered_by: Some(CoveringMount {
+            mount_id: 51,
+            path: "/run/credentials".into(),
+            fs_type: "tmpfs".into(),
+        }),
+        os_error: Some(2),
+        ..ScratchIssue::new("mount_covered", "covered".into())
+    });
+    sample.attribution_error = Some("bounded".into());
+    let (code, payload) = warning(
+        Notices::default()
+            .finish(Ok(sample), Instant::now())
+            .unwrap(),
+    );
+    assert_eq!(code, "SBH-RAM-SCRATCH-INCOMPLETE");
+    assert_eq!(payload["complete"], false);
+    assert_eq!(
+        payload["issue_kinds"],
+        serde_json::json!(["attribution_incomplete", "mount_covered"])
+    );
+    let detail = &payload["observation"]["host"]["issue_details"][0];
+    assert_eq!(detail["mount_id"], 50);
+    assert_eq!(detail["covered_by"]["mount_id"], 51);
+    assert_eq!(detail["os_error"], 2);
+    assert_eq!(payload["observation"]["host"]["issues"][0], "covered");
+
+    let mut probe = Notices::default();
+    let (_, failed) = warning(
+        probe
+            .finish(Err(io::Error::other("no mount table")), Instant::now())
+            .unwrap(),
+    );
+    assert_eq!(failed["issue_kinds"], serde_json::json!(["probe_failed"]));
+}
+
 #[test]
 fn oversized_detail_is_explicitly_truncated_not_silently_claimed_complete() {
     let mut sample = observation(true, true);
@@ -307,12 +353,13 @@ fn stalled_probe_is_single_flight_and_does_not_block_observer_shutdown() {
     });
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let original_thread = observer.job.as_ref().unwrap().worker.thread().id();
-    let (code, _) = warning(
+    let (code, stalled) = warning(
         observer
             .poll_with(now + STALL_AFTER, || panic!("overlapping probe"))
             .unwrap(),
     );
     assert_eq!(code, "SBH-RAM-SCRATCH-INCOMPLETE");
+    assert_eq!(stalled["issue_kinds"], serde_json::json!(["probe_stalled"]));
     assert!(
         observer
             .poll_with(now + SAMPLE_INTERVAL, || panic!(
