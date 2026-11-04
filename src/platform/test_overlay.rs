@@ -27,8 +27,8 @@ use serde::Deserialize;
 
 use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::{
-    BlockDeviceInfo, FsStats, MemoryHeadroom, MemoryInfo, MountPoint, Platform, PlatformPaths,
-    ServiceManager,
+    BlockDeviceInfo, FsStats, InodeStats, MemoryHeadroom, MemoryInfo, MountPoint, Platform,
+    PlatformPaths, ServiceManager,
 };
 use crate::platform::types::{
     Capacity, ExecutablesResult, FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion,
@@ -66,6 +66,9 @@ pub struct InjectedMount {
     pub total: u64,
     /// Free bytes at time zero.
     pub free: u64,
+    /// Optional finite inode accounting. Missing means unknown, never host data.
+    #[serde(default)]
+    pub inodes: Option<InodeStats>,
     /// Whether the mount is RAM-backed (tmpfs-like).
     #[serde(default)]
     pub ram_backed: bool,
@@ -118,6 +121,17 @@ impl InjectedFsTable {
                 return Err(SbhError::InvalidConfig {
                     details: format!(
                         "{TEST_FS_STATS_ENV}: {} has a series point above total",
+                        mount.path.display()
+                    ),
+                });
+            }
+            if mount
+                .inodes
+                .is_some_and(|stats| stats.validated().is_none())
+            {
+                return Err(SbhError::InvalidConfig {
+                    details: format!(
+                        "{TEST_FS_STATS_ENV}: {} has invalid inode accounting",
                         mount.path.display()
                     ),
                 });
@@ -268,6 +282,13 @@ impl Platform for TestOverlayPlatform {
         self.table.owner(path).map_or_else(
             || self.inner.fs_stats(path),
             |mount| Ok(mount.stats_at(self.elapsed_secs())),
+        )
+    }
+
+    fn inode_stats(&self, path: &Path) -> Result<Option<InodeStats>> {
+        self.table.owner(path).map_or_else(
+            || self.inner.inode_stats(path),
+            |mount| Ok(mount.inodes.and_then(InodeStats::validated)),
         )
     }
 
@@ -458,7 +479,8 @@ impl Platform for TestOverlayPlatform {
 #[cfg(test)]
 mod tests {
     use super::{InjectedFsTable, TestOverlayPlatform, refuse_under_service_manager};
-    use crate::platform::pal::{MockPlatform, Platform};
+    use crate::platform::pal::{InodeStats, MockPlatform, Platform};
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -484,6 +506,41 @@ mod tests {
             InjectedFsTable::parse(r#"{"mounts":[{"path":"/x","total":0,"free":0}]}"#).is_err()
         );
         assert!(InjectedFsTable::parse("not json").is_err());
+        assert!(
+            InjectedFsTable::parse(
+                r#"{"mounts":[{"path":"/x","total":10,"free":5,"inodes":{"total":20,"free":2,"available":3}}]}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn inode_overlay_never_pairs_injected_capacity_with_host_accounting() {
+        let native = InodeStats::new(1000, 200, 100).unwrap();
+        let inner =
+            MockPlatform::healthy().with_inode_stats(HashMap::from([(PathBuf::from("/"), native)]));
+        let overlay = TestOverlayPlatform::new(
+            Arc::new(inner),
+            InjectedFsTable::parse(
+                r#"{"mounts":[
+                    {"path":"/injected","total":1000,"free":900},
+                    {"path":"/injected/finite","total":1000,"free":900,
+                     "inodes":{"total":100,"free":4,"available":1}}
+                ]}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(overlay.inode_stats(Path::new("/injected/x")).unwrap(), None);
+        assert_eq!(
+            overlay
+                .inode_stats(Path::new("/injected/finite/x"))
+                .unwrap(),
+            InodeStats::new(100, 4, 1)
+        );
+        assert_eq!(
+            overlay.inode_stats(Path::new("/native")).unwrap(),
+            Some(native)
+        );
     }
 
     #[test]

@@ -57,6 +57,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Added
 
+- **Finite inode capacity has its own platform accounting and pressure model.**
+  Linux reports total, free, and ordinary-caller available inodes separately
+  from filesystem bytes. Unsupported, sentinel, and inconsistent readings
+  remain unavailable. `[pressure.inodes]` provides independent validated
+  thresholds and recovery hysteresis; injected filesystem fixtures never
+  borrow inode readings from the host.
+
 - **Low swap can trigger bounded reclaim on otherwise Green tmpfs mounts.**
   Linux mounts on existing scanner roots now evaluate swap headroom separately
   from their nominal filesystem capacity. Below 10% free swap, a worse backing

@@ -18,8 +18,8 @@ use parking_lot::RwLock;
 use crate::core::errors::{Result, SbhError};
 #[cfg(target_os = "linux")]
 use crate::platform::pal::{
-    BlockDeviceInfo, FsStats, MemoryHeadroom, MemoryInfo, MountPoint, Platform, PlatformPaths,
-    ServiceManager, verify_preallocated_blocks,
+    BlockDeviceInfo, FsStats, InodeStats, MemoryHeadroom, MemoryInfo, MountPoint, Platform,
+    PlatformPaths, ServiceManager, verify_preallocated_blocks,
 };
 #[cfg(target_os = "linux")]
 use crate::platform::sacred_catalog::cross_platform_sacred_paths;
@@ -125,6 +125,19 @@ impl Platform for LinuxPal {
 
     fn mount_points(&self) -> Result<Vec<MountPoint>> {
         self.get_cached_mounts()
+    }
+
+    fn inode_stats(&self, path: &Path) -> Result<Option<InodeStats>> {
+        let resolved = resolve_mount_path(path)?;
+        let stat = nix::sys::statvfs::statvfs(&resolved).map_err(|error| SbhError::FsStats {
+            path: path.to_path_buf(),
+            details: format!("could not read inode accounting: {error}"),
+        })?;
+        Ok(InodeStats::new(
+            stat.files(),
+            stat.files_free(),
+            stat.files_available(),
+        ))
     }
 
     fn is_ram_backed(&self, path: &Path) -> Result<bool> {

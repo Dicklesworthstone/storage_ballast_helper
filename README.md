@@ -823,6 +823,14 @@ orange_min_free_pct = 10.0
 red_min_free_pct = 5.0
 poll_interval_ms = 2000
 
+[pressure.inodes]
+enabled = true                # finite inode capacity is independent of free bytes
+green_min_free_pct = 10.0
+yellow_min_free_pct = 5.0
+orange_min_free_pct = 2.0
+red_min_free_pct = 1.0
+hysteresis_pct = 0.5
+
 [ballast]
 auto_provision = true          # false: the daemon never builds the pool; use `sbh ballast provision`
 file_count = 5

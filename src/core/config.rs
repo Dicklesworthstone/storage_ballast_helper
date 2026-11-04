@@ -329,6 +329,54 @@ pub struct PressureConfig {
     pub prediction: PredictionConfig,
     /// `[pressure.controller]`: the per-mount PID's gains.
     pub controller: ControllerConfig,
+    /// Independent finite-inode capacity thresholds (`[pressure.inodes]`).
+    pub inodes: InodePressureConfig,
+}
+
+/// Available-inode pressure, independent of byte capacity and byte floors.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct InodePressureConfig {
+    pub enabled: bool,
+    pub green_min_free_pct: f64,
+    pub yellow_min_free_pct: f64,
+    pub orange_min_free_pct: f64,
+    pub red_min_free_pct: f64,
+    /// Additional percentage points required before recovering a level.
+    pub hysteresis_pct: f64,
+}
+
+impl InodePressureConfig {
+    /// Strictly descending thresholds with a reachable recovery goal.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let thresholds = [
+            self.green_min_free_pct,
+            self.yellow_min_free_pct,
+            self.orange_min_free_pct,
+            self.red_min_free_pct,
+        ];
+        thresholds
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0)
+            && thresholds.windows(2).all(|pair| pair[0] > pair[1])
+            && self.hysteresis_pct.is_finite()
+            && self.hysteresis_pct >= 0.0
+            && self.green_min_free_pct + self.hysteresis_pct <= 100.0
+    }
+}
+
+impl Default for InodePressureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            green_min_free_pct: 10.0,
+            yellow_min_free_pct: 5.0,
+            orange_min_free_pct: 2.0,
+            red_min_free_pct: 1.0,
+            hysteresis_pct: 0.5,
+        }
+    }
 }
 
 /// Gains of the per-mount PID pressure controller (`[pressure.controller]`).
@@ -1373,6 +1421,7 @@ impl Default for PressureConfig {
             behavior_hysteresis_secs: 5,
             controller: ControllerConfig::default(),
             prediction: PredictionConfig::default(),
+            inodes: InodePressureConfig::default(),
         }
     }
 }
@@ -3074,6 +3123,12 @@ impl Config {
                 details: "pressure.prediction.coverage_target must be in [0.5, 1.0)".to_string(),
             });
         }
+        if !self.pressure.inodes.is_valid() {
+            return Err(SbhError::InvalidConfig {
+                details: "pressure.inodes thresholds must be finite and satisfy 0 < red < orange < yellow < green, with nonnegative hysteresis and green + hysteresis <= 100"
+                    .to_string(),
+            });
+        }
         let controller = &self.pressure.controller;
         for (name, value) in [
             ("kp", controller.kp),
@@ -3457,8 +3512,9 @@ fn add_root_unless_covered(roots: &mut Vec<PathBuf>, dir: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BehaviorPreset, Config, PathsConfig, SacredConfig, SbhError, ScannerEngineMode,
-        add_root_unless_covered, load_sacred_config, sacred_config_path_for, write_sacred_config,
+        BehaviorPreset, Config, InodePressureConfig, PathsConfig, SacredConfig, SbhError,
+        ScannerEngineMode, add_root_unless_covered, load_sacred_config, sacred_config_path_for,
+        write_sacred_config,
     };
 
     #[test]
@@ -3902,6 +3958,41 @@ mod tests {
         let toml_str = "[pressure]\nbehavior_hysteresis_secs = 9\n";
         let parsed: Config = toml::from_str(toml_str).expect("should parse");
         assert_eq!(parsed.pressure.behavior_hysteresis_secs, 9);
+    }
+
+    #[test]
+    fn inode_pressure_defaults_overrides_and_validation() {
+        let defaults = Config::default();
+        assert_eq!(defaults.pressure.inodes, InodePressureConfig::default());
+        assert!(defaults.pressure.inodes.enabled);
+        let parsed: Config = toml::from_str(
+            "[pressure.inodes]\nenabled = false\ngreen_min_free_pct = 12.0\nhysteresis_pct = 1.0\n",
+        )
+        .expect("inode config parses");
+        assert!(!parsed.pressure.inodes.enabled);
+        assert_eq!(parsed.pressure.inodes.green_min_free_pct, 12.0);
+        assert!(parsed.validate().is_ok());
+
+        for (green, yellow, orange, red, hysteresis) in [
+            (10.0, 10.0, 2.0, 1.0, 0.5),
+            (10.0, 5.0, 2.0, 0.0, 0.5),
+            (10.0, 5.0, 2.0, 1.0, -0.1),
+            (100.0, 5.0, 2.0, 1.0, 0.5),
+            (f64::NAN, 5.0, 2.0, 1.0, 0.5),
+            (10.0, 5.0, 2.0, 1.0, f64::INFINITY),
+        ] {
+            let mut config = Config::default();
+            config.pressure.inodes = InodePressureConfig {
+                enabled: true,
+                green_min_free_pct: green,
+                yellow_min_free_pct: yellow,
+                orange_min_free_pct: orange,
+                red_min_free_pct: red,
+                hysteresis_pct: hysteresis,
+            };
+            let error = config.validate().expect_err("invalid inode thresholds");
+            assert!(error.to_string().contains("pressure.inodes"));
+        }
     }
 
     #[test]

@@ -752,6 +752,7 @@ pub fn constants() -> Vec<ConstantDoc> {
     const CONFIG: &str = "src/core/config.rs";
     const RCH_SOURCE: &str = "src/scanner/scoring.rs";
     let pressure = PressureConfig::default();
+    let inodes = &pressure.inodes;
     let controller = &pressure.controller;
     let prediction = &pressure.prediction;
     let telemetry = TelemetryConfig::default();
@@ -818,6 +819,48 @@ pub fn constants() -> Vec<ConstantDoc> {
             ram_scratch::SWAP_RECLAIM_MIN_FREE_PCT,
             "Free swap % below which bounded tmpfs relief may run",
             "src/monitor/ram_scratch.rs",
+        ),
+        constant(
+            "inodes",
+            "enabled",
+            inodes.enabled,
+            "Monitor finite inode capacity independently of byte pressure",
+            CONFIG,
+        ),
+        constant(
+            "inodes",
+            "green_min_free_pct",
+            inodes.green_min_free_pct,
+            "Green at or above this available inode %",
+            CONFIG,
+        ),
+        constant(
+            "inodes",
+            "yellow_min_free_pct",
+            inodes.yellow_min_free_pct,
+            "Yellow at or above this available inode %",
+            CONFIG,
+        ),
+        constant(
+            "inodes",
+            "orange_min_free_pct",
+            inodes.orange_min_free_pct,
+            "Orange at or above this available inode %",
+            CONFIG,
+        ),
+        constant(
+            "inodes",
+            "red_min_free_pct",
+            inodes.red_min_free_pct,
+            "Red at or above this available inode %; Critical below it",
+            CONFIG,
+        ),
+        constant(
+            "inodes",
+            "hysteresis_pct",
+            inodes.hysteresis_pct,
+            "Additional inode percentage points required for recovery",
+            CONFIG,
         ),
         constant(
             "controller",

@@ -610,6 +610,12 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | pressure | `maintenance_interval_secs` | `1800` | Green maintenance pass cadence | `src/core/config.rs` |
 | pressure | `behavior_hysteresis_secs` | `5` | Dwell before a behavior cell change takes effect | `src/core/config.rs` |
 | ram_scratch | `SWAP_RECLAIM_MIN_FREE_PCT` | `10` | Free swap % below which bounded tmpfs relief may run | `src/monitor/ram_scratch.rs` |
+| inodes | `enabled` | `true` | Monitor finite inode capacity independently of byte pressure | `src/core/config.rs` |
+| inodes | `green_min_free_pct` | `10` | Green at or above this available inode % | `src/core/config.rs` |
+| inodes | `yellow_min_free_pct` | `5` | Yellow at or above this available inode % | `src/core/config.rs` |
+| inodes | `orange_min_free_pct` | `2` | Orange at or above this available inode % | `src/core/config.rs` |
+| inodes | `red_min_free_pct` | `1` | Red at or above this available inode %; Critical below it | `src/core/config.rs` |
+| inodes | `hysteresis_pct` | `0.5` | Additional inode percentage points required for recovery | `src/core/config.rs` |
 | controller | `kp` | `0.25` | Proportional gain per point of free-% error | `src/core/config.rs` |
 | controller | `ki` | `0.08` | Integral gain | `src/core/config.rs` |
 | controller | `kd` | `0.02` | Derivative gain | `src/core/config.rs` |

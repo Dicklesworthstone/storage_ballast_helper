@@ -42,6 +42,51 @@ impl FsStats {
     }
 }
 
+/// Finite filesystem inode accounting, independent of byte capacity.
+///
+/// Some filesystems have no fixed inode limit and report zero or sentinel
+/// counters. Those readings are unavailable, never evidence of exhaustion.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InodeStats {
+    /// Total number of inodes reported by the filesystem.
+    pub total: u64,
+    /// Free inodes, including any reserved for privileged callers.
+    pub free: u64,
+    /// Free inodes available to an ordinary caller.
+    pub available: u64,
+}
+
+impl InodeStats {
+    /// Accept only a finite, internally consistent filesystem reading.
+    #[must_use]
+    pub fn new(total: u64, free: u64, available: u64) -> Option<Self> {
+        Self {
+            total,
+            free,
+            available,
+        }
+        .validated()
+    }
+
+    /// Revalidate externally supplied or deserialized counters.
+    #[must_use]
+    pub fn validated(self) -> Option<Self> {
+        (self.total > 0
+            && self.total != u64::MAX
+            && self.free <= self.total
+            && self.available <= self.free)
+            .then_some(self)
+    }
+
+    /// Available inode percentage, absent for unsupported or invalid counters.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn available_pct(&self) -> Option<f64> {
+        self.validated()
+            .map(|stats| (stats.available as f64 * 100.0) / stats.total as f64)
+    }
+}
+
 /// Mount-point metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MountPoint {
@@ -323,6 +368,11 @@ pub trait Platform: Send + Sync {
     }
 
     fn fs_stats(&self, path: &Path) -> Result<FsStats>;
+    /// Fresh inode accounting, when the filesystem has a finite inode limit.
+    /// Unsupported platforms must not substitute byte capacity or host data.
+    fn inode_stats(&self, _path: &Path) -> Result<Option<InodeStats>> {
+        Ok(None)
+    }
     fn mount_points(&self) -> Result<Vec<MountPoint>>;
     /// Resolve a path in the namespace used by this platform's mount table.
     /// Native platforms may need more than symlink resolution (APFS firmlinks).
@@ -601,6 +651,7 @@ pub struct MockPlatform {
     name: &'static str,
     mounts: Vec<MountPoint>,
     stats_by_mount: HashMap<PathBuf, FsStats>,
+    inode_stats_by_mount: HashMap<PathBuf, InodeStats>,
     memory: MemoryInfo,
     paths: PlatformPaths,
     memory_pressure: MemoryPressure,
@@ -637,6 +688,7 @@ impl MockPlatform {
             name: "mock",
             mounts,
             stats_by_mount,
+            inode_stats_by_mount: HashMap::new(),
             memory,
             paths,
             memory_pressure: default_mock_memory_pressure(),
@@ -822,6 +874,13 @@ impl MockPlatform {
         self.service_kind = service_kind;
         self
     }
+
+    /// Supply inode readings explicitly; byte fixtures never inherit host data.
+    #[must_use]
+    pub fn with_inode_stats(mut self, stats: HashMap<PathBuf, InodeStats>) -> Self {
+        self.inode_stats_by_mount = stats;
+        self
+    }
 }
 
 impl Platform for MockPlatform {
@@ -841,6 +900,18 @@ impl Platform for MockPlatform {
                 path: mount.path.clone(),
                 details: "mock stats not found".to_string(),
             })
+    }
+
+    fn inode_stats(&self, path: &Path) -> Result<Option<InodeStats>> {
+        let mount = find_mount(path, &self.mounts).ok_or_else(|| SbhError::FsStats {
+            path: path.to_path_buf(),
+            details: "mock mount not found".to_string(),
+        })?;
+        Ok(self
+            .inode_stats_by_mount
+            .get(&mount.path)
+            .copied()
+            .and_then(InodeStats::validated))
     }
 
     fn mount_points(&self) -> Result<Vec<MountPoint>> {
@@ -1117,12 +1188,66 @@ fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'a MountPoin
 
 #[cfg(test)]
 mod tests {
-    use super::{MockPlatform, Platform, ServiceKind};
+    use super::{InodeStats, MockPlatform, Platform, ServiceKind};
     use crate::platform::types::{
         MappedRegion, OpenFile, OpenFileKind, OpenFileMode, ProcessInfo, ProcessIo, SacredPath,
         SacredPathKind, SacredPathSource,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn inode_stats_require_finite_consistent_counters() {
+        for (total, free, available) in [
+            (0, 0, 0),
+            (u64::MAX, u64::MAX, u64::MAX),
+            (100, 101, 1),
+            (100, 10, 11),
+            (100, u64::MAX, 0),
+            (100, 10, u64::MAX),
+        ] {
+            assert!(InodeStats::new(total, free, available).is_none());
+        }
+        assert_eq!(
+            InodeStats::new(100, 20, 10).unwrap().available_pct(),
+            Some(10.0)
+        );
+        assert_eq!(
+            InodeStats::new(100, 0, 0).unwrap().available_pct(),
+            Some(0.0)
+        );
+        assert_eq!(
+            InodeStats::new(100, 100, 100).unwrap().available_pct(),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn mock_inode_accounting_is_explicit_and_revalidated() {
+        use std::collections::HashMap;
+        use std::path::Path;
+
+        assert_eq!(
+            MockPlatform::healthy()
+                .inode_stats(Path::new("/x"))
+                .unwrap(),
+            None
+        );
+        let expected = InodeStats::new(100, 2, 1).unwrap();
+        let platform = MockPlatform::healthy()
+            .with_inode_stats(HashMap::from([(PathBuf::from("/"), expected)]));
+        assert_eq!(
+            platform.inode_stats(Path::new("/x")).unwrap(),
+            Some(expected)
+        );
+        let invalid = InodeStats {
+            total: 0,
+            free: 0,
+            available: 0,
+        };
+        let platform = MockPlatform::healthy()
+            .with_inode_stats(HashMap::from([(PathBuf::from("/"), invalid)]));
+        assert_eq!(platform.inode_stats(Path::new("/x")).unwrap(), None);
+    }
 
     fn process(pid: i32, name: &str, executable: Option<PathBuf>) -> ProcessInfo {
         ProcessInfo {

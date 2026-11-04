@@ -8,6 +8,7 @@ pub mod conformal;
 pub mod ewma;
 pub mod fs_stats;
 pub mod guardrails;
+pub mod inode_pressure;
 pub mod pid;
 pub mod predictive;
 pub mod ram_scratch;
