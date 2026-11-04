@@ -417,14 +417,17 @@ impl ScratchReport {
 /// `mount_replaced`, `permission_denied`, `mount_inspection_failed`,
 /// `mount_counters_inconsistent`, `mount_topology_unresolved`,
 /// `mount_identity_unavailable`, `mount_table_failed`,
-/// `ramfs_unmeasurable`, `mount_budget_exhausted`, `mount_table_budget_exhausted`, `process_swap_failed`,
-/// `process_swap_incomplete`, `collection_failed`, `target_not_observed` or
-/// `attribution_incomplete`.
+/// `ramfs_unmeasurable`, `mount_budget_exhausted`, `mount_table_budget_exhausted`,
+/// `process_swap_failed`, `process_swap_incomplete`, `process_count_budget_exhausted`,
+/// `process_time_budget_exhausted`, `process_status_budget_exhausted`,
+/// `process_status_malformed`, `process_status_failed`, `process_enumeration_failed`,
+/// `collection_failed`, `target_not_observed` or `attribution_incomplete`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ScratchIssue {
     /// Stable machine-readable reason.
     pub kind: &'static str,
-    /// Mount point as the mount table lists it, when one mount is concerned.
+    /// Mount point as listed, or the first bounded process-path example for
+    /// an aggregated process issue. Display evidence, never execution authority.
     pub path: Option<String>,
     /// Kernel mount ID from `/proc/self/mountinfo`, when one mount is concerned.
     pub mount_id: Option<u64>,

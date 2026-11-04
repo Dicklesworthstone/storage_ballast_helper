@@ -134,7 +134,8 @@ that was measured through another listed path (a bind or propagated copy):
 it is an alias, and it is listed with that filesystem's usage.
 
 Every entry of `issues` has a matching `issue_details` entry, in the same order,
-with a stable `kind`, the mount point `path`, the expected kernel `mount_id`,
+with a stable `kind`, an affected `path`, the expected kernel `mount_id` when
+one mount is concerned,
 `observed_mount_id` when a descriptor supplied identity, `operation` (for example
 `open`, `identity`, `capacity`, `verify_path` or `topology`), and `os_error` when a syscall
 failed. A cover includes `covered_by` (its `mount_id`, `path` and `fs_type`).
@@ -150,7 +151,7 @@ currently visible topmost mount.
 | `mount_not_addressable` | Still listed and nothing listed covers it, yet its path does not resolve |
 | `mount_vanished` | Lookup failed and a fresh mount-table read no longer lists it |
 | `mount_replaced` | The opened mount ID/device differs from the record, the pathname changed during sampling, or the descriptor is not tmpfs |
-| `permission_denied` | Opening, identity verification, or capacity inspection was denied; errno and operation are retained |
+| `permission_denied` | Opening, identity verification, capacity inspection, or a process-status read was denied; errno and operation are retained |
 | `mount_inspection_failed` | Any other lookup or capacity-read failure |
 | `mount_counters_inconsistent` | Block counters are inconsistent or their byte conversion overflows |
 | `mount_topology_unresolved` | Its parent links loop in the mount table |
@@ -160,6 +161,12 @@ currently visible topmost mount.
 | `mount_budget_exhausted` | The mount limit or deadline was reached |
 | `mount_table_budget_exhausted` | Mount-table input exceeded its byte budget |
 | `process_swap_failed`, `process_swap_incomplete` | Process VmSwap evidence is missing |
+| `process_count_budget_exhausted` | The attempted-process limit stopped enumeration; the remaining count and swap are unknown |
+| `process_time_budget_exhausted` | The cooperative deadline stopped process inspection |
+| `process_status_budget_exhausted` | A process-status input exceeded the 64 KiB byte limit |
+| `process_status_malformed` | A process-status input lacks valid VmSwap evidence, has invalid encoding, or overflows its counter |
+| `process_status_failed` | A process-status read failed for a reason other than permission denial or a process exiting |
+| `process_enumeration_failed` | A directory-entry read failed during process enumeration |
 | `collection_failed` | Host memory collection or assessment failed, or `sbh check PATH` could not obtain a report; no complete assessment is available |
 | `target_not_observed` | `sbh check PATH` only: the checked mount is absent from the report |
 | `attribution_incomplete` | On a warning: top-entry diagnostics are partial (see below) |
@@ -167,6 +174,17 @@ currently visible topmost mount.
 None of these is treated as healthy. An operator decides whether a stable
 `mount_covered` or `permission_denied` entry is expected for the namespace sbh
 runs in; sbh does not suppress any of them.
+
+Process failures are aggregated into at most one issue per reason, with a
+failure count and the first bounded example path/error. For these issues,
+`path` is a process-status example or the process directory, `mount_id` is
+null, and `operation` identifies the process read or enumeration. A count/time
+budget records one stop event, not an invented count of omitted processes.
+The generic `process_swap_incomplete` summary and observed partial VmSwap
+counters remain available. A process that exits before its status is read keeps
+the existing ENOENT treatment; valid kernel-thread status can contribute zero.
+Malformed or inaccessible status never becomes an observed zero, and every
+incomplete process observation keeps `complete=false` and exit 4.
 
 ## Top-entry diagnostics
 

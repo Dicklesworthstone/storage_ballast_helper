@@ -28,6 +28,8 @@ use super::{
 };
 
 const MAX_STATUS_BYTES: u64 = 64 * 1024;
+/// One retained path and error per process failure class, never per PID.
+const MAX_PROCESS_EXAMPLE_BYTES: usize = 256;
 const MOUNTINFO: &str = "/proc/self/mountinfo";
 /// Container hosts can list tens of thousands of mounts; this bounds one read.
 const MAX_MOUNTINFO_BYTES: u64 = 32 * 1024 * 1024;
@@ -171,20 +173,37 @@ pub(super) fn inspect(platform: &dyn Platform, limits: ScratchLimits) -> Scratch
         ),
         Err(error) => (Vec::new(), vec![mount_table_issue(&error)]),
     };
-    let process_swap =
-        match collect_process_swap(Path::new("/proc"), limits.max_processes, deadline) {
-            Ok(observation) => observation,
-            Err(error) => {
-                issues.push(ScratchIssue {
-                    os_error: error.raw_os_error(),
-                    ..ScratchIssue::new(
-                        "process_swap_failed",
-                        format!("process swap collection failed: {error}"),
-                    )
-                });
-                ProcessSwap::default()
-            }
-        };
+    let process_swap = append_process_observation(
+        collect_process_swap(Path::new("/proc"), limits.max_processes, deadline),
+        &mut issues,
+    );
+    finish_report(memory, mounts, process_swap, issues)
+}
+
+fn append_process_observation(
+    result: io::Result<(ProcessSwap, Vec<ScratchIssue>)>,
+    issues: &mut Vec<ScratchIssue>,
+) -> ProcessSwap {
+    let process_swap = match result {
+        Ok((observation, details)) => {
+            issues.extend(details);
+            observation
+        }
+        Err(error) => {
+            issues.push(ScratchIssue {
+                operation: Some("process_swap"),
+                os_error: error.raw_os_error(),
+                ..ScratchIssue::new(
+                    "process_swap_failed",
+                    format!(
+                        "process swap collection failed: {}",
+                        process_example(&error.to_string())
+                    ),
+                )
+            });
+            ProcessSwap::default()
+        }
+    };
     if !process_swap.complete {
         issues.push(ScratchIssue::new(
             "process_swap_incomplete",
@@ -194,7 +213,7 @@ pub(super) fn inspect(platform: &dyn Platform, limits: ScratchLimits) -> Scratch
             ),
         ));
     }
-    finish_report(memory, mounts, process_swap, issues)
+    process_swap
 }
 
 fn finish_report(
@@ -758,46 +777,234 @@ fn mount_issue(
     }
 }
 
-fn collect_process_swap(root: &Path, maximum: usize, deadline: Instant) -> io::Result<ProcessSwap> {
+/// A fixed set bounds diagnostics independently of the number of processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ProcessProblem {
+    CountBudget,
+    TimeBudget,
+    StatusBudget,
+    PermissionDenied,
+    Malformed,
+    ReadFailed,
+    EnumerationFailed,
+}
+
+impl ProcessProblem {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::CountBudget => "process_count_budget_exhausted",
+            Self::TimeBudget => "process_time_budget_exhausted",
+            Self::StatusBudget => "process_status_budget_exhausted",
+            Self::PermissionDenied => "permission_denied",
+            Self::Malformed => "process_status_malformed",
+            Self::ReadFailed => "process_status_failed",
+            Self::EnumerationFailed => "process_enumeration_failed",
+        }
+    }
+
+    fn operation(self) -> &'static str {
+        match self {
+            Self::CountBudget | Self::TimeBudget | Self::EnumerationFailed => "process_enumeration",
+            _ => "process_status",
+        }
+    }
+
+    fn message(self, count: usize, attempted: usize, maximum: usize) -> String {
+        match self {
+            Self::CountBudget => format!(
+                "process status count budget exhausted after {attempted} attempts (limit {maximum}); the number of omitted processes and their swap are unknown"
+            ),
+            Self::TimeBudget => format!(
+                "process inspection deadline exhausted after {attempted} status attempts; the number of omitted processes and their swap are unknown; retry with a longer inspection timeout"
+            ),
+            Self::StatusBudget => format!(
+                "{count} process status files exceeded the {MAX_STATUS_BYTES}-byte inspection budget; their swap is unknown"
+            ),
+            Self::PermissionDenied => format!(
+                "{count} process status files denied access; check observer credentials and process visibility; their swap is unknown"
+            ),
+            Self::Malformed => format!(
+                "{count} process status files had malformed or missing swap evidence; their swap is unknown"
+            ),
+            Self::ReadFailed => {
+                format!("{count} process status files could not be read; their swap is unknown")
+            }
+            Self::EnumerationFailed => format!(
+                "{count} process directory entries could not be read; unenumerated process swap is unknown"
+            ),
+        }
+    }
+}
+
+struct ProcessProblemSummary {
+    count: usize,
+    path: Option<String>,
+    error: Option<String>,
+    os_error: Option<i32>,
+}
+
+#[derive(Default)]
+struct ProcessIssues(BTreeMap<ProcessProblem, ProcessProblemSummary>);
+
+impl ProcessIssues {
+    fn record(&mut self, problem: ProcessProblem, path: Option<&Path>, error: Option<&io::Error>) {
+        let summary = self
+            .0
+            .entry(problem)
+            .or_insert_with(|| ProcessProblemSummary {
+                count: 0,
+                path: path.map(|path| process_example(&path.to_string_lossy())),
+                error: error.map(|error| process_example(&error.to_string())),
+                os_error: error.and_then(io::Error::raw_os_error),
+            });
+        summary.count += 1;
+    }
+
+    fn finish(self, attempted: usize, maximum: usize) -> Vec<ScratchIssue> {
+        self.0
+            .into_iter()
+            .map(|(problem, summary)| {
+                let mut message = problem.message(summary.count, attempted, maximum);
+                if let Some(path) = &summary.path {
+                    message.push_str("; first example: ");
+                    message.push_str(path);
+                }
+                if let Some(error) = &summary.error {
+                    message.push_str("; ");
+                    message.push_str(error);
+                }
+                ScratchIssue {
+                    path: summary.path,
+                    operation: Some(problem.operation()),
+                    os_error: summary.os_error,
+                    ..ScratchIssue::new(problem.kind(), message)
+                }
+            })
+            .collect()
+    }
+}
+
+fn process_example(text: &str) -> String {
+    if text.len() <= MAX_PROCESS_EXAMPLE_BYTES {
+        return text.to_owned();
+    }
+    let mut end = MAX_PROCESS_EXAMPLE_BYTES - 3;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+#[derive(Debug)]
+struct ProcessStatusFailure {
+    problem: ProcessProblem,
+    error: io::Error,
+}
+
+impl ProcessStatusFailure {
+    fn read(error: io::Error) -> Self {
+        Self {
+            problem: if error.kind() == io::ErrorKind::PermissionDenied {
+                ProcessProblem::PermissionDenied
+            } else {
+                ProcessProblem::ReadFailed
+            },
+            error,
+        }
+    }
+
+    fn malformed(error: io::Error) -> Self {
+        Self {
+            problem: ProcessProblem::Malformed,
+            error,
+        }
+    }
+}
+
+fn read_process_status(input: impl Read) -> Result<u64, ProcessStatusFailure> {
+    let mut raw = Vec::new();
+    input
+        .take(MAX_STATUS_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(ProcessStatusFailure::read)?;
+    // Check the byte budget before decoding: oversized invalid UTF-8 is still
+    // a budget failure, and no status contents become diagnostic payloads.
+    if raw.len() as u64 > MAX_STATUS_BYTES {
+        return Err(ProcessStatusFailure {
+            problem: ProcessProblem::StatusBudget,
+            error: invalid("process status exceeds its inspection byte budget"),
+        });
+    }
+    let text = std::str::from_utf8(&raw)
+        .map_err(|_| ProcessStatusFailure::malformed(invalid("process status is not UTF-8")))?;
+    parse_vm_swap(text).map_err(ProcessStatusFailure::malformed)
+}
+
+fn collect_process_swap(
+    root: &Path,
+    maximum: usize,
+    deadline: Instant,
+) -> io::Result<(ProcessSwap, Vec<ScratchIssue>)> {
+    let entries = fs::read_dir(root)?.map(|entry| entry.map(|entry| entry.path()));
+    observe_process_swap(root, entries, maximum, deadline, &|path| {
+        let input = File::open(path).map_err(ProcessStatusFailure::read)?;
+        read_process_status(input)
+    })
+}
+
+fn observe_process_swap(
+    root: &Path,
+    entries: impl IntoIterator<Item = io::Result<PathBuf>>,
+    maximum: usize,
+    deadline: Instant,
+    read_status: &dyn Fn(&Path) -> Result<u64, ProcessStatusFailure>,
+) -> io::Result<(ProcessSwap, Vec<ScratchIssue>)> {
     let mut observation = ProcessSwap {
         complete: true,
         ..Default::default()
     };
+    let mut issues = ProcessIssues::default();
     let mut attempted = 0;
-    for entry in fs::read_dir(root)? {
+    let mut entries = entries.into_iter();
+    loop {
         if Instant::now() >= deadline {
             observation.complete = false;
+            issues.record(ProcessProblem::TimeBudget, Some(root), None);
             break;
         }
-        let Ok(entry) = entry else {
-            observation.unreadable += 1;
-            observation.complete = false;
-            continue;
+        let Some(entry) = entries.next() else {
+            break;
         };
-        if !entry
+        // Directory I/O may overrun its cooperative deadline. Do not begin a
+        // separate status read after that in-flight operation has exhausted it.
+        if Instant::now() >= deadline {
+            observation.complete = false;
+            issues.record(ProcessProblem::TimeBudget, Some(root), None);
+            break;
+        }
+        let path = match entry {
+            Ok(path) => path,
+            Err(error) => {
+                observation.unreadable += 1;
+                observation.complete = false;
+                issues.record(ProcessProblem::EnumerationFailed, Some(root), Some(&error));
+                continue;
+            }
+        };
+        if !path
             .file_name()
-            .as_encoded_bytes()
-            .iter()
-            .all(u8::is_ascii_digit)
+            .is_some_and(|name| name.as_encoded_bytes().iter().all(u8::is_ascii_digit))
         {
             continue;
         }
         if attempted >= maximum {
             observation.complete = false;
+            issues.record(ProcessProblem::CountBudget, Some(root), None);
             break;
         }
         attempted += 1;
-        let value = (|| -> io::Result<u64> {
-            let mut text = String::new();
-            File::open(entry.path().join("status"))?
-                .take(MAX_STATUS_BYTES + 1)
-                .read_to_string(&mut text)?;
-            if text.len() as u64 > MAX_STATUS_BYTES {
-                return Err(invalid("process status exceeds inspection budget"));
-            }
-            parse_vm_swap(&text)
-        })();
-        match value {
+        let path = path.join("status");
+        match read_status(&path) {
             Ok(bytes) => {
                 observation.bytes = observation
                     .bytes
@@ -806,14 +1013,15 @@ fn collect_process_swap(root: &Path, maximum: usize, deadline: Instant) -> io::R
                 observation.inspected += 1;
             }
             // A process may exit between enumeration and its status read.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => {
+            Err(failure) if failure.error.kind() == io::ErrorKind::NotFound => {}
+            Err(failure) => {
                 observation.unreadable += 1;
                 observation.complete = false;
+                issues.record(failure.problem, Some(&path), Some(&failure.error));
             }
         }
     }
-    Ok(observation)
+    Ok((observation, issues.finish(attempted, maximum)))
 }
 
 fn parse_vm_swap(status: &str) -> io::Result<u64> {
@@ -868,6 +1076,321 @@ mod tests {
         ] {
             assert!(parse_vm_swap(text).is_err(), "{text}");
         }
+    }
+
+    fn process_fixture(
+        names: &[&str],
+        maximum: usize,
+        deadline: Instant,
+        reader: &dyn Fn(&Path) -> Result<u64, ProcessStatusFailure>,
+    ) -> io::Result<(ProcessSwap, Vec<ScratchIssue>)> {
+        let root = Path::new("/fixture/proc");
+        observe_process_swap(
+            root,
+            names.iter().map(|name| Ok(root.join(name))),
+            maximum,
+            deadline,
+            reader,
+        )
+    }
+
+    fn process_fixture_report(
+        result: io::Result<(ProcessSwap, Vec<ScratchIssue>)>,
+    ) -> ScratchReport {
+        let mut issues = Vec::new();
+        let process_swap = append_process_observation(result, &mut issues);
+        finish_report(
+            Ok(MemoryInfo {
+                total_bytes: 1000,
+                available_bytes: 900,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            }),
+            Vec::new(),
+            process_swap,
+            issues,
+        )
+    }
+
+    #[test]
+    fn process_count_and_time_budgets_keep_distinct_incomplete_reasons() {
+        let (observation, details) = process_fixture(
+            &["self", "101", "102"],
+            1,
+            Instant::now() + Duration::from_secs(10),
+            &|_| read_process_status(&b"VmSwap: 4 kB\n"[..]),
+        )
+        .unwrap();
+        assert_eq!(observation.bytes, 4096);
+        assert_eq!(observation.inspected, 1);
+        assert_eq!(observation.unreadable, 0);
+        assert!(!observation.complete);
+        assert_eq!(kinds(&details), ["process_count_budget_exhausted"]);
+        assert_eq!(details[0].operation, Some("process_enumeration"));
+        assert_eq!(details[0].path.as_deref(), Some("/fixture/proc"));
+        assert_eq!(details[0].os_error, None);
+        assert!(details[0].message.contains("limit 1"));
+        assert!(
+            details[0]
+                .message
+                .contains("omitted processes and their swap are unknown")
+        );
+        let report = process_fixture_report(Ok((observation, details)));
+        assert!(!report.complete);
+        assert_eq!(report.exit_code, 4);
+        assert_eq!(
+            kinds(&report.issue_details),
+            ["process_count_budget_exhausted", "process_swap_incomplete"]
+        );
+
+        let (observation, details) = process_fixture(&["101"], 10, Instant::now(), &|_| {
+            panic!("an expired deadline must not read a process status")
+        })
+        .unwrap();
+        assert!(!observation.complete);
+        assert_eq!(observation.inspected, 0);
+        assert_eq!(observation.unreadable, 0);
+        assert_eq!(kinds(&details), ["process_time_budget_exhausted"]);
+        assert_eq!(
+            process_fixture_report(Ok((observation, details))).exit_code,
+            4
+        );
+    }
+
+    #[test]
+    fn process_status_byte_budget_precedes_decoding_and_bounds_the_read() {
+        // Invalid UTF-8 must not hide the more specific byte-budget failure.
+        let bytes = vec![0xff; usize::try_from(MAX_STATUS_BYTES).unwrap() + 500];
+        let mut input = io::Cursor::new(&bytes);
+        let failure = read_process_status(&mut input).unwrap_err();
+        assert_eq!(failure.problem, ProcessProblem::StatusBudget);
+        assert_eq!(input.position(), MAX_STATUS_BYTES + 1);
+        let (observation, details) = process_fixture(
+            &["101"],
+            10,
+            Instant::now() + Duration::from_secs(10),
+            &|_| read_process_status(bytes.as_slice()),
+        )
+        .unwrap();
+        assert!(!observation.complete);
+        assert_eq!(observation.inspected, 0);
+        assert_eq!(observation.unreadable, 1);
+        assert_eq!(kinds(&details), ["process_status_budget_exhausted"]);
+        assert_eq!(details[0].path.as_deref(), Some("/fixture/proc/101/status"));
+        assert_eq!(details[0].operation, Some("process_status"));
+        assert_eq!(details[0].os_error, None);
+        assert_eq!(
+            process_fixture_report(Ok((observation, details))).exit_code,
+            4
+        );
+    }
+
+    #[test]
+    fn malformed_process_status_preserves_successful_samples_without_payloads() {
+        let (observation, details) = process_fixture(
+            &["100", "101", "102", "103"],
+            10,
+            Instant::now() + Duration::from_secs(10),
+            &|path| {
+                let text: &[u8] = match path
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                {
+                    "100" => b"VmSwap: 8 kB\n",
+                    "101" => b"Name: secret-command\nVmSize: 10 kB\n",
+                    "102" => b"VmSwap: 1 MB\n",
+                    "103" => b"\xff",
+                    _ => panic!("unexpected fixture process"),
+                };
+                read_process_status(text)
+            },
+        )
+        .unwrap();
+        assert_eq!(observation.bytes, 8192);
+        assert_eq!(observation.inspected, 1);
+        assert_eq!(observation.unreadable, 3);
+        assert!(!observation.complete);
+        assert_eq!(kinds(&details), ["process_status_malformed"]);
+        assert!(details[0].message.starts_with("3 process status files"));
+        assert!(!details[0].message.contains("secret-command"));
+        assert_eq!(details[0].path.as_deref(), Some("/fixture/proc/101/status"));
+        assert_eq!(details[0].os_error, None);
+        assert_eq!(
+            process_fixture_report(Ok((observation, details))).exit_code,
+            4
+        );
+    }
+
+    #[test]
+    fn process_permission_and_read_failures_retain_errno_and_partial_totals() {
+        let (observation, details) = process_fixture(
+            &["100", "101", "102", "103"],
+            10,
+            Instant::now() + Duration::from_secs(10),
+            &|path| {
+                let errno = match path
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                {
+                    "100" => return read_process_status(&b"VmSwap: 1 kB\n"[..]),
+                    "101" => libc::EACCES,
+                    "102" => libc::EPERM,
+                    "103" => libc::EIO,
+                    _ => panic!("unexpected fixture process"),
+                };
+                Err(ProcessStatusFailure::read(io::Error::from_raw_os_error(
+                    errno,
+                )))
+            },
+        )
+        .unwrap();
+        assert_eq!(observation.bytes, 1024);
+        assert_eq!(observation.inspected, 1);
+        assert_eq!(observation.unreadable, 3);
+        assert!(!observation.complete);
+        assert_eq!(
+            kinds(&details),
+            ["permission_denied", "process_status_failed"]
+        );
+        assert!(details[0].message.starts_with("2 process status files"));
+        assert_eq!(details[0].path.as_deref(), Some("/fixture/proc/101/status"));
+        assert_eq!(details[0].os_error, Some(libc::EACCES));
+        assert_eq!(details[1].path.as_deref(), Some("/fixture/proc/103/status"));
+        assert_eq!(details[1].os_error, Some(libc::EIO));
+        assert!(
+            details
+                .iter()
+                .all(|issue| issue.operation == Some("process_status"))
+        );
+        let json =
+            serde_json::to_value(process_fixture_report(Ok((observation, details)))).unwrap();
+        assert_eq!(json["complete"], false);
+        assert_eq!(json["exit_code"], 4);
+        assert_eq!(json["assessment"]["process_swap"]["bytes"], 1024);
+        assert_eq!(json["assessment"]["process_swap"]["complete"], false);
+        assert_eq!(json["issues"][0], json["issue_details"][0]["message"]);
+    }
+
+    #[test]
+    fn process_enumeration_failure_retains_the_root_without_inventing_a_pid() {
+        let root = Path::new("/fixture/proc");
+        let (observation, details) = observe_process_swap(
+            root,
+            [
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+                Ok(root.join("101")),
+            ],
+            10,
+            Instant::now() + Duration::from_secs(10),
+            &|_| read_process_status(&b"VmSwap: 0 kB\n"[..]),
+        )
+        .unwrap();
+        assert_eq!(observation.inspected, 1);
+        assert_eq!(observation.unreadable, 1);
+        assert!(!observation.complete);
+        assert_eq!(kinds(&details), ["process_enumeration_failed"]);
+        assert_eq!(details[0].path.as_deref(), Some("/fixture/proc"));
+        assert_eq!(details[0].operation, Some("process_enumeration"));
+        assert_eq!(details[0].os_error, Some(libc::EIO));
+        assert_eq!(
+            process_fixture_report(Ok((observation, details))).exit_code,
+            4
+        );
+    }
+
+    #[test]
+    fn zero_swap_kernel_threads_and_exited_processes_remain_complete() {
+        // Retain the disposable fixture for diagnostics; collection only reads it.
+        let root = tempfile::tempdir().unwrap().keep();
+        for name in ["100", "101", "102", "self"] {
+            fs::create_dir(root.join(name)).unwrap();
+        }
+        let zero = b"Name: sleeping\nVmSize: 10 kB\nVmSwap: 0 kB\n";
+        let kernel = b"Name: kworker\nState: S\n";
+        fs::write(root.join("100/status"), zero).unwrap();
+        fs::write(root.join("101/status"), kernel).unwrap();
+        // 102 disappears before its status read; nonnumeric `self` is ignored.
+        let result = collect_process_swap(&root, 10, Instant::now() + Duration::from_secs(10));
+        let (observation, details) = result.unwrap();
+        assert!(observation.complete);
+        assert_eq!(observation.bytes, 0);
+        assert_eq!(observation.inspected, 2);
+        assert_eq!(observation.unreadable, 0);
+        assert!(details.is_empty());
+        assert_eq!(fs::read(root.join("100/status")).unwrap(), zero);
+        assert_eq!(fs::read(root.join("101/status")).unwrap(), kernel);
+        let report = process_fixture_report(Ok((observation, details)));
+        assert!(report.complete);
+        assert_eq!(report.exit_code, 0);
+    }
+
+    #[test]
+    fn process_failures_aggregate_and_bound_multibyte_examples() {
+        let root = PathBuf::from(format!("/{}", "é".repeat(300)));
+        let calls = std::cell::Cell::new(0_usize);
+        let (observation, details) = observe_process_swap(
+            &root,
+            (100..2100).map(|pid| Ok(root.join(pid.to_string()))),
+            2000,
+            Instant::now() + Duration::from_secs(10),
+            &|_| {
+                let index = calls.get();
+                calls.set(index + 1);
+                let error = if index.is_multiple_of(2) {
+                    io::Error::from_raw_os_error(libc::EACCES)
+                } else {
+                    io::Error::other("é".repeat(1000))
+                };
+                Err(ProcessStatusFailure::read(error))
+            },
+        )
+        .unwrap();
+        assert_eq!(observation.unreadable, 2000);
+        assert_eq!(observation.inspected, 0);
+        assert_eq!(details.len(), 2, "one diagnostic per class, not per PID");
+        assert!(details.iter().all(|issue| {
+            issue.message.starts_with("1000 process status files")
+                && issue.message.len() < 1024
+                && issue.path.as_ref().unwrap().len() <= MAX_PROCESS_EXAMPLE_BYTES
+                && issue.path.as_ref().unwrap().ends_with("...")
+        }));
+        assert_eq!(details[0].os_error, Some(libc::EACCES));
+        assert_eq!(details[1].os_error, None);
+        assert_eq!(
+            process_fixture_report(Ok((observation, details))).exit_code,
+            4
+        );
+    }
+
+    #[test]
+    fn process_sum_overflow_and_collection_errors_stay_fail_closed() {
+        let overflow = process_fixture(
+            &["100", "101"],
+            10,
+            Instant::now() + Duration::from_secs(10),
+            &|_| Ok(u64::MAX),
+        );
+        assert!(overflow.is_err());
+        let report = process_fixture_report(overflow);
+        assert!(!report.complete);
+        assert_eq!(report.exit_code, 4);
+        assert_eq!(
+            kinds(&report.issue_details),
+            ["process_swap_failed", "process_swap_incomplete"]
+        );
+        assert!(report.issue_details[0].message.contains("overflow"));
+        let report = process_fixture_report(Err(io::Error::from_raw_os_error(libc::EACCES)));
+        assert!(!report.complete);
+        assert_eq!(report.exit_code, 4);
+        assert_eq!(report.issue_details[0].os_error, Some(libc::EACCES));
     }
 
     fn record(id: u64, parent: u64, minor: u32, point: &str, fs_type: &str) -> MountRecord {
