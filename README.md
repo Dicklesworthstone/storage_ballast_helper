@@ -1311,7 +1311,7 @@ Demotion to FallbackSafe is automatic and triggered by any of:
 - **Calibration breach**: 3 consecutive observation windows where the guardrail status is Fail (prediction accuracy has degraded), when `calibration_breach_action = "demote"` (the default below Enforce).
 - **Guardrail drift**: The e-process alarm fires at Orange or worse, under the same `calibration_breach_action` rule.
 - **Canary budget exhaustion**: More than 10 deletions in a single hour while in Canary mode, when `canary_budget_action = "demote"`.
-- **Serialization failure**: The daemon can't write its state file, below Red pressure (at Red and Critical the failed write is the full disk itself and cleanup continues).
+- **Serialization failure**: The daemon cannot write its state file and `serialization_failure_action` is `demote`. At Red or Critical byte pressure, it records the failure and preserves the current mode so cleanup can recover. A final `ENOSPC` with fresh Red or Critical inode pressure on the state file's own filesystem receives the same treatment; unrelated pressure and other write errors do not gain that inode exception.
 - **Kill switch**: An environment variable or config flag forces immediate fallback.
 
 #### Recovery with Mandatory Canary Gate
@@ -1481,6 +1481,56 @@ A candidate that cannot be quarantined (different filesystem from the root, unus
 The tracker periodically prunes entries whose last deletion is older than `max_cooldown`, preventing unbounded memory growth in long-running daemon sessions.
 
 Source: `src/daemon/loop_main.rs`
+
+### Finite Inode Capacity
+
+A filesystem can have free bytes and still be unable to create a file because
+it has run out of inodes. On Linux, `sbh` reads finite inode accounting
+separately from byte capacity. The available count excludes reserved inodes;
+zero available inodes is Critical even when many bytes remain free.
+Unsupported, missing, sentinel, or inconsistent counters remain unavailable
+and cannot authorize inode-driven cleanup. Platforms without finite inode
+accounting continue using the existing byte and memory pressure paths.
+
+`[pressure.inodes]` enables this monitor by default. Its available-inode
+thresholds are <!-- claim:constants.inodes.green_min_free_pct -->10<!-- /claim -->%,
+<!-- claim:constants.inodes.yellow_min_free_pct -->5<!-- /claim -->%,
+<!-- claim:constants.inodes.orange_min_free_pct -->2<!-- /claim -->%, and
+<!-- claim:constants.inodes.red_min_free_pct -->1<!-- /claim -->% for Green,
+Yellow, Orange, and Red respectively; lower values are Critical. Escalation is
+immediate. Recovery requires an additional
+<!-- claim:constants.inodes.hysteresis_pct -->0.5<!-- /claim --> percentage points
+and steps down one level per sample. Byte floors, byte forecasts, and byte PID
+gains do not change these thresholds.
+
+`sbh check PATH --json` includes a live `inodes` object with `status`, raw
+`stats`, and independent `pressure`. Orange or worse inode pressure exits
+`1` with `reason: "inode_pressure"`, including when `--target-free 0` permits
+the byte capacity. Unavailable accounting is explicit, with no inferred
+healthy pressure; disabling the inode monitor preserves valid raw counters.
+`sbh status` shows inode availability separately, and its JSON includes
+`pressure.inode_mounts` for writable disk and RAM-backed mounts.
+
+Inode relief uses existing definite artifact candidates on the sampled device
+and within configured scanner roots. Every pass has a shared limit on
+successful artifact removals, and every mutation rechecks current inode
+availability. Cleanup stops when available inodes reach the Green threshold
+plus its recovery margin. A changed mount, unavailable counters, revoked
+scope, or changed inode policy defers queued work. No estimate of an artifact's
+inode yield is used to claim success.
+
+These passes unlink eligible artifacts because quarantine renames retain
+their inodes. They retain protection markers, age checks, active-reference
+checks, policy mode, dry-run, and the exclusion of zero-byte targets. Inode
+pressure does not start compression, log truncation, unrelated-device cleanup,
+or a broader emergency policy. Byte counters and bytes-freed reports keep
+their original meaning.
+
+If the state file still cannot be written after the existing in-place
+fallback, a returned `ENOSPC` together with fresh severe inode pressure on its
+parent filesystem preserves the current policy mode. This lets already
+authorized cleanup recover capacity. It does not promote Observe or
+FallbackSafe, reset Canary limits, or excuse unrelated write errors.
 
 ### RAM-Backed Scratch Preflight
 
@@ -2004,11 +2054,42 @@ is logged with the caller's uid and pid.
 | `sbh daemon ping` | Identity and liveness from the process itself: pid, start time, version, uptime, policy mode |
 | `sbh status` | Asks the daemon to rewrite `state.json` first; the JSON reports `"source": "socket"` (or `"state_file"` when no daemon answered) |
 | `sbh daemon scan-now` | Queues a forced scan of the configured roots on the next tick (the `SIGUSR1` path) |
+| `sbh daemon scan-now PATH... [--force]` | Queues only the selected directories within configured roots; `--force` bypasses scan pacing |
 | `sbh daemon reload` | Re-reads the config (the `SIGHUP` path) |
 | `sbh policy status\|promote\|demote` | Shows or moves the policy mode (observe → canary → enforce and back) and persists the new mode to `[policy] initial_mode` after backing the config file up |
 | `explain {id}` (protocol only) | The decision ledger record for a decision id, read-only |
 | `ballast {release: N \| replenish: true}` (protocol only) | Releases or rebuilds ballast through the coordinator |
 | `sbh daemon shutdown` | A clean stop; the socket file is removed as part of it |
+
+Selected scans retain their own bounded queue, so routine pressure work cannot
+replace an accepted request. Without `--force`, a selected request waits through
+scan cooldown, CPU budgeting, and duty-cycle pacing. `--force` changes scheduling;
+protection, active-reference checks, age rules, dry-run, and the current policy
+still govern every deletion. A mixed-filesystem selection is partitioned by its
+observed mount so each partition uses that mount's byte-pressure evidence.
+Each selected path stays on its own device. When configured cross-device
+traversal permits a nested mount, include that mount explicitly to scan it.
+
+```bash
+sbh daemon scan-now /data/projects/project-a
+sbh daemon scan-now /data/projects/project-a /tmp/build-workspace --force
+```
+
+Selected directories are traversal roots. For fresh discovery of an artifact
+directory such as `target`, select its containing project directory so the
+artifact itself is considered during traversal.
+
+The daemon rejects the whole request if any selected directory is outside its
+current scanner authority or the operator queue cannot accept all partitions.
+CLI relative paths are resolved against the client's working directory;
+paths containing `..` are rejected. Configured-root aliases, directory
+identities, exclusions, and protection markers are checked again before the
+scan and each mutation. A scope revoked while queued is dropped; revocations
+detected during queue refresh are logged. The response's `queued: true`
+acknowledges admission, not completed
+cleanup. The protocol accepts `args.paths` and `args.force`; an omitted
+`force` preserves the immediate all-root behavior when `paths` is empty, while
+an explicit `force: false` requests paced reconciliation.
 
 The socket serves eight connections at a time, ten requests per second,
 and drops request lines over <!-- claim:constants.control.MAX_LINE_BYTES -->64 KiB<!-- /claim -->. `[core] control_socket_enabled = false`
@@ -2052,6 +2133,14 @@ The self-monitor tracks daemon health from within, providing introspection data 
 With every `state.json` write (every <!-- claim:constants.daemon.DAEMON_STATE_WRITE_INTERVAL_SECS -->30<!-- /claim --> seconds, or on request from `sbh status`) the daemon also renders `metrics.prom` beside it, atomically and world-readable, in the Prometheus text exposition format. Point node_exporter's textfile collector at the data directory (`--collector.textfile.directory=/var/lib/sbh` for a system install) and the `sbh_*` families appear with no network surface and no new dependency; `sbh metrics` prints the same text for hosts without a collector.
 
 The families are a view of the state document, so they never disagree with `sbh status`: `sbh_up`, `sbh_info{version,git_sha,policy_mode,run_id}`, `sbh_daemon_uptime_seconds`, `sbh_daemon_cpu_seconds_total`, `sbh_daemon_rss_bytes`, `sbh_daemon_cpu_budget_used_ratio`, `sbh_daemon_cpu_budget_deficit_seconds`; per mount `sbh_mount_free_ratio`, `sbh_mount_pressure_level{level}` (one-hot), `sbh_mount_fill_rate_bytes_per_second`, `sbh_mount_seconds_to_red`, `sbh_mount_reclaim_capability{capability}`, `sbh_mount_controller_state{state}`, `sbh_ballast_present_bytes`, `sbh_ballast_target_bytes`, `sbh_quarantine_bytes`; `sbh_ballast_files{state}`, `sbh_ballast_releases_total`, `sbh_scans_total`, `sbh_deletions_total`, `sbh_bytes_freed_total`, `sbh_bytes_freed_basis{basis}` (one-hot: `observed`, or `estimated_allocated` / `estimated_upper_bound` where ext4 or btrfs frees blocks only at commit), `sbh_errors_total`, `sbh_log_events_dropped_total`, `sbh_last_scan_candidates`, `sbh_policy_mode{mode}` (one-hot), `sbh_policy_mode_seconds`, `sbh_thread_up{thread}`. Scan CPU seconds, per-engine scan counts and guard e-values are not exported yet because the state document does not carry them. `[telemetry] metrics_enabled = false` turns the export off and removes a stale file at startup.
+
+Inode metrics remain independent: `sbh_mount_inode_accounting_known` distinguishes
+available evidence from unavailable or disabled accounting;
+`sbh_mount_inodes_total`, `sbh_mount_inodes_available`,
+`sbh_mount_inode_free_ratio`, and the one-hot
+`sbh_mount_inode_pressure_level{level}` report finite counters and pressure.
+The counter and level samples are absent when accounting is unavailable, so an
+unknown reading cannot masquerade as either zero available inodes or Green.
 
 #### Thread Heartbeats
 

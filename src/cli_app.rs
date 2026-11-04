@@ -46,9 +46,12 @@ use storage_ballast_helper::logger::stats::{
 };
 use storage_ballast_helper::monitor::burst::BurstStats;
 use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
+use storage_ballast_helper::monitor::inode_pressure::{
+    InodePressureEvidence, classify_inode_pressure,
+};
 use storage_ballast_helper::monitor::pid::{PressureLevel, classify_level};
 use storage_ballast_helper::platform::pal::{
-    BlockDeviceInfo, MemoryInfo, Platform, ServiceManager, detect_platform,
+    BlockDeviceInfo, InodeStats, MemoryInfo, Platform, ServiceManager, detect_platform,
 };
 use storage_ballast_helper::platform::types::{
     Capacity, FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
@@ -233,9 +236,16 @@ struct DaemonArgs {
 enum DaemonAction {
     /// Liveness: pid, start time, version, uptime, policy mode.
     Ping,
-    /// Queue a forced scan of the configured roots on the next tick.
+    /// Queue a scan of selected paths within the configured scanner roots.
     #[command(name = "scan-now")]
-    ScanNow,
+    ScanNow {
+        /// Directories to scan; omitted means all configured roots immediately.
+        #[arg(value_name = "PATH")]
+        paths: Vec<PathBuf>,
+        /// Bypass scan pacing for selected paths; all safety checks still apply.
+        #[arg(long)]
+        force: bool,
+    },
     /// Re-read the config file (the SIGHUP path).
     Reload,
     /// Ask the daemon to stop cleanly.
@@ -2752,14 +2762,42 @@ fn report_control_response(
     }
 }
 
-fn run_daemon_control(cli: &Cli, action: &DaemonAction) -> Result<(), CliError> {
-    let cmd = match action {
-        DaemonAction::Ping => "ping",
-        DaemonAction::ScanNow => "scan-now",
-        DaemonAction::Reload => "reload",
-        DaemonAction::Shutdown => "shutdown",
+fn resolve_scan_now_paths(
+    paths: &[PathBuf],
+    resolve_cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<Vec<PathBuf>, CliError> {
+    let cwd = if paths.iter().any(|path| path.is_relative()) {
+        Some(resolve_cwd().map_err(|error| {
+            CliError::User(format!(
+                "cannot resolve scan paths from the current directory: {error}"
+            ))
+        })?)
+    } else {
+        None
     };
-    let (socket, response) = control_request(cli, cmd, &json!({}))?;
+    Ok(paths
+        .iter()
+        .map(|path| match &cwd {
+            Some(cwd) if path.is_relative() => cwd.join(path),
+            _ => path.clone(),
+        })
+        .collect())
+}
+
+fn run_daemon_control(cli: &Cli, action: &DaemonAction) -> Result<(), CliError> {
+    let (cmd, args) = match action {
+        DaemonAction::Ping => ("ping", json!({})),
+        DaemonAction::ScanNow { paths, force } => {
+            let paths = resolve_scan_now_paths(paths, std::env::current_dir)?;
+            (
+                "scan-now",
+                json!({"force": *force || paths.is_empty(), "paths": paths}),
+            )
+        }
+        DaemonAction::Reload => ("reload", json!({})),
+        DaemonAction::Shutdown => ("shutdown", json!({})),
+    };
+    let (socket, response) = control_request(cli, cmd, &args)?;
     report_control_response(cli, &format!("daemon {cmd}"), &socket, &response)
 }
 
@@ -10224,6 +10262,22 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     let memory_pressure = platform.memory_pressure().ok();
     let process_visibility =
         process_attribution_visibility(platform.name(), &config.paths.state_file);
+    // Inode limits also apply to tmpfs. Keep this separate from the disk-byte
+    // table, which intentionally omits RAM-backed mounts.
+    let inode_mounts: Vec<_> = mounts
+        .iter()
+        .filter(|mount| {
+            platform
+                .capacity(&mount.path)
+                .is_ok_and(|capacity| capacity.total_bytes > 0 && !capacity.is_readonly)
+        })
+        .map(|mount| {
+            (
+                mount.path.clone(),
+                live_inode_status(platform.as_ref(), &mount.path, &config),
+            )
+        })
+        .collect();
 
     match output_mode(cli) {
         OutputMode::Human => {
@@ -10297,6 +10351,13 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     free_pct,
                     level.to_uppercase(),
                 );
+            }
+
+            if !inode_mounts.is_empty() {
+                println!("\nInode Availability:");
+                for (mount, inodes) in &inode_mounts {
+                    println!("  {}: {}", mount.display(), inodes.summary());
+                }
             }
 
             if !snapshot_warnings.is_empty() {
@@ -10541,7 +10602,9 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                             format!("UNPROTECTED, {note}")
                         };
                     }
-                    if let Some(pressure) = record.and_then(|record| record.backing_pressure) {
+                    if let Some(pressure) =
+                        record.as_ref().and_then(|record| record.backing_pressure)
+                    {
                         let backing = format!(
                             "swap backing: {}/{} free, relief target {}",
                             format_bytes(pressure.swap_free_bytes),
@@ -10552,6 +10615,20 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                             backing
                         } else {
                             format!("{note}, {backing}")
+                        };
+                    }
+                    if let Some(inodes) = record
+                        .as_ref()
+                        .and_then(|record| record.inode_pressure.as_ref())
+                    {
+                        let inode_note = format!(
+                            "inodes {}: {}/{} available, goal {}",
+                            inodes.level, inodes.available, inodes.total, inodes.target_available
+                        );
+                        note = if note.is_empty() {
+                            inode_note
+                        } else {
+                            format!("{note}, {inode_note}")
                         };
                     }
                     println!(
@@ -10704,7 +10781,12 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     overall_level = level;
                 }
 
-                mounts_json.push(status_mount_json(&capacity, level, free_pct));
+                let mut mount_payload = status_mount_json(&capacity, level, free_pct);
+                if let Some((_, inodes)) = inode_mounts.iter().find(|(path, _)| path == &mount.path)
+                {
+                    mount_payload["inodes"] = json!(inodes);
+                }
+                mounts_json.push(mount_payload);
             }
 
             let recent = db_stats.as_ref().map(|s| {
@@ -10765,6 +10847,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             "pressure": {
                 "mounts": mounts_json,
                 "overall": overall_level,
+                "inode_mounts": inode_mounts.iter().map(|(path, inodes)| json!({
+                    "path": path,
+                    "inodes": inodes,
+                })).collect::<Vec<_>>(),
                 "mount_controllers": daemon_state
                     .as_ref()
                     .and_then(|state| state.get("mount_controllers").cloned())
@@ -11017,6 +11103,78 @@ fn pressure_severity(level: &str) -> u8 {
 
 fn capacity_free_pct(capacity: &Capacity) -> f64 {
     bytes_to_pct(capacity.available_bytes, capacity.total_bytes)
+}
+
+/// Fresh finite inode accounting. Unknown accounting is explicit and never
+/// replaced with a byte-capacity percentage or an invented healthy reading.
+#[derive(Debug, Serialize)]
+struct LiveInodeStatus {
+    status: &'static str,
+    enabled: bool,
+    stats: Option<InodeStats>,
+    pressure: Option<InodePressureEvidence>,
+    issue: Option<String>,
+}
+
+impl LiveInodeStatus {
+    fn prevents_check(&self) -> bool {
+        self.pressure
+            .as_ref()
+            .is_some_and(|evidence| evidence.pressure_level() >= PressureLevel::Orange)
+    }
+
+    fn summary(&self) -> String {
+        let Some(stats) = self.stats else {
+            return self.issue.as_ref().map_or_else(
+                || "finite inode accounting unavailable".to_string(),
+                |issue| format!("finite inode accounting unavailable ({issue})"),
+            );
+        };
+        let level = self.pressure.as_ref().map_or(
+            if self.enabled { "unknown" } else { "disabled" },
+            |evidence| evidence.level.as_str(),
+        );
+        format!(
+            "{}/{} available ({:.1}%), pressure {level}",
+            stats.available,
+            stats.total,
+            stats.available_pct().unwrap_or_default(),
+        )
+    }
+}
+
+fn live_inode_status(platform: &dyn Platform, path: &Path, config: &Config) -> LiveInodeStatus {
+    let (stats, issue) = match platform.inode_stats(path) {
+        Ok(Some(stats)) => stats.validated().map_or_else(
+            || {
+                (
+                    None,
+                    Some("inconsistent or unsupported inode counters".to_string()),
+                )
+            },
+            |stats| (Some(stats), None),
+        ),
+        Ok(None) => (None, None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    let pressure = stats.and_then(|stats| {
+        classify_inode_pressure(stats, &config.pressure.inodes, PressureLevel::Green)
+    });
+    LiveInodeStatus {
+        status: if stats.is_none() {
+            "unavailable"
+        } else if !config.pressure.inodes.enabled {
+            "disabled"
+        } else if pressure.is_none() {
+            "unavailable"
+        } else {
+            "known"
+        },
+        enabled: config.pressure.inodes.enabled,
+        stats,
+        pressure,
+        issue,
+    }
 }
 
 /// One mount of `status --json`. `free` is `available_bytes` on every
@@ -14530,6 +14688,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
 
     let free_pct = capacity_free_pct(&capacity);
     let config = Config::load(cli.config.as_deref()).unwrap_or_default();
+    let inodes = live_inode_status(platform.as_ref(), &check_path, &config);
     // The daemon's Yellow line on this volume: absolute floors (bd-ud9s)
     // lower it on a large disk, so `check` agrees with the daemon's level.
     let threshold_pct = args.target_free.unwrap_or_else(|| {
@@ -14563,6 +14722,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                     "total_bytes": capacity.total_bytes,
                     "need_bytes": need_bytes,
                     "free_pct": free_pct,
+                    "inodes": inodes,
                     "container_id": capacity.container_id.as_deref(),
                     "container_total_bytes": capacity.container_total_bytes,
                     "container_available_bytes": capacity.container_available_bytes,
@@ -14621,6 +14781,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                     "free_pct": free_pct,
                     "threshold_pct": threshold_pct,
                     "unprotected": unprotected_json,
+                    "inodes": inodes,
                     "container_id": capacity.container_id.as_deref(),
                     "container_total_bytes": capacity.container_total_bytes,
                     "container_available_bytes": capacity.container_available_bytes,
@@ -14636,6 +14797,34 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         }
         // C-EXIT: a pressure condition is exit 1, distinct from an I/O failure.
         return Err(CliError::User("disk space below threshold".to_string()));
+    }
+
+    // Ample free bytes cannot compensate for exhausted finite inode capacity.
+    // The live independent threshold is checked before consulting daemon state.
+    if inodes.prevents_check() {
+        match output_mode(cli) {
+            OutputMode::Human => println!(
+                "sbh: {} has inode pressure: {}. Free safe artifacts on this filesystem; byte capacity alone cannot satisfy new-file allocations.",
+                capacity.mount_point.display(),
+                inodes.summary(),
+            ),
+            OutputMode::Json => write_json_line(&json!({
+                "command": "check",
+                "schema_version": 2,
+                "status": "critical",
+                "reason": "inode_pressure",
+                "path": check_path.to_string_lossy(),
+                "mount_point": capacity.mount_point.to_string_lossy(),
+                "free_bytes": capacity.available_bytes,
+                "total_bytes": capacity.total_bytes,
+                "free_pct": free_pct,
+                "inodes": inodes,
+                "unprotected": unprotected_json,
+                "platform": capacity_platform_json(&capacity),
+                "exit_code": 1,
+            }))?,
+        }
+        return Err(CliError::User("insufficient available inodes".to_string()));
     }
 
     // Check 2.7: unprotected pressure. The daemon reports, per mount, what
@@ -14672,6 +14861,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                         "level": unprotected.level,
                         "reclaim_capability": unprotected.capability,
                         "unprotected": unprotected_json,
+                        "inodes": inodes,
                         "platform": capacity_platform_json(&capacity),
                         "exit_code": 1,
                     });
@@ -14748,6 +14938,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                     "platform": capacity_platform_json(&capacity),
                     "ram_scratch": ram_scratch,
                     "ram_write_admission": ram_write_admission,
+                    "inodes": inodes,
                     "exit_code": exit_code,
                 }))?;
             }
@@ -14855,6 +15046,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                                 "minutes_until_red": minutes_left,
                                 "predict_minutes": predict_minutes,
                                 "forecast": forecast_json,
+                                "inodes": inodes,
                                 "container_id": capacity.container_id.as_deref(),
                                 "container_total_bytes": capacity.container_total_bytes,
                                 "container_available_bytes": capacity.container_available_bytes,
@@ -14906,6 +15098,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             "volume_role": capacity.volume_role.as_deref(),
             "free_excludes_purgeable": true,
             "platform": capacity_platform_json(&capacity),
+            "inodes": inodes,
             // Fresh host evidence only for Linux RAM-backed check targets.
             "ram_scratch": ram_scratch,
             "ram_write_admission": ram_write_admission,
@@ -16740,6 +16933,36 @@ mod tests {
         ProcessInfo, ProcessIo, SnapshotThinningEstimate,
     };
     use tempfile::TempDir;
+
+    #[test]
+    fn inode_status_reports_independent_pressure_and_unknown_evidence() {
+        let config = Config::default();
+        let path = Path::new("/data");
+        let unknown = live_inode_status(&MockPlatform::healthy(), path, &config);
+        assert_eq!(unknown.status, "unavailable");
+        assert!(!unknown.prevents_check());
+        assert!(unknown.summary().contains("unavailable"));
+        let platform = MockPlatform::healthy().with_inode_stats(HashMap::from([(
+            PathBuf::from("/"),
+            InodeStats::new(1000, 800, 0).unwrap(),
+        )]));
+        let critical = live_inode_status(&platform, path, &config);
+        assert!(critical.prevents_check());
+        assert_eq!(critical.status, "known");
+        assert!(critical.summary().contains("0/1000 available"));
+        assert_eq!(platform.fs_stats(path).unwrap().free_pct(), 50.0);
+        let json = serde_json::to_value(&critical).unwrap();
+        assert_eq!(json["pressure"]["level"], "critical");
+        assert_eq!(json["stats"]["free"], 800);
+
+        let mut disabled_config = config;
+        disabled_config.pressure.inodes.enabled = false;
+        let disabled = live_inode_status(&platform, path, &disabled_config);
+        assert_eq!(disabled.status, "disabled");
+        assert!(!disabled.prevents_check());
+        assert!(disabled.pressure.is_none());
+        assert_eq!(disabled.stats, critical.stats);
+    }
 
     struct FakeServiceManager {
         loaded: std::result::Result<bool, &'static str>,
@@ -19608,6 +19831,54 @@ mod tests {
         let (sel, reason) = resolve_dashboard_runtime(&legacy_args, &cfg);
         assert_eq!(sel, DashboardRuntimeSelection::Legacy);
         assert_eq!(reason, DashboardSelectionReason::CliFlagLegacy);
+    }
+
+    #[test]
+    fn daemon_scan_now_parses_selected_paths_and_force_without_changing_legacy_form() {
+        for (args, expected_paths, expected_force) in [
+            (
+                vec!["sbh", "daemon", "scan-now"],
+                Vec::<PathBuf>::new(),
+                false,
+            ),
+            (
+                vec!["sbh", "daemon", "scan-now", "/tmp/selected", "/data/other"],
+                vec![PathBuf::from("/tmp/selected"), PathBuf::from("/data/other")],
+                false,
+            ),
+            (
+                vec!["sbh", "daemon", "scan-now", "--force", "/tmp/selected"],
+                vec![PathBuf::from("/tmp/selected")],
+                true,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Daemon(DaemonArgs {
+                action: Some(DaemonAction::ScanNow { paths, force }),
+                ..
+            }) = cli.command
+            else {
+                panic!("expected daemon scan-now");
+            };
+            assert_eq!(paths, expected_paths);
+            assert_eq!(force, expected_force);
+        }
+
+        // Absolute and legacy all-root requests need no working directory,
+        // including when an operator's previous working tree has vanished.
+        let missing_cwd = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(resolve_scan_now_paths(&[], missing_cwd).unwrap().is_empty());
+        let absolute = vec![PathBuf::from("/tmp/selected")];
+        assert_eq!(
+            resolve_scan_now_paths(&absolute, missing_cwd).unwrap(),
+            absolute
+        );
+        let relative = vec![PathBuf::from("selected")];
+        assert!(resolve_scan_now_paths(&relative, missing_cwd).is_err());
+        assert_eq!(
+            resolve_scan_now_paths(&relative, || Ok(PathBuf::from("/tmp/client"))).unwrap(),
+            vec![PathBuf::from("/tmp/client/selected")],
+        );
     }
 
     /// Every `sbh <command>` the README's Command Reference lists exists in

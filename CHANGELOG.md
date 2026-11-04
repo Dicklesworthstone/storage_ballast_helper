@@ -57,12 +57,31 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Added
 
-- **Finite inode capacity has its own platform accounting and pressure model.**
-  Linux reports total, free, and ordinary-caller available inodes separately
-  from filesystem bytes. Unsupported, sentinel, and inconsistent readings
-  remain unavailable. `[pressure.inodes]` provides independent validated
-  thresholds and recovery hysteresis; injected filesystem fixtures never
-  borrow inode readings from the host.
+- **Finite inode pressure can reclaim eligible artifacts despite ample free
+  bytes.** Linux monitors available inodes independently, using validated
+  `[pressure.inodes]` thresholds and recovery hysteresis. Inode-driven passes
+  stay on the sampled device and configured roots, accept only definite
+  nonzero-byte artifacts, share a finite successful-removal allowance, and
+  renew inode availability before each unlink. Recovered, unavailable, or
+  changed evidence stops queued cleanup. Compression, log truncation,
+  quarantine renames, and unrelated-device fallback do not stand in for inode
+  relief. Existing policy, age, identity, process-reference, and protection
+  gates still apply. `sbh check` fails on Orange-or-worse inode pressure even
+  when its byte check passes; status, JSON, and Prometheus expose independent
+  inode evidence without changing byte counts or forecasts. A final state-file
+  `ENOSPC` backed by fresh severe inode pressure on that filesystem preserves
+  the current policy mode so authorized recovery is not stopped by its own
+  persistence failure.
+
+- **The live daemon accepts scoped scan requests.** `sbh daemon scan-now
+  PATH... [--force]` reconciles selected directories inside the current
+  configured roots. A bounded operator queue retains accepted requests across
+  pacing and ordinary scan-queue replacement. Requests spanning multiple
+  mounts use separate physical pressure observations. Root aliases, directory
+  identities, exclusions, and protection are renewed before scanning and
+  mutation; invalid or revoked scopes cannot expand cleanup authority.
+  `--force` bypasses pacing, while all deletion safeguards remain active.
+  The existing no-path command keeps its immediate full-root behavior.
 
 - **Low swap can trigger bounded reclaim on otherwise Green tmpfs mounts.**
   Linux mounts on existing scanner roots now evaluate swap headroom separately

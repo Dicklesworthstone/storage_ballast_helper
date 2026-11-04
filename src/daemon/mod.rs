@@ -8,6 +8,8 @@ pub mod control;
 pub mod coverage;
 pub mod cpu_budget;
 #[cfg(feature = "daemon")]
+pub mod inode_reclaim;
+#[cfg(feature = "daemon")]
 pub mod loop_main;
 pub mod metrics;
 pub mod mount_controller;
@@ -21,6 +23,8 @@ pub mod ram_reclaim;
 pub mod rch_staging;
 #[cfg(feature = "daemon")]
 mod recovery_probe;
+#[cfg(feature = "daemon")]
+pub mod scan_now;
 pub mod self_monitor;
 pub mod service;
 #[cfg(feature = "daemon")]

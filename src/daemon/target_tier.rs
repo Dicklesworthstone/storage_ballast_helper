@@ -963,6 +963,8 @@ fn run_root(
         urgency: due.urgency,
         target_bytes: None,
         ram_reclaim: None,
+        inode_reclaim: None,
+        scan_now: None,
         // Resolved like the candidates' paths, so the executor's containment
         // check compares like with like.
         target_only_root: Some(root.clone()),

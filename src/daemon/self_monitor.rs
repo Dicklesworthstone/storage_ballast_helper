@@ -1032,6 +1032,9 @@ pub struct SelfMonitorTick {
     pub rss_hard_limit_exceeded: bool,
     /// This tick attempted a state-file write and it failed.
     pub state_write_failed: bool,
+    /// OS error returned by the failed state-write operation. Serialization errors
+    /// have no errno; the daemon must not treat those as exhausted capacity.
+    pub state_write_errno: Option<i32>,
 }
 
 impl SelfMonitorTick {
@@ -1185,6 +1188,13 @@ impl SelfMonitor {
         self.run_id = run_id;
     }
 
+    /// The destination this monitor actually writes, independent of a later
+    /// configuration reload that names a different state file.
+    #[must_use]
+    pub fn state_file_path(&self) -> &Path {
+        &self.state_file_path
+    }
+
     /// Final write on shutdown: the last state with `stopped_at`,
     /// `exit_reason` and the final uptime, written regardless of the write
     /// interval so readers can tell a stopped daemon from a stalled one.
@@ -1285,6 +1295,7 @@ impl SelfMonitor {
             rss_hard_limit_bytes: self.rss_hard_limit_bytes,
             rss_hard_limit_exceeded: rss > self.rss_hard_limit_bytes,
             state_write_failed: false,
+            state_write_errno: None,
         };
 
         let write_due = self
@@ -1375,6 +1386,7 @@ impl SelfMonitor {
         if let Err(e) = &result {
             eprintln!("[SBH-SELFMON] failed to write state file: {e}");
             tick.state_write_failed = true;
+            tick.state_write_errno = e.raw_os_error();
         }
         // Update last_write regardless of success to respect the interval
         // and prevent log spam on persistent errors (e.g. permission denied).
@@ -1724,6 +1736,35 @@ mod state_schema_tests {
         assert_eq!(json["exit_reason"], "clean shutdown");
         let back: DaemonState = serde_json::from_value(json).expect("round-trips");
         assert_eq!(back, v2);
+    }
+
+    #[test]
+    fn inode_state_is_optional_and_does_not_replace_byte_pressure() {
+        use crate::core::config::InodePressureConfig;
+        use crate::daemon::mount_controller::MountStateRecord;
+        use crate::monitor::inode_pressure::classify_inode_pressure;
+        use crate::monitor::pid::PressureLevel;
+        use crate::platform::pal::InodeStats;
+
+        let mut controller: MountStateRecord = serde_json::from_value(serde_json::json!({
+            "mount": "/data", "state": "reclaim", "surface": "configured",
+            "level": "green", "urgency": 0.0,
+        }))
+        .unwrap();
+        assert!(controller.inode_pressure.is_none());
+        assert!(serde_json::to_value(&controller).unwrap()["inode_pressure"].is_null());
+        controller.inode_pressure = classify_inode_pressure(
+            InodeStats::new(1000, 10, 0).unwrap(),
+            &InodePressureConfig::default(),
+            PressureLevel::Green,
+        );
+        let encoded = serde_json::to_value(&controller).unwrap();
+        assert_eq!(encoded["level"], "green");
+        assert_eq!(encoded["inode_pressure"]["level"], "critical");
+        assert_eq!(encoded["inode_pressure"]["available"], 0);
+        assert_eq!(encoded["inode_pressure"]["free"], 10);
+        let decoded: MountStateRecord = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, controller);
     }
 }
 
@@ -2596,6 +2637,25 @@ mod tests {
 
         let state = SelfMonitor::read_state(&good_path).unwrap();
         assert!(state.pressure.overall.contains("yellow"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_write_tick_preserves_the_returned_os_error_without_inventing_enospc() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("not-a-directory");
+        fs::write(&parent, b"obstruction").unwrap();
+        let mut monitor = test_monitor(parent.join("state.json"));
+        let tick = monitor.maybe_write_state(PressureLevel::Green, 70.0, "/", 0, 0, 0, "enforce");
+        assert!(tick.state_write_failed);
+        assert!(tick.state_write_errno.is_some());
+        assert_ne!(tick.state_write_errno, Some(libc::ENOSPC));
+        monitor.state_file_path = directory.path().join("state.json");
+        monitor.force_next_write();
+        let recovered =
+            monitor.maybe_write_state(PressureLevel::Green, 70.0, "/", 0, 0, 0, "enforce");
+        assert!(!recovered.state_write_failed);
+        assert_eq!(recovered.state_write_errno, None);
     }
 
     #[test]

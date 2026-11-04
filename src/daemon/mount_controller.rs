@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::burst::ReserveMethod;
+use crate::monitor::inode_pressure::InodePressureEvidence;
 use crate::monitor::pid::PressureLevel;
 use crate::monitor::ram_scratch::SwapReclaimPressure;
 
@@ -774,6 +775,10 @@ pub struct MountStateRecord {
     /// mount's level. The filesystem's real free percentage is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backing_pressure: Option<SwapReclaimPressure>,
+    /// Independent finite inode evidence. Null means unavailable or disabled;
+    /// the byte free-space percentage remains unchanged.
+    #[serde(default)]
+    pub inode_pressure: Option<InodePressureEvidence>,
     /// Seconds until an idle mount rescans on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rescan_in_secs: Option<u64>,
@@ -798,6 +803,7 @@ impl MountController {
             level: format!("{:?}", self.level).to_lowercase(),
             urgency: self.urgency,
             backing_pressure: None,
+            inode_pressure: None,
             rescan_in_secs: self
                 .idle_until
                 .map(|until| until.saturating_duration_since(now).as_secs()),
@@ -1368,6 +1374,7 @@ mod tests {
                 level: level.to_string(),
                 urgency: 0.5,
                 backing_pressure: None,
+                inode_pressure: None,
                 rescan_in_secs: None,
                 reclaim_capability: capability,
                 reserve_state: reserve.map(|present_bytes| ReserveState {

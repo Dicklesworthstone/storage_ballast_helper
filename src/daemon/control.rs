@@ -310,7 +310,10 @@ impl ControlCommand {
                     }
                 };
                 let force = match args.get("force") {
-                    None => false,
+                    // Existing dashboard and CLI requests omit arguments
+                    // and mean the immediate SIGUSR1-style full scan.
+                    // A new selected scope observes pacing unless forced.
+                    None => paths.is_empty(),
                     Some(value) => value
                         .as_bool()
                         .ok_or_else(|| bad("scan-now: force must be a boolean".to_string()))?,
@@ -907,6 +910,20 @@ mod tests {
                 force: true
             }
         );
+        for (args, paths, force) in [
+            (json!({}), Vec::new(), true),
+            (json!({"force": false}), Vec::new(), false),
+            (
+                json!({"paths": ["/selected"]}),
+                vec![PathBuf::from("/selected")],
+                false,
+            ),
+        ] {
+            assert_eq!(
+                ControlCommand::parse(&req("scan-now", args)).unwrap(),
+                ControlCommand::ScanNow { paths, force },
+            );
+        }
         assert_eq!(
             ControlCommand::parse(&req("policy", json!({"action": "promote"}))).unwrap(),
             ControlCommand::Policy(PolicyAction::Promote)

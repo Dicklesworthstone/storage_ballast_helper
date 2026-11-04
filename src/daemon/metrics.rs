@@ -258,7 +258,47 @@ pub fn render(state: &DaemonState, git_sha: &str) -> String {
         "0.99 quantile of used-bytes growth per reaction window on the mount.",
         "gauge",
     );
+    let mut inode_known = Family::new(
+        "sbh_mount_inode_accounting_known",
+        "1 when finite inode pressure accounting is available and enabled, 0 when unknown or disabled.",
+        "gauge",
+    );
+    let mut inode_total = Family::new(
+        "sbh_mount_inodes_total",
+        "Finite inode capacity; absent when inode accounting is unknown or disabled.",
+        "gauge",
+    );
+    let mut inode_available = Family::new(
+        "sbh_mount_inodes_available",
+        "Inodes available to an ordinary caller; absent when accounting is unknown or disabled.",
+        "gauge",
+    );
+    let mut inode_ratio = Family::new(
+        "sbh_mount_inode_free_ratio",
+        "Available inodes as a fraction of finite inode capacity, independent of byte capacity.",
+        "gauge",
+    );
+    let mut inode_level = Family::new(
+        "sbh_mount_inode_pressure_level",
+        "1 for the independent inode pressure level, 0 for the others; absent without accounting.",
+        "gauge",
+    );
     for record in &state.mount_controllers {
+        inode_known.sample(
+            &[("mount", &record.mount)],
+            u8::from(record.inode_pressure.is_some()),
+        );
+        if let Some(inodes) = &record.inode_pressure {
+            inode_total.sample(&[("mount", &record.mount)], inodes.total);
+            inode_available.sample(&[("mount", &record.mount)], inodes.available);
+            inode_ratio.sample(&[("mount", &record.mount)], finite(inodes.free_pct / 100.0));
+            for name in PRESSURE_LEVELS {
+                inode_level.sample(
+                    &[("mount", &record.mount), ("level", name)],
+                    u8::from(inodes.level.eq_ignore_ascii_case(name)),
+                );
+            }
+        }
         let capability_name = serde_plain_name(&record.reclaim_capability);
         for name in [
             "configured",
@@ -296,6 +336,11 @@ pub fn render(state: &DaemonState, git_sha: &str) -> String {
     families.push(quarantined);
     families.push(reserve_recommended);
     families.push(burst_q99);
+    families.push(inode_known);
+    families.push(inode_total);
+    families.push(inode_available);
+    families.push(inode_ratio);
+    families.push(inode_level);
 
     let mut ballast_files = Family::new(
         "sbh_ballast_files",
@@ -667,6 +712,7 @@ mod tests {
                 level: "orange".to_string(),
                 urgency: 0.87,
                 backing_pressure: None,
+                inode_pressure: None,
                 rescan_in_secs: Some(20),
                 reclaim_capability: ReclaimCapability::Configured,
                 reserve_state: Some(ReserveState {
@@ -760,6 +806,38 @@ mod tests {
             "sbh_thread_up{thread=\"scanner\"} 1\n",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in\n{text}");
+        }
+    }
+
+    #[test]
+    fn inode_metrics_preserve_byte_metrics_and_distinguish_unknown_from_zero() {
+        use crate::core::config::InodePressureConfig;
+        use crate::monitor::inode_pressure::classify_inode_pressure;
+        use crate::monitor::pid::PressureLevel;
+        use crate::platform::pal::InodeStats;
+
+        let mut state = sample_state();
+        let unknown = render(&state, "fixture");
+        assert!(unknown.contains("sbh_mount_inode_accounting_known{mount=\"/data\"} 0\n"));
+        assert!(!unknown.contains("sbh_mount_inodes_available{mount=\"/data\"}"));
+        state.mount_controllers[0].inode_pressure = classify_inode_pressure(
+            InodeStats::new(1000, 0, 0).unwrap(),
+            &InodePressureConfig::default(),
+            PressureLevel::Green,
+        );
+        let text = render(&state, "fixture");
+        validate_exposition(&text).unwrap();
+        for expected in [
+            "sbh_mount_inode_accounting_known{mount=\"/data\"} 1\n",
+            "sbh_mount_inodes_total{mount=\"/data\"} 1000\n",
+            "sbh_mount_inodes_available{mount=\"/data\"} 0\n",
+            "sbh_mount_inode_free_ratio{mount=\"/data\"} 0\n",
+            "sbh_mount_inode_pressure_level{mount=\"/data\",level=\"critical\"} 1\n",
+            "sbh_mount_inode_pressure_level{mount=\"/data\",level=\"green\"} 0\n",
+            "sbh_mount_free_ratio{mount=\"/data\"} 0.125\n",
+            "sbh_mount_fill_rate_bytes_per_second{mount=\"/data\"} 2048.5\n",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}");
         }
     }
 

@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 
 use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
-use crate::core::config::{Config, ScannerConfig, ScannerEngineMode};
+use crate::core::config::{Config, InodePressureConfig, ScannerConfig, ScannerEngineMode};
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::compress_tier::{CompressTier, CompressionFirst};
 use crate::daemon::control::{
@@ -38,6 +38,7 @@ use crate::daemon::control::{
 };
 use crate::daemon::coverage::{UNCOVERED_REFRESH_INTERVAL, uncovered_mount_levels};
 use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD, PassCpuGuard, paced_pct};
+use crate::daemon::inode_reclaim::InodeReclaimRequest;
 use crate::daemon::mount_controller::{
     IdleReason, MountController, MountControllerConfig, MountState, MountStateRecord, MountSurface,
     MountTickInput, ReserveBurst, ReserveState, WakeSignals, global_tick,
@@ -50,6 +51,7 @@ use crate::daemon::policy::{
 use crate::daemon::process_io_history::ProcessIoHistory;
 use crate::daemon::ram_reclaim::RamReclaimRequest;
 use crate::daemon::rch_staging::RchStagingTier;
+use crate::daemon::scan_now::{ScanNowClaim, ScanNowQueue, ScanNowScope};
 use crate::daemon::self_monitor::{
     DaemonLock, LoggingState, MountPressure, MountRateState, PolicyStateRecord, SelfMonitor,
     SelfMonitorTick, ThreadHeartbeat, ThreadState, ThreadStatus, ThreadsState,
@@ -70,6 +72,7 @@ use crate::monitor::guardrails::{
     AdaptiveGuard, CalibrationObservation, DeletionFailureMonitor, GuardDiagnostics, GuardStatus,
     PredictionScorecard,
 };
+use crate::monitor::inode_pressure::{InodePressureEvidence, classify_inode_pressure};
 use crate::monitor::pid::{
     PidConfig, PidPressureController, PressureLevel, PressureReading, PressureResponse,
 };
@@ -225,6 +228,10 @@ struct SharedExecutorConfig {
     /// Physical None/IdentifyOnly cells forbid ordinary deletion even when
     /// swap pressure selects a cleanup-capable global behavior cell.
     ram_reclaim_blocks_ordinary_deletion: AtomicBool,
+    /// Live inode policy revokes queued relief after configuration changes.
+    inode_pressure: RwLock<InodePressureConfig>,
+    /// Inode relief cannot borrow RAM's exception to a memory/behavior hold.
+    inode_cleanup_enabled: AtomicBool,
     /// Layer 7: Green batches quarantine instead of removing.
     quarantine_enabled: AtomicBool,
     quarantine_ttl_secs: AtomicU64,
@@ -256,6 +263,8 @@ impl SharedExecutorConfig {
             min_certainty_rank: AtomicU8::new(ArtifactCertainty::Unclear.rank()),
             ram_reclaim_certainty_floor: AtomicU8::new(ArtifactCertainty::Unclear.rank()),
             ram_reclaim_blocks_ordinary_deletion: AtomicBool::new(false),
+            inode_pressure: RwLock::new(InodePressureConfig::default()),
+            inode_cleanup_enabled: AtomicBool::new(true),
             quarantine_enabled: AtomicBool::new(quarantine_enabled),
             quarantine_ttl_secs: AtomicU64::new(quarantine_ttl_secs),
             reclaim_events: AtomicU64::new(0),
@@ -289,11 +298,17 @@ impl SharedExecutorConfig {
         }));
     }
 
-    fn authorize_dispatch(&self, ram_reclaim: bool) -> std::result::Result<(), SkipReason> {
-        if !ram_reclaim
-            && self
-                .ram_reclaim_blocks_ordinary_deletion
-                .load(Ordering::Acquire)
+    fn authorize_dispatch(
+        &self,
+        ram_reclaim: bool,
+        inode_reclaim: bool,
+    ) -> std::result::Result<(), SkipReason> {
+        if (inode_reclaim && !self.inode_cleanup_enabled.load(Ordering::Acquire))
+            || (!ram_reclaim
+                && !inode_reclaim
+                && self
+                    .ram_reclaim_blocks_ordinary_deletion
+                    .load(Ordering::Acquire))
         {
             Err(SkipReason::PolicyChanged)
         } else {
@@ -709,6 +724,9 @@ pub struct ScanRequest {
     /// Explicit operator/service request that must reconcile the configured roots
     /// even when v2 has no dirty event roots under green/yellow pressure.
     pub force_full_scan: bool,
+    /// Revocable authority for selected operator paths. Full reconciliation
+    /// and bypassing scan pacing remain separate choices for these requests.
+    pub scan_now: Option<Arc<ScanNowScope>>,
     /// When config is reloaded, this carries the updated scoring and scanner config.
     pub config_update: Option<(
         crate::core::config::ScoringConfig,
@@ -728,6 +746,74 @@ pub struct ScanRequest {
     /// Swap-driven relief on one already-admitted tmpfs filesystem. Its finite
     /// allowance is shared by every batch from this request.
     pub ram_reclaim: Option<RamReclaimRequest>,
+    /// Finite exact-device inode relief; never a substitute byte target.
+    pub inode_reclaim: Option<InodeReclaimRequest>,
+}
+
+impl ScanRequest {
+    fn has_resource_reclaim(&self) -> bool {
+        self.ram_reclaim.is_some() || self.inode_reclaim.is_some()
+    }
+
+    fn permits_reclaim_path(&self, path: &Path) -> bool {
+        self.ram_reclaim
+            .as_ref()
+            .is_none_or(|relief| relief.contains_path(path))
+            && self
+                .inode_reclaim
+                .as_ref()
+                .is_none_or(|relief| relief.contains_path(path))
+            && self
+                .scan_now
+                .as_ref()
+                .is_none_or(|scope| scope.contains_path(path))
+    }
+
+    fn permits_reclaim_candidate(&self, candidate: &CandidacyScore) -> bool {
+        self.ram_reclaim
+            .as_ref()
+            .is_none_or(|relief| relief.accepts_candidate(candidate))
+            && self
+                .inode_reclaim
+                .as_ref()
+                .is_none_or(|relief| relief.accepts_candidate(candidate))
+            && self
+                .scan_now
+                .as_ref()
+                .is_none_or(|scope| scope.accepts_candidate(candidate))
+    }
+}
+
+impl ScanRequest {
+    fn bypass_scan_pacing(&self) -> bool {
+        self.force_full_scan
+            && self.inode_reclaim.is_none()
+            && self.scan_now.as_ref().is_none_or(|scope| scope.force())
+    }
+}
+
+/// Emergency automatic work keeps priority. A healthy ordinary request may
+/// wait across one operator pass, then runs before another operator claim.
+fn ready_scanner_request(
+    scan_rx: &Receiver<ScanRequest>,
+    queue: Option<&Arc<Mutex<ScanNowQueue>>>,
+    deferred: &mut Option<ScanRequest>,
+) -> (Option<ScanRequest>, Option<ScanNowClaim>) {
+    let routine = scan_rx.try_recv().ok();
+    if routine.as_ref().is_some_and(|request| {
+        request.config_update.is_some() || request.pressure_level >= PressureLevel::Red
+    }) {
+        return (routine, None);
+    }
+    if let Some(request) = deferred.take() {
+        *deferred = routine;
+        return (Some(request), None);
+    }
+    if let Some(claim) = queue.and_then(|queue| ScanNowClaim::take(queue, Instant::now())) {
+        *deferred = routine;
+        return (Some(claim.request()), Some(claim));
+    }
+    (routine, None)
 }
 
 /// How a long startup step keeps a `Type=notify` unit from timing out.
@@ -829,7 +915,7 @@ fn empty_pass_cooldown_active(
     if cooldown.is_zero() {
         return false;
     }
-    if request.force_full_scan
+    if request.bypass_scan_pacing()
         || request.config_update.is_some()
         || request.free_pct.is_none()
         || request.maintenance
@@ -982,7 +1068,8 @@ fn duty_cycle_defer_active(
     request: &ScanRequest,
     pct: u8,
 ) -> bool {
-    if request.force_full_scan || request.config_update.is_some() || request.free_pct.is_none() {
+    if request.bypass_scan_pacing() || request.config_update.is_some() || request.free_pct.is_none()
+    {
         return false;
     }
     let debt = duty_cycle_idle_debt(last_pass_duration, pct);
@@ -1084,6 +1171,9 @@ fn scan_reason_for_request(request: &ScanRequest) -> &'static str {
     if request.maintenance {
         return "maintenance";
     }
+    if request.scan_now.is_some() {
+        return "operator";
+    }
     if request.force_full_scan {
         return "forced";
     }
@@ -1115,10 +1205,14 @@ pub struct DeletionBatch {
     pub candidates: Vec<CandidacyScore>,
     pub pressure_level: PressureLevel,
     pub urgency: f64,
+    /// The original operator scope survives queue waits and config reloads.
+    pub scan_now: Option<Arc<ScanNowScope>>,
     /// W1 planner: the byte target of the pass that produced the batch.
     pub target_bytes: Option<u64>,
     /// Renewed at each mutation boundary; never authorizes unrelated filesystems.
     pub ram_reclaim: Option<RamReclaimRequest>,
+    /// All batches share the inode pass's finite successful-artifact allowance.
+    pub inode_reclaim: Option<InodeReclaimRequest>,
     /// Set by the target-only tier alone (bd-232u): the resolved
     /// `scanner.target_only_roots` root whose pure, idle cargo target dirs
     /// the batch holds. The executor drops any candidate that is not strictly
@@ -1188,6 +1282,12 @@ enum MainLoopCommand {
     Wake,
     /// Write `state.json` on this tick and answer when it is on disk.
     WriteState(Sender<()>),
+    /// Validate and retain a live operator scan under the current config.
+    ScanNow {
+        paths: Vec<PathBuf>,
+        force: bool,
+        reply: Sender<ControlResponse>,
+    },
     /// Release or replenish ballast through the coordinator.
     Ballast {
         action: ControlBallastAction,
@@ -1279,6 +1379,29 @@ impl DaemonControlBackend {
         }
     }
 
+    fn scan_now(&self, paths: Vec<PathBuf>, force: bool) -> ControlResponse {
+        let (reply_tx, reply_rx) = bounded(1);
+        if self
+            .control_tx
+            .try_send(MainLoopCommand::ScanNow {
+                paths,
+                force,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return ControlResponse::failure("busy", "the main loop command queue is full");
+        }
+        reply_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| {
+                ControlResponse::failure(
+                    "timeout",
+                    "the main loop did not accept the scan request within 10 s",
+                )
+            })
+    }
+
     fn explain(&self, id: &str) -> ControlResponse {
         let ledger = match crate::logger::sqlite::SqliteLogger::open_read_only(&self.sqlite_db) {
             Ok(ledger) => ledger,
@@ -1350,11 +1473,8 @@ impl ControlBackend for DaemonControlBackend {
             })),
             ControlCommand::Status => self.status(),
             ControlCommand::ScanNow { paths, force } => {
-                if !paths.is_empty() {
-                    return ControlResponse::failure(
-                        "bad_request",
-                        "scan-now: per-path scans are not supported yet; the forced scan covers the configured roots",
-                    );
+                if !paths.is_empty() || !force {
+                    return self.scan_now(paths, force);
                 }
                 self.signal_handler.request_scan();
                 self.wake();
@@ -1722,6 +1842,8 @@ struct MountMonitor {
     /// Swap has its own capacity and percentage thresholds. Disk byte floors,
     /// forecasts and filesystem fill-rate observations never apply to it.
     swap_pressure_controller: PidPressureController,
+    /// Inode hysteresis is independent of bytes, forecasts and swap.
+    inode_pressure_level: PressureLevel,
     guard: AdaptiveGuard,
     last_guard_sample: Option<GuardSample>,
     /// Conformal calibration of the time-to-red forecast.
@@ -1740,6 +1862,9 @@ struct MountTickResponse {
     backing_pressure: Option<SwapReclaimPressure>,
     /// Scoped, bounded authority carried through the scanner and executor.
     ram_reclaim: Option<RamReclaimRequest>,
+    /// Current finite inode counters; bytes retain their original meaning.
+    inode_pressure: Option<InodePressureEvidence>,
+    inode_reclaim: Option<InodeReclaimRequest>,
     seconds_to_red: Option<f64>,
     prediction_confident: bool,
     /// The predictive policy put this mount itself in imminent danger this
@@ -2109,6 +2234,7 @@ impl MountMonitor {
             rate_estimator,
             pressure_controller,
             swap_pressure_controller: Self::swap_controller(config),
+            inode_pressure_level: PressureLevel::Green,
             guard: AdaptiveGuard::new(guard_config),
             last_guard_sample: None,
             conformal: ConformalCalibrator::new(conformal_config(config)),
@@ -2152,6 +2278,7 @@ impl MountMonitor {
         });
         self.swap_pressure_controller
             .set_base_poll_interval(Duration::from_millis(config.pressure.poll_interval_ms));
+        self.inode_pressure_level = PressureLevel::Green;
 
         if config.pressure.prediction.enabled {
             self.pressure_controller
@@ -2378,6 +2505,8 @@ pub struct MonitoringDaemon {
     /// When a SIGUSR1 scan the full scan queue could not take yet arrived;
     /// it is retried every tick until queued.
     forced_scan_pending_since: Option<Instant>,
+    /// Accepted operator work cannot be replaced by routine pressure scans.
+    scan_now_queue: Arc<Mutex<ScanNowQueue>>,
     /// Rate-limit for the B5 "pressured device has no root_path" warning so the
     /// back-off path does not spam logs on every tick.
     last_device_affinity_warn: Option<Instant>,
@@ -2790,6 +2919,9 @@ fn effective_scan_budget(config: &ScannerConfig, pressure_level: PressureLevel) 
 }
 
 fn v2_pressure_candidate_byte_target(request: &ScanRequest) -> Option<u64> {
+    if request.inode_reclaim.is_some() {
+        return None;
+    }
     if request.pressure_level < PressureLevel::Orange || request.max_delete_batch == 0 {
         return None;
     }
@@ -2859,7 +2991,7 @@ impl EventPassTemplates {
             // A fresh backing-pressure observation authorizes only its
             // bounded pass. Do not retain a stale Green template for this
             // scope or turn this request into unbounded idle event work.
-            if request.ram_reclaim.is_some() {
+            if request.has_resource_reclaim() {
                 continue;
             }
             if let Some(root) = configured
@@ -2916,6 +3048,8 @@ impl EventPassTemplates {
                 free_pct: template.free_pct,
                 max_delete_batch: template.max_delete_batch,
                 force_full_scan: false,
+                scan_now: None,
+                inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
                 maintenance: false,
@@ -3426,7 +3560,7 @@ fn behavior_table_from_config(config: &Config) -> BehaviorDispatchTable {
 /// `MostPromisingCandidates` (Orange) also accept `Likely`; `AnyDefiniteCandidate`
 /// (Red/Critical) dispatches every `Delete` verdict. `None`/`IdentifyOnly`
 /// never dispatch (their batch limit is zero), so their gate is moot.
-const fn min_certainty_for(action: CleanupAction) -> ArtifactCertainty {
+pub(super) const fn min_certainty_for(action: CleanupAction) -> ArtifactCertainty {
     match action {
         CleanupAction::None
         | CleanupAction::IdentifyOnly
@@ -3457,14 +3591,14 @@ fn behavior_allows_scan(mode: BehaviorMode) -> bool {
     mode.scan_aggressiveness != ScanAggressiveness::Skip
 }
 
-fn behavior_allows_delete_dispatch(mode: BehaviorMode) -> bool {
+pub(super) fn behavior_allows_delete_dispatch(mode: BehaviorMode) -> bool {
     !matches!(
         mode.cleanup_action,
         CleanupAction::None | CleanupAction::IdentifyOnly
     )
 }
 
-fn behavior_delete_batch_limit(mode: BehaviorMode, configured_limit: usize) -> usize {
+pub(super) fn behavior_delete_batch_limit(mode: BehaviorMode, configured_limit: usize) -> usize {
     if behavior_allows_delete_dispatch(mode) {
         configured_limit
     } else {
@@ -3884,6 +4018,7 @@ impl MonitoringDaemon {
             config.scoring.batch_risk_budget_by_level,
             config.scoring.false_positive_loss,
         );
+        *shared_executor_config.inode_pressure.write() = config.pressure.inodes.clone();
         let compress_tier =
             CompressTier::with_first(Arc::clone(&shared_executor_config.compression_first));
 
@@ -4003,6 +4138,7 @@ impl MonitoringDaemon {
             swap_thrash_active: false,
             last_scan_channel_warn: None,
             forced_scan_pending_since: None,
+            scan_now_queue: Arc::new(Mutex::new(ScanNowQueue::default())),
             scan_channel_warn_suppressed: 0,
             last_device_affinity_warn: None,
             attribution_reported: HashMap::new(),
@@ -4280,6 +4416,10 @@ impl MonitoringDaemon {
             }
             BehaviorUpdate::Deferred { repeated: true, .. } | BehaviorUpdate::Unchanged => {}
         }
+        self.shared_executor_config.inode_cleanup_enabled.store(
+            behavior_allows_delete_dispatch(self.behavior_state.mode),
+            Ordering::Release,
+        );
     }
 
     fn drain_memory_pressure_events(
@@ -4482,6 +4622,42 @@ impl MonitoringDaemon {
                     self.self_monitor.force_next_write();
                     self.pending_state_replies.push(reply);
                 }
+                MainLoopCommand::ScanNow {
+                    paths,
+                    force,
+                    reply,
+                } => {
+                    let scopes = ScanNowScope::capture(&paths, force, &self.config.scanner)
+                        .and_then(|scope| {
+                            scope.partition(|path| {
+                                self.fs_collector
+                                    .collect(path)
+                                    .ok()
+                                    .map(|stats| stats.mount_point)
+                            })
+                        });
+                    let response = match scopes {
+                        Ok(scopes) => {
+                            let paths: Vec<PathBuf> =
+                                scopes.iter().flat_map(ScanNowScope::paths).collect();
+                            let enqueued = self
+                                .scan_now_queue
+                                .lock()
+                                .enqueue(scopes, CONTROL_CHANNEL_CAP);
+                            match enqueued {
+                                Ok(()) => ControlResponse::success(json!({
+                                    "queued": true,
+                                    "paths": paths,
+                                    "force": force,
+                                    "note": "the selected paths will be reconciled under current filesystem pressure and safety policy",
+                                })),
+                                Err(error) => ControlResponse::failure("busy", error),
+                            }
+                        }
+                        Err(error) => ControlResponse::failure("bad_request", error),
+                    };
+                    let _ = reply.try_send(response);
+                }
                 MainLoopCommand::Ballast { action, reply } => {
                     let result = self.execute_ballast_action(&action);
                     let _ = reply.try_send(result);
@@ -4668,6 +4844,60 @@ impl MonitoringDaemon {
         eprintln!("{payload}");
     }
 
+    /// Only the atomic destination directory's own current inode shortage can
+    /// explain an ENOSPC state-write failure. A pressured neighbor, a stale
+    /// controller level or a state-file symlink target is not this evidence.
+    fn state_write_has_inode_pressure(&self, tick: SelfMonitorTick) -> bool {
+        if !tick.state_write_failed || tick.state_write_errno != Some(libc::ENOSPC) {
+            return false;
+        }
+        let Some(parent) = self.self_monitor.state_file_path().parent() else {
+            return false;
+        };
+        let Ok(resolved) = std::fs::canonicalize(parent) else {
+            return false;
+        };
+        if !resolved.is_dir() {
+            return false;
+        }
+        let Ok(identity) = crate::scanner::walker::identity_for_path(&resolved, false) else {
+            return false;
+        };
+        let Ok(stats) = self.platform.fs_stats(&resolved) else {
+            return false;
+        };
+        if stats.is_readonly
+            || !std::fs::metadata(&stats.mount_point).is_ok_and(|metadata| {
+                crate::scanner::walker::device_id(&metadata) == identity.device_id
+            })
+        {
+            return false;
+        }
+        let Some(evidence) = self
+            .platform
+            .inode_stats(&resolved)
+            .ok()
+            .flatten()
+            .and_then(|sample| {
+                classify_inode_pressure(sample, &self.config.pressure.inodes, PressureLevel::Green)
+            })
+        else {
+            return false;
+        };
+        evidence.pressure_level() >= PressureLevel::Red
+            && std::fs::canonicalize(parent).ok().as_ref() == Some(&resolved)
+            && crate::scanner::walker::identity_for_path(&resolved, false).ok() == Some(identity)
+    }
+
+    fn note_state_write_failure(&self, tick: SelfMonitorTick) {
+        if tick.state_write_failed {
+            let inode_pressure = self.state_write_has_inode_pressure(tick);
+            self.policy_engine
+                .lock()
+                .note_serialization_failure(inode_pressure);
+        }
+    }
+
     // One tick's worth of bookkeeping in program order; splitting it would
     // only scatter the state-file fields it fills.
     #[allow(clippy::too_many_lines)]
@@ -4805,6 +5035,11 @@ impl MonitoringDaemon {
                 .iter()
                 .find(|tick| tick.response.causing_mount == mount)
                 .and_then(|tick| tick.backing_pressure);
+            record.inode_pressure = self
+                .mount_responses
+                .iter()
+                .find(|tick| tick.response.causing_mount == mount)
+                .and_then(|tick| tick.inode_pressure.clone());
             let quarantined_bytes = self.quarantine_held.get(&mount).copied().unwrap_or(0);
             let Some(pool) = inventory
                 .iter()
@@ -5023,6 +5258,7 @@ impl MonitoringDaemon {
                         message: format!("pressure check failed: {e}"),
                     });
                     // On error, sleep and retry.
+                    self.refresh_operator_scans(&[]);
                     self.sleep_with_memory_pressure_events(
                         &memory_pressure_rx,
                         self.last_pressure_level,
@@ -5035,6 +5271,11 @@ impl MonitoringDaemon {
             // actual filesystem response for all-root forced scans and their
             // retries; swap relief has its own narrower request authority.
             let forced_scan_response = self.worst_filesystem_response();
+            let operator_scan_responses: Vec<PressureResponse> = self
+                .mount_responses
+                .iter()
+                .map(|tick| tick.filesystem_response.clone())
+                .collect();
             self.watchdog.maybe_notify("pressure checked");
 
             // 4. Log pressure transitions.
@@ -5088,9 +5329,7 @@ impl MonitoringDaemon {
             // Evidence that cannot be persisted must not keep driving
             // deletions: the policy engine decides what a failed state
             // write means (`policy.serialization_failure_action`).
-            if self_monitor_tick.state_write_failed {
-                self.policy_engine.lock().note_serialization_failure();
-            }
+            self.note_state_write_failure(self_monitor_tick);
             if self_monitor_tick.should_exit_for_rss_hard_limit() {
                 shutdown_result = Err(self.rss_hard_limit_error(self_monitor_tick));
                 break;
@@ -5235,6 +5474,7 @@ impl MonitoringDaemon {
             // 9. Forced scan signal (SIGUSR1). Also wakes idle mounts next tick.
             // A full scan queue defers it to the next tick instead of
             // dropping it.
+            self.refresh_operator_scans(&operator_scan_responses);
             if self.signal_handler.should_scan() {
                 if self.forced_scan_pending_since.is_none()
                     && !Self::trigger_forced_scan(
@@ -5622,8 +5862,25 @@ impl MonitoringDaemon {
             }
             let filesystem_response = response.clone();
 
+            let inode_pressure = self
+                .platform
+                .inode_stats(&mount_path)
+                .ok()
+                .flatten()
+                .and_then(|sample| {
+                    classify_inode_pressure(
+                        sample,
+                        &self.config.pressure.inodes,
+                        monitor.inode_pressure_level,
+                    )
+                });
+            monitor.inode_pressure_level = inode_pressure
+                .as_ref()
+                .map_or(PressureLevel::Green, InodePressureEvidence::pressure_level);
+
             let mut backing_pressure = None;
             let mut ram_reclaim = None;
+            let mut inode_reclaim = None;
             if let Some((pressure, device_id)) = backing_candidate {
                 monitor.swap_pressure_controller.freeze_integral(frozen);
                 let backing_response = monitor.swap_pressure_controller.update(
@@ -5657,6 +5914,53 @@ impl MonitoringDaemon {
                 // Recovery or lost evidence revokes backing-only authority
                 // immediately, without retaining an old PID Critical level.
                 monitor.swap_pressure_controller = MountMonitor::swap_controller(&self.config);
+            }
+
+            if let Some(pressure) = &inode_pressure
+                && pressure.pressure_level() > response.level
+                && pressure.available < pressure.target_available
+                && !stats.is_readonly
+                && let Ok(metadata) = std::fs::symlink_metadata(&mount_path)
+                && metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+            {
+                let level = pressure.pressure_level();
+                let row = crate::monitor::pid::level_response(level);
+                let interval = match row.interval {
+                    crate::monitor::pid::IntervalRule::Divide { by, floor_ms } => {
+                        Duration::from_millis(
+                            (self.config.pressure.poll_interval_ms / by.max(1)).max(floor_ms),
+                        )
+                    }
+                    crate::monitor::pid::IntervalRule::Fixed { ms } => Duration::from_millis(ms),
+                };
+                let urgency: f64 = match level {
+                    PressureLevel::Green => 0.0,
+                    PressureLevel::Yellow => 0.25,
+                    PressureLevel::Orange => 0.5,
+                    PressureLevel::Red => 0.75,
+                    PressureLevel::Critical => 1.0,
+                };
+                response.level = level;
+                response.urgency = response.urgency.max(urgency);
+                response.scan_interval = response.scan_interval.min(interval);
+                response.max_delete_batch = response.max_delete_batch.max(row.batch_base);
+                response.release_ballast_files = 0;
+                // One resource permission per pass. Inode relief uses actual
+                // inode recovery and a finite artifact count, never swap bytes.
+                ram_reclaim = None;
+                backing_pressure = None;
+                inode_reclaim = Some(InodeReclaimRequest::new(
+                    mount_path.clone(),
+                    crate::scanner::walker::device_id(&metadata),
+                    pressure.total,
+                    pressure.target_available,
+                    response
+                        .max_delete_batch
+                        .min(self.config.scanner.max_delete_batch),
+                    &self.config.pressure.inodes,
+                    &self.config.scanner.root_paths,
+                ));
             }
 
             // Evaluate predictive policy with full confidence/trend gating.
@@ -5694,12 +5998,14 @@ impl MonitoringDaemon {
                 now,
                 stats.total_bytes.saturating_sub(stats.available_bytes),
             );
-            self.note_logging_mount_level(&mount_path, response.level);
+            self.note_logging_mount_level(&mount_path, filesystem_response.level);
             self.mount_responses.push(MountTickResponse {
                 response: response.clone(),
                 filesystem_response,
                 backing_pressure,
                 ram_reclaim,
+                inode_pressure,
+                inode_reclaim,
                 seconds_to_red: predicted_seconds,
                 prediction_confident: rate_estimate.confidence >= effective_min_conf,
                 imminent_danger,
@@ -5745,7 +6051,7 @@ impl MonitoringDaemon {
         let backing_raised_pressure = self
             .mount_responses
             .iter()
-            .any(|tick| tick.ram_reclaim.is_some());
+            .any(|tick| tick.ram_reclaim.is_some() || tick.inode_reclaim.is_some());
         self.ram_reclaim_behavior = if backing_raised_pressure {
             RamReclaimBehavior::BackingPressure
         } else if self.ram_reclaim_behavior != RamReclaimBehavior::FilesystemOnly
@@ -5914,7 +6220,8 @@ impl MonitoringDaemon {
             // Disk caches cannot relieve a tmpfs backing-store shortage.
             // The observer's list of RAM mounts is never a source of new
             // cleanup roots, and cross_devices cannot widen this request.
-            let cross_device_fallback = cross_device_fallback && tick.ram_reclaim.is_none();
+            let cross_device_fallback =
+                cross_device_fallback && tick.ram_reclaim.is_none() && tick.inode_reclaim.is_none();
             let roots_here: Vec<PathBuf> = root_mounts
                 .iter()
                 .filter(|(_, root_mount)| root_mount.as_deref() == Some(mount.as_path()))
@@ -5935,6 +6242,7 @@ impl MonitoringDaemon {
             let catalog = if roots_here.is_empty()
                 && !cross_device_fallback
                 && tick.ram_reclaim.is_none()
+                && tick.inode_reclaim.is_none()
                 && self.config.scanner.catalog_roots_on_pressured_device
             {
                 self.catalog_roots_for(&mount, now)
@@ -5944,7 +6252,7 @@ impl MonitoringDaemon {
             let surface = MountSurface {
                 configured_roots: roots_here.len(),
                 catalog_roots: catalog.len(),
-                ballast_pool: has_pool,
+                ballast_pool: has_pool && tick.inode_reclaim.is_none(),
                 cross_device_fallback,
             };
             let recovery_needed = self.pending_recovery.remove(&mount);
@@ -6001,6 +6309,21 @@ impl MonitoringDaemon {
                     eprintln!("[SBH-RAM-RECLAIM] {message}");
                     self.logger_handle.send(ActivityEvent::Info { message });
                 }
+                if tick.inode_reclaim.is_some()
+                    && let Some(pressure) = &tick.inode_pressure
+                {
+                    let message = format!(
+                        "inode pressure on {}: available={}/{} ({:.2}%), filesystem bytes {:.1}% free; definite-artifact relief stops at {} available inodes",
+                        mount.display(),
+                        pressure.available,
+                        pressure.total,
+                        pressure.free_pct,
+                        tick.response.free_pct,
+                        pressure.target_available,
+                    );
+                    eprintln!("[SBH-INODE-RECLAIM] {message}");
+                    self.logger_handle.send(ActivityEvent::Info { message });
+                }
             }
             if decision
                 .transition
@@ -6017,12 +6340,14 @@ impl MonitoringDaemon {
             // reserve. The provisioning floor keeps every refill outside the
             // first level that releases ballast, with the level hysteresis to
             // spare (#38), so a refill cannot push the mount into a release.
-            let replenish_level =
-                if tick.response.level == PressureLevel::Yellow && idle_with_nothing_to_reclaim {
-                    PressureLevel::Green
-                } else {
-                    tick.response.level
-                };
+            let replenish_level = if tick.response.level == PressureLevel::Yellow
+                && idle_with_nothing_to_reclaim
+                && tick.inode_reclaim.is_none()
+            {
+                PressureLevel::Green
+            } else {
+                tick.response.level
+            };
             self.release_controller
                 .observe_level(&mount, replenish_level);
 
@@ -6037,6 +6362,7 @@ impl MonitoringDaemon {
             // names only the most severe mount, and two mounts can fill at once.
             let release_here = release_ballast
                 && tick.ram_reclaim.is_none()
+                && tick.inode_reclaim.is_none()
                 && (behavior_should_release_ballast(
                     self.behavior_state
                         .table()
@@ -6064,6 +6390,7 @@ impl MonitoringDaemon {
                                     Vec::new(),
                                     Some(catalog),
                                     None,
+                                    None,
                                 ));
                             }
                         } else {
@@ -6084,6 +6411,7 @@ impl MonitoringDaemon {
                                 paths,
                                 None,
                                 tick.ram_reclaim.clone(),
+                                tick.inode_reclaim.clone(),
                             ));
                         }
                     }
@@ -6143,10 +6471,14 @@ impl MonitoringDaemon {
         // Ballast has already had first priority. Refresh existing holds even
         // when compression is disabled or stopping, so live emergencies also
         // release older batches scored at a lower pressure level.
-        let mount_levels: HashMap<PathBuf, PressureLevel> = self
-            .mount_controllers
+        let mount_levels: HashMap<PathBuf, PressureLevel> = responses
             .iter()
-            .map(|(mount, controller)| (mount.clone(), controller.level()))
+            .map(|tick| {
+                (
+                    tick.filesystem_response.causing_mount.clone(),
+                    tick.filesystem_response.level,
+                )
+            })
             .collect();
         self.shared_executor_config
             .compression_first
@@ -6159,21 +6491,30 @@ impl MonitoringDaemon {
         let sweep_due = self.quarantine_sweep_due(now);
         let attempted_emergency_sweep = self.sweep_quarantine_entries(
             responses.iter().filter(|tick| {
-                tick.response.level >= PressureLevel::Red && tick.ram_reclaim.is_none()
+                tick.response.level >= PressureLevel::Red
+                    && tick.ram_reclaim.is_none()
+                    && tick.inode_reclaim.is_none()
             }),
             &root_mounts,
             sweep_due,
         );
         let (emergency_scans, pending_scans): (Vec<_>, Vec<_>) = pending_scans
             .into_iter()
-            .partition(|(response, _, _, _)| response.level >= PressureLevel::Red);
-        for (response, paths, catalog, ram_reclaim) in emergency_scans {
+            .partition(|(response, _, _, _, _)| response.level >= PressureLevel::Red);
+        for (response, paths, catalog, ram_reclaim, inode_reclaim) in emergency_scans {
             if let Some(catalog) = catalog {
                 self.catalog_epochs
                     .insert(response.causing_mount.clone(), (response.level, now));
                 self.send_catalog_scan_request(scan_tx, scan_rx, response, catalog);
             } else {
-                self.send_scan_request(scan_tx, scan_rx, response, paths, ram_reclaim);
+                self.send_scan_request(
+                    scan_tx,
+                    scan_rx,
+                    response,
+                    paths,
+                    ram_reclaim,
+                    inode_reclaim,
+                );
             }
             self.last_tick_cleanup_ran = true;
         }
@@ -6194,7 +6535,9 @@ impl MonitoringDaemon {
 
         self.sweep_quarantines(
             responses.iter().filter(|tick| {
-                tick.response.level < PressureLevel::Red && tick.ram_reclaim.is_none()
+                tick.response.level < PressureLevel::Red
+                    && tick.ram_reclaim.is_none()
+                    && tick.inode_reclaim.is_none()
             }),
             &root_mounts,
             now,
@@ -6202,12 +6545,14 @@ impl MonitoringDaemon {
         if sweep_due && attempted_emergency_sweep {
             self.last_quarantine_sweep = Some(now);
         }
-        for (response, paths, catalog, ram_reclaim) in pending_scans {
-            if self.shared_executor_config.compression_first.defers_mount(
-                &response.causing_mount,
-                response.level,
-                Instant::now(),
-            ) {
+        for (response, paths, catalog, ram_reclaim, inode_reclaim) in pending_scans {
+            if inode_reclaim.is_none()
+                && self.shared_executor_config.compression_first.defers_mount(
+                    &response.causing_mount,
+                    response.level,
+                    Instant::now(),
+                )
+            {
                 continue;
             }
             if let Some(catalog) = catalog {
@@ -6216,7 +6561,14 @@ impl MonitoringDaemon {
                     .insert(response.causing_mount.clone(), (response.level, now));
                 self.send_catalog_scan_request(scan_tx, scan_rx, response, catalog);
             } else {
-                self.send_scan_request(scan_tx, scan_rx, response, paths, ram_reclaim);
+                self.send_scan_request(
+                    scan_tx,
+                    scan_rx,
+                    response,
+                    paths,
+                    ram_reclaim,
+                    inode_reclaim,
+                );
             }
             self.last_tick_cleanup_ran = true;
         }
@@ -6288,6 +6640,8 @@ impl MonitoringDaemon {
                         response.max_delete_batch,
                     ),
                     force_full_scan: false,
+                    scan_now: None,
+                    inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
                     maintenance: true,
@@ -6329,7 +6683,7 @@ impl MonitoringDaemon {
             // trigger. Without this, FallbackSafe at green is permanent.
             let in_fallback = self.policy_engine.lock().mode() == ActiveMode::FallbackSafe;
             if scan_allowed && (needs_scan || in_fallback) {
-                self.send_scan_request(scan_tx, scan_rx, response, root_paths, None);
+                self.send_scan_request(scan_tx, scan_rx, response, root_paths, None, None);
                 if needs_scan {
                     self.last_tick_cleanup_ran = true;
                 }
@@ -6888,6 +7242,7 @@ impl MonitoringDaemon {
         response: &crate::monitor::pid::PressureResponse,
         paths: Vec<PathBuf>,
         ram_reclaim: Option<RamReclaimRequest>,
+        inode_reclaim: Option<InodeReclaimRequest>,
     ) {
         // Under Green/Yellow pressure, skip enqueue entirely if the channel is
         // already full — a scan is already in progress and there's no urgency.
@@ -6907,7 +7262,7 @@ impl MonitoringDaemon {
             .as_ref()
             .map(RamReclaimRequest::remaining_bytes)
             .or_else(|| {
-                (response.level >= PressureLevel::Orange)
+                (inode_reclaim.is_none() && response.level >= PressureLevel::Orange)
                     .then(|| self.fs_collector.collect(&response.causing_mount).ok())
                     .flatten()
                     .map(|stats| {
@@ -6927,12 +7282,14 @@ impl MonitoringDaemon {
                 self.behavior_state.mode,
                 response.max_delete_batch,
             ),
-            force_full_scan: false,
+            force_full_scan: inode_reclaim.is_some(),
+            scan_now: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
             target_bytes,
             ram_reclaim,
+            inode_reclaim,
         };
         self.enqueue_scan_logged(scan_tx, scan_rx, response, request);
     }
@@ -6989,6 +7346,8 @@ impl MonitoringDaemon {
                 response.max_delete_batch,
             ),
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots,
             maintenance: false,
@@ -7043,6 +7402,62 @@ impl MonitoringDaemon {
     /// Queue the SIGUSR1 scan from physical filesystem pressure. `false` means
     /// the queue is full or a fresh physical sample is missing, so the caller
     /// retries next tick; a disconnected queue is logged and given up.
+    fn refresh_operator_scans(&self, responses: &[PressureResponse]) {
+        let paths = {
+            let queue = self.scan_now_queue.lock();
+            queue.update_policy(
+                self.behavior_state.table().clone(),
+                self.behavior_state.memory_level,
+                PidConfig::from(&self.config.pressure),
+            );
+            queue.paths()
+        };
+        let mut observations = responses.to_vec();
+        let mut mounts = HashMap::new();
+        // A selected child mount need not be one of the routine monitor's
+        // configured root mounts. Its observation belongs to this operator
+        // request alone and does not activate unrelated cleanup tiers.
+        if !responses.is_empty() {
+            for path in paths {
+                if let Ok(stats) = self.fs_collector.collect(&path) {
+                    mounts.insert(path, stats.mount_point.clone());
+                    if stats.total_bytes > 0
+                        && !observations
+                            .iter()
+                            .any(|response| response.causing_mount == stats.mount_point)
+                    {
+                        observations.push(
+                            PidPressureController::new(
+                                &PidConfig::from(&self.config.pressure),
+                                Duration::from_millis(self.config.pressure.poll_interval_ms),
+                            )
+                            .update(
+                                PressureReading {
+                                    free_bytes: stats.available_bytes,
+                                    total_bytes: stats.total_bytes,
+                                    mount: stats.mount_point,
+                                },
+                                None,
+                                Instant::now(),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        let revoked =
+            self.scan_now_queue
+                .lock()
+                .refresh(&self.config.scanner, &observations, |path| {
+                    mounts.get(path).cloned()
+                });
+        if revoked > 0 {
+            self.logger_handle.send(ActivityEvent::Info {
+                message: format!("cancelled {revoked} pending operator scans because their configured scope or filesystem identity changed"),
+            });
+        }
+    }
+
     fn trigger_forced_scan(
         root_paths: &[PathBuf],
         scan_tx: &Sender<ScanRequest>,
@@ -7058,6 +7473,8 @@ impl MonitoringDaemon {
             free_pct: Some(response.free_pct),
             max_delete_batch: response.max_delete_batch,
             force_full_scan: true,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -7349,6 +7766,8 @@ impl MonitoringDaemon {
                     free_pct: Some(stats.free_pct()),
                     max_delete_batch,
                     force_full_scan: false,
+                    scan_now: None,
+                    inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
                     maintenance: false,
@@ -7523,6 +7942,8 @@ impl MonitoringDaemon {
                         new_config.scoring.batch_risk_budget_by_level,
                         new_config.scoring.false_positive_loss,
                     );
+                    *self.shared_executor_config.inode_pressure.write() =
+                        new_config.pressure.inodes.clone();
 
                     // Update FS collector TTL.
                     self.fs_collector
@@ -7556,6 +7977,10 @@ impl MonitoringDaemon {
                                 .set_min_certainty(min_certainty_for(
                                     transition.to_mode.cleanup_action,
                                 ));
+                            self.shared_executor_config.inode_cleanup_enabled.store(
+                                behavior_allows_delete_dispatch(transition.to_mode),
+                                Ordering::Release,
+                            );
                             let message = format!(
                                 "behavior mode changed source=config_reload memory={:?} \
                                  disk={:?} mode=({}) -> ({})",
@@ -7590,6 +8015,12 @@ impl MonitoringDaemon {
                         details: format!("config hash: {old_hash} -> {new_hash}"),
                     });
                     self.config = new_config;
+                    let revoked_scans = self.scan_now_queue.lock().revoke();
+                    if revoked_scans > 0 {
+                        self.logger_handle.send(ActivityEvent::Info {
+                            message: format!("cancelled {revoked_scans} pending operator scans after config reload; request the desired scope again"),
+                        });
+                    }
                     // Reload may change what sbh can act on: retune the
                     // per-mount controllers and wake idle mounts next tick.
                     let controller_config = mount_controller_config(&self.config);
@@ -7630,6 +8061,7 @@ impl MonitoringDaemon {
         let cpu_budget = Arc::clone(&self.cpu_budget);
         let executor_config = Arc::clone(&self.shared_executor_config);
         let regret = Arc::clone(&self.regret);
+        let scan_now_queue = Arc::clone(&self.scan_now_queue);
         thread::Builder::new()
             .name("sbh-scanner".to_string())
             .spawn(move || {
@@ -7649,6 +8081,7 @@ impl MonitoringDaemon {
                     &cpu_budget,
                     &executor_config,
                     &regret,
+                    Some(&scan_now_queue),
                 );
             })
             .map_err(|source| SbhError::Runtime {
@@ -8010,7 +8443,10 @@ fn dispatch_with_behavior_gate(
     executor_config: &SharedExecutorConfig,
 ) -> bool {
     if executor_config
-        .authorize_dispatch(request.ram_reclaim.is_some())
+        .authorize_dispatch(
+            request.ram_reclaim.is_some(),
+            request.inode_reclaim.is_some(),
+        )
         .is_err()
     {
         return true;
@@ -8035,10 +8471,7 @@ fn dispatch_top_candidates(
     // ~250,000 rows (~0.6 GB) a day kept for 30 days.
     scored.retain(|candidate| {
         candidate.size_bytes > 0
-            && request
-                .ram_reclaim
-                .as_ref()
-                .is_none_or(|relief| relief.accepts_candidate(candidate))
+            && request.permits_reclaim_candidate(candidate)
             && !dispatched
                 .paths
                 .iter()
@@ -8068,8 +8501,10 @@ fn dispatch_top_candidates(
         candidates: std::mem::replace(scored, overflow),
         pressure_level: request.pressure_level,
         urgency: request.urgency,
+        scan_now: request.scan_now.clone(),
         target_bytes: request.target_bytes,
         ram_reclaim: request.ram_reclaim.clone(),
+        inode_reclaim: request.inode_reclaim.clone(),
         target_only_root: None,
         target_only_consent: None,
     };
@@ -8357,7 +8792,7 @@ fn replay_indexed_record(
     {
         prescan_dir_size(
             path,
-            scanner_config.cross_devices && request.ram_reclaim.is_none(),
+            scanner_config.cross_devices && !request.has_resource_reclaim(),
             &AtomicBool::new(false),
         )
     } else {
@@ -8684,6 +9119,7 @@ fn scanner_thread_main(
     cpu_budget: &Arc<Mutex<CpuBudget>>,
     executor_config: &Arc<SharedExecutorConfig>,
     regret: &Arc<SharedRegret>,
+    scan_now_queue: Option<&Arc<Mutex<ScanNowQueue>>>,
 ) {
     const DIR_SIZE_FLOOR: u64 = 100 * 1_048_576; // 100 MiB
 
@@ -8761,36 +9197,44 @@ fn scanner_thread_main(
     // Protected verdicts outlive the per-pass registries (see
     // `ProtectionRegistry::adopt_verdict_cache`).
     let mut carried_verdicts = protection::SacredVerdictCache::default();
+    let mut deferred_routine = None;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
 
+        let (ready_request, mut operator_claim) =
+            ready_scanner_request(scan_rx, scan_now_queue, &mut deferred_routine);
         let request_from_events;
-        let mut request = match scan_rx.recv_timeout(WORKER_SHUTDOWN_POLL_INTERVAL) {
-            Ok(request) => {
-                request_from_events = false;
-                request
+        let mut request = if let Some(request) = ready_request {
+            request_from_events = false;
+            request
+        } else {
+            match scan_rx.recv_timeout(WORKER_SHUTDOWN_POLL_INTERVAL) {
+                Ok(request) => {
+                    request_from_events = false;
+                    request
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // Idle is alive: "stalled" must mean stuck inside a pass,
+                    // not waiting for one.
+                    heartbeat.beat();
+                    let event_config = shared_scanner_config.read().clone();
+                    let Some(request) = event_triggered_request(
+                        scanner_event_source.as_mut(),
+                        &mut pending_event_invalidation,
+                        &mut last_event_poll,
+                        &mut event_request_templates,
+                        &event_config,
+                    ) else {
+                        continue;
+                    };
+                    request_from_events = true;
+                    request
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             }
-            Err(RecvTimeoutError::Timeout) => {
-                // Idle is alive: "stalled" must mean stuck inside a pass,
-                // not waiting for one.
-                heartbeat.beat();
-                let event_config = shared_scanner_config.read().clone();
-                let Some(request) = event_triggered_request(
-                    scanner_event_source.as_mut(),
-                    &mut pending_event_invalidation,
-                    &mut last_event_poll,
-                    &mut event_request_templates,
-                    &event_config,
-                ) else {
-                    continue;
-                };
-                request_from_events = true;
-                request
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
         };
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -8799,8 +9243,18 @@ fn scanner_thread_main(
         // Read latest config at the start of each scan.
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
+        if request
+            .scan_now
+            .as_ref()
+            .is_some_and(|scope| !scope.authorized(&current_scanner_config))
+        {
+            continue;
+        }
         if executor_config
-            .authorize_dispatch(request.ram_reclaim.is_some())
+            .authorize_dispatch(
+                request.ram_reclaim.is_some(),
+                request.inode_reclaim.is_some(),
+            )
             .is_err()
         {
             request.max_delete_batch = 0;
@@ -8819,6 +9273,24 @@ fn scanner_thread_main(
             // pass starts. Report-only tmpfs inventory is never scan authority.
             continue;
         }
+        if let Some(relief) = &request.inode_reclaim
+            && (request.ram_reclaim.is_some()
+                || request.scan_now.is_some()
+                || request.pressure_level == PressureLevel::Green
+                || !request.catalog_roots.is_empty()
+                || relief
+                    .authorize_policy(&executor_config.inode_pressure.read())
+                    .is_err()
+                || relief.authorize_mount(platform.as_ref()).is_err()
+                || request.paths.iter().any(|path| {
+                    !relief.contains_path(path)
+                        || relief
+                            .authorize_scope(path, &current_scanner_config)
+                            .is_err()
+                }))
+        {
+            continue;
+        }
         if request_from_events
             && current_event_source_config(scanner_event_source.as_ref(), &current_scanner_config)
                 .is_none()
@@ -8827,7 +9299,7 @@ fn scanner_thread_main(
             // Do not execute its old paths under a new subscription scope.
             continue;
         }
-        if !request_from_events && request.catalog_roots.is_empty() {
+        if !request_from_events && request.catalog_roots.is_empty() && request.scan_now.is_none() {
             event_request_templates.remember(&request, &current_scanner_config);
         }
 
@@ -8903,6 +9375,9 @@ fn scanner_thread_main(
             &request,
             consecutive_empty_passes,
         ) {
+            if let Some(claim) = &mut operator_claim {
+                claim.defer(WORKER_SHUTDOWN_POLL_INTERVAL);
+            }
             continue;
         }
 
@@ -8916,6 +9391,9 @@ fn scanner_thread_main(
             &request,
             current_scanner_config.max_scan_duty_cycle_pct,
         ) {
+            if let Some(claim) = &mut operator_claim {
+                claim.defer(WORKER_SHUTDOWN_POLL_INTERVAL);
+            }
             continue;
         }
 
@@ -8923,13 +9401,16 @@ fn scanner_thread_main(
         // the bucket holds a CPU-second (the next tick re-requests it) and
         // then walks only as long as the bucket lasts; operator and
         // config-reload scans run regardless, and Critical is never limited.
-        let budget_allowance = if request.force_full_scan || request.config_update.is_some() {
+        let budget_allowance = if request.bypass_scan_pacing() || request.config_update.is_some() {
             None
         } else {
             cpu_budget.lock().pass_cpu_allowance(request.pressure_level)
         };
         if budget_allowance.is_some_and(|cpu_secs| cpu_secs <= 0.0) {
             heartbeat.beat();
+            if let Some(claim) = &mut operator_claim {
+                claim.defer(WORKER_SHUTDOWN_POLL_INTERVAL);
+            }
             continue;
         }
         if request_from_events {
@@ -9184,7 +9665,10 @@ fn scanner_thread_main(
         // scan cycle. Uses the actual triggering free-pct when available so
         // the policy's pressure_free_pct_ceiling gate keeps its configured
         // meaning across Yellow/Orange boundary conditions.
-        if current_scanner_config.log_truncation.enabled && request.ram_reclaim.is_none() {
+        if current_scanner_config.log_truncation.enabled
+            && !request.has_resource_reclaim()
+            && request.scan_now.is_none()
+        {
             let truncation_free_pct = log_truncation_free_pct_for_request(&request);
             let trunc_report = crate::scanner::log_truncator::truncate_oversized_logs(
                 &current_scanner_config.log_truncation,
@@ -9271,7 +9755,16 @@ fn scanner_thread_main(
         // root), and must not make the pass look productive to the B6
         // cooldown. Measured before this: 574 zero-duration replay passes in
         // five minutes, each re-dispatching the same two `unclear` records.
-        let pass_min_certainty = executor_config.dispatch_certainty(request.ram_reclaim.is_some());
+        let pass_min_certainty = executor_config
+            .dispatch_certainty(request.has_resource_reclaim())
+            .max(
+                request
+                    .scan_now
+                    .as_ref()
+                    .map_or(ArtifactCertainty::Unclear, |scope| {
+                        scope.certainty_floor(request.pressure_level)
+                    }),
+            );
         // Counted once per path: the index replay, the priority pre-scan and
         // the walk can each hold the same directory in one pass.
         let mut held_paths: BTreeSet<PathBuf> = BTreeSet::new();
@@ -9321,11 +9814,7 @@ fn scanner_thread_main(
                 replay_engine.set_regret(regret_view.0.clone(), regret_view.1.clone());
                 replay_engine.set_cache_redeletions(cache_redeletions.clone());
                 for record in &records {
-                    if request
-                        .ram_reclaim
-                        .as_ref()
-                        .is_some_and(|relief| !relief.contains_path(&record.path))
-                    {
+                    if !request.permits_reclaim_path(&record.path) {
                         continue;
                     }
                     match replay_indexed_record(
@@ -9346,10 +9835,7 @@ fn scanner_thread_main(
                             // back is not re-dispatched; it stays in the index
                             // (no cooldown) for a cell that accepts it.
                             if score.decision.certainty < pass_min_certainty
-                                || request
-                                    .ram_reclaim
-                                    .as_ref()
-                                    .is_some_and(|relief| !relief.accepts_candidate(&score))
+                                || !request.permits_reclaim_candidate(&score)
                             {
                                 if held_paths.insert(record.path.clone()) {
                                     held_by_certainty += 1;
@@ -9513,7 +9999,7 @@ fn scanner_thread_main(
         let mut priority_candidates: Vec<CandidacyScore> = Vec::new();
         let mut prescan_stop: Option<PassStop> = None;
         let mut prescan_entries: usize = 0;
-        if request.force_full_scan {
+        if request.force_full_scan && request.scan_now.is_none() {
             // An operator asked for the whole tree; do not resume mid-way.
             prescan_cursor.reset();
         }
@@ -9521,7 +10007,7 @@ fn scanner_thread_main(
         // those roots, not the configured ones. Letting it move the resume
         // point would send the *full* sweep back to the start on every Green
         // file-change event, so a scoped pass gets a throwaway cursor.
-        let prescan_uses_cursor = active_scan_paths == request.paths;
+        let prescan_uses_cursor = request.scan_now.is_none() && active_scan_paths == request.paths;
         let prescan_cursor_before = prescan_cursor.clone();
         let mut scratch_cursor = PrescanCursor::new();
         let prescan_resume;
@@ -9544,11 +10030,7 @@ fn scanner_thread_main(
                 .collect();
             'priority_roots: for root in &prescan_root_order {
                 let root = root.as_path();
-                if request
-                    .ram_reclaim
-                    .as_ref()
-                    .is_some_and(|relief| !relief.contains_path(root))
-                {
+                if !request.permits_reclaim_path(root) {
                     continue;
                 }
                 if shutdown.load(Ordering::Relaxed) {
@@ -9583,12 +10065,7 @@ fn scanner_thread_main(
                     // `cursor_before_entry` so the entry is retried whole.
                     let cursor_before_entry = cursor.clone();
                     cursor.advance(root, &path);
-                    if !path.is_dir()
-                        || request
-                            .ram_reclaim
-                            .as_ref()
-                            .is_some_and(|relief| !relief.contains_path(&path))
-                    {
+                    if !path.is_dir() || !request.permits_reclaim_path(&path) {
                         continue;
                     }
                     let _ = protection.discover_ancestor_markers(&path);
@@ -9636,11 +10113,7 @@ fn scanner_thread_main(
                                 break 'priority_roots;
                             }
                             let sub_path = sub_entry.path();
-                            if request
-                                .ram_reclaim
-                                .as_ref()
-                                .is_some_and(|relief| !relief.contains_path(&sub_path))
-                            {
+                            if !request.permits_reclaim_path(&sub_path) {
                                 continue;
                             }
                             if sub_path.is_dir() {
@@ -9675,9 +10148,7 @@ fn scanner_thread_main(
                                                 break 'priority_roots;
                                             }
                                             let d3_path = d3_entry.path();
-                                            if request.ram_reclaim.as_ref().is_some_and(|relief| {
-                                                !relief.contains_path(&d3_path)
-                                            }) {
+                                            if !request.permits_reclaim_path(&d3_path) {
                                                 continue;
                                             }
                                             if d3_path.is_dir() {
@@ -9808,7 +10279,8 @@ fn scanner_thread_main(
                             prescan_dir_size(
                                 &candidate_path,
                                 current_scanner_config.cross_devices
-                                    && request.ram_reclaim.is_none(),
+                                    && !request.has_resource_reclaim()
+                                    && request.scan_now.is_none(),
                                 shutdown,
                             )
                         });
@@ -9924,10 +10396,7 @@ fn scanner_thread_main(
                                 }
                             }
                             if score.decision.certainty < pass_min_certainty
-                                || request
-                                    .ram_reclaim
-                                    .as_ref()
-                                    .is_some_and(|relief| !relief.accepts_candidate(&score))
+                                || !request.permits_reclaim_candidate(&score)
                             {
                                 // bd-8aeq: same gate as the walk below.
                                 if held_paths.insert(candidate_path.clone()) {
@@ -10215,8 +10684,10 @@ fn scanner_thread_main(
             root_paths: active_scan_paths.clone(),
             max_depth: current_scanner_config.max_depth,
             follow_symlinks: current_scanner_config.follow_symlinks
-                && request.ram_reclaim.is_none(),
-            cross_devices: current_scanner_config.cross_devices && request.ram_reclaim.is_none(),
+                && !request.has_resource_reclaim(),
+            cross_devices: current_scanner_config.cross_devices
+                && !request.has_resource_reclaim()
+                && request.scan_now.is_none(),
             parallelism: if scanner_index_enabled {
                 v2_effective_parallelism(&current_scanner_config, request.pressure_level)
             } else {
@@ -10233,7 +10704,11 @@ fn scanner_thread_main(
                 // These are subtrees that yielded zero candidates on a prior
                 // timed-out pass — skipping them lets the walker explore new
                 // territory instead of re-walking known-empty subtrees.
-                let barren = scan_cursor.barren_exclusions();
+                let barren = if request.scan_now.is_some() {
+                    HashSet::new()
+                } else {
+                    scan_cursor.barren_exclusions()
+                };
                 if !barren.is_empty() {
                     eprintln!(
                         "[SBH-SCANNER] incremental cursor: skipping {} barren dirs from prior pass",
@@ -10585,7 +11060,9 @@ fn scanner_thread_main(
             {
                 score.size_bytes = score.size_bytes.max(prescan_dir_size(
                     &entry.path,
-                    current_scanner_config.cross_devices && request.ram_reclaim.is_none(),
+                    current_scanner_config.cross_devices
+                        && !request.has_resource_reclaim()
+                        && request.scan_now.is_none(),
                     shutdown,
                 ));
             }
@@ -10629,10 +11106,7 @@ fn scanner_thread_main(
                 && !score.vetoed;
             if deletable
                 && (score.decision.certainty < pass_min_certainty
-                    || request
-                        .ram_reclaim
-                        .as_ref()
-                        .is_some_and(|relief| !relief.accepts_candidate(&score)))
+                    || !request.permits_reclaim_candidate(&score))
             {
                 // bd-8aeq: indexed above (a cell that accepts this certainty
                 // can replay it) but neither dispatched nor counted toward
@@ -11307,14 +11781,14 @@ fn executor_thread_main(
         batch_count += 1;
 
         if shared_config
-            .authorize_dispatch(batch.ram_reclaim.is_some())
+            .authorize_dispatch(batch.ram_reclaim.is_some(), batch.inode_reclaim.is_some())
             .is_err()
         {
             continue;
         }
         let scanner_snapshot = shared_scanner_config.read().clone();
         if let Some(relief) = &batch.ram_reclaim {
-            if batch.target_only_root.is_some() {
+            if batch.target_only_root.is_some() || batch.inode_reclaim.is_some() {
                 // Swap pressure cannot borrow the target-only protection
                 // exception, even if a malformed queued batch carries both.
                 continue;
@@ -11322,6 +11796,26 @@ fn executor_thread_main(
             batch.candidates.retain(|candidate| {
                 relief.accepts_candidate(candidate)
                     && authorize_ram_reclaim_scope(candidate, &scanner_snapshot).is_ok()
+            });
+            if batch.candidates.is_empty() {
+                continue;
+            }
+        }
+        if let Some(relief) = &batch.inode_reclaim {
+            if batch.target_only_root.is_some()
+                || batch.scan_now.is_some()
+                || batch.pressure_level == PressureLevel::Green
+                || relief
+                    .authorize_policy(&shared_config.inode_pressure.read())
+                    .is_err()
+            {
+                continue;
+            }
+            batch.candidates.retain(|candidate| {
+                relief.accepts_candidate(candidate)
+                    && relief
+                        .authorize_scope(&candidate.path, &scanner_snapshot)
+                        .is_ok()
             });
             if batch.candidates.is_empty() {
                 continue;
@@ -11473,7 +11967,16 @@ fn executor_thread_main(
         // Behavior-cell certainty gate (v0.6 matrix): Green/Yellow cells dispatch
         // only structurally definite artifacts; Orange adds likely ones; Red and
         // Critical dispatch every Delete verdict.
-        let min_certainty = shared_config.dispatch_certainty(batch.ram_reclaim.is_some());
+        let min_certainty = shared_config
+            .dispatch_certainty(batch.ram_reclaim.is_some() || batch.inode_reclaim.is_some())
+            .max(
+                batch
+                    .scan_now
+                    .as_ref()
+                    .map_or(ArtifactCertainty::Unclear, |scope| {
+                        scope.certainty_floor(batch.pressure_level)
+                    }),
+            );
         let (approved_candidates, held_back_by_certainty) =
             retain_dispatchable_by_certainty(approved_candidates, min_certainty);
         if held_back_by_certainty > 0 {
@@ -11499,12 +12002,21 @@ fn executor_thread_main(
                 approved_candidates,
                 &PlanRequest {
                     level: batch.pressure_level,
-                    target_bytes: batch
-                        .ram_reclaim
+                    target_bytes: if batch.inode_reclaim.is_some() {
+                        None
+                    } else {
+                        batch
+                            .ram_reclaim
+                            .as_ref()
+                            .map(RamReclaimRequest::remaining_bytes)
+                            .or(batch.target_bytes)
+                    },
+                    max_items: batch
+                        .inode_reclaim
                         .as_ref()
-                        .map(RamReclaimRequest::remaining_bytes)
-                        .or(batch.target_bytes),
-                    max_items: max_batch_size,
+                        .map_or(max_batch_size, |relief| {
+                            max_batch_size.min(relief.remaining_artifacts())
+                        }),
                     risk_budget: table.budget(batch.pressure_level, false_positive_loss),
                     false_positive_loss,
                     include_review: false,
@@ -11546,7 +12058,9 @@ fn executor_thread_main(
                 // A target-only batch is pinned to the inodes the tier
                 // surveyed, whatever the engine.
                 require_identity: batch.target_only_root.is_some()
+                    || batch.scan_now.is_some()
                     || batch.ram_reclaim.is_some()
+                    || batch.inode_reclaim.is_some()
                     || matches!(scanner_snapshot.engine, ScannerEngineMode::V2),
                 sacred_paths: executor_sacred_paths,
                 // Layer 7: at Green there is time to keep the bytes around,
@@ -11554,6 +12068,7 @@ fn executor_thread_main(
                 // needed and candidates are removed for good.
                 mode: if shared_config.quarantine_enabled.load(Ordering::Relaxed)
                     && batch.pressure_level == PressureLevel::Green
+                    && batch.inode_reclaim.is_none()
                 {
                     DeletionMode::Quarantine
                 } else {
@@ -11657,12 +12172,16 @@ fn executor_thread_main(
             HashMap::new()
         };
 
-        let target_only_platform =
-            if !dry_run && (batch.target_only_root.is_some() || batch.ram_reclaim.is_some()) {
-                detect_platform().ok()
-            } else {
-                None
-            };
+        let target_only_platform = if !dry_run
+            && (batch.target_only_root.is_some()
+                || batch.scan_now.is_some()
+                || batch.ram_reclaim.is_some()
+                || batch.inode_reclaim.is_some())
+        {
+            detect_platform().ok()
+        } else {
+            None
+        };
         let authorize_candidate = |candidate: &CandidacyScore| {
             // A batch planned as a dry-run cannot mutate and still owes its
             // preview counts. Real batches must obey newly restrictive policy.
@@ -11688,18 +12207,59 @@ fn executor_thread_main(
                             .ok_or(SkipReason::PolicyChanged)?,
                     )?;
                 }
+                if let Some(relief) = &batch.inode_reclaim {
+                    relief.authorize_policy(&shared_config.inode_pressure.read())?;
+                    let resolved = relief.authorize_scope(&candidate.path, &scanner_snapshot)?;
+                    if should_skip_protected_daemon_candidate(
+                        &mut protection.lock(),
+                        &resolved,
+                        &sacred_paths,
+                        logger,
+                        "inode relief preflight",
+                    ) {
+                        return Err(SkipReason::SacredStowaway);
+                    }
+                    relief.authorize(
+                        candidate,
+                        target_only_platform
+                            .as_deref()
+                            .ok_or(SkipReason::PolicyChanged)?,
+                    )?;
+                    relief.authorize_scope(&candidate.path, &scanner_snapshot)?;
+                }
                 // The filesystem survey must not outlive new root,
                 // exclusion, protection or idle-window permissions.
+                if let Some(scope) = &batch.scan_now {
+                    let scope_config = shared_scanner_config.read().clone();
+                    if !scope.permits_mutation(
+                        candidate,
+                        &scope_config,
+                        target_only_platform
+                            .as_deref()
+                            .ok_or(SkipReason::PolicyChanged)?,
+                        batch.pressure_level,
+                    ) {
+                        return Err(SkipReason::PolicyChanged);
+                    }
+                }
                 authorize_scanner_mutation_scope(&batch, &scanner_snapshot, shared_scanner_config)?;
-                shared_config.authorize_dispatch(batch.ram_reclaim.is_some())?;
+                shared_config.authorize_dispatch(
+                    batch.ram_reclaim.is_some(),
+                    batch.inode_reclaim.is_some(),
+                )?;
                 shared_config.authorize_mutation(policy_mode, policy_engine.lock().mode())?;
-                shared_config.authorize_compression_first(candidate, batch.pressure_level)?;
+                if batch.inode_reclaim.is_none() {
+                    shared_config.authorize_compression_first(candidate, batch.pressure_level)?;
+                }
             }
             regret.authorize_deletion(candidate, logger)
         };
         let on_unlinked = |candidate: &CandidacyScore, completed_at: Instant| {
             if let Some(relief) = &batch.ram_reclaim {
                 relief.record_unlinked(candidate);
+            }
+            if let Some(relief) = &batch.inode_reclaim {
+                relief.record_unlinked();
             }
             if let Some(identity) = watch_identities.get(&candidate.path) {
                 regret.watch_unlinked(candidate, identity, completed_at);
@@ -12003,6 +12563,229 @@ mod tests {
                 let _ = logger.join();
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn scan_now_backend(daemon: &MonitoringDaemon) -> DaemonControlBackend {
+        DaemonControlBackend {
+            signal_handler: daemon.signal_handler.clone(),
+            control_tx: daemon.control_tx.clone(),
+            logger: daemon.logger_handle.clone(),
+            policy_engine: Arc::clone(&daemon.policy_engine),
+            state_file: daemon.config.paths.state_file.clone(),
+            sqlite_db: daemon.config.paths.sqlite_db.clone(),
+            config_file: daemon.config.paths.config_file.clone(),
+            started_at: "fixture".to_string(),
+            start_instant: daemon.start_time,
+        }
+    }
+
+    #[cfg(unix)]
+    fn submit_operator_scan(
+        daemon: &mut MonitoringDaemon,
+        paths: Vec<PathBuf>,
+        force: bool,
+    ) -> ControlResponse {
+        let backend = scan_now_backend(daemon);
+        let client =
+            thread::spawn(move || backend.handle(ControlCommand::ScanNow { paths, force }, None));
+        let command = daemon
+            .control_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        daemon.pending_control.push(command);
+        daemon.drain_control_commands();
+        client.join().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_scan_now_control_flow_reaches_only_the_selected_scanner_root() {
+        let mut fixture = RegretDaemonFixture::new();
+        let root = fixture.daemon.config.scanner.root_paths[0].clone();
+        let selected = root.join("selected");
+        let sibling = root.join("unselected");
+        for path in [&selected, &sibling] {
+            std::fs::create_dir_all(path.join("target/debug/deps")).unwrap();
+            write_cargo_cachedir_tag(&path.join("target"));
+            std::fs::write(
+                path.join("target/debug/deps/libfixture.rlib"),
+                vec![7_u8; 4096],
+            )
+            .unwrap();
+        }
+        fixture.daemon.config.scanner.engine = ScannerEngineMode::V2;
+        fixture.daemon.config.scanner.min_file_age_minutes = 0;
+        fixture.daemon.config.scoring.min_score = 0.0;
+        *fixture.daemon.shared_scanner_config.write() = fixture.daemon.config.scanner.clone();
+        *fixture.daemon.shared_scoring_config.write() = fixture.daemon.config.scoring.clone();
+        let reply = submit_operator_scan(&mut fixture.daemon, vec![selected.clone()], true);
+        assert!(reply.ok, "{reply:?}");
+        fixture.daemon.check_pressure().unwrap();
+        let physical = fixture.daemon.worst_filesystem_response().unwrap();
+        fixture.daemon.refresh_operator_scans(&[physical]);
+
+        let (scan_tx, scan_rx) = bounded(SCANNER_CHANNEL_CAP);
+        let (del_tx, del_rx) = bounded(EXECUTOR_CHANNEL_CAP);
+        let (report_tx, report_rx) = bounded(REPORT_CHANNEL_CAP);
+        let (_feedback_tx, feedback_rx) = bounded(EXECUTOR_CHANNEL_CAP);
+        let worker = fixture
+            .daemon
+            .spawn_scanner_thread(
+                scan_rx,
+                del_tx,
+                fixture.daemon.logger_handle.clone(),
+                Arc::clone(&fixture.daemon.scanner_heartbeat),
+                report_tx,
+                feedback_rx,
+            )
+            .unwrap();
+        let report = report_rx.recv_timeout(Duration::from_secs(10));
+        fixture
+            .daemon
+            .signal_handler
+            .shutdown_token()
+            .store(true, Ordering::Release);
+        drop(scan_tx);
+        worker.join().unwrap();
+        let WorkerReport::ScanCompleted { root_stats, .. } = report.unwrap() else {
+            panic!("expected the selected scanner pass");
+        };
+        assert_eq!(
+            root_stats
+                .iter()
+                .map(|stats| &stats.path)
+                .collect::<Vec<_>>(),
+            vec![&selected]
+        );
+        for batch in del_rx.try_iter() {
+            assert!(batch.scan_now.is_some());
+            assert!(batch.ram_reclaim.is_none() && batch.inode_reclaim.is_none());
+            assert!(
+                batch
+                    .candidates
+                    .iter()
+                    .all(|candidate| candidate.path.starts_with(&selected))
+            );
+        }
+        assert!(sibling.join("target/debug/deps/libfixture.rlib").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_scan_now_control_rejects_unknown_roots_and_preserves_legacy_force() {
+        let mut fixture = RegretDaemonFixture::new();
+        let root = fixture.daemon.config.scanner.root_paths[0].clone();
+        let outside = fixture.directory.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let reply = submit_operator_scan(&mut fixture.daemon, vec![root.clone(), outside], true);
+        assert!(!reply.ok);
+        assert_eq!(reply.error.as_ref().unwrap().code, "bad_request");
+        assert!(ScanNowClaim::take(&fixture.daemon.scan_now_queue, Instant::now()).is_none());
+
+        let reply = submit_operator_scan(&mut fixture.daemon, vec![root], false);
+        assert!(reply.ok);
+        fixture.daemon.check_pressure().unwrap();
+        let physical = fixture.daemon.worst_filesystem_response().unwrap();
+        fixture.daemon.refresh_operator_scans(&[physical]);
+        let claim = ScanNowClaim::take(&fixture.daemon.scan_now_queue, Instant::now()).unwrap();
+        let request = claim.request();
+        assert!(request.force_full_scan);
+        assert!(!request.bypass_scan_pacing());
+        assert!(empty_pass_cooldown_active(
+            Some(Instant::now()),
+            Instant::now(),
+            Duration::from_secs(60),
+            &request,
+            1
+        ));
+        assert!(duty_cycle_defer_active(
+            Some(Instant::now()),
+            Duration::from_secs(10),
+            Instant::now(),
+            &request,
+            10
+        ));
+        assert_eq!(v2_active_scan_paths(&request, &BTreeSet::new()), None);
+        assert!(
+            scan_now_backend(&fixture.daemon)
+                .handle(
+                    ControlCommand::ScanNow {
+                        paths: Vec::new(),
+                        force: true
+                    },
+                    None
+                )
+                .ok
+        );
+        assert!(
+            fixture.daemon.signal_handler.should_scan(),
+            "legacy all-root scan still uses the immediate forced path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_scan_now_samples_a_selected_nested_mount_without_global_pressure_promotion() {
+        use crate::platform::pal::{FsStats, MountPoint, PlatformPaths};
+        let mut fixture = RegretDaemonFixture::new();
+        let root = fixture.daemon.config.scanner.root_paths[0].clone();
+        let nested = root.join("nested-mount");
+        std::fs::create_dir(&nested).unwrap();
+        fixture.daemon.config.scanner.cross_devices = true;
+        let stats = |mount: &Path, available_bytes| FsStats {
+            total_bytes: 1_000_000_000_000,
+            free_bytes: available_bytes,
+            available_bytes,
+            fs_type: "ext4".to_string(),
+            mount_point: mount.to_path_buf(),
+            is_readonly: false,
+        };
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::new(
+            [&root, &nested]
+                .into_iter()
+                .map(|path| MountPoint {
+                    path: path.clone(),
+                    device: path.display().to_string(),
+                    fs_type: "ext4".to_string(),
+                    is_ram_backed: false,
+                })
+                .collect(),
+            HashMap::from([
+                (root.clone(), stats(&root, 700_000_000_000)),
+                (nested.clone(), stats(&nested, 1_000_000_000)),
+            ]),
+            MemoryInfo {
+                total_bytes: 64_000,
+                available_bytes: 32_000,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            },
+            PlatformPaths::default(),
+        ));
+        fixture.daemon.fs_collector = FsStatsCollector::new(platform, Duration::ZERO);
+        assert!(submit_operator_scan(&mut fixture.daemon, vec![nested.clone()], true).ok);
+        let response = PressureResponse {
+            level: PressureLevel::Green,
+            urgency: 0.0,
+            scan_interval: Duration::from_secs(1),
+            release_ballast_files: 0,
+            max_delete_batch: 10,
+            fallback_active: false,
+            causing_mount: root,
+            free_pct: 70.0,
+            predicted_seconds: None,
+        };
+        let before = fixture.daemon.mount_monitors.len();
+        fixture.daemon.refresh_operator_scans(&[response]);
+        let claim = ScanNowClaim::take(&fixture.daemon.scan_now_queue, Instant::now()).unwrap();
+        assert_eq!(claim.request().paths, vec![nested]);
+        assert_eq!(claim.request().pressure_level, PressureLevel::Critical);
+        assert_eq!(
+            fixture.daemon.mount_monitors.len(),
+            before,
+            "operator sampling adds no global monitor or tier authority"
+        );
     }
 
     #[cfg(unix)]
@@ -12381,6 +13164,8 @@ mod tests {
             response,
             backing_pressure: None,
             ram_reclaim: None,
+            inode_pressure: None,
+            inode_reclaim: None,
             seconds_to_red: None,
             prediction_confident: false,
             imminent_danger: false,
@@ -12461,6 +13246,458 @@ mod tests {
             swap_total_bytes: 64 << 30,
             swap_free_bytes: 0,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_inode_pressure_probe(
+        fixture: &mut RegretDaemonFixture,
+        sample: Option<crate::platform::pal::InodeStats>,
+    ) -> (PathBuf, PathBuf) {
+        use crate::platform::pal::PlatformPaths;
+        let memory = MemoryInfo {
+            swap_total_bytes: 0,
+            swap_free_bytes: 0,
+            ..exhausted_swap_sample()
+        };
+        let (mount, other) =
+            install_tmpfs_pressure_probe(fixture, memory.clone(), "ext4", 70 << 30, false);
+        let mounts = fixture.daemon.platform.mount_points().unwrap();
+        let stats = mounts
+            .iter()
+            .map(|mount| {
+                (
+                    mount.path.clone(),
+                    fixture.daemon.platform.fs_stats(&mount.path).unwrap(),
+                )
+            })
+            .collect();
+        let samples = sample
+            .map(|sample| HashMap::from([(mount.clone(), sample)]))
+            .unwrap_or_default();
+        let platform: Arc<dyn Platform> = Arc::new(
+            MockPlatform::new(mounts, stats, memory, PlatformPaths::default())
+                .with_inode_stats(samples)
+                .with_home(fixture.directory.path())
+                .with_temp_dirs(Vec::new())
+                .with_cache_roots(Vec::new()),
+        );
+        fixture.daemon.platform = Arc::clone(&platform);
+        fixture.daemon.fs_collector = FsStatsCollector::new(platform, Duration::ZERO);
+        (mount, other)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn inode_pressure_dispatches_through_scanner_and_executor_gates_without_byte_authority() {
+        use crate::daemon::policy::BehaviorPreset;
+        use crate::platform::pal::InodeStats;
+        let mut fixture = RegretDaemonFixture::new();
+        let (mount, other) =
+            install_inode_pressure_probe(&mut fixture, InodeStats::new(10_000, 0, 0));
+        let daemon = &mut fixture.daemon;
+        daemon.config.scanner.cross_devices = true;
+        daemon.behavior_state = PressureBehaviorState::new(
+            BehaviorDispatchTable::from_preset(BehaviorPreset::V0_5),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+        );
+        let response = daemon.check_pressure().unwrap();
+        assert_eq!(response.level, PressureLevel::Critical);
+        assert_eq!(response.causing_mount, mount);
+        assert!((response.free_pct - 70.0).abs() < f64::EPSILON);
+        assert_eq!(response.release_ballast_files, 0);
+        assert!(
+            daemon
+                .mount_responses
+                .iter()
+                .all(|tick| tick.filesystem_response.level == PressureLevel::Green)
+        );
+        assert!(
+            daemon
+                .mount_responses
+                .iter()
+                .find(|tick| tick.response.causing_mount == other)
+                .unwrap()
+                .inode_reclaim
+                .is_none()
+        );
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            response.level,
+            "startup",
+            Duration::ZERO,
+        );
+        let (scan_tx, scan_rx) = bounded(4);
+        let (del_tx, del_rx) = bounded(4);
+        daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+        let request = scan_rx
+            .try_recv()
+            .expect("inode shortage must wake its own filesystem");
+        assert_eq!(request.paths, vec![mount.clone()]);
+        assert_eq!(request.free_pct, Some(70.0));
+        assert_eq!(request.target_bytes, None);
+        assert_eq!(v2_pressure_candidate_byte_target(&request), None);
+        assert!(request.force_full_scan);
+        assert!(!request.bypass_scan_pacing());
+        assert!(request.catalog_roots.is_empty());
+        assert!(request.ram_reclaim.is_none());
+        assert!(
+            request
+                .inode_reclaim
+                .as_ref()
+                .unwrap()
+                .remaining_artifacts()
+                > 0
+        );
+        assert!(scan_rx.try_recv().is_err());
+
+        let path = mount.join("target");
+        std::fs::create_dir(&path).unwrap();
+        let mut candidate = test_candidate(&path.to_string_lossy(), 0.9);
+        candidate.identity = crate::scanner::walker::identity_for_path(&path, false).ok();
+        candidate.decision.certainty = ArtifactCertainty::Definite;
+        let shared = &daemon.shared_executor_config;
+        assert_eq!(
+            shared.authorize_dispatch(false, false),
+            Err(SkipReason::PolicyChanged)
+        );
+        assert_eq!(shared.authorize_dispatch(false, true), Ok(()));
+        assert!(dispatch_with_behavior_gate(
+            &mut vec![candidate],
+            &request,
+            &del_tx,
+            &mut PassDispatch::default(),
+            shared
+        ));
+        let batch = del_rx
+            .try_recv()
+            .expect("scoped inode batch passes current behavior gate");
+        assert!(batch.inode_reclaim.is_some());
+        assert_eq!(shared.dispatch_certainty(true), ArtifactCertainty::Definite);
+        let mut ordinary = request;
+        ordinary.paths = vec![other.clone()];
+        ordinary.inode_reclaim = None;
+        assert!(dispatch_with_behavior_gate(
+            &mut vec![test_candidate(&other.join("target").to_string_lossy(), 0.9)],
+            &ordinary,
+            &del_tx,
+            &mut PassDispatch::default(),
+            shared,
+        ));
+        assert!(del_rx.try_recv().is_err());
+
+        let response = daemon.check_pressure().unwrap();
+        daemon.maybe_write_self_monitor_state(&response);
+        let state = SelfMonitor::read_state(&daemon.config.paths.state_file).unwrap();
+        let record = state
+            .mount_controllers
+            .iter()
+            .find(|record| record.mount == mount.to_string_lossy())
+            .unwrap();
+        assert_eq!(record.inode_pressure.as_ref().unwrap().available, 0);
+        assert!(
+            state
+                .pressure
+                .mounts
+                .iter()
+                .any(|sample| sample.path == mount.to_string_lossy()
+                    && (sample.free_pct - 70.0).abs() < f64::EPSILON)
+        );
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+            "startup",
+            Duration::ZERO,
+        );
+        assert_eq!(
+            daemon
+                .shared_executor_config
+                .authorize_dispatch(false, true),
+            Err(SkipReason::PolicyChanged)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inode_recovery_missing_and_disabled_samples_never_create_unscoped_pressure() {
+        use crate::platform::pal::InodeStats;
+        for sample in [None, InodeStats::new(10_000, 1_050, 1_050)] {
+            let mut fixture = RegretDaemonFixture::new();
+            let (mount, _) =
+                install_inode_pressure_probe(&mut fixture, InodeStats::new(10_000, 0, 0));
+            assert_eq!(
+                fixture.daemon.check_pressure().unwrap().level,
+                PressureLevel::Critical
+            );
+            install_inode_pressure_probe(&mut fixture, sample);
+            assert_eq!(
+                fixture
+                    .daemon
+                    .mount_monitors
+                    .get(&mount)
+                    .unwrap()
+                    .inode_pressure_level,
+                PressureLevel::Critical
+            );
+            let response = fixture.daemon.check_pressure().unwrap();
+            assert_eq!(response.level, PressureLevel::Green);
+            assert_eq!(
+                fixture
+                    .daemon
+                    .mount_monitors
+                    .get(&mount)
+                    .unwrap()
+                    .inode_pressure_level,
+                if sample.is_some() {
+                    PressureLevel::Red
+                } else {
+                    PressureLevel::Green
+                }
+            );
+            assert!(
+                fixture
+                    .daemon
+                    .mount_responses
+                    .iter()
+                    .all(|tick| tick.inode_reclaim.is_none())
+            );
+        }
+        let mut fixture = RegretDaemonFixture::new();
+        install_inode_pressure_probe(&mut fixture, InodeStats::new(10_000, 0, 0));
+        fixture.daemon.config.pressure.inodes.enabled = false;
+        assert_eq!(
+            fixture.daemon.check_pressure().unwrap().level,
+            PressureLevel::Green
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn inode_enospc_state_failure_preserves_relief_only_on_the_actual_persistence_filesystem() {
+        use crate::daemon::policy::PolicyConfig;
+        use crate::platform::pal::InodeStats;
+
+        for (case, available, errno, same_mount, expect_advisory) in [
+            ("critical", Some(0), Some(libc::ENOSPC), true, true),
+            ("red", Some(150), Some(libc::ENOSPC), true, true),
+            ("orange", Some(400), Some(libc::ENOSPC), true, false),
+            ("unknown", None, Some(libc::ENOSPC), true, false),
+            ("recovered", Some(1_050), Some(libc::ENOSPC), true, false),
+            ("permission", Some(0), Some(libc::EACCES), true, false),
+            ("serialization", Some(0), None, true, false),
+            ("unrelated", Some(0), Some(libc::ENOSPC), false, false),
+            ("missing-parent", Some(0), Some(libc::ENOSPC), true, false),
+            ("disabled", Some(0), Some(libc::ENOSPC), true, false),
+            ("leaf-symlink", Some(0), Some(libc::ENOSPC), false, false),
+        ] {
+            let mut fixture = RegretDaemonFixture::new();
+            let sample =
+                available.and_then(|available| InodeStats::new(10_000, available, available));
+            let stale_sample = matches!(case, "unknown" | "recovered");
+            let (pressured, other) = install_inode_pressure_probe(
+                &mut fixture,
+                if stale_sample {
+                    InodeStats::new(10_000, 0, 0)
+                } else {
+                    sample
+                },
+            );
+            let stale_response = if stale_sample {
+                let response = fixture.daemon.check_pressure().unwrap();
+                assert_eq!(response.level, PressureLevel::Critical);
+                install_inode_pressure_probe(&mut fixture, sample);
+                Some(response)
+            } else {
+                None
+            };
+            let daemon = &mut fixture.daemon;
+            let destination = if case == "missing-parent" {
+                pressured.join("absent-parent/state.json")
+            } else if same_mount {
+                pressured.join("state.json")
+            } else {
+                other.join("state.json")
+            };
+            if case == "leaf-symlink" {
+                std::os::unix::fs::symlink(pressured.join("elsewhere.json"), &destination).unwrap();
+            }
+            daemon.self_monitor = SelfMonitor::from_telemetry_config(
+                destination,
+                Arc::clone(&daemon.platform),
+                &daemon.config.telemetry,
+            );
+            // A reloaded config path does not change SelfMonitor's bound
+            // destination. In particular an unrelated full-inode path must
+            // never explain failure on a healthy persistence filesystem.
+            daemon.config.paths.state_file = if same_mount {
+                other.join("reloaded-state.json")
+            } else {
+                pressured.join("reloaded-state.json")
+            };
+            daemon.config.pressure.inodes.enabled = case != "disabled";
+            *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+                initial_mode: ActiveMode::Enforce,
+                ..PolicyConfig::default()
+            });
+            let response = stale_response.unwrap_or_else(|| daemon.check_pressure().unwrap());
+            assert!(
+                daemon
+                    .mount_responses
+                    .iter()
+                    .all(|tick| tick.filesystem_response.level == PressureLevel::Green)
+            );
+            let tick = SelfMonitorTick {
+                state_write_failed: true,
+                state_write_errno: errno,
+                ..test_self_monitor_tick(0, u64::MAX)
+            };
+            daemon.note_state_write_failure(tick);
+            let expected = if expect_advisory {
+                ActiveMode::Enforce
+            } else {
+                ActiveMode::FallbackSafe
+            };
+            assert_eq!(daemon.policy_engine.lock().mode(), expected, "{case}");
+            assert_eq!(
+                daemon.policy_engine.lock().serialization_failures(),
+                1,
+                "{case}"
+            );
+            if expect_advisory {
+                daemon.update_behavior_mode(
+                    MemoryPressureLevel::Normal,
+                    response.level,
+                    "startup",
+                    Duration::ZERO,
+                );
+                let (scan_tx, scan_rx) = bounded(4);
+                let (del_tx, _del_rx) = bounded(4);
+                daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+                let request = scan_rx
+                    .try_recv()
+                    .expect("failed persistence must not deadlock its own inode relief");
+                assert!(request.inode_reclaim.is_some(), "{case}");
+                let candidate = test_candidate(&pressured.join("target").to_string_lossy(), 0.9);
+                assert_eq!(
+                    daemon
+                        .policy_engine
+                        .lock()
+                        .evaluate(&[candidate], None)
+                        .approved_for_deletion
+                        .len(),
+                    1,
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn operator_scan_scheduling_preserves_urgent_work_config_and_routine_fairness() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first-selection");
+        let second = directory.path().join("second-selection");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let scanner = ScannerConfig {
+            root_paths: vec![directory.path().to_path_buf()],
+            excluded_paths: Vec::new(),
+            protected_paths: Vec::new(),
+            ..ScannerConfig::default()
+        };
+        let queue = Arc::new(Mutex::new(ScanNowQueue::default()));
+        for path in [&first, &second] {
+            let scope = ScanNowScope::capture(std::slice::from_ref(path), false, &scanner)
+                .unwrap()
+                .partition(|_| Some(directory.path().to_path_buf()))
+                .unwrap();
+            queue.lock().enqueue(scope, 4).unwrap();
+        }
+        queue.lock().update_policy(
+            BehaviorDispatchTable::default(),
+            MemoryPressureLevel::Normal,
+            PidConfig::from(&Config::default().pressure),
+        );
+        let response = quarantine_tick(PressureLevel::Green, directory.path()).response;
+        queue.lock().refresh(&scanner, &[response], |_| {
+            Some(directory.path().to_path_buf())
+        });
+        let routine = |label: &str, level| ScanRequest {
+            paths: vec![directory.path().join(label)],
+            urgency: 0.5,
+            pressure_level: level,
+            free_pct: Some(70.0),
+            max_delete_batch: 2,
+            force_full_scan: false,
+            config_update: None,
+            catalog_roots: Vec::new(),
+            maintenance: false,
+            target_bytes: None,
+            ram_reclaim: None,
+            inode_reclaim: None,
+            scan_now: None,
+        };
+        let (send, receive) = bounded(4);
+        let mut deferred = None;
+        send.send(routine("urgent-first", PressureLevel::Critical))
+            .unwrap();
+        let (request, claim) = ready_scanner_request(&receive, Some(&queue), &mut deferred);
+        assert_eq!(
+            request.unwrap().paths,
+            vec![directory.path().join("urgent-first")]
+        );
+        assert!(claim.is_none());
+
+        send.send(routine("routine-first", PressureLevel::Green))
+            .unwrap();
+        let (request, claim) = ready_scanner_request(&receive, Some(&queue), &mut deferred);
+        assert_eq!(request.unwrap().paths, vec![first]);
+        assert!(claim.is_some());
+        assert!(deferred.is_some());
+        drop(claim);
+
+        // New emergency work and config delivery must also win while an
+        // earlier healthy routine waits across the operator's pass.
+        send.send(routine("urgent-later", PressureLevel::Critical))
+            .unwrap();
+        let (request, claim) = ready_scanner_request(&receive, Some(&queue), &mut deferred);
+        assert_eq!(
+            request.unwrap().paths,
+            vec![directory.path().join("urgent-later")]
+        );
+        assert!(claim.is_none());
+        assert!(deferred.is_some());
+        let mut config_request = routine("config", PressureLevel::Green);
+        config_request.config_update = Some((Config::default().scoring, scanner));
+        send.send(config_request).unwrap();
+        let (request, claim) = ready_scanner_request(&receive, Some(&queue), &mut deferred);
+        assert!(request.unwrap().config_update.is_some());
+        assert!(claim.is_none());
+
+        // A newly read healthy request must not be lost when the older
+        // deferred one gets its turn ahead of the remaining operator work.
+        send.send(routine("routine-later", PressureLevel::Green))
+            .unwrap();
+        let (request, claim) = ready_scanner_request(&receive, Some(&queue), &mut deferred);
+        assert_eq!(
+            request.unwrap().paths,
+            vec![directory.path().join("routine-first")]
+        );
+        assert!(claim.is_none());
+        let (request, claim) = ready_scanner_request(&receive, Some(&queue), &mut deferred);
+        assert_eq!(
+            request.unwrap().paths,
+            vec![directory.path().join("routine-later")]
+        );
+        assert!(claim.is_none());
+        assert!(deferred.is_none());
+        let (request, claim) = ready_scanner_request(&receive, Some(&queue), &mut deferred);
+        assert_eq!(request.unwrap().paths, vec![second]);
+        assert!(claim.is_some());
     }
 
     #[cfg(target_os = "linux")]
@@ -13064,10 +14301,10 @@ mod tests {
             assert_eq!(scored.len(), 1);
             assert!(del_rx.try_recv().is_err());
             assert_eq!(
-                shared.authorize_dispatch(false),
+                shared.authorize_dispatch(false, false),
                 Err(SkipReason::PolicyChanged)
             );
-            assert_eq!(shared.authorize_dispatch(true), Ok(()));
+            assert_eq!(shared.authorize_dispatch(true, false), Ok(()));
 
             let path = ram.join("target");
             std::fs::create_dir(&path).unwrap();
@@ -13105,7 +14342,9 @@ mod tests {
             assert!(daemon.behavior_state.has_pending_target());
             assert_eq!(daemon.ram_reclaim_behavior, RamReclaimBehavior::Recovering);
             assert_eq!(
-                daemon.shared_executor_config.authorize_dispatch(false),
+                daemon
+                    .shared_executor_config
+                    .authorize_dispatch(false, false),
                 Err(SkipReason::PolicyChanged)
             );
             daemon.config.pressure.behavior_hysteresis_secs = 0;
@@ -13121,7 +14360,9 @@ mod tests {
                 RamReclaimBehavior::FilesystemOnly
             );
             assert_eq!(
-                daemon.shared_executor_config.authorize_dispatch(false),
+                daemon
+                    .shared_executor_config
+                    .authorize_dispatch(false, false),
                 Ok(())
             );
         }
@@ -13240,7 +14481,7 @@ mod tests {
             let authorize = |_candidate: &CandidacyScore| {
                 // Previously approved work must obey a live operator pause
                 // or fallback before its next mutation.
-                shared.authorize_dispatch(false)?;
+                shared.authorize_dispatch(false, false)?;
                 shared.authorize_mutation(ActiveMode::Enforce, policy.lock().mode())
             };
             let pause_after_unlink = |candidate: &CandidacyScore, _: Instant| {
@@ -14343,6 +15584,8 @@ mod tests {
                 free_pct: Some(9.0),
                 max_delete_batch: 10,
                 force_full_scan: false,
+                scan_now: None,
+                inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
                 maintenance: false,
@@ -14369,6 +15612,7 @@ mod tests {
                 false, 10, 0.0, 60, 3600, false, 0,
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
+            None,
         );
         logger.shutdown();
         logger_join.join().unwrap();
@@ -14470,6 +15714,8 @@ mod tests {
                     free_pct: Some(9.0),
                     max_delete_batch: 10,
                     force_full_scan: false,
+                    scan_now: None,
+                    inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
                     maintenance: false,
@@ -14496,6 +15742,7 @@ mod tests {
                     false, 10, 0.0, 60, 3600, false, 0,
                 )),
                 &Arc::new(SharedRegret::new(&Config::default())),
+                None,
             );
             logger.shutdown();
             logger_join.join().unwrap();
@@ -14581,6 +15828,8 @@ mod tests {
             free_pct: Some(8.0),
             max_delete_batch: 4,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -14739,6 +15988,7 @@ mod tests {
             rss_hard_limit_bytes: u64::MAX,
             rss_hard_limit_exceeded: false,
             state_write_failed: false,
+            state_write_errno: None,
         }
     }
 
@@ -15306,6 +16556,8 @@ mod tests {
             urgency: 0.8,
             target_bytes: None,
             ram_reclaim: None,
+            inode_reclaim: None,
+            scan_now: None,
             target_only_root: Some(root.clone()),
             target_only_consent: Some(test_target_only_consent(&root, &scanner)),
         };
@@ -15375,6 +16627,8 @@ mod tests {
             urgency: 0.9,
             target_bytes: None,
             ram_reclaim: None,
+            inode_reclaim: None,
+            scan_now: None,
             target_only_root: target_only.then(|| root.clone()),
             target_only_consent: target_only.then(|| test_target_only_consent(&root, &scanner)),
         };
@@ -15492,6 +16746,8 @@ mod tests {
                 urgency: 0.9,
                 target_bytes: None,
                 ram_reclaim: None,
+                inode_reclaim: None,
+                scan_now: None,
                 target_only_root: Some(root),
                 target_only_consent: (case != "missing").then_some(consent),
             })
@@ -15620,6 +16876,8 @@ mod tests {
                 urgency: 0.9,
                 target_bytes: None,
                 ram_reclaim: None,
+                inode_reclaim: None,
+                scan_now: None,
                 target_only_root: target_only_root.map(Path::to_path_buf),
                 target_only_consent: target_only_root
                     .map(|root| test_target_only_consent(root, &scanner)),
@@ -15878,6 +17136,8 @@ mod tests {
             urgency: 0.9,
             target_bytes: None,
             ram_reclaim: None,
+            inode_reclaim: None,
+            scan_now: None,
             target_only_root: Some(root.clone()),
             target_only_consent: Some(test_target_only_consent(&root, &scanner)),
         };
@@ -15983,6 +17243,8 @@ mod tests {
             urgency: 0.9,
             target_bytes: None,
             ram_reclaim: None,
+            inode_reclaim: None,
+            scan_now: None,
             target_only_consent: target_only_root
                 .as_deref()
                 .map(|root| test_target_only_consent(root, &scanner)),
@@ -16067,6 +17329,8 @@ mod tests {
                 urgency: 0.9,
                 target_bytes: None,
                 ram_reclaim: None,
+                inode_reclaim: None,
+                scan_now: None,
                 target_only_root: Some(root),
                 target_only_consent: Some(consent),
             })
@@ -16133,6 +17397,8 @@ mod tests {
                 urgency: 0.9,
                 target_bytes: None,
                 ram_reclaim: None,
+                inode_reclaim: None,
+                scan_now: None,
                 target_only_root: None,
                 target_only_consent: None,
             })
@@ -16169,6 +17435,8 @@ mod tests {
             urgency: 0.9,
             target_bytes: None,
             ram_reclaim: None,
+            inode_reclaim: None,
+            scan_now: None,
             target_only_root: None,
             target_only_consent: None,
         };
@@ -16557,6 +17825,8 @@ mod tests {
                 free_pct: Some(9.0),
                 max_delete_batch: 10,
                 force_full_scan: false,
+                scan_now: None,
+                inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
                 maintenance: false,
@@ -16584,6 +17854,7 @@ mod tests {
                 false, 10, 0.0, 60, 3600, false, 0,
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
+            None,
         );
 
         assert!(
@@ -16750,6 +18021,8 @@ mod tests {
             free_pct: Some(30.0),
             max_delete_batch: 4,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -16852,6 +18125,8 @@ mod tests {
                 free_pct: Some(9.0),
                 max_delete_batch: 10,
                 force_full_scan: false,
+                scan_now: None,
+                inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
                 maintenance: false,
@@ -16879,6 +18154,7 @@ mod tests {
                 false, 10, 0.0, 60, 3600, false, 0,
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
+            None,
         );
 
         // The pre-scan's batch is dispatched first. The walk may follow with
@@ -16985,6 +18261,8 @@ mod tests {
                     free_pct: Some(9.0),
                     max_delete_batch: 10,
                     force_full_scan: false,
+                    scan_now: None,
+                    inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
                     maintenance: false,
@@ -17011,6 +18289,7 @@ mod tests {
                     false, 10, 0.0, 60, 3600, false, 0,
                 )),
                 &Arc::new(SharedRegret::new(&Config::default())),
+                None,
             );
             let mut dispatched = Vec::new();
             while let Ok(batch) = del_rx.try_recv() {
@@ -17233,6 +18512,8 @@ mod tests {
                 free_pct: Some(9.0),
                 max_delete_batch: 10,
                 force_full_scan: false,
+                scan_now: None,
+                inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
                 maintenance: false,
@@ -17260,6 +18541,7 @@ mod tests {
                 false, 10, 0.0, 60, 3600, false, 0,
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
+            None,
         );
 
         let report = report_rx
@@ -17325,6 +18607,7 @@ mod tests {
                 level: "green".to_string(),
                 urgency: 0.0,
                 backing_pressure: None,
+                inode_pressure: None,
                 rescan_in_secs: None,
                 reclaim_capability: crate::daemon::mount_controller::ReclaimCapability::Configured,
                 reserve_state: None,
@@ -17449,6 +18732,8 @@ mod tests {
                 free_pct: Some(9.0),
                 max_delete_batch: 10,
                 force_full_scan: false,
+                scan_now: None,
+                inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
                 maintenance: false,
@@ -17476,6 +18761,7 @@ mod tests {
                 false, 10, 0.0, 60, 3600, false, 0,
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
+            None,
         );
 
         assert!(
@@ -17690,6 +18976,8 @@ mod tests {
                     free_pct: Some(9.0),
                     max_delete_batch: 10,
                     force_full_scan: false,
+                    scan_now: None,
+                    inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
                     maintenance: false,
@@ -17715,6 +19003,7 @@ mod tests {
                 &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
                 &executor_config,
                 &Arc::new(SharedRegret::new(&Config::default())),
+                None,
             );
             logger.shutdown();
             logger_join.join().unwrap();
@@ -17832,6 +19121,8 @@ mod tests {
                         free_pct: Some(9.0),
                         max_delete_batch: 10,
                         force_full_scan: false,
+                        scan_now: None,
+                        inode_reclaim: None,
                         config_update: None,
                         catalog_roots: Vec::new(),
                         maintenance: false,
@@ -17858,6 +19149,7 @@ mod tests {
                 &cpu_budget,
                 &executor_config,
                 &Arc::new(SharedRegret::new(&Config::default())),
+                None,
             );
             logger.shutdown();
             logger_join.join().unwrap();
@@ -18047,6 +19339,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn forced_v2_green_scan_walks_roots_and_logs_telemetry() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("scan-root").join("demo");
@@ -18104,6 +19397,8 @@ mod tests {
                 free_pct: Some(50.0),
                 max_delete_batch: 10,
                 force_full_scan: true,
+                scan_now: None,
+                inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
                 maintenance: false,
@@ -18131,6 +19426,7 @@ mod tests {
                 false, 10, 0.0, 60, 3600, false, 0,
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
+            None,
         );
 
         let report = report_rx
@@ -18869,6 +20165,8 @@ mod tests {
             free_pct: None,
             max_delete_batch: 0,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -18904,6 +20202,8 @@ mod tests {
             free_pct: Some(29.0),
             max_delete_batch: 1,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -19012,6 +20312,8 @@ mod tests {
             free_pct: None,
             max_delete_batch: 10,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -19169,6 +20471,8 @@ mod tests {
             free_pct: Some(8.5),
             max_delete_batch: 10,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -19209,6 +20513,8 @@ mod tests {
             free_pct: Some(18.0),
             max_delete_batch: 0,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -19382,6 +20688,8 @@ mod tests {
             free_pct: None,
             max_delete_batch: 10,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -19404,6 +20712,8 @@ mod tests {
             urgency: 0.5,
             target_bytes: None,
             ram_reclaim: None,
+            inode_reclaim: None,
+            scan_now: None,
             target_only_root: None,
             target_only_consent: None,
         };
@@ -19539,6 +20849,8 @@ mod tests {
             free_pct: Some(15.0),
             max_delete_batch: 4,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -19567,6 +20879,8 @@ mod tests {
             free_pct: Some(50.0),
             max_delete_batch: 10,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -19596,6 +20910,8 @@ mod tests {
             free_pct: None,
             max_delete_batch: 10,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -20173,6 +21489,7 @@ mod tests {
                         false, 10, 0.0, 60, 3600, false, 0,
                     )),
                     &Arc::new(SharedRegret::new(&Config::default())),
+                    None,
                 );
             });
             for (path, dirty, catalog) in [
@@ -20267,6 +21584,8 @@ mod tests {
             free_pct: Some(50.0),
             max_delete_batch: 10,
             force_full_scan: true,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -20385,6 +21704,8 @@ mod tests {
             free_pct: Some(10.0),
             max_delete_batch: 10,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -21089,6 +22410,8 @@ mod tests {
             free_pct: None,
             max_delete_batch: 40,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -21119,6 +22442,8 @@ mod tests {
             free_pct: None,
             max_delete_batch: 40,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -21191,6 +22516,8 @@ mod tests {
             free_pct: None,
             max_delete_batch: 40,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -21215,6 +22542,8 @@ mod tests {
             free_pct: None,
             max_delete_batch: 1,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -21251,6 +22580,8 @@ mod tests {
             free_pct: None,
             max_delete_batch: 1,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
@@ -21265,6 +22596,8 @@ mod tests {
                 urgency: 0.5,
                 target_bytes: None,
                 ram_reclaim: None,
+                inode_reclaim: None,
+                scan_now: None,
                 target_only_root: None,
                 target_only_consent: None,
             })
@@ -21302,6 +22635,8 @@ mod tests {
             free_pct: None,
             max_delete_batch: 10,
             force_full_scan: false,
+            scan_now: None,
+            inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,

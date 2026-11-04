@@ -168,6 +168,83 @@ fn check_above_threshold_is_exit_zero() {
     assert!(stdout(&output).is_empty(), "{}", stdout(&output));
 }
 
+fn inode_fixture_check(config: &Path, path: &Path, inodes: &serde_json::Value) -> Output {
+    let table = serde_json::json!({
+        "mounts": [{
+            "path": path,
+            "fs_type": "ext4",
+            "total": 1_000_000,
+            "free": 900_000,
+            "inodes": inodes,
+        }],
+    });
+    Command::new(common::sbh_bin_path())
+        .arg("--config")
+        .arg(config)
+        .args(["--json", "check", "--target-free", "0"])
+        .arg(path)
+        .env("SBH_TEST_MODE", "1")
+        .env("SBH_TEST_FS_STATS", table.to_string())
+        .output()
+        .expect("run inode preflight")
+}
+
+#[test]
+fn check_inode_exhaustion_fails_even_when_byte_capacity_is_healthy() {
+    let dir = disk_tempdir();
+    let config = config_in(dir.path());
+    let output = inode_fixture_check(
+        &config,
+        dir.path(),
+        &serde_json::json!({"total": 1000, "free": 10, "available": 0}),
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let payload: serde_json::Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(payload["reason"], "inode_pressure");
+    assert_eq!(payload["exit_code"], 1);
+    assert_eq!(payload["free_pct"], 90.0);
+    assert_eq!(payload["free_bytes"], 900_000);
+    assert_eq!(payload["inodes"]["status"], "known");
+    assert_eq!(payload["inodes"]["stats"]["available"], 0);
+    assert_eq!(payload["inodes"]["pressure"]["level"], "critical");
+}
+
+#[test]
+fn check_inode_accounting_unknown_is_explicit_and_does_not_read_host_counters() {
+    let dir = disk_tempdir();
+    let config = config_in(dir.path());
+    let output = inode_fixture_check(&config, dir.path(), &serde_json::Value::Null);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let payload: serde_json::Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(payload["inodes"]["status"], "unavailable");
+    assert!(payload["inodes"]["stats"].is_null());
+    assert!(payload["inodes"]["pressure"].is_null());
+    assert_eq!(payload["free_bytes"], 900_000);
+}
+
+#[test]
+fn check_inode_pressure_can_be_disabled_without_hiding_raw_counters() {
+    let dir = disk_tempdir();
+    let config = config_in(dir.path());
+    let base = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        format!("{base}\n[pressure.inodes]\nenabled = false\n"),
+    )
+    .unwrap();
+    let output = inode_fixture_check(
+        &config,
+        dir.path(),
+        &serde_json::json!({"total": 1000, "free": 0, "available": 0}),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let payload: serde_json::Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(payload["inodes"]["status"], "disabled");
+    assert_eq!(payload["inodes"]["enabled"], false);
+    assert_eq!(payload["inodes"]["stats"]["available"], 0);
+    assert!(payload["inodes"]["pressure"].is_null());
+}
+
 /// `check` without `--target-free` uses the daemon's Yellow line, absolute
 /// floors included (bd-ud9s): a large disk well above its floor is not under
 /// pressure just because its free share is below the percentage.

@@ -1940,12 +1940,16 @@ impl PolicyEngine {
     /// The daemon could not persist `state.json`. Evidence that cannot be
     /// written must not keep driving deletions: with
     /// `serialization_failure_action = demote` the engine enters
-    /// FallbackSafe; `advisory` only counts and logs.
-    pub fn note_serialization_failure(&mut self) {
+    /// FallbackSafe; `advisory` only counts and logs. The one-call inode
+    /// evidence must describe a returned ENOSPC and fresh Red/Critical inode
+    /// pressure on the atomic state-write destination's own filesystem.
+    /// It preserves the current mode without changing global pressure or
+    /// bypassing Observe, the kill switch, Canary quotas, or other guardrails.
+    pub fn note_serialization_failure(&mut self, state_volume_inode_pressure: bool) {
         self.serialization_failures = self.serialization_failures.saturating_add(1);
         // At Red and Critical the failed write is almost always the full disk
         // itself; demoting then would stop the only thing that can fix it.
-        let action = if self.pressure_level >= PressureLevel::Red {
+        let action = if self.pressure_level >= PressureLevel::Red || state_volume_inode_pressure {
             FallbackAction::Advisory
         } else {
             self.config.serialization_failure_action
@@ -1958,8 +1962,16 @@ impl PolicyEngine {
             }
             FallbackAction::Advisory => eprintln!(
                 "[SBH-POLICY] state file write failed ({} so far) — continuing in {} \
-                 (serialization_failure_action = advisory)",
-                self.serialization_failures, self.mode
+                 ({})",
+                self.serialization_failures,
+                self.mode,
+                if state_volume_inode_pressure {
+                    "ENOSPC with validated inode pressure on the state-file filesystem"
+                } else if self.pressure_level >= PressureLevel::Red {
+                    "Red/Critical byte pressure"
+                } else {
+                    "serialization_failure_action = advisory"
+                },
             ),
         }
     }
@@ -2729,7 +2741,7 @@ mod tests {
     fn serialization_failure_demotes_or_advises() {
         let mut engine = PolicyEngine::new(default_config());
         engine.promote(); // canary
-        engine.note_serialization_failure();
+        engine.note_serialization_failure(false);
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
         assert_eq!(
             engine.fallback_reason(),
@@ -2741,11 +2753,59 @@ mod tests {
         config.serialization_failure_action = FallbackAction::Advisory;
         let mut engine = PolicyEngine::new(config);
         engine.promote();
-        engine.note_serialization_failure();
-        engine.note_serialization_failure();
+        engine.note_serialization_failure(false);
+        engine.note_serialization_failure(false);
         assert_eq!(engine.mode(), ActiveMode::Canary);
         assert_eq!(engine.serialization_failures(), 2);
         assert!(engine.fallback_reason().is_none());
+    }
+
+    #[test]
+    fn inode_persistence_advisory_preserves_modes_without_global_emergency_or_quota_bypass() {
+        for initial_mode in [
+            ActiveMode::Observe,
+            ActiveMode::Canary,
+            ActiveMode::Enforce,
+            ActiveMode::FallbackSafe,
+        ] {
+            let mut engine = PolicyEngine::new(PolicyConfig {
+                initial_mode,
+                ..default_config()
+            });
+            engine.note_serialization_failure(true);
+            assert_eq!(engine.mode(), initial_mode);
+            assert_eq!(engine.pressure_level, PressureLevel::Green);
+            assert_eq!(engine.serialization_failures(), 1);
+        }
+        let candidates = vec![sample_candidate(DecisionAction::Delete, 0.9)];
+        for config in [
+            PolicyConfig {
+                initial_mode: ActiveMode::Observe,
+                ..default_config()
+            },
+            PolicyConfig {
+                initial_mode: ActiveMode::Canary,
+                max_canary_deletes_per_hour: 0,
+                ..default_config()
+            },
+            PolicyConfig {
+                initial_mode: ActiveMode::Enforce,
+                kill_switch: true,
+                ..default_config()
+            },
+        ] {
+            let mut engine = PolicyEngine::new(config);
+            let prior = engine.mode();
+            engine.note_serialization_failure(true);
+            assert_eq!(engine.mode(), prior);
+            assert!(
+                engine
+                    .evaluate(&candidates, Some(&passing_guard()))
+                    .approved_for_deletion
+                    .is_empty()
+            );
+            assert_eq!(engine.pressure_level, PressureLevel::Green);
+        }
     }
 
     /// `auto_recover_to`: `none` never leaves FallbackSafe without
@@ -2938,10 +2998,10 @@ mod tests {
             ..PolicyConfig::default()
         });
         engine.set_pressure_level(PressureLevel::Critical);
-        engine.note_serialization_failure();
+        engine.note_serialization_failure(false);
         assert_eq!(engine.mode(), ActiveMode::Enforce);
         engine.set_pressure_level(PressureLevel::Yellow);
-        engine.note_serialization_failure();
+        engine.note_serialization_failure(false);
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
     }
 
