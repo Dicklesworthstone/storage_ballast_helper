@@ -131,7 +131,8 @@ still occupies memory, but its usage cannot be read by path. It is reported as
 unknown and keeps the report incomplete. Its usage is never taken as zero or
 borrowed from the cover. The one exception is a covered copy of a filesystem
 that was measured through another listed path (a bind or propagated copy):
-it is an alias, and it is listed with that filesystem's usage.
+it is an alias. Its usage is already counted, so nothing is missing. It is not
+listed under `mounts`, because its path reaches another filesystem.
 
 Every entry of `issues` has a matching `issue_details` entry, in the same order,
 with a stable `kind`, an affected `path`, the expected kernel `mount_id` when

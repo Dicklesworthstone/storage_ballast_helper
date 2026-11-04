@@ -52,7 +52,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   reaches its own device. A tmpfs stacked under a second tmpfs on the same
   mount point used to be measured through the upper one and dropped as its
   alias: its memory went uncounted in a report that said `complete=true`. It
-  is now reported as covered and the report is incomplete (exit 4).
+  is now reported as covered and the report is incomplete (exit 4). A covered
+  copy of a filesystem measured through another path is an alias: nothing is
+  missing, and it is not listed under `mounts`, because its path reaches
+  another filesystem and top-entry attribution could not read it.
   ([#40](https://github.com/Dicklesworthstone/storage_ballast_helper/issues/40))
 
 ### Added

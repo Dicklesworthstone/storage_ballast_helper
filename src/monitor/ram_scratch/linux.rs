@@ -546,20 +546,16 @@ fn observe_mounts<R: MountReader>(
             Err(issue) => issues.push(*issue),
         }
     }
-    let mut mounts: Vec<_> = measured.iter().map(|(mount, _)| mount.clone()).collect();
+    let mounts: Vec<_> = measured.iter().map(|(mount, _)| mount.clone()).collect();
     // A covered copy of a filesystem measured through another listed path
-    // (a bind or propagated mount) is an alias, not missing evidence.
+    // (a bind or propagated mount) is an alias, not missing evidence. It is
+    // not listed: its path reaches another filesystem, and attribution walks
+    // every listed path, so a complete report would turn incomplete.
     for (record, cover) in covered {
-        if let Some(alias) = mounts
+        if !mounts
             .iter()
-            .find(|mount| record.has_device(mount.filesystem_id))
-            .cloned()
+            .any(|mount| record.has_device(mount.filesystem_id))
         {
-            mounts.push(ScratchMount {
-                path: record.mount_point.to_string_lossy().into_owned(),
-                ..alias
-            });
-        } else {
             issues.push(covered_issue(record, cover));
         }
     }
@@ -2083,7 +2079,8 @@ mod tests {
     }
 
     /// A propagated or bind copy hidden under a mount is the same filesystem
-    /// as a copy that was measured, so nothing is missing.
+    /// as a copy that was measured, so nothing is missing. Only the measured
+    /// path is listed: lookup of a hidden copy's path reaches the cover.
     #[test]
     fn a_covered_copy_of_a_measured_filesystem_is_an_alias() {
         let mut table = host();
@@ -2106,10 +2103,7 @@ mod tests {
             .filter(|mount| mount.filesystem_id == libc::makedev(0, 40))
             .map(|mount| mount.path.as_str())
             .collect();
-        assert_eq!(
-            copies,
-            ["/k/pods/secret", "/k/pods/secret", "/k/other/secret"]
-        );
+        assert_eq!(copies, ["/k/pods/secret"]);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use nix::mount::{MntFlags, MsFlags, mount, umount, umount2};
 use storage_ballast_helper::monitor::ram_scratch::{
@@ -362,6 +363,60 @@ fn native_covered_child_is_incomplete_in_library_and_cli() {
                     .any(|entry| entry.filesystem_id == hidden_device)
             );
             cli_incomplete(&covered, "mount_covered");
+        },
+    );
+}
+
+/// A hidden copy of a measured filesystem is an alias: nothing is missing, and
+/// attribution of the listed paths stays complete, because none of them is the
+/// hidden copy's path, which lookup can no longer take to that filesystem.
+#[test]
+#[ignore = "requires Linux private mount namespaces and root; run native-ram-scratch"]
+fn native_covered_alias_is_not_listed_and_attribution_completes() {
+    in_private_namespace(
+        "native_covered_alias_is_not_listed_and_attribution_completes",
+        |root| {
+            let visible = root.join("visible");
+            let parent = root.join("parent");
+            let hidden = parent.join("hidden");
+            fs::create_dir(&visible).unwrap();
+            fs::create_dir_all(&hidden).unwrap();
+            tmpfs(&visible, "size=1m");
+            marker(&visible.join("one-page"));
+            let device = fs::metadata(&visible).unwrap().dev();
+            bind(&visible, &hidden);
+            tmpfs(&parent, "size=1m");
+            assert!(!hidden.exists(), "the bind copy must be covered");
+
+            let report = inspect(root);
+            no_fixture_issues(&report, root);
+            assert!(measured(&report, &visible, device).used_bytes > 0);
+            let occupied: Vec<_> = report
+                .assessment
+                .as_ref()
+                .unwrap()
+                .mounts
+                .iter()
+                .filter(|entry| Path::new(&entry.path).starts_with(root) && entry.used_bytes > 0)
+                .cloned()
+                .collect();
+            assert!(
+                occupied
+                    .iter()
+                    .all(|entry| Path::new(&entry.path) != hidden),
+                "{occupied:?}"
+            );
+            let attribution = ram_scratch::attribution::inspect(
+                &occupied,
+                ram_scratch::attribution::AttributionLimits::default(),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            assert_eq!(attribution.len(), occupied.len());
+            assert!(
+                attribution.iter().all(|mount| mount.complete),
+                "{attribution:?}"
+            );
         },
     );
 }

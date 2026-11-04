@@ -61,7 +61,9 @@ pub struct ScratchAssessment {
     pub nominal_ram_plus_swap_bytes: u64,
     /// Number of independently counted tmpfs filesystems.
     pub unique_filesystems: usize,
-    /// Every mount name remains visible, including aliases and runtime mounts.
+    /// Every measured mount path, including aliases and runtime mounts. A path
+    /// always reached the filesystem it lists when measured, so a covered copy
+    /// of a filesystem measured through another path is not listed.
     pub mounts: Vec<ScratchMount>,
     /// Stable, additive risk reasons; one assessment produces one warning.
     pub reasons: Vec<&'static str>,
