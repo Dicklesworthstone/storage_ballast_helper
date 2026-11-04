@@ -133,16 +133,15 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/storage_ballast_h
 
 The one-liner detects Linux versus macOS, downloads the matching release
 artifact, installs the `sbh` binary, and updates an existing systemd or launchd
-service binary when one is already registered. First-time daemon registration is
-still handled by `sbh install --auto`, which chooses systemd on Linux and
-launchd on macOS.
+service binary when one is already registered. Register a daemon that can
+reclaim build artifacts with `sudo sbh install --auto`: it chooses systemd on
+Linux or launchd on macOS and installs a system service when running as root.
 
-On Linux, register the daemon in system scope instead:
-`sudo sbh install --systemd --scope system`. `sbh install --auto` registers a
-user-scope service, and an sbh without root cannot inspect other users'
-processes for open or mapped files, so its scanner refuses every deletion
-candidate and only ballast release works. `sbh status` and
-`sbh doctor --system` report this.
+Without root, `sbh install --auto` installs a user service and warns that its
+scanner cannot inspect other users' open or mapped files. It therefore refuses
+deletion candidates; ballast release still works. Explicit `--user` or
+`--scope user|system` overrides the automatic scope. `sbh status` and
+`sbh doctor --system` report the running daemon's process visibility.
 
 Pin a specific version:
 
@@ -152,28 +151,27 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/storage_ballast_h
 
 ### macOS Quick Start
 
-For the default user LaunchAgent install:
+For a system LaunchDaemon that can reclaim build artifacts:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/storage_ballast_helper/main/scripts/install.sh | bash
-sbh install --auto
-sbh doctor --pal
+sudo sbh install --auto
+sudo sbh doctor --pal
 sbh status
 ```
 
-`sbh install --auto` detects macOS, chooses launchd, installs a user-scoped
-LaunchAgent, uses native Application Support paths, and provisions the default
-ballast preset. A user-scoped sbh cannot see other users' processes (macOS
-hides them), so its open-file check is never complete and the scanner refuses
-every deletion candidate: user-scope daemons are conservative by design (they
-veto whatever they cannot prove unused), and only ballast release works.
-`sbh status` and `sbh doctor --system` report this. The root (system-scope)
-daemon is the supported mode for reclaiming build artifacts; register it with:
+`sudo sbh install --auto` detects macOS, chooses launchd system scope, uses
+the system configuration and data paths, and provisions the default ballast
+preset. To request a user LaunchAgent explicitly:
 
 ```bash
-sudo sbh install --launchd --scope system --auto
-sudo sbh doctor --pal
+sbh install --launchd --scope user --auto
 ```
+
+A non-root LaunchAgent cannot see other users' processes (macOS hides them),
+so its open-file check is never complete and the scanner refuses deletion
+candidates. Ballast release still works. The installer explains this limit
+before service registration; `sbh status` and `sbh doctor --system` also report it.
 
 Under root, `scanner.include_user_temp_dir` adds root's temporary directory,
 not yours: list your `$TMPDIR` in `scanner.root_paths` explicitly.
@@ -363,10 +361,10 @@ Precedence is: `--config`, then `SBH_CONFIG`, then the platform default. On macO
 
 ### Install Wizard
 
-Running `sbh install` without prior configuration launches the install wizard, which guides through four steps:
+Running `sbh install --wizard` launches guided setup:
 
 1. **Service manager** -- systemd (Linux default), launchd (macOS default), or none (manual start).
-2. **Service scope** -- user service or system-wide (system scope requires root).
+2. **Service scope** -- system-wide when running as root, user service otherwise. The wizard explains the scanner limitations of non-root services. Explicit service and scope flags are retained without asking those questions again.
 3. **Watched paths** -- auto-detects `/data/projects`, `/tmp`, and `$HOME` if they exist. Custom paths can be added interactively.
 4. **Ballast sizing** -- choose a preset or enter custom file counts:
 
@@ -377,14 +375,20 @@ Running `sbh install` without prior configuration launches the install wizard, w
 | Large | 20 | 1 GiB | 20 GiB |
 | Custom | user-specified | 1 GiB | varies |
 
-For non-interactive environments (CI, automation), `sbh install --auto` applies platform-detected defaults: the platform-native service manager, auto-discovered watched paths, user-scope service, and Medium ballast preset.
+For non-interactive environments (CI, automation), `sbh install --auto` applies
+the platform-native service manager, auto-discovered watched paths, and Medium
+ballast preset. Service scope follows effective privileges: system under root
+or `sudo`, user otherwise. Explicit scope flags always take precedence, and
+`--config` or `SBH_CONFIG` retains its configuration destination. A non-root
+user service's reclamation warning is included in both human and JSON install
+summaries, including `--auto --dry-run --json`.
 
 ### macOS Configure Checklist
 
-- **LaunchAgent vs LaunchDaemon:** user scope is the default and writes under
-  `~/Library/Application Support/sbh/`; system scope requires `sudo`, installs a
-  LaunchDaemon, writes under `/private/var/sbh/`, and can inspect all users'
-  process activity.
+- **LaunchAgent vs LaunchDaemon:** `--auto` selects user scope without root
+  and writes under `~/Library/Application Support/sbh/`. Under `sudo` it
+  selects a system LaunchDaemon, writes data under `/private/var/sbh/`, and
+  has the privileges needed to inspect other users' process activity.
 - **Full Disk Access:** run `sbh doctor --pal` after install. If the
   `macos.full_disk_access` check warns or fails, follow
   `docs/macos-full-disk-access.md`, then restart the launchd service.

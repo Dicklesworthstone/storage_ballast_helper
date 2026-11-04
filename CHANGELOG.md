@@ -8,6 +8,17 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Automatic privileged installs register a system service.** Running
+  `sudo sbh install --auto` now selects systemd system scope or a launchd
+  LaunchDaemon, with the corresponding configuration and data paths. Explicit
+  service and scope choices remain authoritative in automatic and guided
+  installs, and explicit configuration destinations are preserved. A non-root
+  user-service installation explains that scanner reclamation is unavailable
+  with incomplete process visibility, in both human and JSON summaries, and
+  gives the command for a system installation. Process-coverage safeguards
+  remain unchanged
+  ([#27](https://github.com/Dicklesworthstone/storage_ballast_helper/issues/27)).
+
 - **Recreated shared Go caches no longer return to a short deletion cycle.**
   Structurally recognized build and module caches outside rch now share its
   exact-path deletion history. Each repeat doubles the minimum idle window,

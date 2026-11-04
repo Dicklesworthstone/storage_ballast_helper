@@ -261,7 +261,7 @@ enum PolicyCliAction {
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
 #[command(
-    after_long_help = "Platform notes:\n  Omit --systemd/--launchd for auto-detection.\n  On macOS, --auto selects launchd user scope and native Application Support paths.\n  Use sbh doctor --pal after install to verify launchd, APFS, and Full Disk Access state."
+    after_long_help = "Platform notes:\n  Omit --systemd/--launchd for auto-detection.\n  --auto selects system scope when run as root (including sudo), user scope otherwise.\n  Explicit --user or --scope choices take precedence, including in the wizard.\n  Non-root user services can release ballast but cannot reclaim build artifacts because process coverage is incomplete.\n  Use sudo sbh install --auto for a system service, then sbh doctor --system.\n  On macOS, use sbh doctor --pal to verify launchd, APFS, and Full Disk Access state."
 )]
 #[allow(clippy::struct_excessive_bools)]
 struct InstallArgs {
@@ -3089,12 +3089,8 @@ fn resolve_install_service(
         ));
     }
 
-    let user_scope = match args.scope {
-        Some(InstallScopeArg::User) => true,
-        Some(InstallScopeArg::System) => false,
-        None if args.user || args.auto || args.wizard => true,
-        None => kind == ServiceKind::Launchd,
-    };
+    let user_scope = explicit_install_user_scope(args)
+        .unwrap_or(!is_root && (args.auto || args.wizard || kind == ServiceKind::Launchd));
 
     if !user_scope && !is_root {
         return Err(CliError::User(service_system_scope_root_message(
@@ -3105,6 +3101,76 @@ fn resolve_install_service(
     }
 
     Ok(Some(ResolvedInstallService { kind, user_scope }))
+}
+
+fn explicit_install_user_scope(args: &InstallArgs) -> Option<bool> {
+    match args.scope {
+        Some(InstallScopeArg::User) => Some(true),
+        Some(InstallScopeArg::System) => Some(false),
+        None => args.user.then_some(true),
+    }
+}
+
+fn install_wizard_service_options(
+    args: &InstallArgs,
+    service: Option<ResolvedInstallService>,
+) -> storage_ballast_helper::cli::wizard::WizardServiceOptions {
+    use storage_ballast_helper::cli::wizard::{ServiceChoice, WizardServiceOptions};
+
+    let user_scope = explicit_install_user_scope(args);
+    WizardServiceOptions {
+        // An explicit scope also requests service installation; do not let
+        // the wizard replace it with "none" and silently ignore the flag.
+        service: if args.systemd || args.launchd || user_scope.is_some() {
+            service.map(|service| ServiceChoice::from_service_kind(service.kind))
+        } else {
+            None
+        },
+        user_scope,
+    }
+}
+
+fn install_service_warnings(service: Option<ResolvedInstallService>, is_root: bool) -> Vec<String> {
+    use storage_ballast_helper::cli::wizard::{ServiceChoice, service_scope_warning};
+
+    service
+        .and_then(|service| {
+            service_scope_warning(
+                ServiceChoice::from_service_kind(service.kind),
+                service.user_scope,
+                is_root,
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
+fn install_wizard_config(
+    cli: &Cli,
+    answers: &storage_ballast_helper::cli::wizard::WizardAnswers,
+) -> Result<Config, CliError> {
+    use storage_ballast_helper::core::config::ConfigPathSource;
+
+    let mut config = answers.to_config();
+    let target = Config::resolve_config_write_path(cli.config.as_deref());
+    // Explicit destinations retain their ordinary --config/SBH_CONFIG
+    // precedence. Only the implicit layout follows the selected scope.
+    if matches!(
+        target.source,
+        ConfigPathSource::Explicit | ConfigPathSource::Env
+    ) {
+        config.paths.config_file = absolute_install_config_path(&target.path)?;
+    }
+    Ok(config)
+}
+
+fn absolute_install_config_path(path: &Path) -> Result<PathBuf, CliError> {
+    std::path::absolute(path).map_err(|error| {
+        CliError::Runtime(format!(
+            "cannot resolve configuration destination {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 fn resolve_wizard_install_service(
@@ -3165,16 +3231,17 @@ fn run_install_auto_dry_run_json(cli: &Cli, args: &InstallArgs) -> Result<(), Cl
     let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
     let service_kind = platform.service_kind();
     let sudo_command = format_sudo_rerun_command(cli, service_kind);
-    let service = resolve_install_service(args, service_kind, running_as_root(), &sudo_command)?;
+    let is_root = running_as_root();
+    let service = resolve_install_service(args, service_kind, is_root, &sudo_command)?;
 
     let mut answers = auto_answers_for_platform(platform.as_ref());
     apply_resolved_service_to_wizard_answers(&mut answers, service);
-    let config = answers.to_config();
+    let config = install_wizard_config(cli, &answers)?;
     let summary = WizardSummary {
         config_path: config.paths.config_file.clone(),
         config_written: false,
         answers,
-        warnings: vec![],
+        warnings: install_service_warnings(service, is_root),
     };
 
     let release_install = if service_kind == ServiceKind::Launchd && !args.from_source {
@@ -3566,27 +3633,27 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
     let service_kind = platform.service_kind();
     let sudo_command = format_sudo_rerun_command(cli, service_kind);
-    let mut service =
-        resolve_install_service(args, service_kind, running_as_root(), &sudo_command)?;
+    let is_root = running_as_root();
+    let mut service = resolve_install_service(args, service_kind, is_root, &sudo_command)?;
     let guided_install = if args.wizard {
         use storage_ballast_helper::cli::wizard::{
-            WizardSummary, format_summary, run_interactive_for_platform, write_config,
+            WizardSummary, format_summary, run_interactive_for_platform_with_options, write_config,
         };
 
         let stdin = io::stdin();
         let mut reader = stdin.lock();
         let mut writer = io::stderr();
-        let answers = run_interactive_for_platform(&mut reader, &mut writer, platform.as_ref())
-            .map_err(|e| CliError::User(format!("wizard cancelled: {e}")))?;
+        let answers = run_interactive_for_platform_with_options(
+            &mut reader,
+            &mut writer,
+            platform.as_ref(),
+            install_wizard_service_options(args, service),
+        )
+        .map_err(|e| CliError::User(format!("wizard cancelled: {e}")))?;
         drop(reader);
 
-        service = resolve_wizard_install_service(
-            &answers,
-            service_kind,
-            running_as_root(),
-            &sudo_command,
-        )?;
-        let config = answers.to_config();
+        service = resolve_wizard_install_service(&answers, service_kind, is_root, &sudo_command)?;
+        let config = install_wizard_config(cli, &answers)?;
         let config_path = config.paths.config_file.clone();
         let config_written = if args.dry_run {
             config_path
@@ -3598,7 +3665,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             answers,
             config_path: config_written,
             config_written: !args.dry_run,
-            warnings: vec![],
+            warnings: install_service_warnings(service, is_root),
         };
 
         match output_mode(cli) {
@@ -3619,7 +3686,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
 
         let mut answers = auto_answers_for_platform(platform.as_ref());
         apply_resolved_service_to_wizard_answers(&mut answers, service);
-        let config = answers.to_config();
+        let config = install_wizard_config(cli, &answers)?;
         let config_path = config.paths.config_file.clone();
         let config_written = if args.dry_run {
             config_path
@@ -3631,7 +3698,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             answers,
             config_path: config_written,
             config_written: !args.dry_run,
-            warnings: vec![],
+            warnings: install_service_warnings(service, is_root),
         };
 
         match output_mode(cli) {
@@ -3648,10 +3715,30 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     } else {
         None
     };
-    let config = guided_install.as_ref().map_or_else(
+    if guided_install.is_none() {
+        let warnings = install_service_warnings(service, is_root);
+        if !warnings.is_empty() {
+            match output_mode(cli) {
+                OutputMode::Human => {
+                    for warning in warnings {
+                        eprintln!("Warning: {warning}");
+                    }
+                }
+                OutputMode::Json => write_json_line(&json!({
+                    "command": "install",
+                    "step": "service_scope",
+                    "warnings": warnings,
+                }))?,
+            }
+        }
+    }
+    let mut config = guided_install.as_ref().map_or_else(
         || load_install_config(cli, service),
         |(_, config)| config.clone(),
     );
+    if !config.paths.config_file.is_absolute() {
+        config.paths.config_file = absolute_install_config_path(&config.paths.config_file)?;
+    }
     let mut installed_binary_path = if service_kind == ServiceKind::Launchd && !args.from_source {
         run_macos_release_binary_install(cli, args, &config, service)?
     } else {
@@ -3871,7 +3958,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     let unit_path = mgr.config().unit_path();
     let scope = service.scope_name();
 
-    match mgr.install() {
+    match mgr.install_with_config(&config.paths.config_file) {
         Ok(()) => {
             let result = ServiceActionResult {
                 action: "install",
@@ -18690,7 +18777,7 @@ mod tests {
             config_path: answers.to_config().paths.config_file,
             config_written: false,
             answers,
-            warnings: Vec::new(),
+            warnings: install_service_warnings(service, false),
         };
         let release_report = UpdateReport {
             current_version: "0.4.7".to_string(),
@@ -18754,6 +18841,10 @@ mod tests {
         assert_eq!(payload["install"]["dry_run"].as_bool(), Some(true));
         assert!(payload["release_error"].is_null());
         assert_eq!(payload["success"].as_bool(), Some(true));
+        let warning = payload["wizard"]["warnings"][0].as_str().unwrap();
+        assert!(warning.contains("refuses deletion candidates"));
+        assert!(warning.contains("sudo sbh install --launchd --scope system --auto"));
+        assert!(storage_ballast_helper::cli::wizard::format_summary(&summary).contains(warning));
     }
 
     #[test]
@@ -18796,33 +18887,175 @@ mod tests {
     }
 
     #[test]
-    fn install_auto_flag_selects_user_scope_on_all_supported_service_kinds() {
+    fn install_automatic_scope_follows_effective_privilege() {
+        for kind in [ServiceKind::Systemd, ServiceKind::Launchd] {
+            for is_root in [false, true] {
+                for wizard in [false, true] {
+                    let args = InstallArgs {
+                        auto: !wizard,
+                        wizard,
+                        ..InstallArgs::default()
+                    };
+                    let service = resolve_install_service(
+                        &args,
+                        kind,
+                        is_root,
+                        "sudo sbh install --scope system",
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(service.kind, kind);
+                    assert_eq!(service.user_scope, !is_root);
+                    assert_eq!(
+                        install_service_warnings(Some(service), is_root).len(),
+                        usize::from(!is_root)
+                    );
+                    if is_root {
+                        assert_eq!(
+                            install_default_paths_for_service(Some(service)),
+                            PathsConfig::system_default()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn install_explicit_scope_wins_over_root_auto_and_wizard_defaults() {
+        for kind in [ServiceKind::Systemd, ServiceKind::Launchd] {
+            for wizard in [false, true] {
+                for (user, scope, expected_user_scope) in [
+                    (true, None, true),
+                    (false, Some(InstallScopeArg::User), true),
+                    (false, Some(InstallScopeArg::System), false),
+                ] {
+                    let args = InstallArgs {
+                        auto: !wizard,
+                        wizard,
+                        user,
+                        scope,
+                        ..InstallArgs::default()
+                    };
+                    let service = resolve_install_service(&args, kind, true, "sudo sbh install")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(service.user_scope, expected_user_scope);
+                    let options = install_wizard_service_options(&args, Some(service));
+                    assert_eq!(options.user_scope, Some(expected_user_scope));
+                    assert_eq!(
+                        options.service,
+                        Some(
+                            storage_ballast_helper::cli::wizard::ServiceChoice::from_service_kind(
+                                kind
+                            )
+                        )
+                    );
+                    assert!(install_service_warnings(Some(service), true).is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn install_wizard_keeps_unset_service_choices_interactive() {
         let args = InstallArgs {
-            auto: true,
+            wizard: true,
             ..InstallArgs::default()
         };
+        let service =
+            resolve_install_service(&args, ServiceKind::Systemd, true, "sudo sbh install").unwrap();
+        let options = install_wizard_service_options(&args, service);
+        assert!(options.service.is_none());
+        assert!(options.user_scope.is_none());
+        assert!(install_service_warnings(None, false).is_empty());
+    }
 
-        let linux = resolve_install_service(
-            &args,
-            ServiceKind::Systemd,
+    #[test]
+    fn install_auto_preserves_explicit_config_destination_with_system_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("custom.toml");
+        let cli = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            target.to_str().unwrap(),
+            "install",
+            "--auto",
+        ])
+        .unwrap();
+        let answers = test_wizard_answers(
+            storage_ballast_helper::cli::wizard::ServiceChoice::Systemd,
             false,
-            "sudo sbh install --scope system",
-        )
-        .expect("--auto should not require root for systemd user scope")
-        .expect("--auto should request service installation");
-        assert_eq!(linux.kind, ServiceKind::Systemd);
-        assert!(linux.user_scope);
+        );
+        let config = install_wizard_config(&cli, &answers).unwrap();
+        let mut expected = PathsConfig::system_default();
+        expected.config_file.clone_from(&target);
+        assert_eq!(config.paths, expected);
+        assert!(!target.exists(), "configuration planning must not write");
+    }
 
-        let macos = resolve_install_service(
-            &args,
-            ServiceKind::Launchd,
-            false,
-            "sudo sbh install --scope system",
-        )
-        .expect("--auto should resolve launchd")
-        .expect("--auto should request service installation");
-        assert_eq!(macos.kind, ServiceKind::Launchd);
-        assert!(macos.user_scope);
+    #[test]
+    fn install_guided_config_resolves_relative_env_and_explicit_destinations() {
+        const FIXTURE_ENV: &str = "SBH_TEST_GUIDED_CONFIG_DESTINATION";
+        if let Some(root) = std::env::var_os(FIXTURE_ENV).map(PathBuf::from) {
+            for mode in ["--auto", "--wizard"] {
+                for explicit in [false, true] {
+                    let mut argv = vec!["sbh"];
+                    if explicit {
+                        argv.extend(["--config", "explicit destination/config.toml"]);
+                    }
+                    argv.extend(["install", mode, "--dry-run"]);
+                    let cli = Cli::try_parse_from(argv).unwrap();
+                    let answers = test_wizard_answers(
+                        storage_ballast_helper::cli::wizard::ServiceChoice::Systemd,
+                        false,
+                    );
+                    let config = install_wizard_config(&cli, &answers).unwrap();
+                    let expected = root.join(if explicit {
+                        "explicit destination/config.toml"
+                    } else {
+                        "env destination/config.toml"
+                    });
+                    assert_eq!(config.paths.config_file, expected);
+                    assert!(config.paths.config_file.is_absolute());
+                    assert_eq!(
+                        config.paths.state_file,
+                        PathsConfig::system_default().state_file
+                    );
+                    assert!(
+                        !expected.exists(),
+                        "dry-run planning must not create the config"
+                    );
+                }
+            }
+            println!("guided config destinations verified");
+            return;
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(fixture.path()).unwrap();
+        let full_name = concat!(
+            module_path!(),
+            "::install_guided_config_resolves_relative_env_and_explicit_destinations"
+        );
+        let (_, test_name) = full_name.split_once("::").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .current_dir(&root)
+            .env(FIXTURE_ENV, &root)
+            .env("SBH_CONFIG", "env destination/config.toml")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("guided config destinations verified")
+        );
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
     }
 
     #[test]
@@ -20682,7 +20915,11 @@ mod tests {
                 "install",
                 &[
                     "Omit --systemd/--launchd for auto-detection",
-                    "launchd user scope",
+                    "--auto selects system scope when run as root",
+                    "user scope otherwise",
+                    "Explicit --user or --scope choices take precedence",
+                    "cannot reclaim build artifacts",
+                    "launchd, APFS",
                     "Full Disk Access",
                 ],
             ),

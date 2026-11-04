@@ -53,6 +53,44 @@ impl ServiceChoice {
     }
 }
 
+/// Service choices already supplied on the command line.
+///
+/// The wizard skips these questions so accepting a later prompt cannot undo
+/// an explicit `--scope`, `--user`, `--systemd`, or `--launchd` choice.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WizardServiceOptions {
+    /// Service backend selected by the caller.
+    pub service: Option<ServiceChoice>,
+    /// Explicit user (`true`) or system (`false`) scope.
+    pub user_scope: Option<bool>,
+}
+
+/// Explain the reclamation limit of a service that will run without root.
+///
+/// This describes the installed daemon's privileges, not merely the scope's
+/// name: an explicitly requested root user service still runs as root.
+#[must_use]
+pub fn service_scope_warning(
+    service: ServiceChoice,
+    user_scope: bool,
+    is_root: bool,
+) -> Option<String> {
+    if !user_scope || is_root {
+        return None;
+    }
+    let backend = match service {
+        ServiceChoice::Systemd => "--systemd",
+        ServiceChoice::Launchd => "--launchd",
+        ServiceChoice::None => return None,
+    };
+    Some(format!(
+        "This user service will run without root and cannot inspect other users' open or mapped \
+         files. The scanner therefore refuses deletion candidates; ballast release still works. \
+         For artifact reclamation, install a system service with \
+         `sudo sbh install {backend} --scope system --auto`."
+    ))
+}
+
 /// Ballast sizing preset for the wizard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum BallastPreset {
@@ -174,6 +212,7 @@ pub struct WizardSummary {
 pub struct WizardPlatformDefaults {
     service: ServiceChoice,
     watched_paths: Vec<PathBuf>,
+    is_root: bool,
 }
 
 impl WizardPlatformDefaults {
@@ -183,6 +222,7 @@ impl WizardPlatformDefaults {
         Self {
             service: ServiceChoice::from_service_kind(platform.service_kind()),
             watched_paths: auto_detect_watched_paths_for_platform(platform),
+            is_root: effective_user_is_root(),
         }
     }
 
@@ -194,6 +234,7 @@ impl WizardPlatformDefaults {
                     Vec::<PathBuf>::new(),
                     std::env::var_os("HOME").map(PathBuf::from),
                 ),
+                is_root: effective_user_is_root(),
             },
             |platform| Self::from_platform(platform.as_ref()),
         )
@@ -208,6 +249,17 @@ impl WizardPlatformDefaults {
     }
 }
 
+fn effective_user_is_root() -> bool {
+    #[cfg(unix)]
+    {
+        nix::unistd::Uid::effective().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Auto mode
 // ---------------------------------------------------------------------------
@@ -218,7 +270,7 @@ impl WizardPlatformDefaults {
 /// - Service: systemd on Linux, launchd on macOS, none on Windows.
 /// - Watched paths: `/data/projects`, `/tmp`, and `$HOME` if set.
 /// - Ballast: medium preset (10 GB).
-/// - Scope: user service.
+/// - Scope: system service when running as root; user service otherwise.
 #[must_use]
 pub fn auto_answers() -> WizardAnswers {
     auto_answers_for_defaults(&WizardPlatformDefaults::detected())
@@ -235,7 +287,7 @@ fn auto_answers_for_defaults(defaults: &WizardPlatformDefaults) -> WizardAnswers
 
     WizardAnswers {
         service: defaults.service,
-        user_scope: true,
+        user_scope: defaults.service == ServiceChoice::None || !defaults.is_root,
         watched_paths: defaults.watched_paths.clone(),
         ballast_preset: preset,
         ballast_file_count: preset.file_count(),
@@ -305,7 +357,12 @@ pub fn run_interactive<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
 ) -> io::Result<WizardAnswers> {
-    run_interactive_with_defaults(reader, writer, &WizardPlatformDefaults::detected())
+    run_interactive_with_defaults(
+        reader,
+        writer,
+        &WizardPlatformDefaults::detected(),
+        WizardServiceOptions::default(),
+    )
 }
 
 /// Run the interactive wizard using defaults from a caller-provided platform.
@@ -314,10 +371,28 @@ pub fn run_interactive_for_platform<R: BufRead, W: Write>(
     writer: &mut W,
     platform: &dyn Platform,
 ) -> io::Result<WizardAnswers> {
+    run_interactive_for_platform_with_options(
+        reader,
+        writer,
+        platform,
+        WizardServiceOptions::default(),
+    )
+}
+
+/// Run the platform-aware wizard while retaining explicit service choices.
+///
+/// Choices supplied in `options` are not prompted for again.
+pub fn run_interactive_for_platform_with_options<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    platform: &dyn Platform,
+    options: WizardServiceOptions,
+) -> io::Result<WizardAnswers> {
     run_interactive_with_defaults(
         reader,
         writer,
         &WizardPlatformDefaults::from_platform(platform),
+        options,
     )
 }
 
@@ -325,6 +400,7 @@ fn run_interactive_with_defaults<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
     defaults: &WizardPlatformDefaults,
+    options: WizardServiceOptions,
 ) -> io::Result<WizardAnswers> {
     let _ = writeln!(writer, "\n  Storage Ballast Helper — First-Run Setup\n");
     let _ = writeln!(
@@ -333,13 +409,22 @@ fn run_interactive_with_defaults<R: BufRead, W: Write>(
     );
 
     // Step 1: Service manager.
-    let service = prompt_service(reader, writer, defaults)?;
+    let service = if let Some(service) = options.service {
+        let _ = writeln!(writer, "  Service manager: {service} (from command line)");
+        service
+    } else {
+        prompt_service(reader, writer, defaults)?
+    };
 
     // Step 2: User vs system scope.
     let user_scope = if service == ServiceChoice::None {
         true
+    } else if let Some(user_scope) = options.user_scope {
+        let scope = if user_scope { "user" } else { "system" };
+        let _ = writeln!(writer, "  Service scope: {scope} (from command line)");
+        user_scope
     } else {
-        prompt_user_scope(reader, writer)?
+        prompt_user_scope(reader, writer, defaults.is_root)?
     };
 
     // Step 3: Watched paths.
@@ -365,6 +450,9 @@ fn run_interactive_with_defaults<R: BufRead, W: Write>(
 
     let _ = writeln!(writer);
     display_summary(writer, &answers);
+    if let Some(warning) = service_scope_warning(service, user_scope, defaults.is_root) {
+        let _ = writeln!(writer, "    Warning: {warning}");
+    }
 
     let confirmed = prompt_confirm(reader, writer, "Proceed with this configuration?")?;
     if !confirmed {
@@ -408,14 +496,31 @@ fn prompt_service<R: BufRead, W: Write>(
     }
 }
 
-fn prompt_user_scope<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<bool> {
+fn prompt_user_scope<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    is_root: bool,
+) -> io::Result<bool> {
     let _ = writeln!(writer);
     let _ = writeln!(writer, "  [1b] Service scope");
-    let _ = write!(writer, "    Install as user service? [Y/n]: ");
+    let _ = writeln!(
+        writer,
+        "    System services run as root with the privileges needed to inspect other users' active files."
+    );
+    let _ = writeln!(
+        writer,
+        "    Non-root user services can release ballast, but cannot reclaim build artifacts."
+    );
+    let choices = if is_root { "y/N" } else { "Y/n" };
+    let _ = write!(writer, "    Install as user service? [{choices}]: ");
     writer.flush()?;
 
     let input = read_line(reader)?;
-    Ok(!input.trim().eq_ignore_ascii_case("n"))
+    Ok(match input.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => true,
+        "n" | "no" => false,
+        _ => !is_root,
+    })
 }
 
 fn prompt_watched_paths<R: BufRead, W: Write>(
@@ -584,7 +689,8 @@ fn read_line<R: BufRead>(reader: &mut R) -> io::Result<String> {
 ///
 /// Returns the path where config was written.
 pub fn write_config(answers: &WizardAnswers, config_path: &Path) -> io::Result<PathBuf> {
-    let config = answers.to_config();
+    let mut config = answers.to_config();
+    config.paths.config_file = config_path.to_path_buf();
     let toml_str = toml::to_string_pretty(&config).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -685,7 +791,12 @@ mod tests {
 
     #[test]
     fn auto_answers_uses_smart_defaults() {
-        let answers = auto_answers();
+        let defaults = WizardPlatformDefaults {
+            service: ServiceChoice::Systemd,
+            watched_paths: vec![PathBuf::from("/tmp")],
+            is_root: false,
+        };
+        let answers = auto_answers_for_defaults(&defaults);
         assert!(answers.auto_mode);
         assert!(answers.user_scope);
         assert!(
@@ -695,6 +806,39 @@ mod tests {
         assert_eq!(answers.ballast_preset, BallastPreset::Medium);
         assert_eq!(answers.ballast_file_count, 10);
         assert_eq!(answers.ballast_file_size_bytes, 1_073_741_824);
+    }
+
+    #[test]
+    fn auto_scope_follows_effective_privilege_on_each_service_backend() {
+        for service in [ServiceChoice::Systemd, ServiceChoice::Launchd] {
+            for is_root in [false, true] {
+                let answers = auto_answers_for_defaults(&WizardPlatformDefaults {
+                    service,
+                    watched_paths: vec![PathBuf::from("/tmp")],
+                    is_root,
+                });
+                assert_eq!(answers.user_scope, !is_root, "{service}, root={is_root}");
+                if is_root {
+                    assert_eq!(answers.to_config().paths, PathsConfig::system_default());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unprivileged_service_warning_names_the_limit_and_remediation() {
+        for (service, backend) in [
+            (ServiceChoice::Systemd, "--systemd"),
+            (ServiceChoice::Launchd, "--launchd"),
+        ] {
+            let warning = service_scope_warning(service, true, false).unwrap();
+            assert!(warning.contains("refuses deletion candidates"));
+            assert!(warning.contains("ballast release still works"));
+            assert!(warning.contains(&format!("sudo sbh install {backend} --scope system --auto")));
+            assert!(service_scope_warning(service, true, true).is_none());
+            assert!(service_scope_warning(service, false, true).is_none());
+        }
+        assert!(service_scope_warning(ServiceChoice::None, true, false).is_none());
     }
 
     #[test]
@@ -768,22 +912,64 @@ mod tests {
 
     #[test]
     fn interactive_wizard_accepts_defaults() {
-        // Simulate pressing Enter for every prompt (accept all defaults).
-        let input = "\n\n\n\n\n";
-        let mut reader = io::Cursor::new(input.as_bytes());
-        let mut output = Vec::new();
-        let platform = MockPlatform::healthy().with_service_kind(ServiceKind::Launchd);
+        for is_root in [false, true] {
+            let mut reader = io::Cursor::new(b"\n\n\n\n\n\n");
+            let mut output = Vec::new();
+            let defaults = WizardPlatformDefaults {
+                service: ServiceChoice::Launchd,
+                watched_paths: vec![PathBuf::from("/tmp")],
+                is_root,
+            };
+            let answers = run_interactive_with_defaults(
+                &mut reader,
+                &mut output,
+                &defaults,
+                WizardServiceOptions::default(),
+            )
+            .unwrap();
 
-        let answers = run_interactive_for_platform(&mut reader, &mut output, &platform).unwrap();
+            assert_eq!(answers.service, ServiceChoice::Launchd);
+            assert_eq!(answers.user_scope, !is_root);
+            assert_eq!(answers.watched_paths, defaults.watched_paths);
+            assert_eq!(answers.ballast_preset, BallastPreset::Medium);
+            assert!(!answers.auto_mode);
+            let prompts = String::from_utf8(output).unwrap();
+            assert!(prompts.contains(if is_root { "[y/N]" } else { "[Y/n]" }));
+            assert_eq!(prompts.contains("Warning:"), !is_root);
+        }
+    }
 
-        assert_eq!(answers.service, ServiceChoice::Launchd);
-        assert!(answers.user_scope);
-        assert!(
-            !answers.watched_paths.is_empty(),
-            "expected default wizard answers to include at least one watched path"
-        );
-        assert_eq!(answers.ballast_preset, BallastPreset::Medium);
-        assert!(!answers.auto_mode);
+    #[test]
+    fn interactive_explicit_service_scope_skips_prompts_and_keeps_choices() {
+        for is_root in [false, true] {
+            for user_scope in [false, true] {
+                // Service and scope were supplied by CLI flags, so the first
+                // input must be the watched-path answer, not another choice.
+                let mut reader = io::Cursor::new(b"/chosen/work\ns\n\n\n");
+                let mut output = Vec::new();
+                let answers = run_interactive_with_defaults(
+                    &mut reader,
+                    &mut output,
+                    &WizardPlatformDefaults {
+                        service: ServiceChoice::Launchd,
+                        watched_paths: vec![PathBuf::from("/tmp")],
+                        is_root,
+                    },
+                    WizardServiceOptions {
+                        service: Some(ServiceChoice::Systemd),
+                        user_scope: Some(user_scope),
+                    },
+                )
+                .unwrap();
+                assert_eq!(answers.service, ServiceChoice::Systemd);
+                assert_eq!(answers.user_scope, user_scope);
+                assert_eq!(answers.watched_paths, vec![PathBuf::from("/chosen/work")]);
+                assert_eq!(answers.ballast_preset, BallastPreset::Small);
+                let prompts = String::from_utf8(output).unwrap();
+                assert!(!prompts.contains("Install as user service?"));
+                assert!(!prompts.contains("[1/5] Service manager"));
+            }
+        }
     }
 
     #[test]
@@ -865,6 +1051,8 @@ mod tests {
         assert!(config_path.exists());
 
         let contents = std::fs::read_to_string(&config_path).unwrap();
+        let config: Config = toml::from_str(&contents).unwrap();
+        assert_eq!(config.paths.config_file, config_path);
         assert!(
             contents.contains("[scanner]"),
             "should contain scanner section"
@@ -1077,7 +1265,8 @@ mod tests {
     // bd-2j5.19 — WizardAnswers serialization
     #[test]
     fn wizard_answers_serializes_to_json() {
-        let answers = auto_answers();
+        let mut answers = auto_answers();
+        answers.user_scope = true;
         let json = serde_json::to_string(&answers).unwrap();
         assert!(json.contains("\"auto_mode\":true"));
         assert!(json.contains("\"ballast_preset\":\"Medium\""));

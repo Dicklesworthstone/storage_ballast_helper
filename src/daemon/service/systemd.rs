@@ -368,6 +368,48 @@ impl SystemdServiceManager {
         unit
     }
 
+    /// Install a unit that reads the selected configuration explicitly.
+    ///
+    /// Installers resolve the destination before writing it; retaining that
+    /// absolute path keeps the daemon and its derived sandbox on one config.
+    pub fn install_with_config(&self, config: &Path) -> Result<()> {
+        if !config.is_absolute() {
+            return Err(SbhError::Runtime {
+                details: "systemd service installation requires an absolute config path".into(),
+            });
+        }
+        self.install_unit(Some(config))
+    }
+
+    fn install_unit(&self, config: Option<&Path>) -> Result<()> {
+        validate_systemd_binary(&self.config.binary_path)?;
+        self.check_binary_ownership();
+
+        let unit_dir = self.config.unit_dir();
+        let unit_path = self.config.unit_path();
+        let unit_content = self.generate_unit_file_with_config(config);
+
+        // Namespace setup precedes ExecStart (and ExecStartPre). Prepare the
+        // exact grants before publishing/enabling a unit; never broaden them
+        // to an existing ancestor or turn off ProtectSystem to make it start.
+        if !self.config.user_scope {
+            namespace::prepare(&self.config.read_write_paths)?;
+        }
+        fs::create_dir_all(&unit_dir).map_err(|source| SbhError::Io {
+            path: unit_path.clone(),
+            source,
+        })?;
+
+        fs::write(&unit_path, &unit_content).map_err(|source| SbhError::Io {
+            path: unit_path.clone(),
+            source,
+        })?;
+
+        self.run_systemctl(&["daemon-reload"])?;
+        self.run_systemctl(&["enable", SYSTEMD_UNIT_NAME])?;
+        Ok(())
+    }
+
     fn check_binary_ownership(&self) {
         #[cfg(unix)]
         {
@@ -428,33 +470,7 @@ impl SystemdServiceManager {
 
 impl ServiceManager for SystemdServiceManager {
     fn install(&self) -> Result<()> {
-        validate_systemd_binary(&self.config.binary_path)?;
-        self.check_binary_ownership();
-
-        let unit_dir = self.config.unit_dir();
-        let unit_path = self.config.unit_path();
-        let unit_content = self.generate_unit_file();
-
-        // Namespace setup precedes ExecStart (and ExecStartPre). Prepare the
-        // exact grants before publishing/enabling a unit; never broaden them
-        // to an existing ancestor or turn off ProtectSystem to make it start.
-        if !self.config.user_scope {
-            namespace::prepare(&self.config.read_write_paths)?;
-        }
-        fs::create_dir_all(&unit_dir).map_err(|source| SbhError::Io {
-            path: unit_path.clone(),
-            source,
-        })?;
-
-        fs::write(&unit_path, &unit_content).map_err(|source| SbhError::Io {
-            path: unit_path.clone(),
-            source,
-        })?;
-
-        self.run_systemctl(&["daemon-reload"])?;
-        self.run_systemctl(&["enable", SYSTEMD_UNIT_NAME])?;
-
-        Ok(())
+        self.install_unit(None)
     }
 
     fn uninstall(&self) -> Result<()> {
@@ -2210,6 +2226,94 @@ mod exec_path_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod install_config_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn install_with_config_publishes_selected_config_and_matching_sandbox() {
+        const FIXTURE_ENV: &str = "SBH_TEST_EXPLICIT_INSTALL_CONFIG";
+        if let Some(root) = env::var_os(FIXTURE_ENV).map(PathBuf::from) {
+            let config = root.join("custom %n $config/config.toml");
+            let grants = vec![
+                config.parent().unwrap().to_path_buf(),
+                root.join("build outputs"),
+            ];
+            let manager = SystemdServiceManager::new(SystemdConfig {
+                user_scope: false,
+                binary_path: env::current_exe().unwrap(),
+                read_write_paths: grants.clone(),
+            });
+            let unit_path = manager.config().unit_path();
+            fs::create_dir_all(unit_path.parent().unwrap()).unwrap();
+            fs::write(&unit_path, b"existing unit").unwrap();
+            assert!(
+                manager
+                    .install_with_config(Path::new("relative.toml"))
+                    .is_err()
+            );
+            assert_eq!(fs::read(&unit_path).unwrap(), b"existing unit");
+
+            // This calls the actual publication path. Every writable grant,
+            // unit file and systemctl invocation is confined to the fixture.
+            manager.install_with_config(&config).unwrap();
+            let unit = fs::read_to_string(&unit_path).unwrap();
+            assert_eq!(preserved_unit_config(&unit, &[]).unwrap(), Some(config));
+            let sandbox = ServiceSandbox::from_unit_texts(&[&unit]);
+            assert!(sandbox.strict);
+            assert_eq!(sandbox.writable, grants);
+            assert_eq!(
+                fs::read_to_string(root.join("systemctl-calls")).unwrap(),
+                "daemon-reload\nenable sbh.service\n"
+            );
+            return;
+        }
+
+        // Environment changes are restricted to a single-test child, so
+        // parallel tests cannot redirect one another's config or unit paths.
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let systemctl = bin.join("systemctl");
+        fs::write(
+            &systemctl,
+            b"#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SBH_TEST_SYSTEMCTL_CALLS\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+        let full_name = concat!(
+            module_path!(),
+            "::install_with_config_publishes_selected_config_and_matching_sandbox"
+        );
+        let (_, test_name) = full_name.split_once("::").unwrap();
+        let output = Command::new(env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(FIXTURE_ENV, root)
+            .env("SBH_TEST_MODE", "1")
+            .env("SBH_SYSTEMD_UNIT_DIR", root.join("units"))
+            .env("SBH_TEST_SYSTEMCTL_CALLS", root.join("systemctl-calls"))
+            .env("PATH", &bin)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            root.join("units/sbh.service").is_file(),
+            "the isolated test must publish a unit"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("systemctl-calls")).unwrap(),
+            "daemon-reload\nenable sbh.service\n"
+        );
     }
 }
 
