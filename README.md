@@ -1688,7 +1688,7 @@ The daemon monitors swap usage relative to available RAM. When swap utilization 
 
 Swap-thrash warnings are rate-limited to one per 15-minute window to avoid log noise during sustained pressure.
 
-On Linux, less than 10% free swap also supplies an independent pressure signal
+On Linux, less than <!-- claim:constants.ram_scratch.SWAP_RECLAIM_MIN_FREE_PCT -->10<!-- /claim -->% free swap also supplies an independent pressure signal
 for occupied tmpfs mounts covered by scanner roots. A mount can therefore
 reclaim eligible artifacts while its own filesystem free percentage is still
 Green. Each relief pass has a finite byte target, accepts only structurally

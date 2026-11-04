@@ -164,11 +164,16 @@ pub fn assess(
     })
 }
 
+/// Free swap percentage below which bounded tmpfs relief may run.
+/// This is also the recovery target of each relief pass.
+pub const SWAP_RECLAIM_MIN_FREE_PCT: u64 = 10;
+
 /// Shared risk predicate: less than 10% of nonzero configured swap is free.
 #[must_use]
 pub fn swap_nearly_full(memory: &MemoryInfo) -> bool {
     memory.swap_total_bytes > 0
-        && u128::from(memory.swap_free_bytes) * 10 < u128::from(memory.swap_total_bytes)
+        && u128::from(memory.swap_free_bytes) * 100
+            < u128::from(memory.swap_total_bytes) * u128::from(SWAP_RECLAIM_MIN_FREE_PCT)
 }
 
 /// Validated host swap pressure that can raise an occupied tmpfs mount's level.
@@ -202,13 +207,14 @@ pub fn swap_reclaim_pressure(memory: &MemoryInfo) -> Option<SwapReclaimPressure>
     {
         return None;
     }
+    let target_free_bytes = u64::try_from(
+        (u128::from(memory.swap_total_bytes) * u128::from(SWAP_RECLAIM_MIN_FREE_PCT)).div_ceil(100),
+    )
+    .ok()?;
     Some(SwapReclaimPressure {
         swap_total_bytes: memory.swap_total_bytes,
         swap_free_bytes: memory.swap_free_bytes,
-        target_bytes: memory
-            .swap_total_bytes
-            .div_ceil(10)
-            .saturating_sub(memory.swap_free_bytes),
+        target_bytes: target_free_bytes.saturating_sub(memory.swap_free_bytes),
     })
 }
 

@@ -730,7 +730,7 @@ pub fn constants() -> Vec<ConstantDoc> {
         BallastConfig, PressureConfig, ScannerConfig, ScoringConfig, TelemetryConfig,
     };
     use crate::daemon::self_monitor;
-    use crate::monitor::{ewma, guardrails, pid};
+    use crate::monitor::{ewma, guardrails, pid, ram_scratch};
     use crate::scanner::scoring as rch;
     use crate::scanner::{deletion, planner, quarantine, walker};
 
@@ -796,6 +796,13 @@ pub fn constants() -> Vec<ConstantDoc> {
             pressure.behavior_hysteresis_secs,
             "Dwell before a behavior cell change takes effect",
             CONFIG,
+        ),
+        constant(
+            "ram_scratch",
+            "SWAP_RECLAIM_MIN_FREE_PCT",
+            ram_scratch::SWAP_RECLAIM_MIN_FREE_PCT,
+            "Free swap % below which bounded tmpfs relief may run",
+            "src/monitor/ram_scratch.rs",
         ),
         constant(
             "controller",
@@ -2981,6 +2988,28 @@ mod tests {
         assert_eq!(fmt_bytes(1500), "1500 B");
         assert_eq!(fmt_duration(Duration::from_millis(250)), "250 ms");
         assert_eq!(fmt_duration(Duration::from_secs(300)), "300 s");
+    }
+
+    #[test]
+    fn ram_scratch_claim_matches_the_live_reclaim_boundary() {
+        use crate::monitor::ram_scratch::swap_reclaim_pressure;
+        use crate::platform::pal::MemoryInfo;
+
+        let document = DocsDocument::build(&clap::Command::new("sbh"));
+        let threshold: u64 = document
+            .claim_value("constants.ram_scratch.SWAP_RECLAIM_MIN_FREE_PCT")
+            .expect("registered swap headroom claim")
+            .parse()
+            .unwrap();
+        let mut memory = MemoryInfo {
+            total_bytes: 100,
+            available_bytes: 100,
+            swap_total_bytes: 100,
+            swap_free_bytes: threshold,
+        };
+        assert!(swap_reclaim_pressure(&memory).is_none());
+        memory.swap_free_bytes -= 1;
+        assert_eq!(swap_reclaim_pressure(&memory).unwrap().target_bytes, 1);
     }
 
     /// Claim ids resolve against the document; `render_claims` rewrites
