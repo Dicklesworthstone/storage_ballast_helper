@@ -19,6 +19,8 @@ pub mod process_io_history;
 pub mod ram_reclaim;
 #[cfg(feature = "daemon")]
 pub mod rch_staging;
+#[cfg(feature = "daemon")]
+mod recovery_probe;
 pub mod self_monitor;
 pub mod service;
 #[cfg(feature = "daemon")]

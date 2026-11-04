@@ -144,7 +144,8 @@ fn open_beneath_with_mount_id(
 }
 
 #[cfg(target_os = "linux")]
-fn mount_id(fd: BorrowedFd<'_>) -> io::Result<u64> {
+/// Read a pinned descriptor's mount identity using verified kernel evidence.
+pub fn mount_id(fd: BorrowedFd<'_>) -> io::Result<u64> {
     use rustix::fs::{AtFlags, StatxFlags, statx};
     let primary = statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
         .map(|stat| (stat.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stat.stx_mnt_id))

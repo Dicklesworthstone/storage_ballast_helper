@@ -1984,17 +1984,93 @@ fn prescan_dir_size(path: &Path, cross_devices: bool, cancel: &AtomicBool) -> u6
     }
 }
 
-/// Probe write used to leave `MountState::Recovery`: 4 KiB into the mount's
-/// ballast directory (or `<mount>/.sbh`), removed again on success.
-fn probe_mount_writable(mount: &Path, ballast_dir: Option<&Path>) -> bool {
-    let dir = ballast_dir.map_or_else(|| mount.join(".sbh"), Path::to_path_buf);
-    if std::fs::create_dir_all(&dir).is_err() {
+/// Leave Recovery only after a private allocation/writeback probe succeeds on
+/// an existing authorized surface of this device. The mount directory itself
+/// is not implicit write permission, and `.sbh/probe` is never touched.
+fn probe_mount_writable(
+    mount: &Path,
+    ballast_dir: Option<&Path>,
+    roots: &[PathBuf],
+    catalog: &[ExpandedCatalogRoot],
+    cross_device_fallback: bool,
+    scanner: &ScannerConfig,
+) -> bool {
+    use crate::daemon::recovery_probe::probe_writable_surface;
+
+    // An existing managed ballast pool already has independent write authority.
+    // A missing pool is not permission to create a directory during recovery.
+    if ballast_dir.is_some_and(|base| probe_writable_surface(mount, base, |_| true)) {
+        return true;
+    }
+    let mut surfaces: Vec<PathBuf> = roots
+        .iter()
+        .filter(|root| scanner.root_paths.contains(root))
+        .cloned()
+        .collect();
+    if scanner.catalog_roots_on_pressured_device {
+        for entry in catalog {
+            if !matches!(
+                entry.confidence,
+                crate::platform::cleanup_catalog::CleanupConfidence::ReportOnly
+                    | crate::platform::cleanup_catalog::CleanupConfidence::Sacred
+            ) {
+                push_unique_path(&mut surfaces, entry.path.clone());
+            }
+        }
+    }
+    // Check the active exclusions and protection policy after pinning the
+    // base, for both its configured spelling and the opened canonical path.
+    // Whole-root Git inspection is report-only (#33); a Git clone elsewhere
+    // below /tmp cannot forbid a private probe that never touches its entries.
+    if surfaces.iter().any(|base| {
+        probe_writable_surface(mount, base, |resolved| {
+            recovery_probe_surface_allowed(base, resolved, scanner)
+        })
+    }) {
+        return true;
+    }
+
+    // A crossed mount may have no configured root of its own. Its root is
+    // nevertheless within the existing scan scope only when cross-device
+    // traversal is enabled and a configured root contains it. A pressure
+    // observation alone never authorizes writing an unrelated mount root.
+    if !cross_device_fallback || !scanner.cross_devices {
         return false;
     }
-    let probe = dir.join("probe");
-    let written = std::fs::write(&probe, [0u8; 4096]).is_ok();
-    let _ = std::fs::remove_file(&probe);
-    written
+    let Ok(expected_mount) = std::fs::canonicalize(mount) else {
+        return false;
+    };
+    scanner.root_paths.iter().any(|root| {
+        let Ok(expected_root) = std::fs::canonicalize(root) else {
+            return false;
+        };
+        let Ok(relative) = expected_mount.strip_prefix(&expected_root) else {
+            return false;
+        };
+        if relative.as_os_str().is_empty() {
+            return false;
+        }
+        // Retain the configured alias in the spelling so pinning also binds
+        // it, rather than bypassing it through a canonical mount pathname.
+        let base = root.join(relative);
+        probe_writable_surface(mount, &base, |resolved| {
+            resolved == expected_mount
+                && std::fs::canonicalize(root).is_ok_and(|current| current == expected_root)
+                && recovery_probe_surface_allowed(root, &expected_root, scanner)
+                && recovery_probe_surface_allowed(&base, resolved, scanner)
+        })
+    })
+}
+
+fn recovery_probe_surface_allowed(base: &Path, resolved: &Path, scanner: &ScannerConfig) -> bool {
+    let Ok(mut protection) = ProtectionRegistry::new(Some(&scanner.protected_paths)) else {
+        return false;
+    };
+    [base, resolved].into_iter().all(|path| {
+        !crate::daemon::target_tier::is_excluded(path, &scanner.excluded_paths)
+            && protection.discover_ancestor_markers(path).is_ok()
+            && !protection.is_protected(path)
+    })
 }
 
 struct GuardSample {
@@ -5876,8 +5952,16 @@ impl MonitoringDaemon {
                 .mount_controllers
                 .entry(mount.clone())
                 .or_insert_with(|| MountController::new(mount.clone(), controller_config));
-            let recovery_probe_ok = (controller.state() == MountState::Recovery)
-                .then(|| probe_mount_writable(&mount, ballast_dir.as_deref()));
+            let recovery_probe_ok = (controller.state() == MountState::Recovery).then(|| {
+                probe_mount_writable(
+                    &mount,
+                    ballast_dir.as_deref(),
+                    &roots_here,
+                    &catalog,
+                    cross_device_fallback,
+                    &self.config.scanner,
+                )
+            });
             let decision = controller.observe(MountTickInput {
                 level: tick.response.level,
                 urgency: tick.response.urgency,
@@ -11919,6 +12003,364 @@ mod tests {
                 let _ = logger.join();
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_probe_uses_an_authorized_configured_root_without_a_pool() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("scratch");
+        std::fs::create_dir(&root).unwrap();
+        let scanner = ScannerConfig {
+            root_paths: vec![root.clone()],
+            excluded_paths: Vec::new(),
+            protected_paths: Vec::new(),
+            ..ScannerConfig::default()
+        };
+        assert!(probe_mount_writable(
+            directory.path(),
+            None,
+            std::slice::from_ref(&root),
+            &[],
+            false,
+            &scanner,
+        ));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        assert!(!directory.path().join(".sbh").exists());
+
+        // A writable mount ancestor does not grant any new write surface.
+        assert!(!probe_mount_writable(
+            directory.path(),
+            None,
+            &[],
+            &[],
+            false,
+            &scanner
+        ));
+        let unconfigured = directory.path().join("unconfigured");
+        std::fs::create_dir(&unconfigured).unwrap();
+        assert!(!probe_mount_writable(
+            directory.path(),
+            None,
+            std::slice::from_ref(&unconfigured),
+            &[],
+            false,
+            &scanner,
+        ));
+        assert_eq!(std::fs::read_dir(unconfigured).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_probe_does_not_write_into_excluded_or_protected_roots() {
+        for protection in ["excluded", "pattern", "marker", "dangling-marker"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("scratch");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("user-data"), b"preserve").unwrap();
+            let mut scanner = ScannerConfig {
+                root_paths: vec![root.clone()],
+                excluded_paths: Vec::new(),
+                protected_paths: Vec::new(),
+                allow_source_tree_roots: false,
+                ..ScannerConfig::default()
+            };
+            match protection {
+                "excluded" => scanner.excluded_paths.push(root.clone()),
+                "pattern" => scanner
+                    .protected_paths
+                    .push(root.to_string_lossy().into_owned()),
+                "marker" => std::fs::write(root.join(".sbh-protect"), b"preserve").unwrap(),
+                "dangling-marker" => {
+                    std::os::unix::fs::symlink(root.join("missing"), root.join(".sbh-protect"))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !probe_mount_writable(
+                    directory.path(),
+                    None,
+                    std::slice::from_ref(&root),
+                    &[],
+                    false,
+                    &scanner,
+                ),
+                "{protection}"
+            );
+            assert_eq!(std::fs::read(root.join("user-data")).unwrap(), b"preserve");
+            assert!(!std::fs::read_dir(&root).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".sbh-recovery-")
+            }));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_probe_respects_report_only_source_policy_on_a_normal_temp_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("scratch");
+        std::fs::create_dir_all(root.join("checkout/.git")).unwrap();
+        std::fs::write(root.join("checkout/source.rs"), b"user source").unwrap();
+        // A broad root may contain arbitrary repositories. Root-level source
+        // findings are report-only; no entry below the root is a probe target.
+        let scanner = ScannerConfig {
+            root_paths: vec![root.clone()],
+            excluded_paths: Vec::new(),
+            protected_paths: Vec::new(),
+            allow_source_tree_roots: false,
+            ..ScannerConfig::default()
+        };
+        assert!(probe_mount_writable(
+            directory.path(),
+            None,
+            std::slice::from_ref(&root),
+            &[],
+            false,
+            &scanner,
+        ));
+        assert_eq!(
+            std::fs::read(root.join("checkout/source.rs")).unwrap(),
+            b"user source"
+        );
+        assert!(root.join("checkout/.git").is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_probe_refuses_a_protected_target_through_a_configured_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("scratch");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let scanner = ScannerConfig {
+            root_paths: vec![alias.clone()],
+            excluded_paths: Vec::new(),
+            protected_paths: vec![root.to_string_lossy().into_owned()],
+            ..ScannerConfig::default()
+        };
+        assert!(!probe_mount_writable(
+            directory.path(),
+            None,
+            std::slice::from_ref(&alias),
+            &[],
+            false,
+            &scanner,
+        ));
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_probe_crossed_mount_requires_current_unprotected_traversal_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root");
+        let mount = root.join("nested-mount");
+        let unrelated = directory.path().join("unrelated");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir_all(&mount).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let mut scanner = ScannerConfig {
+            root_paths: vec![alias.clone()],
+            cross_devices: true,
+            excluded_paths: Vec::new(),
+            protected_paths: Vec::new(),
+            ..ScannerConfig::default()
+        };
+        assert!(probe_mount_writable(&mount, None, &[], &[], true, &scanner));
+        assert!(!probe_mount_writable(
+            &mount,
+            None,
+            &[],
+            &[],
+            false,
+            &scanner
+        ));
+        assert!(!probe_mount_writable(
+            &unrelated,
+            None,
+            &[],
+            &[],
+            true,
+            &scanner
+        ));
+        assert_eq!(std::fs::read_dir(&mount).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&unrelated).unwrap().count(), 0);
+
+        scanner.cross_devices = false;
+        assert!(!probe_mount_writable(
+            &mount,
+            None,
+            &[],
+            &[],
+            true,
+            &scanner
+        ));
+        scanner.cross_devices = true;
+        scanner.excluded_paths.push(root.clone());
+        assert!(!probe_mount_writable(
+            &mount,
+            None,
+            &[],
+            &[],
+            true,
+            &scanner
+        ));
+        scanner.excluded_paths.clear();
+        scanner
+            .protected_paths
+            .push(alias.to_string_lossy().into_owned());
+        assert!(!probe_mount_writable(
+            &mount,
+            None,
+            &[],
+            &[],
+            true,
+            &scanner
+        ));
+        scanner.protected_paths.clear();
+        std::fs::write(root.join(".sbh-protect"), b"keep").unwrap();
+        assert!(!probe_mount_writable(
+            &mount,
+            None,
+            &[],
+            &[],
+            true,
+            &scanner
+        ));
+        assert_eq!(std::fs::read_dir(mount).unwrap().count(), 0);
+
+        // '/' is an exact-only exclusion. An excluded configured root must
+        // not authorize any crossed child even when that child is not itself
+        // excluded by the ordinary descendant rule.
+        scanner.root_paths = vec![PathBuf::from("/")];
+        scanner.excluded_paths = vec![PathBuf::from("/")];
+        assert!(!probe_mount_writable(
+            &unrelated,
+            None,
+            &[],
+            &[],
+            true,
+            &scanner
+        ));
+        assert_eq!(std::fs::read_dir(unrelated).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_probe_crossed_mount_resumes_without_a_local_root_pool_or_catalog() {
+        let mut fixture = RegretDaemonFixture::new();
+        let root = fixture.directory.path().join("configured-root");
+        let mount = root.join("nested-mount");
+        std::fs::create_dir_all(&mount).unwrap();
+        let daemon = &mut fixture.daemon;
+        // MockPlatform resolves the configured root to '/', so this tick has
+        // no roots_here. The existing default pool also belongs only to '/'.
+        daemon.config.scanner.root_paths = vec![root.clone()];
+        daemon.config.scanner.cross_devices = true;
+        daemon.config.scanner.protected_paths.clear();
+        daemon.config.scanner.excluded_paths.clear();
+        daemon.config.scanner.catalog_roots_on_pressured_device = false;
+        daemon.behavior_state.mode = mock_behavior_mode(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::None,
+            NotificationPriority::Low,
+        );
+        let tick = quarantine_tick(PressureLevel::Critical, &mount);
+        let (scan_tx, scan_rx) = bounded(4);
+        let (del_tx, _del_rx) = bounded(4);
+        daemon.pending_recovery.insert(mount.clone());
+        daemon.mount_responses = vec![tick.clone()];
+        daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(
+            daemon.mount_controllers[&mount].state(),
+            MountState::Recovery
+        );
+        assert!(scan_rx.try_recv().is_err());
+
+        daemon.mount_responses = vec![tick.clone()];
+        daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(
+            daemon.mount_controllers[&mount].state(),
+            MountState::Reclaim
+        );
+        let request = scan_rx
+            .try_recv()
+            .expect("crossed mount must resume its scan");
+        assert_eq!(request.paths, vec![root]);
+        assert!(request.catalog_roots.is_empty());
+        assert_eq!(std::fs::read_dir(&mount).unwrap().count(), 0);
+        assert!(!mount.join(".sbh").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_probe_catalog_only_mount_resumes_reclaim_without_a_pool() {
+        let mut fixture = RegretDaemonFixture::new();
+        let mount = fixture.directory.path().to_path_buf();
+        let cache = mount.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let daemon = &mut fixture.daemon;
+        daemon.config.scanner.root_paths.clear();
+        daemon.config.scanner.protected_paths.clear();
+        daemon.config.scanner.excluded_paths.clear();
+        daemon.config.scanner.catalog_roots_on_pressured_device = true;
+        daemon.catalog_root_cache.insert(
+            mount.clone(),
+            (
+                Instant::now(),
+                vec![ExpandedCatalogRoot {
+                    path: cache.clone(),
+                    rule: "fixture-cache",
+                    confidence: crate::platform::cleanup_catalog::CleanupConfidence::Definite,
+                    min_age: Duration::from_hours(1),
+                }],
+            ),
+        );
+        daemon.behavior_state.mode = mock_behavior_mode(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::None,
+            NotificationPriority::Low,
+        );
+        let tick = quarantine_tick(PressureLevel::Critical, &mount);
+        let (scan_tx, scan_rx) = bounded(4);
+        let (del_tx, _del_rx) = bounded(4);
+        daemon.pending_recovery.insert(mount.clone());
+        daemon.mount_responses = vec![tick.clone()];
+        daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(
+            daemon.mount_controllers.get(&mount).unwrap().state(),
+            MountState::Recovery
+        );
+        assert!(scan_rx.try_recv().is_err());
+
+        daemon.mount_responses = vec![tick.clone()];
+        daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(
+            daemon.mount_controllers.get(&mount).unwrap().state(),
+            MountState::Reclaim
+        );
+        let request = scan_rx
+            .try_recv()
+            .expect("writable catalog must resume its scan");
+        assert_eq!(request.paths, vec![cache.clone()]);
+        assert!(
+            request
+                .catalog_roots
+                .iter()
+                .any(|entry| entry.path == cache)
+        );
+        assert_eq!(std::fs::read_dir(cache).unwrap().count(), 0);
+        assert!(!mount.join(".sbh").exists());
     }
 
     #[cfg(unix)]

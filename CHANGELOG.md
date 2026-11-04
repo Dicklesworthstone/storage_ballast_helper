@@ -16,6 +16,16 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   and cancellation retains both ready and deferred unfinished paths. The live
   constants report exposes the device limit (bd-gh0x).
 
+- **Recovery can resume on writable mounts without a ballast pool.** The
+  daemon probes existing configured roots, eligible opted-in catalog surfaces,
+  and nested mounts already authorized by cross-device traversal. It no longer
+  creates an implicit mount-root `.sbh` directory or truncates a fixed `probe`
+  file. Each probe uses an exclusive private workspace, verifies mount and
+  directory identities and read-only state, syncs its write, and removes only
+  its own unchanged entries. Current exclusions and protection markers still
+  apply. Probing a catalog artifact updates its directory timestamp, so that
+  artifact must observe its normal idle window before reclamation.
+
 - **Automatic privileged installs register a system service.** Running
   `sudo sbh install --auto` now selects systemd system scope or a launchd
   LaunchDaemon, with the corresponding configuration and data paths. Explicit
