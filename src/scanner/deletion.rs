@@ -1168,11 +1168,15 @@ impl DeletionExecutor {
             let completed_at = Instant::now();
             match outcome {
                 Ok(quarantined) => {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let duration_ms = completed_at.duration_since(del_start).as_millis() as u64;
+                    // Record the successful mutation before observers or a
+                    // slow free-space query. Restart backoff must not wait for
+                    // the later regret outcome to know this deletion happened.
+                    self.log_deletion_success(candidate, duration_ms, quarantined);
                     if !quarantined && let Some(on_unlinked) = on_unlinked {
                         on_unlinked(candidate, completed_at);
                     }
-                    #[allow(clippy::cast_possible_truncation)]
-                    let duration_ms = completed_at.duration_since(del_start).as_millis() as u64;
                     report.items_deleted += 1;
                     report.deleted_paths.push(candidate.path.clone());
                     if quarantined {
@@ -1201,8 +1205,6 @@ impl DeletionExecutor {
                         }
                     }
                     consecutive_failures = 0;
-
-                    self.log_deletion_success(candidate, duration_ms, quarantined);
                 }
                 Err(e) => {
                     report.items_failed += 1;
@@ -1615,6 +1617,8 @@ impl DeletionExecutor {
     ) {
         self.log_event(ActivityEvent::ArtifactDeleted {
             path: candidate.path.to_string_lossy().to_string(),
+            category: candidate.classification.category,
+            completed_at: std::time::SystemTime::now(),
             size_bytes: candidate.size_bytes,
             score: candidate.total_score,
             factors: factors_to_record(&candidate.factors),

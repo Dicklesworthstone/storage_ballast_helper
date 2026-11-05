@@ -25,6 +25,7 @@ use crate::logger::sqlite::{
     ActivityRow, DB_SIZE_CAP_BYTES, DB_TRIM_TARGET_BYTES, PressureRow, SqliteLogger,
 };
 use crate::scanner::decision_record::DecisionRecord;
+use crate::scanner::patterns::ArtifactCategory;
 
 mod diagnostics;
 mod lifecycle;
@@ -107,6 +108,11 @@ pub enum ActivityEvent {
     },
     ArtifactDeleted {
         path: String,
+        /// Structural classification at the successful mutation, retained
+        /// independently of the larger decision record for restart backoff.
+        category: ArtifactCategory,
+        /// Mutation completion, before observer work or logger queue delay.
+        completed_at: SystemTime,
         size_bytes: u64,
         score: f64,
         factors: ScoreFactorsRecord,
@@ -793,6 +799,8 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
         }
         ActivityEvent::ArtifactDeleted {
             path,
+            category,
+            completed_at,
             size_bytes,
             score,
             factors,
@@ -804,6 +812,8 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
         } => {
             let mut e = LogEntry::new(EventType::ArtifactDelete, Severity::Info);
             e.path = Some(path.clone());
+            e.ts = chrono::DateTime::<chrono::Utc>::from(*completed_at)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
             e.size = Some(*size_bytes);
             e.score = Some(*score);
             e.factors = Some(factors.clone());
@@ -813,9 +823,10 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
             e.ok = Some(true);
             e.decision_id.clone_from(decision_id);
             e.quarantined = Some(*quarantined);
-            if *quarantined {
-                e.details = Some("quarantined".to_string());
-            }
+            e.details = Some(format!(
+                "category={category:?}{}",
+                if *quarantined { ";quarantined" } else { "" },
+            ));
             e
         }
         ActivityEvent::PolicyTransition {
@@ -957,6 +968,8 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
         }),
         ActivityEvent::ArtifactDeleted {
             path,
+            category,
+            completed_at,
             size_bytes,
             score,
             factors,
@@ -979,12 +992,15 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
             success: 1,
             error_code: None,
             error_message: None,
-            details: match (decision_id, quarantined) {
-                (Some(id), true) => Some(format!("decision_id={id};quarantined")),
-                (Some(id), false) => Some(format!("decision_id={id}")),
-                (None, true) => Some("quarantined".to_string()),
-                (None, false) => None,
-            },
+            details: Some(format!(
+                "{}category={category:?};completed_at={}{}",
+                decision_id
+                    .as_ref()
+                    .map_or_else(String::new, |id| format!("decision_id={id};")),
+                chrono::DateTime::<chrono::Utc>::from(*completed_at)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                if *quarantined { ";quarantined" } else { "" },
+            )),
         }),
         ActivityEvent::ArtifactDeletionFailed {
             path,
@@ -1632,6 +1648,8 @@ mod tests {
         });
         handle.send(ActivityEvent::ArtifactDeleted {
             path: "/data/projects/foo/.target_opus".to_string(),
+            category: ArtifactCategory::RustTarget,
+            completed_at: SystemTime::now(),
             size_bytes: 3_000_000_000,
             score: 0.87,
             factors: ScoreFactorsRecord {
@@ -1665,6 +1683,71 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1);
         }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn deletion_receipts_keep_completion_and_category_without_a_later_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join) = spawn_logger(test_config(dir.path())).unwrap();
+        let completed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let event = |path: &str, quarantined| ActivityEvent::ArtifactDeleted {
+            path: path.to_string(),
+            category: ArtifactCategory::GoCache,
+            completed_at,
+            size_bytes: 4096,
+            score: 0.99,
+            factors: ScoreFactorsRecord {
+                location: 1.0,
+                name: 1.0,
+                age: 1.0,
+                size: 1.0,
+                structure: 1.0,
+            },
+            pressure: "red".to_string(),
+            free_pct: 1.0,
+            duration_ms: 3,
+            decision_id: Some("0123456789ab".to_string()),
+            quarantined,
+        };
+        handle.send(event("/tmp/structural-go-cache", false));
+        handle.send(event("/tmp/quarantined-cache", true));
+        handle.send(ActivityEvent::ArtifactDeletionFailed {
+            path: "/tmp/failed-cache".to_string(),
+            error_code: "SBH-2003".to_string(),
+            error_message: "held by a live process".to_string(),
+        });
+        handle.shutdown();
+        join.join().unwrap();
+
+        let db = SqliteLogger::open_read_only(&dir.path().join("test.db")).unwrap();
+        let receipts = db
+            .successful_deletions_since("2020-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            receipts.len(),
+            1,
+            "only an actual irreversible success counts"
+        );
+        assert_eq!(receipts[0].path, "/tmp/structural-go-cache");
+        assert_eq!(receipts[0].category.as_deref(), Some("GoCache"));
+        assert_eq!(receipts[0].completed_at, Some(completed_at));
+        assert!(
+            db.outcomes_since("2020-01-01T00:00:00Z")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.recent_decisions(10).unwrap().is_empty());
+
+        let contents = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        let entry: LogEntry = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            entry.ts,
+            chrono::DateTime::<chrono::Utc>::from(completed_at)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        );
+        assert_eq!(entry.details.as_deref(), Some("category=GoCache"));
+        assert_eq!(entry.quarantined, Some(false));
     }
 
     #[test]
@@ -1928,6 +2011,8 @@ mod tests {
         });
         handle.send(ActivityEvent::ArtifactDeleted {
             path: "/data/target/debug".to_string(),
+            category: ArtifactCategory::RustTarget,
+            completed_at: SystemTime::now(),
             size_bytes: 500_000_000,
             score: 0.92,
             factors: ScoreFactorsRecord {

@@ -1423,6 +1423,18 @@ The guardrail system continuously validates that the forecasting and scoring pip
 
 rch's remote `CARGO_TARGET_DIR`s (`.rch-target-<worker>-{pool,job,pid}-<key>`) are warm caches shared by later builds, so their age is the newest write anywhere in the tree, never the directory's birth time. Normally sbh honors rch's own floors: a pooled dir must be idle for <!-- claim:constants.rch.RCH_POOLED_IDLE_HOURS -->168<!-- /claim --> hours and a per-job dir for <!-- claim:constants.rch.RCH_PER_JOB_IDLE_HOURS -->12<!-- /claim -->. Pools in daily use never go that long without a write and grew without bound on the fleet, so once the controller's urgency reaches <!-- claim:constants.rch.RCH_PRESSURE_URGENCY -->0.7<!-- /claim --> (from roughly mid-Orange, always at Red) the floors drop to <!-- claim:constants.rch.RCH_PRESSURE_POOLED_IDLE_MINUTES -->60<!-- /claim --> minutes for pools and <!-- claim:constants.rch.RCH_PRESSURE_PER_JOB_IDLE_MINUTES -->30<!-- /claim --> for per-job dirs, and the idle probe may walk up to <!-- claim:constants.rch.RCH_IDLE_PROBE_MAX_ENTRIES_UNDER_PRESSURE -->2000000<!-- /claim --> entries. A pool written inside the floor is vetoed at every pressure, and the open-file and active-lease rails still apply at deletion time.
 
+Repeated removals of the same warm-cache path raise its idle floor, including
+rch's Go caches and structurally recognized shared Go caches. This history
+survives a daemon restart as soon as the successful unlink receipt reaches
+SQLite; it does not wait for the later regret observation to finish. Receipts
+retain the structural category and mutation completion time, so logger delay
+does not extend the history window. Matching receipts and regret outcomes
+count the deletion once; older outcome-only history remains usable.
+Failed attempts, quarantine moves and planned DELETE decisions do not count.
+Restart recovery restores the cache's backoff, without inventing a clean or
+regret label for an observation interrupted by shutdown. Logging failures can
+still leave a removal without recoverable history.
+
 #### Layer 6: Repeat-Deletion Dampening
 
 When an artifact path is deleted and then recreated (common with build directories in active projects), the dampening tracker applies exponential-backoff cooldowns to prevent deletion loops:

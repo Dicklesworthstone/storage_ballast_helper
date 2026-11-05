@@ -6,10 +6,10 @@
 #![allow(missing_docs)]
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::core::errors::{Result, SbhError};
 use crate::scanner::decision_record::DecisionRecord;
@@ -32,6 +32,63 @@ pub struct StoredOutcome {
     pub observed_at: String,
     pub after_secs: u64,
     pub detail: String,
+}
+
+/// A successful irreversible mutation, independent of its later regret label.
+/// Older receipts lack a completion time and may need their decision record
+/// to recover the structural category.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDeletion {
+    pub decision_id: String,
+    pub path: String,
+    pub category: Option<String>,
+    pub recorded_at: SystemTime,
+    pub completed_at: Option<SystemTime>,
+}
+
+impl StoredDeletion {
+    fn from_activity(timestamp: &str, path: String, details: &str) -> Option<Self> {
+        let recorded_at = chrono::DateTime::parse_from_rfc3339(timestamp)
+            .ok()
+            .map(SystemTime::from)?;
+        let mut decision_id = None;
+        let mut category = None;
+        let mut completed_at = None;
+        for field in details.split(';') {
+            if field == "quarantined" {
+                return None;
+            }
+            if let Some(value) = field.strip_prefix("decision_id=") {
+                if decision_id.replace(value.to_string()).is_some()
+                    || !crate::scanner::decision_record::is_decision_id(value)
+                {
+                    return None;
+                }
+            } else if let Some(value) = field.strip_prefix("category=") {
+                if category.replace(value.to_string()).is_some()
+                    || value
+                        .parse::<crate::scanner::patterns::ArtifactCategory>()
+                        .is_err()
+                {
+                    return None;
+                }
+            } else if let Some(value) = field.strip_prefix("completed_at=") {
+                let parsed = chrono::DateTime::parse_from_rfc3339(value)
+                    .ok()
+                    .map(SystemTime::from)?;
+                if completed_at.replace(parsed).is_some() {
+                    return None;
+                }
+            }
+        }
+        Some(Self {
+            decision_id: decision_id?,
+            path,
+            category,
+            recorded_at,
+            completed_at,
+        })
+    }
 }
 
 fn stored_outcome_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredOutcome> {
@@ -185,6 +242,79 @@ impl SqliteLogger {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Successful unlink receipts recorded since `since` (RFC 3339).
+    /// Planned DELETEs, failed attempts and quarantine moves are not evidence
+    /// of an irreversible deletion. Read through the existing type/time index;
+    /// only legacy receipts need a lookup of their indexed decision id.
+    pub fn successful_deletions_since(&self, since: &str) -> Result<Vec<StoredDeletion>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT timestamp, path, details FROM activity_log
+             WHERE event_type = 'artifact_delete' AND timestamp >= ?1
+               AND success = 1 AND path IS NOT NULL AND details IS NOT NULL
+               AND details NOT LIKE '%quarantined%'
+             ORDER BY timestamp ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![since], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut receipts = Vec::new();
+        let mut legacy_categories = std::collections::HashMap::new();
+        for row in rows {
+            let (timestamp, path, details) = row?;
+            let Some(mut receipt) = StoredDeletion::from_activity(&timestamp, path, &details)
+            else {
+                continue;
+            };
+            if receipt.category.is_none() {
+                // A stable id can recur after inode reuse. A lookup made for
+                // an older receipt must not hide a later decision record or
+                // lend that older artifact's classification to the new one.
+                let key = (
+                    receipt.decision_id.clone(),
+                    receipt.path.clone(),
+                    timestamp.clone(),
+                );
+                let category = match legacy_categories.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let record: Option<String> = self
+                            .conn
+                            .prepare_cached(
+                                "SELECT record FROM decision_log
+                             WHERE decision_id = ?1 AND path = ?2 AND timestamp <= ?3
+                             ORDER BY id DESC LIMIT 1",
+                            )?
+                            .query_row(
+                                params![receipt.decision_id, receipt.path, timestamp],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+                        entry.insert(record.and_then(|record| {
+                            serde_json::from_str::<serde_json::Value>(&record)
+                                .ok()?
+                                .get("classification")?
+                                .get("category")?
+                                .as_str()
+                                .filter(|category| {
+                                    category
+                                        .parse::<crate::scanner::patterns::ArtifactCategory>()
+                                        .is_ok()
+                                })
+                                .map(str::to_string)
+                        }))
+                    }
+                };
+                receipt.category.clone_from(category);
+            }
+            receipts.push(receipt);
+        }
+        Ok(receipts)
     }
 
     // ──────────────────── pressure_history ────────────────────
