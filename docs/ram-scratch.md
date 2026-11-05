@@ -390,9 +390,11 @@ the daemon's incomplete observation.
 
 ## Daemon relief when tmpfs backing runs short
 
-On Linux, an occupied, writable tmpfs on an existing scanner root can need
-reclaim even while its own size limit shows plenty of free blocks. When a
-valid host sample has less than 10% of configured swap free, the daemon also
+On Linux, an occupied, writable tmpfs can need reclaim even while its own size
+limit shows plenty of free blocks. The tmpfs must contain an explicitly
+configured scanner root. A root on an ancestor filesystem does not enable this
+relief for nested tmpfs mounts. When a valid host sample has less than 10% of
+configured swap free, the daemon also
 evaluates that mount against swap headroom. The swap controller uses the
 configured pressure percentages independently of disk byte floors. It raises
 the effective mount level only when that signal is worse than the filesystem
@@ -409,7 +411,15 @@ stops if swap recovered or evidence became unavailable.
 
 Relief uses structurally definite artifacts on the same verified tmpfs
 device. `cross_devices` does not widen it to disk caches or nested foreign
-mounts. Source-tree, marker, lease, active-reference, identity, age, regret,
+mounts. Current filesystem observations must also name the sampled mount;
+a distinct bind alias does not qualify just because it shares a device.
+Each pass pins its configured roots' original paths, canonical locations and
+directory identities. Before removal, the artifact must still resolve inside
+an unchanged admitted root, with exclusions and protection applied to its
+resolved path as well as its configured spelling. A configured root alias is
+supported while its target remains unchanged; replacing a root or redirecting
+a parent cannot carry queued permission outside that scope. Source-tree,
+marker, lease, active-reference, identity, age, regret,
 observe-mode and dry-run checks still apply. The diagnostic's attribution
 list adds no scan roots and does not make arbitrary scratch trees disposable.
 The separate filesystem-pressure path continues to operate normally.

@@ -9,11 +9,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::core::config::ScannerConfig;
 use crate::monitor::ram_scratch::swap_reclaim_pressure;
 use crate::platform::pal::Platform;
 use crate::scanner::deletion::SkipReason;
 use crate::scanner::scoring::{ArtifactCertainty, CandidacyScore, DecisionAction};
-use crate::scanner::walker::{device_id, identity_for_path};
+use crate::scanner::walker::{FsIdentity, device_id, identity_for_path};
+
+#[derive(Debug, Clone)]
+struct AdmittedRoot {
+    original: PathBuf,
+    resolved: PathBuf,
+    identity: FsIdentity,
+}
 
 /// A single tmpfs relief pass and its shared, finite allocated-byte allowance.
 ///
@@ -27,6 +35,7 @@ pub struct RamReclaimRequest {
     mount: PathBuf,
     device_id: u64,
     remaining: Arc<AtomicU64>,
+    roots: Vec<AdmittedRoot>,
 }
 
 impl RamReclaimRequest {
@@ -34,12 +43,30 @@ impl RamReclaimRequest {
     ///
     /// The caller obtains `device_id` from the admitted mount and caps
     /// `target_bytes` by both occupied tmpfs blocks and the swap shortfall.
+    /// Resolve existing configured roots now so a later root or alias change
+    /// cannot extend this pass's scope.
     #[must_use]
-    pub fn new(mount: PathBuf, device_id: u64, target_bytes: u64) -> Self {
+    pub fn new(mount: PathBuf, device_id: u64, target_bytes: u64, roots: &[PathBuf]) -> Self {
+        let roots = roots
+            .iter()
+            .filter_map(|root| {
+                let resolved = std::fs::canonicalize(root).ok()?;
+                let identity = identity_for_path(root, true).ok()?;
+                if identity.device_id != device_id || !resolved.is_dir() {
+                    return None;
+                }
+                Some(AdmittedRoot {
+                    original: root.clone(),
+                    resolved,
+                    identity,
+                })
+            })
+            .collect();
         Self {
             mount,
             device_id,
             remaining: Arc::new(AtomicU64::new(target_bytes)),
+            roots,
         }
     }
 
@@ -49,8 +76,37 @@ impl RamReclaimRequest {
         self.remaining.load(Ordering::Acquire)
     }
 
+    /// Renew the admitted root's original alias, canonical directory identity,
+    /// and exclusions in both spellings. A same-device parent symlink can move
+    /// an unchanged artifact outside the root without changing its identity.
+    pub fn authorize_scope(
+        &self,
+        path: &Path,
+        scanner: &ScannerConfig,
+    ) -> Result<PathBuf, SkipReason> {
+        let resolved = std::fs::canonicalize(path).map_err(|_| SkipReason::PolicyChanged)?;
+        let original = std::path::absolute(path).map_err(|_| SkipReason::PolicyChanged)?;
+        if excluded(&original, &resolved, &scanner.excluded_paths) {
+            return Err(SkipReason::PolicyChanged);
+        }
+        let admitted = self.roots.iter().any(|root| {
+            scanner.root_paths.contains(&root.original)
+                && resolved.starts_with(&root.resolved)
+                && std::fs::canonicalize(&root.original).ok().as_ref() == Some(&root.resolved)
+                && identity_for_path(&root.original, true).ok() == Some(root.identity)
+                && std::path::absolute(&root.original).is_ok_and(|original| {
+                    !excluded(&original, &root.resolved, &scanner.excluded_paths)
+                })
+        });
+        if !admitted {
+            return Err(SkipReason::PolicyChanged);
+        }
+        Ok(resolved)
+    }
+
     /// Whether an observed candidate belongs to this pass's narrower scope.
-    /// This is only a queue filter; [`Self::authorize`] renews live evidence.
+    /// This is only a queue filter; the executor renews [`Self::authorize_scope`]
+    /// and [`Self::authorize`] at the mutation boundary.
     #[must_use]
     pub fn accepts_candidate(&self, candidate: &CandidacyScore) -> bool {
         self.remaining_bytes() > 0
@@ -63,13 +119,24 @@ impl RamReclaimRequest {
                 .is_some_and(|identity| identity.device_id == self.device_id)
     }
 
-    /// A no-follow device check for shallow discovery and requested roots.
-    /// In particular, a nested disk mount cannot become a RAM relief surface
-    /// even when the operator normally allows cross-device scanning.
+    /// A device check for shallow discovery and requested roots. Only a
+    /// still-valid configured root alias may itself be a symlink. A nested
+    /// disk mount cannot become a RAM relief surface even when the operator
+    /// normally allows cross-device scanning.
     #[must_use]
     pub fn contains_path(&self, path: &Path) -> bool {
         path.symlink_metadata().is_ok_and(|metadata| {
-            !metadata.file_type().is_symlink() && device_id(&metadata) == self.device_id
+            if metadata.file_type().is_symlink() {
+                // A configured root alias retains its original scope only
+                // while its target and directory identity remain unchanged.
+                self.roots.iter().any(|root| {
+                    root.original == path
+                        && std::fs::canonicalize(path).ok().as_ref() == Some(&root.resolved)
+                        && identity_for_path(path, true).ok() == Some(root.identity)
+                })
+            } else {
+                device_id(&metadata) == self.device_id
+            }
         })
     }
 
@@ -83,7 +150,8 @@ impl RamReclaimRequest {
         let stats = platform
             .fs_stats(&self.mount)
             .map_err(|_| SkipReason::PolicyChanged)?;
-        if stats.fs_type != "tmpfs"
+        if stats.mount_point != self.mount
+            || stats.fs_type != "tmpfs"
             || stats.total_bytes == 0
             || stats.free_bytes > stats.total_bytes
             || stats.available_bytes > stats.free_bytes
@@ -121,7 +189,8 @@ impl RamReclaimRequest {
         let stats = platform
             .fs_stats(&candidate.path)
             .map_err(|_| SkipReason::PolicyChanged)?;
-        if stats.fs_type != "tmpfs"
+        if stats.mount_point != self.mount
+            || stats.fs_type != "tmpfs"
             || stats.is_readonly
             || stats.total_bytes == 0
             || stats.free_bytes > stats.total_bytes
@@ -143,6 +212,24 @@ impl RamReclaimRequest {
                 Some(remaining.saturating_sub(candidate.size_bytes))
             });
     }
+}
+
+fn excluded(original: &Path, resolved: &Path, exclusions: &[PathBuf]) -> bool {
+    exclusions.iter().any(|exclusion| {
+        let Ok(absolute) = std::path::absolute(exclusion) else {
+            return true;
+        };
+        let canonical = std::fs::canonicalize(exclusion).ok();
+        [Some(absolute.as_path()), canonical.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|excluded| {
+                original == excluded
+                    || resolved == excluded
+                    || (excluded.parent().is_some()
+                        && (original.starts_with(excluded) || resolved.starts_with(excluded)))
+            })
+    })
 }
 
 #[cfg(test)]
@@ -238,6 +325,7 @@ mod tests {
             temp.path().to_path_buf(),
             candidate.identity.unwrap().device_id,
             4096,
+            &[temp.path().to_path_buf()],
         );
         let pal = platform(temp.path(), memory(1), "tmpfs");
         assert!((pal.fs_stats(temp.path()).unwrap().free_pct() - 29.0).abs() < f64::EPSILON);
@@ -252,6 +340,7 @@ mod tests {
             temp.path().to_path_buf(),
             candidate.identity.unwrap().device_id,
             4096,
+            &[temp.path().to_path_buf()],
         );
         for observed in [
             memory(1000),
@@ -297,6 +386,7 @@ mod tests {
             temp.path().to_path_buf(),
             candidate.identity.unwrap().device_id,
             4096,
+            &[temp.path().to_path_buf()],
         );
         let disk = platform(temp.path(), memory(1), "ext4");
         assert_eq!(
@@ -317,6 +407,204 @@ mod tests {
     }
 
     #[test]
+    fn matching_device_cannot_authorize_a_different_tmpfs_mount() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let artifact = candidate(nested.join("target"));
+        let request = RamReclaimRequest::new(
+            root.clone(),
+            artifact.identity.unwrap().device_id,
+            artifact.size_bytes,
+            std::slice::from_ref(&root),
+        );
+        let base = platform(&root, memory(1), "tmpfs");
+        assert_eq!(request.authorize(&artifact, &base), Ok(()));
+        assert!(request.contains_path(&artifact.path));
+        let root_stats = base.fs_stats(&root).unwrap();
+        let nested_stats = FsStats {
+            mount_point: nested.clone(),
+            ..root_stats.clone()
+        };
+        let mismatched = MockPlatform::new(
+            base.mount_points().unwrap(),
+            HashMap::from([(root.clone(), nested_stats.clone())]),
+            memory(1),
+            PlatformPaths::default(),
+        );
+        assert_eq!(
+            request.authorize_mount(&mismatched),
+            Err(SkipReason::PolicyChanged)
+        );
+
+        // Bind aliases share the real device; their mount points still differ.
+        let mut mounts = base.mount_points().unwrap();
+        mounts.push(MountPoint {
+            path: nested.clone(),
+            device: "fixture-alias".to_string(),
+            fs_type: "tmpfs".to_string(),
+            is_ram_backed: true,
+        });
+        let aliased = MockPlatform::new(
+            mounts,
+            HashMap::from([(root, root_stats), (nested, nested_stats)]),
+            memory(1),
+            PlatformPaths::default(),
+        );
+        assert_eq!(request.authorize_mount(&aliased), Ok(()));
+        assert_eq!(
+            request.authorize(&artifact, &aliased),
+            Err(SkipReason::PolicyChanged)
+        );
+        assert!(artifact.path.join("artifact").exists());
+        assert_eq!(request.remaining_bytes(), artifact.size_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_root_alias_honors_both_exclusion_spellings_and_allows_real_reclaim() {
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().canonicalize().unwrap();
+        let root = mount.join("actual");
+        fs::create_dir(&root).unwrap();
+        let artifact = candidate(root.join("target"));
+        let alias = mount.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let mut through_alias = artifact.clone();
+        through_alias.path = alias.join("target");
+        let mut scanner = ScannerConfig {
+            root_paths: vec![alias.clone()],
+            excluded_paths: Vec::new(),
+            ..ScannerConfig::default()
+        };
+        let request = RamReclaimRequest::new(
+            mount.clone(),
+            artifact.identity.unwrap().device_id,
+            artifact.size_bytes,
+            &scanner.root_paths,
+        );
+        assert!(request.contains_path(&alias));
+        assert_eq!(
+            request.authorize_scope(&through_alias.path, &scanner),
+            Ok(artifact.path.clone())
+        );
+        for exclusion in [&artifact.path, &through_alias.path, &root, &alias] {
+            scanner.excluded_paths = vec![exclusion.clone()];
+            for path in [&artifact.path, &through_alias.path] {
+                assert_eq!(
+                    request.authorize_scope(path, &scanner),
+                    Err(SkipReason::PolicyChanged)
+                );
+            }
+        }
+        scanner.excluded_paths.clear();
+        let child_alias = root.join("child-alias");
+        std::os::unix::fs::symlink(&artifact.path, &child_alias).unwrap();
+        assert!(!request.contains_path(&child_alias));
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                require_identity: true,
+                ..DeletionConfig::default()
+            },
+            None,
+        );
+        let pal = platform(&mount, memory(1), "tmpfs");
+        let plan = executor.plan(vec![through_alias]);
+        assert_eq!(plan.candidates.len(), 1);
+        let report = executor.execute_with_hooks(
+            &plan,
+            None,
+            Some(&|candidate| {
+                request.authorize_scope(&candidate.path, &scanner)?;
+                request.authorize(candidate, &pal)?;
+                request
+                    .authorize_scope(&candidate.path, &scanner)
+                    .map(|_| ())
+            }),
+            Some(&|candidate, _| request.record_unlinked(candidate)),
+        );
+        assert_eq!(report.items_deleted, 1);
+        assert_eq!(report.items_failed, 0);
+        assert!(!artifact.path.exists());
+        assert_eq!(request.remaining_bytes(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_replacement_and_alias_retarget_revoke_an_unchanged_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().canonicalize().unwrap();
+        let root = mount.join("allowed");
+        fs::create_dir(&root).unwrap();
+        let artifact = candidate(root.join("target"));
+        let root_identity = identity_for_path(&root, true).unwrap();
+        let alias = mount.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let scanner = ScannerConfig {
+            root_paths: vec![root.clone()],
+            excluded_paths: Vec::new(),
+            ..ScannerConfig::default()
+        };
+        let alias_scanner = ScannerConfig {
+            root_paths: vec![alias.clone()],
+            ..scanner.clone()
+        };
+        let request = RamReclaimRequest::new(
+            mount.clone(),
+            root_identity.device_id,
+            artifact.size_bytes,
+            &scanner.root_paths,
+        );
+        let alias_request = RamReclaimRequest::new(
+            mount.clone(),
+            root_identity.device_id,
+            artifact.size_bytes,
+            &alias_scanner.root_paths,
+        );
+        assert!(request.authorize_scope(&artifact.path, &scanner).is_ok());
+        assert!(alias_request.contains_path(&alias));
+
+        // An unchanged canonical spelling and leaf inode are insufficient
+        // when the admitted directory itself has been replaced.
+        let saved_root = mount.join("saved-root");
+        fs::rename(&root, &saved_root).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::rename(saved_root.join("target"), &artifact.path).unwrap();
+        assert_eq!(
+            identity_for_path(&artifact.path, false).ok(),
+            artifact.identity
+        );
+        assert_eq!(artifact.path.canonicalize().unwrap(), artifact.path);
+        assert_eq!(
+            request.authorize_scope(&artifact.path, &scanner),
+            Err(SkipReason::PolicyChanged)
+        );
+        assert!(!alias_request.contains_path(&alias));
+
+        // Restore the original root and artifact identities behind a new
+        // alias target: the admitted canonical location must still match.
+        fs::rename(&artifact.path, saved_root.join("target")).unwrap();
+        fs::rename(&alias, mount.join("saved-alias")).unwrap();
+        std::os::unix::fs::symlink(&saved_root, &alias).unwrap();
+        assert_eq!(identity_for_path(&alias, true).ok(), Some(root_identity));
+        assert_eq!(
+            identity_for_path(&alias.join("target"), false).ok(),
+            artifact.identity
+        );
+        assert!(!alias_request.contains_path(&alias));
+        assert_eq!(
+            alias_request.authorize_scope(&alias.join("target"), &alias_scanner),
+            Err(SkipReason::PolicyChanged)
+        );
+        assert!(saved_root.join("target/artifact").exists());
+        assert_eq!(request.remaining_bytes(), artifact.size_bytes);
+        assert_eq!(alias_request.remaining_bytes(), artifact.size_bytes);
+    }
+
+    #[test]
     fn successful_unlinks_share_one_saturating_allowance_across_batches() {
         let temp = tempfile::tempdir().unwrap();
         let candidate = candidate(temp.path().join("target"));
@@ -324,6 +612,7 @@ mod tests {
             temp.path().to_path_buf(),
             candidate.identity.unwrap().device_id,
             5000,
+            &[temp.path().to_path_buf()],
         );
         let next_batch = request.clone();
         request.record_unlinked(&candidate);
@@ -349,6 +638,7 @@ mod tests {
             temp.path().to_path_buf(),
             eligible.identity.unwrap().device_id,
             eligible.size_bytes,
+            &[temp.path().to_path_buf()],
         );
         let next_batch = request.clone();
         let pal = platform(temp.path(), memory(1), "tmpfs");
@@ -393,6 +683,7 @@ mod tests {
             temp.path().to_path_buf(),
             candidate.identity.unwrap().device_id,
             candidate.size_bytes,
+            &[temp.path().to_path_buf()],
         );
         assert!(
             request
@@ -431,6 +722,7 @@ mod tests {
             temp.path().to_path_buf(),
             candidate.identity.unwrap().device_id,
             4096,
+            &[temp.path().to_path_buf()],
         );
         let pal = platform(temp.path(), memory(1), "tmpfs");
         fs::rename(&candidate.path, temp.path().join("saved")).unwrap();

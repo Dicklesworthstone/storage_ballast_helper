@@ -6017,6 +6017,7 @@ impl MonitoringDaemon {
                         mount_path.clone(),
                         device_id,
                         pressure.target_bytes,
+                        &self.config.scanner.root_paths,
                     ));
                 }
             } else {
@@ -9372,10 +9373,9 @@ fn scanner_thread_main(
             && (relief.authorize_mount(platform.as_ref()).is_err()
                 || request.paths.iter().any(|path| {
                     !relief.contains_path(path)
-                        || !current_scanner_config
-                            .root_paths
-                            .iter()
-                            .any(|root| path_is_same_or_descendant(path, root))
+                        || relief
+                            .authorize_scope(path, &current_scanner_config)
+                            .is_err()
                 }))
         {
             // The pressure and configured roots are renewed when a queued
@@ -11671,25 +11671,6 @@ fn authorize_scanner_mutation_scope(
     }
 }
 
-/// Backing relief has no catalog or target-only exception: the candidate
-/// must still be inside a configured root and outside its exclusions when
-/// the executor takes the batch, including after a queued config reload.
-fn authorize_ram_reclaim_scope(
-    candidate: &CandidacyScore,
-    scanner: &crate::core::config::ScannerConfig,
-) -> std::result::Result<(), SkipReason> {
-    if scanner
-        .root_paths
-        .iter()
-        .any(|root| path_is_same_or_descendant(&candidate.path, root))
-        && !crate::daemon::target_tier::is_excluded(&candidate.path, &scanner.excluded_paths)
-    {
-        Ok(())
-    } else {
-        Err(SkipReason::PolicyChanged)
-    }
-}
-
 /// The operator's `protected_paths` as the executor applies them to a batch.
 /// A target-only batch (bd-232u) goes without the patterns that protect its
 /// root as a whole, which is why the tier exists; one naming something inside
@@ -11904,7 +11885,9 @@ fn executor_thread_main(
             }
             batch.candidates.retain(|candidate| {
                 relief.accepts_candidate(candidate)
-                    && authorize_ram_reclaim_scope(candidate, &scanner_snapshot).is_ok()
+                    && relief
+                        .authorize_scope(&candidate.path, &scanner_snapshot)
+                        .is_ok()
             });
             if batch.candidates.is_empty() {
                 continue;
@@ -12308,13 +12291,27 @@ fn executor_thread_main(
                     heartbeat,
                 )?;
                 if let Some(relief) = &batch.ram_reclaim {
-                    authorize_ram_reclaim_scope(candidate, &scanner_snapshot)?;
+                    let resolved = relief.authorize_scope(&candidate.path, &scanner_snapshot)?;
+                    if should_skip_protected_daemon_candidate(
+                        &mut protection.lock(),
+                        &resolved,
+                        &sacred_paths,
+                        logger,
+                        "RAM relief preflight",
+                    ) {
+                        return Err(SkipReason::SacredStowaway);
+                    }
                     relief.authorize(
                         candidate,
                         target_only_platform
                             .as_deref()
                             .ok_or(SkipReason::PolicyChanged)?,
                     )?;
+                    // The live probes must not outlast the scope or move the
+                    // artifact away from the path whose protection we checked.
+                    if relief.authorize_scope(&candidate.path, &scanner_snapshot)? != resolved {
+                        return Err(SkipReason::PolicyChanged);
+                    }
                 }
                 if let Some(relief) = &batch.inode_reclaim {
                     relief.authorize_policy(&shared_config.inode_pressure.read())?;
@@ -14041,7 +14038,12 @@ mod tests {
         // or escalate target-only candidates to Critical urgency.
         tick.response.level = PressureLevel::Critical;
         tick.response.urgency = 1.0;
-        tick.ram_reclaim = Some(RamReclaimRequest::new(mount.clone(), 17, 100));
+        tick.ram_reclaim = Some(RamReclaimRequest::new(
+            mount.clone(),
+            17,
+            100,
+            std::slice::from_ref(&mount),
+        ));
         responses[0] = tick;
         let mounts = fixture
             .daemon
@@ -20567,7 +20569,7 @@ mod tests {
         use crate::scanner::walker::{FsEntryKind, FsIdentity};
 
         let (send, receive) = bounded(4);
-        let relief = RamReclaimRequest::new(PathBuf::from("/tmp"), 17, 2);
+        let relief = RamReclaimRequest::new(PathBuf::from("/tmp"), 17, 2, &[PathBuf::from("/tmp")]);
         let request = ScanRequest {
             paths: vec![PathBuf::from("/tmp")],
             urgency: 1.0,
@@ -20625,23 +20627,38 @@ mod tests {
 
     #[test]
     fn ram_reclaim_does_not_inherit_idle_event_authority_or_expand_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("allowed");
+        let allowed = root.join("target");
+        let unconfigured = temp.path().join("unconfigured/target");
+        let excluded = root.join("keep/target");
+        for path in [&allowed, &unconfigured, &excluded] {
+            std::fs::create_dir_all(path).unwrap();
+        }
         let scanner = ScannerConfig {
-            root_paths: vec![PathBuf::from("/tmp/allowed")],
-            excluded_paths: vec![PathBuf::from("/tmp/allowed/keep")],
+            root_paths: vec![root.clone()],
+            excluded_paths: vec![root.join("keep")],
             ..ScannerConfig::default()
         };
         let mut request = event_test_request(scanner.root_paths.clone());
         let mut templates = EventPassTemplates::default();
         templates.remember(&request, &scanner);
         assert_eq!(templates.templates.len(), 1);
-        request.ram_reclaim = Some(RamReclaimRequest::new(PathBuf::from("/tmp"), 17, 100));
+        let relief = RamReclaimRequest::new(
+            temp.path().to_path_buf(),
+            crate::scanner::walker::identity_for_path(&root, true)
+                .unwrap()
+                .device_id,
+            100,
+            &scanner.root_paths,
+        );
+        request.ram_reclaim = Some(relief.clone());
         templates.remember(&request, &scanner);
         assert!(templates.templates.is_empty());
-        let allowed = test_candidate("/tmp/allowed/target", 0.9);
-        assert!(authorize_ram_reclaim_scope(&allowed, &scanner).is_ok());
-        for path in ["/tmp/unconfigured/target", "/tmp/allowed/keep/target"] {
+        assert!(relief.authorize_scope(&allowed, &scanner).is_ok());
+        for path in [&unconfigured, &excluded] {
             assert_eq!(
-                authorize_ram_reclaim_scope(&test_candidate(path, 0.9), &scanner),
+                relief.authorize_scope(path, &scanner),
                 Err(SkipReason::PolicyChanged)
             );
         }
@@ -20650,9 +20667,98 @@ mod tests {
             ..scanner
         };
         assert_eq!(
-            authorize_ram_reclaim_scope(&allowed, &revoked),
+            relief.authorize_scope(&allowed, &revoked),
             Err(SkipReason::PolicyChanged)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ram_reclaim_executor_keeps_same_inode_relocated_outside_admitted_root() {
+        use crate::platform::pal::{FsStats, MountPoint, PlatformPaths};
+        use crate::scanner::walker::identity_for_path;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().canonicalize().unwrap();
+        let root = mount.join("allowed");
+        let parent = root.join("sub");
+        let candidate = target_mutation_candidate(&parent, "target", 0.9);
+        let scanner = ScannerConfig {
+            root_paths: vec![root],
+            excluded_paths: Vec::new(),
+            ..ScannerConfig::default()
+        };
+        let relief = RamReclaimRequest::new(
+            mount.clone(),
+            candidate.identity.unwrap().device_id,
+            candidate.size_bytes,
+            &scanner.root_paths,
+        );
+        let platform = MockPlatform::new(
+            vec![MountPoint {
+                path: mount.clone(),
+                device: "fixture".to_string(),
+                fs_type: "tmpfs".to_string(),
+                is_ram_backed: true,
+            }],
+            HashMap::from([(
+                mount.clone(),
+                FsStats {
+                    total_bytes: 100_000,
+                    free_bytes: 29_000,
+                    available_bytes: 29_000,
+                    fs_type: "tmpfs".to_string(),
+                    mount_point: mount.clone(),
+                    is_readonly: false,
+                },
+            )]),
+            MemoryInfo {
+                total_bytes: 64_000,
+                available_bytes: 32_000,
+                swap_total_bytes: 10_000,
+                swap_free_bytes: 1,
+            },
+            PlatformPaths::default(),
+        );
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                require_identity: true,
+                ..DeletionConfig::default()
+            },
+            None,
+        );
+        assert!(relief.authorize_scope(&candidate.path, &scanner).is_ok());
+        assert!(relief.authorize(&candidate, &platform).is_ok());
+        let plan = executor.plan(vec![candidate.clone()]);
+        assert_eq!(plan.candidates.len(), 1);
+
+        // Retain the scanned leaf inode and device while redirecting its
+        // parent outside the configured root after the plan was admitted.
+        let outside = mount.join("outside");
+        std::fs::rename(&parent, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &parent).unwrap();
+        assert_eq!(
+            identity_for_path(&candidate.path, false).ok(),
+            candidate.identity
+        );
+        let report = executor.execute_with_hooks(
+            &plan,
+            None,
+            Some(&|candidate| {
+                relief.authorize_scope(&candidate.path, &scanner)?;
+                relief.authorize(candidate, &platform)?;
+                relief
+                    .authorize_scope(&candidate.path, &scanner)
+                    .map(|_| ())
+            }),
+            Some(&|candidate, _| relief.record_unlinked(candidate)),
+        );
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.skipped_by_reason.get("policy_changed"), Some(&1));
+        assert!(report.backoff_candidates.is_empty());
+        assert_eq!(relief.remaining_bytes(), candidate.size_bytes);
+        assert!(outside.join("target/debug/deps/libdemo.rlib").exists());
     }
 
     #[test]
