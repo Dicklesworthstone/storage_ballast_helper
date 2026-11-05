@@ -393,7 +393,7 @@ fn unlink_observer_notifies_only_successful_real_permanent_removals() {
                 return Err(SkipReason::CategorySuspended);
             }
             if replace_before_mutation {
-                // Deterministic backend failure, independent of uid and
+                // Deterministic late identity refusal, independent of uid and
                 // permission overrides: keep the original inode alive and
                 // substitute a different one after preflight has passed.
                 fs::rename(&candidate.path, &original).unwrap();
@@ -410,8 +410,27 @@ fn unlink_observer_notifies_only_successful_real_permanent_removals() {
         let report = executor.execute_with_hooks(&plan, None, Some(&authorize), Some(&on_unlinked));
         let removed = !dry_run && !refuse && !replace_before_mutation;
         assert_eq!(report.items_deleted, usize::from(removed));
-        assert_eq!(report.items_failed, usize::from(replace_before_mutation));
-        assert_eq!(report.items_skipped, usize::from(refuse));
+        assert_eq!(report.items_failed, 0);
+        assert!(report.errors.is_empty());
+        assert_eq!(report.quarantine_unavailable, 0);
+        assert_eq!(
+            report.items_skipped,
+            usize::from(refuse || replace_before_mutation)
+        );
+        let reason = if refuse {
+            Some(SkipReason::CategorySuspended)
+        } else if replace_before_mutation {
+            Some(SkipReason::IdentityMismatch)
+        } else {
+            None
+        };
+        assert_eq!(
+            report.skipped_by_reason.len(),
+            usize::from(reason.is_some())
+        );
+        if let Some(reason) = reason {
+            assert_eq!(report.skipped_by_reason.get(reason.as_str()), Some(&1));
+        }
         assert_eq!(report.items_would_delete, usize::from(dry_run));
         assert_eq!(
             report.items_quarantined,
@@ -421,13 +440,67 @@ fn unlink_observer_notifies_only_successful_real_permanent_removals() {
             notifications.get(),
             usize::from(removed && mode == DeletionMode::Unlink)
         );
+        if !removed {
+            assert_eq!(report.bytes_freed, 0);
+            assert_eq!(report.bytes_quarantined, 0);
+            assert!(report.deleted_paths.is_empty());
+        }
         if replace_before_mutation {
-            assert_eq!(fs::read(original).unwrap(), PAYLOAD);
-            assert_eq!(fs::read(item.path).unwrap(), b"replacement data");
+            assert_eq!(identity_for_path(&original, false).ok(), item.identity);
+            assert_ne!(identity_for_path(&item.path, false).ok(), item.identity);
+            assert_eq!(fs::read(&original).unwrap(), PAYLOAD);
+            assert_eq!(fs::read(&item.path).unwrap(), b"replacement data");
         } else if !removed {
             assert_eq!(fs::read(item.path).unwrap(), PAYLOAD);
         }
     }
+}
+
+#[test]
+fn unlink_observer_does_not_notify_on_backend_failure() {
+    use std::os::unix::fs::FileTypeExt;
+
+    let dir = scratch();
+    let path = dir.path().join("target");
+    nix::unistd::mkfifo(
+        &path,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+    let item = candidate(&path);
+    let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+    // Unix identities include special entries, but the removal backend only
+    // accepts a regular file or directory as its root. Inspect metadata only:
+    // opening this FIFO for payload I/O could block waiting for another process.
+    assert_eq!(executor.explain_preflight(&item, None), Ok(()));
+    let plan = executor.plan(vec![item.clone()]);
+    assert_eq!(plan.estimated_items, 1);
+    let notifications = Cell::new(0);
+    let on_unlinked = |candidate: &CandidacyScore, _: Instant| {
+        assert_eq!(candidate.path, path);
+        notifications.set(notifications.get() + 1);
+    };
+
+    let report = executor.execute_with_hooks(&plan, None, None, Some(&on_unlinked));
+    assert_eq!(report.items_failed, 1);
+    assert_eq!(report.errors.len(), 1);
+    assert!(
+        report.errors[0]
+            .error
+            .contains("artifact root must be a regular file or directory")
+    );
+    assert_eq!(report.items_skipped, 0);
+    assert!(report.skipped_by_reason.is_empty());
+    assert_eq!(report.items_deleted, 0);
+    assert_eq!(report.items_quarantined, 0);
+    assert_eq!(report.quarantine_unavailable, 0);
+    assert_eq!(report.bytes_freed, 0);
+    assert_eq!(report.bytes_quarantined, 0);
+    assert!(report.deleted_paths.is_empty());
+    assert_eq!(notifications.get(), 0);
+    assert!(fs::symlink_metadata(&path).unwrap().file_type().is_fifo());
+    assert_eq!(identity_for_path(&path, false).ok(), item.identity);
+    assert!(!QuarantineStore::under(dir.path()).root().exists());
 }
 
 type RefusalCase = (&'static str, fn(&mut CandidacyScore), SkipReason);
