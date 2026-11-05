@@ -301,6 +301,7 @@ fn recover_reservation(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TransactionStep {
+    SourcePinned,
     Locked,
     Prepared,
     Moved,
@@ -309,18 +310,29 @@ enum TransactionStep {
 pub(super) fn quarantine(
     store: &QuarantineStore,
     path: &Path,
+    expected: &fs::Metadata,
     id: &str,
     size_bytes: u64,
     ttl: Duration,
     decision: Option<serde_json::Value>,
 ) -> std::result::Result<QuarantineRecord, QuarantineUnavailable> {
-    quarantine_with_hook(store, path, id, size_bytes, ttl, decision, &mut |_| {})
+    quarantine_with_hook(
+        store,
+        path,
+        expected,
+        id,
+        size_bytes,
+        ttl,
+        decision,
+        &mut |_| {},
+    )
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn quarantine_with_hook(
     store: &QuarantineStore,
     path: &Path,
+    expected: &fs::Metadata,
     id: &str,
     size_bytes: u64,
     ttl: Duration,
@@ -329,11 +341,13 @@ fn quarantine_with_hook(
 ) -> std::result::Result<QuarantineRecord, QuarantineUnavailable> {
     let unavailable = |e: io::Error| QuarantineUnavailable::RootUnavailable(e.to_string());
     validate_id(id).map_err(unavailable)?;
+    let original_path = std::path::absolute(path).map_err(unavailable)?;
+    let source = Payload::open_checked(&original_path, expected).map_err(unavailable)?;
+    hook(TransactionStep::SourcePinned);
     store.ensure_root()?;
     let lock = lock_store(store.root()).map_err(unavailable)?;
     let root = Directory::from_locked(&lock).map_err(unavailable)?;
-    let original_path = std::path::absolute(path).map_err(unavailable)?;
-    let source = Payload::open(&original_path).map_err(unavailable)?;
+    source.verify().map_err(unavailable)?;
     if source.identity.device != root.identity().map_err(unavailable)?.device {
         return Err(QuarantineUnavailable::CrossDevice);
     }

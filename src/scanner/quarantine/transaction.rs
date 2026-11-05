@@ -429,6 +429,38 @@ impl Payload {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "quarantine source is absent"))
     }
 
+    /// Bind the source without replacing the identity the caller admitted.
+    /// Store creation and locking can take time; the expected inode must
+    /// already be attached to the transaction before that work begins.
+    pub(super) fn open_checked(path: &Path, expected: &std::fs::Metadata) -> io::Result<Self> {
+        let source = Self::open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let kind = if expected.is_file() {
+                Kind::File
+            } else if expected.is_dir() {
+                Kind::Directory
+            } else {
+                Kind::Other
+            };
+            let expected_identity = Identity {
+                device: expected.dev(),
+                inode: expected.ino(),
+                kind,
+            };
+            if source.identity != expected_identity {
+                return Err(invalid("quarantine source changed since admission"));
+            }
+            Ok(source)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (source, expected);
+            Err(unsupported())
+        }
+    }
+
     pub(super) fn verify(&self) -> io::Result<()> {
         if self.parent.inspect(&self.name)? != Some(self.identity) {
             return Err(invalid("quarantine source identity changed before rename"));
@@ -461,6 +493,116 @@ mod tests {
             .quarantine(&source, "held", 9, Duration::ZERO, None)
             .unwrap();
         (store, record)
+    }
+
+    fn write_source(path: &Path, directory: bool, contents: &[u8]) -> std::path::PathBuf {
+        let payload = if directory {
+            fs::create_dir(path).unwrap();
+            path.join("payload.o")
+        } else {
+            path.to_path_buf()
+        };
+        fs::write(&payload, contents).unwrap();
+        payload
+    }
+
+    #[test]
+    fn quarantine_checked_refuses_a_source_replaced_after_admission() {
+        for directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = QuarantineStore::under(temp.path());
+            let source = temp.path().join("artifact");
+            let retained = temp.path().join("retained-original");
+            write_source(&source, directory, b"admitted source");
+            let expected = fs::symlink_metadata(&source).unwrap();
+            fs::rename(&source, &retained).unwrap();
+            let replacement = write_source(&source, directory, b"unscanned replacement");
+
+            let error = store
+                .quarantine_checked(&source, &expected, "move", 15, Duration::ZERO, None)
+                .unwrap_err();
+
+            assert!(
+                error.to_string().contains("changed since admission"),
+                "{error}"
+            );
+            assert_eq!(fs::read(replacement).unwrap(), b"unscanned replacement");
+            let original = if directory {
+                retained.join("payload.o")
+            } else {
+                retained
+            };
+            assert_eq!(fs::read(original).unwrap(), b"admitted source");
+            assert!(
+                !store.root().exists(),
+                "reject before creating a store or recovery record"
+            );
+        }
+    }
+
+    #[test]
+    fn quarantine_keeps_the_admitted_source_during_store_preparation() {
+        use std::os::unix::fs::MetadataExt;
+        for (directory, replace) in [(false, false), (false, true), (true, false), (true, true)] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = QuarantineStore::under(temp.path());
+            let source = temp.path().join("artifact");
+            let retained = temp.path().join("retained-original");
+            let source_payload = write_source(&source, directory, b"admitted source");
+            let expected = fs::symlink_metadata(&source).unwrap();
+            let mut prepared = false;
+            let result = quarantine_with_hook(
+                &store,
+                &source,
+                &expected,
+                "move",
+                15,
+                Duration::ZERO,
+                None,
+                &mut |step| {
+                    if step == TransactionStep::SourcePinned {
+                        prepared = true;
+                        assert!(
+                            !store.root().exists(),
+                            "fixture must precede store preparation"
+                        );
+                        if replace {
+                            fs::rename(&source, &retained).unwrap();
+                            write_source(&source, directory, b"unscanned replacement");
+                        }
+                    }
+                },
+            );
+            assert!(prepared);
+            if replace {
+                let error = result.unwrap_err();
+                assert!(
+                    error.to_string().contains("source identity changed"),
+                    "{error}"
+                );
+                assert_eq!(fs::read(source_payload).unwrap(), b"unscanned replacement");
+                let original = if directory {
+                    retained.join("payload.o")
+                } else {
+                    retained
+                };
+                assert_eq!(fs::read(original).unwrap(), b"admitted source");
+                assert!(!store.root().join("move").exists());
+                assert!(!store.root().join("move.pending").exists());
+                assert!(!store.root().join("move.json").exists());
+                assert!(store.records().unwrap().is_empty());
+            } else {
+                let record = result.unwrap();
+                assert_eq!(
+                    (record.device_id, record.inode),
+                    (expected.dev(), expected.ino())
+                );
+                assert!(!source.exists());
+                let restored = store.restore("move", false).unwrap();
+                assert_eq!(restored.restored_to, source);
+                assert_eq!(fs::read(source_payload).unwrap(), b"admitted source");
+            }
+        }
     }
 
     #[test]
@@ -571,6 +713,7 @@ mod tests {
         let result = quarantine_with_hook(
             &store,
             &source,
+            &fs::symlink_metadata(&source).unwrap(),
             "move",
             15,
             Duration::ZERO,
@@ -612,6 +755,7 @@ mod tests {
         let record = quarantine_with_hook(
             &store,
             &source,
+            &fs::symlink_metadata(&source).unwrap(),
             "move",
             9,
             Duration::ZERO,
@@ -656,6 +800,7 @@ mod tests {
         let result = quarantine_with_hook(
             &store,
             &source,
+            &fs::symlink_metadata(&source).unwrap(),
             "move",
             15,
             Duration::ZERO,

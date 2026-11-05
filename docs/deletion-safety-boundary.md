@@ -14,9 +14,12 @@ Previously the executor's sacred-containment call was guarded by `is_dir()`,
 so a prebuilt file candidate could bypass those rules even though a directory
 containing the same file was refused.
 
-Directories retain the existing bounded recursive containment check, including
-its per-batch reuse and scan-cost accounting. The additional admission check
-does not perform a second recursive directory walk.
+Directories retain the bounded recursive containment check and its scan-cost
+accounting. A candidate that reaches mutation gets a fresh content check after
+authorization callbacks and filesystem probes: an unchanged directory inode
+does not prove that nobody added a repository or protected content underneath
+it. Positive sacred-path evidence can be reused to refuse a candidate; an
+earlier empty walk cannot authorize its later removal.
 
 ## Ancestor markers are live instructions
 
@@ -37,6 +40,27 @@ Both irreversible removal and quarantine honor these rules. Emergency Review
 consent does not override a hard veto, category suspension, or a protection
 marker. A quarantine failure retains the candidate rather than silently
 selecting irreversible removal; see `docs/quarantine-recovery.md`.
+
+Quarantine also carries the executor's verified source identity into its
+transaction. It binds the source parent and checks that identity before
+creating or locking the store, then checks the same object after preparation
+and before moving it. Replacing the source while the store is being prepared
+cannot silently substitute a different payload. The final identity check and
+rename remain separate syscalls.
+
+## Process absence is fresh for each deletion batch
+
+Opening an existing object file or changing a process's working directory does
+not change the artifact root's modification time. A previous open-file sweep
+therefore cannot establish that a later batch's candidates remain unused,
+even when their directory timestamps have not changed.
+
+On Linux, a recent cached sweep can refuse candidates it positively observed
+in use. A batch with any candidate that would otherwise pass obtains a fresh
+process sweep; incomplete visibility holds the batch. The sweep is shared
+within that batch, rather than repeated for each candidate. This closes reuse
+of stale absence between batches, while the existing leases and final identity
+checks continue to guard the later mutation boundary.
 
 ## Direct removal stays within verified directory descriptors
 
@@ -77,6 +101,14 @@ parents, dangling markers, and markers introduced between preflight and the
 mutation helper. Positive controls prove an unprotected file still unlinks or
 round-trips through quarantine and undo. These tests supplement the public-API
 integration tests in `tests/deletion_boundary.rs`.
+
+Executor regressions also add nested protection markers and repositories from
+the authorization callback, after preflight has already accepted the target.
+Both unlink and quarantine retain those targets. A separate retained-descriptor
+case reopens an existing artifact without changing its root timestamp after a
+previous empty process sweep, and verifies that the next batch keeps it.
+Quarantine tests replace files and directories after admission and during
+store preparation; stable controls still quarantine and restore successfully.
 
 Direct-removal regressions also cover captured-root replacement, parent replacement
 before mutation, symlink substitution at descent/open checkpoints, leaf replacement

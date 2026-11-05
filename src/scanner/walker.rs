@@ -2045,7 +2045,9 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf
 /// Permission, I/O and budget failures all revoke complete coverage.
 ///
 /// This is the expensive part of an open-file check and does not depend on
-/// which candidates are being checked, so one walk can serve several batches
+/// which candidates are being checked, so one fresh walk serves a mutation
+/// batch. Across batches, deletion may reuse positive observations only to
+/// keep candidates; an earlier absence never authorizes a later removal
 /// (see `deletion::OPEN_SWEEP_REUSE_WINDOW`).
 #[cfg(target_os = "linux")]
 pub(crate) fn collect_open_file_targets_linux() -> (Vec<PathBuf>, bool) {

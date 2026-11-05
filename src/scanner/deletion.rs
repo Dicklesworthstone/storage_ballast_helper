@@ -199,75 +199,73 @@ impl DeletionPlan {
     }
 }
 
-/// How long one complete open-file sweep may serve later batches, measured
-/// from when it *started*.
+/// How long a complete open-file sweep may supply positive vetoes to later
+/// batches, measured from when it *started*.
 ///
-/// The sweep walks every process's `/proc/*/fd` and does not depend on the
-/// batch's candidates; on a host with thousands of agent processes under
-/// `CPUQuota=10%` it took most of each batch's 12-25 s, and 74% of batches
-/// start the moment the previous one ends (css, 2026-09-25). A single sweep
-/// already takes over 10 s there, so a 20 s window roughly doubles the
-/// staleness a batch already accepted, and a batch whose candidate root
-/// changed after the sweep started always gets a fresh sweep.
+/// A cached absence never authorizes a mutation. Reopening an existing file,
+/// writing below existing subdirectories, or changing a process's cwd need
+/// not change the candidate root's mtime. Any batch with an apparently idle
+/// candidate therefore takes a fresh sweep. Reuse only saves work when the
+/// old positive observations already require keeping every candidate.
 pub const OPEN_SWEEP_REUSE_WINDOW: Duration = Duration::from_secs(20);
-
-/// Whether a complete sweep that started `age` ago (wall clock
-/// `started_wall`) may serve a batch whose candidate roots have the given
-/// mtimes. A root that changed after the sweep began, or whose mtime cannot
-/// be read, forces a fresh sweep: a rebuild writing into a target shows up
-/// there first.
-#[cfg(any(target_os = "linux", test))]
-fn open_sweep_reusable(
-    age: Duration,
-    started_wall: std::time::SystemTime,
-    mut root_mtimes: impl Iterator<Item = Option<std::time::SystemTime>>,
-) -> bool {
-    age < OPEN_SWEEP_REUSE_WINDOW
-        && root_mtimes.all(|mtime| mtime.is_some_and(|mtime| mtime < started_wall))
-}
 
 #[cfg(target_os = "linux")]
 struct OpenSweep {
     started: Instant,
-    started_wall: std::time::SystemTime,
     targets: Arc<Vec<PathBuf>>,
+}
+
+/// Reuse is deny-only: every candidate must have a positive observation.
+/// Pin those vetoes to the caller's original spellings as well as resolved
+/// paths, so a parent alias changing later cannot turn a refusal into an
+/// authorization based on stale negative evidence.
+#[cfg(target_os = "linux")]
+fn cached_open_vetoes(sweep: &OpenSweep, roots: &[PathBuf]) -> Option<HashSet<PathBuf>> {
+    if sweep.started.elapsed() >= OPEN_SWEEP_REUSE_WINDOW {
+        return None;
+    }
+    let mut paths = walker::open_path_ancestors_for_roots(&sweep.targets, roots);
+    if !roots
+        .iter()
+        .all(|root| walker::is_path_open_by_ancestor(root, &paths))
+    {
+        return None;
+    }
+    paths.extend(roots.iter().cloned());
+    Some(paths)
 }
 
 /// The last complete sweep; one executor thread uses it per process.
 #[cfg(target_os = "linux")]
 static LAST_OPEN_SWEEP: std::sync::Mutex<Option<OpenSweep>> = std::sync::Mutex::new(None);
 
-/// Open file targets for a batch over `roots`: the last complete sweep when
-/// [`open_sweep_reusable`] allows it, otherwise a fresh one.
+/// Open paths for a batch over `roots`. A batch that could mutate gets a
+/// fresh descriptor sweep; cached positives may only keep the entire batch.
+/// Build-scope discovery remains fresh even when all descriptors are vetoes.
 #[cfg(target_os = "linux")]
-fn open_targets_for_batch(roots: &[PathBuf]) -> (Arc<Vec<PathBuf>>, bool) {
+fn open_paths_for_batch(roots: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
     let lock = || {
         LAST_OPEN_SWEEP
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     };
     let reusable = lock().as_ref().and_then(|sweep| {
-        let mtimes = roots.iter().map(|root| {
-            fs::symlink_metadata(root)
-                .and_then(|meta| meta.modified())
-                .ok()
-        });
-        open_sweep_reusable(sweep.started.elapsed(), sweep.started_wall, mtimes)
-            .then(|| Arc::clone(&sweep.targets))
+        cached_open_vetoes(sweep, roots).map(|vetoes| (Arc::clone(&sweep.targets), vetoes))
     });
-    if let Some(targets) = reusable {
-        return (targets, true);
+    if let Some((targets, vetoes)) = reusable {
+        let (mut paths, complete) =
+            walker::checked_open_path_ancestors_for_roots(&targets, true, roots);
+        paths.extend(vetoes);
+        return (paths, complete);
     }
     let started = Instant::now();
-    let started_wall = std::time::SystemTime::now();
     let (targets, complete) = walker::collect_open_file_targets_linux();
     let targets = Arc::new(targets);
     *lock() = complete.then(|| OpenSweep {
         started,
-        started_wall,
         targets: Arc::clone(&targets),
     });
-    (targets, complete)
+    walker::checked_open_path_ancestors_for_roots(&targets, complete, roots)
 }
 
 /// Summary after a deletion batch completes.
@@ -934,8 +932,8 @@ impl DeletionExecutor {
     /// eligible candidate, but cannot override any earlier safety veto.
     ///
     /// A refusal is a typed skip, never a failed deletion or reclaimed bytes.
-    /// Mutation backends retain their final lease and filesystem identity
-    /// checks after authorization; an already-started removal is not cancelled.
+    /// Content, source-root, lease and filesystem identity checks repeat after
+    /// authorization; an already-started removal is not cancelled.
     pub fn execute_with_guard(
         &self,
         plan: &DeletionPlan,
@@ -1015,8 +1013,7 @@ impl DeletionExecutor {
                 || {
                     #[cfg(target_os = "linux")]
                     {
-                        let (targets, complete) = open_targets_for_batch(&roots);
-                        walker::checked_open_path_ancestors_for_roots(&targets, complete, &roots)
+                        open_paths_for_batch(&roots)
                     }
                     #[cfg(not(target_os = "linux"))]
                     {
@@ -1142,14 +1139,22 @@ impl DeletionExecutor {
                 continue;
             }
 
-            // Configuration may have changed, or a sibling repository may
-            // have appeared, while preflight/observer hooks were running.
-            // Never report such a refusal as reclaimed (including dry-run).
-            if self.config.source_roots.authorize(&candidate.path).is_err() {
-                report.record_skip(SkipReason::SourceRootDenied);
-                consecutive_failures = 0;
-                continue;
-            }
+            // Hooks and filesystem observations can outlive the first
+            // containment walk. Refresh the candidate's contents and live
+            // rails before either backend, retaining the checked identity.
+            // A new protection is a skip, never reclaimed bytes, a deletion
+            // failure, or an unavailable quarantine store.
+            let metadata = match self.check_before_mutation(candidate, &mut sacred) {
+                Ok(metadata) => metadata,
+                Err(reason) => {
+                    report.record_skip(reason);
+                    consecutive_failures = 0;
+                    if should_backoff_skip(reason) {
+                        report.backoff_candidates.push(candidate.clone());
+                    }
+                    continue;
+                }
+            };
 
             if self.config.dry_run {
                 report.items_would_delete += 1;
@@ -1162,8 +1167,12 @@ impl DeletionExecutor {
             // Actual deletion, or quarantine (Layer 7). Quarantine has no
             // successful-unlink outcome: failure cannot widen this plan.
             let outcome = match plan.mode {
-                DeletionMode::Unlink => self.delete_path(candidate).map(|()| false),
-                DeletionMode::Quarantine => self.quarantine_path(candidate).map(|()| true),
+                DeletionMode::Unlink => {
+                    Self::delete_after_check(candidate, &metadata).map(|()| false)
+                }
+                DeletionMode::Quarantine => self
+                    .quarantine_after_check(candidate, &metadata)
+                    .map(|()| true),
             };
             let completed_at = Instant::now();
             match outcome {
@@ -1256,7 +1265,7 @@ impl DeletionExecutor {
     /// Delete one candidate through the full batch-mode safety stack: the
     /// complete `preflight_check` veto suite (hardcoded source-tree floor,
     /// scoring eligibility, active lease, symlink, identity, source markers,
-    /// open-file index) followed by `delete_path`'s lease/symlink/identity
+    /// open-file index) followed by fresh content, lease/symlink/identity
     /// and live configured-root rechecks at the mutation point.
     ///
     /// Interactive flows MUST route accepted candidates through this instead
@@ -1380,6 +1389,29 @@ impl DeletionExecutor {
             }
         }
 
+        self.check_contents(candidate, &meta, sacred)?;
+
+        // 7. Not currently open by any process (Linux /proc check).
+        if let Some(open) = open_paths
+            && walker::is_path_open_by_ancestor(path, open)
+        {
+            return Err(SkipReason::FileOpen);
+        }
+
+        Ok(())
+    }
+
+    /// Content evidence can expire without changing the candidate's inode.
+    /// Repeat these bounded walks after authorization hooks. `SacredScanStats`
+    /// only reuses positive vetoes; an earlier clear walk never grants reuse.
+    fn check_contents(
+        &self,
+        candidate: &CandidacyScore,
+        meta: &fs::Metadata,
+        sacred: &mut SacredScanStats,
+    ) -> std::result::Result<(), SkipReason> {
+        let path = &candidate.path;
+
         // 5. Does not contain a Git repository or a `.sbh-protect` marker at
         //    any depth (bd-jydu). The sacred walk in 6c stops at depth 3, so a
         //    clone deeper inside an agent's temp tree reached remove_dir_all.
@@ -1437,13 +1469,6 @@ impl DeletionExecutor {
             return Err(SkipReason::SacredStowaway);
         }
 
-        // 7. Not currently open by any process (Linux /proc check).
-        if let Some(open) = open_paths
-            && walker::is_path_open_by_ancestor(path, open)
-        {
-            return Err(SkipReason::FileOpen);
-        }
-
         Ok(())
     }
 
@@ -1476,61 +1501,73 @@ impl DeletionExecutor {
         Ok(())
     }
 
-    #[allow(clippy::unused_self)]
-    /// The last-moment checks shared by removal and quarantine, run right
-    /// before the mutation: source-root policy, eligibility, lease, symlink
-    /// and identity re-checks. A cached plan cannot authorize a revoked root.
-    fn recheck_before_mutation(&self, candidate: &CandidacyScore) -> Result<fs::Metadata> {
+    /// Fresh content and policy checks shared by both mutation backends.
+    /// The final direct-protection, lease and identity checks follow the
+    /// recursive work. This narrows the observation window; it does not make
+    /// concurrent filesystem or policy changes atomic with removal.
+    fn check_before_mutation(
+        &self,
+        candidate: &CandidacyScore,
+        sacred: &mut SacredScanStats,
+    ) -> std::result::Result<fs::Metadata, SkipReason> {
         let path = &candidate.path;
-        eligibility::check(candidate, &self.config).map_err(|reason| SbhError::SafetyVeto {
-            path: path.clone(),
-            reason: reason.explanation().to_string(),
-        })?;
+        eligibility::check(candidate, &self.config)?;
         self.config
             .source_roots
             .authorize(path)
-            .map_err(|reason| SbhError::SafetyVeto {
-                path: path.clone(),
-                reason,
-            })?;
+            .map_err(|_| SkipReason::SourceRootDenied)?;
+        let before = fs::symlink_metadata(path).map_err(|_| SkipReason::PathGone)?;
+        if before.file_type().is_symlink() {
+            return Err(SkipReason::Symlink);
+        }
+        self.verify_candidate_identity(candidate, &before)?;
+        self.check_contents(candidate, &before, sacred)?;
+
+        // A direct or ancestor marker, source marker, or cache-layout change
+        // can arise while the recursive checks run. Do not reuse admission's
+        // unprotected verdict, even when the inode is unchanged.
+        eligibility::check(candidate, &self.config)?;
         // Recheck immediately before mutation. A lease can begin after the
         // earlier preflight, and deleting despite the newly held lock would
         // recreate the exact scan/reap race this protection exists to close.
         if active_lease::path_is_actively_leased(path) {
-            return Err(SbhError::SafetyVeto {
-                path: path.clone(),
-                reason: "active target lease acquired after deletion preflight".to_string(),
-            });
+            return Err(SkipReason::ActiveLease);
         }
-        // Re-check with symlink_metadata (not metadata/is_dir which follow symlinks)
-        // to close the TOCTOU window between preflight_check and actual deletion.
-        let meta = fs::symlink_metadata(path).map_err(|e| SbhError::io(path, e))?;
+        let meta = fs::symlink_metadata(path).map_err(|_| SkipReason::PathGone)?;
         if meta.file_type().is_symlink() {
-            return Err(SbhError::Runtime {
-                details: format!("path became a symlink before deletion: {}", path.display()),
-            });
+            return Err(SkipReason::Symlink);
         }
-        self.verify_candidate_identity(candidate, &meta)
-            .map_err(|skip| SbhError::Runtime {
-                details: format!(
-                    "path identity changed before deletion: {} ({skip:?})",
-                    path.display()
-                ),
-            })?;
+        self.verify_candidate_identity(candidate, &meta)?;
+        // Even callers that do not require a scanner identity must mutate
+        // the same object whose contents this final walk just inspected.
+        if walker::entry_metadata(&before).identity() != walker::entry_metadata(&meta).identity() {
+            return Err(SkipReason::IdentityMismatch);
+        }
         Ok(meta)
     }
 
-    fn delete_path(&self, candidate: &CandidacyScore) -> Result<()> {
-        let path = &candidate.path;
-        let meta = self.recheck_before_mutation(candidate)?;
+    fn recheck_before_mutation(&self, candidate: &CandidacyScore) -> Result<fs::Metadata> {
+        self.check_before_mutation(candidate, &mut SacredScanStats::default())
+            .map_err(|reason| SbhError::SafetyVeto {
+                path: candidate.path.clone(),
+                reason: reason.explanation().to_string(),
+            })
+    }
 
+    fn delete_path(&self, candidate: &CandidacyScore) -> Result<()> {
+        let meta = self.recheck_before_mutation(candidate)?;
+        Self::delete_after_check(candidate, &meta)
+    }
+
+    fn delete_after_check(candidate: &CandidacyScore, metadata: &fs::Metadata) -> Result<()> {
+        let path = &candidate.path;
         // Reuse the confined quarantine traversal without creating a store or
         // recovery record: emergency removal must work at ENOSPC. The exact
-        // metadata checked above remains the expected root identity. Only
+        // metadata just checked remains the expected root identity. Only
         // recognized regenerable caches may widen directory permissions.
         quarantine::remove_direct(
             path,
-            &meta,
+            metadata,
             classification_allows_force_remove(&candidate.classification),
         )
         .map_err(|e| SbhError::io(path, e))?;
@@ -1550,8 +1587,16 @@ impl DeletionExecutor {
     /// authorizes an unlink: a busy store or failed recovery record must not
     /// silently turn a recoverable cleanup into permanent data loss.
     fn quarantine_path(&self, candidate: &CandidacyScore) -> Result<()> {
+        let metadata = self.recheck_before_mutation(candidate)?;
+        self.quarantine_after_check(candidate, &metadata)
+    }
+
+    fn quarantine_after_check(
+        &self,
+        candidate: &CandidacyScore,
+        metadata: &fs::Metadata,
+    ) -> Result<()> {
         let path = &candidate.path;
-        self.recheck_before_mutation(candidate)?;
         let store = QuarantineStore::for_root(&quarantine::quarantine_root_for(
             path,
             &self.config.quarantine_roots,
@@ -1561,8 +1606,9 @@ impl DeletionExecutor {
             candidate.identity,
             candidate.size_bytes,
         );
-        match store.quarantine(
+        match store.quarantine_checked(
             path,
+            metadata,
             &decision_id,
             candidate.size_bytes,
             self.config.quarantine_ttl,
@@ -3079,6 +3125,89 @@ mod tests {
         assert!(moved_path.exists());
     }
 
+    fn assert_authorization_hook_preserves_nested_marker(mode: DeletionMode, marker: &str) {
+        let dir = scratch_dir();
+        let root = dir.path().join("scan-root");
+        let target = root.join("target");
+        let nested = target.join("debug/deps/nested/work");
+        fs::create_dir_all(&nested).unwrap();
+        let payload = nested.join("artifact.o");
+        fs::write(&payload, b"keep these bytes").unwrap();
+        let candidate = make_identity_candidate(&target, 15, 0.95);
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                require_identity: true,
+                mode,
+                quarantine_roots: vec![root.clone()],
+                // Isolate the candidate's own rails: opting in to a source
+                // root must not authorize a newly nested repository.
+                source_roots: SourceRootPolicy::new(std::slice::from_ref(&root), true),
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![candidate.clone()]);
+        let called = std::cell::Cell::new(false);
+        let marker_path = nested.join(marker);
+        let report = executor.execute_with_hooks(
+            &plan,
+            None,
+            Some(&|_| {
+                called.set(true);
+                if marker == ".git" {
+                    fs::create_dir(&marker_path).unwrap();
+                } else {
+                    fs::write(&marker_path, b"protect").unwrap();
+                }
+                Ok(())
+            }),
+            None,
+        );
+
+        assert!(called.get(), "fixture must reach the post-preflight hook");
+        assert_eq!(report.items_deleted, 0, "{mode:?}, {marker}: {report:?}");
+        assert_eq!(report.items_quarantined, 0);
+        assert_eq!(report.items_failed, 0, "a safety refusal is a skip");
+        assert_eq!(report.items_skipped, 1);
+        let reason = if marker == ".git" {
+            "contains_git"
+        } else {
+            "sacred_stowaway"
+        };
+        assert_eq!(report.skipped_by_reason.get(reason), Some(&1));
+        assert_eq!(report.bytes_freed, 0);
+        assert_eq!(report.bytes_quarantined, 0);
+        assert_eq!(
+            walker::identity_for_path(&target, false).ok(),
+            candidate.identity,
+            "the already-approved directory itself was never replaced"
+        );
+        assert_eq!(fs::read(&payload).unwrap(), b"keep these bytes");
+        assert!(marker_path.exists());
+        assert!(!QuarantineStore::under(&root).root().exists());
+    }
+
+    #[test]
+    fn authorization_hook_cannot_add_nested_protection_before_unlink() {
+        assert_authorization_hook_preserves_nested_marker(DeletionMode::Unlink, ".sbh-protect");
+    }
+
+    #[test]
+    fn authorization_hook_cannot_add_nested_protection_before_quarantine() {
+        assert_authorization_hook_preserves_nested_marker(DeletionMode::Quarantine, ".sbh-protect");
+    }
+
+    #[test]
+    fn authorization_hook_cannot_add_nested_repository_before_unlink() {
+        assert_authorization_hook_preserves_nested_marker(DeletionMode::Unlink, ".git");
+    }
+
+    #[test]
+    fn authorization_hook_cannot_add_nested_repository_before_quarantine() {
+        assert_authorization_hook_preserves_nested_marker(DeletionMode::Quarantine, ".git");
+    }
+
     #[cfg(unix)]
     #[test]
     fn preflight_rejects_symlink_substitution() {
@@ -3532,8 +3661,8 @@ mod tests {
         assert!(candidate.exists());
     }
 
-    /// A clean artifact tree passes the rail and is deleted as before; the
-    /// report shows the one walk it cost.
+    /// A clean artifact tree passes both preflight and the final refresh;
+    /// the report accounts for both containment walks.
     #[test]
     fn clean_artifact_tree_passes_the_sacred_rail() {
         let dir = scratch_dir();
@@ -3552,7 +3681,7 @@ mod tests {
         let report = executor.execute(&plan, None);
 
         assert_eq!(report.items_deleted, 1);
-        assert_eq!(report.sacred_scans, 1);
+        assert_eq!(report.sacred_scans, 2);
         assert!(!candidate.exists());
     }
 
@@ -5039,41 +5168,127 @@ mod tests {
         assert!(target_dir.exists(), "candidate must not be deleted");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn open_sweep_reuse_needs_a_young_sweep_and_unchanged_roots() {
-        use std::time::SystemTime;
-        let started = SystemTime::now();
-        let before = started - Duration::from_secs(60);
-        let after = started + Duration::from_secs(1);
-        let young = Duration::from_secs(5);
+    fn open_sweep_reuse_only_vetoes_all_positively_observed_candidates() {
+        let dir = scratch_dir();
+        let held = dir.path().join("held/target");
+        let idle = dir.path().join("idle/target");
+        fs::create_dir_all(&held).unwrap();
+        fs::create_dir_all(&idle).unwrap();
+        let artifact = held.join("existing.o");
+        fs::write(&artifact, b"object").unwrap();
+        let sweep = OpenSweep {
+            started: Instant::now(),
+            targets: Arc::new(vec![artifact]),
+        };
 
-        assert!(open_sweep_reusable(
-            young,
-            started,
-            [Some(before)].into_iter()
-        ));
-        assert!(!open_sweep_reusable(
-            OPEN_SWEEP_REUSE_WINDOW,
-            started,
-            [Some(before)].into_iter()
-        ));
-        // A root that changed after the sweep began, or whose mtime cannot
-        // be read, forces a fresh sweep.
-        assert!(!open_sweep_reusable(
-            young,
-            started,
-            [Some(before), Some(after)].into_iter()
-        ));
-        assert!(!open_sweep_reusable(
-            young,
-            started,
-            [Some(before), None].into_iter()
-        ));
+        let vetoes = cached_open_vetoes(&sweep, std::slice::from_ref(&held)).unwrap();
+        assert!(walker::is_path_open_by_ancestor(&held, &vetoes));
+        assert!(
+            cached_open_vetoes(&sweep, &[held.clone(), idle]).is_none(),
+            "one positive veto cannot authorize another candidate from cached absence"
+        );
+        let empty = OpenSweep {
+            started: Instant::now(),
+            targets: Arc::new(Vec::new()),
+        };
+        assert!(cached_open_vetoes(&empty, std::slice::from_ref(&held)).is_none());
+        let expired = OpenSweep {
+            started: Instant::now() - OPEN_SWEEP_REUSE_WINDOW,
+            targets: sweep.targets,
+        };
+        assert!(cached_open_vetoes(&expired, std::slice::from_ref(&held)).is_none());
     }
 
-    /// A sweep taken for one batch is not reused for a candidate whose root
-    /// changed afterwards: a file opened there after the sweep still vetoes
-    /// the deletion.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cached_open_veto_survives_a_parent_alias_change() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch_dir();
+        let original = dir.path().join("original");
+        let replacement = dir.path().join("replacement");
+        fs::create_dir_all(original.join("target")).unwrap();
+        fs::create_dir_all(replacement.join("target")).unwrap();
+        let artifact = original.join("target/existing.o");
+        fs::write(&artifact, b"object").unwrap();
+        let alias = dir.path().join("alias");
+        symlink(&original, &alias).unwrap();
+        let candidate = alias.join("target");
+        let sweep = OpenSweep {
+            started: Instant::now(),
+            targets: Arc::new(vec![artifact]),
+        };
+        let vetoes = cached_open_vetoes(&sweep, std::slice::from_ref(&candidate)).unwrap();
+
+        fs::rename(&alias, dir.path().join("old-alias")).unwrap();
+        symlink(&replacement, &alias).unwrap();
+        assert!(
+            walker::is_path_open_by_ancestor(&candidate, &vetoes),
+            "a reused positive remains a veto under the original candidate spelling"
+        );
+    }
+
+    /// Reopening existing output leaves the candidate root's mtime alone.
+    /// An earlier empty snapshot must not authorize deleting that live output.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reopening_an_existing_file_after_a_sweep_blocks_deletion() {
+        let dir = scratch_dir();
+        let target = dir.path().join("target");
+        fs::create_dir_all(target.join("debug/deps")).unwrap();
+        let artifact = target.join("debug/deps/existing.o");
+        fs::write(&artifact, b"live object").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(60);
+        fs::File::open(&target)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let root_mtime = fs::symlink_metadata(&target).unwrap().modified().unwrap();
+
+        // Seed the completed, empty observation from before the reopen. This
+        // makes the unsafe cached-negative branch reproducible without
+        // depending on a preceding host-wide sweep's process visibility.
+        *LAST_OPEN_SWEEP.lock().unwrap() = Some(OpenSweep {
+            started: Instant::now(),
+            targets: Arc::new(Vec::new()),
+        });
+        let handle = fs::File::open(&artifact).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&target).unwrap().modified().unwrap(),
+            root_mtime
+        );
+        let (observed, complete) = open_paths_for_batch(std::slice::from_ref(&target));
+        assert!(
+            !complete || walker::is_path_open_by_ancestor(&artifact, &observed),
+            "a completed observation must include the reopened descriptor, not reuse its earlier absence"
+        );
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: true,
+                require_identity: true,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![make_identity_candidate(&target, 11, 0.95)]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 0, "{report:?}");
+        assert!(
+            report.skipped_by_reason.contains_key("file_open")
+                || report
+                    .skipped_by_reason
+                    .contains_key("open_scan_incomplete"),
+            "a fresh scan must observe the open descriptor or refuse incomplete evidence: {report:?}"
+        );
+        assert_eq!(fs::read(&artifact).unwrap(), b"live object");
+        drop(handle);
+    }
+
+    /// A file created and opened after a previous batch's sweep still vetoes
+    /// deletion. Earlier absence cannot authorize a subsequent batch.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_file_opened_after_the_last_sweep_still_blocks_deletion() {
@@ -5105,12 +5320,9 @@ mod tests {
         }
         assert_eq!(report.items_deleted, 1, "{report:?}");
 
-        // A build starts in `second` after that sweep: a file under it is
-        // held open by this process, and only then does the root change. The
-        // last sweep is process-wide, so another test's executor may sweep at
-        // any moment; marking the root changed after the open means a sweep
-        // that missed the descriptor started before the change and cannot be
-        // reused for `second`.
+        // A build starts in `second` after that sweep: a new file is held
+        // open by this process. This covers creating output as well as the
+        // existing-file reopen regression above.
         let live = second.join("build.lock");
         let mut handle = fs::File::create(&live).unwrap();
         std::io::Write::write_all(&mut handle, b"lock").unwrap();

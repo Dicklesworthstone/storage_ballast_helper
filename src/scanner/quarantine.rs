@@ -455,9 +455,29 @@ impl QuarantineStore {
         ttl: Duration,
         decision: Option<serde_json::Value>,
     ) -> std::result::Result<QuarantineRecord, QuarantineUnavailable> {
+        // Capture admission before placement or store preparation can yield
+        // to another writer. Neither operation may authorize a replacement
+        // object that later appears at the same pathname.
+        let expected = fs::symlink_metadata(path)
+            .map_err(|error| QuarantineUnavailable::RootUnavailable(error.to_string()))?;
+        self.quarantine_checked(path, &expected, decision_id, size_bytes, ttl, decision)
+    }
+
+    /// Carry the caller's admitted source identity through store preparation
+    /// and the descriptor-relative transfer. A replacement is never adopted
+    /// as the source of an already-approved quarantine operation.
+    pub(crate) fn quarantine_checked(
+        &self,
+        path: &Path,
+        expected: &fs::Metadata,
+        decision_id: &str,
+        size_bytes: u64,
+        ttl: Duration,
+        decision: Option<serde_json::Value>,
+    ) -> std::result::Result<QuarantineRecord, QuarantineUnavailable> {
         placement::validate(path, self.root())
             .map_err(|error| QuarantineUnavailable::RootUnavailable(error.to_string()))?;
-        safety::quarantine(self, path, decision_id, size_bytes, ttl, decision)
+        safety::quarantine(self, path, expected, decision_id, size_bytes, ttl, decision)
     }
 
     /// Every valid record in the store, oldest first. Completed moves with
