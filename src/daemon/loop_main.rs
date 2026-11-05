@@ -666,18 +666,21 @@ fn deletion_receipt_matches(
     // Match that rounding without conflating a later reuse of the same inode
     // and stable decision id with an earlier, separately observed deletion.
     let rounding = Duration::from_secs(2);
-    if let Some(completed_at) = receipt.completed_at {
-        completed_at
-            .duration_since(deleted_at)
-            .unwrap_or_else(|error| error.duration())
-            <= rounding
-    } else {
-        // Legacy timestamps were sampled by the logger. They can lag the
-        // unlink, but cannot stand for an unrelated later deletion beyond
-        // the matching outcome's observation window.
-        receipt.recorded_at >= deleted_at.checked_sub(rounding).unwrap_or(deleted_at)
-            && receipt.recorded_at <= observed_at.checked_add(rounding).unwrap_or(observed_at)
-    }
+    receipt.completed_at.map_or_else(
+        || {
+            // Legacy timestamps were sampled by the logger. They can lag the
+            // unlink, but cannot stand for an unrelated later deletion beyond
+            // the matching outcome's observation window.
+            receipt.recorded_at >= deleted_at.checked_sub(rounding).unwrap_or(deleted_at)
+                && receipt.recorded_at <= observed_at.checked_add(rounding).unwrap_or(observed_at)
+        },
+        |completed_at| {
+            completed_at
+                .duration_since(deleted_at)
+                .unwrap_or_else(|error| error.duration())
+                <= rounding
+        },
+    )
 }
 
 /// Whether a process has its working directory or an open file under

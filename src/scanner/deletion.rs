@@ -1523,6 +1523,13 @@ impl DeletionExecutor {
         self.verify_candidate_identity(candidate, &before)?;
         self.check_contents(candidate, &before, sacred)?;
 
+        // The shared policy can be replaced while the recursive work runs.
+        // Renew scope before the final direct-protection and identity checks.
+        self.config
+            .source_roots
+            .authorize(path)
+            .map_err(|_| SkipReason::SourceRootDenied)?;
+
         // A direct or ancestor marker, source marker, or cache-layout change
         // can arise while the recursive checks run. Do not reuse admission's
         // unprotected verdict, even when the inode is unchanged.
@@ -5195,7 +5202,7 @@ mod tests {
         };
         assert!(cached_open_vetoes(&empty, std::slice::from_ref(&held)).is_none());
         let expired = OpenSweep {
-            started: Instant::now() - OPEN_SWEEP_REUSE_WINDOW,
+            started: Instant::now().checked_sub(OPEN_SWEEP_REUSE_WINDOW).unwrap(),
             targets: sweep.targets,
         };
         assert!(cached_open_vetoes(&expired, std::slice::from_ref(&held)).is_none());
