@@ -680,8 +680,10 @@ struct UnreadableProcess {
     error: io::Error,
 }
 
-/// An environment larger than this is skipped, not truncated.
-const BUILD_ENVIRON_LIMIT: usize = 512 * 1024;
+/// The kernel caps argv plus environment at 6 MiB, so every environment a
+/// process could exec with fits. One this size or larger came from a rewritten
+/// mm range: it holds the batch and is never truncated.
+const BUILD_ENVIRON_LIMIT: usize = 6 * 1024 * 1024;
 
 pub(super) fn build_directories() -> Vec<(i32, PathBuf)> {
     build_directory_snapshot().0

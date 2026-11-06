@@ -402,6 +402,37 @@ mod tests {
         }
     }
 
+    /// rch jobs that load env files carry 590 KB environments. Holding the batch
+    /// for one of those stopped reclaim on a full host. Only an environment
+    /// the kernel could not have exec'd may still hold it, never be truncated.
+    #[test]
+    fn a_legal_environment_of_any_size_is_read_and_a_larger_one_holds_the_batch() {
+        let fixture = Fixture::new();
+        let target = fixture.root.join("large-environment");
+        let tail = format!("\0CARGO_TARGET_DIR={}\0", target.display());
+        let filler = "x".repeat(BUILD_ENVIRON_LIMIT - "FILLER=".len() - tail.len());
+        fixture.install(
+            fixture.pid,
+            "rustc",
+            format!("FILLER={filler}{tail}").as_bytes(),
+            b"rustc\0lib.rs\0",
+        );
+        let found = fixture.collect(&NativeProc);
+        assert!(found.denied.is_none(), "a legal environment was refused");
+        assert!(found.complete);
+        assert_eq!(found.directories, vec![(fixture.pid, target)]);
+
+        let oversized = fixture.root.join("proc").join(fixture.pid.to_string());
+        fs::write(
+            oversized.join("environ"),
+            format!("FILLER={}\0", "x".repeat(BUILD_ENVIRON_LIMIT)),
+        )
+        .unwrap();
+        let found = fixture.collect(&NativeProc);
+        assert!(!found.complete);
+        assert_eq!(found.denied.unwrap().file, "environ");
+    }
+
     #[test]
     fn denied_environment_keeps_argv_evidence_but_holds_the_batch() {
         let fixture = Fixture::new();
