@@ -33,6 +33,10 @@ mod build_scopes;
 use build_scopes::BuildDirectoryScopes;
 mod code_sign_clones;
 use code_sign_clones::AppInstance;
+mod read_ahead;
+use read_ahead::{DirectoryRead, ReadAhead, ReadReservation};
+#[cfg(all(test, unix))]
+mod read_ahead_tests;
 mod work_queue;
 pub use work_queue::MAX_ACTIVE_BTRFS_DIRECTORIES;
 use work_queue::{WalkFilesystem, WorkQueue};
@@ -973,6 +977,7 @@ impl DirectoryWalker {
         let windows = Arc::new(DirWindows {
             size: self.dir_window,
             starts: oversized_window_starts().lock().clone(),
+            reads: read_ahead::shared(),
         });
         // Clone sender for workers; drop original so channel closes when workers finish.
         for _ in 0..parallelism {
@@ -1115,6 +1120,7 @@ fn process_directory(
     let dir_path = path.as_path();
     // Check exclusion list.
     if config.excluded_paths.contains(dir_path) {
+        windows.reads.lock().forget(dir_path);
         return;
     }
 
@@ -1122,6 +1128,7 @@ fn process_directory(
     // Note: .sbh-protect marker files are detected during child iteration below,
     // avoiding a separate lstat per directory.
     if protection.read().is_protected(dir_path) {
+        windows.reads.lock().forget(dir_path);
         return;
     }
 
@@ -1135,6 +1142,7 @@ fn process_directory(
         metadata_for_path(dir_path, config.follow_symlinks)
     };
     let Ok(meta) = current else {
+        windows.reads.lock().forget(dir_path);
         results.mark_unfinished(dir_path);
         return;
     };
@@ -1143,6 +1151,7 @@ fn process_directory(
             entry_metadata(expected).identity() != entry_metadata(&meta).identity()
         })
     {
+        windows.reads.lock().forget(dir_path);
         results.mark_unfinished(dir_path);
         return;
     }
@@ -1199,65 +1208,109 @@ fn process_directory(
         return;
     }
 
-    // Unreadable ground is unfinished, not evidence of an empty subtree.
-    let entries = match fs::read_dir(dir_path) {
-        Ok(entries) => entries,
-        Err(_) => {
-            results.mark_unfinished(dir_path);
-            return;
-        }
-    };
-
-    // State for structural signals (incremental accumulation).
-    let mut signals = StructuralSignals::default();
-    let mut object_count = 0u32;
-    let mut total_count = 0u32;
-    let mut content_size: u64 = 0;
-    let mut parent_has_node_manifest = false;
-    // The receipt stores paths in a Vec until collection. Collapse any
-    // number of child failures to one unfinished directory for this pass.
-    let mut entries_incomplete = false;
-
-    // Collect child directories during iteration; queue them AFTER the loop.
-    // This prevents a race where a child dir is queued and processed by another
-    // thread before we discover a .sbh-protect marker later in the listing.
-    let mut pending_children: Vec<PathBuf> = Vec::new();
-
     // The entries this pass processes; every name is still checked.
     let window_start = windows.starts.get(dir_path).copied().unwrap_or(0);
     let window = window_start..window_start.saturating_add(windows.size);
-
-    for entry_result in entries {
+    // Only name-only, no-follow walks retain read-ahead. File sizes and a
+    // symlink target's type can change without changing the parent stamp;
+    // those opt-in observations must be collected anew each pass.
+    let retain_reads = !measure_files && !config.follow_symlinks && cfg!(unix);
+    let Some(meta) = dir_meta.as_ref() else {
+        results.mark_unfinished(dir_path);
+        return;
+    };
+    let retained = retain_reads
+        .then(|| {
+            windows.reads.lock().take(
+                dir_path,
+                meta,
+                window_start,
+                windows.size,
+                config.follow_symlinks,
+            )
+        })
+        .flatten();
+    let mut read = if let Some(read) = retained {
+        read
+    } else {
+        let Ok(mut read) = DirectoryRead::open(
+            dir_path,
+            meta.clone(),
+            window_start,
+            windows.size,
+            config.follow_symlinks,
+        ) else {
+            results.mark_unfinished(dir_path);
+            return;
+        };
+        if retain_reads {
+            windows.reads.lock().admit(dir_path, &mut read);
+        }
+        read
+    };
+    let _reservation = ReadReservation::new(&windows.reads, dir_path, &read);
+    let mut names_this_visit = 0;
+    while !read.exhausted {
         // Large flat directories can take a long time to iterate. Honor
         // cancellation during the hot loop so the daemon can stop promptly
         // when a scan budget expires instead of waiting for the entire
         // directory to finish.
         if cancel.load(Ordering::Relaxed) {
             results.mark_unfinished(dir_path);
+            if retain_reads {
+                windows.reads.lock().retain(dir_path, read);
+            }
+            return;
+        }
+
+        // A name budget is a yield, never proof that a marker is absent.
+        // The retained reader continues beyond this prefix on a later pass.
+        // A file-sizing or follow-symlink walk cannot retain observations;
+        // it leaves this directory unfinished and emits no children at the
+        // cap, rather than treating a potentially unseen marker as absent.
+        if names_this_visit >= MAX_NAMES_READ_PER_DIR {
+            results.mark_unfinished(dir_path);
+            if retain_reads {
+                windows.reads.lock().retain(dir_path, read);
+            }
             return;
         }
 
         // Keep the daemon heartbeat alive while iterating a huge directory.
-        if total_count.is_multiple_of(256)
+        if read.total_count.is_multiple_of(256)
             && let Some(hb) = heartbeat
         {
             hb();
         }
 
+        // Check before taking another entry, so cancellation cannot consume
+        // and lose the next name from a reader that will be resumed.
+        if cancel.load(Ordering::Relaxed) {
+            results.mark_unfinished(dir_path);
+            if retain_reads {
+                windows.reads.lock().retain(dir_path, read);
+            }
+            return;
+        }
+        let Some(entry_result) = read.entries.next() else {
+            read.exhausted = true;
+            break;
+        };
         let Ok(entry) = entry_result else {
-            entries_incomplete = true;
-            continue;
+            // A failed name read could conceal a protection marker. Keep
+            // this ground unfinished and restart its observation later.
+            results.mark_unfinished(dir_path);
+            windows.reads.lock().discard(dir_path, &read);
+            return;
         };
 
         // Per-directory budget: names are cheap to read, so every one is
         // checked (up to MAX_NAMES_READ_PER_DIR), and a `.sbh-protect` marker
         // anywhere in the listing protects the directory. Stats and queueing
         // are bounded to this pass's window; later passes move it on.
-        let index = total_count;
-        if index >= MAX_NAMES_READ_PER_DIR {
-            break;
-        }
-        total_count += 1;
+        let index = read.total_count;
+        read.total_count = read.total_count.saturating_add(1);
+        names_this_visit += 1;
 
         // ─── Incremental Signal Collection ───
         // We can check signals purely from the name without stat-ing the file.
@@ -1268,13 +1321,14 @@ fn process_directory(
             // register the marker and bail — no children get queued.
             ".sbh-protect" => {
                 protection.write().register_marker(dir_path);
+                windows.reads.lock().discard(dir_path, &read);
                 return; // Skip rest of directory — protected subtree.
             }
-            "incremental" => signals.has_incremental = true,
-            "deps" => signals.has_deps = true,
-            "build" => signals.has_build = true,
-            ".fingerprint" => signals.has_fingerprint = true,
-            ".git" => signals.has_git = true,
+            "incremental" => read.signals.has_incremental = true,
+            "deps" => read.signals.has_deps = true,
+            "build" => read.signals.has_build = true,
+            ".fingerprint" => read.signals.has_fingerprint = true,
+            ".git" => read.signals.has_git = true,
             // Root-level cache-directory tag (Cache Directory Tagging
             // Standard, case-sensitive uppercase per the spec). This is the
             // one signal that identifies an arbitrarily-named build cache —
@@ -1284,11 +1338,11 @@ fn process_directory(
             // shares the name cannot mark a directory reclaimable.
             "CACHEDIR.TAG" => {
                 if is_valid_cachedir_tag(&entry.path()) {
-                    signals.has_cachedir_tag = true;
+                    read.signals.has_cachedir_tag = true;
                 }
             }
-            "pyvenv.cfg" => signals.has_pyvenv_cfg = true,
-            "cargo.toml" | "Cargo.toml" => signals.has_cargo_toml = true,
+            "pyvenv.cfg" => read.signals.has_pyvenv_cfg = true,
+            "cargo.toml" | "Cargo.toml" => read.signals.has_cargo_toml = true,
             "package.json"
             | "package-lock.json"
             | "npm-shrinkwrap.json"
@@ -1296,7 +1350,7 @@ fn process_directory(
             | "yarn.lock"
             | "bun.lock"
             | "bun.lockb" => {
-                parent_has_node_manifest = true;
+                read.parent_has_node_manifest = true;
             }
             _ => {}
         }
@@ -1309,7 +1363,7 @@ fn process_directory(
                 || ext_str.eq_ignore_ascii_case("rmeta")
                 || ext_str.eq_ignore_ascii_case("d")
             {
-                object_count += 1;
+                read.object_count = read.object_count.saturating_add(1);
             }
         }
 
@@ -1321,7 +1375,7 @@ fn process_directory(
         // ─── Type Check & Symlink Handling ───
         // Use file_type() which is often free (cached in directory entry).
         let Ok(ft) = entry.file_type() else {
-            entries_incomplete = true;
+            read.entries_incomplete = true;
             continue;
         };
 
@@ -1338,7 +1392,7 @@ fn process_directory(
             match metadata_for_path(&child_path, true) {
                 Ok(meta) => meta.is_dir(),
                 Err(_) => {
-                    entries_incomplete = true;
+                    read.entries_incomplete = true;
                     continue;
                 }
             }
@@ -1357,9 +1411,11 @@ fn process_directory(
                 Ok(child_meta) => {
                     // Allocated blocks, not apparent length (see `allocated_size`):
                     // sparse files must not inflate the directory's reclaim estimate.
-                    content_size = content_size.saturating_add(allocated_size(&child_meta));
+                    read.content_size = read
+                        .content_size
+                        .saturating_add(allocated_size(&child_meta));
                 }
-                Err(_) => entries_incomplete = true,
+                Err(_) => read.entries_incomplete = true,
             }
         }
 
@@ -1367,23 +1423,51 @@ fn process_directory(
         // Deferred dispatch: collect child dirs but don't queue yet. Queueing
         // happens after the loop, ensuring .sbh-protect markers are discovered
         // before any children are dispatched to other worker threads.
-        if depth < config.max_depth && is_dir && !config.excluded_paths.contains(&child_path) {
-            pending_children.push(child_path);
+        if is_dir {
+            // These names do not carry the caller's depth/exclusion policy.
+            // Apply it below, every time a retained listing is dispatched.
+            read.children.push(name_os);
         }
     }
 
-    // A listing longer than one window: the next pass takes the next window.
-    let next_start = next_window_start(window_start, total_count, windows.size);
-    if next_start.is_some() || entries_incomplete {
+    if read.reused {
+        // Retained enumeration is speculative. Reusing it across passes
+        // requires the same directory and unchanged membership, then one
+        // final marker check before any child is queued. The tag's contents
+        // can change without changing its parent directory's timestamps.
+        let current = if depth == 0 {
+            fs::metadata(dir_path)
+        } else {
+            metadata_for_path(dir_path, config.follow_symlinks)
+        };
+        if !current.as_ref().is_ok_and(|meta| read.same_stamp(meta)) {
+            results.mark_unfinished(dir_path);
+            windows.reads.lock().discard(dir_path, &read);
+            return;
+        }
+        match fs::symlink_metadata(dir_path.join(".sbh-protect")) {
+            Ok(_) => {
+                protection.write().register_marker(dir_path);
+                windows.reads.lock().discard(dir_path, &read);
+                return;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => {
+                results.mark_unfinished(dir_path);
+                windows.reads.lock().discard(dir_path, &read);
+                return;
+            }
+        }
+        read.signals.has_cachedir_tag = is_valid_cachedir_tag(&dir_path.join("CACHEDIR.TAG"));
+    }
+
+    // A listing longer than one window still leaves ground unseen. Advance
+    // its next window only after dispatch: cancellation must not skip the
+    // children that were read but never queued.
+    let next_start = next_window_start(window_start, read.total_count, windows.size);
+    if next_start.is_some() || read.entries_incomplete {
         // A window or failed child observation left part of this ground unseen.
         results.mark_unfinished(dir_path);
-    }
-    if next_start.is_some() || window_start > 0 {
-        let mut starts = oversized_window_starts().lock();
-        match next_start {
-            Some(start) => starts.insert(dir_path.to_path_buf(), start),
-            None => starts.remove(dir_path),
-        };
     }
 
     // ─── Deferred Recursion Dispatch ───
@@ -1391,17 +1475,32 @@ fn process_directory(
     // above), so queue collected child dirs for worker threads.
     // Enqueue is unbounded and does not wait for a device's admission. A
     // parent and its children therefore cannot deadlock on the same slot.
-    for child_path in pending_children {
+    for child_index in 0..read.children.len() {
+        if depth >= config.max_depth {
+            break;
+        }
+        if child_index.is_multiple_of(256)
+            && let Some(hb) = heartbeat
+        {
+            hb();
+        }
         if cancel.load(Ordering::Relaxed) {
             results.mark_unfinished(dir_path);
+            if retain_reads {
+                windows.reads.lock().retain(dir_path, read);
+            }
             return;
+        }
+        let child_path = dir_path.join(&read.children[child_index]);
+        if config.excluded_paths.contains(&child_path) {
+            continue;
         }
         let opaque_tree = if config.opaque_pruning {
             classify_opaque_tree(
                 &child_path,
                 OpaqueTreeContext {
-                    parent_has_cargo_toml: signals.has_cargo_toml,
-                    parent_has_node_manifest,
+                    parent_has_cargo_toml: read.signals.has_cargo_toml,
+                    parent_has_node_manifest: read.parent_has_node_manifest,
                 },
             )
         } else {
@@ -1442,8 +1541,8 @@ fn process_directory(
     }
 
     // Finalize structural signals.
-    if total_count > 0 && object_count > 0 {
-        signals.mostly_object_files = object_count * 2 >= total_count;
+    if read.total_count > 0 && read.object_count > 0 {
+        read.signals.mostly_object_files = read.object_count.saturating_mul(2) >= read.total_count;
     }
 
     // Emit a WalkEntry for this directory itself (reuse stat from top of function).
@@ -1455,19 +1554,33 @@ fn process_directory(
         // sizes. This is a lower bound (doesn't recurse into subdirs, capped at
         // MAX_ENTRIES_PER_DIR children) but vastly better than the inode entry
         // size (~4096) for scoring purposes.
-        if emeta.is_dir && content_size > 0 {
-            emeta.content_size_bytes = content_size;
+        if emeta.is_dir && read.content_size > 0 {
+            emeta.content_size_bytes = read.content_size;
         }
         let walk_entry = WalkEntry {
             path: dir_path.to_path_buf(),
             metadata: emeta,
             depth,
-            structural_signals: signals,
+            structural_signals: read.signals,
             is_open: false, // Caller sets this after walk using /proc scan.
             opaque_tree,
         };
 
         results.push(walk_entry, cancel);
+    }
+    if cancel.load(Ordering::Relaxed) {
+        results.mark_unfinished(dir_path);
+    } else if next_start.is_some() || window_start > 0 {
+        let mut starts = oversized_window_starts().lock();
+        match next_start {
+            Some(start) => starts.insert(dir_path.to_path_buf(), start),
+            None => starts.remove(dir_path),
+        };
+    }
+    if retain_reads {
+        // Completing a listing does not complete its subtree. Reuse the
+        // parent names so the next funded slice can reach queued deep work.
+        windows.reads.lock().retain(dir_path, read);
     }
 }
 
@@ -1891,6 +2004,8 @@ struct DirWindows {
     size: u32,
     /// Window starts as of the walk's start, read without locking.
     starts: HashMap<PathBuf, u32>,
+    /// Speculative name enumeration, never subtree-completion evidence.
+    reads: Arc<parking_lot::Mutex<ReadAhead>>,
 }
 
 /// Where the next pass's window starts, after a pass that processed
@@ -4874,6 +4989,7 @@ mod tests {
             let windows = DirWindows {
                 size: MAX_ENTRIES_PER_DIR,
                 starts: HashMap::new(),
+                reads: Arc::default(),
             };
             process_directory(
                 WorkItem {
@@ -5102,6 +5218,7 @@ mod tests {
         let windows = DirWindows {
             size: MAX_ENTRIES_PER_DIR,
             starts: HashMap::new(),
+            reads: Arc::default(),
         };
         let protection = parking_lot::RwLock::new(ProtectionRegistry::marker_only());
         let cancel = AtomicBool::new(false);

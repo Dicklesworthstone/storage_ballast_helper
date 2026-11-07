@@ -8,6 +8,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Large deep directories retain enumeration across finite daemon scans.**
+  Unix name-only, no-follow walks preserve bounded partial reads and parent
+  listings, so a canceled pass can reach descendants on later slices. Reuse
+  renews directory identity, protection markers, cache tags and traversal
+  policy. Reaching the name cap no longer dispatches children before proving
+  the listing contains no protection marker.
+
 - **Inode and swap relief drain eligible quarantine before new cleanup.**
   Resource pressure now reaches the existing scoped quarantine drain, renews
   live shortage and original-path protection, and shares its finite allowance

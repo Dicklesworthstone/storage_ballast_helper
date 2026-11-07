@@ -1,4 +1,4 @@
-# Bounded-memory, resumable pre-scan pages
+# Bounded-memory, resumable scanner directory pages
 
 The pre-scan cursor previously collected every depth-one entry in a scan root,
 sorted the entire collection, removed the already-visited prefix, and only then
@@ -104,6 +104,42 @@ indexes retain identity bindings, invalidations and failure cooldowns across
 restart. This change concerns these two checkpoint surfaces; it does not claim
 byte-preserving JSON output for every CLI command or decision-record type.
 
+## Recursive enumeration also survives a finite slice
+
+A large directory below the priority pre-scan's depth limit can consume a whole
+recursive walk allowance before its children are queued. Restarting that listing
+at its first name on every pass hides the descendants indefinitely. Unix walks
+that omit file sizing and do not follow symlinks now retain the unfinished
+directory iterator, structural observations and child basenames. Completed
+parent listings are also retained so revisiting ancestors need not repeat all
+their enumeration before reaching the unfinished descendant.
+
+Each scanner thread retains at most four partial-reader reservations and sixteen
+completed parent pages. Completed pages together retain at most 65,536 child
+names; each partial reader retains at most its current window's child names.
+These are handle and name-count bounds, not byte limits. Idle entries expire
+after one hour when the cache is next consulted. A checked-out reader keeps its
+reservation during slow native I/O, and a guard releases that reservation if
+its worker unwinds. Rotating the active root subset does not discard unfinished
+reads. This state is process-local and is not a persisted traversal checkpoint.
+
+Reuse requires the same device, inode, modification time and change time.
+Before dispatching retained names, the walker checks `.sbh-protect` again and
+revalidates `CACHEDIR.TAG` contents. Current exclusions, protection, maximum
+depth, opaque classification and device policy still control traversal. A
+failed observation cannot become a permanently cached complete page. Children
+are queued only after actual enumeration EOF, and cancellation during child
+dispatch does not advance the directory's processing window.
+
+The 1,048,576-name per-visit cap yields a retained reader on these daemon walks.
+File-sizing, follow-symlink and non-Unix walks do not retain observations: at
+the cap they leave the directory unfinished, dispatch no children from that
+listing, and retry from its start on a later walk. This preserves the requirement
+to inspect the entire listing for a protection marker. Retained enumeration
+does not guarantee completion for every topology or a continuously changing or
+unreadable tree. A child-dispatch window that itself exhausts every slice can
+still repeat its queued prefix; dispatch position is not retained.
+
 ## Scope and tests
 
 Enumeration must still inspect the whole directory to find the smallest names
@@ -131,6 +167,13 @@ They verify that enumeration yields the pre-scan share, retains recursive
 discovery's remaining allowance, and eventually delivers every name. A shutdown
 test covers both an already-prepared page and a root not yet opened. These
 deterministic accounting tests are not a throughput measurement on a fleet host.
+
+The recursive walk tests use real deep directories and deterministic heartbeat
+cancellation to exercise successive finite slices, inserted protection markers,
+directory replacement, changed traversal policy, changed tag contents and
+cancellation during child dispatch. Cache tests cover bounded admission and
+completed pages, expiration, unwind cleanup and failed-observation retries.
+These tests do not establish a fleet completion rate or qualify native macOS.
 
 `prescan_cursor::enumeration::tests` covers bounded chunks, retained completed
 pages, root replacement, independent scratch progress, forced resets, descriptor
