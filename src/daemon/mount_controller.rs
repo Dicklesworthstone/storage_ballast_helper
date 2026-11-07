@@ -259,6 +259,7 @@ pub struct MountDecision {
 #[derive(Debug, Clone, Copy)]
 pub struct MountControllerConfig {
     /// Predictive escalation: enter `Reclaim` when time-to-red is within this.
+    /// Zero disables predictive escalation without disabling pressure response.
     pub action_horizon: Duration,
     /// Green ticks in a row before `Reclaim` returns to `Maintain`.
     pub recovery_clean_windows: u32,
@@ -390,7 +391,8 @@ impl MountController {
         let before = self.state;
 
         let pressured = input.level >= PressureLevel::Yellow;
-        let predicted = input.prediction_confident
+        let predicted = !self.config.action_horizon.is_zero()
+            && input.prediction_confident
             && input.seconds_to_red.is_some_and(|seconds| {
                 seconds.is_finite()
                     && seconds >= 0.0
@@ -910,6 +912,36 @@ mod tests {
             }
             .scannable()
         );
+    }
+
+    #[test]
+    fn zero_action_horizon_disables_prediction_but_keeps_pressure_response() {
+        let now = Instant::now();
+        let tick = MountTickInput {
+            seconds_to_red: Some(0.0),
+            prediction_confident: true,
+            ..input(PressureLevel::Green, configured(), now)
+        };
+        let mut disabled = MountController::new(
+            PathBuf::from("/data"),
+            MountControllerConfig {
+                action_horizon: Duration::ZERO,
+                ..MountControllerConfig::default()
+            },
+        );
+        let decision = disabled.observe(tick);
+        assert_eq!(decision.state, MountState::Maintain);
+        assert!(!decision.scan);
+
+        // A zero lower bound still warrants action with prediction enabled.
+        let decision = fresh().observe(tick);
+        assert_eq!(decision.state, MountState::Reclaim);
+        assert!(decision.scan);
+
+        // Disabling forecasting must not disable reactive reclamation.
+        let decision = disabled.observe(input(PressureLevel::Orange, configured(), now));
+        assert_eq!(decision.state, MountState::Reclaim);
+        assert!(decision.scan);
     }
 
     struct Case {

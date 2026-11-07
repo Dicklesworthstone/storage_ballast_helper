@@ -8,6 +8,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Prediction settings cannot panic the mount controller or trap pressure in a
+  permanent recovery state.** Enabled horizons must stay finite in seconds,
+  the action horizon must fit a duration, and burst confidence must be a valid
+  probability. Disabled prediction leaves inactive settings inert, including
+  non-finite values, while ordinary pressure relief remains active. Byte-pressure
+  hysteresis must leave a reachable Green recovery boundary.
+
 - **Forecasts and cleanup goals honor each volume's absolute byte thresholds.**
   The rate estimator and calibration guard now use the same effective boundary
   as the pressure controller, and cleanup requests target the effective Green

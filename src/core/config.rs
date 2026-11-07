@@ -2885,17 +2885,35 @@ impl Config {
         if self.pressure.prediction.enabled {
             let pred = &self.pressure.prediction;
 
-            // All horizon minutes must be positive (used in division/comparison).
-            for (name, val) in [
-                ("action_horizon_minutes", pred.action_horizon_minutes),
-                ("warning_horizon_minutes", pred.warning_horizon_minutes),
-                ("imminent_danger_minutes", pred.imminent_danger_minutes),
+            // NaN bypasses ordinary ordering checks. Horizons must also stay
+            // finite when converted to seconds by the runtime controllers.
+            // A zero critical horizon is supported; the others are positive.
+            for (name, val, allow_zero) in [
+                ("action_horizon_minutes", pred.action_horizon_minutes, false),
+                ("warning_horizon_minutes", pred.warning_horizon_minutes, false),
+                ("imminent_danger_minutes", pred.imminent_danger_minutes, false),
+                ("critical_danger_minutes", pred.critical_danger_minutes, true),
             ] {
-                if val <= 0.0 {
+                if !val.is_finite()
+                    || val < 0.0
+                    || (!allow_zero && val == 0.0)
+                    || !(val * 60.0).is_finite()
+                {
+                    let bound = if allow_zero { ">= 0" } else { "> 0" };
                     return Err(SbhError::InvalidConfig {
-                        details: format!("prediction.{name} must be > 0, got {val}"),
+                        details: format!(
+                            "prediction.{name} must be finite, {bound}, and remain finite in seconds; got {val}"
+                        ),
                     });
                 }
+            }
+            // The mount state machine stores this horizon as a Duration.
+            // Finite floating-point seconds can still exceed its range.
+            if std::time::Duration::try_from_secs_f64(pred.action_horizon_minutes * 60.0).is_err() {
+                return Err(SbhError::InvalidConfig {
+                    details: "prediction.action_horizon_minutes must convert to a representable duration"
+                        .to_string(),
+                });
             }
 
             if pred.warning_horizon_minutes <= pred.action_horizon_minutes {
@@ -2916,12 +2934,8 @@ impl Config {
                         .to_string(),
                 });
             }
-            if pred.critical_danger_minutes < 0.0 {
-                return Err(SbhError::InvalidConfig {
-                    details: "prediction.critical_danger_minutes must be >= 0".to_string(),
-                });
-            }
             validate_prob("prediction.min_confidence", pred.min_confidence)?;
+            validate_prob("prediction.burst_min_confidence", pred.burst_min_confidence)?;
         }
 
         if self.scanner.parallelism == 0 {
@@ -3145,6 +3159,12 @@ impl Config {
                     details: format!("pressure.controller.{name} must be a finite number >= 0"),
                 });
             }
+        }
+        if self.pressure.green_min_free_pct + controller.hysteresis_pct > 100.0 {
+            return Err(SbhError::InvalidConfig {
+                details: "pressure.green_min_free_pct + pressure.controller.hysteresis_pct must be <= 100 so Green recovery is reachable"
+                    .to_string(),
+            });
         }
         if controller.kp_scale_min > controller.kp_scale_max {
             return Err(SbhError::InvalidConfig {
@@ -5064,6 +5084,127 @@ mod tests {
         cfg.pressure.prediction.action_horizon_minutes = 30.0;
         let err = cfg.validate().expect_err("expected prediction error");
         assert!(err.to_string().contains("warning_horizon"));
+    }
+
+    #[test]
+    fn prediction_rejects_nonfinite_and_overflowing_horizons_from_toml() {
+        for field in [
+            "action_horizon_minutes",
+            "warning_horizon_minutes",
+            "imminent_danger_minutes",
+            "critical_danger_minutes",
+        ] {
+            for value in ["nan", "inf", "-inf", "1e308"] {
+                let raw = format!("[pressure.prediction]\n{field} = {value}\n");
+                let cfg: Config = toml::from_str(&raw).expect("valid TOML float syntax");
+                let err = cfg
+                    .validate()
+                    .expect_err("invalid horizon must fail before reaching the controller");
+                assert!(
+                    err.to_string().contains(&format!("prediction.{field}")),
+                    "{field}={value}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prediction_action_horizon_must_fit_the_mount_controller_duration() {
+        // The seconds are finite, and the horizons are ordered, but the
+        // action horizon exceeds Duration's range and used to panic at startup.
+        let cfg: Config = toml::from_str(
+            "[pressure.prediction]\naction_horizon_minutes = 1e20\nwarning_horizon_minutes = 1e21\n",
+        )
+        .expect("valid TOML");
+        let err = cfg.validate().expect_err("unrepresentable duration");
+        assert!(err.to_string().contains("action_horizon_minutes"));
+        assert!(err.to_string().contains("representable duration"));
+    }
+
+    #[test]
+    fn prediction_burst_confidence_uses_the_probability_contract() {
+        for value in ["nan", "inf", "-inf", "-0.1", "1.1"] {
+            let raw = format!("[pressure.prediction]\nburst_min_confidence = {value}\n");
+            let cfg: Config = toml::from_str(&raw).expect("valid TOML float syntax");
+            let err = cfg.validate().expect_err("invalid burst confidence");
+            assert!(err.to_string().contains("burst_min_confidence"), "{err}");
+        }
+        // Both probability endpoints remain supported. The predictive policy
+        // itself applies max(min_confidence, burst_min_confidence).
+        for value in ["0.0", "1.0"] {
+            let raw = format!("[pressure.prediction]\nburst_min_confidence = {value}\n");
+            let cfg: Config = toml::from_str(&raw).expect("valid TOML");
+            cfg.validate().expect("valid probability endpoint");
+        }
+    }
+
+    #[test]
+    fn prediction_retains_zero_critical_and_large_representable_horizons() {
+        Config::default().validate().expect("valid defaults");
+        // Do not impose an arbitrary wall-clock cap. Only the action horizon
+        // needs to fit Duration; a warning horizon beyond that range is valid
+        // while its conversion to floating-point seconds remains finite.
+        let cfg: Config = toml::from_str(
+            "[pressure.prediction]\naction_horizon_minutes = 1e16\nwarning_horizon_minutes = 1e100\ncritical_danger_minutes = 0.0\n",
+        )
+        .expect("valid TOML");
+        cfg.validate()
+            .expect("large finite horizons and zero critical");
+    }
+
+    #[test]
+    fn disabled_prediction_keeps_inactive_settings_inert() {
+        let cfg: Config = toml::from_str(
+            "[pressure.prediction]\nenabled = false\naction_horizon_minutes = inf\nwarning_horizon_minutes = nan\nimminent_danger_minutes = -1.0\ncritical_danger_minutes = -1.0\nburst_min_confidence = nan\n",
+        )
+        .expect("valid TOML float syntax");
+        cfg.validate()
+            .expect("disabled prediction does not use these settings");
+    }
+
+    #[test]
+    fn byte_pressure_recovery_must_be_reachable() {
+        for (green, hysteresis) in [(100.0, 1.0), (99.5, 1.0), (20.0, 81.0), (20.0, f64::MAX)] {
+            let mut cfg = Config::default();
+            cfg.pressure.green_min_free_pct = green;
+            cfg.pressure.controller.hysteresis_pct = hysteresis;
+            let err = cfg.validate().expect_err("unreachable Green recovery");
+            assert!(err.to_string().contains("hysteresis_pct"), "{err}");
+            assert!(err.to_string().contains("Green recovery"), "{err}");
+        }
+    }
+
+    #[test]
+    fn valid_byte_pressure_settings_recover_to_green_at_full_capacity() {
+        use crate::monitor::pid::{PidConfig, PidPressureController, PressureLevel, PressureReading};
+        use std::time::{Duration, Instant};
+
+        for (green, hysteresis) in [(20.0, 0.0), (20.0, 1.0), (99.0, 1.0), (100.0, 0.0)] {
+            let mut cfg = Config::default();
+            cfg.pressure.green_min_free_pct = green;
+            cfg.pressure.controller.hysteresis_pct = hysteresis;
+            cfg.validate().expect("reachable recovery boundary");
+            let mut controller = PidPressureController::new(
+                &PidConfig::from(&cfg.pressure),
+                Duration::from_secs(1),
+            );
+            let reading = |free_bytes| PressureReading {
+                free_bytes,
+                total_bytes: 100,
+                mount: PathBuf::from("/"),
+            };
+            let now = Instant::now();
+            let mut response = controller.update(reading(0), None, now);
+            assert_eq!(response.level, PressureLevel::Critical);
+            for step in 1..=4 {
+                response = controller.update(reading(100), None, now + Duration::from_secs(step));
+            }
+            assert_eq!(
+                response.level,
+                PressureLevel::Green,
+                "green={green}, hysteresis={hysteresis}"
+            );
+        }
     }
 
     #[test]

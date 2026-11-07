@@ -2063,9 +2063,15 @@ fn calibrated_estimate(estimate: &RateEstimate, interval: Option<&TteInterval>) 
 /// Controller tunables derived from config.
 fn mount_controller_config(config: &Config) -> MountControllerConfig {
     MountControllerConfig {
-        action_horizon: Duration::from_secs_f64(
-            (config.pressure.prediction.action_horizon_minutes * 60.0).max(0.0),
-        ),
+        // Disabled prediction must not evaluate inactive numeric settings.
+        // Validation rejects an unrepresentable enabled horizon; keep direct
+        // programmatic callers non-panicking and without predictive authority.
+        action_horizon: if config.pressure.prediction.enabled {
+            Duration::try_from_secs_f64(config.pressure.prediction.action_horizon_minutes * 60.0)
+                .unwrap_or(Duration::ZERO)
+        } else {
+            Duration::ZERO
+        },
         recovery_clean_windows: crate::daemon::mount_controller::DEFAULT_RECOVERY_CLEAN_WINDOWS,
         min_rescan_interval: Duration::from_secs(config.scanner.min_rescan_interval_secs.max(1)),
         red_min_free_pct: config.pressure.red_min_free_pct,
@@ -22362,6 +22368,50 @@ mod tests {
             now + interval,
             interval
         ));
+    }
+
+    #[test]
+    fn mount_controller_horizon_is_inert_when_prediction_is_disabled() {
+        let mut config = Config::default();
+        assert_eq!(
+            mount_controller_config(&config).action_horizon,
+            Duration::from_mins(30)
+        );
+        config.pressure.prediction.action_horizon_minutes = 45.5;
+        assert_eq!(
+            mount_controller_config(&config).action_horizon,
+            Duration::from_secs(2730)
+        );
+
+        config.pressure.prediction.enabled = false;
+        for minutes in [30.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, -1.0] {
+            config.pressure.prediction.action_horizon_minutes = minutes;
+            assert_eq!(
+                mount_controller_config(&config).action_horizon,
+                Duration::ZERO,
+                "disabled action horizon {minutes}"
+            );
+        }
+    }
+
+    #[test]
+    fn mount_controller_horizon_refuses_unvalidated_invalid_values() {
+        let mut config = Config::default();
+        for minutes in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            1e20,
+            -1.0,
+        ] {
+            config.pressure.prediction.action_horizon_minutes = minutes;
+            assert_eq!(
+                mount_controller_config(&config).action_horizon,
+                Duration::ZERO,
+                "invalid action horizon {minutes}"
+            );
+        }
     }
 
     /// The B5 device-affinity gate became per-mount state (W1.1): a pressured
