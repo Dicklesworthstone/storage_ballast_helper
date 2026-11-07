@@ -1718,7 +1718,7 @@ fn apply_ledger_scoring_history(config: &Config, engine: &mut ScoringEngine) {
         suspend: Duration::from_secs(config.scoring.regret_suspend_minutes.saturating_mul(60)),
         ..RegretConfig::default()
     });
-    calibrator.replay(history.outcomes, std::time::Instant::now());
+    calibrator.replay(history.outcomes, SystemTime::now());
     engine.set_regret(calibrator.calibrations(), HashSet::new());
     engine.set_cache_redeletions(cache_redeletion_counts(
         history.cache_deletions,

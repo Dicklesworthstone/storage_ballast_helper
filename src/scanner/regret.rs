@@ -20,7 +20,7 @@
 
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -101,6 +101,42 @@ impl Outcome {
     }
 }
 
+/// The inclusive window of resolved outcomes used for category calibration.
+pub const REGRET_EVIDENCE_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// One category observation with its original wall-clock time. Ingestion time
+/// must not extend the useful life of evidence read from the ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegretObservation {
+    /// Artifact category key at decision time.
+    pub category: String,
+    /// Structural certainty at decision time.
+    pub certainty: ArtifactCertainty,
+    /// Resolved outcome; unknown observations do not change calibration.
+    pub outcome: Outcome,
+    /// When the outcome was observed, rather than when it was imported.
+    pub observed_at: SystemTime,
+}
+
+impl RegretObservation {
+    #[cfg(feature = "sqlite")]
+    fn from_stored(stored: &crate::logger::sqlite::StoredOutcome) -> Option<Self> {
+        Some(Self {
+            category: stored.category.clone(),
+            certainty: certainty_from_name(&stored.certainty),
+            outcome: Outcome::from_name(&stored.outcome)?,
+            observed_at: chrono::DateTime::parse_from_rfc3339(&stored.observed_at)
+                .ok()
+                .map(SystemTime::from)?,
+        })
+    }
+
+    fn expired(&self, now: SystemTime) -> bool {
+        now.duration_since(self.observed_at)
+            .is_ok_and(|age| age > REGRET_EVIDENCE_WINDOW)
+    }
+}
+
 /// Persisted scoring evidence shared by daemon startup and manual cleanup.
 /// Loading history never creates a ledger or replays a runtime suspension.
 #[cfg(feature = "sqlite")]
@@ -108,7 +144,7 @@ impl Outcome {
 pub struct ScoringHistory {
     /// Valid outcomes from the last 30 days, ready for
     /// [`RegretCalibrator::replay`].
-    pub outcomes: Vec<(String, ArtifactCertainty, Outcome)>,
+    pub outcomes: Vec<RegretObservation>,
     /// Actual warm-cache deletions within [`CACHE_REDELETION_MEMORY`], with
     /// receipts and their later outcome labels counted only once.
     pub cache_deletions: Vec<(PathBuf, ArtifactCategory, SystemTime)>,
@@ -133,7 +169,7 @@ impl ScoringHistory {
                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         };
         let outcomes = db
-            .outcomes_since(&since(Duration::from_secs(30 * 24 * 60 * 60)))
+            .outcomes_since(&since(REGRET_EVIDENCE_WINDOW))
             .unwrap_or_else(|error| {
                 eprintln!("[SBH-REGRET] could not replay stored outcomes: {error}");
                 Vec::new()
@@ -147,16 +183,8 @@ impl ScoringHistory {
         Self {
             cache_deletions: replay_cache_deletions(receipts, &outcomes, now),
             outcomes: outcomes
-                .into_iter()
-                .filter_map(|stored| {
-                    Outcome::from_name(&stored.outcome).map(|outcome| {
-                        (
-                            stored.category,
-                            certainty_from_name(&stored.certainty),
-                            outcome,
-                        )
-                    })
-                })
+                .iter()
+                .filter_map(RegretObservation::from_stored)
                 .collect(),
         }
     }
@@ -412,6 +440,20 @@ pub struct DecisionOutcome {
     pub detail: String,
 }
 
+impl DecisionOutcome {
+    /// The timestamped calibration observation carried by this outcome.
+    /// An out-of-range wall-clock timestamp supplies no evidence.
+    #[must_use]
+    pub fn observation(&self) -> Option<RegretObservation> {
+        Some(RegretObservation {
+            category: self.category.clone(),
+            certainty: certainty_from_name(&self.certainty),
+            outcome: self.outcome,
+            observed_at: UNIX_EPOCH.checked_add(Duration::from_secs(self.observed_at))?,
+        })
+    }
+}
+
 /// What the detector sees when it looks at a watched path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sighting {
@@ -632,12 +674,22 @@ pub struct CategoryCalibration {
     pub suspended: bool,
 }
 
+/// Compact count deltas for one category at one observation timestamp.
+/// Many outcomes recorded in the same clock tick need only one bucket.
+#[derive(Debug, Clone, Default)]
+struct EvidenceCounts {
+    decisions: u64,
+    regrets: u64,
+    definite_decisions: u64,
+}
+
 /// Regret rates per category with the pooled prior, bounds, calibration
 /// factors and suspensions.
 #[derive(Debug, Clone)]
 pub struct RegretCalibrator {
     config: RegretConfig,
     categories: BTreeMap<String, CategoryStats>,
+    evidence: BTreeMap<SystemTime, BTreeMap<String, EvidenceCounts>>,
 }
 
 impl RegretCalibrator {
@@ -647,6 +699,7 @@ impl RegretCalibrator {
         Self {
             config,
             categories: BTreeMap::new(),
+            evidence: BTreeMap::new(),
         }
     }
 
@@ -677,7 +730,9 @@ impl RegretCalibrator {
         self.config = config;
     }
 
-    /// Record an outcome. `Unknown` outcomes are not evidence.
+    /// Record an outcome observed now. `Unknown` outcomes are not evidence.
+    /// Persisted or delayed observations must use their original timestamp
+    /// through [`Self::record_observation`].
     pub fn record(
         &mut self,
         category: &str,
@@ -685,19 +740,40 @@ impl RegretCalibrator {
         outcome: Outcome,
         now: Instant,
     ) {
-        if outcome == Outcome::Unknown {
+        let observed_at = SystemTime::now();
+        self.record_observation(
+            &RegretObservation {
+                category: category.to_string(),
+                certainty,
+                outcome,
+                observed_at,
+            },
+            observed_at,
+            now,
+        );
+    }
+
+    /// Apply a newly observed outcome to calibration and the live sequential
+    /// alarm. Expired or unknown observations cannot contribute evidence.
+    pub fn record_observation(
+        &mut self,
+        observation: &RegretObservation,
+        now_wall: SystemTime,
+        now: Instant,
+    ) {
+        self.expire(now_wall);
+        if observation.outcome == Outcome::Unknown || observation.expired(now_wall) {
             return;
         }
-        let alpha = self.alpha_for(category, certainty);
-        let stats = self.categories.entry(category.to_string()).or_default();
-        stats.decisions += 1;
-        if certainty == ArtifactCertainty::Definite {
-            stats.definite_decisions += 1;
-        }
+        let alpha = self.alpha_for(&observation.category, observation.certainty);
+        self.add_evidence(observation);
+        let stats = self
+            .categories
+            .get_mut(&observation.category)
+            .expect("adding evidence creates its category");
         // E-process for H0: rate <= alpha against p1 = min(0.5, 4 alpha).
         let p1 = (4.0 * alpha).min(0.5);
-        let step = if outcome == Outcome::Regret {
-            stats.regrets += 1;
+        let step = if observation.outcome == Outcome::Regret {
             (p1 / alpha).ln()
         } else {
             ((1.0 - p1) / (1.0 - alpha)).ln()
@@ -711,18 +787,73 @@ impl RegretCalibrator {
         }
     }
 
-    /// Rebuild from stored outcomes (daemon start).
+    /// Add historical calibration evidence without replaying sequential alarm
+    /// steps or changing any live suspension. Callers admit each observation
+    /// once before using this method.
+    pub fn replay_observation(
+        &mut self,
+        observation: &RegretObservation,
+        now_wall: SystemTime,
+    ) {
+        self.expire(now_wall);
+        if observation.outcome != Outcome::Unknown && !observation.expired(now_wall) {
+            self.add_evidence(observation);
+        }
+    }
+
+    /// Rebuild calibration from timestamped historical outcomes. Historical
+    /// alarms have already served; an existing live alarm remains untouched.
     pub fn replay(
         &mut self,
-        outcomes: impl IntoIterator<Item = (String, ArtifactCertainty, Outcome)>,
-        now: Instant,
+        outcomes: impl IntoIterator<Item = RegretObservation>,
+        now_wall: SystemTime,
     ) {
-        for (category, certainty, outcome) in outcomes {
-            self.record(&category, certainty, outcome, now);
+        for observation in outcomes {
+            self.replay_observation(&observation, now_wall);
         }
-        // Suspensions are not replayed: an alarm from history has served.
-        for stats in self.categories.values_mut() {
-            stats.suspended_until = None;
+    }
+
+    fn add_evidence(&mut self, observation: &RegretObservation) {
+        let counts = self
+            .evidence
+            .entry(observation.observed_at)
+            .or_default()
+            .entry(observation.category.clone())
+            .or_default();
+        let stats = self
+            .categories
+            .entry(observation.category.clone())
+            .or_default();
+        counts.decisions += 1;
+        stats.decisions += 1;
+        if observation.certainty == ArtifactCertainty::Definite {
+            counts.definite_decisions += 1;
+            stats.definite_decisions += 1;
+        }
+        if observation.outcome == Outcome::Regret {
+            counts.regrets += 1;
+            stats.regrets += 1;
+        }
+    }
+
+    /// Remove evidence strictly older than the inclusive thirty-day window.
+    /// Only expired timestamp buckets are visited. Sequential-test state and
+    /// active suspension deadlines are independent of this rolling evidence.
+    pub fn expire(&mut self, now_wall: SystemTime) {
+        let Some(cutoff) = now_wall.checked_sub(REGRET_EVIDENCE_WINDOW) else {
+            return;
+        };
+        while self.evidence.first_key_value().is_some_and(|(at, _)| *at < cutoff) {
+            let (_, expired) = self.evidence.pop_first().expect("expired bucket exists");
+            for (category, counts) in expired {
+                let stats = self
+                    .categories
+                    .get_mut(&category)
+                    .expect("retained evidence has category counts");
+                stats.decisions -= counts.decisions;
+                stats.regrets -= counts.regrets;
+                stats.definite_decisions -= counts.definite_decisions;
+            }
         }
     }
 
@@ -768,6 +899,17 @@ impl RegretCalibrator {
             .get(category)
             .and_then(|s| s.suspended_until)
             .is_some_and(|until| now < until)
+    }
+
+    /// Active category alarms, including a category whose calibration
+    /// evidence has just expired. Expiry must not clear deletion authority.
+    #[must_use]
+    pub fn suspended_categories(&self, now: Instant) -> HashSet<String> {
+        self.categories
+            .iter()
+            .filter(|(_, stats)| stats.suspended_until.is_some_and(|until| now < until))
+            .map(|(category, _)| category.clone())
+            .collect()
     }
 
     /// The category's picture, if it has evidence.
@@ -1053,7 +1195,7 @@ mod tests {
             history
                 .outcomes
                 .iter()
-                .filter(|(_, _, outcome)| *outcome == Outcome::Regret)
+                .filter(|observation| observation.outcome == Outcome::Regret)
                 .count(),
             1,
         );
@@ -1196,18 +1338,143 @@ mod tests {
         assert!(!calibrator.suspended("pip_cache", now + Duration::from_secs(601)));
         // Replay from the ledger rebuilds the counts but not the suspension.
         let mut rebuilt = RegretCalibrator::new(RegretConfig::default());
+        let observed_at = SystemTime::now();
         rebuilt.replay(
-            (0..3).map(|_| {
-                (
-                    "pip_cache".to_string(),
-                    ArtifactCertainty::Likely,
-                    Outcome::Regret,
-                )
+            (0..3).map(|_| RegretObservation {
+                category: "pip_cache".to_string(),
+                certainty: ArtifactCertainty::Likely,
+                outcome: Outcome::Regret,
+                observed_at,
             }),
-            now,
+            observed_at,
         );
         assert_eq!(rebuilt.summary("pip_cache").unwrap().regrets, 3);
         assert!(!rebuilt.suspended("pip_cache", now));
+    }
+
+    #[test]
+    fn calibration_evidence_expires_at_its_original_observation_boundary() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let cutoff = now - REGRET_EVIDENCE_WINDOW;
+        let observation = |category: &str, outcome, observed_at| RegretObservation {
+            category: category.to_string(),
+            certainty: ArtifactCertainty::Definite,
+            outcome,
+            observed_at,
+        };
+        let mut calibrator = RegretCalibrator::new(RegretConfig::default());
+        calibrator.replay(
+            [
+                observation("GoCache", Outcome::Regret, cutoff),
+                observation("GoCache", Outcome::Clean, now),
+                observation("GoCache", Outcome::Regret, cutoff - Duration::from_nanos(1)),
+                observation("RustTarget", Outcome::Regret, now),
+            ],
+            now,
+        );
+        let before = calibrator.summary("GoCache").unwrap();
+        assert_eq!((before.decisions, before.regrets), (2, 1));
+        assert!(before.calibration < 1.0);
+
+        // SQL's >= cutoff includes the exact boundary. Importing that row now
+        // must not grant it another thirty days of influence.
+        calibrator.expire(now);
+        assert_eq!(calibrator.summary("GoCache").unwrap(), before);
+        calibrator.expire(now + Duration::from_nanos(1));
+        let after = calibrator.summary("GoCache").unwrap();
+        assert_eq!((after.decisions, after.regrets), (1, 0));
+        assert_eq!(after.calibration, 1.0);
+        assert_eq!(calibrator.summary("RustTarget").unwrap().regrets, 1);
+
+        calibrator.expire(now + REGRET_EVIDENCE_WINDOW + Duration::from_nanos(1));
+        assert!(calibrator.calibrations().is_empty());
+    }
+
+    #[test]
+    fn expiry_keeps_active_suspensions_and_live_sequential_evidence() {
+        let now_wall = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let now = Instant::now();
+        let mut calibrator = RegretCalibrator::new(RegretConfig {
+            suspend: Duration::from_secs(60),
+            ..RegretConfig::default()
+        });
+        let observation = RegretObservation {
+            category: "GoCache".to_string(),
+            certainty: ArtifactCertainty::Definite,
+            outcome: Outcome::Regret,
+            observed_at: now_wall - REGRET_EVIDENCE_WINDOW,
+        };
+        // Three regrets raise the alarm; the fourth starts its next sequence.
+        for _ in 0..4 {
+            calibrator.record_observation(&observation, now_wall, now);
+        }
+        let e_log = calibrator.categories["GoCache"].e_log;
+        let deadline = calibrator.categories["GoCache"].suspended_until;
+        assert!(e_log > 0.0);
+        assert_eq!(deadline, Some(now + Duration::from_secs(60)));
+
+        calibrator.expire(now_wall + Duration::from_nanos(1));
+        assert!(calibrator.summary("GoCache").is_none());
+        assert_eq!(calibrator.categories["GoCache"].e_log, e_log);
+        assert_eq!(calibrator.categories["GoCache"].suspended_until, deadline);
+        assert_eq!(
+            calibrator.suspended_categories(now + Duration::from_secs(59)),
+            HashSet::from(["GoCache".to_string()]),
+        );
+        assert!(
+            calibrator
+                .suspended_categories(now + Duration::from_secs(60))
+                .is_empty(),
+        );
+
+        // Loading old evidence can change calibration but cannot restart a
+        // served alarm, reset a live sequence, or shorten its deadline.
+        calibrator.replay(
+            (0..100).map(|_| RegretObservation {
+                category: "GoCache".to_string(),
+                certainty: ArtifactCertainty::Definite,
+                outcome: Outcome::Regret,
+                observed_at: now_wall,
+            }),
+            now_wall + Duration::from_nanos(1),
+        );
+        assert_eq!(calibrator.summary("GoCache").unwrap().regrets, 100);
+        assert_eq!(calibrator.categories["GoCache"].e_log, e_log);
+        assert_eq!(calibrator.categories["GoCache"].suspended_until, deadline);
+    }
+
+    #[test]
+    fn timestamp_buckets_keep_dense_evidence_and_match_a_fresh_replay() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let cutoff = now - REGRET_EVIDENCE_WINDOW;
+        let clean = RegretObservation {
+            category: "GoCache".to_string(),
+            certainty: ArtifactCertainty::Definite,
+            outcome: Outcome::Clean,
+            observed_at: cutoff,
+        };
+        let recent = RegretObservation {
+            outcome: Outcome::Regret,
+            observed_at: now,
+            ..clean.clone()
+        };
+        let mut running = RegretCalibrator::new(RegretConfig::default());
+        for _ in 0..10_000 {
+            running.replay_observation(&clean, now);
+        }
+        running.replay_observation(&recent, now);
+        assert_eq!(running.summary("GoCache").unwrap().decisions, 10_001);
+        assert_eq!(running.evidence.len(), 2);
+        assert_eq!(running.evidence[&cutoff].len(), 1);
+        assert_eq!(running.evidence[&cutoff]["GoCache"].decisions, 10_000);
+
+        let after = now + Duration::from_nanos(1);
+        running.expire(after);
+        let mut restarted = RegretCalibrator::new(RegretConfig::default());
+        restarted.replay([recent], after);
+        assert_eq!(running.summary("GoCache"), restarted.summary("GoCache"));
+        assert_eq!(running.summary("GoCache").unwrap().regrets, 1);
+        assert_eq!(running.evidence.len(), 1);
     }
 
     #[test]

@@ -109,7 +109,6 @@ use crate::scanner::protection::{self, ProtectionRegistry};
 use crate::scanner::quarantine::{QuarantineStore, SweepMode as QuarantineSweepMode};
 use crate::scanner::regret::{
     EntryIdentity, RegretCalibrator, RegretConfig, RegretDetector, ScoringHistory, Watch,
-    certainty_from_name,
 };
 use crate::scanner::scoring::{
     ActiveReferenceSummary, ArtifactCertainty, CACHE_REDELETION_MEMORY, CandidacyScore,
@@ -527,14 +526,12 @@ impl SharedRegret {
     /// The scoring engine's view: a calibration factor per category and
     /// the categories whose deletions are suspended right now.
     fn scoring_view(&self, now: Instant) -> (HashMap<String, f64>, HashSet<String>) {
-        let calibrator = self.calibrator.lock();
-        let suspended = calibrator
-            .summaries()
-            .into_iter()
-            .filter(|summary| calibrator.suspended(&summary.category, now))
-            .map(|summary| summary.category)
-            .collect();
-        (calibrator.calibrations(), suspended)
+        let mut calibrator = self.calibrator.lock();
+        calibrator.expire(SystemTime::now());
+        (
+            calibrator.calibrations(),
+            calibrator.suspended_categories(now),
+        )
     }
 
     /// Recheck queued work at the execution boundary: its scoring snapshot
@@ -613,7 +610,7 @@ fn replay_regret_outcomes(regret: &SharedRegret, sqlite_db: &Path) {
     regret
         .calibrator
         .lock()
-        .replay(history.outcomes, Instant::now());
+        .replay(history.outcomes, SystemTime::now());
     if count > 0 {
         eprintln!("[SBH-REGRET] replayed {count} stored outcome(s) into the category calibrator");
     }
@@ -8204,12 +8201,9 @@ impl MonitoringDaemon {
                 .iter()
                 .map(|outcome| {
                     let now = clock();
-                    calibrator.record(
-                        &outcome.category,
-                        certainty_from_name(&outcome.certainty),
-                        outcome.outcome,
-                        now,
-                    );
+                    if let Some(observation) = outcome.observation() {
+                        calibrator.record_observation(&observation, SystemTime::now(), now);
+                    }
                     (
                         calibrator
                             .summary(&outcome.category)

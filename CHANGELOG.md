@@ -8,6 +8,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Long-running daemons age out stale regret evidence.** Category calibration
+  now uses the same inclusive thirty-day observation window as startup and
+  manual scoring. Evidence expires at its original timestamp, so a sparse old
+  regret cannot hold a cache category indefinitely. Ordered count buckets keep
+  expiry proportional to the evidence that actually expires. Existing category
+  suspension deadlines and live sequential alarms survive expiry and replay.
+
 - **Automatic resource relief preserves shallow-scan progress.** Forced inode
   and RAM reclamation requests keep the persisted pre-scan cursor instead of
   repeatedly restarting at the first page. This lets restricted discovery
