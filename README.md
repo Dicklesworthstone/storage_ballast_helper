@@ -1491,9 +1491,43 @@ without that evidence remain available for restore or normal TTL/cap cleanup.
 RAM relief requires a positive byte estimate; inode relief can also remove a
 verified directory whose byte estimate is zero.
 
-Restore with `sbh undo <decision-id>` (the id is on the `[SBH-QUARANTINE]` line, in `sbh explain`, and in `sbh undo --list`), `sbh undo --path <original>`, or `sbh undo --all-since 2h`. A restore is a rename back, byte-identical; it refuses when the original path exists again unless `--force-suffix`, which restores beside it as `<name>.restored-<decision-id>`. The ledger marks the decision `restored`.
+Restore with `sbh undo <decision-id>` (the id is on the `[SBH-QUARANTINE]`
+line, in `sbh explain`, and in `sbh undo --list`), `sbh undo --path <original>`,
+or `sbh undo --all-since 2h`. Restore renames the remaining payload back. It
+refuses when the original path exists again unless `--force-suffix`, which
+restores beside it as `<name>.restored-<decision-id>`.
 
-A candidate that cannot be quarantined (different filesystem from the root, unusable store) is removed for good and the fallback is logged as `quarantine_unavailable` with its reason. `status` shows the bytes held per mount in the Reserve column; `stats` reports `quarantined_count` and `quarantined_bytes` and excludes held bytes from `total_bytes_freed`.
+Recovery completeness survives daemon restarts. New entries start with a
+durable intact witness; before a purge may unlink anything, the store records
+that purging has started. A bounded or interrupted purge can therefore leave
+a useful remainder without allowing undo to call it a complete artifact.
+`undo --list` identifies each entry as `intact`, `purge_started`, or `unknown`.
+Older entries without the witness protocol remain `unknown`, even when their
+remaining contents can be returned.
+
+Undo JSON reports `recovery_state` for held entries and `completeness` for
+returned payloads. `original_estimated_size_bytes` preserves the estimate made
+when the artifact entered quarantine. `estimated_size_bytes` is null unless
+the entry is intact; `intact_estimated_bytes` totals only those intact estimates,
+and `uncertain_entries` counts the others. These figures are estimates, not a
+new measurement of recovered bytes. Existing `size_bytes`, `held_bytes`, and
+`restored_bytes` fields keep those estimates for intact entries or wholly intact
+totals and become null when completeness is uncertain. A requested restore that returns any
+uncertain payload exits `4` (partial success), including a mixed batch with
+intact entries. Listing alone remains read-only and exits `0`.
+
+The ledger records `restored_intact`, `restored_partial`, or `restored_unknown`
+without rewriting the original decision evidence. `sbh explain` displays this
+recovery information separately. Historical `restored` labels are shown with
+unknown completeness because they predate this proof. Recovery annotations
+apply to the newest record for that stable decision ID; a later intact restore
+does not overwrite an older partial annotation.
+
+A candidate that cannot be quarantined (different filesystem from the root,
+unusable store) is retained, and `quarantine_unavailable` records the reason.
+That refusal does not authorize permanent deletion. `status` shows the bytes
+held per mount in the Reserve column; `stats` reports `quarantined_count` and
+`quarantined_bytes` and excludes held bytes from `total_bytes_freed`.
 
 | Parameter | Config Key | Default |
 | --- | --- | --- |

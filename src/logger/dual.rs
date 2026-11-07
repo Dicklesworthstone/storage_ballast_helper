@@ -1878,6 +1878,7 @@ mod tests {
                 size_bytes,
                 quarantined_at: 1_789_000_000,
                 expires_at: 1_789_003_600,
+                recovery_state: crate::scanner::quarantine::RecoveryState::PurgeStarted,
                 decision,
             },
             completed_at,

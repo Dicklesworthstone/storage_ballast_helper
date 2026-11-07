@@ -10,9 +10,7 @@ use parking_lot::RwLock;
 
 use crate::core::errors::{Result, SbhError};
 use crate::core::paths::resolve_absolute_path;
-use crate::platform::pal::{
-    check_process_sampling_deadline, sample_process_io_with_identity,
-};
+use crate::platform::pal::{check_process_sampling_deadline, sample_process_io_with_identity};
 use crate::platform::types::{
     ExecutablesResult, MappedRegion, OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET, OpenFileKind,
     OpenFileMode, OpenFilesResult, PalError, ProcessInfo, ProcessIo, ProcessIoSnapshot, SelfStats,
@@ -132,8 +130,7 @@ pub(super) fn read_process_io_snapshot(
         deadline,
         || {
             let path = pid_proc_path(pid).join("stat");
-            let raw = fs::read_to_string(&path)
-                .map_err(|source| SbhError::Io { path, source })?;
+            let raw = fs::read_to_string(&path).map_err(|source| SbhError::Io { path, source })?;
             process_identity_from_stat(pid, &raw, clock)
         },
         || read_process_io(pid),
@@ -165,11 +162,7 @@ fn cached_process_clock(
     Ok(clock)
 }
 
-fn process_identity_from_stat(
-    pid: i32,
-    raw: &str,
-    clock: ProcessClock,
-) -> Result<(u64, i64)> {
+fn process_identity_from_stat(pid: i32, raw: &str, clock: ProcessClock) -> Result<(u64, i64)> {
     let observed_pid = raw
         .split_once('(')
         .and_then(|(prefix, _)| prefix.trim().parse::<i32>().ok());
@@ -717,20 +710,19 @@ fn process_parse_error(method: &'static str, details: impl Into<String>) -> SbhE
 mod tests {
     use super::{
         ProcessClock, ProcessClockCache, brief_process_info, cached_process_clock,
-        mapped_region_from_maps_line, parse_fdinfo_flags,
-        parse_proc_boot_time_unix_ms, parse_proc_io, parse_proc_self_stat, parse_proc_self_status,
-        parse_proc_start_time_unix_ms, process_identity_from_stat, read_executables_under,
-        read_mmap_regions_under, read_open_files_under, read_process_ids, read_process_io,
-        read_process_io_snapshot, read_process_list, read_process_list_brief,
-        read_process_list_without_command_lines, read_self_stats, ticks_to_micros,
+        mapped_region_from_maps_line, parse_fdinfo_flags, parse_proc_boot_time_unix_ms,
+        parse_proc_io, parse_proc_self_stat, parse_proc_self_status, parse_proc_start_time_unix_ms,
+        process_identity_from_stat, read_executables_under, read_mmap_regions_under,
+        read_open_files_under, read_process_ids, read_process_io, read_process_io_snapshot,
+        read_process_list, read_process_list_brief, read_process_list_without_command_lines,
+        read_self_stats, ticks_to_micros,
     };
     use crate::core::paths::resolve_absolute_path;
     use crate::platform::types::{OpenFileKind, OpenFileMode};
 
     #[test]
     fn sampled_identity_retains_raw_start_ticks_and_rejects_wrong_pid() {
-        let raw =
-            "12345 (sbh worker thread) S 1 2 3 4 5 6 7 8 9 10 345 67 0 0 20 0 1 0 12345";
+        let raw = "12345 (sbh worker thread) S 1 2 3 4 5 6 7 8 9 10 345 67 0 0 20 0 1 0 12345";
         let clock = ProcessClock {
             boot_time_unix_ms: 1_700_000_000_000,
             ticks_per_second: 100,
@@ -760,7 +752,10 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let error = cached_process_clock(&cache, deadline, |ticks| {
             assert_eq!(ticks, None);
-            Err(super::process_parse_error("test", "transient boot read failure"))
+            Err(super::process_parse_error(
+                "test",
+                "transient boot read failure",
+            ))
         });
         assert!(error.is_err());
         assert!(cache.current.read().is_none());
@@ -801,7 +796,10 @@ mod tests {
         assert!(
             cached_process_clock(&cache, next_pass, |ticks| {
                 assert_eq!(ticks, Some(100));
-                Err(super::process_parse_error("test", "temporary btime failure"))
+                Err(super::process_parse_error(
+                    "test",
+                    "temporary btime failure",
+                ))
             })
             .is_err(),
             "a failed refresh must not serve the previous pass's boot time"
@@ -823,8 +821,7 @@ mod tests {
             adjusted
         );
 
-        let raw =
-            "12345 (sbh worker thread) S 1 2 3 4 5 6 7 8 9 10 345 67 0 0 20 0 1 0 12345";
+        let raw = "12345 (sbh worker thread) S 1 2 3 4 5 6 7 8 9 10 345 67 0 0 20 0 1 0 12345";
         let (_, sampled_start) = process_identity_from_stat(12345, raw, refreshed).unwrap();
         assert_eq!(
             sampled_start,

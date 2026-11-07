@@ -16,8 +16,8 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use super::budget::PurgeBudget;
 use super::{
-    QuarantineCompletion, QuarantineRecord, QuarantineStore, QuarantineUnavailable, RestoreOutcome,
-    now_secs,
+    QuarantineCompletion, QuarantineRecord, QuarantineStore, QuarantineUnavailable, RecoveryState,
+    RestoreOutcome, now_secs,
 };
 use crate::core::errors::{Result, SbhError};
 
@@ -34,7 +34,7 @@ pub use beneath::mount_id;
 #[cfg(unix)]
 pub use beneath::open_beneath;
 pub use confined_purge::remove_direct;
-use transaction::{Directory, Payload};
+use transaction::{Directory, Kind, Payload};
 
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 
@@ -215,11 +215,13 @@ fn read_manifest_at(
     root: &Directory,
 ) -> Result<Option<(QuarantineRecord, bool)>> {
     validate_id(id).map_err(|e| SbhError::io(store.root(), e))?;
-    let (record, pending) =
-        match root.read_json::<QuarantineRecord>(OsStr::new(&format!("{id}.json"))) {
+    let ((mut record, manifest_identity), pending) =
+        match root.read_json_identified::<QuarantineRecord>(OsStr::new(&format!("{id}.json"))) {
             Ok(record) => (record, false),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                match root.read_json::<QuarantineRecord>(OsStr::new(&format!("{id}.pending"))) {
+                match root
+                    .read_json_identified::<QuarantineRecord>(OsStr::new(&format!("{id}.pending")))
+                {
                     Ok(record) => (record, true),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                     Err(e) => return Err(SbhError::io(pending_path(store, id), e)),
@@ -228,6 +230,18 @@ fn read_manifest_at(
             Err(e) => return Err(SbhError::io(store.record_path(id), e)),
         };
     validate_record(store, id, &record).map_err(|e| SbhError::io(store.record_path(id), e))?;
+    if record.recovery_state.is_intact() {
+        let witness = root
+            .inspect(OsStr::new(&format!("{id}.intact")))
+            .map_err(|e| SbhError::io(store.root(), e))?;
+        record.recovery_state = match witness {
+            Some(identity) if identity.kind == Kind::File && identity == manifest_identity => {
+                RecoveryState::Intact
+            }
+            None => RecoveryState::PurgeStarted,
+            Some(_) => RecoveryState::Unknown,
+        };
+    }
     Ok(Some((record, pending)))
 }
 
@@ -298,8 +312,22 @@ fn recover_reservation(
     }
     source.verify()?;
     root.remove_directory(OsStr::new(id))?;
+    discard_linked_witness(root, id, OsStr::new(&pending))?;
     root.remove_file(OsStr::new(&pending))?;
     root.sync()
+}
+
+// Reservation rollback may remove only the witness attached to our manifest.
+// An existing unrelated name must survive a failed exclusive admission.
+fn discard_linked_witness(root: &Directory, id: &str, manifest: &OsStr) -> io::Result<()> {
+    let expected = root.inspect(manifest)?;
+    let witness = format!("{id}.intact");
+    if expected.is_some_and(|identity| identity.kind == Kind::File)
+        && root.inspect(OsStr::new(&witness))? == expected
+    {
+        root.remove_file(OsStr::new(&witness))?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -379,6 +407,7 @@ fn quarantine_with_hook(
         size_bytes,
         quarantined_at: timestamp,
         expires_at: timestamp.saturating_add(ttl.as_secs()),
+        recovery_state: RecoveryState::Intact,
         decision,
     };
     validate_record(store, id, &record).map_err(unavailable)?;
@@ -389,6 +418,12 @@ fn quarantine_with_hook(
         // The writer cleans only a file it exclusively created. EEXIST must
         // never remove somebody else's recovery record.
         let _ = root.remove_directory(OsStr::new(id));
+        return Err(unavailable(e));
+    }
+    // A hard link to the existing manifest proves no purge has begun. Reserve
+    // it before moving the payload; revocation later needs no free inode.
+    if let Err(e) = root.link_file(OsStr::new(&pending), OsStr::new(&format!("{id}.intact"))) {
+        discard_unmoved_reservation(&root, &entry, &source, &record);
         return Err(unavailable(e));
     }
     if let Err(e) = entry.sync().and_then(|()| root.sync_ancestors()) {
@@ -445,6 +480,7 @@ fn discard_unmoved_reservation(
             .read_json::<QuarantineRecord>(OsStr::new(&pending))
             .is_ok_and(|current| current == *record)
     {
+        let _ = discard_linked_witness(root, &record.decision_id, OsStr::new(&pending));
         let _ = root.remove_file(OsStr::new(&pending));
         let _ = root.remove_directory(OsStr::new(&record.decision_id));
         let _ = root.sync();
@@ -453,10 +489,43 @@ fn discard_unmoved_reservation(
 
 fn remove_records_at(root: &Directory, id: &str) -> io::Result<()> {
     validate_id(id)?;
+    // Revoke proof first: interruption must not leave a manifest that can
+    // later claim intact contents after its payload was permanently removed.
+    root.remove_file(OsStr::new(&format!("{id}.intact")))?;
     root.remove_file(OsStr::new(&format!("{id}.json")))?;
     root.remove_file(OsStr::new(&format!("{id}.pending")))?;
     // Stuck bookkeeping remains best-effort after guarded record cleanup.
     let _ = root.remove_file(OsStr::new(&format!("{id}.stuck")));
+    Ok(())
+}
+
+// A new-format record keeps its intact proof in a hard link to the manifest.
+// Removing and syncing that existing directory entry needs no new inode or
+// manifest allocation, even when this purge is relieving inode exhaustion.
+fn revoke_intact_witness(root: &Directory, record: &mut QuarantineRecord) -> io::Result<()> {
+    revoke_intact_witness_with_sync(root, record, Directory::sync)
+}
+
+fn revoke_intact_witness_with_sync(
+    root: &Directory,
+    record: &mut QuarantineRecord,
+    sync: impl FnOnce(&Directory) -> io::Result<()>,
+) -> io::Result<()> {
+    if payload_at(root, record)?.is_none() {
+        return Ok(());
+    }
+    let witness = format!("{}.intact", record.decision_id);
+    if !matches!(record.recovery_state, RecoveryState::Unknown)
+        || root.inspect(OsStr::new(&witness))?.is_some()
+    {
+        root.remove_file(OsStr::new(&witness))?;
+        // Repeat this barrier for PurgeStarted after a prior failed fsync:
+        // seeing a missing witness does not yet prove its removal is durable.
+        sync(root)?;
+    }
+    if !matches!(record.recovery_state, RecoveryState::Unknown) {
+        record.recovery_state = RecoveryState::PurgeStarted;
+    }
     Ok(())
 }
 
@@ -467,7 +536,8 @@ pub(super) struct PurgeOutcome {
 }
 
 pub(super) fn purge(store: &QuarantineStore, id: &str) -> Result<u64> {
-    purge_with(store, id, None, |lock, record| {
+    purge_with(store, id, None, |lock, root, record| {
+        revoke_intact_witness(root, record)?;
         confined_purge::remove_payload(lock, record).map(Some)
     })?
     .map(|outcome| outcome.bytes)
@@ -493,10 +563,17 @@ pub(super) fn purge_with_budget_and_gate(
         store,
         &selected.decision_id,
         Some(selected),
-        |lock, record| {
+        |lock, root, record| {
             if !gate(record) {
                 return Ok(None);
             }
+            revoke_intact_witness(root, record)?;
+            // Revocation includes durable I/O. Capacity and resource authority
+            // must still hold afterwards, before any payload unlink begins.
+            if !gate(record) {
+                return Ok(None);
+            }
+            let record = &*record;
             // Renew at bounded mutation checkpoints rather than issuing an
             // expensive filesystem-capacity probe for every small child.
             let mut remaining_unlinks = super::budget::PRESSURE_RECHECK_UNLINKS;
@@ -519,7 +596,7 @@ fn purge_with(
     store: &QuarantineStore,
     id: &str,
     selected: Option<&QuarantineRecord>,
-    remove: impl FnOnce(&File, &QuarantineRecord) -> io::Result<Option<bool>>,
+    remove: impl FnOnce(&File, &Directory, &mut QuarantineRecord) -> io::Result<Option<bool>>,
 ) -> Result<Option<PurgeOutcome>> {
     validate_id(id).map_err(|e| SbhError::io(store.root(), e))?;
     let lock = match lock_store(store.root()) {
@@ -530,7 +607,7 @@ fn purge_with(
         Err(e) => return Err(SbhError::io(store.root(), e)),
     };
     let root = Directory::from_locked(&lock).map_err(|e| SbhError::io(store.root(), e))?;
-    let Some(record) = read_record_at(store, id, &root)? else {
+    let Some(mut record) = read_record_at(store, id, &root)? else {
         let _ = root.remove_file(std::ffi::OsStr::new(&format!("{id}.stuck")));
         return Ok(Some(PurgeOutcome::default()));
     };
@@ -552,7 +629,7 @@ fn purge_with(
     // On refusal keep its manifest so later drains/undo can recover what
     // remains; never fall back to unrestricted recursive removal.
     let Some(removed) =
-        remove(&lock, &record).map_err(|e| SbhError::io(&record.quarantine_path, e))?
+        remove(&lock, &root, &mut record).map_err(|e| SbhError::io(&record.quarantine_path, e))?
     else {
         return Ok(None);
     };
@@ -667,7 +744,12 @@ fn restore_with_hook(
         return Ok(RestoreOutcome {
             decision_id: id.to_string(),
             restored_to: destination,
-            size_bytes: record.size_bytes,
+            original_size_bytes: record.size_bytes,
+            size_bytes: record
+                .recovery_state
+                .is_intact()
+                .then_some(record.size_bytes),
+            completeness: record.recovery_state,
         });
     };
     let mut destination = record.original_path.clone();
@@ -714,7 +796,12 @@ fn restore_with_hook(
     Ok(RestoreOutcome {
         decision_id: id.to_string(),
         restored_to: destination,
-        size_bytes: record.size_bytes,
+        original_size_bytes: record.size_bytes,
+        size_bytes: record
+            .recovery_state
+            .is_intact()
+            .then_some(record.size_bytes),
+        completeness: record.recovery_state,
     })
 }
 
@@ -732,19 +819,247 @@ mod tests {
         (store, record)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn intact_recovery_requires_the_original_regular_manifest_witness() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record) = held(dir.path(), "intact-proof");
+        let manifest = fs::symlink_metadata(store.record_path("intact-proof")).unwrap();
+        let witness_path = store.root().join("intact-proof.intact");
+        let witness = fs::symlink_metadata(&witness_path).unwrap();
+        assert!(witness.is_file());
+        assert_eq!(
+            (manifest.dev(), manifest.ino()),
+            (witness.dev(), witness.ino())
+        );
+        assert!(manifest.nlink() >= 2);
+
+        let reopened = QuarantineStore::at(store.root().to_path_buf());
+        assert_eq!(reopened.record("intact-proof").unwrap(), Some(record));
+        let restored = reopened.restore("intact-proof", false).unwrap();
+        assert_eq!(restored.completeness, RecoveryState::Intact);
+        assert_eq!(restored.original_size_bytes, 100);
+        assert_eq!(restored.size_bytes, Some(100));
+        assert_eq!(fs::read(restored.restored_to).unwrap(), b"original bytes");
+        assert!(fs::symlink_metadata(witness_path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_copied_or_symlinked_witnesses_never_claim_intact_recovery() {
+        use std::os::unix::fs::symlink;
+        for (kind, expected) in [
+            ("missing", RecoveryState::PurgeStarted),
+            ("copied", RecoveryState::Unknown),
+            ("symlinked", RecoveryState::Unknown),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, record) = held(dir.path(), "untrusted-proof");
+            let witness = store.root().join("untrusted-proof.intact");
+            fs::remove_file(&witness).unwrap();
+            match kind {
+                "copied" => {
+                    fs::copy(store.record_path("untrusted-proof"), &witness).unwrap();
+                }
+                "symlinked" => {
+                    symlink(store.record_path("untrusted-proof"), &witness).unwrap();
+                }
+                _ => {}
+            }
+            let reopened = QuarantineStore::at(store.root().to_path_buf());
+            assert_eq!(
+                reopened
+                    .record("untrusted-proof")
+                    .unwrap()
+                    .unwrap()
+                    .recovery_state,
+                expected,
+                "{kind}",
+            );
+            let restored = reopened.restore("untrusted-proof", false).unwrap();
+            assert_eq!(restored.completeness, expected, "{kind}");
+            assert_eq!(restored.size_bytes, None);
+            assert_eq!(restored.original_size_bytes, record.size_bytes);
+            assert_eq!(fs::read(restored.restored_to).unwrap(), b"original bytes");
+            assert!(fs::symlink_metadata(witness).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_manifests_restore_available_contents_without_inventing_completeness() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record) = held(dir.path(), "legacy-proof");
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy.as_object_mut().unwrap().remove("recovery_state");
+        write_json(&store.record_path("legacy-proof"), &legacy).unwrap();
+        fs::remove_file(store.root().join("legacy-proof.intact")).unwrap();
+
+        let reopened = QuarantineStore::at(store.root().to_path_buf());
+        assert_eq!(
+            reopened
+                .record("legacy-proof")
+                .unwrap()
+                .unwrap()
+                .recovery_state,
+            RecoveryState::Unknown,
+        );
+        let restored = reopened.restore("legacy-proof", false).unwrap();
+        assert_eq!(restored.completeness, RecoveryState::Unknown);
+        assert_eq!(restored.size_bytes, None);
+        assert_eq!(restored.original_size_bytes, record.size_bytes);
+        assert_eq!(fs::read(restored.restored_to).unwrap(), b"original bytes");
+    }
+
+    #[test]
+    fn failed_witness_sync_blocks_unlink_and_retries_the_barrier_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record) = held(dir.path(), "sync-proof");
+        let manifest = fs::read(store.record_path("sync-proof")).unwrap();
+        let mut sync_attempts = 0;
+        let mut payload_attempted = false;
+        for attempt in 0..2 {
+            let reopened = QuarantineStore::at(store.root().to_path_buf());
+            let selected = reopened.record("sync-proof").unwrap().unwrap();
+            assert_eq!(
+                selected.recovery_state,
+                if attempt == 0 {
+                    RecoveryState::Intact
+                } else {
+                    RecoveryState::PurgeStarted
+                },
+            );
+            let result = purge_with(
+                &reopened,
+                "sync-proof",
+                Some(&selected),
+                |lock, root, working| {
+                    revoke_intact_witness_with_sync(root, working, |_| {
+                        sync_attempts += 1;
+                        Err(io::Error::other("injected witness fsync failure"))
+                    })?;
+                    payload_attempted = true;
+                    confined_purge::remove_payload(lock, working).map(Some)
+                },
+            );
+            assert!(result.is_err());
+            assert!(
+                !payload_attempted,
+                "durability failure must precede payload work"
+            );
+            assert_eq!(
+                fs::read(&record.quarantine_path).unwrap(),
+                b"original bytes"
+            );
+            assert_eq!(fs::read(store.record_path("sync-proof")).unwrap(), manifest);
+            assert!(!store.root().join("sync-proof.intact").exists());
+        }
+        assert_eq!(
+            sync_attempts, 2,
+            "absence after a failed sync is not durable proof"
+        );
+        let completed = store.drain_all().unwrap();
+        assert!(completed.failures.is_empty());
+        assert_eq!(completed.completed.len(), 1);
+        assert_eq!(
+            completed.completed[0].record.recovery_state,
+            RecoveryState::PurgeStarted,
+        );
+        assert!(!record.quarantine_path.exists());
+        assert!(store.record("sync-proof").unwrap().is_none());
+    }
+
+    #[test]
+    fn partial_pending_metadata_cannot_resurrect_intact_recovery_after_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("partial-target");
+        fs::create_dir(&source).unwrap();
+        for index in 0..96 {
+            fs::write(source.join(format!("{index:03}")), b"held child").unwrap();
+        }
+        let store = QuarantineStore::under(dir.path());
+        let record = store
+            .quarantine(&source, "pending-partial", 4096, Duration::ZERO, None)
+            .unwrap();
+        fs::rename(
+            store.record_path("pending-partial"),
+            pending_path(&store, "pending-partial"),
+        )
+        .unwrap();
+        let first = store.drain_all_with_budget(32).unwrap();
+        assert!(first.budget_exhausted);
+        assert!(first.completed.is_empty());
+        assert!(first.failures.is_empty());
+        let remaining = fs::read_dir(&record.quarantine_path).unwrap().count();
+        assert!(remaining > 0 && remaining < 96);
+        assert_eq!(
+            store
+                .record("pending-partial")
+                .unwrap()
+                .unwrap()
+                .recovery_state,
+            RecoveryState::PurgeStarted,
+        );
+
+        // Finishing publication cannot recreate the original hard-link proof.
+        fs::rename(
+            pending_path(&store, "pending-partial"),
+            store.record_path("pending-partial"),
+        )
+        .unwrap();
+        let reopened = QuarantineStore::at(store.root().to_path_buf());
+        let restored = reopened.restore("pending-partial", false).unwrap();
+        assert_eq!(restored.completeness, RecoveryState::PurgeStarted);
+        assert_eq!(restored.size_bytes, None);
+        assert_eq!(restored.original_size_bytes, 4096);
+        assert_eq!(
+            fs::read_dir(restored.restored_to).unwrap().count(),
+            remaining
+        );
+        assert!(!store.root().join("pending-partial.intact").exists());
+    }
+
+    #[test]
+    fn an_existing_witness_refuses_admission_without_touching_the_source_or_foreign_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::under(dir.path());
+        store.ensure_root().unwrap();
+        let source = dir.path().join("new-payload");
+        fs::write(&source, b"source survives").unwrap();
+        let witness = store.root().join("collision.intact");
+        fs::write(&witness, b"foreign witness").unwrap();
+        assert!(
+            store
+                .quarantine(&source, "collision", 100, Duration::ZERO, None)
+                .is_err()
+        );
+        assert_eq!(fs::read(source).unwrap(), b"source survives");
+        assert_eq!(fs::read(witness).unwrap(), b"foreign witness");
+        assert!(!store.root().join("collision.pending").exists());
+        assert!(!store.entry_dir("collision").exists());
+        assert!(store.records().unwrap().is_empty());
+    }
+
     #[test]
     fn a_post_unlink_failure_is_not_replayed_as_a_new_success() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, record) = held(dir.path(), "post-unlink");
-        let failed = purge_with(&store, "post-unlink", Some(&record), |lock, selected| {
-            assert!(confined_purge::remove_payload(lock, selected)?);
-            // Model a finalization interruption after permanent removal.
-            Err(io::Error::other(
-                "injected post-unlink finalization failure",
-            ))
-        });
+        let (store, mut record) = held(dir.path(), "post-unlink");
+        let failed = purge_with(
+            &store,
+            "post-unlink",
+            Some(&record),
+            |lock, root, selected| {
+                revoke_intact_witness(root, selected)?;
+                assert!(confined_purge::remove_payload(lock, selected)?);
+                // Model a finalization interruption after permanent removal.
+                Err(io::Error::other(
+                    "injected post-unlink finalization failure",
+                ))
+            },
+        );
         assert!(failed.is_err());
         assert!(!record.quarantine_path.exists());
+        record.recovery_state = RecoveryState::PurgeStarted;
         assert_eq!(store.record("post-unlink").unwrap(), Some(record.clone()));
 
         let resumed =
@@ -1230,6 +1545,8 @@ mod tests {
         let mut extended = selected.clone();
         extended.expires_at += 3600;
         write_json(&store.record_path("ttl-changed"), &extended).unwrap();
+        // Replacing the manifest inode no longer authenticates its old witness.
+        extended.recovery_state = RecoveryState::Unknown;
         let mut out = super::super::DrainOutcome::default();
         let mut budget = PurgeBudget::bounded(32);
         assert!(!store.try_purge(&selected, selected.expires_at, &mut out, &mut budget));

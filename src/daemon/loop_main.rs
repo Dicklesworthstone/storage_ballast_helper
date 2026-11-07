@@ -8673,7 +8673,9 @@ impl MonitoringDaemon {
             (None, None) => return Ok(()),
             (Some(_), Some(_)) => return Err(SkipReason::PolicyChanged),
         }
-        let category = record.definite_category().ok_or(SkipReason::PolicyChanged)?;
+        let category = record
+            .definite_category()
+            .ok_or(SkipReason::PolicyChanged)?;
         // Check after path and identity I/O, and release the evidence lock
         // before the caller performs any mutation or further PAL work.
         if self
@@ -15779,8 +15781,7 @@ mod tests {
                 assert_eq!(relief.remaining_bytes(), 0);
             }
             fixture.flush_logger();
-            let db =
-                SqliteLogger::open_read_only(&fixture.daemon.config.paths.sqlite_db).unwrap();
+            let db = SqliteLogger::open_read_only(&fixture.daemon.config.paths.sqlite_db).unwrap();
             let receipts = db
                 .successful_deletions_since("1970-01-01T00:00:00.000Z")
                 .unwrap();

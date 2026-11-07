@@ -170,12 +170,7 @@ impl ProcessIoHistory {
             }
         };
 
-        let mut report = self.sample_processes(
-            platform,
-            processes,
-            collected_at_unix_ms,
-            deadline,
-        );
+        let mut report = self.sample_processes(platform, processes, collected_at_unix_ms, deadline);
         let persist_due = self
             .last_persist_at
             .is_none_or(|last| now.duration_since(last) >= self.persist_interval);
@@ -209,12 +204,12 @@ impl ProcessIoHistory {
             pid_errors: 0,
             persisted: false,
         };
-        let mut start = self
-            .last_sampled_pid
-            .map_or(0, |pid| processes.partition_point(|process| *process <= pid));
-        let mut end = self
-            .sweep_upper_pid
-            .map_or(0, |pid| processes.partition_point(|process| *process <= pid));
+        let mut start = self.last_sampled_pid.map_or(0, |pid| {
+            processes.partition_point(|process| *process <= pid)
+        });
+        let mut end = self.sweep_upper_pid.map_or(0, |pid| {
+            processes.partition_point(|process| *process <= pid)
+        });
         let upper_pid = if self.sweep_upper_pid.is_none() || start >= end {
             // A fixed upper boundary makes the sweep finite even when new
             // higher PIDs arrive faster than we can sample. Also restart when
@@ -772,10 +767,14 @@ mod tests {
         assert_eq!(report.pids_seen, 6);
         assert_eq!(report.pids_recorded, 2);
         assert_eq!(*platform.selected.lock().unwrap(), vec![10, 20]);
-        assert!(history.samples_by_process.keys().all(|key| key.start_time_unix_ms == Some(0)));
+        assert!(
+            history
+                .samples_by_process
+                .keys()
+                .all(|key| key.start_time_unix_ms == Some(0))
+        );
 
-        let (report, error) =
-            history.maybe_sample(&platform, now + DEFAULT_BUCKET_INTERVAL);
+        let (report, error) = history.maybe_sample(&platform, now + DEFAULT_BUCKET_INTERVAL);
         assert!(error.is_none());
         assert_eq!(report.pids_recorded, 2);
         assert_eq!(*platform.selected.lock().unwrap(), vec![10, 20, 30, 40]);

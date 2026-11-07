@@ -55,7 +55,9 @@ impl PurgeBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scanner::quarantine::{DrainOutcome, QuarantineRecord, QuarantineStore};
+    use crate::scanner::quarantine::{
+        DrainOutcome, QuarantineRecord, QuarantineStore, RecoveryState,
+    };
     use std::fs;
     use std::path::Path;
     use std::time::Duration;
@@ -125,6 +127,8 @@ mod tests {
     fn a_large_payload_resumes_after_reopening_without_double_counting_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let (store, record) = held_tree(temp.path(), "wide", 96);
+        let mut partial_record = record.clone();
+        partial_record.recovery_state = RecoveryState::PurgeStarted;
         let outside = temp.path().join("outside");
         fs::write(&outside, b"outside survives").unwrap();
         fs::create_dir(&record.original_path).unwrap();
@@ -158,7 +162,10 @@ mod tests {
                 "each adequately sized slice makes progress"
             );
             previous = remaining;
-            assert_eq!(reopened.record("wide").unwrap(), Some(record.clone()));
+            assert_eq!(
+                reopened.record("wide").unwrap(),
+                Some(partial_record.clone())
+            );
             assert!(!reopened.root().join("wide.stuck").exists());
         }
         assert!(
@@ -167,7 +174,7 @@ mod tests {
         );
         assert_eq!((entries, bytes), (1, 1234));
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].record, record);
+        assert_eq!(completed[0].record, partial_record);
         assert!(store.record("wide").unwrap().is_none());
         assert_eq!(store.drain_all_with_budget(32).unwrap().counts(), (0, 0));
         assert_eq!(fs::read(outside).unwrap(), b"outside survives");
@@ -216,8 +223,13 @@ mod tests {
         assert!(store.drain_all_with_budget(32).unwrap().budget_exhausted);
         let remaining = remaining_files(&record);
         assert!(remaining > 0 && remaining < 96);
-        let restored = store.restore("undo", false).unwrap();
+        let reopened = QuarantineStore::at(store.root().to_path_buf());
+        let restored = reopened.restore("undo", false).unwrap();
         assert_eq!(restored.restored_to, record.original_path);
+        assert_eq!(restored.completeness, RecoveryState::PurgeStarted);
+        assert_eq!(restored.original_size_bytes, record.size_bytes);
+        assert_eq!(restored.size_bytes, None);
+        assert!(!store.root().join("undo.intact").exists());
         assert_eq!(
             fs::read_dir(restored.restored_to.join("children"))
                 .unwrap()
@@ -325,6 +337,57 @@ mod tests {
     }
 
     #[test]
+    fn pressure_recovery_during_witness_sync_stops_before_any_payload_unlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, record) = held_tree(temp.path(), "post-sync-hold", 8);
+        let manifest = fs::read(store.record_path("post-sync-hold")).unwrap();
+        let mut checks = 0;
+        let out = store
+            .sweep_with_pressure_gate(
+                record.quarantined_at,
+                crate::scanner::quarantine::SweepMode::Pressure,
+                |selected| {
+                    checks += 1;
+                    assert_eq!(
+                        selected.recovery_state,
+                        if checks == 1 {
+                            RecoveryState::Intact
+                        } else {
+                            RecoveryState::PurgeStarted
+                        },
+                    );
+                    checks == 1
+                },
+            )
+            .unwrap();
+
+        assert_eq!(checks, 2, "renew after durable witness revocation");
+        assert_eq!(remaining_files(&record), 8);
+        assert_eq!(out.drained.counts(), (0, 0));
+        assert_eq!(out.drained.deferred_entries, 1);
+        assert!(!out.drained.budget_exhausted);
+        assert!(out.drained.completed.is_empty());
+        assert!(out.drained.failures.is_empty());
+        assert!(store.stuck_entries().unwrap().is_empty());
+        assert_eq!(
+            fs::read(store.record_path("post-sync-hold")).unwrap(),
+            manifest
+        );
+        assert!(!store.root().join("post-sync-hold.intact").exists());
+        let reopened = QuarantineStore::at(store.root().to_path_buf());
+        let restored = reopened.restore("post-sync-hold", false).unwrap();
+        assert_eq!(restored.completeness, RecoveryState::PurgeStarted);
+        assert_eq!(restored.size_bytes, None);
+        assert_eq!(
+            fs::read_dir(restored.restored_to.join("children"))
+                .unwrap()
+                .count(),
+            8,
+            "conservative uncertainty must still preserve every available child",
+        );
+    }
+
+    #[test]
     fn pressure_sweep_renews_authority_for_each_completed_entry() {
         for recover_after_first in [false, true] {
             let temp = tempfile::tempdir().unwrap();
@@ -352,7 +415,11 @@ mod tests {
                 .unwrap();
             let expected_entries = if recover_after_first { 1 } else { 2 };
 
-            assert_eq!(checks, 2, "every new manifest renews its own authority");
+            assert_eq!(
+                checks,
+                if recover_after_first { 3 } else { 4 },
+                "each admitted manifest renews before and after durable revocation",
+            );
             assert_eq!(out.drained.entries, expected_entries);
             assert_eq!(out.drained.bytes, expected_entries as u64 * 100);
             assert_eq!(out.held_bytes, if recover_after_first { 100 } else { 0 });
@@ -398,7 +465,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(checks, 2, "one admission and one bounded renewal");
+        assert_eq!(checks, 3, "two admission checks and one bounded renewal");
         assert_eq!(remaining_files(&record), before - PRESSURE_RECHECK_UNLINKS,);
         assert_eq!(out.drained.counts(), (0, 0));
         assert_eq!(out.drained.deferred_entries, 1);
@@ -408,9 +475,11 @@ mod tests {
         );
         assert!(out.drained.failures.is_empty());
         assert_eq!(out.held_bytes, record.size_bytes);
+        let mut partial_record = record.clone();
+        partial_record.recovery_state = RecoveryState::PurgeStarted;
         assert_eq!(
             store.record("partial-pressure").unwrap(),
-            Some(record.clone())
+            Some(partial_record)
         );
         assert!(!store.root().join("partial-pressure.stuck").exists());
 
@@ -487,7 +556,9 @@ mod tests {
         assert_eq!(out.counts(), (1, 0));
         assert_eq!(out.completed.len(), 1);
         let mut completed = out.completed.pop().unwrap();
-        assert_eq!(completed.record, record);
+        let mut purged_record = record;
+        purged_record.recovery_state = RecoveryState::PurgeStarted;
+        assert_eq!(completed.record, purged_record);
         assert!(completed.completed_at >= before && completed.completed_at <= after);
         assert_eq!(
             completed.category(),
@@ -544,7 +615,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(authorized, ["c"]);
+        assert_eq!(authorized, ["c", "c"]);
         assert_eq!(swept.drained.counts(), (1, 100));
         assert_eq!(swept.drained.completed.len(), 1);
         assert_eq!(swept.drained.deferred_entries, 2);
@@ -554,6 +625,8 @@ mod tests {
         assert!(store.stuck_entries().unwrap().is_empty());
         for record in &records[..2] {
             let restored = store.restore(&record.decision_id, false).unwrap();
+            assert_eq!(restored.completeness, RecoveryState::Intact);
+            assert_eq!(restored.size_bytes, Some(record.size_bytes));
             assert_eq!(
                 fs::read(restored.restored_to.join("cached")).unwrap(),
                 b"recoverable"

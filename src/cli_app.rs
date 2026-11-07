@@ -72,7 +72,8 @@ use storage_ballast_helper::scanner::patterns::{
 use storage_ballast_helper::scanner::planner::{BatchPlan, PlanObjective, PlanRequest, plan_batch};
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
 use storage_ballast_helper::scanner::quarantine::{
-    QuarantineCompletion, QuarantineStore, StuckEntry,
+    QuarantineCompletion, QuarantineRecord, QuarantineStore, RecoveryState, RestoreOutcome,
+    StuckEntry,
 };
 use storage_ballast_helper::scanner::scoring::{
     ActiveReferenceSummary, CandidacyScore, CandidateInput, ScoringEngine,
@@ -1245,6 +1246,24 @@ enum ExplainSource {
     Jsonl(Vec<storage_ballast_helper::scanner::decision_record::DecisionRecord>),
 }
 
+#[derive(Debug, Serialize)]
+struct RecoveryExplanation {
+    scope: &'static str,
+    completeness: RecoveryState,
+    description: &'static str,
+}
+
+fn recovery_explanation(db: &SqliteLogger, decision_id: &str) -> Option<RecoveryExplanation> {
+    db.decision_restore_state(decision_id)
+        .ok()
+        .flatten()
+        .map(|completeness| RecoveryExplanation {
+            scope: "latest_for_decision_id",
+            completeness,
+            description: undo_recovery_description(completeness),
+        })
+}
+
 impl ExplainSource {
     fn label(&self) -> &'static str {
         match self {
@@ -1484,6 +1503,7 @@ fn run_explain(cli: &Cli, args: &ExplainArgs) -> Result<(), CliError> {
                     .map(|record| {
                         let mut value = record.to_json_at_level(level);
                         if let ExplainSource::Sqlite(db) = &source {
+                            value["recovery"] = json!(recovery_explanation(db, &record.id));
                             value["outcomes"] =
                                 json!(db.outcomes_for_decision(&record.id).unwrap_or_default());
                             value["plans"] = json!(
@@ -1523,6 +1543,12 @@ fn run_explain(cli: &Cli, args: &ExplainArgs) -> Result<(), CliError> {
                 );
                 print!("{}", format_explain(record, level));
                 if let ExplainSource::Sqlite(db) = &source {
+                    if let Some(recovery) = recovery_explanation(db, &record.id) {
+                        println!(
+                            "  Recovery (latest for this decision ID): payload returned; {}",
+                            recovery.description
+                        );
+                    }
                     for outcome in db.outcomes_for_decision(&record.id).unwrap_or_default() {
                         println!(
                             "  Outcome: {} at {} ({} after the decision): {}",
@@ -13483,11 +13509,116 @@ fn record_quarantine_completions(ledger_path: &Path, completions: Vec<Quarantine
     }
 }
 
-/// `sbh undo`: put quarantined entries back (Layer 7).
+fn undo_recovery_description(state: RecoveryState) -> &'static str {
+    match state {
+        RecoveryState::Intact => "intact; no purge was started",
+        RecoveryState::PurgeStarted => "purge started; files may be missing",
+        RecoveryState::Unknown => "completeness unknown",
+    }
+}
+
+fn undo_recovery_totals(
+    entries: impl Iterator<Item = (RecoveryState, Option<u64>)>,
+) -> (u64, usize) {
+    entries.fold((0_u64, 0_usize), |(bytes, uncertain), (state, estimate)| {
+        if state.is_intact() {
+            (bytes.saturating_add(estimate.unwrap_or(0)), uncertain)
+        } else {
+            (bytes, uncertain + 1)
+        }
+    })
+}
+
+fn undo_list_report(roots: &[PathBuf], held: &[(QuarantineStore, QuarantineRecord)]) -> Value {
+    let (intact_estimated_bytes, uncertain_entries) = undo_recovery_totals(
+        held.iter()
+            .map(|(_, record)| (record.recovery_state, Some(record.size_bytes))),
+    );
+    json!({
+        "command": "undo",
+        "roots": roots,
+        "held_bytes": (uncertain_entries == 0).then_some(intact_estimated_bytes),
+        "intact_estimated_bytes": intact_estimated_bytes,
+        "uncertain_entries": uncertain_entries,
+        "held": held.iter().map(|(store, record)| json!({
+            "decision_id": record.decision_id,
+            "original_path": record.original_path,
+            "quarantine_path": record.quarantine_path,
+            "size_bytes": record.recovery_state.is_intact().then_some(record.size_bytes),
+            "original_estimated_size_bytes": record.size_bytes,
+            "estimated_size_bytes": record.recovery_state.is_intact().then_some(record.size_bytes),
+            "recovery_state": record.recovery_state,
+            "quarantined_at": record.quarantined_at,
+            "expires_at": record.expires_at,
+            "store": store.root(),
+        })).collect::<Vec<_>>(),
+        "exit_code": 0,
+    })
+}
+
+fn undo_restore_result(
+    restored: &[RestoreOutcome],
+    failed: &[(String, String)],
+) -> Result<(), CliError> {
+    let uncertain = restored
+        .iter()
+        .filter(|outcome| !outcome.completeness.is_intact())
+        .count();
+    if failed.is_empty() && uncertain == 0 {
+        Ok(())
+    } else if restored.is_empty() {
+        Err(CliError::Runtime(format!(
+            "{} entries not restored",
+            failed.len()
+        )))
+    } else {
+        Err(CliError::Partial(format!(
+            "{} payloads returned; {uncertain} have uncertain completeness; {} entries failed",
+            restored.len(),
+            failed.len()
+        )))
+    }
+}
+
+fn undo_restore_report(restored: &[RestoreOutcome], failed: &[(String, String)]) -> Value {
+    let (intact_estimated_bytes, uncertain_entries) = undo_recovery_totals(
+        restored
+            .iter()
+            .map(|outcome| (outcome.completeness, outcome.size_bytes)),
+    );
+    let result = undo_restore_result(restored, failed);
+    json!({
+        "command": "undo",
+        "restored": restored.iter().map(|outcome| json!({
+            "decision_id": outcome.decision_id,
+            "restored_to": outcome.restored_to,
+            "size_bytes": if outcome.completeness.is_intact() {
+                outcome.size_bytes
+            } else {
+                None
+            },
+            "original_estimated_size_bytes": outcome.original_size_bytes,
+            "estimated_size_bytes": if outcome.completeness.is_intact() {
+                outcome.size_bytes
+            } else {
+                None
+            },
+            "completeness": outcome.completeness,
+        })).collect::<Vec<_>>(),
+        "restored_bytes": (uncertain_entries == 0).then_some(intact_estimated_bytes),
+        "intact_estimated_bytes": intact_estimated_bytes,
+        "uncertain_entries": uncertain_entries,
+        "failed": failed.iter().map(|(id, error)| json!({
+            "decision_id": id,
+            "error": error,
+        })).collect::<Vec<_>>(),
+        "exit_code": result.as_ref().err().map_or(0, CliError::exit_code),
+    })
+}
+
+/// `sbh undo`: put the remaining quarantined payloads back (Layer 7).
 #[allow(clippy::too_many_lines)]
 fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
-    use storage_ballast_helper::scanner::quarantine::QuarantineRecord;
-
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
     let roots: Vec<PathBuf> = if args.roots.is_empty() {
@@ -13509,30 +13640,17 @@ fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
             .cmp(&b.1.quarantined_at)
             .then_with(|| a.1.decision_id.cmp(&b.1.decision_id))
     });
-    let held_bytes = held
-        .iter()
-        .map(|(_, record)| record.size_bytes)
-        .fold(0u64, u64::saturating_add);
+    let (held_bytes, uncertain_held) = undo_recovery_totals(
+        held.iter()
+            .map(|(_, record)| (record.recovery_state, Some(record.size_bytes))),
+    );
     let now_unix = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
 
     if args.list {
         match output_mode(cli) {
-            OutputMode::Json => write_json_line(&json!({
-                "command": "undo",
-                "roots": roots,
-                "held_bytes": held_bytes,
-                "held": held.iter().map(|(store, record)| json!({
-                    "decision_id": record.decision_id,
-                    "original_path": record.original_path,
-                    "quarantine_path": record.quarantine_path,
-                    "size_bytes": record.size_bytes,
-                    "quarantined_at": record.quarantined_at,
-                    "expires_at": record.expires_at,
-                    "store": store.root(),
-                })).collect::<Vec<_>>(),
-            }))?,
+            OutputMode::Json => write_json_line(&undo_list_report(&roots, &held))?,
             OutputMode::Human => {
                 if held.is_empty() {
                     println!(
@@ -13542,16 +13660,17 @@ fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
                     );
                 } else {
                     println!(
-                        "Quarantined entries ({} held; restore with `sbh undo <decision-id>`):",
-                        format_bytes(held_bytes)
+                        "Quarantined entries ({} estimated in intact entries; {uncertain_held} uncertain; restore with `sbh undo <decision-id>`):",
+                        format_bytes(held_bytes),
                     );
                     for (_, record) in &held {
                         let left = record.expires_at.saturating_sub(now_unix);
                         println!(
-                            "  {}  {:>10}  {}  (expires in {})",
+                            "  {}  {}  ({}; original estimate {}; expires in {})",
                             record.decision_id,
-                            format_bytes(record.size_bytes),
                             record.original_path.display(),
+                            undo_recovery_description(record.recovery_state),
+                            format_bytes(record.size_bytes),
                             format_duration(Duration::from_secs(left))
                         );
                     }
@@ -13599,15 +13718,23 @@ fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
     for (store, record) in selected {
         match store.restore(&record.decision_id, args.force_suffix) {
             Ok(outcome) => {
+                let estimate = outcome
+                    .size_bytes
+                    .filter(|_| outcome.completeness.is_intact())
+                    .map_or_else(
+                        || "remaining size unknown".to_string(),
+                        |bytes| format!("estimated {}", format_bytes(bytes)),
+                    );
                 eprintln!(
-                    "[SBH-UNDO] restored {} -> {} (decision {}, {})",
+                    "[SBH-UNDO] restored payload {} -> {} (decision {}; {}; {estimate})",
                     record.original_path.display(),
                     outcome.restored_to.display(),
                     outcome.decision_id,
-                    format_bytes(outcome.size_bytes)
+                    undo_recovery_description(outcome.completeness),
                 );
                 if let Some(ledger) = &ledger
-                    && let Err(e) = ledger.mark_decision_restored(&outcome.decision_id)
+                    && let Err(e) =
+                        ledger.mark_decision_restored(&outcome.decision_id, outcome.completeness)
                 {
                     eprintln!(
                         "[SBH-UNDO] ledger not updated for {}: {e}",
@@ -13622,29 +13749,17 @@ fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
             }
         }
     }
-    let restored_bytes = restored
-        .iter()
-        .map(|o| o.size_bytes)
-        .fold(0u64, u64::saturating_add);
+    let (restored_bytes, uncertain_restored) = undo_recovery_totals(
+        restored
+            .iter()
+            .map(|outcome| (outcome.completeness, outcome.size_bytes)),
+    );
     match output_mode(cli) {
-        OutputMode::Json => write_json_line(&json!({
-            "command": "undo",
-            "restored": restored.iter().map(|o| json!({
-                "decision_id": o.decision_id,
-                "restored_to": o.restored_to,
-                "size_bytes": o.size_bytes,
-            })).collect::<Vec<_>>(),
-            "restored_bytes": restored_bytes,
-            "failed": failed.iter().map(|(id, error)| json!({
-                "decision_id": id,
-                "error": error,
-            })).collect::<Vec<_>>(),
-        }))?,
+        OutputMode::Json => write_json_line(&undo_restore_report(&restored, &failed))?,
         OutputMode::Human => {
             println!(
-                "Restored {} entr{} ({}).",
+                "Returned {} quarantined payloads ({} estimated in intact entries; {uncertain_restored} with uncertain completeness).",
                 restored.len(),
-                if restored.len() == 1 { "y" } else { "ies" },
                 format_bytes(restored_bytes)
             );
             for (id, error) in &failed {
@@ -13652,25 +13767,7 @@ fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
             }
         }
     }
-    if failed.is_empty() {
-        Ok(())
-    } else if restored.is_empty() {
-        Err(CliError::Runtime(format!(
-            "{} entr{} not restored",
-            failed.len(),
-            if failed.len() == 1 {
-                "y was"
-            } else {
-                "ies were"
-            }
-        )))
-    } else {
-        Err(CliError::Partial(format!(
-            "{} of {} entries not restored",
-            failed.len(),
-            failed.len() + restored.len()
-        )))
-    }
+    undo_restore_result(&restored, &failed)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -14602,7 +14699,7 @@ fn print_clean_summary(report: &storage_ballast_helper::scanner::deletion::Delet
         }
         if report.quarantine_unavailable > 0 {
             println!(
-                "  Quarantine unavailable for {} item(s): removed for good (reasons on stderr)",
+                "  Quarantine unavailable for {} item(s): retained, not removed (reasons on stderr)",
                 report.quarantine_unavailable
             );
         }
@@ -17005,6 +17102,223 @@ mod tests {
         ProcessInfo, ProcessIo, SnapshotThinningEstimate,
     };
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn undo_fixture(root: &Path, id: &str, state: RecoveryState) -> (QuarantineStore, PathBuf) {
+        let target = root.join(id);
+        std::fs::create_dir(&target).unwrap();
+        let size = if state == RecoveryState::PurgeStarted {
+            let children = target.join("children");
+            std::fs::create_dir(&children).unwrap();
+            for index in 0..96 {
+                std::fs::write(children.join(format!("obj-{index:03}")), b"obj").unwrap();
+            }
+            288
+        } else {
+            std::fs::write(target.join("a.o"), b"obj").unwrap();
+            3
+        };
+        let store = QuarantineStore::under(root);
+        let record = store
+            .quarantine(&target, id, size, Duration::ZERO, None)
+            .unwrap();
+        if state == RecoveryState::PurgeStarted {
+            assert!(store.drain_all_with_budget(32).unwrap().budget_exhausted);
+            let remaining = std::fs::read_dir(record.quarantine_path.join("children"))
+                .unwrap()
+                .count();
+            assert!(remaining > 0 && remaining < 96);
+        } else if state == RecoveryState::Unknown {
+            let mut legacy = serde_json::to_value(&record).unwrap();
+            legacy.as_object_mut().unwrap().remove("recovery_state");
+            std::fs::write(
+                store.root().join(format!("{id}.json")),
+                serde_json::to_vec(&legacy).unwrap(),
+            )
+            .unwrap();
+            std::fs::remove_file(store.root().join(format!("{id}.intact"))).unwrap();
+        }
+        (QuarantineStore::at(store.root().to_path_buf()), target)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_reports_only_intact_estimates_after_partial_purge_and_legacy_recovery() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        // The bounded purge runs before adding the other held entries.
+        let (store, partial_path) = undo_fixture(&root, "partial", RecoveryState::PurgeStarted);
+        let (_, intact_path) = undo_fixture(&root, "intact", RecoveryState::Intact);
+        let (_, legacy_path) = undo_fixture(&root, "legacy", RecoveryState::Unknown);
+        let held: Vec<_> = store
+            .records()
+            .unwrap()
+            .into_iter()
+            .map(|record| (store.clone(), record))
+            .collect();
+        let list = undo_list_report(std::slice::from_ref(&root), &held);
+        assert_eq!(list["exit_code"], 0);
+        assert!(list["held_bytes"].is_null());
+        assert_eq!(list["intact_estimated_bytes"], 3);
+        assert_eq!(list["uncertain_entries"], 2);
+        for entry in list["held"].as_array().unwrap() {
+            let intact = entry["decision_id"] == "intact";
+            assert_eq!(entry["size_bytes"].is_number(), intact);
+            assert_eq!(entry["estimated_size_bytes"].is_number(), intact);
+            assert!(entry["original_estimated_size_bytes"].as_u64().unwrap() > 0);
+        }
+        let intact_only: Vec<_> = held
+            .iter()
+            .filter(|(_, record)| record.decision_id == "intact")
+            .cloned()
+            .collect();
+        assert_eq!(
+            undo_list_report(std::slice::from_ref(&root), &intact_only)["held_bytes"],
+            3
+        );
+
+        let restored: Vec<_> = held
+            .iter()
+            .map(|(_, record)| store.restore(&record.decision_id, false).unwrap())
+            .collect();
+        assert_eq!(std::fs::read(intact_path.join("a.o")).unwrap(), b"obj");
+        assert_eq!(std::fs::read(legacy_path.join("a.o")).unwrap(), b"obj");
+        let remaining = std::fs::read_dir(partial_path.join("children"))
+            .unwrap()
+            .count();
+        assert!(remaining > 0 && remaining < 96);
+        let report = undo_restore_report(&restored, &[]);
+        assert_eq!(report["exit_code"], 4);
+        assert!(report["restored_bytes"].is_null());
+        assert_eq!(report["intact_estimated_bytes"], 3);
+        assert_eq!(report["uncertain_entries"], 2);
+        for entry in report["restored"].as_array().unwrap() {
+            let intact = entry["decision_id"] == "intact";
+            assert_eq!(entry["size_bytes"].is_number(), intact);
+            assert_eq!(entry["estimated_size_bytes"].is_number(), intact);
+            assert_eq!(entry["completeness"] == "intact", intact);
+        }
+        let intact = restored
+            .iter()
+            .find(|outcome| outcome.completeness.is_intact())
+            .unwrap();
+        let intact_report = undo_restore_report(std::slice::from_ref(intact), &[]);
+        assert_eq!(intact_report["exit_code"], 0);
+        assert_eq!(intact_report["restored_bytes"], 3);
+        assert_eq!(intact_report["restored"][0]["size_bytes"], 3);
+
+        let failed = vec![("missing".to_string(), "payload absent".to_string())];
+        assert_eq!(undo_restore_report(&restored, &failed)["exit_code"], 4);
+        assert_eq!(undo_restore_report(&[], &failed)["exit_code"], 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_listing_is_read_only_and_actual_uncertain_restores_exit_partial() {
+        for state in [
+            RecoveryState::Intact,
+            RecoveryState::PurgeStarted,
+            RecoveryState::Unknown,
+        ] {
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let (store, target) = undo_fixture(&root, "entry", state);
+            let record_path = store.root().join("entry.json");
+            let record_before = std::fs::read(&record_path).unwrap();
+            let mut config = Config::default();
+            config.scanner.root_paths = vec![root.clone()];
+            config.paths.sqlite_db = root.join("activity.sqlite3");
+            let config_path = root.join("config.toml");
+            std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+            let list_cli = Cli::try_parse_from([
+                "sbh",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--json",
+                "undo",
+                "--root",
+                root.to_str().unwrap(),
+                "--list",
+            ])
+            .unwrap();
+            run(&list_cli).unwrap();
+            assert_eq!(std::fs::read(&record_path).unwrap(), record_before);
+            assert!(
+                !config.paths.sqlite_db.exists(),
+                "listing must not open a writable ledger"
+            );
+            assert!(!target.exists());
+
+            let restore_cli = Cli::try_parse_from([
+                "sbh",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--json",
+                "undo",
+                "entry",
+                "--root",
+                root.to_str().unwrap(),
+            ])
+            .unwrap();
+            let result = run(&restore_cli);
+            if state.is_intact() {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(&error, CliError::Partial(_)));
+                assert_eq!(error.exit_code(), 4);
+            }
+            assert!(target.exists());
+            assert!(store.records().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn explain_recovery_reports_legacy_uncertainty_separately_from_decision_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("activity.sqlite3");
+        let db = SqliteLogger::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        for (id, action, state, label) in [
+            ("intact", "restored_intact", RecoveryState::Intact, "intact"),
+            (
+                "partial",
+                "restored_partial",
+                RecoveryState::PurgeStarted,
+                "purge_started",
+            ),
+            (
+                "unknown",
+                "restored_unknown",
+                RecoveryState::Unknown,
+                "unknown",
+            ),
+            ("legacy", "restored", RecoveryState::Unknown, "unknown"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO decision_log (
+                        decision_id, timestamp, path, action, effective_action, policy_mode,
+                        total_score, posterior_abandoned, expected_loss_keep,
+                        expected_loss_delete, record
+                     ) VALUES (?1, '2026-11-07T00:00:00Z', '/tmp/held', 'delete', ?2,
+                               'enforce', 0.9, 0.99, 1.0, 0.1, '{}')",
+                    rusqlite::params![id, action],
+                )
+                .unwrap();
+            let recovery = recovery_explanation(&db, id).unwrap();
+            assert_eq!(recovery.completeness, state);
+            let rendered = serde_json::to_value(&recovery).unwrap();
+            assert_eq!(rendered["scope"], "latest_for_decision_id");
+            assert_eq!(rendered["completeness"], label);
+            if state == RecoveryState::PurgeStarted {
+                assert!(recovery.description.contains("files may be missing"));
+            } else if state == RecoveryState::Unknown {
+                assert!(recovery.description.contains("unknown"));
+            }
+        }
+        assert!(recovery_explanation(&db, "missing").is_none());
+    }
 
     #[cfg(unix)]
     #[test]

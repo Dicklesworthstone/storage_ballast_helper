@@ -1991,6 +1991,7 @@ mod tests {
                     size_bytes,
                     quarantined_at: 1,
                     expires_at: 2,
+                    recovery_state: crate::scanner::quarantine::RecoveryState::PurgeStarted,
                     decision: None,
                 },
                 completed_at,

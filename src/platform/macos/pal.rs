@@ -200,8 +200,8 @@ impl Platform for MacOsPal {
 
     fn process_ids(&self, deadline: Instant) -> Result<Vec<i32>> {
         check_process_sampling_deadline("macos", "process_ids", deadline)?;
-        let mut pids = proc_listpids_safe()
-            .map_err(|error| macos_method_error("process_ids", &error))?;
+        let mut pids =
+            proc_listpids_safe().map_err(|error| macos_method_error("process_ids", &error))?;
         check_process_sampling_deadline("macos", "process_ids", deadline)?;
         let current_pid = current_process_pid();
         pids.retain(|pid| *pid > 0 && *pid != current_pid);

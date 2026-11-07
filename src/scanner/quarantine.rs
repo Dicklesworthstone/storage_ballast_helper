@@ -213,6 +213,31 @@ pub struct StuckEntry {
     pub last_error: String,
 }
 
+/// What durable recovery metadata proves about the held payload.
+///
+/// A purge intent is recorded before unlinking, so `PurgeStarted` means
+/// contents may be incomplete even if the next operation was refused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryState {
+    /// Legacy metadata cannot prove whether a prior purge removed children.
+    #[default]
+    Unknown,
+    /// A durable intact witness proves this store has not begun a purge.
+    Intact,
+    /// Purge authority was durably recorded; only remaining contents survive.
+    PurgeStarted,
+}
+
+impl RecoveryState {
+    /// A recorded size estimate can describe the whole restored artifact only
+    /// while the original intact witness remains valid.
+    #[must_use]
+    pub const fn is_intact(self) -> bool {
+        matches!(self, Self::Intact)
+    }
+}
+
 /// The record kept next to a quarantined entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuarantineRecord {
@@ -232,6 +257,10 @@ pub struct QuarantineRecord {
     pub quarantined_at: u64,
     /// Unix seconds after which the entry may be unlinked.
     pub expires_at: u64,
+    /// Recovery completeness, renewed from the durable intact witness when read.
+    /// Older manifests have no witness protocol and remain explicitly unknown.
+    #[serde(default)]
+    pub recovery_state: RecoveryState,
     /// A compact decision snapshot for `sbh explain`.
     #[serde(default)]
     pub decision: Option<serde_json::Value>,
@@ -292,8 +321,13 @@ pub struct RestoreOutcome {
     /// Where the entry was put back (differs from the record's original path
     /// only under `force_suffix`).
     pub restored_to: PathBuf,
-    /// The bytes the record claimed.
-    pub size_bytes: u64,
+    /// Original recorded estimate before any irreversible purge work.
+    pub original_size_bytes: u64,
+    /// Restored-byte estimate only when completeness is proven intact.
+    /// Unknown or possibly partial contents have no defensible byte total.
+    pub size_bytes: Option<u64>,
+    /// Whether the recovered contents are intact, possibly partial, or unknown.
+    pub completeness: RecoveryState,
 }
 
 /// A quarantine root on one mount.
@@ -965,6 +999,10 @@ mod tests {
 
         let outcome = store.restore("d1", false).unwrap();
         assert_eq!(outcome.restored_to, target);
+        assert_eq!(outcome.completeness, RecoveryState::Intact);
+        assert_eq!(outcome.size_bytes, Some(4096));
+        assert_eq!(outcome.original_size_bytes, 4096);
+        assert!(!store.root().join("d1.intact").exists());
         assert_eq!(tree_digest(&target), before, "restore is byte-identical");
         assert!(store.records().unwrap().is_empty());
         assert!(store.record("d1").unwrap().is_none());

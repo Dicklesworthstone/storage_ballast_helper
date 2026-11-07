@@ -1117,16 +1117,58 @@ impl SqliteLogger {
         Ok(total)
     }
 
-    /// Borrow the underlying connection (for stats/query engines).
-    /// `sbh undo`: the decision's entry left quarantine and is back at its
-    /// original path. Returns the number of ledger rows updated.
-    pub fn mark_decision_restored(&self, decision_id: &str) -> Result<usize> {
+    /// Record that a payload left quarantine without presenting an uncertain
+    /// restore as recovery of the complete artifact. The immutable decision
+    /// evidence is retained; these labels describe the later recovery.
+    pub fn mark_decision_restored(
+        &self,
+        decision_id: &str,
+        completeness: crate::scanner::quarantine::RecoveryState,
+    ) -> Result<usize> {
+        use crate::scanner::quarantine::RecoveryState;
+
+        let action = match completeness {
+            RecoveryState::Intact => "restored_intact",
+            RecoveryState::PurgeStarted => "restored_partial",
+            RecoveryState::Unknown => "restored_unknown",
+        };
         Ok(self.connection().execute(
-            "UPDATE decision_log SET effective_action = 'restored' WHERE decision_id = ?1",
-            params![decision_id],
+            "UPDATE decision_log SET effective_action = ?2
+             WHERE id = (
+                 SELECT id FROM decision_log WHERE decision_id = ?1 ORDER BY id DESC LIMIT 1
+             )",
+            params![decision_id, action],
         )?)
     }
 
+    /// Recovery evidence for the newest row with this stable decision ID.
+    /// Historical `restored` labels predate completeness tracking and must
+    /// never be promoted to proof that the complete artifact was returned.
+    pub fn decision_restore_state(
+        &self,
+        decision_id: &str,
+    ) -> Result<Option<crate::scanner::quarantine::RecoveryState>> {
+        use crate::scanner::quarantine::RecoveryState;
+
+        let action = self
+            .conn
+            .query_row(
+                "SELECT effective_action FROM decision_log
+                 WHERE decision_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![decision_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(match action.as_deref() {
+            Some("restored_intact") => Some(RecoveryState::Intact),
+            Some("restored_partial") => Some(RecoveryState::PurgeStarted),
+            Some("restored_unknown" | "restored") => Some(RecoveryState::Unknown),
+            _ => None,
+        })
+    }
+
+    /// Borrow the underlying connection (for stats/query engines).
     pub(crate) fn connection(&self) -> &rusqlite::Connection {
         &self.conn
     }
@@ -1550,6 +1592,107 @@ mod tests {
                 .unwrap();
         }
         logger.conn.execute_batch("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn restore_ledger_distinguishes_completeness_without_rewriting_decision_evidence() {
+        use crate::scanner::quarantine::RecoveryState;
+
+        let (dir, logger) = temp_db();
+        fill_decisions(&logger, 0, 5, 8);
+        for (id, state, expected_action) in [
+            ("d0", RecoveryState::Intact, "restored_intact"),
+            ("d1", RecoveryState::PurgeStarted, "restored_partial"),
+            ("d2", RecoveryState::Unknown, "restored_unknown"),
+        ] {
+            assert_eq!(logger.mark_decision_restored(id, state).unwrap(), 1);
+            assert_eq!(logger.decision_restore_state(id).unwrap(), Some(state));
+            let (record, action): (String, String) = logger
+                .conn
+                .query_row(
+                    "SELECT record, effective_action FROM decision_log WHERE decision_id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                record,
+                "x".repeat(8),
+                "original decision evidence is immutable"
+            );
+            assert_eq!(action, expected_action);
+        }
+        logger
+            .conn
+            .execute(
+                "UPDATE decision_log SET effective_action = 'restored' WHERE decision_id = 'd3'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            logger.decision_restore_state("d3").unwrap(),
+            Some(RecoveryState::Unknown),
+            "legacy success labels do not prove complete recovery"
+        );
+        assert_eq!(logger.decision_restore_state("d4").unwrap(), None);
+        assert_eq!(logger.decision_restore_state("missing").unwrap(), None);
+        assert_eq!(
+            logger
+                .mark_decision_restored("missing", RecoveryState::Intact)
+                .unwrap(),
+            0
+        );
+
+        // A new decision about the same stable identity must not inherit an
+        // earlier row's recovery annotation.
+        logger
+            .conn
+            .execute(
+                "INSERT INTO decision_log (
+                    decision_id, timestamp, path, action, policy_mode, total_score,
+                    posterior_abandoned, expected_loss_keep, expected_loss_delete, record
+                 ) SELECT decision_id, timestamp, path, action, policy_mode, total_score,
+                    posterior_abandoned, expected_loss_keep, expected_loss_delete, record
+                   FROM decision_log WHERE decision_id = 'd1' LIMIT 1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(logger.decision_restore_state("d1").unwrap(), None);
+        assert_eq!(
+            logger
+                .mark_decision_restored("d1", RecoveryState::Intact)
+                .unwrap(),
+            1
+        );
+        let prior_actions: Vec<String> = logger
+            .conn
+            .prepare(
+                "SELECT effective_action FROM decision_log
+                 WHERE decision_id = 'd1' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            prior_actions,
+            vec![
+                "restored_partial".to_string(),
+                "restored_intact".to_string()
+            ],
+            "a later intact restore must not upgrade an older partial recovery"
+        );
+        drop(logger);
+        let reader = SqliteLogger::open_read_only(&dir.path().join("test.db")).unwrap();
+        assert_eq!(
+            reader.decision_restore_state("d1").unwrap(),
+            Some(RecoveryState::Intact)
+        );
+        assert_eq!(
+            reader.decision_restore_state("d3").unwrap(),
+            Some(RecoveryState::Unknown)
+        );
     }
 
     fn fill_activity(logger: &SqliteLogger, start: u32, count: u32) {

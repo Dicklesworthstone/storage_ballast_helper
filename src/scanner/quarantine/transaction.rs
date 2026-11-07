@@ -269,6 +269,40 @@ impl Directory {
         Err(unsupported())
     }
 
+    /// Add an exclusive, descriptor-relative hard-link witness to an already
+    /// written regular manifest. This allocates no additional inode.
+    pub(super) fn link_file(&self, name: &OsStr, witness: &OsStr) -> io::Result<()> {
+        child_name(name)?;
+        child_name(witness)?;
+        #[cfg(unix)]
+        {
+            let expected = self.inspect(name)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "manifest disappeared before linking",
+                )
+            })?;
+            if expected.kind != Kind::File {
+                return Err(invalid("intact witness requires a regular manifest"));
+            }
+            rustix::fs::linkat(
+                &self.file,
+                name,
+                &self.file,
+                witness,
+                rustix::fs::AtFlags::empty(),
+            )?;
+            if self.inspect(name)? != Some(expected) || self.inspect(witness)? != Some(expected) {
+                return Err(invalid(
+                    "manifest changed while creating its intact witness",
+                ));
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        Err(unsupported())
+    }
+
     pub(super) fn rename_noreplace(
         &self,
         name: &OsStr,
@@ -344,17 +378,25 @@ impl Directory {
     }
 
     pub(super) fn read_json<T: DeserializeOwned>(&self, name: &OsStr) -> io::Result<T> {
+        self.read_json_identified(name).map(|(value, _)| value)
+    }
+
+    pub(super) fn read_json_identified<T: DeserializeOwned>(
+        &self,
+        name: &OsStr,
+    ) -> io::Result<(T, Identity)> {
         child_name(name)?;
         #[cfg(unix)]
         {
-            use rustix::fs::{Mode, OFlags, openat};
+            use rustix::fs::{Mode, OFlags, fstat, openat};
             let file = File::from(openat(
                 &self.file,
                 name,
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
             )?);
-            decode_json(file)
+            let identity = Identity::of(&fstat(&file)?);
+            decode_json(file).map(|value| (value, identity))
         }
         #[cfg(not(unix))]
         Err(unsupported())
@@ -478,7 +520,7 @@ impl Payload {
 mod tests {
     use super::super::{
         TransactionStep, confined_purge, lock_store, purge_with, quarantine_with_hook,
-        read_record_at, restore_with_hook,
+        read_record_at, restore_with_hook, revoke_intact_witness,
     };
     use super::*;
     use crate::scanner::quarantine::QuarantineStore;
@@ -640,27 +682,40 @@ mod tests {
     }
 
     #[test]
-    fn purge_finalization_cannot_remove_replacement_stores_recovery_data() {
+    fn purge_revocation_and_finalization_preserve_replacement_store_recovery_data() {
         let temp = tempfile::tempdir().unwrap();
         let (store, record) = held(temp.path());
         let saved = temp.path().join("purged-store");
-        let result = purge_with(&store, "held", None, |lock, selected| {
-            let removed = confined_purge::remove_payload(lock, selected)?;
-            // The real payload is gone, but the transaction has not removed
-            // its manifest yet. A path-based finalizer would touch this new store.
+        let foreign_names = [
+            "held.json",
+            "held.pending",
+            "held.intact",
+            "held.stuck",
+            "held/keep",
+        ];
+        let result = purge_with(&store, "held", None, |lock, root, selected| {
+            // The lock already pins the original store. Both revocation and
+            // finalization must ignore this replacement at its old pathname.
             fs::rename(store.root(), &saved)?;
             fs::create_dir_all(store.root().join("held"))?;
-            for name in ["held.json", "held.pending", "held.stuck", "held/keep"] {
+            for name in foreign_names {
                 fs::write(store.root().join(name), name.as_bytes())?;
             }
-            Ok(Some(removed))
+            revoke_intact_witness(root, selected)?;
+            assert!(!saved.join("held.intact").exists());
+            confined_purge::remove_payload(lock, selected).map(Some)
         })
+        .unwrap()
         .unwrap();
-        assert_eq!(result, Some(9));
+        assert_eq!(result.bytes, 9);
+        assert_eq!(
+            result.completed.unwrap().record.recovery_state,
+            crate::scanner::quarantine::RecoveryState::PurgeStarted,
+        );
         assert!(!saved.join("held.json").exists());
         assert!(!saved.join("held").exists());
         assert!(!record.original_path.exists());
-        for name in ["held.json", "held.pending", "held.stuck", "held/keep"] {
+        for name in foreign_names {
             assert_eq!(fs::read(store.root().join(name)).unwrap(), name.as_bytes());
         }
     }
@@ -734,6 +789,7 @@ mod tests {
             "definitely unmoved reservation can be cleaned"
         );
         assert!(!saved.join("move").exists());
+        assert!(!saved.join("move.intact").exists());
         assert_eq!(
             fs::read(store.root().join("move.pending")).unwrap(),
             b"foreign recovery"

@@ -1291,9 +1291,7 @@ fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'a MountPoin
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        InodeStats, MockPlatform, Platform, ServiceKind, sample_process_io_with_identity,
-    };
+    use super::{InodeStats, MockPlatform, Platform, ServiceKind, sample_process_io_with_identity};
     use crate::platform::types::{
         MappedRegion, OpenFile, OpenFileKind, OpenFileMode, ProcessInfo, ProcessIo, SacredPath,
         SacredPathKind, SacredPathSource,
