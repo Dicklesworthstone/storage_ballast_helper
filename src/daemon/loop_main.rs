@@ -106,7 +106,7 @@ use crate::scanner::patterns::{
     StructuralSignals,
 };
 use crate::scanner::planner::{PlanObjective, PlanRequest, RiskBudgetByLevel, plan_batch};
-use crate::scanner::prescan_cursor::PrescanCursor;
+use crate::scanner::prescan_cursor::{PrescanCursor, RootPage};
 use crate::scanner::protection::{self, ProtectionRegistry};
 use crate::scanner::quarantine::{
     QuarantineRecord, QuarantineStore, SweepMode as QuarantineSweepMode,
@@ -3978,6 +3978,23 @@ impl PassLimits {
             .allowance_secs()
             .is_some_and(|allowance| self.cpu.spent_secs() >= allowance * PRESCAN_CPU_SHARE)
             .then_some(PassStop::PrescanCpuShare)
+    }
+
+    /// Prepare names under the same limits as the rest of the pre-scan.
+    /// Enumeration retains its directory handle and bounded selection when
+    /// this yields; delivery is lazy so a resumed pass never clones a whole
+    /// page before it can check its remaining allowance.
+    fn prescan_page(
+        &mut self,
+        cursor: &PrescanCursor,
+        root: &Path,
+        shutdown: &AtomicBool,
+        heartbeat: &ThreadHeartbeat,
+    ) -> std::io::Result<Option<RootPage>> {
+        cursor.poll_entries_to_visit(root, || {
+            heartbeat.beat();
+            !shutdown.load(Ordering::Relaxed) && self.prescan_stop().is_none()
+        })
     }
 
     /// Whether the general walk must stop now, and which limit says so.
@@ -10836,7 +10853,7 @@ fn scanner_thread_main(
         // file-change event, so a scoped pass gets a throwaway cursor.
         let prescan_uses_cursor = request.scan_now.is_none() && active_scan_paths == request.paths;
         let prescan_cursor_before = prescan_cursor.clone();
-        let mut scratch_cursor = PrescanCursor::new();
+        let mut scratch_cursor = prescan_cursor.scoped_read_ahead();
         let prescan_resume;
         {
             let cursor: &mut PrescanCursor = if prescan_uses_cursor {
@@ -10868,11 +10885,24 @@ fn scanner_thread_main(
                     prescan_stop = Some(stop);
                     break;
                 }
-                let Ok(root_entries) = cursor.entries_to_visit(root) else {
-                    // An unreadable root must not pin the cursor: move on so
-                    // the next root gets its turn.
-                    cursor.complete_root(&active_scan_paths, root);
-                    continue;
+                let root_entries = match limits.prescan_page(cursor, root, shutdown, heartbeat) {
+                    Ok(Some(entries)) => entries,
+                    Ok(None) => {
+                        // Preparation used this phase's allowance or observed
+                        // shutdown. Keep its read-ahead and give the next root
+                        // a turn without claiming this root was covered.
+                        scanner_should_exit = shutdown.load(Ordering::Relaxed);
+                        prescan_stop = limits.prescan_stop();
+                        cursor.complete_root(&active_scan_paths, root);
+                        break;
+                    }
+                    Err(_) => {
+                        // An unreadable root or busy reader admission must not
+                        // pin the cursor. Its incomplete page proof preserves
+                        // progress while the next root gets its turn.
+                        cursor.complete_root(&active_scan_paths, root);
+                        continue;
+                    }
                 };
                 for path in root_entries {
                     if shutdown.load(Ordering::Relaxed) {
@@ -21533,6 +21563,106 @@ mod tests {
             PassCpuGuard::unlimited(start),
         );
         assert_eq!(unlimited.prescan_stop(), None);
+    }
+
+    #[test]
+    fn prescan_enumeration_resumes_across_the_production_cpu_allowance() {
+        let scratch = temp_root_scratch_dir();
+        let root = scratch.path();
+        let expected: Vec<_> = (0..1025)
+            .map(|index| {
+                let path = root.join(format!("entry-{index:04}"));
+                std::fs::create_dir(&path).unwrap();
+                path
+            })
+            .collect();
+        let roots = vec![root.to_path_buf()];
+        let mut cursor = PrescanCursor::new();
+        let shutdown = AtomicBool::new(false);
+        let heartbeat = ThreadHeartbeat::new("prescan-enumeration-budget");
+        let samples = Arc::new(AtomicU64::new(0));
+        let mut pauses = 0;
+
+        for _ in 0..8 {
+            let start = Instant::now();
+            let budget = CpuBudget::new(10, start, 0.0);
+            let allowance = budget.pass_cpu_allowance(PressureLevel::Critical);
+            assert_eq!(allowance, Some(crate::daemon::cpu_budget::BURST_SECS));
+            let sample = Arc::clone(&samples);
+            // Charge each checkpoint half a CPU-second. This deterministically
+            // makes the real enumeration exceed the pre-scan share without
+            // burning CPU or relying on the test host's directory speed.
+            let guard = PassCpuGuard::new(allowance, start, move || {
+                Some(sample.fetch_add(1, Ordering::Relaxed) as f64 / 2.0)
+            })
+            .with_sample_interval(Duration::ZERO);
+            let mut limits = PassLimits::new(
+                start,
+                start + Duration::from_mins(15),
+                Duration::from_secs(60),
+                guard,
+            );
+            let page = limits
+                .prescan_page(&cursor, root, &shutdown, &heartbeat)
+                .unwrap();
+            let Some(page) = page else {
+                pauses += 1;
+                assert_eq!(limits.prescan_stop(), Some(PassStop::PrescanCpuShare));
+                assert_eq!(limits.walk_stop(), None, "recursive work keeps its share");
+                cursor.complete_root(&roots, root);
+                assert_eq!(cursor.position().1, None, "reading is not completed work");
+                continue;
+            };
+            assert!(pauses > 0, "enumeration must honor the live pass budget");
+            let observed: Vec<_> = page.into_iter().collect();
+            assert_eq!(observed, expected, "no names are lost across phase stops");
+            for path in &observed {
+                cursor.advance(root, path);
+            }
+            cursor.complete_root(&roots, root);
+            assert_eq!(cursor.position().1, None, "the final page is now covered");
+            return;
+        }
+        panic!("finite pre-scan slices failed to complete directory preparation");
+    }
+
+    #[test]
+    fn prescan_shutdown_holds_a_ready_page_without_advancing_progress() {
+        let scratch = temp_root_scratch_dir();
+        let root = scratch.path();
+        std::fs::create_dir(root.join("candidate")).unwrap();
+        let cursor = PrescanCursor::new();
+        let shutdown = AtomicBool::new(false);
+        let heartbeat = ThreadHeartbeat::new("prescan-enumeration-shutdown");
+        let start = Instant::now();
+        let mut limits = PassLimits::new(
+            start,
+            start + Duration::from_mins(15),
+            Duration::from_secs(60),
+            PassCpuGuard::unlimited(start),
+        );
+        assert!(
+            limits
+                .prescan_page(&cursor, root, &shutdown, &heartbeat)
+                .unwrap()
+                .is_some()
+        );
+        shutdown.store(true, Ordering::Relaxed);
+        assert!(
+            limits
+                .prescan_page(&cursor, root, &shutdown, &heartbeat)
+                .unwrap()
+                .is_none(),
+            "even a prepared page cannot be delivered after shutdown",
+        );
+        assert!(
+            limits
+                .prescan_page(&cursor, &root.join("missing"), &shutdown, &heartbeat)
+                .unwrap()
+                .is_none(),
+            "shutdown is checked before opening the next root",
+        );
+        assert_eq!(cursor.position(), (None, None));
     }
 
     /// A spent CPU allowance ends the pass; an unspent one does not, however

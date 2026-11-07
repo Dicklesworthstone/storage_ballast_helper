@@ -10,21 +10,22 @@ the total number of directory entries.
 
 ## Preparation survives a pass boundary
 
-`entries_to_visit`, the method already used by the daemon, retains its directory
-iterator and selection heap when preparation runs out of its slice. Each call
-reads at most sixteen chunks of 256 entries and checks a 50 ms elapsed-time
-allowance between chunks. `WouldBlock` means preparation or reader admission is
-pending, not EOF. The existing daemon error-yield branch calls `complete_root`;
-the incomplete page proof preserves continuation and read-ahead on that branch.
+The daemon uses `poll_entries_to_visit` through `PassLimits::prescan_page`.
+Preparation retains its directory iterator and selection heap when the live
+pre-scan CPU share, phase deadline, pass deadline or shutdown check stops it.
+The callback runs between chunks of at most 256 names and renews the scanner
+heartbeat. `Ok(None)` means the phase paused; `WouldBlock` means reader admission
+is pending. Neither means EOF. Yielding calls `complete_root` to give the next
+root a turn; the incomplete page proof preserves continuation and read-ahead.
 
 If enumeration and sorting finish at the end of a slice, the prepared page is
 retained for the next call. Stopping before examining the returned names therefore
-does not require preparing the same page again. The explicit
-`poll_entries_to_visit` API also accepts caller-supplied budget/cancellation
-checks and returns a lazy `RootPage`; the existing daemon entry API still returns
-a `Vec<PathBuf>`, not the lazy iterator. The daemon retains its existing pass,
-shutdown and heartbeat checks between calls. No claim is made that its `PassLimits`
-or heartbeat callback has been moved inside individual filesystem operations.
+does not require preparing the same page again. The returned `RootPage` clones
+one name at a time, so entering a resumed daemon pass does not copy a whole
+50,000-name page before checking its allowance. The convenience
+`entries_to_visit` API still returns a vector and uses its own sixteen-chunk,
+50 ms preparation slice; the daemon no longer uses that API. Budget and
+heartbeat checks remain cooperative between filesystem operations.
 
 Four live roots share `ROOT_ENTRY_CAP` (200,000) cached names, with at most 50,000
 names and one retained directory iterator per root. These are cache-entry and
@@ -42,9 +43,9 @@ not renew unrelated readers. This is not a completion guarantee for arbitrary
 request schedules or a permanently changing filesystem.
 
 Normal cursors constructed on the same scanner thread share only volatile
-read-ahead through a weak, thread-local cache. This includes the daemon's fresh
-scratch cursor for each event-scoped pass. Their completed positions and page
-proofs remain independent, so event-scoped work cannot advance configured-root
+read-ahead through a weak, thread-local cache. The daemon explicitly derives
+each event-scoped scratch cursor with `scoped_read_ahead`. Completed positions
+and page proofs remain independent, so event-scoped work cannot advance configured-root
 checkpoint coverage. Clones retain their own completion proof. A forced reset
 clears shared speculative reads; peers keep their completed positions. Dropping
 the last cursor releases the cache and its directory handles.
@@ -52,7 +53,7 @@ the last cursor releases the cache and its directory handles.
 ## A full page is not a completed root
 
 Selection records whether enumeration saw more eligible names than fit in the
-page. The daemon's existing `entries_to_visit`, `advance`, `complete_root`
+page. The daemon's `poll_entries_to_visit`, `advance`, `complete_root`
 sequence uses that evidence: consuming a capped page preserves its last examined
 name instead of restarting at the root's beginning. An exactly-full final page
 is distinguishable from a capped page and needs no extra empty pass.
@@ -106,11 +107,10 @@ byte-preserving JSON output for every CLI command or decision-record type.
 ## Scope and tests
 
 Enumeration must still inspect the whole directory to find the smallest names
-in an unspecified order. An individual filesystem call, the final bounded sort,
-and collection of a ready page into the existing entry API's vector are not
-interruptible. The 50 ms check is cooperative, not a hard I/O deadline or a
-universal scan-latency guarantee. Daemon pass scheduling and empty-pass pacing
-still affect how quickly a paused preparation is revisited. New names absent
+in an unspecified order. An individual filesystem call and the final bounded
+sort are not interruptible. The daemon's pass checks are cooperative, not a
+hard I/O deadline or a universal scan-latency guarantee. Daemon pass scheduling
+and empty-pass pacing still affect how quickly a paused preparation is revisited. New names absent
 from a retained page are discovered in a later sweep. Work inside a single
 depth-one entry still follows the daemon's existing nested traversal and budget
 policy. Candidate scoring, protection, pressure thresholds and mutation policy
@@ -124,6 +124,13 @@ enumeration failures, independent rewind clones, legacy checkpoints, forced
 resets, disappearing tails, and changing enumeration order. Parent API tests
 retry only the explicit `WouldBlock` preparation state; their ordering and
 coverage assertions remain.
+
+Daemon tests also drive the production `PassLimits::prescan_page` path with
+the default Critical CPU allowance and injected cumulative CPU observations.
+They verify that enumeration yields the pre-scan share, retains recursive
+discovery's remaining allowance, and eventually delivers every name. A shutdown
+test covers both an already-prepared page and a root not yet opened. These
+deterministic accounting tests are not a throughput measurement on a fleet host.
 
 `prescan_cursor::enumeration::tests` covers bounded chunks, retained completed
 pages, root replacement, independent scratch progress, forced resets, descriptor

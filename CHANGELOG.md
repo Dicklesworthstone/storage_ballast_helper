@@ -8,6 +8,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Directory preparation obeys the daemon's live scan budget.** The priority
+  pre-scan now checks CPU, wall time and shutdown between enumeration chunks,
+  retains unfinished reads for later passes, and delivers prepared names
+  lazily. Scoped scans explicitly share read-ahead without advancing the
+  configured roots' completed-work cursor. Enumeration can yield its CPU
+  share to recursive discovery without losing the names it already read.
+
 - **Long-running daemons age out stale regret evidence.** Category calibration
   now uses the same inclusive thirty-day observation window as startup and
   manual scoring. Evidence expires at its original timestamp, so a sparse old
