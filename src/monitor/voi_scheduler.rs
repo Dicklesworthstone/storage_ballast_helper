@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 pub use crate::core::config::VoiConfig;
 
-mod pressure_order;
+pub(crate) mod pressure_order;
 
 // ──────────────────── configuration ────────────────────
 
@@ -78,6 +78,15 @@ pub struct PathStats {
     pub ewma_io_cost_per_scan: f64,
     /// Forecast: predicted reclaim for next scan.
     pub forecast_reclaim: f64,
+    /// Largest candidate-byte estimate observed in an unfinished pass during
+    /// the current partial-evidence window; not a whole-root yield forecast.
+    pub partial_candidate_bytes: u64,
+    /// Largest number of candidates observed in an unfinished pass during
+    /// that window. Includes real zero-byte artifacts under inode pressure.
+    pub partial_candidates: u32,
+    /// Start of a fixed evidence window. Later observations do not extend it,
+    /// so reclaimed artifacts cannot bias scheduling indefinitely.
+    partial_window_started: Option<Instant>,
     /// Forecast that was in effect before the most recent scan (for error computation).
     last_pre_scan_forecast: f64,
     /// Last actual reclaim (for forecast error tracking).
@@ -107,6 +116,9 @@ impl PathStats {
             ewma_reclaim_per_scan: 0.0,
             ewma_io_cost_per_scan: 1000.0, // default assumption: 1000 reads per scan
             forecast_reclaim: 0.0,
+            partial_candidate_bytes: 0,
+            partial_candidates: 0,
+            partial_window_started: None,
             last_pre_scan_forecast: 0.0,
             last_actual_reclaim: 0,
             dirty_rate_per_hour: PRIOR_DIRTY_RATE_PER_HOUR,
@@ -146,6 +158,31 @@ impl PathStats {
         expected_reclaim.mul_add(hazard, -(io_cost_weight * self.ewma_io_cost_per_scan))
     }
 
+    fn partial_evidence_current(&self, now: Instant) -> bool {
+        self.partial_window_started
+            .is_some_and(|started| now.saturating_duration_since(started) < MAX_REVISIT_INTERVAL)
+    }
+
+    fn has_pending_work(&self, now: Instant) -> bool {
+        self.dirty_pending || (self.partial_candidates > 0 && self.partial_evidence_current(now))
+    }
+
+    fn record_partial_scan(&mut self, candidate_bytes: u64, candidates: u32, now: Instant) {
+        if candidates == 0 {
+            return;
+        }
+        if !self.partial_evidence_current(now) {
+            self.partial_candidate_bytes = 0;
+            self.partial_candidates = 0;
+            self.partial_window_started = Some(now);
+        }
+        // Repeated attempts can rediscover the same candidate. Keep an
+        // observed maximum, never a cumulative reclaim claim, and do not
+        // refresh the window when smaller later candidates keep appearing.
+        self.partial_candidate_bytes = self.partial_candidate_bytes.max(candidate_bytes);
+        self.partial_candidates = self.partial_candidates.max(candidates);
+    }
+
     /// Update stats after a completed scan.
     fn record_scan(
         &mut self,
@@ -163,6 +200,9 @@ impl PathStats {
         self.last_scanned = Some(now);
         self.last_actual_reclaim = reclaimed_bytes;
         self.dirty_pending = false;
+        self.partial_candidate_bytes = 0;
+        self.partial_candidates = 0;
+        self.partial_window_started = None;
 
         // Snapshot the pre-update forecast so forecast_error() compares the actual
         // result against the prediction that was made *before* seeing this observation.
@@ -357,7 +397,21 @@ impl VoiScheduler {
         }
     }
 
-    /// Record whether a completed pass found `path` dirty (v2 event source),
+    /// Retain positive findings from an unfinished pass without certifying
+    /// root coverage, clearing dirty work, or training whole-root forecasts.
+    pub fn record_partial_scan_result(
+        &mut self,
+        path: &PathBuf,
+        candidate_bytes: u64,
+        candidates: u32,
+        now: Instant,
+    ) {
+        if let Some(stats) = self.path_stats.get_mut(path) {
+            stats.record_partial_scan(candidate_bytes, candidates, now);
+        }
+    }
+
+    /// Record whether a pass found `path` dirty (v2 event source),
     /// feeding the hazard rate and marking the root for the next plan.
     pub fn record_dirty(&mut self, path: &PathBuf, dirty: bool, now: Instant) {
         if let Some(stats) = self.path_stats.get_mut(path) {
@@ -390,10 +444,10 @@ impl VoiScheduler {
                 .enumerate()
                 .map(|(position, path)| {
                     let stats = self.path_stats.get(path);
-                    let dirty = stats.is_some_and(|s| s.dirty_pending);
+                    let dirty = stats.is_some_and(|s| s.has_pending_work(now));
                     let index = stats.map_or(f64::NEG_INFINITY, |s| {
                         s.hazard_index(
-                            Self::expected_reclaim(s, prior),
+                            Self::expected_reclaim(s, prior, now),
                             self.config.io_cost_weight,
                             now,
                         )
@@ -440,11 +494,16 @@ impl VoiScheduler {
         mean.max(1.0)
     }
 
-    fn expected_reclaim(stats: &PathStats, prior: f64) -> f64 {
-        if stats.scan_count == 0 {
+    fn expected_reclaim(stats: &PathStats, prior: f64, now: Instant) -> f64 {
+        let forecast = if stats.scan_count == 0 {
             prior
         } else {
             stats.forecast_reclaim
+        };
+        if stats.partial_evidence_current(now) {
+            forecast.max(stats.partial_candidate_bytes as f64)
+        } else {
+            forecast
         }
     }
 
@@ -560,10 +619,10 @@ impl VoiScheduler {
             .iter()
             .map(|path| {
                 let stats = self.path_stats.get(path);
-                let dirty = stats.is_some_and(|s| s.dirty_pending);
+                let dirty = stats.is_some_and(|s| s.has_pending_work(now));
                 let index = stats.map_or(0.0, |s| {
                     s.hazard_index(
-                        Self::expected_reclaim(s, prior),
+                        Self::expected_reclaim(s, prior, now),
                         self.config.io_cost_weight,
                         now,
                     )
@@ -1072,6 +1131,106 @@ mod tests {
         assert_eq!(stats.total_items_deleted, 3);
         assert_eq!(stats.false_positive_count, 1);
         assert!(stats.last_scanned.is_some());
+    }
+
+    #[test]
+    fn partial_scan_findings_do_not_train_completion_or_clear_dirty_work() {
+        let mut scheduler = scheduler_with_paths(&["/data"]);
+        let path = PathBuf::from("/data");
+        let start = Instant::now();
+        scheduler.record_scan_result(&path, 5000, 3, 1, 200.0, start);
+        scheduler.record_dirty(&path, true, start);
+        scheduler.end_window();
+        let before = scheduler.path_stats(&path).unwrap().clone();
+        let calibration = scheduler.calibration_summary();
+
+        let later = start + Duration::from_secs(60);
+        scheduler.record_partial_scan_result(&path, 9000, 4, later);
+        scheduler.record_partial_scan_result(&path, 2000, 2, later);
+        scheduler.record_partial_scan_result(&path, 0, 0, later);
+        scheduler.end_window();
+        let partial = scheduler.path_stats(&path).unwrap();
+        assert_eq!(partial.partial_candidate_bytes, 9000);
+        assert_eq!(partial.partial_candidates, 4);
+        assert_eq!(partial.scan_count, before.scan_count);
+        assert_eq!(partial.last_scanned, before.last_scanned);
+        assert_eq!(partial.total_reclaimed_bytes, before.total_reclaimed_bytes);
+        assert_eq!(partial.total_items_deleted, before.total_items_deleted);
+        assert_eq!(partial.false_positive_count, before.false_positive_count);
+        assert_eq!(partial.last_actual_reclaim, before.last_actual_reclaim);
+        assert_eq!(partial.forecast_reclaim, before.forecast_reclaim);
+        assert_eq!(partial.ewma_io_cost_per_scan, before.ewma_io_cost_per_scan);
+        assert_eq!(
+            partial.last_dirty_observation,
+            before.last_dirty_observation
+        );
+        assert!(partial.dirty_pending);
+        assert_eq!(VoiScheduler::expected_reclaim(partial, 1.0, later), 9000.0);
+        assert_eq!(
+            scheduler.calibration_summary().recent_mapes,
+            calibration.recent_mapes,
+        );
+
+        scheduler.record_scan_result(&path, 0, 0, 0, 150.0, later);
+        let complete = scheduler.path_stats(&path).unwrap();
+        assert_eq!(complete.scan_count, before.scan_count + 1);
+        assert_eq!(complete.last_scanned, Some(later));
+        assert!(!complete.dirty_pending);
+        assert_eq!(complete.partial_candidate_bytes, 0);
+        assert_eq!(complete.partial_candidates, 0);
+        assert_eq!(complete.partial_window_started, None);
+        assert_eq!(
+            VoiScheduler::expected_reclaim(complete, 1.0, later),
+            complete.forecast_reclaim,
+        );
+    }
+
+    #[test]
+    fn partial_evidence_expires_without_later_finds_extending_the_window() {
+        let mut scheduler = scheduler_with_paths(&["/data"]);
+        let path = PathBuf::from("/data");
+        let start = Instant::now();
+        scheduler.record_partial_scan_result(&path, 1_000_000, 5, start);
+        let end = start + MAX_REVISIT_INTERVAL;
+        scheduler.record_partial_scan_result(&path, 20, 1, end - Duration::from_secs(1));
+        let stats = scheduler.path_stats(&path).unwrap();
+        assert_eq!(stats.scan_count, 0);
+        assert_eq!(stats.last_scanned, None);
+        assert_eq!(stats.partial_window_started, Some(start));
+        assert!(stats.has_pending_work(end - Duration::from_nanos(1)));
+        assert!(!stats.has_pending_work(end));
+        assert_eq!(VoiScheduler::expected_reclaim(stats, 1.0, end), 1.0);
+
+        scheduler.record_partial_scan_result(&path, 0, 0, end);
+        assert!(!scheduler.path_stats(&path).unwrap().has_pending_work(end));
+        scheduler.record_partial_scan_result(&path, 6, 1, end);
+        let renewed = scheduler.path_stats(&path).unwrap();
+        assert_eq!(renewed.partial_candidate_bytes, 6);
+        assert_eq!(renewed.partial_candidates, 1);
+        assert_eq!(renewed.partial_window_started, Some(end));
+    }
+
+    #[test]
+    fn zero_byte_partial_candidate_keeps_a_bounded_opportunity_without_fake_yield() {
+        let mut scheduler = scheduler_with_paths(&["/a", "/b"]);
+        scheduler.config.scan_budget_per_interval = 1;
+        let start = Instant::now();
+        for path in ["/a", "/b"] {
+            scheduler.record_scan_result(&PathBuf::from(path), 0, 0, 0, 100.0, start);
+        }
+        let path = PathBuf::from("/b");
+        scheduler.record_partial_scan_result(&path, 0, 1, start);
+        let stats = scheduler.path_stats(&path).unwrap();
+        assert!(!stats.dirty_pending);
+        assert_eq!(stats.partial_candidate_bytes, 0);
+        assert_eq!(stats.forecast_reclaim, 0.0);
+        assert_eq!(VoiScheduler::expected_reclaim(stats, 1.0, start), 0.0);
+        assert!(stats.has_pending_work(start));
+        assert!(!stats.has_pending_work(start + MAX_REVISIT_INTERVAL));
+
+        let plan = scheduler.schedule(start + Duration::from_secs(1));
+        assert_eq!(plan.paths[0].path, path);
+        assert_eq!(plan.paths[0].forecast_reclaim_bytes, 0.0);
     }
 
     #[test]

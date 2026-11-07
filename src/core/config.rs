@@ -885,8 +885,9 @@ pub struct TelemetryConfig {
     /// CPU budget for the whole daemon as percent of one core (Q7): a token
     /// bucket with a 5 s burst that scanner passes, pre-scans, maintenance,
     /// index work and the monitor tick all draw from; in deficit the daemon
-    /// yields (never at Critical, never for ballast release, state writes or
-    /// heartbeats). 0 disables pacing; accounting still shows in `sbh status`.
+    /// yields. Critical monitor ticks, ballast release, state writes and
+    /// heartbeats never wait; automatic Critical scans still use a finite
+    /// funded slice. 0 disables pacing; accounting still shows in `sbh status`.
     pub cpu_budget_pct: u8,
     /// Depth of the CPU token bucket in CPU-seconds: the most a single
     /// discretionary scan pass may spend, and the size of the burst the

@@ -23,13 +23,13 @@ struct Opportunity {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct PressureOrder {
+pub(crate) struct PressureOrder {
     history: BTreeMap<PathBuf, Opportunity>,
     sequence: u64,
 }
 
 impl PressureOrder {
-    pub(super) fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
 
@@ -41,7 +41,7 @@ impl PressureOrder {
     /// `paths` already has the ordinary dirty/index order. Return precisely
     /// its unique scope; pressure's entry/time budget is the caller's, not the
     /// maintenance scheduler's root-count budget. Only an opportunity is spent.
-    pub(super) fn reorder(
+    pub(crate) fn reorder(
         &mut self,
         paths: &mut Vec<PathBuf>,
         fallback: bool,

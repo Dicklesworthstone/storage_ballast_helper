@@ -1785,6 +1785,20 @@ The uncertainty discount ranges from 0.5 (fewer than 3 scans, high uncertainty) 
 
 The scan budget is split: 80% exploitation (highest-utility paths) and 20% exploration (least-recently-scanned paths). This balance prevents the scheduler from permanently ignoring paths where a new project has started generating artifacts.
 
+Full-scan age, forecasts, and calibration advance only after a recursive walk
+exhausts its scope with a complete coverage receipt. A timed-out pass or an
+index/pre-scan-only result does not prove that a root is empty. Positive partial
+findings can still prioritize work, but that evidence expires at the revisit
+interval and is cleared by a completed scan. An incomplete empty result cannot
+park its mount's pressure controller as though the whole scope was searched.
+
+Automatic Orange, Red, and Critical recursive walks with a finite CPU allowance
+alternate the normal leading-root preference with the least recently led root
+in the admitted scope. A turn is consumed only when the recursive walker starts:
+dropped requests, pacing deferrals, replay-only work, and failed starts do not
+spend it. This keeps other roots eligible across bounded passes while Critical
+scans retain their finite CPU allowance.
+
 #### Fallback Mode
 
 If the VOI scheduler's forecast error (MAPE) exceeds 50% for 3 consecutive windows, it falls back to simple round-robin scheduling. It recovers after 5 consecutive windows with acceptable MAPE. This prevents the scheduler from making poor allocation decisions when its model of the environment is wrong.

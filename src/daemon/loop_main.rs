@@ -83,6 +83,7 @@ use crate::monitor::special_locations::{
     AlertThrottle, HorizonRule, SpecialAlert, SpecialLocationRegistry,
 };
 use crate::monitor::voi_scheduler::VoiScheduler;
+use crate::monitor::voi_scheduler::pressure_order::PressureOrder;
 use crate::platform::cleanup_catalog::{self, ExpandedCatalogRoot};
 use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
 use crate::platform::types::{
@@ -1647,6 +1648,85 @@ struct RootScanResult {
     /// The v2 event source reported changes under this root before the
     /// pass (feeds the scheduler's hazard rate).
     dirty: bool,
+    /// A recursive walk exhausted its work and returned a definitive receipt
+    /// with no unfinished path overlapping this root. Attempt completion alone
+    /// is not proof.
+    coverage_complete: bool,
+}
+
+impl RootScanResult {
+    fn unvisited(path: PathBuf, dirty: bool) -> Self {
+        Self {
+            path,
+            candidates_found: 0,
+            potential_bytes: 0,
+            false_positives: 0,
+            duration: Duration::ZERO,
+            dirty,
+            coverage_complete: false,
+        }
+    }
+
+    fn record_scheduler_feedback(&self, scheduler: &mut VoiScheduler, now: Instant) {
+        let candidates = u32::try_from(self.candidates_found).unwrap_or(u32::MAX);
+        if self.coverage_complete {
+            scheduler.record_scan_result(
+                &self.path,
+                self.potential_bytes,
+                candidates,
+                u32::try_from(self.false_positives).unwrap_or(u32::MAX),
+                self.duration.as_millis() as f64,
+                now,
+            );
+        } else {
+            scheduler.record_partial_scan_result(&self.path, self.potential_bytes, candidates, now);
+        }
+        // A real event remains useful even when the walk was interrupted.
+        // Absence of an event in an unvisited root is not a clean scan.
+        if self.coverage_complete || self.dirty {
+            scheduler.record_dirty(&self.path, self.dirty, now);
+        }
+    }
+
+    /// Only called after uncancelled recursive EOF, never after a byte target,
+    /// budget stop or catalog probe. Unknown coverage proves nothing.
+    fn finish_recursive_walk(&mut self, unfinished: Option<&[PathBuf]>) {
+        self.coverage_complete = unfinished.is_some_and(|paths| {
+            !paths
+                .iter()
+                .any(|path| path.starts_with(&self.path) || self.path.starts_with(path))
+        });
+    }
+}
+
+/// Index replay, priority discovery and the recursive walker can find the
+/// same candidate in one pass. Preserve its positive evidence once, under
+/// the most specific requested root, even when a later stage never starts.
+fn record_root_candidate(
+    stats: &mut HashMap<PathBuf, RootScanResult>,
+    observed: &mut HashMap<PathBuf, u64>,
+    path: &Path,
+    size_bytes: u64,
+) {
+    if let Some(stat) = stats
+        .values_mut()
+        .filter(|stat| path.starts_with(&stat.path))
+        .max_by_key(|stat| stat.path.components().count())
+    {
+        let additional_bytes = match observed.entry(path.to_path_buf()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(size_bytes);
+                stat.candidates_found = stat.candidates_found.saturating_add(1);
+                size_bytes
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let previous = *entry.get();
+                entry.insert(previous.max(size_bytes));
+                size_bytes.saturating_sub(previous)
+            }
+        };
+        stat.potential_bytes = stat.potential_bytes.saturating_add(additional_bytes);
+    }
 }
 
 #[derive(Debug)]
@@ -5838,29 +5918,13 @@ impl MonitoringDaemon {
                         self.self_monitor.record_scan(candidates, 0, duration);
                         self.last_scan_completed = Some((Instant::now(), duration));
                         let now = Instant::now();
-                        #[allow(clippy::cast_possible_truncation)]
                         for stat in &root_stats {
-                            self.voi_scheduler.record_scan_result(
-                                &stat.path,
-                                stat.potential_bytes,
-                                stat.candidates_found as u32,
-                                stat.false_positives as u32,
-                                stat.duration.as_millis() as f64,
-                                now,
-                            );
-                            self.voi_scheduler.record_dirty(&stat.path, stat.dirty, now);
+                            stat.record_scheduler_feedback(&mut self.voi_scheduler, now);
                         }
                         self.voi_scheduler.end_window();
-                        // A completed (not timed-out) pass with nothing found
-                        // on a mount parks that mount's controller in Idle.
-                        if !timed_out {
-                            self.note_scan_pass_per_mount(
-                                &root_stats,
-                                pressure_level,
-                                background,
-                                now,
-                            );
-                        }
+                        // Positive findings help even after a timeout. Only
+                        // proven root coverage can justify an empty mount.
+                        self.note_scan_pass_per_mount(&root_stats, pressure_level, background, now);
                     }
                     WorkerReport::DeletionCompleted {
                         deleted,
@@ -7523,9 +7587,8 @@ impl MonitoringDaemon {
         });
     }
 
-    /// Feed a completed scan pass to the per-mount controllers: a mount whose
-    /// roots all came back empty, with nothing left to release, goes idle
-    /// with an exponential rescan backoff.
+    /// Feed observed candidates to the per-mount controllers. An empty result
+    /// can park a mount only when every reported root on it was fully covered.
     fn note_scan_pass_per_mount(
         &mut self,
         root_stats: &[RootScanResult],
@@ -7533,14 +7596,23 @@ impl MonitoringDaemon {
         background: bool,
         now: Instant,
     ) {
-        let mut found_by_mount: HashMap<PathBuf, usize> = HashMap::new();
+        let mut found_by_mount: HashMap<PathBuf, (usize, bool)> = HashMap::new();
+        let mut unresolved_root = false;
         for stat in root_stats {
             let Ok(stats) = self.fs_collector.collect(&stat.path) else {
+                // This root could share any of the reported mounts. Its
+                // unknown coverage cannot disappear from an empty verdict.
+                unresolved_root = true;
                 continue;
             };
-            *found_by_mount.entry(stats.mount_point).or_insert(0) += stat.candidates_found;
+            let (found, complete) = found_by_mount.entry(stats.mount_point).or_insert((0, true));
+            *found = found.saturating_add(stat.candidates_found);
+            *complete &= stat.coverage_complete;
         }
-        for (mount, found) in found_by_mount {
+        for (mount, (found, complete)) in found_by_mount {
+            if found == 0 && (!complete || unresolved_root) {
+                continue;
+            }
             let releasable = self
                 .ballast_coordinator
                 .pool_for_mount(&mount)
@@ -9730,6 +9802,60 @@ impl MaintenanceKeepLog {
     }
 }
 
+/// Give finite automatic pressure walks a leading-root opportunity only
+/// when the recursive stream actually starts. Queued, deferred, pre-scan-only
+/// and held requests must not spend the next root's turn (bd-kf7k).
+fn start_recursive_walk(
+    mut config: WalkerConfig,
+    protection: ProtectionRegistry,
+    heartbeat: &Arc<ThreadHeartbeat>,
+    request: &ScanRequest,
+    budget_allowance: Option<f64>,
+    limits: &mut PassLimits,
+    root_order: &mut PressureOrder,
+) -> Result<(WalkStream, Arc<AtomicBool>, Option<PassStop>)> {
+    // The final pre-scan probe or history read may have used the remaining
+    // allowance. Do not launch workers or spend a turn for an expired pass.
+    if let Some(stop) = limits.walk_stop() {
+        return Ok((
+            WalkStream::from_entries(Vec::new()),
+            Arc::new(AtomicBool::new(false)),
+            Some(stop),
+        ));
+    }
+    let pending_order = if request.pressure_level >= PressureLevel::Orange
+        && !request.maintenance
+        && request.catalog_roots.is_empty()
+        && request.scan_now.is_none()
+        && request.config_update.is_none()
+        && !request.bypass_scan_pacing()
+        && budget_allowance.is_some_and(|allowance| allowance.is_finite() && allowance > 0.0)
+    {
+        let mut pending = root_order.clone();
+        // Preserve alternate opportunities for the heuristic leader and
+        // the relative order of all other roots. Only the current active
+        // scope participates; request paths and the pre-scan cursor stay put.
+        pending.reorder(&mut config.root_paths, false, |_| true);
+        Some(pending)
+    } else {
+        None
+    };
+    // Only classified entries use a walked directory's size, and they
+    // read it later (bd-gh0x).
+    let walker = DirectoryWalker::new(config, protection)
+        .without_file_sizes()
+        .with_heartbeat({
+            let heartbeat = Arc::clone(heartbeat);
+            move || heartbeat.beat()
+        });
+    let cancel_token = walker.cancel_token();
+    let stream = walker.stream()?;
+    if let Some(pending) = pending_order {
+        *root_order = pending;
+    }
+    Ok((stream, cancel_token, None))
+}
+
 /// Scanner thread: receives scan requests, walks directories, scores candidates,
 /// and sends deletion batches to the executor.
 ///
@@ -9768,6 +9894,9 @@ fn scanner_thread_main(
     // does not send the sweep back to the first root: a `/data/projects` too
     // large to enumerate in one pass is covered across passes.
     let mut prescan_cursor = PrescanCursor::load(prescan_cursor_path);
+    // Producer-side rankings can be replaced in the queue or deferred by
+    // pacing. Track actual recursive starts independently of those requests.
+    let mut admitted_root_order = PressureOrder::default();
     // A budget-truncated pass is normal on a large tree, so the operator-facing
     // `SBH-2007` warning is rate-limited: the activity log has no retention
     // policy (its `activity.sqlite3` grows unbounded), and one warning per
@@ -9880,6 +10009,9 @@ fn scanner_thread_main(
         // Read latest config at the start of each scan.
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
+        if request.config_update.is_some() {
+            admitted_root_order.reset();
+        }
         if executor_config.scan_posture_for(&request) == ScanAggressiveness::Skip {
             // Queued and event-triggered automatic work must observe the
             // current memory posture too. Leave pending event coverage intact.
@@ -10040,9 +10172,9 @@ fn scanner_thread_main(
         }
 
         // Q7: the daemon-wide CPU budget. A discretionary pass waits until
-        // the bucket holds a CPU-second (the next tick re-requests it) and
-        // then walks only as long as the bucket lasts; operator and
-        // config-reload scans run regardless, and Critical is never limited.
+        // the bucket is nearly full (the next tick re-requests it), then
+        // walks only for its funded CPU slice, including at Critical.
+        // Forced operator and config-reload scans bypass that pacing.
         let budget_allowance = if request.bypass_scan_pacing() || request.config_update.is_some() {
             None
         } else {
@@ -10279,13 +10411,11 @@ fn scanner_thread_main(
             let root_stats = request
                 .paths
                 .iter()
-                .map(|path| RootScanResult {
-                    path: path.clone(),
-                    candidates_found: 0,
-                    potential_bytes: 0,
-                    false_positives: 0,
-                    duration: Duration::ZERO,
-                    dirty: dirty_under(&scanner_event_dirty_roots, path),
+                .map(|path| {
+                    RootScanResult::unvisited(
+                        path.clone(),
+                        dirty_under(&scanner_event_dirty_roots, path),
+                    )
                 })
                 .collect();
             let _ = report_tx.try_send(WorkerReport::ScanCompleted {
@@ -10412,6 +10542,21 @@ fn scanner_thread_main(
         // the walk can each hold the same directory in one pass.
         let mut held_paths: BTreeSet<PathBuf> = BTreeSet::new();
         let mut held_by_certainty: usize = 0;
+        // Every stage contributes observations to its actual root, but none
+        // certifies coverage until a complete recursive walk proves it.
+        let mut root_stats_map: HashMap<PathBuf, RootScanResult> = active_scan_paths
+            .iter()
+            .map(|root| {
+                (
+                    root.clone(),
+                    RootScanResult::unvisited(
+                        root.clone(),
+                        dirty_under(&scanner_event_dirty_roots, root),
+                    ),
+                )
+            })
+            .collect();
+        let mut observed_candidates = HashMap::new();
 
         if scanner_index_enabled
             && request.pressure_level >= PressureLevel::Orange
@@ -10530,6 +10675,14 @@ fn scanner_thread_main(
                 carried_verdicts = replay_protection.verdict_cache_snapshot();
             }
             replay_counts.set((records.len(), revetoed));
+            for candidate in &indexed_candidates {
+                record_root_candidate(
+                    &mut root_stats_map,
+                    &mut observed_candidates,
+                    &candidate.path,
+                    candidate.size_bytes,
+                );
+            }
             let indexed_bytes = indexed_candidates
                 .iter()
                 .map(|candidate| candidate.size_bytes)
@@ -10566,18 +10719,7 @@ fn scanner_thread_main(
                             None,
                         ),
                     });
-                    let root_stats = active_scan_paths
-                        .iter()
-                        .enumerate()
-                        .map(|(index, path)| RootScanResult {
-                            path: path.clone(),
-                            candidates_found: if index == 0 { candidates_found } else { 0 },
-                            potential_bytes: if index == 0 { indexed_bytes } else { 0 },
-                            false_positives: 0,
-                            duration: Duration::ZERO,
-                            dirty: dirty_under(&scanner_event_dirty_roots, path),
-                        })
-                        .collect();
+                    let root_stats = root_stats_map.into_values().collect();
                     let _ = report_tx.try_send(WorkerReport::ScanCompleted {
                         candidates: candidates_found,
                         duration: Duration::ZERO,
@@ -11104,6 +11246,14 @@ fn scanner_thread_main(
 
         // Dispatch priority candidates immediately if any found.
         if !priority_candidates.is_empty() {
+            for candidate in &priority_candidates {
+                record_root_candidate(
+                    &mut root_stats_map,
+                    &mut observed_candidates,
+                    &candidate.path,
+                    candidate.size_bytes,
+                );
+            }
             let count = priority_candidates.len();
             priority_candidates.sort_by(|a, b| {
                 b.total_score
@@ -11173,18 +11323,7 @@ fn scanner_thread_main(
         }
         if scan_timed_out {
             let duration = scan_start.elapsed();
-            let root_stats: Vec<RootScanResult> = active_scan_paths
-                .iter()
-                .enumerate()
-                .map(|(index, path)| RootScanResult {
-                    path: path.clone(),
-                    candidates_found: if index == 0 { candidates_found } else { 0 },
-                    potential_bytes: 0,
-                    false_positives: 0,
-                    duration,
-                    dirty: dirty_under(&scanner_event_dirty_roots, path),
-                })
-                .collect();
+            let root_stats = root_stats_map.into_values().collect();
             let _ = report_tx.send(WorkerReport::ScanCompleted {
                 candidates: candidates_found,
                 duration,
@@ -11277,22 +11416,7 @@ fn scanner_thread_main(
                     process_cpu_micros,
                 ),
             });
-            let root_stats = active_scan_paths
-                .iter()
-                .enumerate()
-                .map(|(index, path)| RootScanResult {
-                    path: path.clone(),
-                    candidates_found: if index == 0 { candidates_found } else { 0 },
-                    potential_bytes: if index == 0 {
-                        v2_candidate_bytes_seen
-                    } else {
-                        0
-                    },
-                    false_positives: 0,
-                    duration,
-                    dirty: dirty_under(&scanner_event_dirty_roots, path),
-                })
-                .collect();
+            let root_stats = root_stats_map.into_values().collect();
             let _ = report_tx.try_send(WorkerReport::ScanCompleted {
                 candidates: candidates_found,
                 duration,
@@ -11371,7 +11495,7 @@ fn scanner_thread_main(
         // candidate unit, sized and dated by a bounded probe, and flows
         // through the same classification, scoring, vetoes and dispatch below.
         let recursive_scan_held = executor_config.holds_recursive_scan(&request);
-        let (mut rx, cancel_token) = if recursive_scan_held {
+        let (mut rx, cancel_token, prewalk_stop) = if recursive_scan_held {
             // DefiniteOnly retains index replay and the bounded artifact
             // pre-scan above. It does not start a broad discovery walk. An
             // empty stream shares normal accounting without claiming EOF
@@ -11381,21 +11505,19 @@ fn scanner_thread_main(
             (
                 WalkStream::from_entries(Vec::new()),
                 Arc::new(AtomicBool::new(false)),
+                Some(PassStop::ScanPosture),
             )
         } else if request.catalog_roots.is_empty() {
-            // Only classified entries use a walked directory's size, and they
-            // read it below (bd-gh0x).
-            let walker = DirectoryWalker::new(walker_config, protection)
-                .without_file_sizes()
-                .with_heartbeat({
-                    let hb = Arc::clone(heartbeat);
-                    move || hb.beat()
-                });
-            let cancel_token = walker.cancel_token();
-
-            // Perform the walk (streaming).
-            match walker.stream() {
-                Ok(r) => (r, cancel_token),
+            match start_recursive_walk(
+                walker_config,
+                protection,
+                heartbeat,
+                &request,
+                budget_allowance,
+                &mut limits,
+                &mut admitted_root_order,
+            ) {
+                Ok(stream) => stream,
                 Err(e) => {
                     logger.send(ActivityEvent::Error {
                         code: e.code().to_string(),
@@ -11424,13 +11546,14 @@ fn scanner_thread_main(
             (
                 WalkStream::from_entries(entries),
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
         };
 
         let mut paths_scanned = 0;
         // Which limit ended the general walk, if any.
-        let mut walk_stop = recursive_scan_held.then_some(PassStop::ScanPosture);
-        scan_timed_out |= recursive_scan_held;
+        let mut walk_stop = prewalk_stop;
+        scan_timed_out |= prewalk_stop.is_some();
         let mut walk_exhausted = false;
         let mut opaque_pruned_dirs = 0usize;
         let mut scored: Vec<CandidacyScore> = Vec::with_capacity(1024);
@@ -11443,22 +11566,6 @@ fn scanner_thread_main(
             .max(1)
             .saturating_mul(EARLY_DISPATCH_MULTIPLIER);
         let mut next_dispatch_deadline = scan_start + EARLY_DISPATCH_MAX_WAIT;
-
-        // Initialize per-root stats.
-        let mut root_stats_map: HashMap<PathBuf, RootScanResult> = HashMap::new();
-        for root in &active_scan_paths {
-            root_stats_map.insert(
-                root.clone(),
-                RootScanResult {
-                    path: root.clone(),
-                    candidates_found: 0,
-                    potential_bytes: 0,
-                    false_positives: 0,
-                    duration: Duration::ZERO,
-                    dirty: dirty_under(&scanner_event_dirty_roots, root),
-                },
-            );
-        }
 
         // Process entries with timeout to handle walker deadlocks.
         // The walker can deadlock when both worker threads block on a full work queue
@@ -11531,6 +11638,9 @@ fn scanner_thread_main(
                 limits.walk_stop()
             };
             if entry_budget_reached || stop.is_some() {
+                // Receiving removed this unprocessed entry from the stream's
+                // unfinished receipt. Its ancestors still need another pass.
+                mark_non_barren(&mut non_barren_dirs, &entry.path);
                 cancel_token.store(true, Ordering::Relaxed);
                 scan_timed_out = true;
                 walk_stop = stop;
@@ -11768,7 +11878,10 @@ fn scanner_thread_main(
             }
 
             // Attribute to root.
-            let root_path = active_scan_paths.iter().find(|r| entry.path.starts_with(r));
+            let root_path = active_scan_paths
+                .iter()
+                .filter(|root| entry.path.starts_with(root))
+                .max_by_key(|root| root.components().count());
 
             if scanner_index_backoff_active {
                 continue;
@@ -11792,13 +11905,13 @@ fn scanner_thread_main(
                 candidates_found += 1;
                 let potential_bytes = score.size_bytes;
                 v2_candidate_bytes_seen = v2_candidate_bytes_seen.saturating_add(potential_bytes);
+                record_root_candidate(
+                    &mut root_stats_map,
+                    &mut observed_candidates,
+                    &score.path,
+                    potential_bytes,
+                );
                 scored.push(score);
-                if let Some(root) = root_path
-                    && let Some(stat) = root_stats_map.get_mut(root)
-                {
-                    stat.candidates_found += 1;
-                    stat.potential_bytes += potential_bytes;
-                }
             } else if score.vetoed
                 && let Some(root) = root_path
                 && let Some(stat) = root_stats_map.get_mut(root)
@@ -11857,6 +11970,9 @@ fn scanner_thread_main(
             // recorded unfinished subtree still keeps the event work pending.
             let unfinished = rx.unfinished_after_cancel(Duration::ZERO);
             pending_event_invalidation.acknowledge_walk(&active_scan_paths, unfinished.as_deref());
+            for stat in root_stats_map.values_mut() {
+                stat.finish_recursive_walk(unfinished.as_deref());
+            }
         } else if scan_timed_out {
             let unfinished = rx.unfinished_after_cancel(WALK_STOP_WAIT);
             for path in unfinished.iter().flatten() {
@@ -11872,16 +11988,17 @@ fn scanner_thread_main(
             }
         }
 
-        // Distribute total scan duration across roots so the VOI scheduler gets
-        // non-zero IO cost estimates.  The walker interleaves entries from all
-        // roots, so per-root wall time is not available; dividing evenly is an
-        // acceptable approximation that the EWMA smooths over time.
+        // Only proven root coverage trains full-scan cost estimates. The
+        // walker interleaves roots, so completed passes divide their cost;
+        // unfinished passes retain positive observations without this model.
         let total_scan_duration = scan_start.elapsed();
         let num_roots = root_stats_map.len().max(1);
         let per_root_divisor = u32::try_from(num_roots).unwrap_or(u32::MAX);
         let per_root_duration = total_scan_duration / per_root_divisor;
         for stat in root_stats_map.values_mut() {
-            stat.duration = per_root_duration;
+            if stat.coverage_complete {
+                stat.duration = per_root_duration;
+            }
         }
 
         #[allow(clippy::cast_possible_truncation)]
@@ -13219,6 +13336,186 @@ mod tests {
     use crate::scanner::scoring::{DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::path::Path;
     use std::time::Duration;
+
+    #[test]
+    fn root_observations_preserve_partial_findings_under_their_actual_roots() {
+        let roots: Vec<PathBuf> = ["/a", "/b", "/b/nested", "/unvisited"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let mut stats: HashMap<_, _> = roots
+            .iter()
+            .map(|path| (path.clone(), RootScanResult::unvisited(path.clone(), false)))
+            .collect();
+        let mut observed = HashMap::new();
+        // Replay, pre-scan and walk observations of one path count once;
+        // a later better size estimate contributes only its positive delta.
+        for bytes in [64, 96, 8] {
+            record_root_candidate(
+                &mut stats,
+                &mut observed,
+                Path::new("/b/nested/target"),
+                bytes,
+            );
+        }
+        record_root_candidate(&mut stats, &mut observed, Path::new("/b/zero"), 0);
+        record_root_candidate(&mut stats, &mut observed, Path::new("/outside/target"), 500);
+        assert_eq!(stats[Path::new("/a")].candidates_found, 0);
+        assert_eq!(stats[Path::new("/b")].candidates_found, 1);
+        assert_eq!(stats[Path::new("/b")].potential_bytes, 0);
+        assert_eq!(stats[Path::new("/b/nested")].candidates_found, 1);
+        assert_eq!(stats[Path::new("/b/nested")].potential_bytes, 96);
+        assert!(stats.values().all(|stat| !stat.coverage_complete));
+
+        let mut scheduler = VoiScheduler::new(crate::core::config::VoiConfig::default());
+        for path in &roots {
+            scheduler.register_path(path.clone());
+        }
+        let unvisited = PathBuf::from("/unvisited");
+        let now = Instant::now();
+        scheduler.record_dirty(&unvisited, true, now);
+        // Neither partial false-positive counts nor its shared pass duration
+        // may train complete-root calibration.
+        let nested = stats.get_mut(Path::new("/b/nested")).unwrap();
+        nested.false_positives = 7;
+        nested.duration = Duration::from_secs(60);
+        for stat in stats.values() {
+            stat.record_scheduler_feedback(&mut scheduler, now);
+        }
+        scheduler.end_window();
+        let partial = scheduler.path_stats(&PathBuf::from("/b/nested")).unwrap();
+        assert_eq!(partial.partial_candidate_bytes, 96);
+        assert_eq!(partial.partial_candidates, 1);
+        assert_eq!(partial.forecast_reclaim, 0.0);
+        assert_eq!(partial.false_positive_count, 0);
+        assert_eq!(partial.ewma_io_cost_per_scan, 1000.0);
+        for path in &roots {
+            let stat = scheduler.path_stats(path).unwrap();
+            assert_eq!(stat.scan_count, 0);
+            assert_eq!(stat.last_scanned, None);
+        }
+        assert!(scheduler.path_stats(&unvisited).unwrap().dirty_pending);
+        assert!(scheduler.calibration_summary().recent_mapes.is_empty());
+    }
+
+    #[test]
+    fn recursive_eof_receipts_only_complete_nonoverlapping_roots() {
+        let mut a = RootScanResult::unvisited(PathBuf::from("/a"), false);
+        let mut b = RootScanResult::unvisited(PathBuf::from("/b"), false);
+        a.finish_recursive_walk(None);
+        assert!(!a.coverage_complete);
+        a.finish_recursive_walk(Some(&[PathBuf::from("/")]));
+        assert!(!a.coverage_complete, "unfinished ancestors also overlap");
+        let unfinished = [PathBuf::from("/b/large-directory")];
+        a.finish_recursive_walk(Some(&unfinished));
+        b.finish_recursive_walk(Some(&unfinished));
+        assert!(a.coverage_complete);
+        assert!(!b.coverage_complete);
+        a.finish_recursive_walk(Some(&[PathBuf::from("/ab")]));
+        assert!(a.coverage_complete, "overlap uses path components");
+
+        let now = Instant::now();
+        let mut scheduler = VoiScheduler::new(crate::core::config::VoiConfig::default());
+        for root in [&a.path, &b.path] {
+            scheduler.register_path(root.clone());
+            scheduler.record_dirty(root, true, now);
+        }
+        a.record_scheduler_feedback(&mut scheduler, now);
+        b.record_scheduler_feedback(&mut scheduler, now);
+        assert_eq!(
+            scheduler.path_stats(&a.path).unwrap().last_scanned,
+            Some(now)
+        );
+        assert!(!scheduler.path_stats(&a.path).unwrap().dirty_pending);
+        assert_eq!(scheduler.path_stats(&b.path).unwrap().last_scanned, None);
+        assert!(scheduler.path_stats(&b.path).unwrap().dirty_pending);
+        b.finish_recursive_walk(Some(&[]));
+        b.record_scheduler_feedback(&mut scheduler, now);
+        assert_eq!(scheduler.path_stats(&b.path).unwrap().scan_count, 1);
+        assert!(!scheduler.path_stats(&b.path).unwrap().dirty_pending);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_or_unmapped_roots_cannot_park_a_mount_but_positive_findings_still_count() {
+        use crate::platform::pal::{MountPoint, PlatformPaths};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let mount = fixture.directory.path().join("observed-mount");
+        let a = mount.join("a");
+        let b = mount.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let mock = MockPlatform::healthy();
+        let mut reading = mock.fs_stats(Path::new("/")).unwrap();
+        reading.mount_point = mount.clone();
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::new(
+            vec![MountPoint {
+                path: mount.clone(),
+                device: "coverage-test-device".into(),
+                fs_type: reading.fs_type.clone(),
+                is_ram_backed: false,
+            }],
+            HashMap::from([(mount.clone(), reading)]),
+            mock.memory_info().unwrap(),
+            PlatformPaths::default(),
+        ));
+        let now = Instant::now();
+        let daemon = &mut fixture.daemon;
+        daemon.fs_collector = FsStatsCollector::new(platform, Duration::ZERO);
+        let mut controller =
+            MountController::new(mount.clone(), mount_controller_config(&daemon.config));
+        controller.observe(MountTickInput {
+            level: PressureLevel::Orange,
+            urgency: 0.6,
+            free_pct: 10.0,
+            seconds_to_red: None,
+            prediction_confident: false,
+            surface: MountSurface {
+                configured_roots: 2,
+                ..MountSurface::default()
+            },
+            releasable_ballast: false,
+            recovery_needed: false,
+            recovery_probe_ok: None,
+            wake: WakeSignals::default(),
+            now,
+        });
+        daemon.mount_controllers.insert(mount.clone(), controller);
+        let mut roots = vec![
+            RootScanResult::unvisited(a, false),
+            RootScanResult::unvisited(b, false),
+        ];
+        roots[1].finish_recursive_walk(Some(&[]));
+        daemon.note_scan_pass_per_mount(&roots, PressureLevel::Orange, false, now);
+        assert_eq!(
+            daemon.mount_controllers[&mount].state(),
+            MountState::Reclaim
+        );
+        assert_eq!(daemon.mount_controllers[&mount].empty_passes(), 0);
+
+        roots[0].finish_recursive_walk(Some(&[]));
+        let mut unknown =
+            RootScanResult::unvisited(fixture.directory.path().join("unmapped"), false);
+        unknown.finish_recursive_walk(Some(&[]));
+        roots.push(unknown);
+        daemon.note_scan_pass_per_mount(&roots, PressureLevel::Orange, false, now);
+        assert_eq!(
+            daemon.mount_controllers[&mount].state(),
+            MountState::Reclaim
+        );
+        let unknown = roots.pop().unwrap();
+
+        daemon.note_scan_pass_per_mount(&roots, PressureLevel::Orange, false, now);
+        assert_eq!(daemon.mount_controllers[&mount].state(), MountState::Idle);
+        assert_eq!(daemon.mount_controllers[&mount].empty_passes(), 1);
+        roots[0].coverage_complete = false;
+        roots[0].candidates_found = 1;
+        roots[0].potential_bytes = 0;
+        roots.push(unknown);
+        daemon.note_scan_pass_per_mount(&roots, PressureLevel::Orange, false, now);
+        assert_eq!(daemon.mount_controllers[&mount].empty_passes(), 0);
+    }
 
     /// An initialized daemon with all writes under a temporary directory
     /// and platform observations supplied by the regular mock PAL. No
@@ -18707,6 +19004,77 @@ mod tests {
         assert!(!second_pass(&old_rule).contains(&deep));
     }
 
+    /// A budget can stop the consumer after the final entry was received,
+    /// even when the producer has already finished the complete walk. That
+    /// popped path is absent from the stream's unfinished receipt (bd-kf7k).
+    #[test]
+    fn a_budget_stopped_popped_entry_remains_reachable_on_the_next_pass() {
+        let scratch = temp_root_scratch_dir();
+        let root = scratch.path().join("scan");
+        let project = root.join("project");
+        let target = project.join("target");
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        let config = |excluded: HashSet<PathBuf>| WalkerConfig {
+            root_paths: vec![root.clone()],
+            max_depth: 10,
+            follow_symlinks: false,
+            cross_devices: false,
+            parallelism: 1,
+            excluded_paths: excluded,
+            opaque_pruning: false,
+        };
+
+        let walker =
+            DirectoryWalker::new(config(HashSet::new()), ProtectionRegistry::marker_only());
+        let cancel = walker.cancel_token();
+        let mut stream = walker.stream().unwrap();
+        // One worker emits both root children before the nested target. The
+        // consumer has visited those parents when it receives the last entry.
+        let visited: HashSet<PathBuf> = (0..2)
+            .map(|_| stream.recv_timeout(WALK_STOP_WAIT).unwrap().path)
+            .collect();
+        assert_eq!(visited, HashSet::from([project.clone(), empty.clone()]));
+        let popped = stream.recv_timeout(WALK_STOP_WAIT).unwrap();
+        assert_eq!(popped.path, target);
+        assert!(matches!(
+            stream.recv_timeout(WALK_STOP_WAIT),
+            Err(RecvTimeoutError::Disconnected)
+        ));
+        // The worker can finish before the consumer notices its spent budget.
+        // Cancelling now has no queued entry left to protect the target.
+        cancel.store(true, Ordering::Relaxed);
+        let unfinished = stream.unfinished_after_cancel(Duration::ZERO).unwrap();
+        assert!(unfinished.is_empty());
+        let mut receipt_only = HashSet::new();
+        for path in unfinished {
+            mark_non_barren(&mut receipt_only, &path);
+        }
+        let mut old_cursor = ScanCursor::new();
+        old_cursor.update(&visited, &receipt_only, true);
+
+        mark_non_barren(&mut receipt_only, &popped.path);
+        let mut cursor = ScanCursor::new();
+        cursor.update(&visited, &receipt_only, true);
+        assert_eq!(cursor.barren_exclusions(), HashSet::from([empty]));
+        assert!(old_cursor.barren_exclusions().contains(&project));
+
+        let second_pass = |cursor: &ScanCursor| -> Vec<PathBuf> {
+            DirectoryWalker::new(
+                config(cursor.barren_exclusions()),
+                ProtectionRegistry::marker_only(),
+            )
+            .walk()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect()
+        };
+        assert!(!second_pass(&old_cursor).contains(&target));
+        assert!(second_pass(&cursor).contains(&target));
+    }
+
     #[test]
     fn scan_cursor_keeps_only_fresh_barren_dirs_when_they_fill_the_cap() {
         let mut cursor = scan_cursor(3, &[("/old/a", 1), ("/old/b", 2)]);
@@ -20596,6 +20964,11 @@ mod tests {
             };
             assert_eq!(*timed_out, index == 0, "{report:?}");
             assert_eq!(root_stats.len(), 1, "{report:?}");
+            assert_eq!(
+                root_stats[0].coverage_complete,
+                matches!(index, 1 | 3),
+                "only the two full recursive passes prove root completion: {report:?}",
+            );
             if index < 3 {
                 dirty.push(root_stats[0].dirty);
             }
@@ -21023,6 +21396,302 @@ mod tests {
         );
         *cpu.lock() = 3.0;
         assert_eq!(limits.walk_stop(), Some(PassStop::Cpu));
+    }
+
+    #[test]
+    fn finite_critical_walks_share_actual_leading_root_opportunities() {
+        let scratch = temp_root_scratch_dir();
+        let roots: Vec<_> = ["hot", "c", "b", "a"]
+            .map(|name| {
+                let root = scratch.path().join(name);
+                std::fs::create_dir_all(root.join("discovered")).unwrap();
+                std::fs::write(root.join("discovered/payload"), name).unwrap();
+                root
+            })
+            .into();
+        let mut request = event_test_request(roots.clone());
+        request.pressure_level = PressureLevel::Critical;
+        request.free_pct = Some(1.0);
+        let heartbeat = ThreadHeartbeat::new("finite-root-turns");
+        let mut order = PressureOrder::default();
+        let mut budget_at = Instant::now();
+        let cpu = Arc::new(Mutex::new(0.0_f64));
+        let mut budget = CpuBudget::new(10, budget_at, 0.0);
+        let mut discovered = BTreeSet::new();
+
+        // A fixed heuristic winner retains alternate turns. Other roots get
+        // real stream leads even when every funded pass stops in its first.
+        for expected in ["a", "hot", "b", "hot", "c", "hot"] {
+            let allowance = budget.pass_cpu_allowance(PressureLevel::Critical);
+            assert_eq!(allowance, Some(crate::daemon::cpu_budget::BURST_SECS));
+            let start = Instant::now();
+            let sample = Arc::clone(&cpu);
+            let guard = PassCpuGuard::new(allowance, start, move || Some(*sample.lock()))
+                .with_sample_interval(Duration::ZERO);
+            let mut limits = PassLimits::new(
+                start,
+                start + Duration::from_mins(5),
+                Duration::from_secs(60),
+                guard,
+            );
+            let (mut stream, cancel, stop) = start_recursive_walk(
+                WalkerConfig {
+                    root_paths: roots.clone(),
+                    max_depth: 10,
+                    follow_symlinks: false,
+                    cross_devices: false,
+                    parallelism: 1,
+                    excluded_paths: HashSet::new(),
+                    opaque_pruning: false,
+                },
+                ProtectionRegistry::marker_only(),
+                &heartbeat,
+                &request,
+                allowance,
+                &mut limits,
+                &mut order,
+            )
+            .unwrap();
+            assert_eq!(stop, None);
+            let first = stream.recv_timeout(WALK_STOP_WAIT).unwrap();
+            let expected_root = scratch.path().join(expected);
+            assert_eq!(first.path.parent(), Some(expected_root.as_path()));
+            discovered.insert(expected_root);
+            assert_eq!(limits.walk_stop(), None);
+            *cpu.lock() += crate::daemon::cpu_budget::BURST_SECS;
+            assert_eq!(limits.walk_stop(), Some(PassStop::Cpu));
+            cancel.store(true, Ordering::Relaxed);
+            assert!(stream.unfinished_after_cancel(WALK_STOP_WAIT).is_some());
+
+            // The next request is unfunded until the production bucket
+            // refills. Such pacing must not consume a recursive opportunity.
+            let _ = budget.observe(budget_at, *cpu.lock());
+            assert_eq!(
+                budget.pass_cpu_allowance(PressureLevel::Critical),
+                Some(0.0),
+            );
+            budget_at += Duration::from_secs(50);
+            let _ = budget.observe(budget_at, *cpu.lock());
+        }
+        assert_eq!(discovered, roots.iter().cloned().collect());
+        assert_eq!(
+            request.paths, roots,
+            "walk fairness must not disturb the persistent pre-scan's scope or order",
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn expired_or_failed_walk_starts_do_not_spend_the_next_root_turn() {
+        let scratch = temp_root_scratch_dir();
+        let roots: Vec<_> = ["hot", "b", "a"]
+            .map(|name| {
+                let root = scratch.path().join(name);
+                std::fs::create_dir_all(root.join("discovered")).unwrap();
+                std::fs::write(root.join("discovered/payload"), name).unwrap();
+                root
+            })
+            .into();
+        let config = || WalkerConfig {
+            root_paths: roots.clone(),
+            max_depth: 10,
+            follow_symlinks: false,
+            cross_devices: false,
+            parallelism: 1,
+            excluded_paths: HashSet::new(),
+            opaque_pruning: false,
+        };
+        let mut request = event_test_request(roots.clone());
+        request.pressure_level = PressureLevel::Critical;
+        let heartbeat = ThreadHeartbeat::new("unstarted-root-turns");
+        let mut order = PressureOrder::default();
+        for expected in [PassStop::Cpu, PassStop::Wall] {
+            let start = Instant::now();
+            let cpu = Arc::new(Mutex::new(0.0_f64));
+            let sample = Arc::clone(&cpu);
+            let guard = PassCpuGuard::new(Some(5.0), start, move || Some(*sample.lock()))
+                .with_sample_interval(Duration::ZERO);
+            let deadline = if expected == PassStop::Wall {
+                start
+            } else {
+                start + Duration::from_mins(5)
+            };
+            let mut limits = PassLimits::new(start, deadline, Duration::from_secs(60), guard);
+            if expected == PassStop::Cpu {
+                // Model a final pre-scan probe consuming the last funded
+                // CPU after the prior checkpoint, before broad discovery.
+                *cpu.lock() = 5.0;
+            }
+            let (mut stream, _, stop) = start_recursive_walk(
+                config(),
+                ProtectionRegistry::marker_only(),
+                &heartbeat,
+                &request,
+                Some(5.0),
+                &mut limits,
+                &mut order,
+            )
+            .unwrap();
+            assert_eq!(stop, Some(expected));
+            assert!(matches!(
+                stream.recv_timeout(Duration::ZERO),
+                Err(RecvTimeoutError::Disconnected)
+            ));
+        }
+
+        let fresh_limits = || {
+            let start = Instant::now();
+            PassLimits::new(
+                start,
+                start + Duration::from_mins(5),
+                Duration::from_secs(60),
+                PassCpuGuard::new(Some(5.0), start, || Some(0.0)),
+            )
+        };
+        let mut invalid = config();
+        invalid
+            .root_paths
+            .push(scratch.path().join("invalid\0root"));
+        assert!(
+            start_recursive_walk(
+                invalid,
+                ProtectionRegistry::marker_only(),
+                &heartbeat,
+                &request,
+                Some(5.0),
+                &mut fresh_limits(),
+                &mut order,
+            )
+            .is_err()
+        );
+        let (stream, _, stop) = start_recursive_walk(
+            config(),
+            ProtectionRegistry::marker_only(),
+            &heartbeat,
+            &request,
+            Some(5.0),
+            &mut fresh_limits(),
+            &mut order,
+        )
+        .unwrap();
+        assert_eq!(stop, None);
+        let entries: Vec<_> = stream.collect();
+        assert_eq!(
+            entries[0].path.parent(),
+            Some(scratch.path().join("a").as_path()),
+            "CPU, wall and startup failures must leave the first opportunity available",
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ordinary_pressure_walk_fairness_does_not_reorder_other_scan_authorities() {
+        let scratch = temp_root_scratch_dir();
+        let roots: Vec<_> = ["hot", "b", "a"]
+            .map(|name| {
+                let root = scratch.path().join(name);
+                std::fs::create_dir_all(root.join("discovered")).unwrap();
+                std::fs::write(root.join("discovered/payload"), name).unwrap();
+                root
+            })
+            .into();
+        let mut request = event_test_request(roots.clone());
+        request.pressure_level = PressureLevel::Critical;
+        let heartbeat = ThreadHeartbeat::new("scoped-root-turns");
+        let mut order = PressureOrder::default();
+        let mut lead = |request: &ScanRequest, allowance: Option<f64>| {
+            let start = Instant::now();
+            let mut limits = PassLimits::new(
+                start,
+                start + Duration::from_mins(5),
+                Duration::from_secs(60),
+                PassCpuGuard::new(allowance, start, || Some(0.0)),
+            );
+            let (stream, _, stop) = start_recursive_walk(
+                WalkerConfig {
+                    root_paths: roots.clone(),
+                    max_depth: 10,
+                    follow_symlinks: false,
+                    cross_devices: false,
+                    parallelism: 1,
+                    excluded_paths: HashSet::new(),
+                    opaque_pruning: false,
+                },
+                ProtectionRegistry::marker_only(),
+                &heartbeat,
+                request,
+                allowance,
+                &mut limits,
+                &mut order,
+            )
+            .unwrap();
+            assert_eq!(stop, None);
+            let entries: Vec<_> = stream.collect();
+            entries[0].path.parent().unwrap().to_path_buf()
+        };
+        assert_eq!(lead(&request, Some(5.0)), scratch.path().join("a"));
+
+        let mut calm = request.clone();
+        calm.pressure_level = PressureLevel::Green;
+        let mut maintenance = request.clone();
+        maintenance.maintenance = true;
+        let mut forced = request.clone();
+        forced.force_full_scan = true;
+        let mut config = Config::default();
+        config.scanner.root_paths = roots.clone();
+        let mut reload = request.clone();
+        reload.config_update = Some((config.scoring.clone(), config.scanner.clone()));
+        let mut selected = request.clone();
+        selected.scan_now = Some(Arc::new(
+            ScanNowScope::capture(&[], false, &config.scanner).unwrap(),
+        ));
+        let mut catalog = request.clone();
+        catalog.catalog_roots = vec![ExpandedCatalogRoot {
+            path: roots[0].clone(),
+            rule: "test-catalog-cache",
+            confidence: cleanup_catalog::CleanupConfidence::Definite,
+            min_age: Duration::ZERO,
+        }];
+        for excluded in [calm, maintenance, forced, reload, selected, catalog] {
+            assert_eq!(lead(&excluded, Some(5.0)), scratch.path().join("hot"));
+        }
+        assert_eq!(lead(&request, None), scratch.path().join("hot"));
+        assert_eq!(lead(&request, Some(5.0)), scratch.path().join("hot"));
+        assert_eq!(lead(&request, Some(5.0)), scratch.path().join("b"));
+        // An active subset never recalls old roots from another mount or
+        // changes the producer's scope. Reload discards only turn history.
+        order.reset();
+        let start = Instant::now();
+        let mut limits = PassLimits::new(
+            start,
+            start + Duration::from_mins(5),
+            Duration::from_secs(60),
+            PassCpuGuard::new(Some(5.0), start, || Some(0.0)),
+        );
+        let active = roots[1].clone();
+        let (stream, _, stop) = start_recursive_walk(
+            WalkerConfig {
+                root_paths: vec![active.clone()],
+                max_depth: 10,
+                follow_symlinks: false,
+                cross_devices: false,
+                parallelism: 1,
+                excluded_paths: HashSet::new(),
+                opaque_pruning: false,
+            },
+            ProtectionRegistry::marker_only(),
+            &heartbeat,
+            &request,
+            Some(5.0),
+            &mut limits,
+            &mut order,
+        )
+        .unwrap();
+        assert_eq!(stop, None);
+        let entries: Vec<_> = stream.collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path.parent(), Some(active.as_path()));
+        assert_eq!(request.paths, roots);
     }
 
     /// The `SBH-2007` budget warning is rate-limited, because a truncated pass

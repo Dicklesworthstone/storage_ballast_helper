@@ -927,6 +927,7 @@ impl DirectoryWalker {
         }
         let (result_tx, result_rx) =
             channel::bounded::<Vec<WalkEntry>>(RESULT_CHANNEL_CAP / WALK_BATCH_ENTRIES);
+        let unfinished = Arc::new(parking_lot::Mutex::new(Vec::new()));
 
         // Seed work queue with root paths.
         for root in &self.config.root_paths {
@@ -938,8 +939,15 @@ impl DirectoryWalker {
             // `follow_symlinks`.
             let meta = match fs::metadata(root) {
                 Ok(m) => m,
-                Err(err) if err.kind() == ErrorKind::NotFound => continue,
-                Err(err) if err.kind() == ErrorKind::PermissionDenied => continue,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::NotFound | ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    unfinished.lock().push(root.clone());
+                    continue;
+                }
                 Err(err) => {
                     return Err(SbhError::Io {
                         path: root.clone(),
@@ -948,6 +956,7 @@ impl DirectoryWalker {
                 }
             };
             if !meta.is_dir() {
+                unfinished.lock().push(root.clone());
                 continue;
             }
             let dev = device_id(&meta);
@@ -965,8 +974,6 @@ impl DirectoryWalker {
             size: self.dir_window,
             starts: oversized_window_starts().lock().clone(),
         });
-        let unfinished = Arc::new(parking_lot::Mutex::new(Vec::new()));
-
         // Clone sender for workers; drop original so channel closes when workers finish.
         for _ in 0..parallelism {
             let work = Arc::clone(&work);
@@ -1128,9 +1135,7 @@ fn process_directory(
         metadata_for_path(dir_path, config.follow_symlinks)
     };
     let Ok(meta) = current else {
-        if expected_metadata.is_some() {
-            results.mark_unfinished(dir_path);
-        }
+        results.mark_unfinished(dir_path);
         return;
     };
     if !meta.is_dir()
@@ -1194,12 +1199,13 @@ fn process_directory(
         return;
     }
 
-    // Read directory entries, gracefully handling permission errors.
+    // Unreadable ground is unfinished, not evidence of an empty subtree.
     let entries = match fs::read_dir(dir_path) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => return,
-        Err(err) if err.kind() == ErrorKind::NotFound => return,
-        Err(_) => return, // Other errors: skip gracefully.
+        Err(_) => {
+            results.mark_unfinished(dir_path);
+            return;
+        }
     };
 
     // State for structural signals (incremental accumulation).
@@ -1208,6 +1214,9 @@ fn process_directory(
     let mut total_count = 0u32;
     let mut content_size: u64 = 0;
     let mut parent_has_node_manifest = false;
+    // The receipt stores paths in a Vec until collection. Collapse any
+    // number of child failures to one unfinished directory for this pass.
+    let mut entries_incomplete = false;
 
     // Collect child directories during iteration; queue them AFTER the loop.
     // This prevents a race where a child dir is queued and processed by another
@@ -1236,6 +1245,7 @@ fn process_directory(
         }
 
         let Ok(entry) = entry_result else {
+            entries_incomplete = true;
             continue;
         };
 
@@ -1311,6 +1321,7 @@ fn process_directory(
         // ─── Type Check & Symlink Handling ───
         // Use file_type() which is often free (cached in directory entry).
         let Ok(ft) = entry.file_type() else {
+            entries_incomplete = true;
             continue;
         };
 
@@ -1324,7 +1335,13 @@ fn process_directory(
         // Determine if we should recurse.
         // If following symlinks, we must stat to see if the target is a dir.
         let is_dir = if config.follow_symlinks && ft.is_symlink() {
-            metadata_for_path(&child_path, true).is_ok_and(|m| m.is_dir())
+            match metadata_for_path(&child_path, true) {
+                Ok(meta) => meta.is_dir(),
+                Err(_) => {
+                    entries_incomplete = true;
+                    continue;
+                }
+            }
         } else {
             ft.is_dir()
         };
@@ -1335,13 +1352,15 @@ fn process_directory(
         // For child dirs: skip (their recursive size will be computed when they
         // are processed as their own WalkEntry). A walk without file sizes
         // skips this (see `DirectoryWalker::without_file_sizes`).
-        if measure_files
-            && !is_dir
-            && let Ok(child_meta) = entry.metadata()
-        {
-            // Allocated blocks, not apparent length (see `allocated_size`):
-            // sparse files must not inflate the directory's reclaim estimate.
-            content_size = content_size.saturating_add(allocated_size(&child_meta));
+        if measure_files && !is_dir {
+            match entry.metadata() {
+                Ok(child_meta) => {
+                    // Allocated blocks, not apparent length (see `allocated_size`):
+                    // sparse files must not inflate the directory's reclaim estimate.
+                    content_size = content_size.saturating_add(allocated_size(&child_meta));
+                }
+                Err(_) => entries_incomplete = true,
+            }
         }
 
         // ─── Collect Child Dirs ───
@@ -1355,8 +1374,8 @@ fn process_directory(
 
     // A listing longer than one window: the next pass takes the next window.
     let next_start = next_window_start(window_start, total_count, windows.size);
-    if next_start.is_some() {
-        // This pass leaves the rest of the listing unexamined.
+    if next_start.is_some() || entries_incomplete {
+        // A window or failed child observation left part of this ground unseen.
         results.mark_unfinished(dir_path);
     }
     if next_start.is_some() || window_start > 0 {
@@ -5499,6 +5518,77 @@ mod tests {
             after_drop < 64,
             "{after_drop} heartbeats after the stream was dropped"
         );
+    }
+
+    #[test]
+    fn skipped_seed_roots_remain_unfinished_after_other_roots_complete() {
+        let tmp = TempDir::new().unwrap();
+        let present = tmp.path().join("present");
+        let candidate = present.join("target");
+        let missing = tmp.path().join("missing");
+        let not_directory = tmp.path().join("not-a-directory");
+        fs::create_dir_all(&candidate).unwrap();
+        fs::write(&not_directory, b"not a directory").unwrap();
+        let mut config = test_config(&present);
+        config.root_paths = vec![missing.clone(), not_directory.clone(), present];
+        let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+        let mut stream = walker.stream().unwrap();
+        let seen: HashSet<_> = stream.by_ref().map(|entry| entry.path).collect();
+        assert!(seen.contains(&candidate));
+        let unfinished: HashSet<_> = stream
+            .unfinished_after_cancel(Duration::ZERO)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(unfinished, HashSet::from([missing, not_directory]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_followed_children_mark_one_directory_without_changing_policy_exclusions() {
+        let tmp = TempDir::new().unwrap();
+        let uncertain = tmp.path().join("uncertain");
+        let healthy = tmp.path().join("healthy");
+        fs::create_dir(&uncertain).unwrap();
+        fs::create_dir(&healthy).unwrap();
+        for index in 0..64 {
+            std::os::unix::fs::symlink(
+                tmp.path().join("absent-target"),
+                uncertain.join(format!("link-{index}")),
+            )
+            .unwrap();
+        }
+
+        for (follow_symlinks, excluded, incomplete) in [
+            (false, false, false),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let mut config = test_config(tmp.path());
+            config.follow_symlinks = follow_symlinks;
+            if excluded {
+                config.excluded_paths.insert(uncertain.clone());
+            }
+            let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only())
+                .without_file_sizes();
+            let mut stream = walker.stream().unwrap();
+            let seen: HashSet<_> = stream.by_ref().map(|entry| entry.path).collect();
+            assert!(seen.contains(&healthy));
+            assert_eq!(seen.contains(&uncertain), !excluded);
+            // Assert the pre-deduplication footprint as well as the public
+            // receipt: 64 failed child probes must retain only one path.
+            let recorded = stream.unfinished.lock().clone();
+            let expected = if incomplete {
+                vec![uncertain.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(recorded, expected);
+            assert_eq!(
+                stream.unfinished_after_cancel(Duration::ZERO).unwrap(),
+                expected
+            );
+        }
     }
 
     /// A directory longer than one processing window is unfinished even when
