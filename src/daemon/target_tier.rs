@@ -2196,7 +2196,11 @@ mod tests {
             let platform = MockPlatform::healthy();
             let pressure = red_pressure();
             let due = probe_root(&root, &platform, &pressure).unwrap();
-            pressure.write().observed_at = Some(Instant::now() - PRESSURE_MAX_AGE);
+            pressure.write().observed_at = Some(
+                Instant::now()
+                    .checked_sub(PRESSURE_MAX_AGE)
+                    .expect("test clock supports expired pressure evidence"),
+            );
             let (del_tx, del_rx) = crossbeam_channel::bounded(1);
             let summary = run_root(
                 &due,

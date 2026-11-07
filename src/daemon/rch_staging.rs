@@ -1588,7 +1588,9 @@ mod tests {
     fn an_old_tick_timestamp_cannot_refresh_expired_admission_evidence() {
         let mut probe = BlockedAdmission::new();
         probe.finish_probe();
-        let expired_start = Instant::now() - ADMISSION_MAX_AGE - Duration::from_secs(1);
+        let expired_start = Instant::now()
+            .checked_sub(ADMISSION_MAX_AGE + Duration::from_secs(1))
+            .expect("expired admission timestamp must be representable");
         probe.tier.probe.as_mut().unwrap().started = expired_start;
         // Simulate a tick captured before unrelated monitor work stalled.
         // Its timestamp says one second elapsed; real monotonic time says

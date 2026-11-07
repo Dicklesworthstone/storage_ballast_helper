@@ -13427,7 +13427,7 @@ fn logging_ram_recheck_due(pressured: bool, last_check: Option<Instant>, now: In
 mod tests {
     use super::*;
     use crate::core::config::Config;
-    use crate::daemon::policy::NotificationPriority;
+    use crate::daemon::policy::{NotificationPriority, PolicyConfig};
     use crate::monitor::pid::PressureLevel;
     use crate::monitor::special_locations::{
         SpecialKind, SpecialLocation, SpecialLocationRegistry,
@@ -13789,7 +13789,7 @@ mod tests {
             }
             let live = RwLock::new(changed);
             let executor = SharedExecutorConfig::new(false, 10, 0.0, 60, 3600, false, 0);
-            let policy = Mutex::new(PolicyEngine::new(Default::default()));
+            let policy = Mutex::new(PolicyEngine::new(PolicyConfig::default()));
             let shutdown = AtomicBool::new(change == "shutdown");
             let report = truncate_daemon_logs(&scanner, 0.0, &live, &executor, &policy, &shutdown);
             assert_eq!(report.files_truncated, 0, "{change}");
@@ -18865,7 +18865,7 @@ mod tests {
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
             None,
-            &Mutex::new(PolicyEngine::new(Default::default())),
+            &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
         );
         logger.shutdown();
         logger_join.join().unwrap();
@@ -18996,7 +18996,7 @@ mod tests {
                 )),
                 &Arc::new(SharedRegret::new(&Config::default())),
                 None,
-                &Mutex::new(PolicyEngine::new(Default::default())),
+                &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
             );
             logger.shutdown();
             logger_join.join().unwrap();
@@ -21557,7 +21557,7 @@ mod tests {
                     &executor_config,
                     &regret,
                     None,
-                    &Mutex::new(PolicyEngine::new(Default::default())),
+                    &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
                 );
             });
             // Do not panic while the worker can be waiting on scan_rx: always
@@ -21822,7 +21822,7 @@ mod tests {
             &executor_config,
             &Arc::new(SharedRegret::new(&config)),
             None,
-            &Mutex::new(PolicyEngine::new(Default::default())),
+            &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
         );
         logger.shutdown();
         logger_join.join().unwrap();
@@ -21941,7 +21941,7 @@ mod tests {
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
             None,
-            &Mutex::new(PolicyEngine::new(Default::default())),
+            &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
         );
 
         assert!(
@@ -22691,7 +22691,7 @@ mod tests {
                 &executor_config,
                 &Arc::new(SharedRegret::new(&config)),
                 None,
-                &Mutex::new(PolicyEngine::new(Default::default())),
+                &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
             );
             logger.shutdown();
             logger_join.join().unwrap();
@@ -22825,7 +22825,7 @@ mod tests {
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
             None,
-            &Mutex::new(PolicyEngine::new(Default::default())),
+            &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
         );
 
         // The pre-scan's batch is dispatched first. The walk may follow with
@@ -22961,7 +22961,7 @@ mod tests {
                 )),
                 &Arc::new(SharedRegret::new(&Config::default())),
                 None,
-                &Mutex::new(PolicyEngine::new(Default::default())),
+                &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
             );
             let mut dispatched = Vec::new();
             while let Ok(batch) = del_rx.try_recv() {
@@ -23214,7 +23214,7 @@ mod tests {
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
             None,
-            &Mutex::new(PolicyEngine::new(Default::default())),
+            &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
         );
 
         let report = report_rx
@@ -23435,7 +23435,7 @@ mod tests {
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
             None,
-            &Mutex::new(PolicyEngine::new(Default::default())),
+            &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
         );
 
         assert!(
@@ -23678,7 +23678,7 @@ mod tests {
                 &executor_config,
                 &Arc::new(SharedRegret::new(&Config::default())),
                 None,
-                &Mutex::new(PolicyEngine::new(Default::default())),
+                &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
             );
             logger.shutdown();
             logger_join.join().unwrap();
@@ -23825,7 +23825,7 @@ mod tests {
                 &executor_config,
                 &Arc::new(SharedRegret::new(&Config::default())),
                 None,
-                &Mutex::new(PolicyEngine::new(Default::default())),
+                &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
             );
             logger.shutdown();
             logger_join.join().unwrap();
@@ -24103,7 +24103,7 @@ mod tests {
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
             None,
-            &Mutex::new(PolicyEngine::new(Default::default())),
+            &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
         );
 
         let report = report_rx
@@ -26616,7 +26616,7 @@ mod tests {
                     )),
                     &Arc::new(SharedRegret::new(&Config::default())),
                     None,
-                    &Mutex::new(PolicyEngine::new(Default::default())),
+                    &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
                 );
             });
             for (path, dirty, catalog) in [
