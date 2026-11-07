@@ -63,6 +63,7 @@ use crate::logger::dual::{
     ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, ScanCompletionTelemetry, spawn_logger,
 };
 use crate::logger::jsonl::JsonlConfig;
+use crate::logger::sqlite::{HistoryPage, HistoryWatermark, SqliteLogger};
 use crate::monitor::burst::BurstStats;
 use crate::monitor::conformal::{ConformalCalibrator, ConformalConfig, TteInterval};
 use crate::monitor::ewma::{DiskRateEstimator, RateEstimate};
@@ -108,7 +109,8 @@ use crate::scanner::prescan_cursor::PrescanCursor;
 use crate::scanner::protection::{self, ProtectionRegistry};
 use crate::scanner::quarantine::{QuarantineStore, SweepMode as QuarantineSweepMode};
 use crate::scanner::regret::{
-    EntryIdentity, RegretCalibrator, RegretConfig, RegretDetector, ScoringHistory, Watch,
+    EntryIdentity, HistoryAdmission, REGRET_EVIDENCE_WINDOW, RegretCalibrator, RegretConfig,
+    RegretDetector, Watch,
 };
 use crate::scanner::scoring::{
     ActiveReferenceSummary, ArtifactCertainty, CACHE_REDELETION_MEMORY, CandidacyScore,
@@ -473,6 +475,163 @@ impl SharedExecutorConfig {
 
 // ──────────────────── regret labels (Q4) ────────────────────
 
+/// Poll persisted manual-cleanup evidence on the scanner, away from the
+/// monitor's pressure/deletion deadlines. Catch-up stays bounded per poll.
+const REGRET_HISTORY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const REGRET_HISTORY_CATCHUP_INTERVAL: Duration = Duration::from_secs(1);
+const REGRET_HISTORY_PAGE_LIMIT: u32 = 256;
+const REGRET_HISTORY_PAGES_PER_POLL: usize = 2;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    created_at: Option<SystemTime>,
+}
+
+impl HistoryFileIdentity {
+    fn read(path: &Path) -> std::io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                created_at: metadata.created().ok(),
+            })
+        }
+    }
+}
+
+struct LiveRegretHistory {
+    path: PathBuf,
+    epoch: u64,
+    identity: Option<HistoryFileIdentity>,
+    watermark: HistoryWatermark,
+    frontier: HistoryWatermark,
+    initialized: bool,
+    replay_until: Option<HistoryWatermark>,
+    next_poll: Option<Instant>,
+    in_flight: bool,
+    admission: HistoryAdmission,
+}
+
+impl LiveRegretHistory {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            epoch: 0,
+            identity: None,
+            watermark: HistoryWatermark::default(),
+            frontier: HistoryWatermark::default(),
+            initialized: false,
+            replay_until: None,
+            next_poll: None,
+            in_flight: false,
+            admission: HistoryAdmission::default(),
+        }
+    }
+
+    fn set_path(&mut self, path: &Path) {
+        if self.path != path {
+            self.path = path.to_path_buf();
+            self.epoch = self.epoch.wrapping_add(1);
+            self.identity = None;
+            self.watermark = HistoryWatermark::default();
+            self.frontier = HistoryWatermark::default();
+            self.initialized = false;
+            self.replay_until = None;
+            self.next_poll = None;
+            self.in_flight = false;
+        }
+    }
+}
+
+struct HistoryReadPlan {
+    path: PathBuf,
+    epoch: u64,
+    identity: Option<HistoryFileIdentity>,
+    watermark: HistoryWatermark,
+    frontier: HistoryWatermark,
+    initialized: bool,
+}
+
+struct HistoryReadBatch {
+    identity: HistoryFileIdentity,
+    new_generation: bool,
+    pages: Vec<HistoryPage>,
+}
+
+fn history_since(now: SystemTime, window: Duration) -> String {
+    chrono::DateTime::<chrono::Utc>::from(
+        now.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH),
+    )
+    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// No shared evidence lock is held while opening or querying the ledger.
+/// If it changes underneath a read, nothing from that read is published.
+fn read_history_pages(plan: &HistoryReadPlan, now: SystemTime) -> Option<HistoryReadBatch> {
+    let identity = HistoryFileIdentity::read(&plan.path).ok()?;
+    let new_generation = !plan.initialized || plan.identity.as_ref() != Some(&identity);
+    let mut watermark = if new_generation {
+        HistoryWatermark::default()
+    } else {
+        plan.watermark
+    };
+    let mut observed_frontier = if new_generation {
+        HistoryWatermark::default()
+    } else {
+        plan.frontier
+    };
+    let db = SqliteLogger::open_history_reader(&plan.path).ok()?;
+    let outcome_since = history_since(now, REGRET_EVIDENCE_WINDOW);
+    let receipt_since = history_since(now, CACHE_REDELETION_MEMORY + Duration::from_secs(2));
+    let mut pages = Vec::with_capacity(REGRET_HISTORY_PAGES_PER_POLL);
+    for _ in 0..REGRET_HISTORY_PAGES_PER_POLL {
+        let mut page = db
+            .history_page(
+                watermark,
+                &outcome_since,
+                &receipt_since,
+                REGRET_HISTORY_PAGE_LIMIT,
+            )
+            .ok()?;
+        page.reset = page.reset
+            || page.frontier.activity_id < observed_frontier.activity_id
+            || page.frontier.outcome_id < observed_frontier.outcome_id;
+        observed_frontier = page.frontier;
+        if page.reset {
+            // A same-inode truncation can reset AUTOINCREMENT without a
+            // rename. Discard earlier pages from this read and rebase later.
+            pages.clear();
+        }
+        let done = page.reset || !page.more;
+        watermark = page.watermark;
+        pages.push(page);
+        if done {
+            break;
+        }
+    }
+    if HistoryFileIdentity::read(&plan.path).ok()? != identity {
+        return None;
+    }
+    Some(HistoryReadBatch {
+        identity,
+        new_generation,
+        pages,
+    })
+}
+
 /// The regret detector the executor feeds and the tick resolves, and the
 /// calibrator whose per-category view the scanner applies before scoring.
 struct SharedRegret {
@@ -482,6 +641,8 @@ struct SharedRegret {
     /// re-deletion backoff (bd-tz67). The category preserves structural Go
     /// cache recognition; pruned past [`CACHE_REDELETION_MEMORY`].
     cache_deletions: Mutex<Vec<(PathBuf, ArtifactCategory, SystemTime)>>,
+    current_run_id: Option<String>,
+    history: Mutex<LiveRegretHistory>,
 }
 
 impl SharedRegret {
@@ -491,7 +652,137 @@ impl SharedRegret {
             detector: Mutex::new(RegretDetector::new(regret.window)),
             calibrator: Mutex::new(RegretCalibrator::new(regret)),
             cache_deletions: Mutex::new(Vec::new()),
+            current_run_id: None,
+            history: Mutex::new(LiveRegretHistory::new(config.paths.sqlite_db.clone())),
         }
+    }
+
+    fn with_run_id(mut self, run_id: String) -> Self {
+        self.current_run_id = (!run_id.is_empty()).then_some(run_id);
+        self
+    }
+
+    fn is_current_run(&self, run_id: Option<&str>) -> bool {
+        self.current_run_id
+            .as_deref()
+            .is_some_and(|current| run_id == Some(current))
+    }
+
+    fn begin_history_read(&self, now: Instant, force: bool) -> Option<HistoryReadPlan> {
+        let mut history = self.history.lock();
+        if history.in_flight
+            || (!force && history.next_poll.is_some_and(|next| now < next))
+        {
+            return None;
+        }
+        history.in_flight = true;
+        history.next_poll = Some(now + REGRET_HISTORY_POLL_INTERVAL);
+        Some(HistoryReadPlan {
+            path: history.path.clone(),
+            epoch: history.epoch,
+            identity: history.identity.clone(),
+            watermark: history.watermark,
+            frontier: history.frontier,
+            initialized: history.initialized,
+        })
+    }
+
+    /// Apply only new external occurrences. The current writer's rows
+    /// are applied directly by the unlink and observation hooks.
+    /// Historical backfill adjusts counts without replaying old alarms.
+    fn admit_history_page(
+        &self,
+        history: &mut LiveRegretHistory,
+        page: HistoryPage,
+        now_wall: SystemTime,
+        now: Instant,
+    ) -> usize {
+        let mut admitted = 0;
+        for record in page.receipts {
+            if !self.is_current_run(record.run_id.as_deref())
+                && history.admission.admit_receipt(record.value, now_wall)
+            {
+                admitted += 1;
+            }
+        }
+        let mut calibrator = self.calibrator.lock();
+        for record in page.outcomes {
+            if self.is_current_run(record.run_id.as_deref()) {
+                continue;
+            }
+            let Some(observation) = history.admission.admit_outcome(record.value, now_wall) else {
+                continue;
+            };
+            if history
+                .replay_until
+                .is_some_and(|frontier| record.row_id <= frontier.outcome_id)
+            {
+                calibrator.replay_observation(&observation, now_wall);
+            } else {
+                calibrator.record_observation(&observation, now_wall, now);
+            }
+            admitted += 1;
+        }
+        calibrator.expire(now_wall);
+        history.admission.expire(now_wall);
+        history.watermark = page.watermark;
+        history.frontier = page.frontier;
+        if history.replay_until.is_some_and(|frontier| {
+            page.watermark.activity_id >= frontier.activity_id
+                && page.watermark.outcome_id >= frontier.outcome_id
+        }) {
+            history.replay_until = None;
+        }
+        admitted
+    }
+
+    fn refresh_history(&self) {
+        self.refresh_history_at(Instant::now(), SystemTime::now());
+    }
+
+    fn refresh_history_at(&self, now: Instant, now_wall: SystemTime) -> usize {
+        let Some(plan) = self.begin_history_read(now, false) else {
+            return 0;
+        };
+        let read = read_history_pages(&plan, now_wall);
+        let mut history = self.history.lock();
+        // A reload can select another ledger while SQLite is blocked.
+        // Its epoch owns its own pending read; do not clear that state.
+        if history.epoch != plan.epoch {
+            return 0;
+        }
+        history.in_flight = false;
+        let Some(read) = read else {
+            return 0;
+        };
+        if read.pages.iter().any(|page| page.reset) {
+            history.identity = None;
+            history.watermark = HistoryWatermark::default();
+            history.frontier = HistoryWatermark::default();
+            history.initialized = false;
+            history.replay_until = None;
+            history.next_poll = Some(now + REGRET_HISTORY_CATCHUP_INTERVAL);
+            return 0;
+        }
+        if read.new_generation {
+            history.admission.begin_generation();
+            history.replay_until = read.pages.first().map(|page| page.frontier);
+            history.identity = Some(read.identity);
+            history.initialized = true;
+        }
+        let more = read.pages.last().is_some_and(|page| page.more);
+        let mut admitted = 0;
+        for page in read.pages {
+            admitted += self.admit_history_page(&mut history, page, now_wall, now);
+        }
+        history.next_poll = Some(
+            now + if more {
+                REGRET_HISTORY_CATCHUP_INTERVAL
+            } else {
+                REGRET_HISTORY_POLL_INTERVAL
+            },
+        );
+        admitted
     }
 
     /// sbh's earlier deletions of each warm-cache path still inside
@@ -502,12 +793,18 @@ impl SharedRegret {
             !now.duration_since(*deleted_at)
                 .is_ok_and(|age| age > CACHE_REDELETION_MEMORY)
         });
-        cache_redeletion_counts(
+        let mut counts = cache_redeletion_counts(
             deletions
                 .iter()
                 .map(|(path, category, deleted_at)| (path, *category, *deleted_at)),
             now,
-        )
+        );
+        drop(deletions);
+        for (path, count) in self.history.lock().admission.cache_redeletions(now) {
+            let own = counts.entry(path).or_default();
+            *own = own.saturating_add(count);
+        }
+        counts
     }
 
     /// Reconfigure both feedback components while retaining pending
@@ -521,6 +818,7 @@ impl SharedRegret {
         // Publish the paired update before releasing either guard. Retain the
         // original reverse acquisition order while making the release explicit.
         drop((calibrator, detector));
+        self.history.lock().set_path(&config.paths.sqlite_db);
     }
 
     /// The scoring engine's view: a calibration factor per category and
@@ -565,22 +863,26 @@ impl SharedRegret {
     fn watch_unlinked(
         &self,
         candidate: &CandidacyScore,
-        identity: &EntryIdentity,
+        identity: Option<&EntryIdentity>,
         completed_at: Instant,
     ) {
-        let watch = Watch {
-            decision_id: crate::scanner::decision_record::stable_decision_id(
-                &candidate.path,
-                candidate.identity,
-                candidate.size_bytes,
-            ),
-            path: candidate.path.clone(),
-            identity: identity.clone(),
-            category: format!("{:?}", candidate.classification.category),
-            certainty: candidate.decision.certainty,
-            deleted_at: completed_at,
-        };
-        self.detector.lock().watch(watch);
+        if let Some(identity) = identity {
+            let watch = Watch {
+                decision_id: crate::scanner::decision_record::stable_decision_id(
+                    &candidate.path,
+                    candidate.identity,
+                    candidate.size_bytes,
+                ),
+                path: candidate.path.clone(),
+                identity: identity.clone(),
+                category: format!("{:?}", candidate.classification.category),
+                certainty: candidate.decision.certainty,
+                deleted_at: completed_at,
+            };
+            self.detector.lock().watch(watch);
+        }
+        // Successful permanent removal counts even when a detector identity
+        // could not be captured; the current writer's persisted copy is skipped.
         if is_warm_cache(&candidate.path, candidate.classification.category) {
             self.cache_deletions.lock().push((
                 candidate.path.clone(),
@@ -601,18 +903,57 @@ fn regret_config(config: &Config) -> RegretConfig {
     }
 }
 
-/// Rebuild the regret calibrator from the last 30 days of stored outcomes
-/// (daemon start); suspensions are not replayed.
+/// Restore the startup evidence and its exact row frontier in one SQLite
+/// snapshot. Later polling starts after that frontier, so a manual cleanup
+/// between startup and the first scan is neither skipped nor counted twice.
 fn replay_regret_outcomes(regret: &SharedRegret, sqlite_db: &Path) {
-    let history = ScoringHistory::load(sqlite_db);
-    let count = history.outcomes.len();
-    regret.cache_deletions.lock().extend(history.cache_deletions);
-    regret
-        .calibrator
-        .lock()
-        .replay(history.outcomes, SystemTime::now());
-    if count > 0 {
-        eprintln!("[SBH-REGRET] replayed {count} stored outcome(s) into the category calibrator");
+    regret.history.lock().set_path(sqlite_db);
+    let now = Instant::now();
+    let now_wall = SystemTime::now();
+    let Some(plan) = regret.begin_history_read(now, true) else {
+        return;
+    };
+    let restored = (|| {
+        let identity = HistoryFileIdentity::read(&plan.path).ok()?;
+        let db = SqliteLogger::open_history_reader(&plan.path).ok()?;
+        let snapshot = db
+            .history_snapshot(
+                &history_since(now_wall, REGRET_EVIDENCE_WINDOW),
+                &history_since(
+                    now_wall,
+                    CACHE_REDELETION_MEMORY + Duration::from_secs(2),
+                ),
+            )
+            .ok()?;
+        if HistoryFileIdentity::read(&plan.path).ok()? != identity {
+            return None;
+        }
+        Some((identity, snapshot))
+    })();
+    let mut history = regret.history.lock();
+    if history.epoch != plan.epoch {
+        return;
+    }
+    history.in_flight = false;
+    let Some((identity, snapshot)) = restored else {
+        return;
+    };
+    history.admission.begin_generation();
+    history.identity = Some(identity);
+    history.initialized = true;
+    history.replay_until = Some(snapshot.watermark);
+    let page = HistoryPage {
+        watermark: snapshot.watermark,
+        frontier: snapshot.watermark,
+        receipts: snapshot.receipts,
+        outcomes: snapshot.outcomes,
+        more: false,
+        reset: false,
+    };
+    let admitted = regret.admit_history_page(&mut history, page, now_wall, now);
+    drop(history);
+    if admitted > 0 {
+        eprintln!("[SBH-REGRET] restored {admitted} stored scoring evidence record(s)");
     }
 }
 
@@ -3432,6 +3773,8 @@ struct PassLimits {
     prescan_deadline: Instant,
     /// Measured CPU allowance for the whole pass.
     cpu: PassCpuGuard,
+    history: Option<Arc<SharedRegret>>,
+    history_poll_at: Instant,
 }
 
 impl PassLimits {
@@ -3452,13 +3795,37 @@ impl PassLimits {
             deadline,
             prescan_deadline,
             cpu,
+            history: None,
+            history_poll_at: scan_start,
         }
+    }
+
+    fn with_history(mut self, history: Arc<SharedRegret>) -> Self {
+        self.history = Some(history);
+        self
+    }
+
+    /// These budget checkpoints run on the scanner, including idle walker
+    /// timeouts. A cheap clock gate keeps ledger polling out of per-entry
+    /// work; the reader also enforces its normal five-second cadence.
+    fn refresh_history(&mut self, now: Instant) -> Instant {
+        if now < self.history_poll_at {
+            return now;
+        }
+        self.history_poll_at = now + REGRET_HISTORY_CATCHUP_INTERVAL;
+        if let Some(history) = &self.history {
+            history.refresh_history();
+            // A read can consume wall/CPU budget. Test the limits against
+            // completion time so it cannot grant another stale allowance.
+            return Instant::now();
+        }
+        now
     }
 
     /// Whether the priority pre-scan must stop now, and which limit says so.
     /// The pass-ending limits are checked first so their verdict wins.
     fn prescan_stop(&mut self) -> Option<PassStop> {
-        let now = Instant::now();
+        let now = self.refresh_history(Instant::now());
         if now >= self.deadline {
             return Some(PassStop::Wall);
         }
@@ -3476,7 +3843,7 @@ impl PassLimits {
 
     /// Whether the general walk must stop now, and which limit says so.
     fn walk_stop(&mut self) -> Option<PassStop> {
-        let now = Instant::now();
+        let now = self.refresh_history(Instant::now());
         if now >= self.deadline {
             return Some(PassStop::Wall);
         }
@@ -4094,7 +4461,7 @@ impl MonitoringDaemon {
 
         // Regret labels: rebuilt from the ledger so calibration survives a
         // restart.
-        let regret = Arc::new(SharedRegret::new(&config));
+        let regret = Arc::new(SharedRegret::new(&config).with_run_id(run_id.clone()));
         replay_regret_outcomes(&regret, &config.paths.sqlite_db);
 
         // 11. Self-monitor (writes state.json for CLI, tracks health).
@@ -9285,6 +9652,10 @@ fn scanner_thread_main(
             break;
         }
 
+        // Bounded ledger reads run here even when there is no scan request.
+        // The monitor never waits on SQLite or filesystem history reads.
+        regret.refresh_history();
+
         let (ready_request, mut operator_claim) =
             ready_scanner_request(scan_rx, scan_now_queue, &mut deferred_routine);
         let request_from_events;
@@ -9816,7 +10187,8 @@ fn scanner_thread_main(
             scan_deadline,
             Duration::from_secs(current_scanner_config.prescan_time_budget_secs),
             PassCpuGuard::new(budget_allowance, scan_start, current_scan_cpu_secs),
-        );
+        )
+        .with_history(Arc::clone(regret));
 
         // Track total candidates found (priority pre-scan + general walker).
         let mut candidates_found = 0;
@@ -12418,9 +12790,11 @@ fn executor_thread_main(
             if let Some(relief) = &batch.inode_reclaim {
                 relief.record_unlinked();
             }
-            if let Some(identity) = watch_identities.get(&candidate.path) {
-                regret.watch_unlinked(candidate, identity, completed_at);
-            }
+            regret.watch_unlinked(
+                candidate,
+                watch_identities.get(&candidate.path),
+                completed_at,
+            );
         };
         let report = executor.execute_with_hooks(
             &plan,
@@ -15462,7 +15836,7 @@ mod tests {
         for candidate in [&cache, &pool, &named_only] {
             regret.watch_unlinked(
                 candidate,
-                &EntryIdentity::of(&candidate.path).unwrap(),
+                Some(&EntryIdentity::of(&candidate.path).unwrap()),
                 Instant::now(),
             );
         }
@@ -15572,6 +15946,337 @@ mod tests {
                 "decision_id={decision_id};category=GoCache;completed_at={timestamp}"
             )),
         }
+    }
+
+    fn persisted_regret_outcome(
+        path: &str,
+        decision_id: &str,
+        observed_at: SystemTime,
+    ) -> crate::scanner::regret::DecisionOutcome {
+        crate::scanner::regret::DecisionOutcome {
+            decision_id: decision_id.to_string(),
+            path: PathBuf::from(path),
+            category: "GoCache".to_string(),
+            certainty: "definite".to_string(),
+            outcome: Outcome::Regret,
+            observed_at: observed_at
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            after_secs: 0,
+            detail: "manual cleanup observation".to_string(),
+        }
+    }
+
+    #[test]
+    fn live_regret_history_imports_manual_work_and_excludes_its_own_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("activity.sqlite3");
+        let mut config = Config::default();
+        config.paths.sqlite_db.clone_from(&db_path);
+        let db = SqliteLogger::open(&db_path).unwrap();
+        let regret = SharedRegret::new(&config).with_run_id("this-daemon".to_string());
+        replay_regret_outcomes(&regret, &db_path);
+        let now = SystemTime::now();
+        let tick = Instant::now() + REGRET_HISTORY_POLL_INTERVAL;
+        let manual_path = "/manual/structural-go-cache";
+        let own_path = "/daemon/structural-go-cache";
+        let mut own = test_candidate(own_path, 0.95);
+        own.classification.category = ArtifactCategory::GoCache;
+        // An absent detector identity must not lose direct cache accounting.
+        regret.watch_unlinked(&own, None, tick);
+        assert_eq!(regret.cache_redeletions(now).get(&own.path), Some(&1));
+        assert_eq!(regret.detector.lock().pending(), 0);
+        let own_outcome = persisted_regret_outcome(own_path, "0123456789ac", now);
+        regret.calibrator.lock().record_observation(
+            &own_outcome.observation().unwrap(),
+            now,
+            tick,
+        );
+        db.log_activity_for_run(
+            &cache_receipt_row(own_path, "0123456789ac", now),
+            Some("this-daemon"),
+        )
+        .unwrap();
+        db.log_outcome_for_run(&own_outcome, Some("this-daemon"))
+            .unwrap();
+
+        let receipt = cache_receipt_row(manual_path, "0123456789ab", now);
+        let outcome = persisted_regret_outcome(manual_path, "0123456789ab", now);
+        db.log_activity(&receipt).unwrap();
+        db.log_outcome(&outcome).unwrap();
+        assert_eq!(regret.refresh_history_at(tick, now), 2);
+        let counts = regret.cache_redeletions(now);
+        assert_eq!(counts.get(Path::new(manual_path)), Some(&1));
+        assert_eq!(counts.get(Path::new(own_path)), Some(&1));
+        assert_eq!(regret.calibrator.lock().summary("GoCache").unwrap().decisions, 2);
+        assert_eq!(regret.detector.lock().pending(), 0);
+        assert_eq!(
+            regret.refresh_history_at(tick + REGRET_HISTORY_POLL_INTERVAL, now),
+            0,
+        );
+
+        // Two byte-identical persisted occurrences are distinct deletions;
+        // a set of fingerprints would incorrectly collapse the second one.
+        db.log_activity_for_run(&receipt, Some("another-daemon")).unwrap();
+        db.log_outcome_for_run(&outcome, Some("another-daemon")).unwrap();
+        assert_eq!(
+            regret.refresh_history_at(tick + REGRET_HISTORY_POLL_INTERVAL * 2, now),
+            2,
+        );
+        assert_eq!(regret.cache_redeletions(now).get(Path::new(manual_path)), Some(&2));
+        assert_eq!(regret.calibrator.lock().summary("GoCache").unwrap().decisions, 3);
+        assert!(
+            regret.calibrator.lock().suspended(
+                "GoCache",
+                tick + REGRET_HISTORY_POLL_INTERVAL * 2,
+            ),
+            "new external outcomes must advance the live alarm",
+        );
+
+        // Stable decision IDs can recur after inode reuse; completion time
+        // distinguishes the later physical removal.
+        let later = now + Duration::from_secs(10);
+        db.log_activity(&cache_receipt_row(manual_path, "0123456789ab", later))
+            .unwrap();
+        db.log_outcome(&persisted_regret_outcome(manual_path, "0123456789ab", later))
+            .unwrap();
+        assert_eq!(
+            regret.refresh_history_at(tick + REGRET_HISTORY_POLL_INTERVAL * 3, later),
+            2,
+        );
+        assert_eq!(regret.cache_redeletions(later).get(Path::new(manual_path)), Some(&3));
+        assert_eq!(regret.calibrator.lock().summary("GoCache").unwrap().decisions, 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn live_regret_history_bounds_replay_and_survives_replacement_and_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("activity.sqlite3");
+        let mut config = Config::default();
+        config.paths.sqlite_db.clone_from(&db_path);
+        let regret = SharedRegret::new(&config).with_run_id("this-daemon".to_string());
+        let now = SystemTime::now();
+        let tick = Instant::now();
+        assert_eq!(regret.refresh_history_at(tick, now), 0);
+        assert!(!db_path.exists(), "history reads must not create a missing ledger");
+        {
+            let mut calibrator = regret.calibrator.lock();
+            for _ in 0..3 {
+                calibrator.record(
+                    "ExistingAlarm",
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    tick,
+                );
+            }
+        }
+        let alarm_deadline = tick + regret.calibrator.lock().config().suspend;
+        let path = "/manual/paged-go-cache";
+        {
+            let db = SqliteLogger::open(&db_path).unwrap();
+            for index in 0..600 {
+                db.log_activity(&cache_receipt_row(path, &format!("{index:012x}"), now))
+                    .unwrap();
+            }
+            for index in 0..3 {
+                db.log_outcome(&persisted_regret_outcome(path, &format!("{index:012x}"), now))
+                    .unwrap();
+            }
+        }
+        let first = tick + REGRET_HISTORY_POLL_INTERVAL;
+        regret.refresh_history_at(first, now);
+        assert_eq!(regret.cache_redeletions(now).get(Path::new(path)), Some(&512));
+        assert_eq!(regret.history.lock().watermark.activity_id, 512);
+        assert_eq!(regret.refresh_history_at(first, now), 0, "catch-up is paced");
+        regret.refresh_history_at(first + REGRET_HISTORY_CATCHUP_INTERVAL, now);
+        assert_eq!(regret.cache_redeletions(now).get(Path::new(path)), Some(&600));
+        {
+            let calibrator = regret.calibrator.lock();
+            assert_eq!(calibrator.summary("GoCache").unwrap().decisions, 3);
+            assert!(!calibrator.suspended("GoCache", first));
+            assert!(calibrator.suspended("ExistingAlarm", alarm_deadline - Duration::from_secs(1)));
+            assert!(!calibrator.suspended("ExistingAlarm", alarm_deadline));
+        }
+
+        // A rotated/restored copy can reuse every row ID. Its new inode
+        // starts bounded reconciliation without multiplying retained evidence.
+        let replacement = directory.path().join("replacement.sqlite3");
+        std::fs::copy(&db_path, &replacement).unwrap();
+        std::fs::rename(&replacement, &db_path).unwrap();
+        let replaced = first + REGRET_HISTORY_POLL_INTERVAL * 2;
+        regret.refresh_history_at(replaced, now);
+        regret.refresh_history_at(replaced + REGRET_HISTORY_CATCHUP_INTERVAL, now);
+        assert_eq!(regret.cache_redeletions(now).get(Path::new(path)), Some(&600));
+        assert_eq!(regret.calibrator.lock().summary("GoCache").unwrap().decisions, 3);
+
+        let moved = directory.path().join("configured-history.sqlite3");
+        std::fs::copy(&db_path, &moved).unwrap();
+        {
+            let db = SqliteLogger::open(&moved).unwrap();
+            db.log_activity(&cache_receipt_row(path, "000000000258", now))
+                .unwrap();
+            db.log_outcome(&persisted_regret_outcome(path, "000000000258", now))
+                .unwrap();
+        }
+        config.paths.sqlite_db = moved;
+        regret.update_config(&config);
+        let reloaded = replaced + REGRET_HISTORY_POLL_INTERVAL * 2;
+        regret.refresh_history_at(reloaded, now);
+        regret.refresh_history_at(reloaded + REGRET_HISTORY_CATCHUP_INTERVAL, now);
+        assert_eq!(regret.cache_redeletions(now).get(Path::new(path)), Some(&601));
+        let calibrator = regret.calibrator.lock();
+        assert_eq!(calibrator.summary("GoCache").unwrap().decisions, 4);
+        assert!(!calibrator.suspended("GoCache", reloaded));
+        assert!(calibrator.suspended("ExistingAlarm", alarm_deadline - Duration::from_secs(1)));
+        assert!(!calibrator.suspended("ExistingAlarm", alarm_deadline));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_scan_checkpoints_ingest_external_alarms_without_restarting_the_pass() {
+        for prescan in [true, false] {
+            let mut fixture = RegretDaemonFixture::new();
+            // Initialization starts the logger asynchronously. Establish an
+            // empty evidence frontier before creating the active pass.
+            fixture.flush_logger();
+            {
+                let _db = SqliteLogger::open(&fixture.daemon.config.paths.sqlite_db).unwrap();
+            }
+            replay_regret_outcomes(
+                &fixture.daemon.regret,
+                &fixture.daemon.config.paths.sqlite_db,
+            );
+            assert!(fixture.daemon.regret.history.lock().initialized);
+            let start = Instant::now();
+            let mut limits = PassLimits::new(
+                start,
+                start + Duration::from_mins(2),
+                Duration::from_mins(1),
+                PassCpuGuard::unlimited(start),
+            )
+            .with_history(Arc::clone(&fixture.daemon.regret));
+            assert_eq!(limits.prescan_stop(), None);
+            let path = "/manual/active-pass-go-cache";
+            let now = SystemTime::now();
+            {
+                let db = SqliteLogger::open(&fixture.daemon.config.paths.sqlite_db).unwrap();
+                for index in 0..3 {
+                    db.log_outcome(&persisted_regret_outcome(path, &format!("{index:012x}"), now))
+                        .unwrap();
+                }
+            }
+            assert!(fixture.daemon.regret.calibrator.lock().summary("GoCache").is_none());
+            // Move only scheduling clocks, without sleeping or replacing the
+            // already-running pass and its captured scoring view.
+            let due = Instant::now();
+            fixture.daemon.regret.history.lock().next_poll = Some(due);
+            limits.history_poll_at = due;
+            let stop = if prescan {
+                limits.prescan_stop()
+            } else {
+                limits.walk_stop()
+            };
+            assert_eq!(stop, None);
+            assert_eq!(
+                fixture.daemon.regret.calibrator.lock().summary("GoCache").unwrap().decisions,
+                3,
+            );
+            let mut candidate = test_candidate(path, 0.95);
+            candidate.classification.category = ArtifactCategory::GoCache;
+            assert_eq!(
+                fixture
+                    .daemon
+                    .regret
+                    .authorize_deletion(&candidate, &fixture.daemon.logger_handle),
+                Err(SkipReason::CategorySuspended),
+            );
+
+            // A second candidate checkpoint cannot reopen the ledger before
+            // the local polling gate, even when the shared reader is due.
+            {
+                let db = SqliteLogger::open(&fixture.daemon.config.paths.sqlite_db).unwrap();
+                db.log_outcome(&persisted_regret_outcome(path, "000000000003", now))
+                    .unwrap();
+            }
+            fixture.daemon.regret.history.lock().next_poll = None;
+            limits.history_poll_at = Instant::now() + Duration::from_mins(1);
+            assert_eq!(limits.prescan_stop(), None);
+            assert_eq!(limits.walk_stop(), None);
+            assert_eq!(
+                fixture.daemon.regret.calibrator.lock().summary("GoCache").unwrap().decisions,
+                3,
+            );
+            limits.deadline = Instant::now();
+            assert_eq!(limits.prescan_stop(), Some(PassStop::Wall));
+            assert_eq!(limits.walk_stop(), Some(PassStop::Wall));
+            fixture.flush_logger();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_scanner_ingests_manual_cleanup_without_a_new_scan_or_restart() {
+        let mut fixture = RegretDaemonFixture::new();
+        let (scan_tx, scan_rx) = bounded(SCANNER_CHANNEL_CAP);
+        let (del_tx, del_rx) = bounded(EXECUTOR_CHANNEL_CAP);
+        let (report_tx, report_rx) = bounded(REPORT_CHANNEL_CAP);
+        let (_feedback_tx, feedback_rx) = bounded(EXECUTOR_CHANNEL_CAP);
+        let worker = fixture
+            .daemon
+            .spawn_scanner_thread(
+                scan_rx,
+                del_tx,
+                fixture.daemon.logger_handle.clone(),
+                Arc::clone(&fixture.daemon.scanner_heartbeat),
+                report_tx,
+                feedback_rx,
+            )
+            .unwrap();
+        let path = "/manual/idle-worker-go-cache";
+        {
+            let db = SqliteLogger::open(&fixture.daemon.config.paths.sqlite_db).unwrap();
+            let now = SystemTime::now();
+            db.log_activity(&cache_receipt_row(path, "0123456789ab", now))
+                .unwrap();
+            db.log_outcome(&persisted_regret_outcome(path, "0123456789ab", now))
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let observed = loop {
+            if fixture
+                .daemon
+                .regret
+                .cache_redeletions(SystemTime::now())
+                .get(Path::new(path))
+                == Some(&1)
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        fixture
+            .daemon
+            .signal_handler
+            .shutdown_token()
+            .store(true, Ordering::Release);
+        drop(scan_tx);
+        worker.join().unwrap();
+        fixture.flush_logger();
+
+        assert!(observed, "the running idle scanner must refresh persisted manual work");
+        assert!(report_rx.try_recv().is_err(), "no scan request was submitted");
+        assert!(del_rx.try_recv().is_err());
+        assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
+        assert_eq!(
+            fixture.daemon.regret.calibrator.lock().summary("GoCache").unwrap().decisions,
+            1,
+        );
     }
 
     /// The old startup path reads only outcomes, so it loses this cache's
@@ -18367,7 +19072,7 @@ mod tests {
                 assert!(!candidate.path.exists());
                 fixture.daemon.regret.watch_unlinked(
                     candidate,
-                    &identities[&candidate.path],
+                    Some(&identities[&candidate.path]),
                     completed_at,
                 );
                 if candidate.path == first {

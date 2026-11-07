@@ -190,23 +190,351 @@ impl ScoringHistory {
     }
 }
 
+/// Read-only import bookkeeping for persisted scoring evidence.
+///
+/// Each fingerprint retains the greatest multiplicity seen in one source
+/// generation. Re-reading a copied ledger does not duplicate its effects, but
+/// separate identical rows in that ledger still represent separate events.
+/// The daemon filters its own run's writes before admission.
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Default)]
+pub struct HistoryAdmission {
+    generation: u64,
+    receipts: BTreeMap<SystemTime, HashMap<ReceiptFingerprint, SourceMultiplicity>>,
+    outcomes: BTreeMap<SystemTime, HashMap<OutcomeFingerprint, SourceMultiplicity>>,
+    cache_groups: HashMap<(String, String), CacheHistoryGroup>,
+    cache_expiry: BTreeMap<SystemTime, HashSet<(String, String)>>,
+}
+
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReceiptFingerprint {
+    decision_id: String,
+    path: String,
+    // Category is hydrated from decision_log for legacy receipts. Its
+    // availability can change when that table is pruned or copied, without
+    // changing the successful mutation this fingerprint identifies.
+    recorded_at: SystemTime,
+    completed_at: Option<SystemTime>,
+}
+
+#[cfg(feature = "sqlite")]
+impl From<&crate::logger::sqlite::StoredDeletion> for ReceiptFingerprint {
+    fn from(receipt: &crate::logger::sqlite::StoredDeletion) -> Self {
+        Self {
+            decision_id: receipt.decision_id.clone(),
+            path: receipt.path.clone(),
+            recorded_at: receipt.recorded_at,
+            completed_at: receipt.completed_at,
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OutcomeFingerprint {
+    decision_id: String,
+    path: String,
+    category: String,
+    certainty: String,
+    outcome: String,
+    observed_at: SystemTime,
+    after_secs: u64,
+    detail: String,
+}
+
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Default)]
+struct SourceMultiplicity {
+    generation: u64,
+    seen: u64,
+    admitted: u64,
+}
+
+#[cfg(feature = "sqlite")]
+impl SourceMultiplicity {
+    fn admit(&mut self, generation: u64) -> bool {
+        if self.generation != generation {
+            self.generation = generation;
+            self.seen = 0;
+        }
+        self.seen = self.seen.saturating_add(1);
+        if self.seen <= self.admitted {
+            return false;
+        }
+        self.admitted = self.seen;
+        true
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Default)]
+struct CacheHistoryGroup {
+    receipts: Vec<crate::logger::sqlite::StoredDeletion>,
+    outcomes: Vec<(SystemTime, crate::logger::sqlite::StoredOutcome)>,
+    deletions: Vec<(PathBuf, ArtifactCategory, SystemTime)>,
+}
+
+#[cfg(feature = "sqlite")]
+impl CacheHistoryGroup {
+    fn rebuild(&mut self, now: SystemTime) {
+        // Reconcile only this decision/path group. Reconsidering its matches
+        // also handles a better-matching receipt or earlier label arriving
+        // later, without making effects depend on database page boundaries.
+        self.deletions = replay_cache_deletions(
+            self.receipts.clone(),
+            self.outcomes.iter().map(|(_, outcome)| outcome),
+            now,
+        );
+    }
+
+    fn expire(&mut self, now: SystemTime) {
+        self.receipts.retain(|receipt| {
+            retained_at(
+                receipt.completed_at.unwrap_or(receipt.recorded_at),
+                now,
+                CACHE_REDELETION_MEMORY + RECEIPT_MATCH_ROUNDING,
+            )
+        });
+        self.outcomes
+            .retain(|(deleted_at, _)| retained_at(*deleted_at, now, CACHE_REDELETION_MEMORY));
+        self.rebuild(now);
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl HistoryAdmission {
+    /// Begin reading a different database generation from its start. Existing
+    /// evidence and admitted multiplicities survive; per-source counts reset
+    /// lazily when each fingerprint is encountered.
+    pub fn begin_generation(&mut self) {
+        if let Some(generation) = self.generation.checked_add(1) {
+            self.generation = generation;
+        } else {
+            // Preserve multiplicities even after a counter wrap. This visits
+            // retained keys once per u64::MAX source generations, never per
+            // polling pass.
+            for counts in self
+                .receipts
+                .values_mut()
+                .flat_map(HashMap::values_mut)
+                .chain(self.outcomes.values_mut().flat_map(HashMap::values_mut))
+            {
+                counts.generation = 0;
+                counts.seen = 0;
+            }
+            self.generation = 1;
+        }
+    }
+
+    /// Admit one irreversible-success receipt. A new source occurrence
+    /// returns true; a copied occurrence or expired receipt returns false.
+    /// Cache effects stay inside this admission state so a later label never
+    /// contributes a second deletion.
+    pub fn admit_receipt(
+        &mut self,
+        receipt: crate::logger::sqlite::StoredDeletion,
+        now: SystemTime,
+    ) -> bool {
+        self.expire(now);
+        let deleted_at = receipt.completed_at.unwrap_or(receipt.recorded_at);
+        if !retained_at(
+            deleted_at,
+            now,
+            CACHE_REDELETION_MEMORY + RECEIPT_MATCH_ROUNDING,
+        ) {
+            return false;
+        }
+        let (admitted, occurrence) = {
+            let counts = self
+                .receipts
+                .entry(deleted_at)
+                .or_default()
+                .entry(ReceiptFingerprint::from(&receipt))
+                .or_default();
+            (counts.admit(self.generation), counts.seen)
+        };
+        if !admitted {
+            self.enrich_receipt(&receipt, occurrence, now);
+            return false;
+        }
+        let key = (receipt.decision_id.clone(), receipt.path.clone());
+        // Keep the receipt for the matcher rounding allowance after its own
+        // effect expires. An outcome with a rounded later deletion time must
+        // not resurrect an already expired, successfully paired removal.
+        let expires_from = deleted_at
+            .checked_add(RECEIPT_MATCH_ROUNDING)
+            .unwrap_or(deleted_at);
+        self.cache_expiry
+            .entry(expires_from)
+            .or_default()
+            .insert(key.clone());
+        let group = self.cache_groups.entry(key).or_default();
+        group.receipts.push(receipt);
+        group.rebuild(now);
+        true
+    }
+
+    fn enrich_receipt(
+        &mut self,
+        receipt: &crate::logger::sqlite::StoredDeletion,
+        occurrence: u64,
+        now: SystemTime,
+    ) {
+        if receipt.category.is_none() {
+            return;
+        }
+        let key = (receipt.decision_id.clone(), receipt.path.clone());
+        let Some(group) = self.cache_groups.get_mut(&key) else {
+            return;
+        };
+        let mut matched = 0;
+        let mut changed = false;
+        for existing in &mut group.receipts {
+            if existing.recorded_at == receipt.recorded_at
+                && existing.completed_at == receipt.completed_at
+            {
+                matched += 1;
+                if matched == occurrence {
+                    if existing.category.is_none() {
+                        existing.category.clone_from(&receipt.category);
+                        changed = true;
+                    }
+                    break;
+                }
+            }
+        }
+        if changed {
+            group.rebuild(now);
+        }
+    }
+
+    /// Admit one outcome and return its calibration observation exactly once
+    /// per source occurrence. Unknown labels still restore cache history, but
+    /// the calibrator treats them as no evidence. A caller chooses live alarm
+    /// handling or historical replay according to the source's checkpoint.
+    pub fn admit_outcome(
+        &mut self,
+        outcome: crate::logger::sqlite::StoredOutcome,
+        now: SystemTime,
+    ) -> Option<RegretObservation> {
+        self.expire(now);
+        let observation = RegretObservation::from_stored(&outcome)?;
+        if observation.expired(now) {
+            return None;
+        }
+        let fingerprint = OutcomeFingerprint {
+            decision_id: outcome.decision_id.clone(),
+            path: outcome.path.clone(),
+            category: outcome.category.clone(),
+            certainty: outcome.certainty.clone(),
+            outcome: outcome.outcome.clone(),
+            observed_at: observation.observed_at,
+            after_secs: outcome.after_secs,
+            detail: outcome.detail.clone(),
+        };
+        if !self
+            .outcomes
+            .entry(observation.observed_at)
+            .or_default()
+            .entry(fingerprint)
+            .or_default()
+            .admit(self.generation)
+        {
+            return None;
+        }
+        if let Some(deleted_at) = observation
+            .observed_at
+            .checked_sub(Duration::from_secs(outcome.after_secs))
+            && retained_at(deleted_at, now, CACHE_REDELETION_MEMORY)
+        {
+            let key = (outcome.decision_id.clone(), outcome.path.clone());
+            self.cache_expiry
+                .entry(deleted_at)
+                .or_default()
+                .insert(key.clone());
+            let group = self.cache_groups.entry(key).or_default();
+            group.outcomes.push((deleted_at, outcome));
+            group.rebuild(now);
+        }
+        Some(observation)
+    }
+
+    /// Forget only evidence whose original timestamp has left its window.
+    /// Ordered timestamp buckets make an idle refresh independent of the
+    /// number of retained fingerprints.
+    pub fn expire(&mut self, now: SystemTime) {
+        expire_buckets(
+            &mut self.receipts,
+            now,
+            CACHE_REDELETION_MEMORY + RECEIPT_MATCH_ROUNDING,
+        );
+        expire_buckets(&mut self.outcomes, now, REGRET_EVIDENCE_WINDOW);
+        let Some(cutoff) = now.checked_sub(CACHE_REDELETION_MEMORY) else {
+            return;
+        };
+        while self.cache_expiry.first_key_value().is_some_and(|(at, _)| *at < cutoff) {
+            let (_, keys) = self.cache_expiry.pop_first().expect("expired bucket exists");
+            for key in keys {
+                let empty = self.cache_groups.get_mut(&key).is_some_and(|group| {
+                    group.expire(now);
+                    group.receipts.is_empty() && group.outcomes.is_empty()
+                });
+                if empty {
+                    self.cache_groups.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Current imported warm-cache deletion counts. The daemon combines
+    /// these with its own directly observed removals, whose ledger copies
+    /// were excluded by run provenance before admission.
+    pub fn cache_redeletions(&mut self, now: SystemTime) -> HashMap<PathBuf, u32> {
+        self.expire(now);
+        crate::scanner::scoring::cache_redeletion_counts(
+            self.cache_groups.values().flat_map(|group| {
+                group
+                    .deletions
+                    .iter()
+                    .map(|(path, category, deleted_at)| (path, *category, *deleted_at))
+            }),
+            now,
+        )
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn retained_at(observed_at: SystemTime, now: SystemTime, window: Duration) -> bool {
+    !now.duration_since(observed_at).is_ok_and(|age| age > window)
+}
+
+#[cfg(feature = "sqlite")]
+fn expire_buckets<T>(buckets: &mut BTreeMap<SystemTime, T>, now: SystemTime, window: Duration) {
+    let Some(cutoff) = now.checked_sub(window) else {
+        return;
+    };
+    while buckets.first_key_value().is_some_and(|(at, _)| *at < cutoff) {
+        buckets.pop_first();
+    }
+}
+
 /// A persisted success restores warm-cache backoff even if the daemon stopped
 /// before its regret window ended. Outcomes remain a fallback for old or
 /// missing receipts, never a second count of the same successful deletion.
 #[cfg(feature = "sqlite")]
-fn replay_cache_deletions(
+fn replay_cache_deletions<'a>(
     receipts: Vec<crate::logger::sqlite::StoredDeletion>,
-    outcomes: &[crate::logger::sqlite::StoredOutcome],
+    outcomes: impl IntoIterator<Item = &'a crate::logger::sqlite::StoredOutcome>,
     now: SystemTime,
 ) -> Vec<(PathBuf, ArtifactCategory, SystemTime)> {
     let recent = |deleted_at| {
         !now.duration_since(deleted_at)
             .is_ok_and(|age| age > CACHE_REDELETION_MEMORY)
     };
-    let mut receipts: Vec<_> = receipts
-        .into_iter()
-        .filter(|receipt| recent(receipt.completed_at.unwrap_or(receipt.recorded_at)))
-        .collect();
+    // Match before expiring receipt effects. A rounded outcome timestamp
+    // must not turn a paired, just-expired receipt into a new fallback count.
+    let mut receipts = receipts;
     let mut by_version: HashMap<(String, String), Vec<usize>> = HashMap::new();
     for (index, receipt) in receipts.iter().enumerate() {
         by_version
@@ -217,7 +545,7 @@ fn replay_cache_deletions(
     let mut matched = vec![false; receipts.len()];
     let mut history = Vec::new();
     let mut labelled: Vec<_> = outcomes
-        .iter()
+        .into_iter()
         .filter_map(|stored| {
             Outcome::from_name(&stored.outcome)?;
             let observed_at = chrono::DateTime::parse_from_rfc3339(&stored.observed_at)
@@ -263,6 +591,9 @@ fn replay_cache_deletions(
         }
     }
     history.extend(receipts.into_iter().filter_map(|receipt| {
+        if !recent(receipt.completed_at.unwrap_or(receipt.recorded_at)) {
+            return None;
+        }
         let path = PathBuf::from(receipt.path);
         let category = receipt
             .category
@@ -278,6 +609,9 @@ fn replay_cache_deletions(
 }
 
 #[cfg(feature = "sqlite")]
+const RECEIPT_MATCH_ROUNDING: Duration = Duration::from_secs(2);
+
+#[cfg(feature = "sqlite")]
 fn deletion_receipt_matches(
     receipt: &crate::logger::sqlite::StoredDeletion,
     deleted_at: SystemTime,
@@ -286,7 +620,7 @@ fn deletion_receipt_matches(
     // Outcome timestamps and elapsed times are stored as whole seconds.
     // Match that rounding without conflating a later reuse of the same inode
     // and stable decision id with an earlier, separately observed deletion.
-    let rounding = Duration::from_secs(2);
+    let rounding = RECEIPT_MATCH_ROUNDING;
     receipt.completed_at.map_or_else(
         || {
             // Legacy timestamps were sampled by the logger. They can lag the
@@ -1207,6 +1541,301 @@ mod tests {
             ]),
             "pending successes survive without labels; old evidence expires independently",
         );
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn history_receipt(
+        decision_id: &str,
+        path: &str,
+        completed_at: SystemTime,
+    ) -> crate::logger::sqlite::StoredDeletion {
+        crate::logger::sqlite::StoredDeletion {
+            decision_id: decision_id.to_string(),
+            path: path.to_string(),
+            category: Some("GoCache".to_string()),
+            recorded_at: completed_at + Duration::from_secs(1),
+            completed_at: Some(completed_at),
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn history_outcome(
+        decision_id: &str,
+        path: &str,
+        deleted_at: SystemTime,
+        outcome: Outcome,
+    ) -> crate::logger::sqlite::StoredOutcome {
+        crate::logger::sqlite::StoredOutcome {
+            decision_id: decision_id.to_string(),
+            path: path.to_string(),
+            category: "GoCache".to_string(),
+            certainty: "definite".to_string(),
+            outcome: outcome.as_str().to_string(),
+            observed_at: chrono::DateTime::<chrono::Utc>::from(
+                deleted_at + Duration::from_secs(10),
+            )
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            after_secs: 10,
+            detail: "history fixture".to_string(),
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn history_admission_retains_duplicate_rows_without_recounting_copied_sources() {
+        let deleted_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let now = deleted_at + Duration::from_secs(20);
+        let path = "/data/tmp/recreated-cache";
+        let receipt = history_receipt("0123456789ab", path, deleted_at);
+        let outcome = history_outcome("0123456789ab", path, deleted_at, Outcome::Clean);
+        let mut history = HistoryAdmission::default();
+        for _ in 0..2 {
+            assert!(history.admit_receipt(receipt.clone(), now));
+            assert!(history.admit_outcome(outcome.clone(), now).is_some());
+        }
+        assert_eq!(history.cache_redeletions(now)[Path::new(path)], 2);
+
+        history.begin_generation();
+        for _ in 0..2 {
+            assert!(!history.admit_receipt(receipt.clone(), now));
+            assert!(history.admit_outcome(outcome.clone(), now).is_none());
+        }
+        assert_eq!(history.cache_redeletions(now)[Path::new(path)], 2);
+        // A genuinely additional identical row in this generation remains
+        // observable; a fingerprint is not merely a set membership test.
+        assert!(history.admit_receipt(receipt, now));
+        assert!(history.admit_outcome(outcome, now).is_some());
+        assert_eq!(history.cache_redeletions(now)[Path::new(path)], 3);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn history_admission_enriches_legacy_receipts_without_counting_them_again() {
+        let deleted_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let now = deleted_at + Duration::from_secs(30);
+        let path = "/data/tmp/legacy-cache";
+        let mut unknown = history_receipt("0123456789ab", path, deleted_at);
+        unknown.completed_at = None;
+        unknown.category = None;
+        let mut known = unknown.clone();
+        known.category = Some("GoCache".to_string());
+        let mut history = HistoryAdmission::default();
+        for _ in 0..2 {
+            assert!(history.admit_receipt(unknown.clone(), now));
+        }
+        assert!(history.cache_redeletions(now).is_empty());
+
+        history.begin_generation();
+        assert!(!history.admit_receipt(known.clone(), now));
+        assert!(!history.admit_receipt(unknown.clone(), now));
+        assert_eq!(history.cache_redeletions(now)[Path::new(path)], 1);
+        history.begin_generation();
+        for _ in 0..2 {
+            assert!(!history.admit_receipt(known.clone(), now));
+        }
+        assert_eq!(history.cache_redeletions(now)[Path::new(path)], 2);
+        history.begin_generation();
+        for _ in 0..2 {
+            assert!(!history.admit_receipt(unknown.clone(), now));
+        }
+        assert_eq!(
+            history.cache_redeletions(now)[Path::new(path)],
+            2,
+            "losing decision_log hydration cannot recount or erase known receipts",
+        );
+
+        let mut labelled = HistoryAdmission::default();
+        labelled.admit_receipt(unknown, now);
+        labelled.admit_outcome(
+            history_outcome("0123456789ab", path, deleted_at, Outcome::Clean),
+            now,
+        );
+        assert_eq!(labelled.cache_redeletions(now)[Path::new(path)], 1);
+        labelled.begin_generation();
+        assert!(!labelled.admit_receipt(known, now));
+        assert_eq!(
+            labelled.cache_redeletions(now)[Path::new(path)],
+            1,
+            "a category recovered from a matching label is not a second deletion",
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn history_admission_pairs_receipts_and_labels_independently_of_arrival_order() {
+        let deleted_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let now = deleted_at + Duration::from_secs(30);
+        let path = "/data/tmp/reused-inode-cache";
+        let first = history_receipt("0123456789ab", path, deleted_at);
+        let second = history_receipt(
+            "0123456789ab",
+            path,
+            deleted_at + Duration::from_secs(3),
+        );
+        let flexible = history_outcome(
+            "0123456789ab",
+            path,
+            deleted_at + Duration::from_secs(1),
+            Outcome::Clean,
+        );
+        let exact = history_outcome("0123456789ab", path, deleted_at, Outcome::Regret);
+        for receipts_first in [true, false] {
+            let mut history = HistoryAdmission::default();
+            if receipts_first {
+                history.admit_receipt(first.clone(), now);
+                history.admit_receipt(second.clone(), now);
+            }
+            history.admit_outcome(flexible.clone(), now);
+            history.admit_outcome(exact.clone(), now);
+            if !receipts_first {
+                history.admit_receipt(second.clone(), now);
+                history.admit_receipt(first.clone(), now);
+            }
+            // The later-arriving exact label needs the first receipt; the
+            // flexible label must be reconsidered against the second receipt.
+            assert_eq!(history.cache_redeletions(now)[Path::new(path)], 2);
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn history_admission_uses_receipt_completion_at_the_exact_cache_expiry_boundary() {
+        let deleted_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let now = deleted_at + Duration::from_secs(30);
+        let path = "/data/tmp/rounded-cache";
+        let receipt = history_receipt("0123456789ab", path, deleted_at);
+        let outcome = history_outcome(
+            "0123456789ab",
+            path,
+            deleted_at + Duration::from_secs(1),
+            Outcome::Unknown,
+        );
+        for receipt_first in [true, false] {
+            let mut history = HistoryAdmission::default();
+            if receipt_first {
+                history.admit_receipt(receipt.clone(), now);
+            }
+            assert!(history.admit_outcome(outcome.clone(), now).is_some());
+            if !receipt_first {
+                history.admit_receipt(receipt.clone(), now);
+            }
+            assert_eq!(history.cache_redeletions(now)[Path::new(path)], 1);
+            assert_eq!(
+                history.cache_redeletions(deleted_at + CACHE_REDELETION_MEMORY)
+                    [Path::new(path)],
+                1,
+            );
+            assert!(
+                history
+                    .cache_redeletions(
+                        deleted_at + CACHE_REDELETION_MEMORY + Duration::from_nanos(1),
+                    )
+                    .is_empty(),
+                "a later rounded outcome must not resurrect an expired receipt",
+            );
+            assert!(
+                history
+                    .cache_redeletions(
+                        deleted_at + CACHE_REDELETION_MEMORY + Duration::from_secs(3),
+                    )
+                    .is_empty(),
+            );
+            assert!(history.cache_groups.is_empty());
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn history_admission_keeps_independent_windows_and_rejects_unusable_rows() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let mut history = HistoryAdmission::default();
+        let old_deletion = now - Duration::from_secs(8 * 24 * 60 * 60);
+        assert!(!history.admit_receipt(
+            history_receipt("0123456789ab", "/data/tmp/expired-cache", old_deletion),
+            now,
+        ));
+        let retained = history
+            .admit_outcome(
+                history_outcome(
+                    "0123456789ab",
+                    "/data/tmp/expired-cache",
+                    old_deletion,
+                    Outcome::Regret,
+                ),
+                now,
+            )
+            .unwrap();
+        assert_eq!(retained.outcome, Outcome::Regret);
+        assert_eq!(retained.observed_at, old_deletion + Duration::from_secs(10));
+        assert!(history.cache_redeletions(now).is_empty());
+
+        let fallback_path = "/data/tmp/outcome-only-cache";
+        let fallback = history_outcome(
+            "abcdef012345",
+            fallback_path,
+            now - Duration::from_secs(30),
+            Outcome::Unknown,
+        );
+        assert_eq!(
+            history
+                .admit_outcome(fallback.clone(), now)
+                .unwrap()
+                .outcome,
+            Outcome::Unknown,
+        );
+        assert_eq!(history.cache_redeletions(now)[Path::new(fallback_path)], 1);
+        let mut malformed = fallback.clone();
+        malformed.outcome = "not-a-label".to_string();
+        assert!(history.admit_outcome(malformed, now).is_none());
+        let mut malformed = fallback;
+        malformed.observed_at = "not-a-time".to_string();
+        assert!(history.admit_outcome(malformed, now).is_none());
+        assert!(history
+            .admit_outcome(
+                history_outcome(
+                    "fedcba987654",
+                    "/data/tmp/too-old-cache",
+                    now - REGRET_EVIDENCE_WINDOW - Duration::from_secs(11),
+                    Outcome::Regret,
+                ),
+                now,
+            )
+            .is_none());
+
+        history.expire(now + REGRET_EVIDENCE_WINDOW + Duration::from_secs(1));
+        assert!(history.receipts.is_empty());
+        assert!(history.outcomes.is_empty());
+        assert!(history.cache_groups.is_empty());
+        assert!(history.cache_expiry.is_empty());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn history_admission_recovers_legacy_classification_and_distinct_reuses() {
+        let deleted_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let now = deleted_at + Duration::from_secs(60);
+        let path = "/data/tmp/legacy-cache";
+        let mut legacy = history_receipt("0123456789ab", path, deleted_at);
+        legacy.completed_at = None;
+        legacy.category = None;
+        let mut history = HistoryAdmission::default();
+        history.admit_receipt(legacy, now);
+        assert!(history.cache_redeletions(now).is_empty());
+        history.admit_outcome(
+            history_outcome("0123456789ab", path, deleted_at, Outcome::Clean),
+            now,
+        );
+        assert_eq!(history.cache_redeletions(now)[Path::new(path)], 1);
+
+        // Inode/decision-id reuse at a later completion time is a distinct
+        // deletion, even though the path and stable id are identical.
+        let reused_at = deleted_at + Duration::from_secs(30);
+        history.admit_receipt(history_receipt("0123456789ab", path, reused_at), now);
+        history.admit_outcome(
+            history_outcome("0123456789ab", path, reused_at, Outcome::Clean),
+            now,
+        );
+        assert_eq!(history.cache_redeletions(now)[Path::new(path)], 2);
     }
 
     fn watch(id: &str, path: &Path, category: &str, at: Instant) -> Watch {

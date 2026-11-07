@@ -119,12 +119,20 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Added
 
-- **Cleanup history retains writer provenance and supports bounded reads.**
-  SQLite records the daemon run on receipts and outcomes, including after
-  logger recovery. A read-only history API captures consistent startup
-  boundaries and consumes capped pages by append ID. It advances past malformed
-  records, preserves progress across retention, and reads older schemas without
-  migration. Writable opens serialize the additive provenance migration.
+- **Running daemons learn from cleanup performed by other processes.** The
+  scanner polls persisted receipts and outcomes while idle and at bounded
+  checkpoints during long scans, updating warm-cache backoff and regret
+  calibration without a restart. New alarms reach the executor's category
+  guard while the current pass retains its scoring snapshot. Each refresh
+  reads at most two pages of 256 raw rows per table through a read-only
+  connection with a short lock timeout. Persisted writer identities prevent
+  the daemon's own asynchronous log records from duplicating its live evidence.
+  Startup uses a consistent history snapshot; database replacement, sequence
+  resets, and history-path reloads resume bounded reconciliation while retaining
+  existing evidence and active suspension deadlines. Copied history preserves
+  real duplicate occurrences, receipt/outcome pairs count once, and historical
+  replay does not restart served alarms. Older ledgers remain readable without
+  migration; writable opens add provenance columns transactionally.
 
 - **Finite inode pressure can reclaim eligible artifacts despite ample free
   bytes.** Linux monitors available inodes independently, using validated

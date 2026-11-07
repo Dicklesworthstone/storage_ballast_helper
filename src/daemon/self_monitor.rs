@@ -55,14 +55,15 @@ pub struct PolicyStateRecord {
     pub serialization_failures: u64,
 }
 
-/// A fresh run identifier (`<pid hex>-<epoch millis hex>`), shared by the
-/// state file and every activity log line of one daemon run.
+/// An opaque identifier shared by this daemon run's state and activity
+/// records. Randomness distinguishes runs even when PIDs and clocks repeat.
 #[must_use]
 pub fn generate_run_id() -> String {
     format!(
-        "{:x}-{:x}",
+        "{:x}-{:x}-{:032x}",
         std::process::id(),
-        chrono::Utc::now().timestamp_millis()
+        chrono::Utc::now().timestamp_millis(),
+        rand::random::<u128>(),
     )
 }
 /// RSS that logs a warning.
@@ -1773,6 +1774,17 @@ mod tests {
     use super::*;
 
     use crate::platform::pal::MockPlatform;
+
+    #[test]
+    fn run_ids_distinguish_rapid_restarts_of_the_same_process() {
+        let ids: std::collections::HashSet<_> = (0..256).map(|_| generate_run_id()).collect();
+        assert_eq!(ids.len(), 256);
+        for id in ids {
+            let suffix = id.rsplit('-').next().unwrap();
+            assert_eq!(suffix.len(), 32);
+            assert!(u128::from_str_radix(suffix, 16).is_ok());
+        }
+    }
 
     /// bd-rc-master-ajg1.4.11: the VOI block is built from the config, the
     /// calibration summary and the last plan; an older state file parses
