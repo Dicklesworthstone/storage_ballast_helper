@@ -39,6 +39,8 @@ pub enum Severity {
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
     ArtifactDelete,
+    /// Permanent removal of a previously quarantined payload.
+    QuarantinePurge,
     BallastRelease,
     BallastReplenish,
     BallastProvision,
@@ -1513,6 +1515,7 @@ mod tests {
 
         let event_types = [
             EventType::ArtifactDelete,
+            EventType::QuarantinePurge,
             EventType::BallastRelease,
             EventType::BallastReplenish,
             EventType::BallastProvision,

@@ -28,7 +28,7 @@ Cross-platform disk-pressure defense for AI coding workloads: predictive monitor
 | Predictive pressure control | EWMA + PID reacts before disks hit critical levels |
 | Multi-volume ballast pools | Frees space on the exact filesystem under pressure |
 | Safe artifact cleanup | Deterministic scoring + hard vetoes (`.git`, protected paths, too-recent files, open files) |
-| Zero-write emergency mode | Recover from near-100% full disks without needing DB/config writes |
+| Emergency recovery | Reclaim space on critically full disks without a database or config prerequisite |
 | Project protection | `.sbh-protect` markers and config globs prevent accidental cleanup in critical repos |
 | Explainable decisions | Evidence ledger + `sbh explain` shows why each action happened |
 | Strong observability | `status`, `dashboard`, `stats`, `blame`, structured logs, and decision traces |
@@ -61,7 +61,7 @@ sbh explain --id <decision-id>
 sbh stats --window 24h
 sbh blame --json
 
-# 8) Emergency recovery (zero-write mode)
+# 8) Emergency recovery
 sbh emergency /data --target-free 10 --yes
 ```
 
@@ -105,7 +105,7 @@ Existing solutions fall short in specific ways:
 | Multi-volume awareness | ✅ | ⚠️ usually custom | ⚠️ partial | ⚠️ manual |
 | Hard safety vetoes | ✅ built-in | ⚠️ fragile scripts | ⚠️ limited | ✅ human judgment |
 | Explainability and traces | ✅ | ❌ | ❌ | ❌ |
-| Emergency zero-write recovery | ✅ | ❌ | ❌ | ⚠️ slow |
+| Emergency recovery | ✅ | ❌ | ❌ | ⚠️ slow |
 | Service-grade observability | ✅ | ❌ | ⚠️ minimal | ❌ |
 
 ### Real-World Operator Perspective
@@ -418,7 +418,7 @@ summaries, including `--auto --dry-run --json`.
 | `sbh clean` | Manual cleanup with confirmation/dry-run |
 | `sbh undo` | Restore quarantined entries (`<decision-id>`, `--path`, `--all-since`, `--list`) |
 | `sbh relocate` | Report dormant protected scratch, apply verified backup relocation, or restore a relocated tree ([guide](docs/relocation.md)) |
-| `sbh emergency` | Zero-write recovery mode on critically full disks |
+| `sbh emergency` | Immediate recovery on critically full disks |
 
 ### Ballast and Protection
 
@@ -1932,22 +1932,17 @@ template = '{"text": "sbh: ${SUMMARY}", "level": "${LEVEL}", "mount": "${MOUNT}"
 
 Source: `src/daemon/notifications.rs`
 
-### Zero-Write Emergency Mode
+### Emergency Recovery
 
-When a disk is at 99%+ utilization, normal operations may fail because they need to write temporary files, state, or logs. `sbh emergency` operates in a zero-write mode that avoids all disk writes:
+When a disk is at 99%+ utilization, normal operations may fail because they need to write temporary files, state, or logs. `sbh emergency` begins reclamation without a database or configuration-file prerequisite. It uses built-in defaults and in-memory scoring, writes output to stdout/stderr, and does not write JSONL or daemon state files.
 
-- No SQLite writes (database might be on the full disk).
-- No JSONL writes (log file might be on the full disk).
-- No state file updates.
-- No configuration file reads that might trigger cache writes.
-- Scoring uses in-memory defaults only.
-- Output goes directly to stdout/stderr.
+After a quarantine drain physically removes payloads and finalizes their recovery records, the command tries to save completion receipts in the default activity ledger. Payloads left partial, absent, restored, or refused produce no success receipt. A drain without completions never opens the ledger; a receipt-write failure warns and does not stop recovery. The scan-and-delete executor remains independent of the ledger.
 
 The emergency command scans the specified paths, scores candidates using the standard multi-factor engine, and presents them for immediate deletion. With `--yes`, it executes deletions immediately without interactive confirmation, prioritizing the highest-scoring candidates until the target free space is reached or all candidates are exhausted. Because no config is read, `--min-age <MINUTES>` (default 5) is the only age floor: artifacts modified more recently are left alone, and `--min-age 0` reclaims fresh builds too. Every candidate is printed with its decision id (`id <hex>` in the plan, `candidates[].decision_id` in `--json`), the same id `sbh scan` and `sbh clean` would record, so a later `sbh explain --id` can be matched against what emergency acted on.
 
 **Emergency escalation:** unlike `sbh clean`, emergency mode also acts on candidates whose decision-theoretic outcome is `Review` (score cleared the threshold and nothing vetoed them, but the keep-vs-delete loss margin was too ambiguous for unattended deletion). `Review` means "a human should look" — in emergency mode the human *is* looking, via the interactive confirmation or an explicit `--yes`. Without this escalation, a candidate corpus that is 100% `Review` would make the last line of defence a silent no-op on a critically full disk. Unambiguous `Delete` decisions are still executed first; every hard safety rail (vetoes, sacred paths, `.sbh-protect` markers, and the `.git`/Cargo-manifest/source-tree/open-file/active-lease pre-flight checks) applies unchanged.
 
-A completely full disk is precisely the situation where most cleanup tools fail, since they need to write temp files or state. By reducing to pure in-memory scoring and direct unlink calls, `sbh emergency` can recover a system that nothing else can touch.
+Emergency recovery does not require a successful ledger write, so unavailable logging cannot prevent reclamation on a full disk.
 
 ### Scanner Indexes
 
@@ -2543,7 +2538,7 @@ For test harness conventions and structured logging registration, see `docs/test
 - Ask the scorer directly: `sbh explain --why-not <dir>` scores that directory now, runs the deletion preflight, and prints the first thing standing in the way (a `.sbh-protect` marker or protected pattern, an exclusion, a scoring veto, a preflight refusal such as a source tree or an active lease, or a score below `scoring.min_score`) followed by the full factor table. Add `--counterfactual` to see the smallest change of age, size, or pressure that would flip it to Delete, and `--json` for the same report as data.
 - `sbh scan <path> --min-score 0.0` lists everything the scorer saw; each line ends with an id for `sbh explain --id`.
 - Check protections via `sbh protect --list`.
-- Use `sbh emergency <path>` for immediate zero-write triage.
+- Use `sbh emergency <path>` for immediate recovery.
 
 ### "Cleanup is too conservative"
 - Inspect policy mode (`observe`/`canary`/`enforce`).
@@ -2621,7 +2616,7 @@ For test harness conventions and structured logging registration, see `docs/test
 No. Early development incidents on 2026-05-16 and 2026-05-22 led to hardcoded vetoes that cannot be disabled by configuration. Specifically, `HardcodedSourceTree` vetoes any directory with known source structures, and `LooksLikeSourceCode` vetoes directories containing source manifests (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, etc.) lacking build markers. These hardcoded vetoes are checked during pre-flight before any deletion can occur. You can verify safety for any path using `sbh scan <path> --explain` or `sbh explain --why-not <dir>`, which reveals exact factor scores and any vetoes that apply. Additionally, permanent protection can be established via `.sbh-protect` marker files or `scanner.protected_paths` in `config.toml`.
 
 ### Can I force cleanup during an incident?
-Yes. Use `sbh emergency ...` for zero-write recovery, then return to normal policy modes.
+Yes. Use `sbh emergency ...` for immediate recovery, then return to normal policy modes.
 
 ### Can I run `sbh` without the daemon?
 Yes. `scan`, `clean`, `check`, and `emergency` support operational workflows without a long-running service. The dashboard will enter degraded mode but remains functional for navigation and overlay features.

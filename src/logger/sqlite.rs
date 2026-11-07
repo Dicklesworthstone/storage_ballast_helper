@@ -356,14 +356,14 @@ impl SqliteLogger {
         Ok(rows)
     }
 
-    /// Successful unlink receipts recorded since `since` (RFC 3339).
-    /// Planned DELETEs, failed attempts and quarantine moves are not evidence
-    /// of an irreversible deletion. Read through the existing type/time index;
+    /// Successful unlink and completed quarantine-purge receipts since `since`
+    /// (RFC 3339). Planned DELETEs, failed attempts and quarantine moves are
+    /// not evidence of an irreversible deletion. Use the type/time index;
     /// only legacy receipts need a lookup of their indexed decision id.
     pub fn successful_deletions_since(&self, since: &str) -> Result<Vec<StoredDeletion>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT timestamp, path, details FROM activity_log
-             WHERE event_type = 'artifact_delete' AND timestamp >= ?1
+             WHERE event_type IN ('artifact_delete', 'quarantine_purge') AND timestamp >= ?1
                AND success = 1 AND path IS NOT NULL AND details IS NOT NULL
                AND details NOT LIKE '%quarantined%'
              ORDER BY timestamp ASC, id ASC",
@@ -446,7 +446,7 @@ impl SqliteLogger {
         {
             let mut statement = self.conn.prepare_cached(&format!(
                 "SELECT id, {receipt_source}, timestamp, path, details FROM activity_log
-                 WHERE event_type = 'artifact_delete' AND success = 1
+                 WHERE event_type IN ('artifact_delete', 'quarantine_purge') AND success = 1
                    AND timestamp >= ?1 AND id <= ?2
                  ORDER BY id ASC"
             ))?;
@@ -520,9 +520,12 @@ impl SqliteLogger {
             // all IDs. Large unrelated planner/diagnostic strings stay in SQLite.
             let mut statement = self.conn.prepare_cached(&format!(
                 "SELECT id, {receipt_source},
-                        CASE WHEN event_type = 'artifact_delete' AND success = 1 THEN timestamp END,
-                        CASE WHEN event_type = 'artifact_delete' AND success = 1 THEN path END,
-                        CASE WHEN event_type = 'artifact_delete' AND success = 1 THEN details END
+                        CASE WHEN event_type IN ('artifact_delete', 'quarantine_purge')
+                                  AND success = 1 THEN timestamp END,
+                        CASE WHEN event_type IN ('artifact_delete', 'quarantine_purge')
+                                  AND success = 1 THEN path END,
+                        CASE WHEN event_type IN ('artifact_delete', 'quarantine_purge')
+                                  AND success = 1 THEN details END
                  FROM activity_log WHERE id > ?1 AND id <= ?2
                  ORDER BY id ASC LIMIT ?3"
             ))?;
@@ -1885,6 +1888,70 @@ mod tests {
             after_secs: 1,
             detail: "recreated during use".to_string(),
         }
+    }
+
+    #[test]
+    fn quarantine_purge_history_requires_success_and_never_counts_a_rename() {
+        let (_dir, writer) = temp_db();
+        let mut held = history_activity(10);
+        held.details.as_mut().unwrap().push_str(";quarantined");
+        writer.log_activity(&held).unwrap();
+        let mut purged = history_activity(20);
+        purged.event_type = "quarantine_purge".to_string();
+        writer
+            .log_activity_for_run(&purged, Some("purge-run"))
+            .unwrap();
+        let mut failed = history_activity(30);
+        failed.event_type = "quarantine_purge".to_string();
+        failed.success = 0;
+        writer.log_activity(&failed).unwrap();
+        let mut diagnostic = history_activity(40);
+        diagnostic.event_type = "info".to_string();
+        writer.log_activity(&diagnostic).unwrap();
+
+        let reader = SqliteLogger::open_history_reader(writer.path()).unwrap();
+        let snapshot = reader.history_snapshot(&stamp(0), &stamp(0)).unwrap();
+        assert_eq!(snapshot.receipts.len(), 1);
+        assert_eq!(snapshot.receipts[0].run_id.as_deref(), Some("purge-run"));
+        assert_eq!(snapshot.receipts[0].row_id, 2);
+        let completed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_020);
+        assert_eq!(snapshot.receipts[0].value.recorded_at, completed_at);
+        assert_eq!(snapshot.receipts[0].value.completed_at, Some(completed_at));
+        assert!(snapshot.outcomes.is_empty());
+        assert_eq!(
+            reader.successful_deletions_since(&stamp(0)).unwrap().len(),
+            1
+        );
+
+        // The bounded reader consumes unsuccessful/held rows without turning
+        // them into permanent-deletion evidence or stalling its append cursor.
+        writer.log_activity(&held).unwrap();
+        writer.log_activity(&failed).unwrap();
+        let mut zero = history_activity(70);
+        zero.event_type = "quarantine_purge".to_string();
+        zero.path = Some("/data/shared/zero-byte-cache".to_string());
+        zero.size_bytes = Some(0);
+        writer.log_activity(&zero).unwrap();
+        let skipped = reader
+            .history_page(snapshot.watermark, &stamp(0), &stamp(0), 2)
+            .unwrap();
+        assert_eq!(skipped.watermark.activity_id, 6);
+        assert!(skipped.receipts.is_empty());
+        assert!(skipped.outcomes.is_empty());
+        assert!(skipped.more);
+        let last = reader
+            .history_page(skipped.watermark, &stamp(0), &stamp(0), 2)
+            .unwrap();
+        assert_eq!(last.receipts.len(), 1);
+        assert_eq!(last.receipts[0].value.path, "/data/shared/zero-byte-cache");
+        assert_eq!(last.receipts[0].row_id, 7);
+        assert!(last.outcomes.is_empty());
+        assert_eq!(last.watermark, last.frontier);
+        assert!(!last.more);
+        assert_eq!(
+            reader.successful_deletions_since(&stamp(0)).unwrap().len(),
+            2
+        );
     }
 
     #[test]

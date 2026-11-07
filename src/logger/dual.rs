@@ -26,6 +26,7 @@ use crate::logger::sqlite::{
 };
 use crate::scanner::decision_record::DecisionRecord;
 use crate::scanner::patterns::ArtifactCategory;
+use crate::scanner::quarantine::QuarantineCompletion;
 
 mod diagnostics;
 mod lifecycle;
@@ -126,6 +127,9 @@ pub enum ActivityEvent {
         /// unlinked; `size_bytes` is held, not freed.
         quarantined: bool,
     },
+    /// A quarantined payload was physically unlinked and its manifest
+    /// finalized. The original rename and this permanent removal are distinct.
+    QuarantinePurged(Box<QuarantineCompletion>),
     ArtifactDeletionFailed {
         path: String,
         error_code: String,
@@ -732,6 +736,28 @@ fn scan_completion_details(
     )
 }
 
+fn quarantine_purge_details(completion: &QuarantineCompletion) -> String {
+    let completed_at = chrono::DateTime::<chrono::Utc>::from(completion.completed_at)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    format!(
+        "decision_id={};{}completed_at={completed_at}",
+        completion.record.decision_id,
+        completion
+            .category()
+            .map_or_else(String::new, |category| format!("category={category:?};"))
+    )
+}
+
+fn quarantine_purge_score(completion: &QuarantineCompletion) -> Option<f64> {
+    completion
+        .record
+        .decision
+        .as_ref()?
+        .get("score")?
+        .as_f64()
+        .filter(|score| score.is_finite())
+}
+
 #[allow(clippy::too_many_lines)]
 fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
     match event {
@@ -828,6 +854,18 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
                 if *quarantined { ";quarantined" } else { "" },
             ));
             e
+        }
+        ActivityEvent::QuarantinePurged(completion) => {
+            let mut entry = LogEntry::new(EventType::QuarantinePurge, Severity::Info);
+            entry.ts = chrono::DateTime::<chrono::Utc>::from(completion.completed_at)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            entry.path = Some(completion.record.original_path.to_string_lossy().into_owned());
+            entry.size = Some(completion.record.size_bytes);
+            entry.score = quarantine_purge_score(completion);
+            entry.ok = Some(true);
+            entry.decision_id = Some(completion.record.decision_id.clone());
+            entry.details = Some(quarantine_purge_details(completion));
+            entry
         }
         ActivityEvent::PolicyTransition {
             transition,
@@ -1001,6 +1039,23 @@ pub(crate) fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow
                     .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 if *quarantined { ";quarantined" } else { "" },
             )),
+        }),
+        ActivityEvent::QuarantinePurged(completion) => Some(ActivityRow {
+            timestamp: chrono::DateTime::<chrono::Utc>::from(completion.completed_at)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            event_type: "quarantine_purge".to_string(),
+            severity: "info".to_string(),
+            path: Some(completion.record.original_path.to_string_lossy().into_owned()),
+            size_bytes: Some(i64::try_from(completion.record.size_bytes).unwrap_or(i64::MAX)),
+            score: quarantine_purge_score(completion),
+            score_factors: None,
+            pressure_level: None,
+            free_pct: None,
+            duration_ms: None,
+            success: 1,
+            error_code: None,
+            error_message: None,
+            details: Some(quarantine_purge_details(completion)),
         }),
         ActivityEvent::ArtifactDeletionFailed {
             path,
@@ -1793,6 +1848,134 @@ mod tests {
         );
         assert_eq!(entry.details.as_deref(), Some("category=GoCache"));
         assert_eq!(entry.quarantined, Some(false));
+    }
+
+    fn purge_completion(
+        path: &str,
+        size_bytes: u64,
+        completed_at: SystemTime,
+        decision: Option<serde_json::Value>,
+    ) -> QuarantineCompletion {
+        QuarantineCompletion {
+            record: crate::scanner::quarantine::QuarantineRecord {
+                decision_id: "0123456789ab".to_string(),
+                original_path: PathBuf::from(path),
+                quarantine_path: PathBuf::from("/quarantine/0123456789ab/held"),
+                device_id: 7,
+                inode: 11,
+                size_bytes,
+                quarantined_at: 1_789_000_000,
+                expires_at: 1_789_003_600,
+                decision,
+            },
+            completed_at,
+        }
+    }
+
+    #[test]
+    fn quarantine_purge_jsonl_retains_completion_and_only_known_classification() {
+        let completed_at =
+            UNIX_EPOCH + Duration::from_secs(1_790_000_000) + Duration::from_millis(123);
+        for decision in [
+            None,
+            Some(serde_json::json!({"category": "not-a-category"})),
+            Some(serde_json::json!({"category": "GoCache", "score": 0.97})),
+        ] {
+            let completion = purge_completion("/data/tmp/go-build", 0, completed_at, decision);
+            let category = completion.category();
+            let entry = event_to_log_entry(&ActivityEvent::QuarantinePurged(Box::new(completion)));
+            assert_eq!(entry.event, EventType::QuarantinePurge);
+            assert_eq!(entry.path.as_deref(), Some("/data/tmp/go-build"));
+            assert_eq!(entry.size, Some(0));
+            assert_eq!(entry.ok, Some(true));
+            assert_eq!(entry.decision_id.as_deref(), Some("0123456789ab"));
+            assert_eq!(entry.ts, "2026-09-21T14:13:20.123Z");
+            assert!(entry.quarantined.is_none());
+            assert!(entry.pressure.is_none());
+            assert!(entry.free_pct.is_none());
+            assert_eq!(entry.score.is_some(), category.is_some());
+            assert_eq!(
+                entry.details.as_ref().unwrap().contains("category=GoCache"),
+                category.is_some(),
+                "a familiar path cannot supply a missing structural classification"
+            );
+            assert!(entry.details.as_ref().unwrap().contains(&entry.ts));
+            let json = serde_json::to_value(&entry).unwrap();
+            assert_eq!(json["event"], "quarantine_purge");
+            assert!(json.get("quarantined").is_none());
+            let decoded: LogEntry = serde_json::from_value(json).unwrap();
+            assert_eq!(decoded.event, EventType::QuarantinePurge);
+            assert_eq!(decoded.ts, entry.ts);
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn quarantine_purge_writes_receipts_to_both_backends_without_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.run_id = Some("purge-run".to_string());
+        let (handle, join) = spawn_logger(config).unwrap();
+        let completed_at =
+            UNIX_EPOCH + Duration::from_secs(1_790_000_000) + Duration::from_millis(123);
+        handle.send(ActivityEvent::QuarantinePurged(Box::new(purge_completion(
+            "/data/shared/arbitrary-cache-name",
+            4096,
+            completed_at,
+            Some(serde_json::json!({"category": "GoCache", "score": 0.97})),
+        ))));
+        handle.send(ActivityEvent::QuarantinePurged(Box::new(purge_completion(
+            "/data/tmp/go-build",
+            0,
+            completed_at,
+            None,
+        ))));
+        handle.shutdown();
+        join.join().unwrap();
+
+        let db = SqliteLogger::open_read_only(&dir.path().join("test.db")).unwrap();
+        let snapshot = db
+            .history_snapshot("2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(snapshot.receipts.len(), 2);
+        assert_eq!(
+            snapshot.receipts[0].value.path,
+            "/data/shared/arbitrary-cache-name"
+        );
+        assert_eq!(snapshot.receipts[0].value.category.as_deref(), Some("GoCache"));
+        assert!(snapshot.receipts[1].value.category.is_none());
+        for receipt in &snapshot.receipts {
+            assert_eq!(receipt.run_id.as_deref(), Some("purge-run"));
+            assert_eq!(receipt.value.recorded_at, completed_at);
+            assert_eq!(receipt.value.completed_at, Some(completed_at));
+        }
+        assert!(snapshot.outcomes.is_empty());
+        assert!(db.recent_decisions(10).unwrap().is_empty());
+        assert_eq!(
+            db.successful_deletions_since("2020-01-01T00:00:00Z")
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let contents = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        let entries: Vec<LogEntry> = contents
+            .lines()
+            .map(|line| {
+                assert_eq!(
+                    crate::logger::schema::validate_line(line),
+                    Ok(crate::logger::schema::SCHEMA_VERSION)
+                );
+                serde_json::from_str(line).unwrap()
+            })
+            .collect();
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            assert_eq!(entry.event, EventType::QuarantinePurge);
+            assert_eq!(entry.run_id.as_deref(), Some("purge-run"));
+            assert_eq!(entry.ts, "2026-09-21T14:13:20.123Z");
+            assert!(entry.quarantined.is_none());
+        }
     }
 
     #[cfg(feature = "sqlite")]

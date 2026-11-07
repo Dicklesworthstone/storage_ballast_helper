@@ -868,6 +868,24 @@ impl SharedRegret {
         }
     }
 
+    /// Finalizing a held payload contributes successful-removal history, but
+    /// its original pathname disappeared at quarantine time. Starting a new
+    /// recreation watch now would invent a fresh observation window.
+    fn note_quarantine_purged(
+        &self,
+        completion: &crate::scanner::quarantine::QuarantineCompletion,
+    ) {
+        let path = &completion.record.original_path;
+        let category = completion.category().unwrap_or(ArtifactCategory::Unknown);
+        if is_warm_cache(path, category) {
+            self.cache_deletions.lock().push((
+                path.clone(),
+                category,
+                completion.completed_at,
+            ));
+        }
+    }
+
     /// Begin observation at the unlink's completion, without moving the
     /// deadline if acquiring the detector lock takes time.
     fn watch_unlinked(
@@ -8772,14 +8790,20 @@ impl MonitoringDaemon {
                 match store.sweep_with_pressure_gate(now_unix, mode, gate) {
                     Ok(swept) => {
                         held = held.saturating_add(swept.held_bytes);
-                        let (why, drained) = (swept.reason, swept.drained);
-                        if let Some(relief) = &tick.ram_reclaim {
-                            relief.record_unlinked_bytes(drained.bytes);
-                        }
-                        if let Some(relief) = &tick.inode_reclaim {
-                            for _ in 0..drained.entries {
+                        let (why, mut drained) = (swept.reason, swept.drained);
+                        for completion in drained.completed.drain(..) {
+                            if let Some(relief) = &tick.ram_reclaim {
+                                relief.record_unlinked_bytes(completion.record.size_bytes);
+                            }
+                            if let Some(relief) = &tick.inode_reclaim {
                                 relief.record_unlinked();
                             }
+                            // Own-run history rows are excluded from polling,
+                            // so account locally before queuing the receipt.
+                            self.regret.note_quarantine_purged(&completion);
+                            self.logger_handle.send(ActivityEvent::QuarantinePurged(
+                                Box::new(completion),
+                            ));
                         }
                         if drained.entries > 0 {
                             let count = drained.entries;
@@ -15236,6 +15260,81 @@ mod tests {
                 Ok(())
             );
         }
+    }
+
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_finalization_reaches_durable_and_live_history_without_a_new_watch() {
+        let mut fixture = RegretDaemonFixture::new();
+        let root = fixture.daemon.config.scanner.root_paths[0].clone();
+        let cache = root.join("opaque-tool-cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(cache.join("artifact"), b"cached").unwrap();
+        let store = QuarantineStore::under(&root);
+        let held = store
+            .quarantine(
+                &cache,
+                "0123456789ab",
+                6,
+                Duration::ZERO,
+                Some(json!({ "category": "GoCache" })),
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.daemon.regret.cache_redeletions(SystemTime::now()).get(&cache),
+            None,
+            "a recoverable rename is not a completed physical removal",
+        );
+        let mount = PathBuf::from("/");
+        fixture.daemon.sweep_quarantines(
+            &[quarantine_tick(PressureLevel::Green, &mount)],
+            &[(root, Some(mount.clone()))],
+            Instant::now(),
+        );
+        assert!(!held.quarantine_path.exists());
+        assert!(store.record("0123456789ab").unwrap().is_none());
+        assert_eq!(
+            fixture.daemon.regret.cache_redeletions(SystemTime::now()).get(&cache),
+            Some(&1),
+            "the current writer must account before its receipt is polled",
+        );
+        assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
+        fixture.flush_logger();
+
+        let db = SqliteLogger::open_read_only(&fixture.daemon.config.paths.sqlite_db).unwrap();
+        let receipts = db
+            .successful_deletions_since("1970-01-01T00:00:00.000Z")
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].decision_id, "0123456789ab");
+        assert_eq!(receipts[0].path.as_str(), cache.to_string_lossy().as_ref());
+        assert_eq!(receipts[0].category.as_deref(), Some("GoCache"));
+
+        let before_poll = fixture.daemon.regret.history.lock().watermark.activity_id;
+        fixture.daemon.regret.refresh_history_at(
+            Instant::now() + REGRET_HISTORY_POLL_INTERVAL,
+            SystemTime::now(),
+        );
+        assert!(
+            fixture.daemon.regret.history.lock().watermark.activity_id > before_poll,
+            "the own-run check must consume the persisted receipt, not skip a throttled poll",
+        );
+        assert_eq!(
+            fixture.daemon.regret.cache_redeletions(SystemTime::now()).get(&cache),
+            Some(&1),
+            "the current writer's persisted copy must not double-count",
+        );
+        let restarted = SharedRegret::new(&fixture.daemon.config).with_run_id("restart".into());
+        replay_regret_outcomes(&restarted, &fixture.daemon.config.paths.sqlite_db);
+        assert_eq!(
+            restarted.cache_redeletions(SystemTime::now()).get(&cache),
+            Some(&1),
+            "startup replay must retain structural classification for an opaque cache name",
+        );
+        assert_eq!(restarted.detector.lock().pending(), 0);
+        let events = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
+        assert!(events.contains("quarantine_purge"), "{events}");
     }
 
     #[cfg(unix)]

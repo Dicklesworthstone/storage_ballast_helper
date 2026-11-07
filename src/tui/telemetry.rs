@@ -1581,6 +1581,7 @@ fn parse_event_type(input: &str) -> Option<crate::logger::jsonl::EventType> {
     let compact = normalized.replace('_', "");
     match normalized.as_str() {
         "artifact_delete" => Some(crate::logger::jsonl::EventType::ArtifactDelete),
+        "quarantine_purge" => Some(crate::logger::jsonl::EventType::QuarantinePurge),
         "ballast_release" => Some(crate::logger::jsonl::EventType::BallastRelease),
         "ballast_replenish" => Some(crate::logger::jsonl::EventType::BallastReplenish),
         "ballast_provision" => Some(crate::logger::jsonl::EventType::BallastProvision),
@@ -1594,6 +1595,7 @@ fn parse_event_type(input: &str) -> Option<crate::logger::jsonl::EventType> {
         "emergency" => Some(crate::logger::jsonl::EventType::Emergency),
         _ => match compact.as_str() {
             "artifactdelete" => Some(crate::logger::jsonl::EventType::ArtifactDelete),
+            "quarantinepurge" => Some(crate::logger::jsonl::EventType::QuarantinePurge),
             "ballastrelease" => Some(crate::logger::jsonl::EventType::BallastRelease),
             "ballastreplenish" => Some(crate::logger::jsonl::EventType::BallastReplenish),
             "ballastprovision" => Some(crate::logger::jsonl::EventType::BallastProvision),
@@ -2107,6 +2109,34 @@ mod tests {
         let result = adapter.recent_events(10, &critical_filter);
         assert_eq!(result.data.len(), 1);
         assert_eq!(result.data[0].severity, "critical");
+    }
+
+    #[test]
+    fn jsonl_schema_shield_retains_purge_identity_and_zero_byte_estimates() {
+        for event in ["quarantine_purge", "QuarantinePurge", "quarantine-purge"] {
+            let line = serde_json::json!({
+                "timestamp": "2026-09-21T14:13:20.123Z",
+                "event_type": event,
+                "level": "info",
+                "target_path": "/cache/original",
+                "size_bytes": 0,
+                "success": true,
+                "decision_id": "0123456789ab",
+                "message": "completed permanent removal"
+            });
+            let ParseOutcome::Recovered(entry) =
+                parse_jsonl_entry_with_schema_shield(&line.to_string())
+            else {
+                panic!("legacy purge fields must remain readable");
+            };
+            assert_eq!(entry.event, crate::logger::jsonl::EventType::QuarantinePurge);
+            assert_eq!(entry.path.as_deref(), Some("/cache/original"));
+            assert_eq!(entry.size, Some(0));
+            assert_eq!(entry.ok, Some(true));
+            assert_eq!(entry.decision_id.as_deref(), Some("0123456789ab"));
+            assert_eq!(entry.details.as_deref(), Some("completed permanent removal"));
+            assert!(entry.quarantined.is_none());
+        }
     }
 
     #[test]

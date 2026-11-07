@@ -131,6 +131,7 @@ mod tests {
         fs::write(record.original_path.join("new-build"), b"keep rebuild").unwrap();
         let mut entries = 0;
         let mut bytes = 0;
+        let mut completed = Vec::new();
         let mut previous = 96;
         let mut paused = false;
         for _ in 0..100 {
@@ -143,8 +144,10 @@ mod tests {
             bytes += out.bytes;
             if reopened.record("wide").unwrap().is_none() {
                 assert!(!out.budget_exhausted);
+                completed.extend(out.completed);
                 break;
             }
+            assert!(out.completed.is_empty(), "a partial root has no receipt");
             paused = true;
             assert!(out.budget_exhausted);
             assert_eq!(out.deferred_entries, 1);
@@ -163,6 +166,8 @@ mod tests {
             "fixture must exercise continuation, not only completion"
         );
         assert_eq!((entries, bytes), (1, 1234));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].record, record);
         assert!(store.record("wide").unwrap().is_none());
         assert_eq!(store.drain_all_with_budget(32).unwrap().counts(), (0, 0));
         assert_eq!(fs::read(outside).unwrap(), b"outside survives");
@@ -192,6 +197,16 @@ mod tests {
         let rest = store.drain_all().unwrap();
         assert_eq!(rest.counts(), (2, 200));
         assert!(rest.failures.is_empty());
+        let merged = first.merged(rest);
+        assert_eq!(merged.counts(), (3, 300));
+        assert_eq!(
+            merged
+                .completed
+                .iter()
+                .map(|entry| entry.record.decision_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"],
+        );
     }
 
     #[test]
@@ -430,6 +445,86 @@ mod tests {
             assert_eq!(out.reason, if cap_bytes.is_some() { "size cap" } else { "ttl" });
             assert!(!out.drained.budget_exhausted);
             assert!(out.drained.failures.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_zero_byte_root_still_produces_a_completion_with_its_original_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("go-build");
+        fs::create_dir(&source).unwrap();
+        let store = QuarantineStore::under(temp.path());
+        let record = store
+            .quarantine(
+                &source,
+                "zero-receipt",
+                0,
+                Duration::ZERO,
+                Some(serde_json::json!({"category": "RustTarget"})),
+            )
+            .unwrap();
+        let before = std::time::SystemTime::now();
+        let mut out = store.drain_all().unwrap();
+        let after = std::time::SystemTime::now();
+
+        assert_eq!(out.counts(), (1, 0));
+        assert_eq!(out.completed.len(), 1);
+        let mut completed = out.completed.pop().unwrap();
+        assert_eq!(completed.record, record);
+        assert!(completed.completed_at >= before && completed.completed_at <= after);
+        assert_eq!(
+            completed.category(),
+            Some(crate::scanner::patterns::ArtifactCategory::RustTarget),
+        );
+        // The original spelling is deliberately cache-shaped. Missing or
+        // malformed legacy evidence still cannot be guessed from that name.
+        for snapshot in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"category": "not-a-category"})),
+            Some(serde_json::json!({"category": 1})),
+        ] {
+            completed.record.decision = snapshot;
+            assert_eq!(completed.category(), None);
+        }
+        assert!(store.drain_all().unwrap().completed.is_empty());
+    }
+
+    #[test]
+    fn absent_payloads_and_interrupted_restores_do_not_create_completion_receipts() {
+        for (id, restored, pending) in [
+            ("absent", false, false),
+            ("restored", true, false),
+            ("pending-restore", true, true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("original");
+            fs::write(&source, b"held bytes").unwrap();
+            let store = QuarantineStore::under(temp.path());
+            let record = store
+                .quarantine(&source, id, 100, Duration::ZERO, None)
+                .unwrap();
+            if restored {
+                fs::rename(&record.quarantine_path, &record.original_path).unwrap();
+            } else {
+                fs::remove_file(&record.quarantine_path).unwrap();
+            }
+            if pending {
+                fs::rename(
+                    store.record_path(id),
+                    store.root().join(format!("{id}.pending")),
+                )
+                .unwrap();
+            }
+
+            let out = store.drain_all().unwrap();
+            assert_eq!(out.bytes, 0);
+            assert!(out.completed.is_empty());
+            assert!(out.failures.is_empty());
+            assert!(store.drain_all().unwrap().completed.is_empty());
+            if restored {
+                assert_eq!(fs::read(&record.original_path).unwrap(), b"held bytes");
+            }
         }
     }
 

@@ -18,6 +18,7 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// Event types the contract knows, as they appear in `event`.
 pub const EVENT_TYPES: &[&str] = &[
     "artifact_delete",
+    "quarantine_purge",
     "ballast_release",
     "ballast_replenish",
     "ballast_provision",
@@ -101,6 +102,21 @@ pub fn validate_value(value: &Value) -> Result<u32, String> {
             require("ok")?;
             if object.get("ok") == Some(&Value::Bool(false)) {
                 require("error_code")?;
+            }
+        }
+        "quarantine_purge" => {
+            string("path")?;
+            string("decision_id")?;
+            string("details")?;
+            object
+                .get("size")
+                .and_then(Value::as_u64)
+                .ok_or("`quarantine_purge` line without unsigned `size`")?;
+            if object.get("ok") != Some(&Value::Bool(true)) {
+                return Err("`quarantine_purge` requires confirmed success".to_string());
+            }
+            if object.get("quarantined") == Some(&Value::Bool(true)) {
+                return Err("`quarantine_purge` cannot still be held in quarantine".to_string());
             }
         }
         "ballast_release" | "ballast_replenish" | "ballast_provision" => {
@@ -241,6 +257,37 @@ mod tests {
                 .unwrap_err()
                 .contains("decision_id")
         );
+    }
+
+    #[test]
+    fn a_purge_requires_permanent_success_even_when_its_byte_estimate_is_zero() {
+        let valid = serde_json::json!({
+            "ts": "2026-09-21T14:13:20.123Z",
+            "event": "quarantine_purge",
+            "severity": "info",
+            "schema_version": SCHEMA_VERSION,
+            "run_id": "purge-run",
+            "path": "/cache/original",
+            "size": 0,
+            "ok": true,
+            "decision_id": "0123456789ab",
+            "details": "decision_id=0123456789ab;completed_at=2026-09-21T14:13:20.123Z"
+        });
+        assert_eq!(validate_value(&valid), Ok(SCHEMA_VERSION));
+        for key in ["path", "size", "ok", "decision_id", "details"] {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(validate_value(&missing).is_err(), "{key}");
+        }
+        for (key, value) in [
+            ("size", Value::from(-1)),
+            ("ok", Value::Bool(false)),
+            ("quarantined", Value::Bool(true)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[key] = value;
+            assert!(validate_value(&invalid).is_err(), "{key}");
+        }
     }
 
     /// Lines as a v0.5.1 daemon wrote them on the fleet: no schema version,

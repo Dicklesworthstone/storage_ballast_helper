@@ -1644,7 +1644,13 @@ impl DeletionExecutor {
             &decision_id,
             candidate.size_bytes,
             self.config.quarantine_ttl,
-            None,
+            // Preserve the admitted structural evidence for the eventual
+            // permanent-removal receipt, even after decision-log retention.
+            Some(serde_json::json!({
+                "category": format!("{:?}", candidate.classification.category),
+                "certainty": format!("{:?}", candidate.decision.certainty),
+                "score": candidate.total_score,
+            })),
         ) {
             Ok(record) => {
                 eprintln!(
@@ -3095,6 +3101,15 @@ mod tests {
             assert_eq!(
                 fs::read(record.quarantine_path.join("deps/a.o")).unwrap(),
                 b"obj"
+            );
+            assert_eq!(
+                record.decision,
+                Some(serde_json::json!({
+                    "category": "RustTarget",
+                    "certainty": "Definite",
+                    "score": candidate.total_score,
+                })),
+                "both batch and checked quarantine retain their admitted evidence",
             );
             let events = events.lock();
             let [

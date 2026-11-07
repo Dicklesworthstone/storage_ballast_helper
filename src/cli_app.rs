@@ -40,6 +40,7 @@ use storage_ballast_helper::daemon::service::{
     ServiceActionResult, SystemdServiceManager, launchd_labels_for_discovery,
     launchd_system_plist_path_for_label, launchd_user_plist_path_for_label,
 };
+use storage_ballast_helper::logger::dual::ActivityEvent;
 use storage_ballast_helper::logger::sqlite::SqliteLogger;
 use storage_ballast_helper::logger::stats::{
     RamScratchFreshness, RamScratchNotice, StatsEngine, window_label,
@@ -70,7 +71,9 @@ use storage_ballast_helper::scanner::patterns::{
 };
 use storage_ballast_helper::scanner::planner::{BatchPlan, PlanObjective, PlanRequest, plan_batch};
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
-use storage_ballast_helper::scanner::quarantine::{QuarantineStore, StuckEntry};
+use storage_ballast_helper::scanner::quarantine::{
+    QuarantineCompletion, QuarantineStore, StuckEntry,
+};
 use storage_ballast_helper::scanner::scoring::{
     ActiveReferenceSummary, CandidacyScore, CandidateInput, ScoringEngine,
 };
@@ -147,7 +150,7 @@ enum Command {
     Config(ConfigArgs),
     /// Show version and optional build metadata.
     Version(VersionArgs),
-    /// Emergency zero-write recovery mode.
+    /// Emergency recovery using built-in defaults.
     Emergency(EmergencyArgs),
     /// Protect a path subtree from sbh cleanup.
     Protect(ProtectArgs),
@@ -5181,6 +5184,8 @@ fn run_stats_json(
                 "deletions": {
                     "count": ws.deletions.count,
                     "total_bytes_freed": ws.deletions.total_bytes_freed,
+                    "purged_count": ws.deletions.purged_count,
+                    "purged_bytes": ws.deletions.purged_bytes,
                     "avg_size": ws.deletions.avg_size,
                     "median_size": ws.deletions.median_size,
                     "failures": ws.deletions.failures,
@@ -5272,6 +5277,11 @@ fn print_window_stats_human(ws: &storage_ballast_helper::logger::stats::WindowSt
     println!(
         "    Bytes freed: {}",
         format_bytes(ws.deletions.total_bytes_freed)
+    );
+    println!(
+        "    Quarantine purges: {} ({})",
+        ws.deletions.purged_count,
+        format_bytes(ws.deletions.purged_bytes),
     );
     if ws.deletions.count > 0 {
         println!("    Avg size:    {}", format_bytes(ws.deletions.avg_size));
@@ -10731,6 +10741,11 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     stats.deletions.count,
                     format_bytes(stats.deletions.total_bytes_freed),
                 );
+                println!(
+                    "  Quarantine purges: {} items, {} freed",
+                    stats.deletions.purged_count,
+                    format_bytes(stats.deletions.purged_bytes),
+                );
                 if let Some(cat) = &stats.deletions.most_common_category {
                     println!("  Most common: {cat}");
                 }
@@ -10776,6 +10791,8 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 json!({
                     "deletions": s.deletions.count,
                     "bytes_freed": s.deletions.total_bytes_freed,
+                    "purged_count": s.deletions.purged_count,
+                    "purged_bytes": s.deletions.purged_bytes,
                     "failures": s.deletions.failures,
                     "most_common_category": s.deletions.most_common_category,
                 })
@@ -13403,8 +13420,8 @@ fn record_cli_plan(cli: &Cli, config: &Config, batch_plan: &BatchPlan) {
 }
 
 /// Give manual cleanup the daemon's receipt encoding without a second
-/// asynchronous logger or a competing JSONL rotation owner. Emergency uses
-/// its own bare executor and never opens this ledger.
+/// asynchronous logger or a competing JSONL rotation owner. Emergency keeps
+/// its bare executor; only completed quarantine drains persist receipts.
 fn clean_executor_with_receipts(
     deletion_config: DeletionConfig,
     ledger_path: &Path,
@@ -13433,6 +13450,37 @@ fn clean_executor_with_receipts(
             );
         }
     })
+}
+
+/// Persist only physically completed quarantine removals. Emergency calls
+/// this after reclamation; a drain without completions never opens a ledger.
+/// A receipt failure cannot turn a successful removal into a failed cleanup.
+fn record_quarantine_completions(ledger_path: &Path, completions: Vec<QuarantineCompletion>) {
+    if completions.is_empty() {
+        return;
+    }
+    let db = match SqliteLogger::open(ledger_path) {
+        Ok(db) => db,
+        Err(error) => {
+            eprintln!(
+                "[SBH-EMERGENCY] activity ledger {} not writable; quarantine purge receipts cannot be recorded: {error}",
+                ledger_path.display()
+            );
+            return;
+        }
+    };
+    for completion in completions {
+        let event = ActivityEvent::QuarantinePurged(Box::new(completion));
+        if let Err(error) = db.log_activity_event(&event) {
+            eprintln!(
+                "[SBH-EMERGENCY] quarantine purge receipts not recorded in {}: {error}",
+                ledger_path.display()
+            );
+            // Warn once for this drain. Repeating the same unavailable write
+            // must not hold up the remaining emergency cleanup.
+            break;
+        }
+    }
 }
 
 /// `sbh undo`: put quarantined entries back (Layer 7).
@@ -15596,7 +15644,8 @@ fn parse_decimal_byte_count(number: &str, multiplier: u64) -> std::result::Resul
 fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     let start = std::time::Instant::now();
 
-    // Emergency mode: ZERO disk writes. Use defaults only — no config file.
+    // Use defaults only — no config file or pre-cleanup ledger writes.
+    // Completed quarantine removals persist best-effort receipts after reclaim.
     let config = Config::default();
 
     // Determine scan roots: CLI paths, then fall back to defaults.
@@ -15648,6 +15697,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                         failure.path.display()
                     );
                 }
+                record_quarantine_completions(&config.paths.sqlite_db, drained.completed);
             }
             Err(e) => eprintln!(
                 "[SBH-EMERGENCY] quarantine under {} not drained: {e}",
@@ -15810,7 +15860,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     // Display candidates: the report goes to stdout, the mode banner and
     // its caveats to stderr.
     if output_mode(cli) == OutputMode::Human {
-        eprintln!("EMERGENCY MODE — zero-write recovery");
+        eprintln!("EMERGENCY MODE — immediate recovery");
         println!(
             "Scanned {} directories in {:.1}s\n",
             dir_count,
@@ -18723,6 +18773,217 @@ mod tests {
         assert!(report.backoff_candidates.is_empty());
     }
 
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_completion_receipts_follow_real_finalization_and_decision_evidence() {
+        use storage_ballast_helper::scanner::deletion::CheckedDeletion;
+
+        for size in [0, 3] {
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let target = directory.path().join("target");
+            std::fs::create_dir(&target).unwrap();
+            if size > 0 {
+                std::fs::write(target.join("a.o"), b"obj").unwrap();
+            }
+            let ledger = directory.path().join("activity.sqlite3");
+            let mut candidate = clean_receipt_candidate(&target);
+            candidate.size_bytes = size;
+            let decision_id = candidate_decision_id(&candidate);
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    check_open_files: false,
+                    require_identity: true,
+                    mode: DeletionMode::Quarantine,
+                    quarantine_roots: vec![directory.path().to_path_buf()],
+                    ..DeletionConfig::default()
+                },
+                None,
+            );
+            assert_eq!(
+                executor.delete_candidate_checked(&candidate, None).unwrap(),
+                CheckedDeletion::Quarantined,
+            );
+            assert!(!ledger.exists(), "a reversible move creates no purge receipt");
+            let store = QuarantineStore::under(directory.path());
+            let before = SystemTime::now();
+            let drained = store.drain_all().unwrap();
+            let after = SystemTime::now();
+            assert_eq!(drained.completed.len(), 1);
+            let completion = &drained.completed[0];
+            assert_eq!(completion.record.original_path, target);
+            assert_eq!(completion.record.decision_id, decision_id);
+            assert_eq!(completion.record.size_bytes, size);
+            assert_eq!(completion.category(), Some(ArtifactCategory::RustTarget));
+            assert!(completion.completed_at >= before && completion.completed_at <= after);
+            let completed_at = completion.completed_at;
+            record_quarantine_completions(&ledger, drained.completed);
+
+            let db = SqliteLogger::open_read_only(&ledger).unwrap();
+            let events = db.recent_activity(10).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event_type, "quarantine_purge");
+            assert_eq!(events[0].success, 1);
+            let receipts = db
+                .successful_deletions_since("1970-01-01T00:00:00.000Z")
+                .unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].path.as_str(), target.to_string_lossy().as_ref());
+            assert_eq!(receipts[0].decision_id, decision_id);
+            assert_eq!(receipts[0].category.as_deref(), Some("RustTarget"));
+            let recorded_at = receipts[0].completed_at.expect("purge completion time");
+            assert!(
+                completed_at
+                    .duration_since(recorded_at)
+                    .is_ok_and(|delta| delta < Duration::from_millis(1)),
+                "receipt time preserves the completion instant at ledger millisecond precision",
+            );
+            let stats = StatsEngine::new(&db)
+                .window_stats(Duration::from_hours(1))
+                .unwrap();
+            assert_eq!(stats.deletions.count, 0);
+            assert_eq!(stats.deletions.purged_count, 1);
+            assert_eq!(stats.deletions.purged_bytes, size);
+            assert_eq!(stats.deletions.total_bytes_freed, size);
+
+            // Resuming an already-finalized drain cannot log it a second time.
+            record_quarantine_completions(&ledger, store.drain_all().unwrap().completed);
+            assert_eq!(db.recent_activity(10).unwrap().len(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_completion_receipts_keep_legacy_categories_unknown() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        // An artifact-like basename is not structural evidence.
+        let source = directory.path().join("target");
+        std::fs::write(&source, b"old").unwrap();
+        let store = QuarantineStore::under(directory.path());
+        store
+            .quarantine(&source, "0123456789ab", 3, Duration::ZERO, None)
+            .unwrap();
+        let ledger = directory.path().join("activity.sqlite3");
+        let drained = store.drain_all().unwrap();
+        assert_eq!(drained.completed.len(), 1);
+        assert_eq!(drained.completed[0].category(), None);
+        record_quarantine_completions(&ledger, drained.completed);
+
+        let db = SqliteLogger::open_read_only(&ledger).unwrap();
+        let receipts = db
+            .successful_deletions_since("1970-01-01T00:00:00.000Z")
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].path.as_str(), source.to_string_lossy().as_ref());
+        assert_eq!(receipts[0].category, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_completion_receipts_leave_no_ledger_for_noncompletions() {
+        for mode in ["preview", "absent", "restored", "partial", "refused"] {
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let target = directory.path().join("target");
+            std::fs::create_dir(&target).unwrap();
+            for index in 0..8 {
+                std::fs::write(target.join(format!("{index}.o")), b"obj").unwrap();
+            }
+            let ledger = directory.path().join("unopened/activity.sqlite3");
+            let store = QuarantineStore::under(directory.path());
+            let drained = if mode == "preview" {
+                let candidate = clean_receipt_candidate(&target);
+                let executor = clean_executor_with_receipts(
+                    DeletionConfig {
+                        dry_run: true,
+                        check_open_files: false,
+                        mode: DeletionMode::Quarantine,
+                        quarantine_roots: vec![directory.path().to_path_buf()],
+                        ..DeletionConfig::default()
+                    },
+                    &ledger,
+                );
+                executor.delete_candidate_checked(&candidate, None).unwrap();
+                assert!(target.exists());
+                store.drain_all().unwrap()
+            } else {
+                let record = store
+                    .quarantine(&target, mode, 24, Duration::ZERO, None)
+                    .unwrap();
+                match mode {
+                    "absent" => std::fs::remove_dir_all(&record.quarantine_path).unwrap(),
+                    "restored" => {
+                        store.restore(mode, false).unwrap();
+                    }
+                    "refused" => {
+                        std::fs::rename(
+                            &record.quarantine_path,
+                            directory.path().join("retained-original"),
+                        )
+                        .unwrap();
+                        std::fs::create_dir(&record.quarantine_path).unwrap();
+                        std::fs::write(record.quarantine_path.join("replacement"), b"retain")
+                            .unwrap();
+                    }
+                    _ => {}
+                }
+                if mode == "partial" {
+                    let partial = store.drain_all_with_budget(2).unwrap();
+                    assert!(partial.budget_exhausted);
+                    assert!(record.quarantine_path.exists());
+                    partial
+                } else {
+                    let outcome = store.drain_all().unwrap();
+                    if mode == "refused" {
+                        assert_eq!(outcome.failures.len(), 1);
+                        assert!(record.quarantine_path.join("replacement").exists());
+                    }
+                    outcome
+                }
+            };
+
+            assert!(drained.completed.is_empty(), "{mode}: {drained:?}");
+            record_quarantine_completions(&ledger, drained.completed);
+            assert!(!ledger.exists(), "{mode} must not create an activity ledger");
+            assert!(!directory.path().join("unopened").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_receipt_write_failure_preserves_successful_drain_results() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let ledger = directory.path().join("activity.sqlite3");
+        drop(SqliteLogger::open(&ledger).unwrap());
+        let connection = rusqlite::Connection::open(&ledger).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER refuse_purge_receipt BEFORE INSERT ON activity_log
+                 BEGIN SELECT RAISE(ABORT, 'fixture receipt failure'); END;",
+            )
+            .unwrap();
+        drop(connection);
+        let store = QuarantineStore::under(directory.path());
+        for id in ["a", "b"] {
+            let source = directory.path().join(id);
+            std::fs::write(&source, b"obj").unwrap();
+            store
+                .quarantine(&source, id, 3, Duration::ZERO, None)
+                .unwrap();
+        }
+        let drained = store.drain_all().unwrap();
+        assert_eq!(drained.counts(), (2, 6));
+        assert_eq!(drained.completed.len(), 2);
+        assert!(drained.failures.is_empty());
+        assert!(store.records().unwrap().is_empty());
+        record_quarantine_completions(&ledger, drained.completed);
+        assert!(store.records().unwrap().is_empty());
+        assert!(SqliteLogger::open_read_only(&ledger)
+            .unwrap()
+            .recent_activity(10)
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     fn scan_trace_reports_active_reference_checks() {
         let path = PathBuf::from("/tmp/cargo-target-active");
@@ -21407,6 +21668,8 @@ mod tests {
                 total_bytes_freed: 1_000_000,
                 quarantined_count: 0,
                 quarantined_bytes: 0,
+                purged_count: 0,
+                purged_bytes: 0,
                 avg_size: 100_000,
                 median_size: 80_000,
                 largest_deletion: None,

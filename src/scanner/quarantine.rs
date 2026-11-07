@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::core::errors::{Result, SbhError};
+use crate::scanner::patterns::ArtifactCategory;
 use crate::scanner::protection::{MARKER_FILENAME, create_marker};
 
 mod budget;
@@ -103,6 +104,33 @@ pub struct SweepOutcome {
     pub held_bytes: u64,
 }
 
+/// One payload root actually unlinked and durably finalized by this drain.
+///
+/// An absent payload, interrupted restore, partial purge or failed finalization
+/// is not a completion. Size remains the decision-time estimate, including zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineCompletion {
+    /// The fresh manifest admitted while holding the store lock.
+    pub record: QuarantineRecord,
+    /// When permanent removal completed, rather than when it was quarantined.
+    pub completed_at: SystemTime,
+}
+
+impl QuarantineCompletion {
+    /// Structural classification captured when the artifact entered quarantine.
+    /// Legacy or malformed snapshots stay unknown; paths are never guessed.
+    #[must_use]
+    pub fn category(&self) -> Option<ArtifactCategory> {
+        self.record
+            .decision
+            .as_ref()?
+            .get("category")?
+            .as_str()?
+            .parse()
+            .ok()
+    }
+}
+
 /// What a drain actually managed to do.
 ///
 /// Drains are best-effort per entry: a single unremovable entry must never
@@ -119,6 +147,9 @@ pub struct DrainOutcome {
     /// Bytes their records claimed. A partially purged entry is not credited
     /// until its payload root is removed and the transaction is finalized.
     pub bytes: u64,
+    /// Successful physical removals whose metadata transaction also completed.
+    /// The shared traversal budget bounds their count in every batch drain.
+    pub completed: Vec<QuarantineCompletion>,
     /// Entries that would not unlink this pass.
     pub failures: Vec<DrainFailure>,
     /// Entries skipped because they are still cooling down after a failure.
@@ -158,6 +189,7 @@ impl DrainOutcome {
         self.deferred_entries = self.deferred_entries.saturating_add(other.deferred_entries);
         self.budget_exhausted |= other.budget_exhausted;
         self.failures.extend(other.failures);
+        self.completed.extend(other.completed);
         self
     }
 
@@ -425,9 +457,10 @@ impl QuarantineStore {
             Ok(None)
         };
         match result {
-            Ok(Some(bytes)) => {
+            Ok(Some(purged)) => {
                 out.entries += 1;
-                out.bytes = out.bytes.saturating_add(bytes);
+                out.bytes = out.bytes.saturating_add(purged.bytes);
+                out.completed.extend(purged.completed);
             }
             Ok(None) => {
                 out.deferred_entries += 1;

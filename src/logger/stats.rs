@@ -44,13 +44,18 @@ pub struct WindowStats {
 #[derive(Debug, Clone, Default)]
 pub struct DeletionStats {
     pub count: u64,
-    /// Bytes actually released (quarantined entries are excluded: they are
-    /// held, not freed).
+    /// Estimated bytes released by unlinks and finalized quarantine purges.
+    /// Quarantine moves themselves release no bytes.
     pub total_bytes_freed: u64,
     /// Of `count`, deletions that went into quarantine (Layer 7).
     pub quarantined_count: u64,
     /// Bytes held in quarantine by those deletions at decision time.
     pub quarantined_bytes: u64,
+    /// Completed permanent quarantine removals, separate from the original
+    /// cleanup decisions counted by `count`.
+    pub purged_count: u64,
+    /// Recorded byte estimates released by those completed finalizations.
+    pub purged_bytes: u64,
     pub avg_size: u64,
     pub median_size: u64,
     pub largest_deletion: Option<PathInfo>,
@@ -734,6 +739,8 @@ impl<'a> StatsEngine<'a> {
                         "total_bytes_freed": w.deletions.total_bytes_freed,
                         "quarantined_count": w.deletions.quarantined_count,
                         "quarantined_bytes": w.deletions.quarantined_bytes,
+                        "purged_count": w.deletions.purged_count,
+                        "purged_bytes": w.deletions.purged_bytes,
                         "avg_size": w.deletions.avg_size,
                         "median_size": w.deletions.median_size,
                         "largest_deletion": w.deletions.largest_deletion.as_ref().map(|p| {
@@ -863,6 +870,18 @@ impl<'a> StatsEngine<'a> {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
 
+        // A later purge releases the held payload. Keep this phase separate
+        // from the original cleanup decision so a rename-plus-purge lifecycle
+        // does not inflate decision counts or the original size distribution.
+        let (purged_count, purged_bytes): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)
+             FROM activity_log
+             WHERE event_type = 'quarantine_purge' AND success = 1
+               AND timestamp >= ?1",
+            params![since],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
         // Median via OFFSET/LIMIT (efficient for sorted data with index).
         let median_size = if count > 0 {
             let offset = count / 2;
@@ -940,9 +959,12 @@ impl<'a> StatsEngine<'a> {
 
         Ok(DeletionStats {
             count: count.max(0) as u64,
-            total_bytes_freed: total.saturating_sub(quarantined_bytes).max(0) as u64,
+            total_bytes_freed: (total.saturating_sub(quarantined_bytes).max(0) as u64)
+                .saturating_add(purged_bytes.max(0) as u64),
             quarantined_count: quarantined_count.max(0) as u64,
             quarantined_bytes: quarantined_bytes.max(0) as u64,
+            purged_count: purged_count.max(0) as u64,
+            purged_bytes: purged_bytes.max(0) as u64,
             avg_size: avg_size as u64,
             median_size,
             largest_deletion: largest,
@@ -1923,6 +1945,87 @@ mod tests {
             ws.deletions.most_common_category.as_deref(),
             Some(".target*")
         );
+    }
+
+    #[test]
+    fn quarantine_finalization_frees_bytes_without_counting_a_second_decision() {
+        use crate::logger::dual::ActivityEvent;
+        use crate::scanner::quarantine::{QuarantineCompletion, QuarantineRecord};
+        use std::time::SystemTime;
+
+        let (_dir, db) = temp_db();
+        for (path, bytes, details) in [
+            ("/cache/unlinked", 256, None),
+            ("/cache/held", 4096, Some("decision_id=0123456789ab;quarantined")),
+        ] {
+            db.log_activity(&ActivityRow {
+                timestamp: ts(5),
+                event_type: "artifact_delete".to_string(),
+                severity: "info".to_string(),
+                path: Some(path.to_string()),
+                size_bytes: Some(bytes),
+                score: Some(0.97),
+                score_factors: None,
+                pressure_level: None,
+                free_pct: None,
+                duration_ms: None,
+                success: 1,
+                error_code: None,
+                error_message: None,
+                details: details.map(str::to_string),
+            })
+            .unwrap();
+        }
+        let purge = |path: &str, size_bytes, completed_at| {
+            ActivityEvent::QuarantinePurged(Box::new(QuarantineCompletion {
+                record: QuarantineRecord {
+                    decision_id: "0123456789ab".to_string(),
+                    original_path: path.into(),
+                    quarantine_path: "/quarantine/0123456789ab/held".into(),
+                    device_id: 7,
+                    inode: 11,
+                    size_bytes,
+                    quarantined_at: 1,
+                    expires_at: 2,
+                    decision: None,
+                },
+                completed_at,
+            }))
+        };
+        let now = SystemTime::now();
+        for event in [
+            purge("/cache/held", 4096, now - Duration::from_mins(3)),
+            purge("/cache/zero", 0, now - Duration::from_mins(2)),
+            // Logging an older completion now must not move it into this window.
+            purge("/cache/old", 8192, now - Duration::from_hours(48)),
+        ] {
+            db.log_activity_event(&event).unwrap();
+        }
+        let mut failed = crate::logger::dual::event_to_activity_row(&purge(
+            "/cache/failed",
+            1_000_000,
+            now,
+        ))
+        .unwrap();
+        failed.success = 0;
+        db.log_activity(&failed).unwrap();
+
+        let engine = StatsEngine::new(&db);
+        let stats = engine.window_stats(Duration::from_mins(10)).unwrap();
+        assert_eq!(stats.deletions.count, 2);
+        assert_eq!(stats.deletions.quarantined_count, 1);
+        assert_eq!(stats.deletions.quarantined_bytes, 4096);
+        assert_eq!(stats.deletions.purged_count, 2);
+        assert_eq!(stats.deletions.purged_bytes, 4096);
+        assert_eq!(stats.deletions.total_bytes_freed, 4352);
+        assert_eq!(stats.deletions.avg_size, 2176);
+        assert_eq!(stats.deletions.failures, 0);
+        let exported = engine.export_json().unwrap();
+        let deletions = &exported["windows"][0]["deletions"];
+        assert_eq!(deletions["count"], 2);
+        assert_eq!(deletions["purged_count"], 2);
+        assert_eq!(deletions["purged_bytes"], 4096);
+        assert_eq!(deletions["total_bytes_freed"], 4352);
     }
 
     /// Policy transitions, failures by reason and the age at deletion all

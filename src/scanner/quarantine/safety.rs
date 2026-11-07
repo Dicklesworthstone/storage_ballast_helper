@@ -10,12 +10,15 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::budget::PurgeBudget;
-use super::{QuarantineRecord, QuarantineStore, QuarantineUnavailable, RestoreOutcome, now_secs};
+use super::{
+    QuarantineCompletion, QuarantineRecord, QuarantineStore, QuarantineUnavailable, RestoreOutcome,
+    now_secs,
+};
 use crate::core::errors::{Result, SbhError};
 
 #[cfg(unix)]
@@ -457,10 +460,17 @@ fn remove_records_at(root: &Directory, id: &str) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Default)]
+pub(super) struct PurgeOutcome {
+    pub(super) bytes: u64,
+    pub(super) completed: Option<QuarantineCompletion>,
+}
+
 pub(super) fn purge(store: &QuarantineStore, id: &str) -> Result<u64> {
     purge_with(store, id, None, |lock, record| {
         confined_purge::remove_payload(lock, record).map(Some)
     })?
+    .map(|outcome| outcome.bytes)
     .ok_or_else(|| SbhError::Runtime {
         details: "unlimited quarantine purge unexpectedly paused".to_string(),
     })
@@ -475,7 +485,7 @@ pub(super) fn purge_with_budget_and_gate(
     selected: &QuarantineRecord,
     budget: &mut PurgeBudget,
     gate: &mut impl FnMut(&QuarantineRecord) -> bool,
-) -> Result<Option<u64>> {
+) -> Result<Option<PurgeOutcome>> {
     if budget.exhausted() {
         return Ok(None);
     }
@@ -510,17 +520,19 @@ fn purge_with(
     id: &str,
     selected: Option<&QuarantineRecord>,
     remove: impl FnOnce(&File, &QuarantineRecord) -> io::Result<Option<bool>>,
-) -> Result<Option<u64>> {
+) -> Result<Option<PurgeOutcome>> {
     validate_id(id).map_err(|e| SbhError::io(store.root(), e))?;
     let lock = match lock_store(store.root()) {
         Ok(lock) => lock,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Some(0)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(Some(PurgeOutcome::default()));
+        }
         Err(e) => return Err(SbhError::io(store.root(), e)),
     };
     let root = Directory::from_locked(&lock).map_err(|e| SbhError::io(store.root(), e))?;
     let Some(record) = read_record_at(store, id, &root)? else {
         let _ = root.remove_file(std::ffi::OsStr::new(&format!("{id}.stuck")));
-        return Ok(Some(0));
+        return Ok(Some(PurgeOutcome::default()));
     };
     if selected.is_some_and(|selected| selected != &record) {
         // Inventory is read before locking: another cooperating operation can
@@ -544,6 +556,7 @@ fn purge_with(
     else {
         return Ok(None);
     };
+    let completed_at = removed.then(SystemTime::now);
     let bytes = if removed {
         record.size_bytes
     } else {
@@ -555,7 +568,15 @@ fn purge_with(
     remove_records_at(&root, id).map_err(|e| SbhError::io(store.record_path(id), e))?;
     let _ = root.remove_directory(std::ffi::OsStr::new(id));
     root.sync().map_err(|e| SbhError::io(store.root(), e))?;
-    Ok(Some(bytes))
+    // Publish physical-removal evidence only after the whole transaction
+    // succeeds. A later absent-payload retry must not invent a fresh unlink.
+    Ok(Some(PurgeOutcome {
+        bytes,
+        completed: completed_at.map(|completed_at| QuarantineCompletion {
+            record,
+            completed_at,
+        }),
+    }))
 }
 
 fn suffixed_destination(record: &QuarantineRecord) -> PathBuf {
@@ -709,6 +730,38 @@ mod tests {
             .quarantine(&source, id, 100, Duration::from_secs(0), None)
             .unwrap();
         (store, record)
+    }
+
+    #[test]
+    fn a_post_unlink_failure_is_not_replayed_as_a_new_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record) = held(dir.path(), "post-unlink");
+        let failed = purge_with(
+            &store,
+            "post-unlink",
+            Some(&record),
+            |lock, selected| {
+                assert!(confined_purge::remove_payload(lock, selected)?);
+                // Model a finalization interruption after permanent removal.
+                Err(io::Error::other("injected post-unlink finalization failure"))
+            },
+        );
+        assert!(failed.is_err());
+        assert!(!record.quarantine_path.exists());
+        assert_eq!(store.record("post-unlink").unwrap(), Some(record.clone()));
+
+        let resumed = purge_with_budget_and_gate(
+            &store,
+            &record,
+            &mut PurgeBudget::bounded(32),
+            &mut |_| true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resumed.bytes, 0);
+        assert!(resumed.completed.is_none());
+        assert!(store.record("post-unlink").unwrap().is_none());
+        assert_eq!(store.purge("post-unlink").unwrap(), 0);
     }
 
     #[test]
@@ -1265,7 +1318,8 @@ mod tests {
                 &mut PurgeBudget::bounded(32),
                 &mut |_| true,
             )
-            .unwrap(),
+            .unwrap()
+            .map(|outcome| outcome.bytes),
             Some(100)
         );
         assert!(!selected.quarantine_path.exists());
