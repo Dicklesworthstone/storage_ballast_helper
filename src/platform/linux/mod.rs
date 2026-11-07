@@ -445,6 +445,7 @@ mod tests {
         let unmapped = LinuxPal {
             mounts_cache: RwLock::new(Some((Vec::new(), Instant::now()))),
             cache_ttl: Duration::from_secs(3600),
+            ..LinuxPal::new()
         };
         assert!(unmapped.fs_stats(temp.path()).is_err());
         assert!(unmapped.is_ram_backed(temp.path()).is_err());

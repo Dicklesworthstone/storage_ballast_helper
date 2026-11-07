@@ -737,6 +737,7 @@ impl SharedRegret {
             admitted += 1;
         }
         calibrator.expire(now_wall);
+        drop(calibrator);
         history.admission.expire(now_wall);
         history.watermark = page.watermark;
         history.frontier = page.frontier;
@@ -813,7 +814,8 @@ impl SharedRegret {
             now,
         );
         drop(deletions);
-        for (path, count) in self.history.lock().admission.cache_redeletions(now) {
+        let historical = self.history.lock().admission.cache_redeletions(now);
+        for (path, count) in historical {
             let own = counts.entry(path).or_default();
             *own = own.saturating_add(count);
         }

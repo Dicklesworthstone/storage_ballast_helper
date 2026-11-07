@@ -1389,12 +1389,11 @@ fn process_directory(
         // Determine if we should recurse.
         // If following symlinks, we must stat to see if the target is a dir.
         let is_dir = if config.follow_symlinks && ft.is_symlink() {
-            match metadata_for_path(&child_path, true) {
-                Ok(meta) => meta.is_dir(),
-                Err(_) => {
-                    read.entries_incomplete = true;
-                    continue;
-                }
+            if let Ok(meta) = metadata_for_path(&child_path, true) {
+                meta.is_dir()
+            } else {
+                read.entries_incomplete = true;
+                continue;
             }
         } else {
             ft.is_dir()
@@ -1475,7 +1474,7 @@ fn process_directory(
     // above), so queue collected child dirs for worker threads.
     // Enqueue is unbounded and does not wait for a device's admission. A
     // parent and its children therefore cannot deadlock on the same slot.
-    for child_index in 0..read.children.len() {
+    for (child_index, child_name) in read.children.iter().enumerate() {
         if depth >= config.max_depth {
             break;
         }
@@ -1491,7 +1490,7 @@ fn process_directory(
             }
             return;
         }
-        let child_path = dir_path.join(&read.children[child_index]);
+        let child_path = dir_path.join(child_name);
         if config.excluded_paths.contains(&child_path) {
             continue;
         }
