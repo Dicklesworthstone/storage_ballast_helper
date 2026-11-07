@@ -25,7 +25,7 @@ use crate::scanner::walker::FsIdentity;
 
 mod optimization;
 
-pub use optimization::{BatchPlan, PlanRequest, PlannedItem, RiskBudgetByLevel};
+pub use optimization::{BatchPlan, PlanObjective, PlanRequest, PlannedItem, RiskBudgetByLevel};
 
 /// Choose a disjoint, risk-budgeted batch after enforcing all supplied vetoes.
 ///
@@ -286,11 +286,57 @@ mod tests {
     fn request(target_bytes: Option<u64>) -> PlanRequest {
         PlanRequest {
             level: PressureLevel::Critical,
+            objective: PlanObjective::Bytes,
             target_bytes,
             max_items: 100,
             risk_budget: None,
             false_positive_loss: 50.0,
             include_review: true,
+        }
+    }
+
+    #[test]
+    fn artifact_objective_keeps_alias_veto_overlap_and_risk_boundaries() {
+        let mut candidates = vec![
+            candidate("/cache/tree", 0, Some((7, 1))),
+            candidate("/cache/alias", 0, Some((7, 1))),
+            veto(candidate("/cache/tree/busy", 0, Some((7, 2)))),
+            candidate("/cache/tree/safe", 0, Some((7, 3))),
+            candidate("/cache/alias/safe", 0, Some((7, 3))),
+            candidate("/independent", 0, Some((7, 4))),
+            candidate("/independent/child", 0, Some((7, 5))),
+            candidate("/unknown", 0, None),
+        ];
+        let mut req = request(None);
+        req.objective = PlanObjective::ArtifactRemovals;
+        req.max_items = 3;
+        req.risk_budget = Some(1.0);
+        let expected = BTreeSet::from([
+            PathBuf::from("/cache/alias/safe"),
+            PathBuf::from("/independent"),
+        ]);
+        let (_, reference) = plan_batch(candidates.clone(), &req);
+        for _ in 0..candidates.len() {
+            let (chosen, plan) = plan_batch(candidates.clone(), &req);
+            assert_eq!(plan, reference);
+            assert_eq!(
+                chosen.iter().map(|c| c.path.clone()).collect::<BTreeSet<_>>(),
+                expected
+            );
+            assert_eq!(plan.planned_bytes, 0);
+            assert_eq!(plan.top_n_bytes, 0);
+            assert_eq!(plan.chosen.len(), 2);
+            assert!(plan.risk_used > 0.0 && plan.risk_used <= 1.0 + 1e-9);
+            assert!(
+                plan.chosen
+                    .iter()
+                    .all(|item| item.bytes == 0 && item.value > 0.0)
+            );
+            assert!(
+                !plan.skipped_for_overlap.is_empty(),
+                "aliases and descendants remain alternatives"
+            );
+            candidates.rotate_left(1);
         }
     }
 

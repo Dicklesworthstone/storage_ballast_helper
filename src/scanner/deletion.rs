@@ -2977,8 +2977,8 @@ mod tests {
             let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let captured = Arc::clone(&events);
             let receipt_path = target.clone();
-            let executor = DeletionExecutor::new(offline_config(), None)
-                .with_activity_observer(move |event| {
+            let executor = DeletionExecutor::new(offline_config(), None).with_activity_observer(
+                move |event| {
                     if matches!(event, ActivityEvent::ArtifactDeleted { .. }) {
                         assert!(
                             !receipt_path.exists(),
@@ -2986,7 +2986,8 @@ mod tests {
                         );
                     }
                     captured.lock().push(event.clone());
-                });
+                },
+            );
             let started = std::time::SystemTime::now();
 
             if single {
@@ -3014,15 +3015,17 @@ mod tests {
 
             assert!(!target.exists());
             let events = events.lock();
-            let [ActivityEvent::ArtifactDeleted {
-                path,
-                category,
-                completed_at,
-                size_bytes,
-                decision_id,
-                quarantined,
-                ..
-            }] = events.as_slice()
+            let [
+                ActivityEvent::ArtifactDeleted {
+                    path,
+                    category,
+                    completed_at,
+                    size_bytes,
+                    decision_id,
+                    quarantined,
+                    ..
+                },
+            ] = events.as_slice()
             else {
                 panic!("expected exactly one successful mutation receipt: {events:?}");
             };
@@ -3036,7 +3039,11 @@ mod tests {
             assert_eq!(*size_bytes, 3);
             assert_eq!(decision_id.as_deref(), Some(expected_id.as_str()));
             assert!(completed_at.duration_since(started).is_ok());
-            assert!(std::time::SystemTime::now().duration_since(*completed_at).is_ok());
+            assert!(
+                std::time::SystemTime::now()
+                    .duration_since(*completed_at)
+                    .is_ok()
+            );
             assert!(!*quarantined);
         }
     }
@@ -3085,13 +3092,18 @@ mod tests {
                 .record(&id)
                 .unwrap()
                 .expect("the payload remains restorable");
-            assert_eq!(fs::read(record.quarantine_path.join("deps/a.o")).unwrap(), b"obj");
+            assert_eq!(
+                fs::read(record.quarantine_path.join("deps/a.o")).unwrap(),
+                b"obj"
+            );
             let events = events.lock();
-            let [ActivityEvent::ArtifactDeleted {
-                decision_id,
-                quarantined,
-                ..
-            }] = events.as_slice()
+            let [
+                ActivityEvent::ArtifactDeleted {
+                    decision_id,
+                    quarantined,
+                    ..
+                },
+            ] = events.as_slice()
             else {
                 panic!("expected exactly one quarantine receipt: {events:?}");
             };
@@ -3183,10 +3195,12 @@ mod tests {
             }
 
             assert_eq!(fs::read(target.join("a.o")).unwrap(), b"obj");
-            assert!(events
-                .lock()
-                .iter()
-                .all(|event| !matches!(event, ActivityEvent::ArtifactDeleted { .. })));
+            assert!(
+                events
+                    .lock()
+                    .iter()
+                    .all(|event| !matches!(event, ActivityEvent::ArtifactDeleted { .. }))
+            );
         }
     }
 

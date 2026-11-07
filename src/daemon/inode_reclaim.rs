@@ -13,7 +13,7 @@ use crate::core::config::{InodePressureConfig, ScannerConfig};
 use crate::platform::pal::Platform;
 use crate::scanner::deletion::SkipReason;
 use crate::scanner::scoring::{ArtifactCertainty, CandidacyScore, DecisionAction};
-use crate::scanner::walker::{FsIdentity, device_id, identity_for_path};
+use crate::scanner::walker::{FsEntryKind, FsIdentity, device_id, identity_for_path};
 
 #[derive(Debug, Clone)]
 struct AdmittedRoot {
@@ -115,10 +115,15 @@ impl InodeReclaimRequest {
     }
 
     /// A cheap queue filter; mutation still requires current filesystem proof.
+    /// A zero-byte estimate needs an observed directory: removing its own inode
+    /// can relieve exhaustion without claiming any allocated-byte yield.
     #[must_use]
     pub fn accepts_candidate(&self, candidate: &CandidacyScore) -> bool {
         self.remaining_artifacts() > 0
-            && candidate.size_bytes > 0
+            && (candidate.size_bytes > 0
+                || candidate
+                    .identity
+                    .is_some_and(|identity| identity.kind == FsEntryKind::Directory))
             && !candidate.vetoed
             && candidate.decision.action == DecisionAction::Delete
             && candidate.decision.certainty == ArtifactCertainty::Definite
@@ -386,21 +391,55 @@ mod tests {
     }
 
     #[test]
-    fn zero_byte_uncertain_vetoed_and_foreign_device_candidates_stay_protected() {
+    fn zero_byte_directory_authority_requires_identity_and_live_inode_pressure() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut candidate = candidate(temp.path().join("target"));
+        candidate.size_bytes = 0;
+        let request = request(temp.path(), &candidate, 2);
+        let exhausted = platform(temp.path(), InodeStats::new(10_000, 0, 0));
+        assert!(request.accepts_candidate(&candidate));
+        assert_eq!(request.authorize(&candidate, &exhausted), Ok(()));
+        assert!(
+            (exhausted.fs_stats(temp.path()).unwrap().free_pct() - 70.0).abs() < f64::EPSILON
+        );
+        for kind in [FsEntryKind::File, FsEntryKind::Symlink, FsEntryKind::Other] {
+            let mut altered = candidate.clone();
+            altered.identity.as_mut().unwrap().kind = kind;
+            assert!(!request.accepts_candidate(&altered));
+            assert_eq!(
+                request.authorize(&altered, &exhausted),
+                Err(SkipReason::PolicyChanged)
+            );
+        }
+        let recovered = platform(temp.path(), InodeStats::new(10_000, 1_050, 1_050));
+        assert_eq!(
+            request.authorize(&candidate, &recovered),
+            Err(SkipReason::PolicyChanged)
+        );
+        assert_eq!(candidate.size_bytes, 0);
+        assert!(candidate.path.exists());
+    }
+
+    #[test]
+    fn uncertain_vetoed_and_foreign_device_candidates_stay_protected() {
         let temp = tempfile::tempdir().unwrap();
         let candidate = candidate(temp.path().join("target"));
         let request = request(temp.path(), &candidate, 2);
-        for changed in 0..6 {
-            let mut altered = candidate.clone();
-            match changed {
-                0 => altered.size_bytes = 0,
-                1 => altered.decision.certainty = ArtifactCertainty::Likely,
-                2 => altered.vetoed = true,
-                3 => altered.decision.category_suspended = true,
-                4 => altered.identity = None,
-                _ => altered.identity.as_mut().unwrap().device_id ^= 1,
+        for size_bytes in [0, candidate.size_bytes] {
+            for changed in 0..7 {
+                let mut altered = candidate.clone();
+                altered.size_bytes = size_bytes;
+                match changed {
+                    0 => altered.decision.certainty = ArtifactCertainty::Likely,
+                    1 => altered.vetoed = true,
+                    2 => altered.decision.category_suspended = true,
+                    3 => altered.identity = None,
+                    4 => altered.identity.as_mut().unwrap().device_id ^= 1,
+                    5 => altered.decision.action = DecisionAction::Keep,
+                    _ => altered.decision.action = DecisionAction::Review,
+                }
+                assert!(!request.accepts_candidate(&altered));
             }
-            assert!(!request.accepts_candidate(&altered));
         }
     }
 
@@ -509,10 +548,12 @@ mod tests {
     }
 
     #[test]
-    fn successful_unlinks_spend_one_shared_pass_allowance_without_inode_estimates() {
+    fn zero_byte_unlinks_spend_one_shared_pass_allowance_without_inode_estimates() {
         let temp = tempfile::tempdir().unwrap();
-        let first = candidate(temp.path().join("first-target"));
-        let second = candidate(temp.path().join("second-target"));
+        let mut first = candidate(temp.path().join("first-target"));
+        let mut second = candidate(temp.path().join("second-target"));
+        first.size_bytes = 0;
+        second.size_bytes = 0;
         let request = request(temp.path(), &first, 1);
         let queued_batch = request.clone();
         let pal = platform(temp.path(), InodeStats::new(10_000, 0, 0));
@@ -526,6 +567,7 @@ mod tests {
             None,
         );
         let plan = executor.plan(vec![first.clone()]);
+        assert_eq!(plan.total_reclaimable_bytes, 0);
         let report = executor.execute_with_hooks(
             &plan,
             None,
@@ -534,6 +576,7 @@ mod tests {
         );
         assert_eq!(report.items_deleted, 1);
         assert_eq!(report.items_failed, 0);
+        assert_eq!(report.bytes_freed, 0);
         assert_eq!(queued_batch.remaining_artifacts(), 0);
         let later_plan = executor.plan(vec![second.clone()]);
         let later_report = executor.execute_with_hooks(

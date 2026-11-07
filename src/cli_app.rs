@@ -68,7 +68,7 @@ use storage_ballast_helper::scanner::engine::{ScannerEngine, SelectedScannerEngi
 use storage_ballast_helper::scanner::patterns::{
     ArtifactCategory, ArtifactPatternRegistry, OpaqueTreeDisposition,
 };
-use storage_ballast_helper::scanner::planner::{BatchPlan, PlanRequest, plan_batch};
+use storage_ballast_helper::scanner::planner::{BatchPlan, PlanObjective, PlanRequest, plan_batch};
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
 use storage_ballast_helper::scanner::quarantine::{QuarantineStore, StuckEntry};
 use storage_ballast_helper::scanner::scoring::{
@@ -1680,6 +1680,7 @@ fn cli_plan_request(
 ) -> PlanRequest {
     PlanRequest {
         level,
+        objective: PlanObjective::Bytes,
         target_bytes,
         max_items,
         risk_budget: config
@@ -1705,9 +1706,7 @@ fn order_by_plan(plan: &mut DeletionPlan, batch_plan: &BatchPlan) {
 /// Apply the same persisted regret and warm-cache evidence as daemon startup.
 /// Reading history creates no ledger; runtime suspensions are not replayed.
 fn apply_ledger_scoring_history(config: &Config, engine: &mut ScoringEngine) {
-    use storage_ballast_helper::scanner::regret::{
-        RegretCalibrator, RegretConfig, ScoringHistory,
-    };
+    use storage_ballast_helper::scanner::regret::{RegretCalibrator, RegretConfig, ScoringHistory};
     use storage_ballast_helper::scanner::scoring::cache_redeletion_counts;
 
     let history = ScoringHistory::load(&config.paths.sqlite_db);
@@ -13708,7 +13707,8 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     let mut scoring_config = config.scoring.clone();
     scoring_config.min_score = args.min_score;
     warn_visibility_gap("clean");
-    let mut engine = ScoringEngine::from_config(&scoring_config, config.scanner.min_file_age_minutes);
+    let mut engine =
+        ScoringEngine::from_config(&scoring_config, config.scanner.min_file_age_minutes);
     apply_ledger_scoring_history(&config, &mut engine);
     let sacred_paths = active_sacred_paths(&config)?;
     let now = SystemTime::now();
@@ -17036,10 +17036,11 @@ mod tests {
         apply_ledger_scoring_history(&config, &mut engine);
         let held = engine.score_candidate(&input(&cache), 0.0);
         assert!(held.vetoed);
-        assert!(held
-            .veto_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("60m idle floor")));
+        assert!(
+            held.veto_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("60m idle floor"))
+        );
         let unrelated = engine.score_candidate(&input(&other_cache), 0.0);
         assert!(!unrelated.vetoed, "{:?}", unrelated.veto_reason);
         assert!(unrelated.decision.regret_calibration < 1.0);
@@ -18621,12 +18622,21 @@ mod tests {
                     .unwrap();
                 assert_eq!(receipts.len(), usize::from(!quarantine));
                 if quarantine {
-                    assert!(activity[0].details.as_ref().unwrap().contains(";quarantined"));
+                    assert!(
+                        activity[0]
+                            .details
+                            .as_ref()
+                            .unwrap()
+                            .contains(";quarantined")
+                    );
                     let held = QuarantineStore::under(directory.path())
                         .record(&decision_id)
                         .unwrap()
                         .unwrap();
-                    assert_eq!(std::fs::read(held.quarantine_path.join("a.o")).unwrap(), b"obj");
+                    assert_eq!(
+                        std::fs::read(held.quarantine_path.join("a.o")).unwrap(),
+                        b"obj"
+                    );
                 } else {
                     assert_eq!(receipts[0].decision_id, decision_id);
                     assert_eq!(receipts[0].path.as_str(), target.to_string_lossy().as_ref());
@@ -18670,7 +18680,10 @@ mod tests {
             assert_eq!(report.items_would_delete, usize::from(mode == "preview"));
             assert_eq!(std::fs::read(target.join("a.o")).unwrap(), b"obj");
             if mode == "preview" {
-                assert!(!ledger.exists(), "the receipt sink must not write a preview");
+                assert!(
+                    !ledger.exists(),
+                    "the receipt sink must not write a preview"
+                );
             } else {
                 assert!(
                     SqliteLogger::open_read_only(&ledger)

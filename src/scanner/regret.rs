@@ -473,8 +473,15 @@ impl HistoryAdmission {
         let Some(cutoff) = now.checked_sub(CACHE_REDELETION_MEMORY) else {
             return;
         };
-        while self.cache_expiry.first_key_value().is_some_and(|(at, _)| *at < cutoff) {
-            let (_, keys) = self.cache_expiry.pop_first().expect("expired bucket exists");
+        while self
+            .cache_expiry
+            .first_key_value()
+            .is_some_and(|(at, _)| *at < cutoff)
+        {
+            let (_, keys) = self
+                .cache_expiry
+                .pop_first()
+                .expect("expired bucket exists");
             for key in keys {
                 let empty = self.cache_groups.get_mut(&key).is_some_and(|group| {
                     group.expire(now);
@@ -506,7 +513,8 @@ impl HistoryAdmission {
 
 #[cfg(feature = "sqlite")]
 fn retained_at(observed_at: SystemTime, now: SystemTime, window: Duration) -> bool {
-    !now.duration_since(observed_at).is_ok_and(|age| age > window)
+    !now.duration_since(observed_at)
+        .is_ok_and(|age| age > window)
 }
 
 #[cfg(feature = "sqlite")]
@@ -514,7 +522,10 @@ fn expire_buckets<T>(buckets: &mut BTreeMap<SystemTime, T>, now: SystemTime, win
     let Some(cutoff) = now.checked_sub(window) else {
         return;
     };
-    while buckets.first_key_value().is_some_and(|(at, _)| *at < cutoff) {
+    while buckets
+        .first_key_value()
+        .is_some_and(|(at, _)| *at < cutoff)
+    {
         buckets.pop_first();
     }
 }
@@ -1124,11 +1135,7 @@ impl RegretCalibrator {
     /// Add historical calibration evidence without replaying sequential alarm
     /// steps or changing any live suspension. Callers admit each observation
     /// once before using this method.
-    pub fn replay_observation(
-        &mut self,
-        observation: &RegretObservation,
-        now_wall: SystemTime,
-    ) {
+    pub fn replay_observation(&mut self, observation: &RegretObservation, now_wall: SystemTime) {
         self.expire(now_wall);
         if observation.outcome != Outcome::Unknown && !observation.expired(now_wall) {
             self.add_evidence(observation);
@@ -1177,7 +1184,11 @@ impl RegretCalibrator {
         let Some(cutoff) = now_wall.checked_sub(REGRET_EVIDENCE_WINDOW) else {
             return;
         };
-        while self.evidence.first_key_value().is_some_and(|(at, _)| *at < cutoff) {
+        while self
+            .evidence
+            .first_key_value()
+            .is_some_and(|(at, _)| *at < cutoff)
+        {
             let (_, expired) = self.evidence.pop_first().expect("expired bucket exists");
             for (category, counts) in expired {
                 let stats = self
@@ -1667,11 +1678,7 @@ mod tests {
         let now = deleted_at + Duration::from_secs(30);
         let path = "/data/tmp/reused-inode-cache";
         let first = history_receipt("0123456789ab", path, deleted_at);
-        let second = history_receipt(
-            "0123456789ab",
-            path,
-            deleted_at + Duration::from_secs(3),
-        );
+        let second = history_receipt("0123456789ab", path, deleted_at + Duration::from_secs(3));
         let flexible = history_outcome(
             "0123456789ab",
             path,
@@ -1721,8 +1728,7 @@ mod tests {
             }
             assert_eq!(history.cache_redeletions(now)[Path::new(path)], 1);
             assert_eq!(
-                history.cache_redeletions(deleted_at + CACHE_REDELETION_MEMORY)
-                    [Path::new(path)],
+                history.cache_redeletions(deleted_at + CACHE_REDELETION_MEMORY)[Path::new(path)],
                 1,
             );
             assert!(
@@ -1790,17 +1796,19 @@ mod tests {
         let mut malformed = fallback;
         malformed.observed_at = "not-a-time".to_string();
         assert!(history.admit_outcome(malformed, now).is_none());
-        assert!(history
-            .admit_outcome(
-                history_outcome(
-                    "fedcba987654",
-                    "/data/tmp/too-old-cache",
-                    now - REGRET_EVIDENCE_WINDOW - Duration::from_secs(11),
-                    Outcome::Regret,
-                ),
-                now,
-            )
-            .is_none());
+        assert!(
+            history
+                .admit_outcome(
+                    history_outcome(
+                        "fedcba987654",
+                        "/data/tmp/too-old-cache",
+                        now - REGRET_EVIDENCE_WINDOW - Duration::from_secs(11),
+                        Outcome::Regret,
+                    ),
+                    now,
+                )
+                .is_none()
+        );
 
         history.expire(now + REGRET_EVIDENCE_WINDOW + Duration::from_secs(1));
         assert!(history.receipts.is_empty());

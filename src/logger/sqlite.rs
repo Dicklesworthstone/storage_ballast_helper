@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 
 use crate::core::errors::{Result, SbhError};
 use crate::scanner::decision_record::DecisionRecord;
@@ -450,7 +452,9 @@ impl SqliteLogger {
             ))?;
             let mut rows = statement.query(params![receipt_since, watermark.activity_id])?;
             while let Some(row) = rows.next()? {
-                if let Some(mut record) = history_receipt_from_row(row, receipt_since).ok().flatten() {
+                if let Some(mut record) =
+                    history_receipt_from_row(row, receipt_since).ok().flatten()
+                {
                     self.hydrate_history_receipt(&mut record.value)?;
                     receipts.push(record);
                 }
@@ -531,7 +535,9 @@ impl SqliteLogger {
             while let Some(row) = rows.next()? {
                 watermark.activity_id = row.get(0)?;
                 consumed += 1;
-                if let Some(mut record) = history_receipt_from_row(row, receipt_since).ok().flatten() {
+                if let Some(mut record) =
+                    history_receipt_from_row(row, receipt_since).ok().flatten()
+                {
                     self.hydrate_history_receipt(&mut record.value)?;
                     receipts.push(record);
                 }
@@ -549,11 +555,8 @@ impl SqliteLogger {
                  FROM decision_outcome WHERE id > ?1 AND id <= ?2
                  ORDER BY id ASC LIMIT ?3"
             ))?;
-            let mut rows = statement.query(params![
-                after.outcome_id.max(0),
-                frontier.outcome_id,
-                limit,
-            ])?;
+            let mut rows =
+                statement.query(params![after.outcome_id.max(0), frontier.outcome_id, limit,])?;
             let mut consumed = 0;
             while let Some(row) = rows.next()? {
                 watermark.outcome_id = row.get(8)?;
@@ -617,11 +620,14 @@ impl SqliteLogger {
                  WHERE decision_id = ?1 AND path = ?2 AND timestamp <= ?3
                  ORDER BY id DESC LIMIT 1",
             )?
-            .query_row(params![receipt.decision_id, receipt.path, timestamp], |row| {
-                // A malformed legacy JSON payload cannot hold the append cursor
-                // forever. Statement, locking and I/O errors still propagate.
-                Ok(row.get::<_, String>(0).ok())
-            })
+            .query_row(
+                params![receipt.decision_id, receipt.path, timestamp],
+                |row| {
+                    // A malformed legacy JSON payload cannot hold the append cursor
+                    // forever. Statement, locking and I/O errors still propagate.
+                    Ok(row.get::<_, String>(0).ok())
+                },
+            )
             .optional()?
             .flatten();
         receipt.category = record.and_then(|record| {
@@ -631,7 +637,9 @@ impl SqliteLogger {
                 .get("category")?
                 .as_str()
                 .filter(|category| {
-                    category.parse::<crate::scanner::patterns::ArtifactCategory>().is_ok()
+                    category
+                        .parse::<crate::scanner::patterns::ArtifactCategory>()
+                        .is_ok()
                 })
                 .map(str::to_string)
         });

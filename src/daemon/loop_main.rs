@@ -104,7 +104,7 @@ use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, OpaqueTreeDisposition,
     StructuralSignals,
 };
-use crate::scanner::planner::{PlanRequest, RiskBudgetByLevel, plan_batch};
+use crate::scanner::planner::{PlanObjective, PlanRequest, RiskBudgetByLevel, plan_batch};
 use crate::scanner::prescan_cursor::PrescanCursor;
 use crate::scanner::protection::{self, ProtectionRegistry};
 use crate::scanner::quarantine::{QuarantineStore, SweepMode as QuarantineSweepMode};
@@ -572,10 +572,8 @@ struct HistoryReadBatch {
 }
 
 fn history_since(now: SystemTime, window: Duration) -> String {
-    chrono::DateTime::<chrono::Utc>::from(
-        now.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH),
-    )
-    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    chrono::DateTime::<chrono::Utc>::from(now.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// No shared evidence lock is held while opening or querying the ledger.
@@ -670,9 +668,7 @@ impl SharedRegret {
 
     fn begin_history_read(&self, now: Instant, force: bool) -> Option<HistoryReadPlan> {
         let mut history = self.history.lock();
-        if history.in_flight
-            || (!force && history.next_poll.is_some_and(|next| now < next))
-        {
+        if history.in_flight || (!force && history.next_poll.is_some_and(|next| now < next)) {
             return None;
         }
         history.in_flight = true;
@@ -919,10 +915,7 @@ fn replay_regret_outcomes(regret: &SharedRegret, sqlite_db: &Path) {
         let snapshot = db
             .history_snapshot(
                 &history_since(now_wall, REGRET_EVIDENCE_WINDOW),
-                &history_since(
-                    now_wall,
-                    CACHE_REDELETION_MEMORY + Duration::from_secs(2),
-                ),
+                &history_since(now_wall, CACHE_REDELETION_MEMORY + Duration::from_secs(2)),
             )
             .ok()?;
         if HistoryFileIdentity::read(&plan.path).ok()? != identity {
@@ -8911,14 +8904,20 @@ fn dispatch_top_candidates(
     // Neither a path under a dispatched tree nor one containing it: deleting
     // an ancestor would take a subtree rebuilt since its own deletion. The
     // ancestor waits for the next pass.
-    // A candidate that frees nothing is never chosen by the planner (once an
-    // empty mktemp target of a live build was: ts2 2026-10-15), so it is not
-    // dispatched either. Each still cost a policy evaluation, a plan and a
+    // Byte reclamation excludes candidates that free nothing (once an empty
+    // mktemp target of a live build was chosen: ts2 2026-10-15). Scoped inode
+    // relief can admit a definite directory with no allocated bytes because
+    // its removal can reclaim an inode. Each empty byte candidate otherwise
+    // cost a policy evaluation, a plan and a
     // decision_log row on every pass: on ts2 at Critical (2026-10-17) that was
     // 3,479 empty bun-workspace node_modules and target dirs in 20 minutes,
     // ~250,000 rows (~0.6 GB) a day kept for 30 days.
     scored.retain(|candidate| {
-        candidate.size_bytes > 0
+        (candidate.size_bytes > 0
+            || request
+                .inode_reclaim
+                .as_ref()
+                .is_some_and(|relief| relief.accepts_candidate(candidate)))
             && request.permits_reclaim_candidate(candidate)
             && !dispatched
                 .paths
@@ -10457,9 +10456,7 @@ fn scanner_thread_main(
         let mut priority_candidates: Vec<CandidacyScore> = Vec::new();
         let mut prescan_stop: Option<PassStop> = None;
         let mut prescan_entries: usize = 0;
-        if request.force_full_scan
-            && request.scan_now.is_none()
-            && !request.has_resource_reclaim()
+        if request.force_full_scan && request.scan_now.is_none() && !request.has_resource_reclaim()
         {
             // An operator asked for the whole tree; do not resume mid-way.
             // Automatic forced relief must retain paged discovery progress.
@@ -12171,18 +12168,21 @@ fn authorize_target_only_mutation(
     Ok(())
 }
 
-/// Drop candidates with nothing to reclaim. The planner never chooses an
-/// item that frees no bytes (an empty mktemp target of a live remote build
+/// Drop candidates with no gain for the batch's resource. Byte reclamation
+/// never chooses an item that frees no bytes (an empty mktemp target of a
+/// live remote build
 /// was taken at Critical on ts2, 2026-10-15), so evaluating them only re-ran
 /// the policy engine every pass and wrote an approved, never-executed delete
 /// to the decision ledger each time: on ts2 99 hardlinked bun trees were
 /// "approved 99/99 ... planner chose none" pass after pass. Returns how many
-/// were dropped.
+/// were dropped. Only an admitted inode-relief directory may have zero bytes.
 fn drop_zero_byte_candidates(batch: &mut DeletionBatch) -> usize {
     let before = batch.candidates.len();
-    batch
-        .candidates
-        .retain(|candidate| candidate.size_bytes > 0);
+    let inode_reclaim = batch.inode_reclaim.as_ref();
+    batch.candidates.retain(|candidate| {
+        candidate.size_bytes > 0
+            || inode_reclaim.is_some_and(|relief| relief.accepts_candidate(candidate))
+    });
     before - batch.candidates.len()
 }
 
@@ -12509,6 +12509,11 @@ fn executor_thread_main(
                 approved_candidates,
                 &PlanRequest {
                     level: batch.pressure_level,
+                    objective: if batch.inode_reclaim.is_some() {
+                        PlanObjective::ArtifactRemovals
+                    } else {
+                        PlanObjective::Bytes
+                    },
                     target_bytes: if batch.inode_reclaim.is_some() {
                         None
                     } else {
@@ -13018,13 +13023,13 @@ mod tests {
     use crate::core::config::Config;
     use crate::daemon::policy::NotificationPriority;
     use crate::monitor::pid::PressureLevel;
-    use crate::scanner::regret::Outcome;
     use crate::monitor::special_locations::{
         SpecialKind, SpecialLocation, SpecialLocationRegistry,
     };
     use crate::platform::pal::{MemoryInfo, MockPlatform};
     use crate::platform::types::PalError;
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
+    use crate::scanner::regret::Outcome;
     use crate::scanner::scoring::{DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::path::Path;
     use std::time::Duration;
@@ -15988,11 +15993,10 @@ mod tests {
         assert_eq!(regret.cache_redeletions(now).get(&own.path), Some(&1));
         assert_eq!(regret.detector.lock().pending(), 0);
         let own_outcome = persisted_regret_outcome(own_path, "0123456789ac", now);
-        regret.calibrator.lock().record_observation(
-            &own_outcome.observation().unwrap(),
-            now,
-            tick,
-        );
+        regret
+            .calibrator
+            .lock()
+            .record_observation(&own_outcome.observation().unwrap(), now, tick);
         db.log_activity_for_run(
             &cache_receipt_row(own_path, "0123456789ac", now),
             Some("this-daemon"),
@@ -16009,7 +16013,15 @@ mod tests {
         let counts = regret.cache_redeletions(now);
         assert_eq!(counts.get(Path::new(manual_path)), Some(&1));
         assert_eq!(counts.get(Path::new(own_path)), Some(&1));
-        assert_eq!(regret.calibrator.lock().summary("GoCache").unwrap().decisions, 2);
+        assert_eq!(
+            regret
+                .calibrator
+                .lock()
+                .summary("GoCache")
+                .unwrap()
+                .decisions,
+            2
+        );
         assert_eq!(regret.detector.lock().pending(), 0);
         assert_eq!(
             regret.refresh_history_at(tick + REGRET_HISTORY_POLL_INTERVAL, now),
@@ -16018,19 +16030,32 @@ mod tests {
 
         // Two byte-identical persisted occurrences are distinct deletions;
         // a set of fingerprints would incorrectly collapse the second one.
-        db.log_activity_for_run(&receipt, Some("another-daemon")).unwrap();
-        db.log_outcome_for_run(&outcome, Some("another-daemon")).unwrap();
+        db.log_activity_for_run(&receipt, Some("another-daemon"))
+            .unwrap();
+        db.log_outcome_for_run(&outcome, Some("another-daemon"))
+            .unwrap();
         assert_eq!(
             regret.refresh_history_at(tick + REGRET_HISTORY_POLL_INTERVAL * 2, now),
             2,
         );
-        assert_eq!(regret.cache_redeletions(now).get(Path::new(manual_path)), Some(&2));
-        assert_eq!(regret.calibrator.lock().summary("GoCache").unwrap().decisions, 3);
+        assert_eq!(
+            regret.cache_redeletions(now).get(Path::new(manual_path)),
+            Some(&2)
+        );
+        assert_eq!(
+            regret
+                .calibrator
+                .lock()
+                .summary("GoCache")
+                .unwrap()
+                .decisions,
+            3
+        );
         assert!(
-            regret.calibrator.lock().suspended(
-                "GoCache",
-                tick + REGRET_HISTORY_POLL_INTERVAL * 2,
-            ),
+            regret
+                .calibrator
+                .lock()
+                .suspended("GoCache", tick + REGRET_HISTORY_POLL_INTERVAL * 2,),
             "new external outcomes must advance the live alarm",
         );
 
@@ -16039,14 +16064,29 @@ mod tests {
         let later = now + Duration::from_secs(10);
         db.log_activity(&cache_receipt_row(manual_path, "0123456789ab", later))
             .unwrap();
-        db.log_outcome(&persisted_regret_outcome(manual_path, "0123456789ab", later))
-            .unwrap();
+        db.log_outcome(&persisted_regret_outcome(
+            manual_path,
+            "0123456789ab",
+            later,
+        ))
+        .unwrap();
         assert_eq!(
             regret.refresh_history_at(tick + REGRET_HISTORY_POLL_INTERVAL * 3, later),
             2,
         );
-        assert_eq!(regret.cache_redeletions(later).get(Path::new(manual_path)), Some(&3));
-        assert_eq!(regret.calibrator.lock().summary("GoCache").unwrap().decisions, 4);
+        assert_eq!(
+            regret.cache_redeletions(later).get(Path::new(manual_path)),
+            Some(&3)
+        );
+        assert_eq!(
+            regret
+                .calibrator
+                .lock()
+                .summary("GoCache")
+                .unwrap()
+                .decisions,
+            4
+        );
     }
 
     #[cfg(unix)]
@@ -16061,7 +16101,10 @@ mod tests {
         let now = SystemTime::now();
         let tick = Instant::now();
         assert_eq!(regret.refresh_history_at(tick, now), 0);
-        assert!(!db_path.exists(), "history reads must not create a missing ledger");
+        assert!(
+            !db_path.exists(),
+            "history reads must not create a missing ledger"
+        );
         {
             let mut calibrator = regret.calibrator.lock();
             for _ in 0..3 {
@@ -16082,17 +16125,31 @@ mod tests {
                     .unwrap();
             }
             for index in 0..3 {
-                db.log_outcome(&persisted_regret_outcome(path, &format!("{index:012x}"), now))
-                    .unwrap();
+                db.log_outcome(&persisted_regret_outcome(
+                    path,
+                    &format!("{index:012x}"),
+                    now,
+                ))
+                .unwrap();
             }
         }
         let first = tick + REGRET_HISTORY_POLL_INTERVAL;
         regret.refresh_history_at(first, now);
-        assert_eq!(regret.cache_redeletions(now).get(Path::new(path)), Some(&512));
+        assert_eq!(
+            regret.cache_redeletions(now).get(Path::new(path)),
+            Some(&512)
+        );
         assert_eq!(regret.history.lock().watermark.activity_id, 512);
-        assert_eq!(regret.refresh_history_at(first, now), 0, "catch-up is paced");
+        assert_eq!(
+            regret.refresh_history_at(first, now),
+            0,
+            "catch-up is paced"
+        );
         regret.refresh_history_at(first + REGRET_HISTORY_CATCHUP_INTERVAL, now);
-        assert_eq!(regret.cache_redeletions(now).get(Path::new(path)), Some(&600));
+        assert_eq!(
+            regret.cache_redeletions(now).get(Path::new(path)),
+            Some(&600)
+        );
         {
             let calibrator = regret.calibrator.lock();
             assert_eq!(calibrator.summary("GoCache").unwrap().decisions, 3);
@@ -16109,8 +16166,19 @@ mod tests {
         let replaced = first + REGRET_HISTORY_POLL_INTERVAL * 2;
         regret.refresh_history_at(replaced, now);
         regret.refresh_history_at(replaced + REGRET_HISTORY_CATCHUP_INTERVAL, now);
-        assert_eq!(regret.cache_redeletions(now).get(Path::new(path)), Some(&600));
-        assert_eq!(regret.calibrator.lock().summary("GoCache").unwrap().decisions, 3);
+        assert_eq!(
+            regret.cache_redeletions(now).get(Path::new(path)),
+            Some(&600)
+        );
+        assert_eq!(
+            regret
+                .calibrator
+                .lock()
+                .summary("GoCache")
+                .unwrap()
+                .decisions,
+            3
+        );
 
         let moved = directory.path().join("configured-history.sqlite3");
         std::fs::copy(&db_path, &moved).unwrap();
@@ -16126,7 +16194,10 @@ mod tests {
         let reloaded = replaced + REGRET_HISTORY_POLL_INTERVAL * 2;
         regret.refresh_history_at(reloaded, now);
         regret.refresh_history_at(reloaded + REGRET_HISTORY_CATCHUP_INTERVAL, now);
-        assert_eq!(regret.cache_redeletions(now).get(Path::new(path)), Some(&601));
+        assert_eq!(
+            regret.cache_redeletions(now).get(Path::new(path)),
+            Some(&601)
+        );
         let calibrator = regret.calibrator.lock();
         assert_eq!(calibrator.summary("GoCache").unwrap().decisions, 4);
         assert!(!calibrator.suspended("GoCache", reloaded));
@@ -16164,11 +16235,23 @@ mod tests {
             {
                 let db = SqliteLogger::open(&fixture.daemon.config.paths.sqlite_db).unwrap();
                 for index in 0..3 {
-                    db.log_outcome(&persisted_regret_outcome(path, &format!("{index:012x}"), now))
-                        .unwrap();
+                    db.log_outcome(&persisted_regret_outcome(
+                        path,
+                        &format!("{index:012x}"),
+                        now,
+                    ))
+                    .unwrap();
                 }
             }
-            assert!(fixture.daemon.regret.calibrator.lock().summary("GoCache").is_none());
+            assert!(
+                fixture
+                    .daemon
+                    .regret
+                    .calibrator
+                    .lock()
+                    .summary("GoCache")
+                    .is_none()
+            );
             // Move only scheduling clocks, without sleeping or replacing the
             // already-running pass and its captured scoring view.
             let due = Instant::now();
@@ -16181,7 +16264,14 @@ mod tests {
             };
             assert_eq!(stop, None);
             assert_eq!(
-                fixture.daemon.regret.calibrator.lock().summary("GoCache").unwrap().decisions,
+                fixture
+                    .daemon
+                    .regret
+                    .calibrator
+                    .lock()
+                    .summary("GoCache")
+                    .unwrap()
+                    .decisions,
                 3,
             );
             let mut candidate = test_candidate(path, 0.95);
@@ -16206,7 +16296,14 @@ mod tests {
             assert_eq!(limits.prescan_stop(), None);
             assert_eq!(limits.walk_stop(), None);
             assert_eq!(
-                fixture.daemon.regret.calibrator.lock().summary("GoCache").unwrap().decisions,
+                fixture
+                    .daemon
+                    .regret
+                    .calibrator
+                    .lock()
+                    .summary("GoCache")
+                    .unwrap()
+                    .decisions,
                 3,
             );
             limits.deadline = Instant::now();
@@ -16269,12 +16366,25 @@ mod tests {
         worker.join().unwrap();
         fixture.flush_logger();
 
-        assert!(observed, "the running idle scanner must refresh persisted manual work");
-        assert!(report_rx.try_recv().is_err(), "no scan request was submitted");
+        assert!(
+            observed,
+            "the running idle scanner must refresh persisted manual work"
+        );
+        assert!(
+            report_rx.try_recv().is_err(),
+            "no scan request was submitted"
+        );
         assert!(del_rx.try_recv().is_err());
         assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
         assert_eq!(
-            fixture.daemon.regret.calibrator.lock().summary("GoCache").unwrap().decisions,
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("GoCache")
+                .unwrap()
+                .decisions,
             1,
         );
     }
@@ -18802,6 +18912,286 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn zero_byte_dispatch_requires_scoped_inode_directory_authority() {
+        let temp = temp_root_scratch_dir();
+        let root = temp.path().join("root");
+        let directory = root.join("empty");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = root.join("empty-file");
+        std::fs::write(&file, []).unwrap();
+        let mut scanner = Config::default().scanner;
+        scanner.root_paths = vec![root.clone()];
+        let policy = Config::default().pressure.inodes;
+        let root_identity = crate::scanner::walker::identity_for_path(&root, true).unwrap();
+        let relief = InodeReclaimRequest::new(
+            root.clone(),
+            root_identity.device_id,
+            1_000,
+            200,
+            10,
+            &policy,
+            &scanner.root_paths,
+        );
+        let mut valid = test_candidate(&directory.to_string_lossy(), 0.99);
+        valid.size_bytes = 0;
+        valid.identity = crate::scanner::walker::identity_for_path(&directory, false).ok();
+        let mut zero_file = test_candidate(&file.to_string_lossy(), 0.99);
+        zero_file.size_bytes = 0;
+        zero_file.identity = crate::scanner::walker::identity_for_path(&file, false).ok();
+        let mut missing_identity = valid.clone();
+        missing_identity.identity = None;
+        let mut other_device = valid.clone();
+        other_device.identity.as_mut().unwrap().device_id ^= 1;
+        let mut likely = valid.clone();
+        likely.decision.certainty = ArtifactCertainty::Likely;
+        let mut vetoed = valid.clone();
+        vetoed.vetoed = true;
+        let mut suspended = valid.clone();
+        suspended.decision.category_suspended = true;
+        let candidates = vec![
+            valid.clone(),
+            zero_file,
+            missing_identity,
+            other_device,
+            likely,
+            vetoed,
+            suspended,
+        ];
+
+        for mode in ["bytes", "ram", "operator", "inode"] {
+            let mut request = event_test_request(vec![root.clone()]);
+            request.pressure_level = PressureLevel::Critical;
+            request.urgency = 1.0;
+            match mode {
+                "inode" => request.inode_reclaim = Some(relief.clone()),
+                "ram" => {
+                    request.ram_reclaim = Some(RamReclaimRequest::new(
+                        root.clone(),
+                        root_identity.device_id,
+                        4096,
+                        &scanner.root_paths,
+                    ));
+                }
+                "operator" => {
+                    request.scan_now = Some(Arc::new(
+                        ScanNowScope::capture(&[], false, &scanner).unwrap(),
+                    ));
+                }
+                _ => {}
+            }
+            let expected = usize::from(mode == "inode");
+            let mut batch = DeletionBatch {
+                candidates: candidates.clone(),
+                pressure_level: request.pressure_level,
+                urgency: request.urgency,
+                target_bytes: None,
+                ram_reclaim: request.ram_reclaim.clone(),
+                inode_reclaim: request.inode_reclaim.clone(),
+                scan_now: request.scan_now.clone(),
+                target_only_root: None,
+                target_only_consent: None,
+            };
+            assert_eq!(
+                drop_zero_byte_candidates(&mut batch),
+                candidates.len() - expected,
+                "{mode}",
+            );
+            assert_eq!(batch.candidates.len(), expected, "{mode}");
+            let (send, receive) = bounded(1);
+            let mut scored = candidates.clone();
+            assert!(dispatch_top_candidates(
+                &mut scored,
+                &request,
+                &send,
+                &mut PassDispatch::default(),
+            ));
+            if mode == "inode" {
+                let dispatched = receive.try_recv().unwrap();
+                assert_eq!(dispatched.candidates.len(), 1);
+                assert_eq!(dispatched.candidates[0].path, directory);
+                assert_eq!(dispatched.candidates[0].size_bytes, 0);
+                assert_eq!(batch.candidates[0].path, directory);
+            } else {
+                assert!(receive.try_recv().is_err(), "{mode}");
+            }
+            assert!(scored.is_empty(), "{mode}");
+        }
+        assert!(directory.is_dir());
+        assert!(file.is_file());
+    }
+
+    /// Compose the real scanner, planner and executor stages with controlled
+    /// PAL evidence. The thread's real /proc scan is intentionally not used:
+    /// unprivileged hosts can have incomplete process visibility.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn inode_removal_pipeline_stops_on_fresh_recovery_and_keeps_live_safety_rails() {
+        use crate::platform::pal::{FsStats, InodeStats, MountPoint, PlatformPaths};
+        use crate::platform::types::{OpenFile, OpenFileKind, OpenFileMode};
+        use std::cell::Cell;
+
+        let temp = temp_root_scratch_dir();
+        let root = temp.path().join("root");
+        let first = root.join("a-empty");
+        let recovered = root.join("b-empty");
+        let protected = root.join("c-protected");
+        let opened = root.join("d-open");
+        let paths = [&first, &recovered, &protected, &opened];
+        let candidates: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                std::fs::create_dir_all(path).unwrap();
+                let mut candidate =
+                    test_candidate(&path.to_string_lossy(), 1.0 - index as f64 * 0.01);
+                candidate.size_bytes = 0;
+                candidate.identity = crate::scanner::walker::identity_for_path(path, false).ok();
+                candidate
+            })
+            .collect();
+        let live_file = opened.join("live.lock");
+        std::fs::write(&live_file, []).unwrap();
+        let platform = |available| {
+            MockPlatform::new(
+                vec![MountPoint {
+                    path: root.clone(),
+                    device: "inode-fixture".to_string(),
+                    fs_type: "ext4".to_string(),
+                    is_ram_backed: false,
+                }],
+                HashMap::from([(
+                    root.clone(),
+                    FsStats {
+                        total_bytes: 100 << 30,
+                        free_bytes: 70 << 30,
+                        available_bytes: 70 << 30,
+                        fs_type: "ext4".to_string(),
+                        mount_point: root.clone(),
+                        is_readonly: false,
+                    },
+                )]),
+                MemoryInfo {
+                    total_bytes: 8 << 30,
+                    available_bytes: 4 << 30,
+                    swap_total_bytes: 0,
+                    swap_free_bytes: 0,
+                },
+                PlatformPaths::default(),
+            )
+            .with_inode_stats(HashMap::from([(
+                root.clone(),
+                InodeStats::new(10_000, available, available).unwrap(),
+            )]))
+            .with_home(temp.path())
+            .with_temp_dirs(Vec::new())
+            .with_cache_roots(Vec::new())
+            .with_open_file(OpenFile {
+                pid: 42,
+                path: live_file.clone(),
+                fd: Some(3),
+                kind: OpenFileKind::Regular,
+                mode: OpenFileMode::Read,
+            })
+        };
+        let pressured: Arc<dyn Platform> = Arc::new(platform(0));
+        let restored = platform(5_000);
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![root.clone()];
+        let identity = crate::scanner::walker::identity_for_path(&root, true).unwrap();
+        let relief = InodeReclaimRequest::new(
+            root.clone(),
+            identity.device_id,
+            10_000,
+            2_000,
+            4,
+            &config.pressure.inodes,
+            &config.scanner.root_paths,
+        );
+        assert_eq!(relief.authorize_mount(pressured.as_ref()), Ok(()));
+        assert_eq!(
+            relief.authorize_mount(&restored),
+            Err(SkipReason::PolicyChanged),
+        );
+        let mut request = event_test_request(vec![root.clone()]);
+        request.pressure_level = PressureLevel::Critical;
+        request.urgency = 1.0;
+        request.inode_reclaim = Some(relief.clone());
+        let (send, receive) = bounded(1);
+        let mut scored = candidates;
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut PassDispatch::default(),
+        ));
+        let mut batch = receive.try_recv().unwrap();
+        assert_eq!(drop_zero_byte_candidates(&mut batch), 0);
+        let mut plan_request = PlanRequest {
+            level: batch.pressure_level,
+            objective: PlanObjective::Bytes,
+            target_bytes: None,
+            max_items: relief.remaining_artifacts(),
+            risk_budget: Some(10.0),
+            false_positive_loss: 10.0,
+            include_review: false,
+        };
+        assert!(plan_batch(batch.candidates.clone(), &plan_request).0.is_empty());
+        plan_request.objective = PlanObjective::ArtifactRemovals;
+        let (planned, accounting) = plan_batch(batch.candidates, &plan_request);
+        assert_eq!(planned.len(), 4);
+        assert_eq!(accounting.planned_bytes, 0);
+        assert_eq!(accounting.objective, PlanObjective::ArtifactRemovals);
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                dry_run: false,
+                min_score: 0.0,
+                max_batch_size: 4,
+                check_open_files: true,
+                require_identity: true,
+                quarantine_roots: vec![root.clone()],
+                ..Default::default()
+            },
+            None,
+        )
+        .with_platform(Arc::clone(&pressured));
+        let plan = executor.plan(planned);
+        assert_eq!(plan.candidates.len(), 4);
+        assert_eq!(plan.total_reclaimable_bytes, 0);
+        protection::create_marker(&protected, None).unwrap();
+        let removed = Cell::new(0usize);
+        let authorize = |candidate: &CandidacyScore| {
+            relief.authorize_policy(&config.pressure.inodes)?;
+            relief.authorize_scope(&candidate.path, &config.scanner)?;
+            let current: &dyn Platform = if removed.get() == 0 {
+                pressured.as_ref()
+            } else {
+                &restored
+            };
+            relief.authorize(candidate, current)
+        };
+        let on_unlinked = |_: &CandidacyScore, _: Instant| {
+            relief.record_unlinked();
+            removed.set(removed.get() + 1);
+        };
+        let report =
+            executor.execute_with_hooks(&plan, None, Some(&authorize), Some(&on_unlinked));
+        assert_eq!(report.deleted_paths, vec![first.clone()]);
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.bytes_freed, 0, "no byte yield may be invented");
+        assert_eq!(report.skipped_by_reason.get("policy_changed"), Some(&1));
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+        assert_eq!(report.skipped_by_reason.get("file_open"), Some(&1));
+        assert_eq!(relief.remaining_artifacts(), 3);
+        assert!(!first.exists());
+        assert!(recovered.is_dir());
+        assert!(protected.is_dir());
+        assert!(live_file.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn executor_compression_guard_holds_queued_work_without_poisoning_its_retry() {
         use crate::daemon::compress_tier::RootStatus;
 
@@ -19140,7 +19530,10 @@ mod tests {
 
             // SIGUSR1 asks for a full reconciliation.
             request.force_full_scan = true;
-            assert_eq!(shared.scan_posture_for(&request), ScanAggressiveness::Normal);
+            assert_eq!(
+                shared.scan_posture_for(&request),
+                ScanAggressiveness::Normal
+            );
             assert!(!shared.holds_recursive_scan(&request));
 
             // Inode requests also force reconciliation, but that internal
@@ -19176,7 +19569,10 @@ mod tests {
             request.scan_now = Some(Arc::new(
                 ScanNowScope::capture(&[], false, &config.scanner).unwrap(),
             ));
-            assert_eq!(shared.scan_posture_for(&request), ScanAggressiveness::Normal);
+            assert_eq!(
+                shared.scan_posture_for(&request),
+                ScanAggressiveness::Normal
+            );
             assert!(!shared.holds_recursive_scan(&request));
             assert!(!request.bypass_scan_pacing());
         }
@@ -19409,7 +19805,9 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn scanner_cancels_recursive_discovery_when_memory_posture_changes_mid_pass() {
         use crate::platform::pal::{FsStats, MountPoint, PlatformPaths, ServiceManager};
-        use crate::platform::types::{ExecutablesResult, MappedRegion, OpenFilesResult, ProcessInfo};
+        use crate::platform::types::{
+            ExecutablesResult, MappedRegion, OpenFilesResult, ProcessInfo,
+        };
 
         struct RestrictDuringReferences {
             base: MockPlatform,
@@ -20026,11 +20424,9 @@ mod tests {
             logger.shutdown();
             logger_join.join().unwrap();
 
-            let first = del_rx
-                .try_recv()
-                .unwrap_or_else(|error| {
-                    panic!("{source:?} must dispatch a pre-scan batch: {error}")
-                });
+            let first = del_rx.try_recv().unwrap_or_else(|error| {
+                panic!("{source:?} must dispatch a pre-scan batch: {error}")
+            });
             let paths = first
                 .candidates
                 .iter()
@@ -20045,7 +20441,9 @@ mod tests {
                 matches!(source, ForceSource::Operator),
                 "{source:?}: only the explicit operator restarts the covered prefix: {paths:?}",
             );
-            let report = report_rx.try_recv().expect("scanner must report completion");
+            let report = report_rx
+                .try_recv()
+                .expect("scanner must report completion");
             let WorkerReport::ScanCompleted { timed_out, .. } = report else {
                 panic!("expected scanner completion");
             };
@@ -22475,6 +22873,7 @@ mod tests {
                 vec![candidate],
                 &PlanRequest {
                     level: PressureLevel::Critical,
+                    objective: PlanObjective::Bytes,
                     target_bytes: Some(target_bytes),
                     max_items: 10,
                     risk_budget: None,

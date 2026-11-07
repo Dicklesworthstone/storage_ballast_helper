@@ -25,9 +25,13 @@
 //! The approximation bound for ordinary knapsack does not extend to these
 //! overlap and batch-size constraints.
 //!
-//! Determinism: ties break on bytes descending, then path ascending, so
-//! identical inputs plan identically whatever order the walker found them
-//! in (design principle 3).
+//! Inode relief instead ranks artifact removals per unit of expected loss,
+//! retaining the same risk, item and overlap limits. Its byte accounting is
+//! unchanged; filesystem inode counters remain the executor's stopping goal.
+//!
+//! Determinism: byte plans break ties on bytes descending, then path ascending;
+//! artifact plans use path ascending. Identical inputs plan identically whatever
+//! order the walker found them in (design principle 3).
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -37,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use crate::monitor::pid::PressureLevel;
 use crate::scanner::decision_record::stable_decision_id;
 use crate::scanner::scoring::{CandidacyScore, DecisionAction};
-use crate::scanner::walker::FsIdentity;
+use crate::scanner::walker::{FsEntryKind, FsIdentity};
 
 /// The risk budget per pressure level as a multiple of one false-positive
 /// loss (`scoring.false_positive_loss`): how many "average mistakes" one
@@ -101,13 +105,46 @@ fn finite_budget_or_zero(budget: f64) -> f64 {
     }
 }
 
+/// The resource objective used to rank independently eligible cleanup units.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanObjective {
+    /// Reclaim allocated bytes, optionally toward a byte target.
+    #[default]
+    Bytes,
+    /// Remove artifacts within the risk and item budgets. Inode relief uses
+    /// this objective and measures actual filesystem recovery before each
+    /// unlink; one artifact is not an estimate of its descendant inode count.
+    ArtifactRemovals,
+}
+
+impl PlanObjective {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::ArtifactRemovals => "artifact_removals",
+        }
+    }
+
+    fn has_gain(self, candidate: &CandidacyScore) -> bool {
+        candidate.size_bytes > 0
+            || (self == Self::ArtifactRemovals
+                && candidate
+                    .identity
+                    .is_some_and(|identity| identity.kind == FsEntryKind::Directory))
+    }
+}
+
 /// What the planner was asked to do.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanRequest {
     /// The pressure level the batch runs at.
     pub level: PressureLevel,
+    /// Bytes or independently eligible artifact removals per unit of risk.
+    pub objective: PlanObjective,
     /// Bytes the batch should reach; `None` means "as much as the batch
-    /// size and budget allow".
+    /// size and budget allow". Artifact-removal requests must use `None`;
+    /// mixing an artifact objective with a byte target fails closed.
     pub target_bytes: Option<u64>,
     /// The level's batch size (0 plans nothing).
     pub max_items: usize,
@@ -134,7 +171,7 @@ pub struct PlannedItem {
     pub posterior: f64,
     /// `(1 - posterior) * false_positive_loss`.
     pub expected_loss: f64,
-    /// Bytes per loss unit, the greedy key.
+    /// Reclaim per loss unit under the batch's objective: bytes or artifacts.
     pub value: f64,
 }
 
@@ -143,6 +180,9 @@ pub struct PlannedItem {
 pub struct BatchPlan {
     /// Pressure level the plan was made for.
     pub level: String,
+    /// The resource objective; byte totals remain byte estimates in either mode.
+    #[serde(default)]
+    pub objective: PlanObjective,
     /// The byte target, if any.
     pub target_bytes: Option<u64>,
     /// Bytes the chosen set is expected to reclaim.
@@ -175,7 +215,7 @@ impl BatchPlan {
     #[must_use]
     pub fn summary_line(&self) -> String {
         format!(
-            "level={} target_bytes={} planned_bytes={} risk_budget={} risk_used={:.2} chosen={} skipped_for_budget={} top_n_risk={:.2} skipped_for_overlap={}",
+            "level={} target_bytes={} planned_bytes={} risk_budget={} risk_used={:.2} chosen={} skipped_for_budget={} top_n_risk={:.2} skipped_for_overlap={} objective={}",
             self.level,
             self.target_bytes
                 .map_or_else(|| "none".to_string(), |b| b.to_string()),
@@ -186,7 +226,8 @@ impl BatchPlan {
             self.chosen.len(),
             self.skipped_for_budget.len(),
             self.top_n_risk,
-            self.skipped_for_overlap.len()
+            self.skipped_for_overlap.len(),
+            self.objective.label()
         )
     }
 
@@ -210,7 +251,9 @@ impl BatchPlan {
             item.expected_loss,
             self.risk_budget
                 .map_or_else(|| "unbounded".to_string(), |b| format!("{b:.1}")),
-            if self.target_bytes.is_some() {
+            if self.objective == PlanObjective::ArtifactRemovals {
+                "removes an eligible artifact at low expected loss"
+            } else if self.target_bytes.is_some() {
                 if self.target_met {
                     "reaches the target"
                 } else {
@@ -299,7 +342,11 @@ fn plannable(candidate: &CandidacyScore, include_review: bool) -> bool {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn item(candidate: &CandidacyScore, false_positive_loss: f64) -> PlannedItem {
+fn item(
+    candidate: &CandidacyScore,
+    false_positive_loss: f64,
+    objective: PlanObjective,
+) -> PlannedItem {
     // The eligibility gate validates this probability; clamping malformed
     // evidence here would turn infinity into certainty (or NaN into tiny loss).
     let posterior = candidate.decision.posterior_abandoned;
@@ -314,7 +361,12 @@ fn item(candidate: &CandidacyScore, false_positive_loss: f64) -> PlannedItem {
         bytes: candidate.size_bytes,
         posterior,
         expected_loss,
-        value: candidate.size_bytes as f64 / expected_loss,
+        value: match objective {
+            PlanObjective::Bytes => candidate.size_bytes as f64 / expected_loss,
+            PlanObjective::ArtifactRemovals => {
+                f64::from(u8::from(objective.has_gain(candidate))) / expected_loss
+            }
+        },
     }
 }
 
@@ -560,7 +612,8 @@ pub fn plan_batch(
     candidates: Vec<CandidacyScore>,
     request: &PlanRequest,
 ) -> (Vec<CandidacyScore>, BatchPlan) {
-    let valid_loss = valid_loss_unit(request.false_positive_loss);
+    let valid_loss = valid_loss_unit(request.false_positive_loss)
+        && (request.objective == PlanObjective::Bytes || request.target_bytes.is_none());
     let risk_budget = if valid_loss {
         request.risk_budget.map(finite_budget_or_zero)
     } else {
@@ -582,7 +635,7 @@ pub fn plan_batch(
             c.identity
                 .is_none_or(|identity| !blocked_identities.contains(&identity))
         })
-        .map(|c| (item(&c, request.false_positive_loss), c))
+        .map(|c| (item(&c, request.false_positive_loss, request.objective), c))
         .collect();
 
     // The comparison set: top-N by score for the same target.
@@ -592,7 +645,13 @@ pub fn plan_batch(
             b.1.total_score
                 .partial_cmp(&a.1.total_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.0.bytes.cmp(&a.0.bytes))
+                .then_with(|| {
+                    if request.objective == PlanObjective::Bytes {
+                        b.0.bytes.cmp(&a.0.bytes)
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
                 .then_with(|| a.0.path.cmp(&b.0.path))
                 .then_with(|| a.0.decision_id.cmp(&b.0.decision_id))
         });
@@ -606,8 +665,11 @@ pub fn plan_batch(
                 break;
             }
             // A duplicate or descendant must not consume a comparison slot
-            // or count the same bytes toward the target twice.
-            if selected.overlaps(score) {
+            // or count the same resource toward the objective twice.
+            if (request.objective == PlanObjective::ArtifactRemovals
+                && !request.objective.has_gain(score))
+                || selected.overlaps(score)
+            {
                 continue;
             }
             selected.insert(score);
@@ -624,7 +686,13 @@ pub fn plan_batch(
         b.0.value
             .partial_cmp(&a.0.value)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.0.bytes.cmp(&a.0.bytes))
+            .then_with(|| {
+                if request.objective == PlanObjective::Bytes {
+                    b.0.bytes.cmp(&a.0.bytes)
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
             .then_with(|| a.0.path.cmp(&b.0.path))
             .then_with(|| a.0.decision_id.cmp(&b.0.decision_id))
     });
@@ -643,10 +711,10 @@ pub fn plan_batch(
         let next_risk = risk_used + planned.expected_loss;
         let over_budget =
             !next_risk.is_finite() || risk_budget.is_some_and(|budget| next_risk > budget + 1e-9);
-        // An empty candidate frees nothing and still carries its loss: at
-        // Critical (no risk budget) the greedy pass took a fresh, empty
-        // mktemp target of a live remote build (ts2 2026-10-15).
-        if planned.bytes == 0
+        // Byte cleanup must not take an empty live build target. Inode relief
+        // may instead remove an independently admitted, observed directory:
+        // its own inode is useful even when allocated-byte reclaim is zero.
+        if !request.objective.has_gain(score)
             || target_met
             || chosen_idx.len() >= request.max_items
             || over_budget
@@ -665,7 +733,7 @@ pub fn plan_batch(
     // Best-single fallback: when the greedy set falls short of the target
     // (or has none), the single largest candidate that fits the budget on
     // its own beats a bundle of small safe ones if it reclaims more.
-    if !target_met && request.max_items >= 1 {
+    if request.objective == PlanObjective::Bytes && !target_met && request.max_items >= 1 {
         let best_single = plannable
             .iter()
             .enumerate()
@@ -687,7 +755,9 @@ pub fn plan_batch(
         }
     }
 
-    if let Some(cover) = lower_risk_cover(&plannable, &chosen_idx, request, risk_budget) {
+    if request.objective == PlanObjective::Bytes
+        && let Some(cover) = lower_risk_cover(&plannable, &chosen_idx, request, risk_budget)
+    {
         chosen_idx = cover.indices;
         planned_bytes = u64::try_from(cover.bytes).unwrap_or(u64::MAX);
         risk_used = cover.risk;
@@ -725,6 +795,7 @@ pub fn plan_batch(
     }
     let plan = BatchPlan {
         level: format!("{:?}", request.level).to_lowercase(),
+        objective: request.objective,
         target_bytes: request.target_bytes,
         planned_bytes,
         risk_budget,
@@ -794,6 +865,7 @@ mod tests {
     fn request(level: PressureLevel, target: Option<u64>, budget: Option<f64>) -> PlanRequest {
         PlanRequest {
             level,
+            objective: PlanObjective::Bytes,
             target_bytes: target,
             max_items: 10,
             risk_budget: budget,
@@ -804,6 +876,116 @@ mod tests {
 
     const GIB: u64 = 1 << 30;
     const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn artifact_objective_prefers_low_loss_removals_without_fabricating_bytes() {
+        let zero = identified("/cache/zero", 0, 7, 1);
+        let mut small = identified("/cache/small", 4096, 7, 2);
+        small.decision.posterior_abandoned = 0.98;
+        let mut huge = identified("/cache/huge", 100 * GIB, 7, 3);
+        huge.decision.posterior_abandoned = 0.90;
+        huge.total_score = 3.0;
+        let candidates = vec![huge, small, zero];
+        let mut req = request(PressureLevel::Critical, None, None);
+        req.max_items = 1;
+
+        let (byte_chosen, byte_plan) = plan_batch(candidates.clone(), &req);
+        assert_eq!(byte_chosen[0].path, Path::new("/cache/huge"));
+        assert_eq!(byte_plan.planned_bytes, 100 * GIB);
+        assert_eq!(byte_plan.objective, PlanObjective::Bytes);
+
+        req.objective = PlanObjective::ArtifactRemovals;
+        let (chosen, plan) = plan_batch(candidates.clone(), &req);
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].path, Path::new("/cache/zero"));
+        assert_eq!(plan.planned_bytes, 0);
+        assert_eq!(plan.chosen[0].bytes, 0);
+        assert_eq!(plan.objective, PlanObjective::ArtifactRemovals);
+        assert!(!plan.target_met);
+        assert!(plan.summary_line().contains("objective=artifact_removals"));
+        assert!(
+            plan.explain_choice(1)
+                .unwrap()
+                .contains("removes an eligible artifact")
+        );
+        assert_eq!(
+            serde_json::to_value(&plan).unwrap()["objective"],
+            "artifact_removals"
+        );
+
+        req.max_items = 2;
+        req.risk_budget = Some(1.5);
+        let (chosen, plan) = plan_batch(candidates, &req);
+        assert_eq!(
+            chosen.iter().map(|c| c.path.as_path()).collect::<Vec<_>>(),
+            [Path::new("/cache/zero"), Path::new("/cache/small")]
+        );
+        assert_eq!(plan.planned_bytes, 4096);
+        assert!(plan.risk_used <= 1.5 + 1e-9);
+        assert_eq!(plan.skipped_for_budget.len(), 1);
+        assert_finite_plan(&plan);
+    }
+
+    #[test]
+    fn zero_byte_artifact_gain_requires_an_observed_directory() {
+        let mut candidates = vec![
+            identified("/cache/directory", 0, 7, 1),
+            candidate("/cache/unknown", 0, 1.0, 2.0, DecisionAction::Delete),
+        ];
+        for (path, kind, inode) in [
+            ("/cache/file", FsEntryKind::File, 2),
+            ("/cache/link", FsEntryKind::Symlink, 3),
+            ("/cache/other", FsEntryKind::Other, 4),
+        ] {
+            let mut score = identified(path, 0, 7, inode);
+            score.identity.as_mut().unwrap().kind = kind;
+            score.decision.posterior_abandoned = 1.0;
+            candidates.push(score);
+        }
+        let mut req = request(PressureLevel::Critical, None, None);
+        let (byte_chosen, byte_plan) = plan_batch(candidates.clone(), &req);
+        assert!(byte_chosen.is_empty());
+        assert_eq!(byte_plan.planned_bytes, 0);
+
+        req.objective = PlanObjective::ArtifactRemovals;
+        let (chosen, plan) = plan_batch(candidates, &req);
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].path, Path::new("/cache/directory"));
+        assert_eq!(plan.planned_bytes, 0);
+        assert!(plan.risk_used > 0.0);
+        assert_finite_plan(&plan);
+    }
+
+    #[test]
+    fn artifact_objective_preserves_risk_and_item_limits_and_rejects_byte_targets() {
+        let candidates = vec![
+            identified("/cache/zero", 0, 7, 1),
+            identified("/cache/large", GIB, 7, 2),
+        ];
+        let mut req = request(PressureLevel::Critical, None, None);
+        req.objective = PlanObjective::ArtifactRemovals;
+        for target in [Some(0), Some(1), Some(GIB)] {
+            req.target_bytes = target;
+            let (chosen, plan) = plan_batch(candidates.clone(), &req);
+            assert!(chosen.is_empty(), "{plan:?}");
+            assert_eq!(plan.planned_bytes, 0);
+            assert_eq!(plan.risk_used, 0.0);
+        }
+        req.target_bytes = None;
+        req.risk_budget = Some(0.0);
+        assert!(plan_batch(candidates.clone(), &req).0.is_empty());
+        req.risk_budget = None;
+        req.max_items = 0;
+        assert!(plan_batch(candidates.clone(), &req).0.is_empty());
+        req.max_items = 1;
+        let (chosen, plan) = plan_batch(candidates.clone(), &req);
+        assert_eq!(chosen.len(), 1);
+        assert!(plan.risk_used > 0.0);
+
+        req.objective = PlanObjective::Bytes;
+        req.target_bytes = Some(0);
+        assert!(plan_batch(candidates, &req).0.is_empty());
+    }
 
     #[test]
     fn a_parent_and_child_cannot_satisfy_a_target_with_the_same_bytes() {
@@ -951,11 +1133,13 @@ mod tests {
     }
 
     #[test]
-    fn old_persisted_plans_default_to_no_overlap_explanations() {
+    fn old_persisted_plans_default_to_bytes_and_no_overlap_explanations() {
         let (_, plan) = plan_batch(Vec::new(), &request(PressureLevel::Green, None, None));
         let mut value = serde_json::to_value(&plan).unwrap();
         value.as_object_mut().unwrap().remove("skipped_for_overlap");
+        value.as_object_mut().unwrap().remove("objective");
         let decoded: BatchPlan = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.objective, PlanObjective::Bytes);
         assert_eq!(decoded, plan);
     }
 
@@ -1634,7 +1818,7 @@ mod tests {
                         1.0,
                         DecisionAction::Delete,
                     );
-                    (item(&score, req.false_positive_loss), score)
+                    (item(&score, req.false_positive_loss, req.objective), score)
                 })
                 .collect();
             // Feed every feasible subset as an incumbent, not only a subset
@@ -1762,7 +1946,7 @@ mod tests {
             identified("/p/sufficient", 10 * GIB, 7, 20),
         ]
         .into_iter()
-        .map(|score| (item(&score, req.false_positive_loss), score))
+        .map(|score| (item(&score, req.false_positive_loss, req.objective), score))
         .collect();
         assert!(trim_cover(&items, vec![0, 1], 10 * GIB, None).is_none());
         let cover = lower_risk_cover(&items, &[0, 1], &req, None).unwrap();

@@ -1324,7 +1324,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(recovered, 5, "backend recovery must retain writer provenance");
+        assert_eq!(
+            recovered, 5,
+            "backend recovery must retain writer provenance"
+        );
         let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
         assert_eq!(jsonl.matches("SBH-LOCKED-").count(), 3);
         assert_eq!(jsonl.matches("SBH-TRIPPED-").count(), 50);
