@@ -8,6 +8,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Inode and swap relief drain eligible quarantine before new cleanup.**
+  Resource pressure now reaches the existing scoped quarantine drain, renews
+  live shortage and original-path protection, and shares its finite allowance
+  with the following scan. Yellow remains inventory-only; inode relief no
+  longer waits for compression, which cannot free inodes.
+
 - **Directory preparation obeys the daemon's live scan budget.** The priority
   pre-scan now checks CPU, wall time and shutdown between enumeration chunks,
   retains unfinished reads for later passes, and delivers prepared names

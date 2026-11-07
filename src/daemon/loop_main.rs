@@ -7071,14 +7071,14 @@ impl MonitoringDaemon {
         // Root probes for a new compression pass can block in native I/O.
         // Drain and enqueue emergency work before those probes, including
         // when the operator configured compression to start at Red/Critical.
+        // Resource relief drains eligible held artifacts first and shares
+        // their consumed allowance with the subsequent scanner request.
         // Both sweep phases share the same maintenance cadence decision.
         let sweep_due = self.quarantine_sweep_due(now);
         let attempted_emergency_sweep = self.sweep_quarantine_entries(
-            responses.iter().filter(|tick| {
-                tick.response.level >= PressureLevel::Red
-                    && tick.ram_reclaim.is_none()
-                    && tick.inode_reclaim.is_none()
-            }),
+            responses
+                .iter()
+                .filter(|tick| tick.response.level >= PressureLevel::Red),
             &root_mounts,
             sweep_due,
         );
@@ -7118,11 +7118,9 @@ impl MonitoringDaemon {
         }
 
         self.sweep_quarantines(
-            responses.iter().filter(|tick| {
-                tick.response.level < PressureLevel::Red
-                    && tick.ram_reclaim.is_none()
-                    && tick.inode_reclaim.is_none()
-            }),
+            responses
+                .iter()
+                .filter(|tick| tick.response.level < PressureLevel::Red),
             &root_mounts,
             now,
         );
@@ -8783,21 +8781,46 @@ impl MonitoringDaemon {
         tick: &MountTickResponse,
         record: &QuarantineRecord,
     ) -> std::result::Result<(), SkipReason> {
-        match (&tick.ram_reclaim, &tick.inode_reclaim) {
+        if tick.ram_reclaim.is_none() && tick.inode_reclaim.is_none() {
+            return Ok(());
+        }
+        let scanner = self.shared_scanner_config.read().clone();
+        let resolved = match (&tick.ram_reclaim, &tick.inode_reclaim) {
             (Some(relief), None) => {
                 if !relief.accepts_quarantined(record, false) {
                     return Err(SkipReason::PolicyChanged);
                 }
-                relief.authorize_quarantine_scope(record, &self.shared_scanner_config.read())?;
+                relief.authorize_quarantine_scope(record, &scanner)?
             }
             (None, Some(relief)) => {
                 if !relief.accepts_quarantined(record, false) {
                     return Err(SkipReason::PolicyChanged);
                 }
-                relief.authorize_quarantine_scope(record, &self.shared_scanner_config.read())?;
+                relief.authorize_quarantine_scope(record, &scanner)?
             }
             (None, None) => return Ok(()),
             (Some(_), Some(_)) => return Err(SkipReason::PolicyChanged),
+        };
+        // The original may have gained protection since quarantine. Recheck
+        // both spellings with a fresh registry: the store's own mandatory
+        // marker protects it from scanning, not from an authorized purge.
+        let original =
+            std::path::absolute(&record.original_path).map_err(|_| SkipReason::PolicyChanged)?;
+        let mut protection = ProtectionRegistry::new(Some(&scanner.protected_paths))
+            .map_err(|_| SkipReason::SacredStowaway)?;
+        for path in [&original, &resolved] {
+            protection
+                .discover_ancestor_markers(path)
+                .map_err(|_| SkipReason::SacredStowaway)?;
+            if path
+                .ancestors()
+                .any(|ancestor| protection.is_protected(ancestor))
+            {
+                return Err(SkipReason::SacredStowaway);
+            }
+        }
+        if !scanner_mutation_scope_matches(&scanner, &self.shared_scanner_config.read(), false) {
+            return Err(SkipReason::PolicyChanged);
         }
         let category = record
             .definite_category()
@@ -8870,9 +8893,10 @@ impl MonitoringDaemon {
         self.authorize_quarantine_resource_record(tick, record)?;
         shared.authorize_dispatch(tick.ram_reclaim.is_some(), tick.inode_reclaim.is_some())?;
         shared.authorize_mutation(approved_mode, self.policy_engine.lock().mode())?;
-        if shared
-            .compression_first
-            .defers_mount(mount, level, Instant::now())
+        if tick.inode_reclaim.is_none()
+            && shared
+                .compression_first
+                .defers_mount(mount, level, Instant::now())
         {
             return Err(SkipReason::CompressionFirst);
         }
@@ -8893,6 +8917,7 @@ impl MonitoringDaemon {
         for tick in responses {
             let mount = &tick.response.causing_mount;
             let level = tick.response.level;
+            let resource_scoped = tick.ram_reclaim.is_some() || tick.inode_reclaim.is_some();
             let pressured = matches!(
                 level,
                 PressureLevel::Orange | PressureLevel::Red | PressureLevel::Critical
@@ -8916,11 +8941,17 @@ impl MonitoringDaemon {
                 let approved_mode = self.policy_engine.lock().mode();
                 if self.config.scanner.dry_run
                     || !approved_mode.allows_deletion()
-                    || self.shared_executor_config.compression_first.defers_mount(
-                        mount,
-                        level,
-                        Instant::now(),
-                    )
+                    // Resource-only Yellow cannot borrow maintenance's
+                    // TTL/cap authority, which deliberately bypasses the
+                    // pressure callbacks. Keep its inventory until Orange.
+                    || (resource_scoped && !pressured)
+                    // Compression cannot relieve an inode shortage.
+                    || (tick.inode_reclaim.is_none()
+                        && self.shared_executor_config.compression_first.defers_mount(
+                            mount,
+                            level,
+                            Instant::now(),
+                        ))
                 {
                     if let Ok(bytes) = store.held_bytes() {
                         held = held.saturating_add(bytes);
@@ -16035,6 +16066,449 @@ mod tests {
             assert!(!swept.drained.budget_exhausted);
             assert!(records[1].quarantine_path.exists());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn handle_pressure_drains_resource_quarantine_before_new_scans() {
+        use crate::daemon::policy::PolicyConfig;
+        use crate::platform::pal::InodeStats;
+
+        for inode_relief in [false, true] {
+            for level in [PressureLevel::Orange, PressureLevel::Critical] {
+                let mut fixture = RegretDaemonFixture::new();
+                let (mount, other) = if inode_relief {
+                    let available = if level == PressureLevel::Orange {
+                        300
+                    } else {
+                        0
+                    };
+                    install_inode_pressure_probe(
+                        &mut fixture,
+                        InodeStats::new(10_000, available, available),
+                    )
+                } else {
+                    install_tmpfs_pressure_probe(
+                        &mut fixture,
+                        MemoryInfo {
+                            swap_free_bytes: if level == PressureLevel::Orange {
+                                4 << 30
+                            } else {
+                                0
+                            },
+                            ..exhausted_swap_sample()
+                        },
+                        "tmpfs",
+                        70 << 30,
+                        false,
+                    )
+                };
+                let daemon = &mut fixture.daemon;
+                if !inode_relief {
+                    // The swap sample remains below the independent 10%
+                    // relief boundary while selecting the Orange sweep.
+                    daemon.config.pressure.yellow_min_free_pct = 10.0;
+                    daemon.config.pressure.orange_min_free_pct = 5.0;
+                    daemon.config.pressure.red_min_free_pct = 2.0;
+                }
+                daemon.config.scanner.max_delete_batch = 1;
+                *daemon.shared_scanner_config.write() = daemon.config.scanner.clone();
+                *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+                    initial_mode: ActiveMode::Enforce,
+                    ..PolicyConfig::default()
+                });
+                let response = daemon.check_pressure().unwrap();
+                assert_eq!(response.level, level, "inode relief={inode_relief}");
+                assert_eq!(response.causing_mount, mount);
+                assert!(
+                    daemon
+                        .mount_responses
+                        .iter()
+                        .all(|tick| { tick.filesystem_response.level == PressureLevel::Green })
+                );
+                daemon.update_behavior_mode(
+                    MemoryPressureLevel::Normal,
+                    level,
+                    "startup",
+                    Duration::ZERO,
+                );
+                let allowance = daemon
+                    .mount_responses
+                    .iter()
+                    .find(|tick| tick.response.causing_mount == mount)
+                    .unwrap()
+                    .ram_reclaim
+                    .as_ref()
+                    .map_or(8, RamReclaimRequest::remaining_bytes);
+                let store = QuarantineStore::under(&mount);
+                let records: Vec<_> = ["a-legacy", "b-approved", "c-later"]
+                    .into_iter()
+                    .map(|id| {
+                        let source = mount.join(id);
+                        std::fs::write(&source, b"retained").unwrap();
+                        store
+                            .quarantine(
+                                &source,
+                                id,
+                                allowance,
+                                Duration::from_hours(24),
+                                (id != "a-legacy").then(
+                                    || json!({"category": "RustTarget", "certainty": "Definite"}),
+                                ),
+                            )
+                            .unwrap()
+                    })
+                    .collect();
+                assert!(store.root().join(".sbh-protect").exists());
+                let other_source = other.join("held.o");
+                std::fs::write(&other_source, b"unrelated").unwrap();
+                let other_record = QuarantineStore::under(&other)
+                    .quarantine(&other_source, "other", 9, Duration::from_hours(24), None)
+                    .unwrap();
+                // Pressure work must run even between maintenance epochs.
+                daemon.last_quarantine_sweep = Some(Instant::now());
+                let (scan_tx, scan_rx) = bounded(4);
+                let (del_tx, _del_rx) = bounded(4);
+                daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+
+                assert!(
+                    records[0].quarantine_path.exists(),
+                    "legacy evidence is held"
+                );
+                assert!(
+                    !records[1].quarantine_path.exists(),
+                    "eligible held work runs first"
+                );
+                assert!(
+                    records[2].quarantine_path.exists(),
+                    "the shared allowance is spent"
+                );
+                assert!(other_record.quarantine_path.exists());
+                assert_eq!(daemon.quarantine_held.get(&mount), Some(&(2 * allowance)));
+                assert!(store.stuck_entries().unwrap().is_empty());
+                let request = scan_rx.try_recv().expect("the pressured root is scheduled");
+                assert_eq!(request.paths, vec![mount]);
+                if inode_relief {
+                    assert_eq!(request.inode_reclaim.unwrap().remaining_artifacts(), 0);
+                } else {
+                    assert_eq!(request.ram_reclaim.unwrap().remaining_bytes(), 0);
+                    assert_eq!(request.target_bytes, Some(0));
+                }
+                assert!(scan_rx.try_recv().is_err(), "healthy roots stay idle");
+                fixture.flush_logger();
+                let db =
+                    SqliteLogger::open_read_only(&fixture.daemon.config.paths.sqlite_db).unwrap();
+                let receipts = db
+                    .successful_deletions_since("1970-01-01T00:00:00.000Z")
+                    .unwrap();
+                assert_eq!(receipts.len(), 1);
+                assert_eq!(Path::new(&receipts[0].path), records[1].original_path);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn handle_pressure_preserves_resource_quarantine_without_live_authority() {
+        use crate::daemon::policy::PolicyConfig;
+        use crate::platform::pal::InodeStats;
+
+        for inode_relief in [false, true] {
+            for case in [
+                "observe",
+                "dry-run",
+                "recovered",
+                "missing",
+                "excluded",
+                "marker",
+                "protected",
+            ] {
+                let mut fixture = RegretDaemonFixture::new();
+                let (mount, _) = if inode_relief {
+                    install_inode_pressure_probe(&mut fixture, InodeStats::new(10_000, 0, 0))
+                } else {
+                    install_tmpfs_pressure_probe(
+                        &mut fixture,
+                        exhausted_swap_sample(),
+                        "tmpfs",
+                        70 << 30,
+                        false,
+                    )
+                };
+                *fixture.daemon.shared_scanner_config.write() =
+                    fixture.daemon.config.scanner.clone();
+                *fixture.daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+                    initial_mode: if case == "observe" {
+                        ActiveMode::Observe
+                    } else {
+                        ActiveMode::Enforce
+                    },
+                    ..PolicyConfig::default()
+                });
+                let response = fixture.daemon.check_pressure().unwrap();
+                assert_eq!(response.level, PressureLevel::Critical);
+                fixture.daemon.update_behavior_mode(
+                    MemoryPressureLevel::Normal,
+                    response.level,
+                    "startup",
+                    Duration::ZERO,
+                );
+                let source = mount.join("held.o");
+                std::fs::write(&source, b"retained").unwrap();
+                let store = QuarantineStore::under(&mount);
+                let record = store
+                    .quarantine(
+                        &source,
+                        "held",
+                        8,
+                        Duration::from_hours(24),
+                        Some(json!({"category": "RustTarget", "certainty": "Definite"})),
+                    )
+                    .unwrap();
+                if matches!(case, "recovered" | "missing") {
+                    // Keep the queued Critical tick, but revoke the resource
+                    // evidence observed at the actual purge boundary.
+                    if inode_relief {
+                        install_inode_pressure_probe(
+                            &mut fixture,
+                            (case == "recovered")
+                                .then(|| InodeStats::new(10_000, 2000, 2000).unwrap()),
+                        );
+                    } else {
+                        install_tmpfs_pressure_probe(
+                            &mut fixture,
+                            MemoryInfo {
+                                swap_total_bytes: if case == "recovered" { 64 << 30 } else { 0 },
+                                swap_free_bytes: if case == "recovered" { 64 << 30 } else { 0 },
+                                ..exhausted_swap_sample()
+                            },
+                            "tmpfs",
+                            70 << 30,
+                            false,
+                        );
+                    }
+                }
+                let daemon = &mut fixture.daemon;
+                daemon.config.scanner.dry_run = case == "dry-run";
+                if case == "excluded" {
+                    daemon
+                        .shared_scanner_config
+                        .write()
+                        .excluded_paths
+                        .push(source.clone());
+                }
+                if case == "marker" {
+                    std::fs::write(mount.join(".sbh-protect"), b"new protection").unwrap();
+                }
+                if case == "protected" {
+                    daemon
+                        .shared_scanner_config
+                        .write()
+                        .protected_paths
+                        .push(mount.to_string_lossy().into_owned());
+                }
+                let (scan_tx, scan_rx) = bounded(4);
+                let (del_tx, _del_rx) = bounded(4);
+                daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+                assert_eq!(
+                    std::fs::read(&record.quarantine_path).unwrap(),
+                    b"retained",
+                    "{case}, inode relief={inode_relief}",
+                );
+                assert_eq!(daemon.quarantine_held.get(&mount), Some(&8));
+                assert!(store.stuck_entries().unwrap().is_empty());
+                assert!(store.record("held").unwrap().is_some());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resource_quarantine_protection_checks_original_and_resolved_path_patterns() {
+        use crate::platform::pal::InodeStats;
+
+        for inode_relief in [false, true] {
+            for protect_resolved in [false, true] {
+                let mut fixture = RegretDaemonFixture::new();
+                let (mount, _) = if inode_relief {
+                    install_inode_pressure_probe(&mut fixture, InodeStats::new(10_000, 0, 0))
+                } else {
+                    install_tmpfs_pressure_probe(
+                        &mut fixture,
+                        exhausted_swap_sample(),
+                        "tmpfs",
+                        70 << 30,
+                        false,
+                    )
+                };
+                let alias = fixture.directory.path().join("alias");
+                std::os::unix::fs::symlink(&mount, &alias).unwrap();
+                let daemon = &mut fixture.daemon;
+                daemon.config.scanner.root_paths = vec![alias.clone()];
+                *daemon.shared_scanner_config.write() = daemon.config.scanner.clone();
+                let source = alias.join("held.o");
+                std::fs::write(&source, b"retained").unwrap();
+                let store = QuarantineStore::under(&alias);
+                let record = store
+                    .quarantine(
+                        &source,
+                        "held",
+                        8,
+                        Duration::from_hours(24),
+                        Some(json!({"category": "RustTarget", "certainty": "Definite"})),
+                    )
+                    .unwrap();
+                let mut tick = quarantine_tick(PressureLevel::Critical, &mount);
+                if inode_relief {
+                    tick.inode_reclaim = Some(InodeReclaimRequest::new(
+                        mount.clone(),
+                        record.device_id,
+                        10_000,
+                        1_000,
+                        1,
+                        &daemon.config.pressure.inodes,
+                        &daemon.config.scanner.root_paths,
+                    ));
+                } else {
+                    tick.ram_reclaim = Some(RamReclaimRequest::new(
+                        mount.clone(),
+                        record.device_id,
+                        8,
+                        &daemon.config.scanner.root_paths,
+                    ));
+                }
+                assert_eq!(
+                    daemon.authorize_quarantine_resource_record(&tick, &record),
+                    Ok(())
+                );
+                let protected = if protect_resolved { &mount } else { &alias };
+                daemon
+                    .shared_scanner_config
+                    .write()
+                    .protected_paths
+                    .push(format!("{}/held.*", protected.display()));
+                assert_eq!(
+                    daemon.authorize_quarantine_resource_record(&tick, &record),
+                    Err(SkipReason::SacredStowaway),
+                    "inode relief={inode_relief}, resolved pattern={protect_resolved}",
+                );
+                daemon.sweep_quarantines(&[tick], &[(alias, Some(mount.clone()))], Instant::now());
+                assert_eq!(std::fs::read(&record.quarantine_path).unwrap(), b"retained");
+                assert_eq!(daemon.quarantine_held.get(&mount), Some(&8));
+                assert!(store.stuck_entries().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn yellow_resource_pressure_cannot_apply_unfiltered_quarantine_maintenance() {
+        for inode_relief in [false, true] {
+            let mut fixture = RegretDaemonFixture::new();
+            let (mount, _) = if inode_relief {
+                install_inode_pressure_probe(
+                    &mut fixture,
+                    crate::platform::pal::InodeStats::new(10_000, 750, 750),
+                )
+            } else {
+                install_tmpfs_pressure_probe(
+                    &mut fixture,
+                    MemoryInfo {
+                        swap_free_bytes: 4 << 30,
+                        ..exhausted_swap_sample()
+                    },
+                    "tmpfs",
+                    70 << 30,
+                    false,
+                )
+            };
+            let daemon = &mut fixture.daemon;
+            if !inode_relief {
+                daemon.config.pressure.yellow_min_free_pct = 5.0;
+                daemon.config.pressure.orange_min_free_pct = 3.0;
+                daemon.config.pressure.red_min_free_pct = 1.0;
+            }
+            *daemon.shared_scanner_config.write() = daemon.config.scanner.clone();
+            let response = daemon.check_pressure().unwrap();
+            assert_eq!(response.level, PressureLevel::Yellow);
+            daemon.update_behavior_mode(
+                MemoryPressureLevel::Normal,
+                response.level,
+                "startup",
+                Duration::ZERO,
+            );
+            let source = mount.join("expired-legacy.o");
+            std::fs::write(&source, b"retained").unwrap();
+            let store = QuarantineStore::under(&mount);
+            let record = store
+                .quarantine(&source, "expired", 8, Duration::ZERO, None)
+                .unwrap();
+            assert!(daemon.quarantine_sweep_due(Instant::now()));
+            let (scan_tx, scan_rx) = bounded(4);
+            let (del_tx, _del_rx) = bounded(4);
+            daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+            assert_eq!(std::fs::read(&record.quarantine_path).unwrap(), b"retained");
+            assert_eq!(daemon.quarantine_held.get(&mount), Some(&8));
+            assert!(store.record("expired").unwrap().is_some());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inode_quarantine_relief_does_not_wait_for_compression() {
+        use crate::daemon::compress_tier::RootStatus;
+        use crate::platform::pal::InodeStats;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let (mount, _) =
+            install_inode_pressure_probe(&mut fixture, InodeStats::new(10_000, 300, 300));
+        let daemon = &mut fixture.daemon;
+        *daemon.shared_scanner_config.write() = daemon.config.scanner.clone();
+        let response = daemon.check_pressure().unwrap();
+        assert_eq!(response.level, PressureLevel::Orange);
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            response.level,
+            "startup",
+            Duration::ZERO,
+        );
+        let source = mount.join("held.o");
+        std::fs::write(&source, b"retained").unwrap();
+        let store = QuarantineStore::under(&mount);
+        let record = store
+            .quarantine(
+                &source,
+                "held",
+                8,
+                Duration::from_hours(24),
+                Some(json!({"category": "RustTarget", "certainty": "Definite"})),
+            )
+            .unwrap();
+        let first = Arc::clone(&daemon.shared_executor_config.compression_first);
+        first.begin(
+            &[RootStatus {
+                root: mount.clone(),
+                btrfs: true,
+                level: Some(PressureLevel::Orange),
+                mount_point: Some(mount.clone()),
+                device_id: Some(record.device_id),
+            }],
+            &[],
+            Instant::now(),
+            Duration::from_secs(30),
+        );
+        assert!(first.defers_mount(&mount, PressureLevel::Orange, Instant::now()));
+        let ticks = daemon.mount_responses.clone();
+        daemon.sweep_quarantines(
+            &ticks,
+            &[(mount.clone(), Some(mount.clone()))],
+            Instant::now(),
+        );
+        assert!(!record.quarantine_path.exists());
+        assert_eq!(daemon.quarantine_held.get(&mount), Some(&0));
+        assert!(first.defers_mount(&mount, PressureLevel::Orange, Instant::now()));
     }
 
     #[cfg(target_os = "linux")]

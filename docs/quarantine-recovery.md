@@ -50,6 +50,26 @@ Mutating store operations use a non-blocking, process-scoped directory lock. No
 lock file needs allocation on a full disk, and process exit releases the lock.
 A concurrent operation is refused rather than waiting indefinitely.
 
+## Relief from inode or swap pressure
+
+At Orange or worse, inode and tmpfs swap relief considers eligible quarantined
+artifacts before scheduling new cleanup on that filesystem. A held artifact
+must retain a recorded definite category, the admitted device identity, and an
+original path under a current configured root. Legacy or uncertain records,
+suspended categories, newly excluded or protected original paths, and changed
+root aliases remain held. Protection is checked in both the original and
+resolved path spelling; the quarantine store's own `.sbh-protect` marker does
+not prevent an otherwise authorized purge.
+
+The pressure gate renews the actual inode or swap shortage before removal and
+at bounded checkpoints within large payloads. Completed purges consume the same
+finite allowance as the scan request that follows: an inode pass counts completed
+artifact removals, while a swap pass charges their allocated-byte estimates.
+Recovery, unavailable evidence, observe mode, and dry-run keep the remaining
+payloads restorable. Compression holds do not postpone inode relief because
+compression cannot release inodes. Resource-only Yellow pressure reports held
+inventory without borrowing maintenance's broader TTL or size-cap authority.
+
 ## Executor failure and admission semantics
 
 **Quarantine mode never falls back to permanent deletion.** A busy store,
