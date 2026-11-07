@@ -61,18 +61,19 @@ pub(super) fn remove_payload(store: &File, record: &QuarantineRecord) -> io::Res
 }
 
 /// `None` is a cooperative pause, not a filesystem failure or a removed root.
-pub(super) fn remove_payload_with_budget(
+pub(super) fn remove_payload_with_budget_and_gate(
     store: &File,
     record: &QuarantineRecord,
     budget: &mut PurgeBudget,
+    gate: &mut impl FnMut() -> bool,
 ) -> io::Result<Option<bool>> {
     #[cfg(unix)]
     {
-        unix::remove_payload_with_budget(store, record, budget)
+        unix::remove_payload_with_budget_and_gate(store, record, budget, gate)
     }
     #[cfg(not(unix))]
     {
-        let _ = (store, record, budget);
+        let _ = (store, record, budget, gate);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "confined quarantine purge requires Unix directory descriptors",
@@ -236,6 +237,7 @@ mod unix {
             0,
             allow_permission_changes,
             &mut PurgeBudget::unlimited(),
+            &mut || true,
             hook,
         )? {
             Some(true) => Ok(()),
@@ -253,12 +255,13 @@ mod unix {
         remove_with_hook(store, record, &mut |_, _| {})
     }
 
-    pub(super) fn remove_payload_with_budget(
+    pub(super) fn remove_payload_with_budget_and_gate(
         store: &File,
         record: &QuarantineRecord,
         budget: &mut PurgeBudget,
+        gate: &mut impl FnMut() -> bool,
     ) -> io::Result<Option<bool>> {
-        remove_with_budget_and_hook(store, record, budget, &mut |_, _| {})
+        remove_with_budget_and_gate_and_hook(store, record, budget, gate, &mut |_, _| {})
     }
 
     fn remove_with_hook(
@@ -274,6 +277,16 @@ mod unix {
         store: &File,
         record: &QuarantineRecord,
         budget: &mut PurgeBudget,
+        hook: &mut impl FnMut(&OsStr, Step),
+    ) -> io::Result<Option<bool>> {
+        remove_with_budget_and_gate_and_hook(store, record, budget, &mut || true, hook)
+    }
+
+    fn remove_with_budget_and_gate_and_hook(
+        store: &File,
+        record: &QuarantineRecord,
+        budget: &mut PurgeBudget,
+        gate: &mut impl FnMut() -> bool,
         hook: &mut impl FnMut(&OsStr, Step),
     ) -> io::Result<Option<bool>> {
         if !budget.take() {
@@ -307,7 +320,7 @@ mod unix {
                 "quarantine payload identity changed; refusing purge",
             ));
         }
-        let Some(removed) = remove_child(&entry, name, payload, 0, false, budget, hook)? else {
+        let Some(removed) = remove_child(&entry, name, payload, 0, false, budget, gate, hook)? else {
             // The manifest remains the recovery anchor. Never finalize a
             // partially removed payload or give it a failed-deletion cooldown.
             return Ok(None);
@@ -319,6 +332,7 @@ mod unix {
         Ok(Some(removed))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn remove_child(
         parent: &File,
         name: &OsStr,
@@ -326,6 +340,7 @@ mod unix {
         depth: usize,
         allow_permission_changes: bool,
         budget: &mut PurgeBudget,
+        gate: &mut impl FnMut() -> bool,
         hook: &mut impl FnMut(&OsStr, Step),
     ) -> io::Result<Option<bool>> {
         if !budget.take() {
@@ -382,6 +397,7 @@ mod unix {
                     depth + 1,
                     allow_permission_changes,
                     budget,
+                    gate,
                     hook,
                 )?
                 .is_none()
@@ -394,6 +410,11 @@ mod unix {
             return Ok(None);
         }
         hook(name, Step::BeforeUnlink);
+        if !gate() {
+            return Ok(None);
+        }
+        // Capacity and policy checks may block. Revalidate the admitted child
+        // after that boundary so a replacement cannot inherit this unlink.
         if !same_child(parent, name, expected)? {
             return Ok(Some(false));
         }
@@ -430,6 +451,34 @@ mod unix {
                 .quarantine(&source, id, 100, Duration::ZERO, None)
                 .unwrap();
             (store, record)
+        }
+
+        #[test]
+        fn pressure_renewal_does_not_authorize_a_leaf_replaced_during_the_probe() {
+            let temp = tempfile::tempdir().unwrap();
+            let (store, record) = held_tree(temp.path(), "pressure-swap");
+            let leaf = record.quarantine_path.join("nested/leaf");
+            let saved = temp.path().join("saved-leaf");
+            let lock = lock_store(store.root()).unwrap();
+            let mut fired = false;
+            let result = remove_payload_with_budget_and_gate(
+                &lock,
+                &record,
+                &mut PurgeBudget::bounded(128),
+                &mut || {
+                    assert!(!fired, "the first renewal must reach the only leaf");
+                    fired = true;
+                    fs::rename(&leaf, &saved).unwrap();
+                    fs::write(&leaf, b"replacement").unwrap();
+                    true
+                },
+            );
+
+            assert!(fired);
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::read(&leaf).unwrap(), b"replacement");
+            assert_eq!(fs::read(&saved).unwrap(), b"held bytes");
+            assert!(store.record_path("pressure-swap").exists());
         }
 
         #[test]

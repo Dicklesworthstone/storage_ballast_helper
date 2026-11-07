@@ -206,10 +206,17 @@ impl RamReclaimRequest {
     /// artifacts are indivisible; one may exceed the remaining allowance,
     /// which stops every later candidate and batch from this pass.
     pub fn record_unlinked(&self, candidate: &CandidacyScore) {
+        self.record_unlinked_bytes(candidate.size_bytes);
+    }
+
+    /// Charge completed quarantine removals against the same pass allowance.
+    /// Rename-only and partially purged entries have not completed reclamation
+    /// and must not be credited here.
+    pub fn record_unlinked_bytes(&self, bytes: u64) {
         let _ = self
             .remaining
             .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                Some(remaining.saturating_sub(candidate.size_bytes))
+                Some(remaining.saturating_sub(bytes))
             });
     }
 }

@@ -16,6 +16,10 @@
 /// synchronous completion semantics.
 pub const DEFAULT_DRAIN_WORK: usize = 16_384;
 
+/// Maximum payload unlink attempts authorized by one live pressure sample.
+/// Manifest admission always renews separately, even for a smaller payload.
+pub(super) const PRESSURE_RECHECK_UNLINKS: usize = 64;
+
 #[derive(Debug)]
 pub(super) struct PurgeBudget {
     remaining: Option<usize>,
@@ -267,6 +271,166 @@ mod tests {
         assert_eq!(total, expired.size_bytes);
         assert!(store.record("expired").unwrap().is_none());
         assert_eq!(store.record("future").unwrap(), Some(future));
+    }
+
+    #[test]
+    fn pressure_recovery_preserves_payload_manifest_and_failure_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, record) = held_tree(temp.path(), "recovered", 8);
+        store.note_stuck(&record, "previous refusal", record.quarantined_at);
+        let manifest = fs::read(store.record_path("recovered")).unwrap();
+        let stuck = fs::read(store.root().join("recovered.stuck")).unwrap();
+        let mut checks = 0;
+        let out = store
+            .sweep_with_pressure_gate(
+                record.quarantined_at,
+                crate::scanner::quarantine::SweepMode::Pressure,
+                |selected| {
+                    assert_eq!(selected, &record);
+                    checks += 1;
+                    false
+                },
+            )
+            .unwrap();
+
+        assert_eq!(checks, 1);
+        assert_eq!(out.drained.counts(), (0, 0));
+        assert_eq!(out.drained.deferred_entries, 1);
+        assert!(!out.drained.budget_exhausted);
+        assert!(out.drained.failures.is_empty());
+        assert_eq!(out.drained.skipped_stuck, 0);
+        assert_eq!(out.held_bytes, record.size_bytes);
+        assert_eq!(remaining_files(&record), 8);
+        assert_eq!(store.record("recovered").unwrap(), Some(record));
+        assert_eq!(fs::read(store.record_path("recovered")).unwrap(), manifest);
+        assert_eq!(fs::read(store.root().join("recovered.stuck")).unwrap(), stuck);
+    }
+
+    #[test]
+    fn pressure_sweep_renews_authority_for_each_completed_entry() {
+        for recover_after_first in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = QuarantineStore::under(temp.path());
+            let mut records = Vec::new();
+            for id in ["a", "b"] {
+                let source = temp.path().join(id);
+                fs::write(&source, b"held").unwrap();
+                records.push(
+                    store
+                        .quarantine(&source, id, 100, Duration::ZERO, None)
+                        .unwrap(),
+                );
+            }
+            let mut checks = 0;
+            let out = store
+                .sweep_with_pressure_gate(
+                    records[0].quarantined_at,
+                    crate::scanner::quarantine::SweepMode::Pressure,
+                    |_| {
+                        checks += 1;
+                        !recover_after_first || records[0].quarantine_path.exists()
+                    },
+                )
+                .unwrap();
+            let expected_entries = if recover_after_first { 1 } else { 2 };
+
+            assert_eq!(checks, 2, "every new manifest renews its own authority");
+            assert_eq!(out.drained.entries, expected_entries);
+            assert_eq!(out.drained.bytes, expected_entries as u64 * 100);
+            assert_eq!(out.held_bytes, if recover_after_first { 100 } else { 0 });
+            assert_eq!(
+                out.drained.deferred_entries,
+                usize::from(recover_after_first),
+            );
+            assert!(!out.drained.budget_exhausted);
+            assert!(out.drained.failures.is_empty());
+            assert!(!records[0].quarantine_path.exists());
+            assert_eq!(records[1].quarantine_path.exists(), recover_after_first);
+            assert_eq!(store.records().unwrap().len(), usize::from(recover_after_first));
+            assert!(!store.root().join("a.stuck").exists());
+            assert!(!store.root().join("b.stuck").exists());
+        }
+    }
+
+    #[test]
+    fn pressure_recovery_pauses_a_resumed_payload_within_the_mutation_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, record) = held_tree(temp.path(), "partial-pressure", 128);
+        let first = store.drain_all_with_budget(32).unwrap();
+        assert!(first.budget_exhausted);
+        assert_eq!(first.counts(), (0, 0));
+        let before = remaining_files(&record);
+        assert!(before > PRESSURE_RECHECK_UNLINKS && before < 128);
+        fs::create_dir(&record.original_path).unwrap();
+        fs::write(record.original_path.join("new-build"), b"retain rebuild").unwrap();
+
+        let mut checks = 0;
+        let out = store
+            .sweep_with_pressure_gate(
+                record.quarantined_at,
+                crate::scanner::quarantine::SweepMode::Pressure,
+                |_| {
+                    checks += 1;
+                    // Recovery occurs as soon as the first held child is gone.
+                    remaining_files(&record) == before
+                },
+            )
+            .unwrap();
+
+        assert_eq!(checks, 2, "one admission and one bounded renewal");
+        assert_eq!(
+            remaining_files(&record),
+            before - PRESSURE_RECHECK_UNLINKS,
+        );
+        assert_eq!(out.drained.counts(), (0, 0));
+        assert_eq!(out.drained.deferred_entries, 1);
+        assert!(!out.drained.budget_exhausted, "policy hold is not work exhaustion");
+        assert!(out.drained.failures.is_empty());
+        assert_eq!(out.held_bytes, record.size_bytes);
+        assert_eq!(store.record("partial-pressure").unwrap(), Some(record.clone()));
+        assert!(!store.root().join("partial-pressure.stuck").exists());
+
+        let resumed = store
+            .sweep_with_pressure_gate(
+                record.quarantined_at,
+                crate::scanner::quarantine::SweepMode::Pressure,
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(resumed.drained.counts(), (1, record.size_bytes));
+        assert_eq!(resumed.held_bytes, 0);
+        assert!(resumed.drained.failures.is_empty());
+        assert_eq!(store.drain_all().unwrap().counts(), (0, 0));
+        assert_eq!(
+            fs::read(record.original_path.join("new-build")).unwrap(),
+            b"retain rebuild",
+        );
+    }
+
+    #[test]
+    fn maintenance_ttl_and_cap_keep_their_own_authority() {
+        for cap_bytes in [None, Some(0)] {
+            let temp = tempfile::tempdir().unwrap();
+            let (store, record) = held_tree(temp.path(), "maintenance", 4);
+            let now = if cap_bytes.is_some() {
+                record.quarantined_at - 1
+            } else {
+                record.expires_at
+            };
+            let out = store
+                .sweep_with_pressure_gate(
+                    now,
+                    crate::scanner::quarantine::SweepMode::Maintenance { cap_bytes },
+                    |_| panic!("maintenance must not borrow pressure authority"),
+                )
+                .unwrap();
+
+            assert_eq!(out.drained.counts(), (1, record.size_bytes));
+            assert_eq!(out.held_bytes, 0);
+            assert_eq!(out.reason, if cap_bytes.is_some() { "size cap" } else { "ttl" });
+            assert!(!out.drained.budget_exhausted);
+            assert!(out.drained.failures.is_empty());
+        }
     }
 
     #[test]

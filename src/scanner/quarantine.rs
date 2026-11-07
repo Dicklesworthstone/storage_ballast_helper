@@ -124,12 +124,13 @@ pub struct DrainOutcome {
     /// Entries skipped because they are still cooling down after a failure.
     pub skipped_stuck: usize,
     /// Selected entries deferred without a deletion failure because of a
-    /// budget pause, lock contention or changed inventory. This does not
-    /// count the unvisited suffix after the drain yields.
+    /// budget pause, pressure hold, lock contention or changed inventory.
+    /// This does not count the unvisited suffix after the drain yields.
     pub deferred_entries: usize,
     /// The shared traversal allowance ended before all requested work could
     /// finish. Call the drain again to resume from the remaining payloads.
-    /// Contention or changed selection can defer work without setting this.
+    /// A pressure hold, contention or changed selection can defer work
+    /// without setting this.
     pub budget_exhausted: bool,
 }
 
@@ -405,10 +406,21 @@ impl QuarantineStore {
         out: &mut DrainOutcome,
         budget: &mut PurgeBudget,
     ) -> bool {
+        self.try_purge_with_gate(record, now_unix, out, budget, &mut |_| true)
+    }
+
+    fn try_purge_with_gate(
+        &self,
+        record: &QuarantineRecord,
+        now_unix: u64,
+        out: &mut DrainOutcome,
+        budget: &mut PurgeBudget,
+        gate: &mut impl FnMut(&QuarantineRecord) -> bool,
+    ) -> bool {
         // Charge attempted records as well as tree traversal, so a long run
         // of manifest/permission errors cannot receive a fresh budget per item.
         let result = if budget.take() {
-            safety::purge_with_budget(self, record, budget)
+            safety::purge_with_budget_and_gate(self, record, budget, gate)
         } else {
             Ok(None)
         };
@@ -419,7 +431,7 @@ impl QuarantineStore {
             }
             Ok(None) => {
                 out.deferred_entries += 1;
-                out.budget_exhausted = true;
+                out.budget_exhausted |= budget.exhausted();
                 return false;
             }
             Err(SbhError::Io { source, .. }) if source.kind() == io::ErrorKind::WouldBlock => {
@@ -641,6 +653,26 @@ impl QuarantineStore {
     /// and every tick under pressure; the separate calls read and parsed every
     /// record three or four times per sweep (bd-os02).
     pub fn sweep(&self, now_unix: u64, mode: SweepMode) -> Result<SweepOutcome> {
+        self.sweep_with_pressure_gate(now_unix, mode, |_| true)
+    }
+
+    /// Renew pressure authority after locking and admitting each manifest, and
+    /// after at most 64 payload unlink attempts within a large entry.
+    ///
+    /// A false gate cooperatively defers the sweep without recording a failure
+    /// or cooldown. Any remaining payload and its manifest stay recoverable;
+    /// partial entries do not receive a reclaimed-byte credit. The work budget
+    /// continues to bound traversal independently of the pressure checks.
+    ///
+    /// Maintenance has its own TTL/cap authority and does not call this gate.
+    /// The callback runs under the store lock: it may inspect live filesystem
+    /// and policy state, but must not reenter or modify the quarantine store.
+    pub fn sweep_with_pressure_gate(
+        &self,
+        now_unix: u64,
+        mode: SweepMode,
+        mut gate: impl FnMut(&QuarantineRecord) -> bool,
+    ) -> Result<SweepOutcome> {
         let records = self.records()?;
         let mut held = records
             .iter()
@@ -653,7 +685,13 @@ impl QuarantineStore {
                 reason = "pressure";
                 let mut budget = PurgeBudget::bounded(DEFAULT_DRAIN_WORK);
                 for entry in &records {
-                    if !self.try_purge(entry, now_unix, &mut drained, &mut budget) {
+                    if !self.try_purge_with_gate(
+                        entry,
+                        now_unix,
+                        &mut drained,
+                        &mut budget,
+                        &mut gate,
+                    ) {
                         break;
                     }
                 }

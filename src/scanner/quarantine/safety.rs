@@ -466,13 +466,15 @@ pub(super) fn purge(store: &QuarantineStore, id: &str) -> Result<u64> {
     })
 }
 
-/// A budget pause returns `None`. Lock contention or changed selection returns
-/// `WouldBlock`, which the batch layer defers without recording a stuck entry.
-/// The selected TTL, identity and decision must still match under the lock.
-pub(super) fn purge_with_budget(
+/// A budget pause or pressure hold returns `None`. Lock contention or changed
+/// selection returns `WouldBlock`, which the batch layer defers without recording
+/// a stuck entry. The selected TTL, identity and decision must still match under
+/// the lock before pressure authority is renewed.
+pub(super) fn purge_with_budget_and_gate(
     store: &QuarantineStore,
     selected: &QuarantineRecord,
     budget: &mut PurgeBudget,
+    gate: &mut impl FnMut(&QuarantineRecord) -> bool,
 ) -> Result<Option<u64>> {
     if budget.exhausted() {
         return Ok(None);
@@ -481,7 +483,25 @@ pub(super) fn purge_with_budget(
         store,
         &selected.decision_id,
         Some(selected),
-        |lock, record| confined_purge::remove_payload_with_budget(lock, record, budget),
+        |lock, record| {
+            if !gate(record) {
+                return Ok(None);
+            }
+            // Renew at bounded mutation checkpoints rather than issuing an
+            // expensive filesystem-capacity probe for every small child.
+            let mut remaining_unlinks = super::budget::PRESSURE_RECHECK_UNLINKS;
+            let mut renew = || {
+                if remaining_unlinks == 0 {
+                    if !gate(record) {
+                        return false;
+                    }
+                    remaining_unlinks = super::budget::PRESSURE_RECHECK_UNLINKS;
+                }
+                remaining_unlinks -= 1;
+                true
+            };
+            confined_purge::remove_payload_with_budget_and_gate(lock, record, budget, &mut renew)
+        },
     )
 }
 
@@ -1239,7 +1259,13 @@ mod tests {
         // Changing only the publication state is not changing the selected
         // payload or policy. Admit it through the same locked snapshot check.
         assert_eq!(
-            purge_with_budget(&store, &from_pending, &mut PurgeBudget::bounded(32)).unwrap(),
+            purge_with_budget_and_gate(
+                &store,
+                &from_pending,
+                &mut PurgeBudget::bounded(32),
+                &mut |_| true,
+            )
+            .unwrap(),
             Some(100)
         );
         assert!(!selected.quarantine_path.exists());

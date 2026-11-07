@@ -415,17 +415,31 @@ impl SharedExecutorConfig {
         planned_pressure: PressureLevel,
         platform: &dyn Platform,
     ) -> std::result::Result<(), SkipReason> {
+        self.authorize_disk_reclaim_path(&candidate.path, None, planned_pressure, platform)
+    }
+
+    /// Sample the object that still exists, which may be a quarantine store
+    /// whose payload has already been partially purged. A scoped pressure
+    /// sweep must stay on the filesystem selected by its monitor tick.
+    fn authorize_disk_reclaim_path(
+        &self,
+        path: &Path,
+        expected_mount: Option<&Path>,
+        planned_pressure: PressureLevel,
+        platform: &dyn Platform,
+    ) -> std::result::Result<(), SkipReason> {
         let policy = self.disk_pressure.read().clone();
         // Bypass the monitor's cache: earlier removals in this very batch
         // may have recovered the filesystem since the last monitor tick.
         let stats = platform
-            .fs_stats(&candidate.path)
+            .fs_stats(path)
             .map_err(|_| SkipReason::PolicyChanged)?;
         if stats.is_readonly
             || stats.total_bytes == 0
             || stats.free_bytes > stats.total_bytes
             || stats.available_bytes > stats.free_bytes
             || !stats.mount_point.is_absolute()
+            || expected_mount.is_some_and(|mount| stats.mount_point.as_path() != mount)
         {
             return Err(SkipReason::PolicyChanged);
         }
@@ -8616,6 +8630,66 @@ impl MonitoringDaemon {
         }
     }
 
+    /// A pressure tick is evidence to start a sweep, not authority to empty
+    /// the quarantine after ballast release or an earlier purge recovers it.
+    /// Resource-only relief renews its own goal instead of borrowing disk
+    /// byte pressure. Every probe is followed by the cheap live policy gates.
+    fn authorize_quarantine_pressure(
+        &self,
+        tick: &MountTickResponse,
+        store: &QuarantineStore,
+        approved_mode: ActiveMode,
+    ) -> std::result::Result<(), SkipReason> {
+        let shared = &self.shared_executor_config;
+        let mount = &tick.response.causing_mount;
+        let level = tick.response.level;
+        shared.authorize_mutation(approved_mode, self.policy_engine.lock().mode())?;
+        match (&tick.ram_reclaim, &tick.inode_reclaim) {
+            (Some(relief), None) => {
+                relief.authorize_scope(store.root(), &self.shared_scanner_config.read())?;
+                relief.authorize_mount(self.platform.as_ref())?;
+            }
+            (None, Some(relief)) => {
+                relief.authorize_policy(&shared.inode_pressure.read())?;
+                relief.authorize_scope(store.root(), &self.shared_scanner_config.read())?;
+                relief.authorize_mount(self.platform.as_ref())?;
+            }
+            (None, None) => {
+                shared.authorize_disk_reclaim_path(
+                    store.root(),
+                    Some(mount),
+                    level,
+                    self.platform.as_ref(),
+                )?;
+            }
+            (Some(_), Some(_)) => return Err(SkipReason::PolicyChanged),
+        }
+        if tick.ram_reclaim.is_some() || tick.inode_reclaim.is_some() {
+            let stats = self
+                .platform
+                .fs_stats(store.root())
+                .map_err(|_| SkipReason::PolicyChanged)?;
+            if stats.mount_point != *mount
+                || stats.is_readonly
+                || stats.total_bytes == 0
+                || stats.free_bytes > stats.total_bytes
+                || stats.available_bytes > stats.free_bytes
+            {
+                return Err(SkipReason::PolicyChanged);
+            }
+        }
+        shared.authorize_dispatch(tick.ram_reclaim.is_some(), tick.inode_reclaim.is_some())?;
+        shared.authorize_mutation(approved_mode, self.policy_engine.lock().mode())?;
+        if shared
+            .compression_first
+            .defers_mount(mount, level, Instant::now())
+        {
+            return Err(SkipReason::CompressionFirst);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn sweep_quarantine_entries<'a>(
         &mut self,
         responses: impl IntoIterator<Item = &'a MountTickResponse>,
@@ -8649,8 +8723,9 @@ impl MonitoringDaemon {
                 // A prior quarantine decision does not authorize irreversible
                 // cleanup after the operator selects observe/dry-run or the
                 // policy falls back. Inventory stays available in those modes.
+                let approved_mode = self.policy_engine.lock().mode();
                 if self.config.scanner.dry_run
-                    || !self.policy_engine.lock().mode().allows_deletion()
+                    || !approved_mode.allows_deletion()
                     || self.shared_executor_config.compression_first.defers_mount(
                         mount,
                         level,
@@ -8668,10 +8743,44 @@ impl MonitoringDaemon {
                     QuarantineSweepMode::Maintenance { cap_bytes }
                 };
                 attempted_sweep = true;
-                match store.sweep(now_unix, mode) {
+                // Reserve at most this pass's resource allowance while the
+                // store owns its purge transaction. Failed attempts can use
+                // this local allowance; only completed unlinks consume the
+                // shared request below. Repeated checks within one payload
+                // do not reserve its estimate again.
+                let mut active_record = None;
+                let mut admitted_artifacts = 0usize;
+                let mut admitted_bytes = 0u64;
+                let mut bytes_before_active = 0u64;
+                let gate = |record: &crate::scanner::quarantine::QuarantineRecord| {
+                    if active_record.as_ref() != Some(&record.decision_id) {
+                        active_record = Some(record.decision_id.clone());
+                        admitted_artifacts = admitted_artifacts.saturating_add(1);
+                        bytes_before_active = admitted_bytes;
+                        admitted_bytes = admitted_bytes.saturating_add(record.size_bytes);
+                    }
+                    if tick.inode_reclaim.as_ref().is_some_and(|relief| {
+                        admitted_artifacts > relief.remaining_artifacts()
+                    }) || tick.ram_reclaim.as_ref().is_some_and(|relief| {
+                        bytes_before_active >= relief.remaining_bytes()
+                    }) {
+                        return false;
+                    }
+                    self.authorize_quarantine_pressure(tick, &store, approved_mode)
+                        .is_ok()
+                };
+                match store.sweep_with_pressure_gate(now_unix, mode, gate) {
                     Ok(swept) => {
                         held = held.saturating_add(swept.held_bytes);
                         let (why, drained) = (swept.reason, swept.drained);
+                        if let Some(relief) = &tick.ram_reclaim {
+                            relief.record_unlinked_bytes(drained.bytes);
+                        }
+                        if let Some(relief) = &tick.inode_reclaim {
+                            for _ in 0..drained.entries {
+                                relief.record_unlinked();
+                            }
+                        }
                         if drained.entries > 0 {
                             let count = drained.entries;
                             let bytes = drained.bytes;
@@ -15131,6 +15240,281 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn quarantine_pressure_stops_at_fresh_recovery_and_retains_restorable_entries() {
+        use crate::daemon::policy::PolicyConfig;
+
+        for (initially_recovered, recover_after_first, absolute_floors, expected) in [
+            (true, false, false, 0),
+            (false, true, false, 1),
+            (false, false, false, 2),
+            (false, true, true, 1),
+        ] {
+            let mut fixture = RegretDaemonFixture::new();
+            let root = fixture.daemon.config.scanner.root_paths[0].clone();
+            let store = QuarantineStore::under(&root);
+            let records: Vec<_> = ["a", "b"]
+                .into_iter()
+                .map(|id| {
+                    let source = root.join(id);
+                    std::fs::write(&source, b"recoverable").unwrap();
+                    store
+                        .quarantine(&source, id, 11, Duration::from_hours(24), None)
+                        .unwrap()
+                })
+                .collect();
+            *fixture.daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+                initial_mode: ActiveMode::Enforce,
+                ..PolicyConfig::default()
+            });
+            let (total, low, green) = if absolute_floors {
+                fixture
+                    .daemon
+                    .shared_executor_config
+                    .disk_pressure
+                    .write()
+                    .min_free_bytes =
+                    [80_u64 << 30, 60_u64 << 30, 40_u64 << 30, 25_u64 << 30];
+                (2_u64 << 40, 79_u64 << 30, 80_u64 << 30)
+            } else {
+                (100_000, 1_000, 20_000)
+            };
+            let tick = quarantine_tick(PressureLevel::Critical, Path::new("/"));
+            let gate = |_record: &crate::scanner::quarantine::QuarantineRecord| {
+                let recovered = initially_recovered
+                    || (recover_after_first && !records[0].quarantine_path.exists());
+                fixture.daemon.platform = Arc::new(disk_pressure_platform(vec![
+                    disk_pressure_sample("/", total, if recovered { green } else { low }),
+                ]));
+                fixture
+                    .daemon
+                    .authorize_quarantine_pressure(&tick, &store, ActiveMode::Enforce)
+                    .is_ok()
+            };
+            let swept = store
+                .sweep_with_pressure_gate(0, QuarantineSweepMode::Pressure, gate)
+                .unwrap();
+            assert_eq!(swept.drained.counts(), (expected, expected as u64 * 11));
+            assert_eq!(swept.held_bytes, (2 - expected) as u64 * 11);
+            assert!(swept.drained.failures.is_empty());
+            assert!(!swept.drained.budget_exhausted);
+            assert!(store.stuck_entries().unwrap().is_empty());
+            for (index, record) in records.iter().enumerate() {
+                assert_eq!(record.quarantine_path.exists(), index >= expected);
+                if index >= expected {
+                    let restored = store.restore(&record.decision_id, false).unwrap();
+                    assert_eq!(std::fs::read(restored.restored_to).unwrap(), b"recoverable");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_quarantine_sweep_does_not_use_a_stale_critical_tick_after_recovery() {
+        let mut fixture = RegretDaemonFixture::new();
+        let root = fixture.daemon.config.scanner.root_paths[0].clone();
+        let source = root.join("recoverable.o");
+        std::fs::write(&source, b"retained").unwrap();
+        let store = QuarantineStore::under(&root);
+        let record = store
+            .quarantine(&source, "held", 8, Duration::from_hours(24), None)
+            .unwrap();
+        let mount = PathBuf::from("/");
+        let tick = quarantine_tick(PressureLevel::Critical, &mount);
+        fixture.daemon.sweep_quarantines(
+            &[tick],
+            &[(root, Some(mount.clone()))],
+            Instant::now(),
+        );
+        assert_eq!(std::fs::read(&record.quarantine_path).unwrap(), b"retained");
+        assert!(store.record("held").unwrap().is_some());
+        assert_eq!(fixture.daemon.quarantine_held.get(&mount), Some(&8));
+        assert!(store.stuck_entries().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_pressure_rechecks_operator_policy_between_payloads() {
+        use crate::daemon::policy::PolicyConfig;
+
+        for (mode, dry_run) in [
+            (ActiveMode::Observe, false),
+            (ActiveMode::Canary, false),
+            (ActiveMode::Enforce, true),
+        ] {
+            let mut fixture = RegretDaemonFixture::new();
+            let root = fixture.daemon.config.scanner.root_paths[0].clone();
+            let store = QuarantineStore::under(&root);
+            let mut records = Vec::new();
+            for id in ["a", "b"] {
+                let source = root.join(id);
+                std::fs::write(&source, b"retained").unwrap();
+                records.push(
+                    store
+                        .quarantine(&source, id, 8, Duration::from_hours(24), None)
+                        .unwrap(),
+                );
+            }
+            fixture.daemon.platform = Arc::new(disk_pressure_platform(vec![
+                disk_pressure_sample("/", 100_000, 1_000),
+            ]));
+            *fixture.daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+                initial_mode: ActiveMode::Enforce,
+                ..PolicyConfig::default()
+            });
+            let tick = quarantine_tick(PressureLevel::Critical, Path::new("/"));
+            let gate = |_record: &crate::scanner::quarantine::QuarantineRecord| {
+                if !records[0].quarantine_path.exists() {
+                    *fixture.daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+                        initial_mode: mode,
+                        ..PolicyConfig::default()
+                    });
+                    fixture
+                        .daemon
+                        .shared_executor_config
+                        .dry_run
+                        .store(dry_run, Ordering::Relaxed);
+                }
+                fixture
+                    .daemon
+                    .authorize_quarantine_pressure(&tick, &store, ActiveMode::Enforce)
+                    .is_ok()
+            };
+            let swept = store
+                .sweep_with_pressure_gate(0, QuarantineSweepMode::Pressure, gate)
+                .unwrap();
+            assert_eq!(swept.drained.counts(), (1, 8), "{mode:?} {dry_run}");
+            assert_eq!(swept.held_bytes, 8);
+            assert!(swept.drained.failures.is_empty());
+            assert!(!swept.drained.budget_exhausted);
+            assert!(records[1].quarantine_path.exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quarantine_resource_relief_uses_its_own_live_goal_and_finite_allowance() {
+        use crate::daemon::policy::PolicyConfig;
+        use crate::platform::pal::InodeStats;
+
+        for inode_relief in [false, true] {
+            for recovered in [false, true] {
+                let mut fixture = RegretDaemonFixture::new();
+                let (mount, _) = if inode_relief {
+                    install_inode_pressure_probe(
+                        &mut fixture,
+                        InodeStats::new(
+                            10_000,
+                            if recovered { 2_000 } else { 0 },
+                            if recovered { 2_000 } else { 0 },
+                        ),
+                    )
+                } else {
+                    install_tmpfs_pressure_probe(
+                        &mut fixture,
+                        MemoryInfo {
+                            swap_free_bytes: if recovered { 64 << 30 } else { 0 },
+                            ..exhausted_swap_sample()
+                        },
+                        "tmpfs",
+                        70 << 30,
+                        false,
+                    )
+                };
+                *fixture.daemon.shared_scanner_config.write() =
+                    fixture.daemon.config.scanner.clone();
+                *fixture.daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+                    initial_mode: ActiveMode::Enforce,
+                    ..PolicyConfig::default()
+                });
+                fixture
+                    .daemon
+                    .shared_executor_config
+                    .inode_cleanup_enabled
+                    .store(true, Ordering::Release);
+                let store = QuarantineStore::under(&mount);
+                let mut records = Vec::new();
+                for id in ["a", "b"] {
+                    let source = mount.join(id);
+                    std::fs::write(&source, b"retained").unwrap();
+                    records.push(
+                        store
+                            .quarantine(&source, id, 8, Duration::from_hours(24), None)
+                            .unwrap(),
+                    );
+                }
+                let mut tick = quarantine_tick(PressureLevel::Critical, &mount);
+                tick.filesystem_response.level = PressureLevel::Green;
+                if inode_relief {
+                    tick.inode_reclaim = Some(InodeReclaimRequest::new(
+                        mount.clone(),
+                        records[0].device_id,
+                        10_000,
+                        1_000,
+                        1,
+                        &fixture.daemon.config.pressure.inodes,
+                        &fixture.daemon.config.scanner.root_paths,
+                    ));
+                } else {
+                    tick.ram_reclaim = Some(RamReclaimRequest::new(
+                        mount.clone(),
+                        records[0].device_id,
+                        8,
+                        &fixture.daemon.config.scanner.root_paths,
+                    ));
+                }
+                fixture.daemon.sweep_quarantines(
+                    std::slice::from_ref(&tick),
+                    &[(mount.clone(), Some(mount.clone()))],
+                    Instant::now(),
+                );
+                assert_eq!(records[0].quarantine_path.exists(), recovered);
+                assert!(records[1].quarantine_path.exists());
+                assert_eq!(
+                    fixture.daemon.quarantine_held.get(&mount),
+                    Some(&if recovered { 16 } else { 8 }),
+                );
+                if let Some(relief) = tick.inode_reclaim {
+                    assert_eq!(relief.remaining_artifacts(), if recovered { 1 } else { 0 });
+                }
+                if let Some(relief) = tick.ram_reclaim {
+                    assert_eq!(relief.remaining_bytes(), if recovered { 8 } else { 0 });
+                }
+                assert!(store.stuck_entries().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn quarantine_pressure_cannot_borrow_another_mounts_shortage() {
+        let shared = SharedExecutorConfig::new(false, 10, 0.5, 300, 3600, true, 86_400);
+        let platform = disk_pressure_platform(vec![
+            disk_pressure_sample("/selected", 100_000, 1_000),
+            disk_pressure_sample("/other", 100_000, 1_000),
+        ]);
+        assert!(
+            shared
+                .authorize_disk_reclaim_path(
+                    Path::new("/selected/.sbh/quarantine"),
+                    Some(Path::new("/selected")),
+                    PressureLevel::Critical,
+                    &platform,
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            shared.authorize_disk_reclaim_path(
+                Path::new("/other/.sbh/quarantine"),
+                Some(Path::new("/selected")),
+                PressureLevel::Critical,
+                &platform,
+            ),
+            Err(SkipReason::PolicyChanged),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn quarantine_sweeps_preserve_payloads_in_observe_fallback_and_dry_run() {
         use crate::daemon::policy::PolicyConfig;
 
@@ -15151,6 +15535,9 @@ mod tests {
             let mount = PathBuf::from("/");
             let roots = vec![(root, Some(mount.clone()))];
             let ticks = vec![quarantine_tick(level, &mount)];
+            fixture.daemon.platform = Arc::new(disk_pressure_platform(vec![
+                disk_pressure_sample("/", 100_000, 1_000),
+            ]));
             for (mode, dry_run) in [
                 (ActiveMode::Observe, false),
                 (ActiveMode::FallbackSafe, false),
@@ -15286,6 +15673,9 @@ mod tests {
         use crate::daemon::compress_tier::RootStatus;
 
         let mut fixture = RegretDaemonFixture::new();
+        fixture.daemon.platform = Arc::new(disk_pressure_platform(vec![
+            disk_pressure_sample("/", 100_000, 1_000),
+        ]));
         let root = fixture.directory.path().join("project");
         let candidate = root.join("target");
         std::fs::create_dir(&candidate).unwrap();
@@ -15366,7 +15756,11 @@ mod tests {
                     self.probes.try_send(()).unwrap();
                 }
                 let mut stats = self.base.fs_stats(path)?;
-                // Exercise startup admission without launching a native worker.
+                // Fresh quarantine probes must confirm the synthetic Critical
+                // tick as well as exercising compression admission ordering.
+                stats.total_bytes = 100_000;
+                stats.free_bytes = 1_000;
+                stats.available_bytes = 1_000;
                 stats.fs_type = "ext4".into();
                 Ok(stats)
             }
