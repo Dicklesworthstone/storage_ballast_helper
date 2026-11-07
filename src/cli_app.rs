@@ -1702,20 +1702,15 @@ fn order_by_plan(plan: &mut DeletionPlan, batch_plan: &BatchPlan) {
     });
 }
 
-/// The per-category regret calibration factors the last 30 days of stored
-/// outcomes imply (empty when the ledger is missing or unreadable).
-fn ledger_regret_calibrations(config: &Config) -> HashMap<String, f64> {
+/// Apply the same persisted regret and warm-cache evidence as daemon startup.
+/// Reading history creates no ledger; runtime suspensions are not replayed.
+fn apply_ledger_scoring_history(config: &Config, engine: &mut ScoringEngine) {
     use storage_ballast_helper::scanner::regret::{
-        Outcome, RegretCalibrator, RegretConfig, certainty_from_name,
+        RegretCalibrator, RegretConfig, ScoringHistory,
     };
-    let Ok(db) = SqliteLogger::open_read_only(&config.paths.sqlite_db) else {
-        return HashMap::new();
-    };
-    let since = (chrono::Utc::now() - chrono::Duration::days(30))
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let Ok(outcomes) = db.outcomes_since(&since) else {
-        return HashMap::new();
-    };
+    use storage_ballast_helper::scanner::scoring::cache_redeletion_counts;
+
+    let history = ScoringHistory::load(&config.paths.sqlite_db);
     let mut calibrator = RegretCalibrator::new(RegretConfig {
         window: Duration::from_secs(config.scoring.regret_window_minutes.saturating_mul(60)),
         alpha_definite: config.scoring.regret_alpha_definite,
@@ -1723,19 +1718,12 @@ fn ledger_regret_calibrations(config: &Config) -> HashMap<String, f64> {
         suspend: Duration::from_secs(config.scoring.regret_suspend_minutes.saturating_mul(60)),
         ..RegretConfig::default()
     });
-    calibrator.replay(
-        outcomes.into_iter().filter_map(|stored| {
-            Outcome::from_name(&stored.outcome).map(|outcome| {
-                (
-                    stored.category,
-                    certainty_from_name(&stored.certainty),
-                    outcome,
-                )
-            })
-        }),
-        std::time::Instant::now(),
-    );
-    calibrator.calibrations()
+    calibrator.replay(history.outcomes, std::time::Instant::now());
+    engine.set_regret(calibrator.calibrations(), HashSet::new());
+    engine.set_cache_redeletions(cache_redeletion_counts(
+        history.cache_deletions,
+        SystemTime::now(),
+    ));
 }
 
 /// The scanner's own view of one directory: walk its parent one level with
@@ -1912,11 +1900,7 @@ fn why_not_report(
 
     let mut engine =
         ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
-    // Regret labels (Q4): the ledger's outcomes raise the bar the same way
-    // they do in the daemon, so the explanation names the threshold the
-    // daemon would apply now (suspensions are daemon runtime state and are
-    // not replayed here).
-    engine.set_regret(ledger_regret_calibrations(config), HashSet::new());
+    apply_ledger_scoring_history(config, &mut engine);
     let sacred_paths = active_sacred_paths(config)?;
     let (mut score, sacred_overlaps) =
         score_candidate_with_deferred_sacred_check(&engine, &candidate, 0.0, &sacred_paths, |_| {
@@ -12665,7 +12649,9 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
 
     // Classify and score each entry with active-reference evidence attached.
     let registry = ArtifactPatternRegistry::default();
-    let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+    let mut engine =
+        ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+    apply_ledger_scoring_history(&config, &mut engine);
     let sacred_paths = active_sacred_paths(&config)?;
     let now = SystemTime::now();
     let active_reference_scan = active_reference_scan_config(&config);
@@ -13063,7 +13049,9 @@ fn scan_ab_pass(
         .map_err(|e| CliError::Runtime(e.to_string()))?;
 
     let registry = ArtifactPatternRegistry::default();
-    let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+    let mut engine =
+        ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+    apply_ledger_scoring_history(config, &mut engine);
     let sacred_paths = active_sacred_paths(config)?;
     let now = SystemTime::now();
     let mut opaque_pruned_dirs = 0usize;
@@ -13720,7 +13708,8 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     let mut scoring_config = config.scoring.clone();
     scoring_config.min_score = args.min_score;
     warn_visibility_gap("clean");
-    let engine = ScoringEngine::from_config(&scoring_config, config.scanner.min_file_age_minutes);
+    let mut engine = ScoringEngine::from_config(&scoring_config, config.scanner.min_file_age_minutes);
+    apply_ledger_scoring_history(&config, &mut engine);
     let sacred_paths = active_sacred_paths(&config)?;
     let now = SystemTime::now();
     let active_reference_scan = active_reference_scan_config(&config);
@@ -16967,6 +16956,97 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    #[test]
+    fn manual_scoring_reuses_cache_receipts_and_regret_without_runtime_suspensions() {
+        use storage_ballast_helper::logger::sqlite::ActivityRow;
+        use storage_ballast_helper::scanner::patterns::{
+            ArtifactClassification, StructuralSignals,
+        };
+        use storage_ballast_helper::scanner::regret::{DecisionOutcome, Outcome};
+
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let mut config = Config::default();
+        config.paths.sqlite_db = directory.path().join("activity.sqlite3");
+        config.scanner.min_file_age_minutes = 30;
+        let cache = directory.path().join("go-build");
+        let other_cache = directory.path().join("unseen-go-cache");
+        let input = |path: &Path| CandidateInput {
+            path: path.to_path_buf(),
+            size_bytes: 4 * 1024 * 1024 * 1024,
+            age: Duration::from_mins(45),
+            classification: ArtifactClassification {
+                pattern_name: std::borrow::Cow::Borrowed("test-go-cache"),
+                category: ArtifactCategory::GoCache,
+                name_confidence: 1.0,
+                structural_confidence: 1.0,
+                combined_confidence: 1.0,
+            },
+            signals: StructuralSignals::default(),
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+        let mut engine =
+            ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+        let baseline = engine.score_candidate(&input(&cache), 0.0);
+        assert!(!baseline.vetoed, "{:?}", baseline.veto_reason);
+
+        let now = SystemTime::now();
+        let timestamp = chrono::DateTime::<chrono::Utc>::from(now - Duration::from_secs(10))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let db = SqliteLogger::open(&config.paths.sqlite_db).unwrap();
+        // A successful unlink still awaiting its outcome must already hold
+        // a recreated cache beyond the original 30-minute idle floor.
+        db.log_activity(&ActivityRow {
+            timestamp: timestamp.clone(),
+            event_type: "artifact_delete".to_string(),
+            severity: "info".to_string(),
+            path: Some(cache.to_string_lossy().into_owned()),
+            size_bytes: Some(4096),
+            score: Some(0.99),
+            score_factors: None,
+            pressure_level: None,
+            free_pct: None,
+            duration_ms: Some(1),
+            success: 1,
+            error_code: None,
+            error_message: None,
+            details: Some(format!(
+                "decision_id=0123456789ab;category=GoCache;completed_at={timestamp}"
+            )),
+        })
+        .unwrap();
+        for index in 0..3 {
+            db.log_outcome(&DecisionOutcome {
+                decision_id: format!("regret-{index}"),
+                path: directory.path().join(format!("previous-cache-{index}")),
+                category: "GoCache".to_string(),
+                certainty: "definite".to_string(),
+                outcome: Outcome::Regret,
+                observed_at: now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                after_secs: 60,
+                detail: String::new(),
+            })
+            .unwrap();
+        }
+        drop(db);
+        let before = std::fs::read(&config.paths.sqlite_db).unwrap();
+
+        apply_ledger_scoring_history(&config, &mut engine);
+        let held = engine.score_candidate(&input(&cache), 0.0);
+        assert!(held.vetoed);
+        assert!(held
+            .veto_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("60m idle floor")));
+        let unrelated = engine.score_candidate(&input(&other_cache), 0.0);
+        assert!(!unrelated.vetoed, "{:?}", unrelated.veto_reason);
+        assert!(unrelated.decision.regret_calibration < 1.0);
+        assert!(!unrelated.decision.category_suspended);
+        assert_eq!(std::fs::read(&config.paths.sqlite_db).unwrap(), before);
+    }
+
     #[test]
     fn inode_status_reports_independent_pressure_and_unknown_evidence() {
         let config = Config::default();
@@ -18549,7 +18629,7 @@ mod tests {
                     assert_eq!(std::fs::read(held.quarantine_path.join("a.o")).unwrap(), b"obj");
                 } else {
                     assert_eq!(receipts[0].decision_id, decision_id);
-                    assert_eq!(receipts[0].path, target.to_string_lossy().into_owned());
+                    assert_eq!(receipts[0].path.as_str(), target.to_string_lossy().as_ref());
                     assert_eq!(receipts[0].category.as_deref(), Some("RustTarget"));
                     assert!(receipts[0].completed_at.is_some());
                 }

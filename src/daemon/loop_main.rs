@@ -108,7 +108,7 @@ use crate::scanner::prescan_cursor::PrescanCursor;
 use crate::scanner::protection::{self, ProtectionRegistry};
 use crate::scanner::quarantine::{QuarantineStore, SweepMode as QuarantineSweepMode};
 use crate::scanner::regret::{
-    EntryIdentity, Outcome, RegretCalibrator, RegretConfig, RegretDetector, Watch,
+    EntryIdentity, RegretCalibrator, RegretConfig, RegretDetector, ScoringHistory, Watch,
     certainty_from_name,
 };
 use crate::scanner::scoring::{
@@ -576,157 +576,16 @@ fn regret_config(config: &Config) -> RegretConfig {
 /// Rebuild the regret calibrator from the last 30 days of stored outcomes
 /// (daemon start); suspensions are not replayed.
 fn replay_regret_outcomes(regret: &SharedRegret, sqlite_db: &Path) {
-    let Ok(db) = crate::logger::sqlite::SqliteLogger::open_read_only(sqlite_db) else {
-        return;
-    };
-    let since = (chrono::Utc::now() - chrono::Duration::days(30))
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let outcomes = db.outcomes_since(&since).unwrap_or_else(|error| {
-        eprintln!("[SBH-REGRET] could not replay stored outcomes: {error}");
-        Vec::new()
-    });
-    let count = outcomes.len();
-    let now = SystemTime::now();
-    let cache_since = chrono::DateTime::<chrono::Utc>::from(
-        now.checked_sub(CACHE_REDELETION_MEMORY)
-            .unwrap_or(SystemTime::UNIX_EPOCH),
-    )
-    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let receipts = db
-        .successful_deletions_since(&cache_since)
-        .unwrap_or_else(|error| {
-            eprintln!("[SBH-REGRET] could not replay successful deletion receipts: {error}");
-            Vec::new()
-        });
-    let cache_deletions = replay_cache_deletions(receipts, &outcomes, now);
-    regret.cache_deletions.lock().extend(cache_deletions);
-    regret.calibrator.lock().replay(
-        outcomes.into_iter().filter_map(|stored| {
-            Outcome::from_name(&stored.outcome).map(|outcome| {
-                (
-                    stored.category,
-                    certainty_from_name(&stored.certainty),
-                    outcome,
-                )
-            })
-        }),
-        Instant::now(),
-    );
+    let history = ScoringHistory::load(sqlite_db);
+    let count = history.outcomes.len();
+    regret.cache_deletions.lock().extend(history.cache_deletions);
+    regret
+        .calibrator
+        .lock()
+        .replay(history.outcomes, Instant::now());
     if count > 0 {
         eprintln!("[SBH-REGRET] replayed {count} stored outcome(s) into the category calibrator");
     }
-}
-
-/// A persisted success restores warm-cache backoff even if the daemon stopped
-/// before its regret window ended. Outcomes remain a fallback for old or
-/// missing receipts, never a second count of the same successful deletion.
-fn replay_cache_deletions(
-    receipts: Vec<crate::logger::sqlite::StoredDeletion>,
-    outcomes: &[crate::logger::sqlite::StoredOutcome],
-    now: SystemTime,
-) -> Vec<(PathBuf, ArtifactCategory, SystemTime)> {
-    let recent = |deleted_at| {
-        !now.duration_since(deleted_at)
-            .is_ok_and(|age| age > CACHE_REDELETION_MEMORY)
-    };
-    let mut receipts: Vec<_> = receipts
-        .into_iter()
-        .filter(|receipt| recent(receipt.completed_at.unwrap_or(receipt.recorded_at)))
-        .collect();
-    let mut by_version: HashMap<(String, String), Vec<usize>> = HashMap::new();
-    for (index, receipt) in receipts.iter().enumerate() {
-        by_version
-            .entry((receipt.decision_id.clone(), receipt.path.clone()))
-            .or_default()
-            .push(index);
-    }
-    let mut matched = vec![false; receipts.len()];
-    let mut history = Vec::new();
-    let mut labelled: Vec<_> = outcomes
-        .iter()
-        .filter_map(|stored| {
-            Outcome::from_name(&stored.outcome)?;
-            let observed_at = chrono::DateTime::parse_from_rfc3339(&stored.observed_at)
-                .ok()
-                .map(SystemTime::from)?;
-            let deleted_at = observed_at.checked_sub(Duration::from_secs(stored.after_secs))?;
-            recent(deleted_at).then_some((stored, deleted_at, observed_at))
-        })
-        .collect();
-    labelled.sort_by_key(|(_, deleted_at, _)| *deleted_at);
-    for (stored, deleted_at, observed_at) in labelled {
-        let key = (stored.decision_id.clone(), stored.path.clone());
-        let matched_receipt = by_version.get(&key).and_then(|indices| {
-            indices
-                .iter()
-                .copied()
-                .filter(|&index| {
-                    !matched[index]
-                        && deletion_receipt_matches(&receipts[index], deleted_at, observed_at)
-                })
-                .min_by_key(|&index| {
-                    let completed = receipts[index]
-                        .completed_at
-                        .unwrap_or(receipts[index].recorded_at);
-                    completed
-                        .duration_since(deleted_at)
-                        .unwrap_or_else(|error| error.duration())
-                })
-        });
-        if let Some(index) = matched_receipt {
-            matched[index] = true;
-            // A legacy receipt may outlive its decision record. Its matching
-            // outcome still supplies the original structural classification.
-            if receipts[index].category.is_none() {
-                receipts[index].category = Some(stored.category.clone());
-            }
-        } else {
-            let path = PathBuf::from(&stored.path);
-            let category = stored.category.parse().unwrap_or(ArtifactCategory::Unknown);
-            if is_warm_cache(&path, category) {
-                history.push((path, category, deleted_at));
-            }
-        }
-    }
-    history.extend(receipts.into_iter().filter_map(|receipt| {
-        let path = PathBuf::from(receipt.path);
-        let category = receipt
-            .category
-            .and_then(|category| category.parse().ok())
-            .unwrap_or(ArtifactCategory::Unknown);
-        is_warm_cache(&path, category).then_some((
-            path,
-            category,
-            receipt.completed_at.unwrap_or(receipt.recorded_at),
-        ))
-    }));
-    history
-}
-
-fn deletion_receipt_matches(
-    receipt: &crate::logger::sqlite::StoredDeletion,
-    deleted_at: SystemTime,
-    observed_at: SystemTime,
-) -> bool {
-    // Outcome timestamps and elapsed times are stored as whole seconds.
-    // Match that rounding without conflating a later reuse of the same inode
-    // and stable decision id with an earlier, separately observed deletion.
-    let rounding = Duration::from_secs(2);
-    receipt.completed_at.map_or_else(
-        || {
-            // Legacy timestamps were sampled by the logger. They can lag the
-            // unlink, but cannot stand for an unrelated later deletion beyond
-            // the matching outcome's observation window.
-            receipt.recorded_at >= deleted_at.checked_sub(rounding).unwrap_or(deleted_at)
-                && receipt.recorded_at <= observed_at.checked_add(rounding).unwrap_or(observed_at)
-        },
-        |completed_at| {
-            completed_at
-                .duration_since(deleted_at)
-                .unwrap_or_else(|error| error.duration())
-                <= rounding
-        },
-    )
 }
 
 /// Whether a process has its working directory or an open file under
@@ -12709,6 +12568,7 @@ mod tests {
     use crate::core::config::Config;
     use crate::daemon::policy::NotificationPriority;
     use crate::monitor::pid::PressureLevel;
+    use crate::scanner::regret::Outcome;
     use crate::monitor::special_locations::{
         SpecialKind, SpecialLocation, SpecialLocationRegistry,
     };

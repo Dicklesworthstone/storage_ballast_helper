@@ -26,7 +26,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "sqlite")]
+use crate::scanner::patterns::ArtifactCategory;
 use crate::scanner::scoring::ArtifactCertainty;
+#[cfg(feature = "sqlite")]
+use crate::scanner::scoring::{CACHE_REDELETION_MEMORY, is_warm_cache};
 
 /// Tunables (`[scoring]` regret keys).
 #[derive(Debug, Clone, PartialEq)]
@@ -95,6 +99,181 @@ impl Outcome {
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// Persisted scoring evidence shared by daemon startup and manual cleanup.
+/// Loading history never creates a ledger or replays a runtime suspension.
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Default)]
+pub struct ScoringHistory {
+    /// Valid outcomes from the last 30 days, ready for
+    /// [`RegretCalibrator::replay`].
+    pub outcomes: Vec<(String, ArtifactCertainty, Outcome)>,
+    /// Actual warm-cache deletions within [`CACHE_REDELETION_MEMORY`], with
+    /// receipts and their later outcome labels counted only once.
+    pub cache_deletions: Vec<(PathBuf, ArtifactCategory, SystemTime)>,
+}
+
+#[cfg(feature = "sqlite")]
+impl ScoringHistory {
+    /// Read the existing ledger without creating or migrating it. Missing
+    /// or unreadable history leaves the normal scoring defaults in force.
+    /// Queries use the bounded outcome and cache-history time windows.
+    #[must_use]
+    pub fn load(sqlite_db: &Path) -> Self {
+        Self::load_at(sqlite_db, SystemTime::now())
+    }
+
+    fn load_at(sqlite_db: &Path, now: SystemTime) -> Self {
+        let Ok(db) = crate::logger::sqlite::SqliteLogger::open_read_only(sqlite_db) else {
+            return Self::default();
+        };
+        let since = |window| {
+            chrono::DateTime::<chrono::Utc>::from(now.checked_sub(window).unwrap_or(UNIX_EPOCH))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        let outcomes = db
+            .outcomes_since(&since(Duration::from_secs(30 * 24 * 60 * 60)))
+            .unwrap_or_else(|error| {
+                eprintln!("[SBH-REGRET] could not replay stored outcomes: {error}");
+                Vec::new()
+            });
+        let receipts = db
+            .successful_deletions_since(&since(CACHE_REDELETION_MEMORY))
+            .unwrap_or_else(|error| {
+                eprintln!("[SBH-REGRET] could not replay successful deletion receipts: {error}");
+                Vec::new()
+            });
+        Self {
+            cache_deletions: replay_cache_deletions(receipts, &outcomes, now),
+            outcomes: outcomes
+                .into_iter()
+                .filter_map(|stored| {
+                    Outcome::from_name(&stored.outcome).map(|outcome| {
+                        (
+                            stored.category,
+                            certainty_from_name(&stored.certainty),
+                            outcome,
+                        )
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A persisted success restores warm-cache backoff even if the daemon stopped
+/// before its regret window ended. Outcomes remain a fallback for old or
+/// missing receipts, never a second count of the same successful deletion.
+#[cfg(feature = "sqlite")]
+fn replay_cache_deletions(
+    receipts: Vec<crate::logger::sqlite::StoredDeletion>,
+    outcomes: &[crate::logger::sqlite::StoredOutcome],
+    now: SystemTime,
+) -> Vec<(PathBuf, ArtifactCategory, SystemTime)> {
+    let recent = |deleted_at| {
+        !now.duration_since(deleted_at)
+            .is_ok_and(|age| age > CACHE_REDELETION_MEMORY)
+    };
+    let mut receipts: Vec<_> = receipts
+        .into_iter()
+        .filter(|receipt| recent(receipt.completed_at.unwrap_or(receipt.recorded_at)))
+        .collect();
+    let mut by_version: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    for (index, receipt) in receipts.iter().enumerate() {
+        by_version
+            .entry((receipt.decision_id.clone(), receipt.path.clone()))
+            .or_default()
+            .push(index);
+    }
+    let mut matched = vec![false; receipts.len()];
+    let mut history = Vec::new();
+    let mut labelled: Vec<_> = outcomes
+        .iter()
+        .filter_map(|stored| {
+            Outcome::from_name(&stored.outcome)?;
+            let observed_at = chrono::DateTime::parse_from_rfc3339(&stored.observed_at)
+                .ok()
+                .map(SystemTime::from)?;
+            let deleted_at = observed_at.checked_sub(Duration::from_secs(stored.after_secs))?;
+            recent(deleted_at).then_some((stored, deleted_at, observed_at))
+        })
+        .collect();
+    labelled.sort_by_key(|(_, deleted_at, _)| *deleted_at);
+    for (stored, deleted_at, observed_at) in labelled {
+        let key = (stored.decision_id.clone(), stored.path.clone());
+        let matched_receipt = by_version.get(&key).and_then(|indices| {
+            indices
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    !matched[index]
+                        && deletion_receipt_matches(&receipts[index], deleted_at, observed_at)
+                })
+                .min_by_key(|&index| {
+                    let completed = receipts[index]
+                        .completed_at
+                        .unwrap_or(receipts[index].recorded_at);
+                    completed
+                        .duration_since(deleted_at)
+                        .unwrap_or_else(|error| error.duration())
+                })
+        });
+        if let Some(index) = matched_receipt {
+            matched[index] = true;
+            // A legacy receipt may outlive its decision record. Its matching
+            // outcome still supplies the original structural classification.
+            if receipts[index].category.is_none() {
+                receipts[index].category = Some(stored.category.clone());
+            }
+        } else {
+            let path = PathBuf::from(&stored.path);
+            let category = stored.category.parse().unwrap_or(ArtifactCategory::Unknown);
+            if is_warm_cache(&path, category) {
+                history.push((path, category, deleted_at));
+            }
+        }
+    }
+    history.extend(receipts.into_iter().filter_map(|receipt| {
+        let path = PathBuf::from(receipt.path);
+        let category = receipt
+            .category
+            .and_then(|category| category.parse().ok())
+            .unwrap_or(ArtifactCategory::Unknown);
+        is_warm_cache(&path, category).then_some((
+            path,
+            category,
+            receipt.completed_at.unwrap_or(receipt.recorded_at),
+        ))
+    }));
+    history
+}
+
+#[cfg(feature = "sqlite")]
+fn deletion_receipt_matches(
+    receipt: &crate::logger::sqlite::StoredDeletion,
+    deleted_at: SystemTime,
+    observed_at: SystemTime,
+) -> bool {
+    // Outcome timestamps and elapsed times are stored as whole seconds.
+    // Match that rounding without conflating a later reuse of the same inode
+    // and stable decision id with an earlier, separately observed deletion.
+    let rounding = Duration::from_secs(2);
+    receipt.completed_at.map_or_else(
+        || {
+            // Legacy timestamps were sampled by the logger. They can lag the
+            // unlink, but cannot stand for an unrelated later deletion beyond
+            // the matching outcome's observation window.
+            receipt.recorded_at >= deleted_at.checked_sub(rounding).unwrap_or(deleted_at)
+                && receipt.recorded_at <= observed_at.checked_add(rounding).unwrap_or(observed_at)
+        },
+        |completed_at| {
+            completed_at
+                .duration_since(deleted_at)
+                .unwrap_or_else(|error| error.duration())
+                <= rounding
+        },
+    )
 }
 
 /// The identity of a directory entry: its parent's device and inode plus
@@ -766,6 +945,127 @@ fn ln_gamma(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn scoring_history_missing_or_unreadable_ledger_creates_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing/activity.sqlite3");
+        let history = ScoringHistory::load(&missing);
+        assert!(history.outcomes.is_empty());
+        assert!(history.cache_deletions.is_empty());
+        assert!(!missing.parent().unwrap().exists());
+
+        let invalid = directory.path().join("invalid.sqlite3");
+        std::fs::write(&invalid, b"not a SQLite database").unwrap();
+        let history = ScoringHistory::load(&invalid);
+        assert!(history.outcomes.is_empty());
+        assert!(history.cache_deletions.is_empty());
+        assert_eq!(std::fs::read(&invalid).unwrap(), b"not a SQLite database");
+
+        // Reading a database from an older or unrelated schema must not
+        // quietly install sbh's schema or change its journal mode.
+        let legacy = directory.path().join("legacy.sqlite3");
+        let connection = rusqlite::Connection::open(&legacy).unwrap();
+        connection
+            .execute_batch("CREATE TABLE existing_marker (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        drop(connection);
+        let before = std::fs::read(&legacy).unwrap();
+        let history = ScoringHistory::load(&legacy);
+        assert!(history.outcomes.is_empty());
+        assert!(history.cache_deletions.is_empty());
+        assert_eq!(std::fs::read(&legacy).unwrap(), before);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn scoring_history_keeps_pending_receipts_and_bounds_each_evidence_window() {
+        use crate::logger::sqlite::{ActivityRow, SqliteLogger};
+        use crate::scanner::scoring::cache_redeletion_counts;
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("activity.sqlite3");
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let recent = now - Duration::from_secs(10);
+        let db = SqliteLogger::open(&database).unwrap();
+        for (path, completed_at) in [
+            ("/data/tmp/pending-cache", recent),
+            (
+                "/data/tmp/expired-receipt",
+                now - CACHE_REDELETION_MEMORY - Duration::from_secs(1),
+            ),
+        ] {
+            let timestamp = chrono::DateTime::<chrono::Utc>::from(completed_at)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            db.log_activity(&ActivityRow {
+                timestamp: timestamp.clone(),
+                event_type: "artifact_delete".to_string(),
+                severity: "info".to_string(),
+                path: Some(path.to_string()),
+                size_bytes: Some(4096),
+                score: Some(0.99),
+                score_factors: None,
+                pressure_level: None,
+                free_pct: None,
+                duration_ms: Some(1),
+                success: 1,
+                error_code: None,
+                error_message: None,
+                details: Some(format!(
+                    "decision_id=0123456789ab;category=GoCache;completed_at={timestamp}"
+                )),
+            })
+            .unwrap();
+        }
+        for (id, category, outcome, observed_at) in [
+            ("fallback", "GoCache", Outcome::Unknown, recent),
+            (
+                "retained",
+                "RustTarget",
+                Outcome::Regret,
+                now - Duration::from_secs(10 * 24 * 60 * 60),
+            ),
+            (
+                "expired",
+                "RustTarget",
+                Outcome::Regret,
+                now - Duration::from_secs(31 * 24 * 60 * 60),
+            ),
+        ] {
+            db.log_outcome(&DecisionOutcome {
+                decision_id: id.to_string(),
+                path: PathBuf::from(format!("/data/tmp/{id}")),
+                category: category.to_string(),
+                certainty: "definite".to_string(),
+                outcome,
+                observed_at: observed_at.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                after_secs: 10,
+                detail: String::new(),
+            })
+            .unwrap();
+        }
+        drop(db);
+
+        let history = ScoringHistory::load_at(&database, now);
+        assert_eq!(history.outcomes.len(), 2);
+        assert_eq!(
+            history
+                .outcomes
+                .iter()
+                .filter(|(_, _, outcome)| *outcome == Outcome::Regret)
+                .count(),
+            1,
+        );
+        assert_eq!(
+            cache_redeletion_counts(history.cache_deletions, now),
+            HashMap::from([
+                (PathBuf::from("/data/tmp/pending-cache"), 1),
+                (PathBuf::from("/data/tmp/fallback"), 1),
+            ]),
+            "pending successes survive without labels; old evidence expires independently",
+        );
+    }
 
     fn watch(id: &str, path: &Path, category: &str, at: Instant) -> Watch {
         Watch {

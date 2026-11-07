@@ -8,6 +8,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Live CLI scoring remembers previous cleanup outcomes.** `scan`, `clean`,
+  `explain --why-not`, and scan comparisons now load the same read-only history
+  as daemon startup. Recent completed removals increase warm-cache idle windows,
+  and regret outcomes adjust category calibration. Receipt/outcome pairs count
+  once, their seven-day and thirty-day windows remain independent, and missing,
+  corrupt, or older ledgers do not trigger schema writes during inspection.
+  Runtime category suspensions remain local to the running daemon.
+
 - **Manual cleanup records successful mutations for future decisions.** Both
   automatic and interactive cleanup now persist the daemon's receipt format
   synchronously after each successful removal. Quarantine moves remain marked

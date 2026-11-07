@@ -3031,7 +3031,7 @@ mod tests {
                 candidate.identity,
                 candidate.size_bytes,
             );
-            assert_eq!(path, &target.to_string_lossy().into_owned());
+            assert_eq!(path.as_str(), target.to_string_lossy().as_ref());
             assert_eq!(*category, ArtifactCategory::RustTarget);
             assert_eq!(*size_bytes, 3);
             assert_eq!(decision_id.as_deref(), Some(expected_id.as_str()));
