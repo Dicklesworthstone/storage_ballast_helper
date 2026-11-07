@@ -8,6 +8,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Automatic resource relief preserves shallow-scan progress.** Forced inode
+  and RAM reclamation requests keep the persisted pre-scan cursor instead of
+  repeatedly restarting at the first page. This lets restricted discovery
+  reach later projects while memory remains scarce. An explicit unscoped
+  operator reconciliation still restarts the sweep as requested.
+
 - **Automatic scans obey live memory-pressure discovery limits.** A
   `DefiniteOnly` posture keeps bounded artifact pre-scans, indexed candidates,
   and catalog probes available while holding general recursive discovery.

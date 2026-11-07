@@ -10091,8 +10091,12 @@ fn scanner_thread_main(
         let mut priority_candidates: Vec<CandidacyScore> = Vec::new();
         let mut prescan_stop: Option<PassStop> = None;
         let mut prescan_entries: usize = 0;
-        if request.force_full_scan && request.scan_now.is_none() {
+        if request.force_full_scan
+            && request.scan_now.is_none()
+            && !request.has_resource_reclaim()
+        {
             // An operator asked for the whole tree; do not resume mid-way.
+            // Automatic forced relief must retain paged discovery progress.
             prescan_cursor.reset();
         }
         // A pass the v2 engine scoped to the dirty project directories covers
@@ -19166,6 +19170,192 @@ mod tests {
             .is_none(),
             "an operator's forced scan is a full sweep"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn automatic_forced_relief_resumes_prescan_while_operator_force_restarts_it() {
+        use crate::platform::pal::{FsStats, InodeStats, MountPoint, PlatformPaths};
+
+        #[derive(Clone, Copy, Debug)]
+        enum ForceSource {
+            Inode,
+            Ram,
+            Operator,
+        }
+
+        for source in [ForceSource::Inode, ForceSource::Ram, ForceSource::Operator] {
+            let temp = temp_root_scratch_dir();
+            let root = temp.path().join("scan-root");
+            for name in ["aaa_repo", "zzz_repo"] {
+                let project = root.join(name);
+                std::fs::create_dir_all(project.join(".git")).unwrap();
+                std::fs::write(
+                    project.join("Cargo.toml"),
+                    "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+                )
+                .unwrap();
+                let target = project.join("target");
+                std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+                std::fs::write(target.join("debug/artifact.o"), [0xA5_u8; 8192]).unwrap();
+                write_cargo_cachedir_tag(&target);
+            }
+
+            let mut config = Config::default();
+            // The first dispatch must come from the real priority cursor,
+            // without candidate-index replay obscuring which page was read.
+            config.scanner.engine = ScannerEngineMode::V1;
+            config.scanner.root_paths = vec![root.clone()];
+            config.scanner.parallelism = 1;
+            config.scanner.min_file_age_minutes = 0;
+            config.scanner.active_reference_min_size_bytes = u64::MAX;
+            config.scanner.scan_time_budget_secs = 30;
+            config.scanner.log_truncation.enabled = false;
+            config.scoring.min_score = 0.0;
+            let identity = crate::scanner::walker::identity_for_path(&root, true).unwrap();
+            let mut memory = MockPlatform::healthy().memory_info().unwrap();
+            memory.swap_total_bytes = 1_000;
+            memory.swap_free_bytes = 1;
+            let platform: Arc<dyn Platform> = Arc::new(
+                MockPlatform::new(
+                    vec![MountPoint {
+                        path: root.clone(),
+                        device: "fixture".to_string(),
+                        fs_type: "tmpfs".to_string(),
+                        is_ram_backed: true,
+                    }],
+                    HashMap::from([(
+                        root.clone(),
+                        FsStats {
+                            total_bytes: 1_000_000,
+                            free_bytes: 500_000,
+                            available_bytes: 500_000,
+                            fs_type: "tmpfs".to_string(),
+                            mount_point: root.clone(),
+                            is_readonly: false,
+                        },
+                    )]),
+                    memory,
+                    PlatformPaths::default(),
+                )
+                .with_inode_stats(HashMap::from([(
+                    root.clone(),
+                    InodeStats::new(1_000, 5, 5).unwrap(),
+                )])),
+            );
+            let mut request = event_test_request(vec![root.clone()]);
+            request.pressure_level = PressureLevel::Orange;
+            request.free_pct = Some(9.0);
+            request.urgency = 0.9;
+            request.force_full_scan = true;
+            match source {
+                ForceSource::Inode => {
+                    let relief = InodeReclaimRequest::new(
+                        root.clone(),
+                        identity.device_id,
+                        1_000,
+                        100,
+                        10,
+                        &config.pressure.inodes,
+                        &config.scanner.root_paths,
+                    );
+                    relief.authorize_mount(platform.as_ref()).unwrap();
+                    request.inode_reclaim = Some(relief);
+                }
+                ForceSource::Ram => {
+                    let relief = RamReclaimRequest::new(
+                        root.clone(),
+                        identity.device_id,
+                        1_048_576,
+                        &config.scanner.root_paths,
+                    );
+                    relief.authorize_mount(platform.as_ref()).unwrap();
+                    request.ram_reclaim = Some(relief);
+                }
+                ForceSource::Operator => {}
+            }
+            let (index_path, cursor_path) = scanner_state_paths(temp.path());
+            // This is the persisted boundary of a partial page/pass. Resetting
+            // it on each automatic request would keep revisiting the prefix.
+            let mut seeded = PrescanCursor::new();
+            seeded.advance(&root, &root.join("aaa_repo"));
+            seeded.save(&cursor_path).unwrap();
+
+            let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+                sqlite_path: None,
+                jsonl_config: crate::logger::jsonl::JsonlConfig {
+                    path: temp.path().join("activity.jsonl"),
+                    fallback_path: None,
+                    max_size_bytes: 1_048_576,
+                    max_rotated_files: 0,
+                    fsync_interval_secs: 0,
+                },
+                channel_capacity: 64,
+                run_id: None,
+            })
+            .unwrap();
+            let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+            let (del_tx, del_rx) = bounded::<DeletionBatch>(16);
+            let (report_tx, report_rx) = bounded::<WorkerReport>(2);
+            let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+            let executor_config = Arc::new(SharedExecutorConfig::new(
+                false, 10, 0.0, 60, 3600, false, 0,
+            ));
+            executor_config.set_min_certainty(ArtifactCertainty::Definite);
+            executor_config.set_scan_posture(ScanAggressiveness::DefiniteOnly);
+            scan_tx.send(request).unwrap();
+            drop(scan_tx);
+            scanner_thread_main(
+                &scan_rx,
+                &del_tx,
+                &logger,
+                &Arc::new(RwLock::new(config.scoring.clone())),
+                &Arc::new(RwLock::new(config.scanner.clone())),
+                &platform,
+                &ThreadHeartbeat::new("forced-relief-cursor-test"),
+                &report_tx,
+                &Arc::new(AtomicBool::new(false)),
+                &index_path,
+                &cursor_path,
+                &feedback_rx,
+                &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+                &executor_config,
+                &Arc::new(SharedRegret::new(&config)),
+                None,
+            );
+            logger.shutdown();
+            logger_join.join().unwrap();
+
+            let first = del_rx
+                .try_recv()
+                .unwrap_or_else(|error| {
+                    panic!("{source:?} must dispatch a pre-scan batch: {error}")
+                });
+            let paths = first
+                .candidates
+                .iter()
+                .map(|candidate| candidate.path.clone())
+                .collect::<Vec<_>>();
+            assert!(
+                paths.contains(&root.join("zzz_repo/target")),
+                "{source:?} must reach the unexamined suffix: {paths:?}",
+            );
+            assert_eq!(
+                paths.contains(&root.join("aaa_repo/target")),
+                matches!(source, ForceSource::Operator),
+                "{source:?}: only the explicit operator restarts the covered prefix: {paths:?}",
+            );
+            let report = report_rx.try_recv().expect("scanner must report completion");
+            let WorkerReport::ScanCompleted { timed_out, .. } = report else {
+                panic!("expected scanner completion");
+            };
+            assert_eq!(
+                timed_out,
+                !matches!(source, ForceSource::Operator),
+                "{source:?}: automatic relief must retain the DefiniteOnly discovery hold",
+            );
+        }
     }
 
     /// The pre-scan must resume where the last pass stopped, not restart at
