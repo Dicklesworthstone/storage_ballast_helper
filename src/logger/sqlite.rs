@@ -213,6 +213,16 @@ impl SqliteLogger {
         Ok(())
     }
 
+    /// Persist an event's activity row with the same encoding as the daemon.
+    /// This synchronous path does not rotate JSONL files or write the separate
+    /// decision, outcome, pressure, or ballast inventory tables.
+    pub fn log_activity_event(&self, event: &crate::logger::dual::ActivityEvent) -> Result<()> {
+        if let Some(row) = crate::logger::dual::event_to_activity_row(event) {
+            self.log_activity(&row)?;
+        }
+        Ok(())
+    }
+
     /// Query recent activity entries, newest first.
     pub fn recent_activity(&self, limit: u32) -> Result<Vec<ActivityRow>> {
         let mut stmt = self.conn.prepare_cached(

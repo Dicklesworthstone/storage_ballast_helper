@@ -808,10 +808,13 @@ type UnlinkObserver<'a> = &'a dyn Fn(&CandidacyScore, Instant);
 /// shutdown), or `None` to continue.
 pub type SkipCheck<'a> = &'a dyn Fn(&Path) -> Option<SkipReason>;
 
+type ActivityObserver = Arc<dyn Fn(&ActivityEvent) + Send + Sync>;
+
 /// The deletion executor: takes scored candidates and deletes them safely.
 pub struct DeletionExecutor {
     config: DeletionConfig,
     logger: Option<ActivityLoggerHandle>,
+    activity_observer: Option<ActivityObserver>,
     platform: Option<Arc<dyn Platform>>,
 }
 
@@ -851,8 +854,22 @@ impl DeletionExecutor {
         Self {
             config,
             logger,
+            activity_observer: None,
             platform: None,
         }
+    }
+
+    /// Observe execution events synchronously at their existing emission point.
+    /// Manual cleanup uses this to persist receipts without starting another
+    /// rotating JSONL writer beside the daemon. Observers must handle their own
+    /// persistence failures: an already completed removal cannot be retried.
+    #[must_use]
+    pub fn with_activity_observer(
+        mut self,
+        observer: impl Fn(&ActivityEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.activity_observer = Some(Arc::new(observer));
+        self
     }
 
     /// Attach a platform instance to query open files, processes, and sacred paths.
@@ -1296,16 +1313,24 @@ impl DeletionExecutor {
         if self.config.check_open_files && open_paths.is_none() {
             return Ok(CheckedDeletion::Skipped(SkipReason::OpenScanIncomplete));
         }
-        match self.config.mode {
+        let started = Instant::now();
+        let quarantined = match self.config.mode {
             DeletionMode::Quarantine => {
                 self.quarantine_path(candidate)?;
-                Ok(CheckedDeletion::Quarantined)
+                true
             }
             DeletionMode::Unlink => {
                 self.delete_path(candidate)?;
-                Ok(CheckedDeletion::Deleted)
+                false
             }
-        }
+        };
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.log_deletion_success(candidate, duration_ms, quarantined);
+        Ok(if quarantined {
+            CheckedDeletion::Quarantined
+        } else {
+            CheckedDeletion::Deleted
+        })
     }
 
     // ──────────────────── pre-flight checks ────────────────────
@@ -1657,6 +1682,9 @@ impl DeletionExecutor {
     // ──────────────────── logging helpers ────────────────────
 
     fn log_event(&self, event: ActivityEvent) {
+        if let Some(observer) = &self.activity_observer {
+            observer(&event);
+        }
         if let Some(logger) = &self.logger {
             logger.send(event);
         }
@@ -2936,6 +2964,230 @@ mod tests {
         assert_eq!(report.items_failed, 0);
         assert!(!file_path.exists());
         assert!(!dir_path.exists());
+    }
+
+    #[test]
+    fn activity_observer_records_batch_and_checked_unlinks_once() {
+        for single in [false, true] {
+            let dir = scratch_dir();
+            let target = dir.path().join("target");
+            fs::create_dir_all(target.join("deps")).unwrap();
+            fs::write(target.join("deps/a.o"), "obj").unwrap();
+            let candidate = make_identity_candidate(&target, 3, 0.9);
+            let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let captured = Arc::clone(&events);
+            let receipt_path = target.clone();
+            let executor = DeletionExecutor::new(offline_config(), None)
+                .with_activity_observer(move |event| {
+                    if matches!(event, ActivityEvent::ArtifactDeleted { .. }) {
+                        assert!(
+                            !receipt_path.exists(),
+                            "success must follow the filesystem mutation"
+                        );
+                    }
+                    captured.lock().push(event.clone());
+                });
+            let started = std::time::SystemTime::now();
+
+            if single {
+                assert_eq!(
+                    executor.delete_candidate_checked(&candidate, None).unwrap(),
+                    CheckedDeletion::Deleted
+                );
+            } else {
+                let on_unlinked = |_: &CandidacyScore, _: Instant| {
+                    assert_eq!(
+                        events.lock().len(),
+                        1,
+                        "the receipt precedes any unlink observer work"
+                    );
+                };
+                let report = executor.execute_with_hooks(
+                    &executor.plan(vec![candidate.clone()]),
+                    None,
+                    None,
+                    Some(&on_unlinked),
+                );
+                assert_eq!(report.items_deleted, 1);
+                assert_eq!(report.items_failed, 0);
+            }
+
+            assert!(!target.exists());
+            let events = events.lock();
+            let [ActivityEvent::ArtifactDeleted {
+                path,
+                category,
+                completed_at,
+                size_bytes,
+                decision_id,
+                quarantined,
+                ..
+            }] = events.as_slice()
+            else {
+                panic!("expected exactly one successful mutation receipt: {events:?}");
+            };
+            let expected_id = crate::scanner::decision_record::stable_decision_id(
+                &target,
+                candidate.identity,
+                candidate.size_bytes,
+            );
+            assert_eq!(path, &target.to_string_lossy().into_owned());
+            assert_eq!(*category, ArtifactCategory::RustTarget);
+            assert_eq!(*size_bytes, 3);
+            assert_eq!(decision_id.as_deref(), Some(expected_id.as_str()));
+            assert!(completed_at.duration_since(started).is_ok());
+            assert!(std::time::SystemTime::now().duration_since(*completed_at).is_ok());
+            assert!(!*quarantined);
+        }
+    }
+
+    #[test]
+    fn activity_observer_marks_batch_and_checked_quarantines() {
+        for single in [false, true] {
+            let dir = scratch_dir();
+            let root = dir.path().join("project");
+            let target = root.join("target");
+            fs::create_dir_all(target.join("deps")).unwrap();
+            fs::write(target.join("deps/a.o"), "obj").unwrap();
+            let candidate = make_identity_candidate(&target, 3, 0.9);
+            let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let captured = Arc::clone(&events);
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    require_identity: true,
+                    mode: DeletionMode::Quarantine,
+                    quarantine_roots: vec![root.clone()],
+                    ..offline_config()
+                },
+                None,
+            )
+            .with_activity_observer(move |event| captured.lock().push(event.clone()));
+
+            if single {
+                assert_eq!(
+                    executor.delete_candidate_checked(&candidate, None).unwrap(),
+                    CheckedDeletion::Quarantined
+                );
+            } else {
+                let report = executor.execute(&executor.plan(vec![candidate.clone()]), None);
+                assert_eq!(report.items_deleted, 1);
+                assert_eq!(report.items_quarantined, 1);
+                assert_eq!(report.bytes_freed, 0);
+            }
+
+            assert!(!target.exists());
+            let id = crate::scanner::decision_record::stable_decision_id(
+                &target,
+                candidate.identity,
+                candidate.size_bytes,
+            );
+            let record = QuarantineStore::under(&root)
+                .record(&id)
+                .unwrap()
+                .expect("the payload remains restorable");
+            assert_eq!(fs::read(record.quarantine_path.join("deps/a.o")).unwrap(), b"obj");
+            let events = events.lock();
+            let [ActivityEvent::ArtifactDeleted {
+                decision_id,
+                quarantined,
+                ..
+            }] = events.as_slice()
+            else {
+                panic!("expected exactly one quarantine receipt: {events:?}");
+            };
+            assert_eq!(decision_id.as_deref(), Some(id.as_str()));
+            assert!(*quarantined, "a rename must not be replayed as an unlink");
+        }
+    }
+
+    #[test]
+    fn activity_observer_ignores_dry_runs_and_preflight_refusals() {
+        for dry_run in [false, true] {
+            for single in [false, true] {
+                let dir = scratch_dir();
+                let target = dir.path().join("target");
+                fs::create_dir_all(&target).unwrap();
+                fs::write(target.join("a.o"), "obj").unwrap();
+                let candidate = make_identity_candidate(&target, 3, 0.9);
+                let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                let captured = Arc::clone(&events);
+                let executor = DeletionExecutor::new(
+                    DeletionConfig {
+                        dry_run,
+                        ..offline_config()
+                    },
+                    None,
+                )
+                .with_activity_observer(move |event| captured.lock().push(event.clone()));
+                let plan = executor.plan(vec![candidate.clone()]);
+                if !dry_run {
+                    fs::write(target.join(protection::MARKER_FILENAME), "protected").unwrap();
+                }
+
+                if single {
+                    let outcome = executor.delete_candidate_checked(&candidate, None);
+                    if dry_run {
+                        assert!(outcome.is_err());
+                    } else {
+                        assert!(matches!(outcome, Ok(CheckedDeletion::Skipped(_))));
+                    }
+                } else {
+                    let report = executor.execute(&plan, None);
+                    assert_eq!(report.items_deleted, 0);
+                    assert_eq!(report.items_failed, 0);
+                    assert_eq!(report.items_would_delete, usize::from(dry_run));
+                    assert_eq!(report.items_skipped, usize::from(!dry_run));
+                }
+
+                assert_eq!(fs::read(target.join("a.o")).unwrap(), b"obj");
+                assert!(events.lock().is_empty(), "no mutation means no receipt");
+            }
+        }
+    }
+
+    #[test]
+    fn activity_observer_does_not_claim_failed_quarantines() {
+        for single in [false, true] {
+            let dir = scratch_dir();
+            let root = dir.path().join("project");
+            let target = root.join("target");
+            fs::create_dir_all(&target).unwrap();
+            fs::write(target.join("a.o"), "obj").unwrap();
+            fs::create_dir_all(root.join(".sbh")).unwrap();
+            fs::write(
+                root.join(".sbh").join(quarantine::QUARANTINE_DIR_NAME),
+                "not a directory",
+            )
+            .unwrap();
+            let candidate = make_identity_candidate(&target, 3, 0.9);
+            let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let captured = Arc::clone(&events);
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    require_identity: true,
+                    mode: DeletionMode::Quarantine,
+                    quarantine_roots: vec![root],
+                    ..offline_config()
+                },
+                None,
+            )
+            .with_activity_observer(move |event| captured.lock().push(event.clone()));
+
+            if single {
+                assert!(executor.delete_candidate_checked(&candidate, None).is_err());
+            } else {
+                let report = executor.execute(&executor.plan(vec![candidate]), None);
+                assert_eq!(report.items_deleted, 0);
+                assert_eq!(report.items_failed, 1);
+                assert_eq!(report.quarantine_unavailable, 1);
+            }
+
+            assert_eq!(fs::read(target.join("a.o")).unwrap(), b"obj");
+            assert!(events
+                .lock()
+                .iter()
+                .all(|event| !matches!(event, ActivityEvent::ArtifactDeleted { .. })));
+        }
     }
 
     /// `bytes_freed` stays the scanner's estimate; `bytes_freed_observed` is

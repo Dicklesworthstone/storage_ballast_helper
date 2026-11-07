@@ -13415,6 +13415,39 @@ fn record_cli_plan(cli: &Cli, config: &Config, batch_plan: &BatchPlan) {
     }
 }
 
+/// Give manual cleanup the daemon's receipt encoding without a second
+/// asynchronous logger or a competing JSONL rotation owner. Emergency uses
+/// its own bare executor and never opens this ledger.
+fn clean_executor_with_receipts(
+    deletion_config: DeletionConfig,
+    ledger_path: &Path,
+) -> DeletionExecutor {
+    let dry_run = deletion_config.dry_run;
+    let executor = DeletionExecutor::new(deletion_config, None);
+    if dry_run {
+        return executor;
+    }
+    let db = match SqliteLogger::open(ledger_path) {
+        Ok(db) => parking_lot::Mutex::new(db),
+        Err(error) => {
+            eprintln!(
+                "[SBH-CLEAN] activity ledger {} not writable; cleanup receipts cannot be recorded: {error}",
+                ledger_path.display()
+            );
+            return executor;
+        }
+    };
+    let ledger_path = ledger_path.to_path_buf();
+    executor.with_activity_observer(move |event| {
+        if let Err(error) = db.lock().log_activity_event(event) {
+            eprintln!(
+                "[SBH-CLEAN] activity receipt not recorded in {}: {error}",
+                ledger_path.display()
+            );
+        }
+    })
+}
+
 /// `sbh undo`: put quarantined entries back (Layer 7).
 #[allow(clippy::too_many_lines)]
 fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
@@ -13770,7 +13803,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
         quarantine_roots: root_paths.clone(),
         ..Default::default()
     };
-    let executor = DeletionExecutor::new(deletion_config, None);
+    let executor = clean_executor_with_receipts(deletion_config, &config.paths.sqlite_db);
     // Record every scored, non-vetoed candidate (keep, review and delete
     // verdicts alike) before planning, so `sbh explain` can also answer
     // "why was this kept?" for CLI runs.
@@ -18401,6 +18434,200 @@ mod tests {
         let lines = read_plain_tail_lines(file.path(), 2).expect("tail should read");
 
         assert_eq!(lines, vec!["two".to_string(), "three".to_string()]);
+    }
+
+    #[cfg(unix)]
+    fn clean_receipt_candidate(path: &Path) -> CandidacyScore {
+        use storage_ballast_helper::scanner::patterns::ArtifactClassification;
+        use storage_ballast_helper::scanner::scoring::{
+            ArtifactCertainty, DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors,
+        };
+
+        CandidacyScore {
+            path: path.to_path_buf(),
+            identity: Some(
+                storage_ballast_helper::scanner::walker::identity_for_path(path, false).unwrap(),
+            ),
+            total_score: 0.9,
+            factors: ScoreFactors {
+                location: 0.8,
+                name: 0.9,
+                age: 0.7,
+                size: 0.6,
+                structure: 0.85,
+                pressure_multiplier: 1.0,
+            },
+            vetoed: false,
+            veto_reason: None,
+            classification: ArtifactClassification {
+                pattern_name: std::borrow::Cow::Borrowed("target"),
+                category: ArtifactCategory::RustTarget,
+                name_confidence: 0.95,
+                structural_confidence: 0.90,
+                combined_confidence: 0.92,
+            },
+            size_bytes: 3,
+            age: Duration::from_hours(24),
+            decision: DecisionOutcome {
+                action: DecisionAction::Delete,
+                posterior_abandoned: 0.92,
+                expected_loss_keep: 1.5,
+                expected_loss_delete: 0.3,
+                calibration_score: 0.85,
+                fallback_active: false,
+                certainty: ArtifactCertainty::Definite,
+                posterior_floor_applied: false,
+                regret_calibration: 1.0,
+                category_suspended: false,
+            },
+            ledger: EvidenceLedger {
+                terms: Vec::new(),
+                summary: "approved receipt fixture".to_string(),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_receipts_persist_batch_and_checked_mutations_with_their_reversibility() {
+        use storage_ballast_helper::scanner::deletion::CheckedDeletion;
+
+        for single in [false, true] {
+            for quarantine in [false, true] {
+                let directory = tempfile::tempdir_in("/tmp").unwrap();
+                let target = directory.path().join("target");
+                std::fs::create_dir(&target).unwrap();
+                std::fs::write(target.join("a.o"), b"obj").unwrap();
+                let ledger = directory.path().join("activity.sqlite3");
+                let candidate = clean_receipt_candidate(&target);
+                let decision_id = candidate_decision_id(&candidate);
+                let executor = clean_executor_with_receipts(
+                    DeletionConfig {
+                        check_open_files: false,
+                        require_identity: true,
+                        mode: if quarantine {
+                            DeletionMode::Quarantine
+                        } else {
+                            DeletionMode::Unlink
+                        },
+                        quarantine_roots: vec![directory.path().to_path_buf()],
+                        ..DeletionConfig::default()
+                    },
+                    &ledger,
+                );
+
+                if single {
+                    assert_eq!(
+                        executor.delete_candidate_checked(&candidate, None).unwrap(),
+                        if quarantine {
+                            CheckedDeletion::Quarantined
+                        } else {
+                            CheckedDeletion::Deleted
+                        }
+                    );
+                } else {
+                    let report = executor.execute(&executor.plan(vec![candidate]), None);
+                    assert_eq!(report.items_deleted, 1);
+                    assert_eq!(report.items_failed, 0);
+                }
+                assert!(!target.exists());
+                let db = SqliteLogger::open_read_only(&ledger).unwrap();
+                let activity = db.recent_activity(10).unwrap();
+                assert_eq!(activity.len(), 1);
+                assert_eq!(activity[0].event_type, "artifact_delete");
+                assert_eq!(activity[0].success, 1);
+                let receipts = db
+                    .successful_deletions_since("1970-01-01T00:00:00.000Z")
+                    .unwrap();
+                assert_eq!(receipts.len(), usize::from(!quarantine));
+                if quarantine {
+                    assert!(activity[0].details.as_ref().unwrap().contains(";quarantined"));
+                    let held = QuarantineStore::under(directory.path())
+                        .record(&decision_id)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(std::fs::read(held.quarantine_path.join("a.o")).unwrap(), b"obj");
+                } else {
+                    assert_eq!(receipts[0].decision_id, decision_id);
+                    assert_eq!(receipts[0].path, target.to_string_lossy().into_owned());
+                    assert_eq!(receipts[0].category.as_deref(), Some("RustTarget"));
+                    assert!(receipts[0].completed_at.is_some());
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_receipts_exclude_previews_declines_and_protected_artifacts() {
+        for mode in ["preview", "decline", "protected"] {
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let target = directory.path().join("target");
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("a.o"), b"obj").unwrap();
+            let ledger = directory.path().join("activity.sqlite3");
+            let candidate = clean_receipt_candidate(&target);
+            let executor = clean_executor_with_receipts(
+                DeletionConfig {
+                    dry_run: mode == "preview",
+                    check_open_files: false,
+                    require_identity: true,
+                    ..DeletionConfig::default()
+                },
+                &ledger,
+            );
+            let plan = executor.plan(vec![candidate]);
+            if mode == "protected" {
+                std::fs::write(target.join(".sbh-protect"), b"protected").unwrap();
+            }
+            let decline = |_: &Path| Some(SkipReason::UserDeclined);
+            let report = executor.execute(
+                &plan,
+                (mode == "decline").then_some(&decline as SkipCheck<'_>),
+            );
+            assert_eq!(report.items_deleted, 0);
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.items_would_delete, usize::from(mode == "preview"));
+            assert_eq!(std::fs::read(target.join("a.o")).unwrap(), b"obj");
+            if mode == "preview" {
+                assert!(!ledger.exists(), "the receipt sink must not write a preview");
+            } else {
+                assert!(
+                    SqliteLogger::open_read_only(&ledger)
+                        .unwrap()
+                        .recent_activity(10)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_receipt_write_failure_does_not_turn_an_unlink_into_a_failed_deletion() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let target = directory.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("a.o"), b"obj").unwrap();
+        let ledger = directory.path().join("activity.sqlite3");
+        let candidate = clean_receipt_candidate(&target);
+        let executor = clean_executor_with_receipts(
+            DeletionConfig {
+                check_open_files: false,
+                require_identity: true,
+                ..DeletionConfig::default()
+            },
+            &ledger,
+        );
+        let connection = rusqlite::Connection::open(&ledger).unwrap();
+        connection.execute_batch("DROP TABLE activity_log").unwrap();
+        drop(connection);
+        let report = executor.execute(&executor.plan(vec![candidate]), None);
+        assert_eq!(report.items_deleted, 1);
+        assert_eq!(report.items_failed, 0);
+        assert!(!target.exists());
+        assert!(report.backoff_candidates.is_empty());
     }
 
     #[test]

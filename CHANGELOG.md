@@ -8,6 +8,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Manual cleanup records successful mutations for future decisions.** Both
+  automatic and interactive cleanup now persist the daemon's receipt format
+  synchronously after each successful removal. Quarantine moves remain marked
+  reversible, while previews, refusals, and failed removals never become success
+  history. Receipt failures warn without misreporting a completed deletion.
+  Emergency recovery keeps its zero-write logging path.
+
 - **Queued pressure-driven deletions stop when their filesystem reaches its
   Green goal.** The executor checks current candidate-local filesystem stats
   against live volume-aware thresholds before planning and before each removal.

@@ -942,7 +942,7 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
 
 #[cfg(feature = "sqlite")]
 #[allow(clippy::too_many_lines, clippy::cast_possible_wrap)]
-fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
+pub(crate) fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     match event {
