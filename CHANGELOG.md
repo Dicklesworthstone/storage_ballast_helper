@@ -8,6 +8,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Automatic scans obey live memory-pressure discovery limits.** A
+  `DefiniteOnly` posture keeps bounded artifact pre-scans, indexed candidates,
+  and catalog probes available while holding general recursive discovery.
+  `Skip` admits no automatic pass. Restrictive transitions cancel an active
+  recursive walk, preserve unfinished event coverage, and report a partial
+  pass so unseen roots are not parked as empty. Explicit operator scans keep
+  their existing reconciliation scope.
+
 - **Live CLI scoring remembers previous cleanup outcomes.** `scan`, `clean`,
   `explain --why-not`, and scan comparisons now load the same read-only history
   as daemon startup. Recent completed removals increase warm-cache idle windows,

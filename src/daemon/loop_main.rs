@@ -222,6 +222,9 @@ struct SharedExecutorConfig {
     /// Minimum [`ArtifactCertainty`] rank the current behavior cell dispatches
     /// (set from the cleanup action on every behavior transition).
     min_certainty_rank: AtomicU8,
+    /// Live discovery posture. Memory pressure narrows scanning without
+    /// revoking the cleanup authority of already-known candidates.
+    scan_posture: RwLock<ScanAggressiveness>,
     /// Physical-pressure certainty floor while backing pressure drives the
     /// global cell. Swap relief must not loosen unrelated disk batches.
     ram_reclaim_certainty_floor: AtomicU8,
@@ -263,6 +266,7 @@ impl SharedExecutorConfig {
             repeat_base_cooldown_secs: AtomicU64::new(repeat_base_cooldown),
             repeat_max_cooldown_secs: AtomicU64::new(repeat_max_cooldown),
             min_certainty_rank: AtomicU8::new(ArtifactCertainty::Unclear.rank()),
+            scan_posture: RwLock::new(ScanAggressiveness::Normal),
             ram_reclaim_certainty_floor: AtomicU8::new(ArtifactCertainty::Unclear.rank()),
             ram_reclaim_blocks_ordinary_deletion: AtomicBool::new(false),
             inode_pressure: RwLock::new(InodePressureConfig::default()),
@@ -345,6 +349,33 @@ impl SharedExecutorConfig {
     fn set_min_certainty(&self, certainty: ArtifactCertainty) {
         self.min_certainty_rank
             .store(certainty.rank(), Ordering::Relaxed);
+    }
+
+    fn set_scan_posture(&self, posture: ScanAggressiveness) {
+        *self.scan_posture.write() = posture;
+    }
+
+    fn scan_posture_for(&self, request: &ScanRequest) -> ScanAggressiveness {
+        if request.scan_now.is_some()
+            || (request.force_full_scan
+                && !request.has_resource_reclaim()
+                && request.config_update.is_none())
+        {
+            // A scoped operator request and SIGUSR1 retain their explicit
+            // reconciliation scope. Their separate pacing rules still apply.
+            // Inode relief also forces reconciliation, but is automatic work.
+            ScanAggressiveness::Normal
+        } else {
+            *self.scan_posture.read()
+        }
+    }
+
+    fn holds_recursive_scan(&self, request: &ScanRequest) -> bool {
+        match self.scan_posture_for(request) {
+            ScanAggressiveness::Skip => true,
+            ScanAggressiveness::DefiniteOnly => request.catalog_roots.is_empty(),
+            _ => false,
+        }
     }
 
     fn min_score(&self) -> f64 {
@@ -3359,6 +3390,8 @@ enum PassStop {
     PrescanCpuShare,
     /// `scanner.scan_time_budget_secs` — the pass's wall ceiling.
     Wall,
+    /// A live scan posture leaves broader discovery for a later pass.
+    ScanPosture,
     /// The daemon's measured CPU allowance for this pass (Q7).
     Cpu,
 }
@@ -3370,6 +3403,7 @@ impl PassStop {
             Self::PrescanPhase => "prescan wall budget",
             Self::PrescanCpuShare => "prescan cpu share",
             Self::Wall => "scan wall budget",
+            Self::ScanPosture => "restricted scan posture",
             Self::Cpu => "daemon cpu budget",
         }
     }
@@ -3377,7 +3411,7 @@ impl PassStop {
     /// Whether this stop ends the whole pass (as opposed to just the
     /// priority pre-scan phase).
     const fn ends_pass(self) -> bool {
-        matches!(self, Self::Wall | Self::Cpu)
+        matches!(self, Self::Wall | Self::Cpu | Self::ScanPosture)
     }
 }
 
@@ -4097,6 +4131,7 @@ impl MonitoringDaemon {
             MemoryPressureLevel::Unknown,
             PressureLevel::Green,
         );
+        shared_executor_config.set_scan_posture(behavior_state.mode.scan_aggressiveness);
 
         let prediction_config = config.pressure.prediction.clone();
         // Q7: calibrated to the CPU already spent on startup so that work
@@ -4415,6 +4450,8 @@ impl MonitoringDaemon {
             hysteresis,
         ) {
             BehaviorUpdate::Applied(transition) => {
+                self.shared_executor_config
+                    .set_scan_posture(transition.to_mode.scan_aggressiveness);
                 self.shared_executor_config
                     .set_min_certainty(min_certainty_for(transition.to_mode.cleanup_action));
                 self.cpu_budget.lock().set_pct(paced_pct(
@@ -8040,6 +8077,8 @@ impl MonitoringDaemon {
                         }
                         self.log_behavior_matrix("config_reload");
                     }
+                    self.shared_executor_config
+                        .set_scan_posture(self.behavior_state.mode.scan_aggressiveness);
 
                     // Rebuild predictive policy with new thresholds.
                     self.predictive_policy =
@@ -9291,6 +9330,12 @@ fn scanner_thread_main(
         // Read latest config at the start of each scan.
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
+        if executor_config.scan_posture_for(&request) == ScanAggressiveness::Skip {
+            // Queued and event-triggered automatic work must observe the
+            // current memory posture too. Leave pending event coverage intact.
+            heartbeat.beat();
+            continue;
+        }
         if request
             .scan_now
             .as_ref()
@@ -10772,7 +10817,19 @@ fn scanner_thread_main(
         // Catalog-only requests do not walk: each derived root is one opaque
         // candidate unit, sized and dated by a bounded probe, and flows
         // through the same classification, scoring, vetoes and dispatch below.
-        let (mut rx, cancel_token) = if request.catalog_roots.is_empty() {
+        let recursive_scan_held = executor_config.holds_recursive_scan(&request);
+        let (mut rx, cancel_token) = if recursive_scan_held {
+            // DefiniteOnly retains index replay and the bounded artifact
+            // pre-scan above. It does not start a broad discovery walk. An
+            // empty stream shares normal accounting without claiming EOF
+            // coverage for roots that have not been reconciled.
+            drop(walker_config);
+            drop(protection);
+            (
+                WalkStream::from_entries(Vec::new()),
+                Arc::new(AtomicBool::new(false)),
+            )
+        } else if request.catalog_roots.is_empty() {
             // Only classified entries use a walked directory's size, and they
             // read it below (bd-gh0x).
             let walker = DirectoryWalker::new(walker_config, protection)
@@ -10819,7 +10876,8 @@ fn scanner_thread_main(
 
         let mut paths_scanned = 0;
         // Which limit ended the general walk, if any.
-        let mut walk_stop: Option<PassStop> = None;
+        let mut walk_stop = recursive_scan_held.then_some(PassStop::ScanPosture);
+        scan_timed_out |= recursive_scan_held;
         let mut walk_exhausted = false;
         let mut opaque_pruned_dirs = 0usize;
         let mut scored: Vec<CandidacyScore> = Vec::with_capacity(1024);
@@ -10859,6 +10917,12 @@ fn scanner_thread_main(
                 scanner_should_exit = true;
                 break;
             }
+            if executor_config.holds_recursive_scan(&request) {
+                cancel_token.store(true, Ordering::Relaxed);
+                scan_timed_out = true;
+                walk_stop = Some(PassStop::ScanPosture);
+                break;
+            }
             let mut entry = match rx.recv_timeout(Duration::from_secs(2)) {
                 Ok(entry) => entry,
                 Err(RecvTimeoutError::Timeout) => {
@@ -10890,6 +10954,15 @@ fn scanner_thread_main(
             if shutdown.load(Ordering::Relaxed) {
                 cancel_token.store(true, Ordering::Relaxed);
                 scanner_should_exit = true;
+                break;
+            }
+            if executor_config.holds_recursive_scan(&request) {
+                // The popped entry is no longer in the stream's unfinished
+                // receipt. Keep its ancestors eligible for the next pass.
+                mark_non_barren(&mut non_barren_dirs, &entry.path);
+                cancel_token.store(true, Ordering::Relaxed);
+                scan_timed_out = true;
+                walk_stop = Some(PassStop::ScanPosture);
                 break;
             }
             paths_scanned += 1;
@@ -11274,7 +11347,12 @@ fn scanner_thread_main(
             // (raise `scanner.scan_time_budget_secs`, raise
             // `telemetry.cpu_budget_pct`/`cpu_budget_burst_secs`, or accept
             // the multi-pass sweep). The entry count says how far it got.
-            if claim_budget_warning(&mut last_budget_warning, Instant::now()) {
+            if walk_stop == Some(PassStop::ScanPosture) {
+                logger.send(ActivityEvent::Info {
+                    message: "scanner posture deferred recursive discovery; unfinished roots remain pending"
+                        .to_string(),
+                });
+            } else if claim_budget_warning(&mut last_budget_warning, Instant::now()) {
                 logger.send(ActivityEvent::Warning {
                     code: "SBH-2007".to_string(),
                     message: format!(
@@ -18339,6 +18417,469 @@ mod tests {
                 assert_eq!(outcomes[0].after_secs, age);
             }
         }
+    }
+
+    #[test]
+    fn scanner_posture_overrides_belong_to_operators_not_automatic_relief() {
+        let temp = temp_root_scratch_dir();
+        let root = temp.path().to_path_buf();
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![root.clone()];
+        let identity = crate::scanner::walker::identity_for_path(&root, true).unwrap();
+        let shared = SharedExecutorConfig::new(false, 10, 0.0, 60, 3600, false, 0);
+
+        for posture in [ScanAggressiveness::DefiniteOnly, ScanAggressiveness::Skip] {
+            shared.set_scan_posture(posture);
+            let mut request = event_test_request(vec![root.clone()]);
+            request.pressure_level = PressureLevel::Critical;
+            assert_eq!(shared.scan_posture_for(&request), posture);
+            assert!(shared.holds_recursive_scan(&request));
+
+            // SIGUSR1 asks for a full reconciliation.
+            request.force_full_scan = true;
+            assert_eq!(shared.scan_posture_for(&request), ScanAggressiveness::Normal);
+            assert!(!shared.holds_recursive_scan(&request));
+
+            // Inode requests also force reconciliation, but that internal
+            // flag must not grant an operator's posture override.
+            request.inode_reclaim = Some(InodeReclaimRequest::new(
+                root.clone(),
+                identity.device_id,
+                1_000,
+                200,
+                1,
+                &config.pressure.inodes,
+                &config.scanner.root_paths,
+            ));
+            assert_eq!(shared.scan_posture_for(&request), posture);
+            assert!(shared.holds_recursive_scan(&request));
+            request.inode_reclaim = None;
+            request.ram_reclaim = Some(RamReclaimRequest::new(
+                root.clone(),
+                identity.device_id,
+                1,
+                &config.scanner.root_paths,
+            ));
+            assert_eq!(shared.scan_posture_for(&request), posture);
+            assert!(shared.holds_recursive_scan(&request));
+            request.ram_reclaim = None;
+            request.config_update = Some((config.scoring.clone(), config.scanner.clone()));
+            assert_eq!(shared.scan_posture_for(&request), posture);
+            assert!(shared.holds_recursive_scan(&request));
+
+            // A selected operator scope retains its discovery authority
+            // without --force; that flag still controls pacing separately.
+            request.config_update = None;
+            request.scan_now = Some(Arc::new(
+                ScanNowScope::capture(&[], false, &config.scanner).unwrap(),
+            ));
+            assert_eq!(shared.scan_posture_for(&request), ScanAggressiveness::Normal);
+            assert!(!shared.holds_recursive_scan(&request));
+            assert!(!request.bypass_scan_pacing());
+        }
+
+        let mut request = event_test_request(vec![root.clone()]);
+        request.catalog_roots = vec![ExpandedCatalogRoot {
+            path: root,
+            rule: "test-catalog-cache",
+            confidence: cleanup_catalog::CleanupConfidence::Definite,
+            min_age: Duration::ZERO,
+        }];
+        shared.set_scan_posture(ScanAggressiveness::DefiniteOnly);
+        assert!(!shared.holds_recursive_scan(&request));
+        shared.set_scan_posture(ScanAggressiveness::Skip);
+        assert!(shared.holds_recursive_scan(&request));
+        shared.set_scan_posture(ScanAggressiveness::Normal);
+        assert!(!shared.holds_recursive_scan(&request));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn scanner_memory_posture_preserves_reclaim_and_unfinished_discovery() {
+        let temp = temp_root_scratch_dir();
+        let root = temp.path().join("scan-root");
+        let make_target = |project: &Path| {
+            let target = project.join("target");
+            for child in ["debug/deps", "debug/incremental", "debug/.fingerprint"] {
+                std::fs::create_dir_all(target.join(child)).unwrap();
+            }
+            std::fs::write(
+                project.join("Cargo.toml"),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+            write_cargo_cachedir_tag(&target);
+            std::fs::write(target.join("debug/deps/libfixture.rlib"), [0xA5_u8; 8192]).unwrap();
+            target
+        };
+        let shallow = make_target(&root.join("shallow"));
+        let deep = make_target(&root.join("deep/one/two/three"));
+        let catalog = root.join("ordinary-data");
+        std::fs::create_dir_all(&catalog).unwrap();
+
+        let mut config = Config::default();
+        config.scanner.engine = ScannerEngineMode::V2;
+        config.scanner.root_paths = vec![root.clone()];
+        config.scanner.parallelism = 1;
+        config.scanner.event_watch_budget = 64;
+        config.scanner.min_file_age_minutes = 0;
+        config.scanner.active_reference_min_size_bytes = u64::MAX;
+        config.scanner.min_rescan_interval_secs = 0;
+        config.scanner.max_scan_duty_cycle_pct = 100;
+        config.scanner.scan_time_budget_secs = 30;
+        config.scanner.log_truncation.enabled = false;
+        config.scoring.min_score = 0.0;
+
+        let log_path = temp.path().join("activity.jsonl");
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: log_path.clone(),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 128,
+            run_id: None,
+        })
+        .unwrap();
+        let scoring = Arc::new(RwLock::new(config.scoring.clone()));
+        let scanner = Arc::new(RwLock::new(config.scanner.clone()));
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        let executor_config = Arc::new(SharedExecutorConfig::new(
+            false, 10, 0.0, 60, 3600, false, 0,
+        ));
+        executor_config.set_min_certainty(ArtifactCertainty::Definite);
+        executor_config.set_scan_posture(ScanAggressiveness::DefiniteOnly);
+        let regret = Arc::new(SharedRegret::new(&config));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(2);
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(32);
+        let (report_tx, report_rx) = bounded::<WorkerReport>(16);
+        let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        let (index_path, cursor_path) = scanner_state_paths(temp.path());
+        let request_for = |level| {
+            let mut request = event_test_request(vec![root.clone()]);
+            request.pressure_level = level;
+            request.free_pct = Some(if level == PressureLevel::Critical {
+                1.0
+            } else {
+                50.0
+            });
+            request.urgency = 1.0;
+            request
+        };
+
+        let observations = thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                scanner_thread_main(
+                    &scan_rx,
+                    &del_tx,
+                    &logger,
+                    &scoring,
+                    &scanner,
+                    &platform,
+                    &ThreadHeartbeat::new("memory-posture-test"),
+                    &report_tx,
+                    &shutdown,
+                    &index_path,
+                    &cursor_path,
+                    &feedback_rx,
+                    &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+                    &executor_config,
+                    &regret,
+                    None,
+                );
+            });
+            // Do not panic while the worker can be waiting on scan_rx: always
+            // close its input and join before asserting the observations.
+            let result = (|| -> std::result::Result<_, String> {
+                let send = |request| scan_tx.send(request).map_err(|error| error.to_string());
+                let report = || {
+                    report_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|error| error.to_string())
+                };
+                send(request_for(PressureLevel::Critical))?;
+                let limited = report()?;
+
+                executor_config.set_scan_posture(ScanAggressiveness::Normal);
+                send(request_for(PressureLevel::Green))?;
+                let recovered = report()?;
+                send(request_for(PressureLevel::Green))?;
+                let reconciled = report()?;
+                // The third report guarantees the prior pass flushed its
+                // candidates. Later operator work cannot prove recovery.
+                let recovery_batches = del_rx.try_iter().collect::<Vec<_>>();
+
+                executor_config.set_scan_posture(ScanAggressiveness::Skip);
+                send(request_for(PressureLevel::Critical))?;
+                let mut forced = request_for(PressureLevel::Green);
+                forced.force_full_scan = true;
+                send(forced)?;
+                let explicit = report()?;
+
+                executor_config.set_scan_posture(ScanAggressiveness::DefiniteOnly);
+                let mut catalog_request = request_for(PressureLevel::Yellow);
+                catalog_request.paths = vec![catalog.clone()];
+                catalog_request.catalog_roots = vec![ExpandedCatalogRoot {
+                    path: catalog.clone(),
+                    rule: "test-catalog-cache",
+                    confidence: cleanup_catalog::CleanupConfidence::Definite,
+                    min_age: Duration::MAX,
+                }];
+                send(catalog_request)?;
+                let catalog_report = report()?;
+                Ok((
+                    [limited, recovered, reconciled, explicit, catalog_report],
+                    recovery_batches,
+                ))
+            })();
+            if result.is_err() {
+                shutdown.store(true, Ordering::Relaxed);
+            }
+            drop(scan_tx);
+            worker.join().expect("scanner worker must finish");
+            result
+        });
+        logger.shutdown();
+        logger_join.join().unwrap();
+
+        let (reports, batches) = observations.expect("each permitted scan must complete");
+        let mut dirty = Vec::new();
+        for (index, report) in reports.iter().enumerate() {
+            let WorkerReport::ScanCompleted {
+                candidates,
+                root_stats,
+                timed_out,
+                pressure_level,
+                ..
+            } = report
+            else {
+                panic!("expected scanner completion");
+            };
+            assert_eq!(*timed_out, index == 0, "{report:?}");
+            assert_eq!(root_stats.len(), 1, "{report:?}");
+            if index < 3 {
+                dirty.push(root_stats[0].dirty);
+            }
+            if index == 0 || index == 3 {
+                assert!(*candidates > 0, "{report:?}");
+            }
+            if index == 3 {
+                assert_eq!(
+                    *pressure_level,
+                    PressureLevel::Green,
+                    "Skip must suppress the preceding automatic Critical request",
+                );
+            }
+        }
+        assert_eq!(
+            dirty,
+            vec![true, true, false],
+            "partial DefiniteOnly discovery must retain event coverage until Normal reconciles it",
+        );
+        let saw = |level, path: &Path| {
+            batches.iter().any(|batch| {
+                batch.pressure_level == level
+                    && batch
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.path.as_path() == path)
+            })
+        };
+        assert!(saw(PressureLevel::Critical, &shallow));
+        assert!(!saw(PressureLevel::Critical, &deep));
+        assert!(
+            saw(PressureLevel::Green, &deep),
+            "ordinary recovery must discover the deferred subtree before any forced request",
+        );
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("scanner posture deferred recursive discovery"));
+        assert!(log.contains("catalog scan: 1 root(s) probed, 1 skipped as recently used"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn scanner_cancels_recursive_discovery_when_memory_posture_changes_mid_pass() {
+        use crate::platform::pal::{FsStats, MountPoint, PlatformPaths, ServiceManager};
+        use crate::platform::types::{ExecutablesResult, MappedRegion, OpenFilesResult, ProcessInfo};
+
+        struct RestrictDuringReferences {
+            base: MockPlatform,
+            executor_config: Arc<SharedExecutorConfig>,
+            triggered: Arc<AtomicBool>,
+        }
+
+        impl Platform for RestrictDuringReferences {
+            fn name(&self) -> &'static str {
+                self.base.name()
+            }
+
+            fn fs_stats(&self, path: &Path) -> Result<FsStats> {
+                self.base.fs_stats(path)
+            }
+
+            fn mount_points(&self) -> Result<Vec<MountPoint>> {
+                self.base.mount_points()
+            }
+
+            fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+                self.base.is_ram_backed(path)
+            }
+
+            fn default_paths(&self) -> PlatformPaths {
+                self.base.default_paths()
+            }
+
+            fn memory_info(&self) -> Result<MemoryInfo> {
+                self.base.memory_info()
+            }
+
+            fn service_manager(&self) -> Box<dyn ServiceManager> {
+                self.base.service_manager()
+            }
+
+            fn process_list_without_command_lines(&self) -> Result<Vec<ProcessInfo>> {
+                // This candidate is deeper than the priority pre-scan can
+                // reach. The broad walker is already running when its first
+                // active-reference probe publishes a restrictive posture.
+                self.executor_config
+                    .set_scan_posture(ScanAggressiveness::DefiniteOnly);
+                self.triggered.store(true, Ordering::Relaxed);
+                self.base.process_list_without_command_lines()
+            }
+
+            fn open_files_under_roots(&self, roots: &[PathBuf]) -> Result<OpenFilesResult> {
+                self.base.open_files_under_roots(roots)
+            }
+
+            fn executables_under_roots(&self, roots: &[PathBuf]) -> Result<ExecutablesResult> {
+                self.base.executables_under_roots(roots)
+            }
+
+            fn mmap_regions_under_roots(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+                self.base.mmap_regions_under_roots(roots)
+            }
+        }
+
+        let temp = temp_root_scratch_dir();
+        let root = temp.path().join("scan-root");
+        let project = root.join("deep/one/two/three");
+        let target = project.join("target");
+        for child in ["debug/deps", "debug/incremental", "debug/.fingerprint"] {
+            std::fs::create_dir_all(target.join(child)).unwrap();
+        }
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        write_cargo_cachedir_tag(&target);
+        std::fs::write(target.join("debug/deps/libfixture.rlib"), [0xA5_u8; 8192]).unwrap();
+
+        let mut config = Config::default();
+        config.scanner.engine = ScannerEngineMode::V2;
+        config.scanner.root_paths = vec![root.clone()];
+        config.scanner.parallelism = 1;
+        config.scanner.event_watch_budget = 64;
+        config.scanner.min_file_age_minutes = 0;
+        config.scanner.active_reference_min_size_bytes = 0;
+        config.scanner.active_reference_cache_ttl_secs = 0;
+        config.scanner.min_rescan_interval_secs = 0;
+        config.scanner.max_scan_duty_cycle_pct = 100;
+        config.scanner.scan_time_budget_secs = 30;
+        config.scanner.log_truncation.enabled = false;
+        config.scoring.min_score = 0.0;
+
+        let executor_config = Arc::new(SharedExecutorConfig::new(
+            false, 10, 0.0, 60, 3600, false, 0,
+        ));
+        executor_config.set_min_certainty(ArtifactCertainty::Definite);
+        executor_config.set_scan_posture(ScanAggressiveness::Normal);
+        let triggered = Arc::new(AtomicBool::new(false));
+        let platform: Arc<dyn Platform> = Arc::new(RestrictDuringReferences {
+            base: MockPlatform::healthy(),
+            executor_config: Arc::clone(&executor_config),
+            triggered: Arc::clone(&triggered),
+        });
+        let log_path = temp.path().join("activity.jsonl");
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: log_path.clone(),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 64,
+            run_id: None,
+        })
+        .unwrap();
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(16);
+        let (report_tx, report_rx) = bounded::<WorkerReport>(2);
+        let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        let (index_path, cursor_path) = scanner_state_paths(temp.path());
+        let mut request = event_test_request(vec![root]);
+        request.pressure_level = PressureLevel::Critical;
+        request.free_pct = Some(1.0);
+        request.urgency = 1.0;
+        scan_tx.send(request).unwrap();
+        drop(scan_tx);
+        scanner_thread_main(
+            &scan_rx,
+            &del_tx,
+            &logger,
+            &Arc::new(RwLock::new(config.scoring.clone())),
+            &Arc::new(RwLock::new(config.scanner.clone())),
+            &platform,
+            &ThreadHeartbeat::new("live-memory-posture-test"),
+            &report_tx,
+            &Arc::new(AtomicBool::new(false)),
+            &index_path,
+            &cursor_path,
+            &feedback_rx,
+            &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+            &executor_config,
+            &Arc::new(SharedRegret::new(&config)),
+            None,
+        );
+        logger.shutdown();
+        logger_join.join().unwrap();
+
+        assert!(
+            triggered.load(Ordering::Relaxed),
+            "the deep candidate must reach the real walker's reference probe",
+        );
+        let report = report_rx
+            .try_recv()
+            .expect("scanner must report a partial pass");
+        assert!(
+            matches!(
+                report,
+                WorkerReport::ScanCompleted {
+                    timed_out: true,
+                    ..
+                }
+            ),
+            "{report:?}",
+        );
+        assert!(
+            del_rx.try_iter().any(|batch| {
+                batch
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.path == target)
+            }),
+            "restricting discovery must preserve cleanup of the already-scored definite artifact",
+        );
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("scanner posture deferred recursive discovery"));
     }
 
     #[test]

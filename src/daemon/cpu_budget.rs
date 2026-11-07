@@ -58,9 +58,10 @@ use crate::monitor::pid::PressureLevel;
 /// configured pace, capped at one core: at Orange the priority pre-scan on
 /// fmd stopped on the budget ~150 times an hour (2026-09-30) while the
 /// matrix asked for "increased scanner budget" and nothing read it.
-/// `Light` and `DefiniteOnly` (memory Warn/Critical) halve it, so the walk
-/// allocates at half the rate while memory is short; `DefiniteOnly` does not
-/// yet restrict which paths are walked. A configured 0 stays disabled.
+/// `Light` and `DefiniteOnly` (memory Warn/Critical) halve the configured
+/// pace. The scanner also restricts automatic DefiniteOnly discovery to
+/// index replay, the shallow artifact pre-scan and catalog probes. A
+/// configured 0 disables CPU pacing without disabling that scope limit.
 #[must_use]
 pub fn paced_pct(configured: u8, scan: ScanAggressiveness) -> u8 {
     match scan {

@@ -1328,7 +1328,9 @@ When guardrails report a non-Pass status, a penalty (default 50.0) is added to t
 
 What actually runs at a given pressure is the behavior matrix: memory pressure (rows) crossed with disk pressure (columns) selects a scanner posture, a cleanup posture, a ballast action and a notification severity. `[behavior] preset` (or `SBH_BEHAVIOR_PRESET`) picks `v0.6` (the default: reclaim before the cliff), `v0.5` (the matrix shipped through v0.5.x, for rollback) or `custom` (`v0.6` plus `[behavior.cells.<memory>_<disk>]` overrides, which go through the never-reduce rule in `src/daemon/policy.rs`). The tables are generated from the code by `sbh docs --render README.md`.
 
-The scan posture sets the CPU pace: `aggressive` paces the scanner at twice `telemetry.cpu_budget_pct` (at most one core), `light` and `definite_only` at half, `normal` at the configured value, and `skip` starts no new scans. Critical disk pressure is unpaced regardless. `definite_only` does not yet restrict which paths are walked.
+The scan posture sets the CPU pace: `aggressive` paces the scanner at twice `telemetry.cpu_budget_pct` (at most one core), `light` and `definite_only` at half, and `normal` at the configured value. Automatic scanner passes, including Critical passes, use the measured CPU allowance; Critical pressure exempts the monitor from yielding so ballast release and monitoring stay responsive.
+
+`definite_only` also limits automatic discovery to candidate-index replay, the existing shallow artifact pre-scan and catalog probes. It defers broad recursive walks; a live switch to `definite_only` or `skip` stops an ongoing general walk at its next checkpoint. Unfinished roots remain pending so ordinary scans can reconcile them when memory pressure eases. `skip` starts no new automatic scans. Cleanup and ballast authority still follow their behavior-matrix cells, while explicit `scan-now` and SIGUSR1 requests retain their requested reconciliation scope and existing pacing rules.
 
 <!-- sbh-docs:begin behavior-matrix -->
 **Preset `v0.6` (default)** (cell = scan / cleanup / ballast / notify):
