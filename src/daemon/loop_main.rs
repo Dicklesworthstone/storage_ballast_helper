@@ -8539,6 +8539,7 @@ impl MonitoringDaemon {
                     // Revoke old target-only surveys and queued exceptions
                     // before publishing replacement scanner permissions.
                     self.target_tier.update_config(&new_config.scanner);
+                    self.rch_staging.update_config(&new_config);
                     *self.shared_scoring_config.write() = new_config.scoring.clone();
                     *self.shared_scanner_config.write() = new_config.scanner.clone();
 

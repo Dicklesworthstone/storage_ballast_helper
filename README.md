@@ -1394,6 +1394,13 @@ the same root requires a fresh selection. The executor renews that permission
 after the purity probe and before mutation, so a long batch cannot keep using
 a protection exception that the operator has withdrawn.
 
+An in-flight rch staging pass is also revocable. Reloading its scanner,
+pressure, or policy settings cancels the old pass, as does leaving Enforce
+mode or recovering enough space to require an older idle cutoff. The worker
+checks cancellation after its process and marker checks and before starting
+each rch command. Restoring the earlier settings or pressure cannot revive
+that pass; a blocked worker keeps its slot until it exits.
+
 #### Layer 2: Pre-Flight Safety Checks
 
 Before any deletion is executed, an eight-point pre-flight check must pass:

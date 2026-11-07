@@ -27,9 +27,11 @@
 //! 3. only when every such tree passes, has rch prune that project
 //!    (`--project=<name> --execute`).
 //!
-//! The pass runs only in Enforce mode and never under `scanner.dry_run`, and
-//! the `rch` it runs must be owned, together with every directory above it,
-//! by root or the daemon's user and be writable by no one else.
+//! The pass runs only in Enforce mode and never under `scanner.dry_run`. A
+//! configuration change or pressure recovery revokes an in-flight pass;
+//! cancellation is checked again before any rch command starts. The `rch` it
+//! runs must be owned, together with every directory above it, by root or the
+//! daemon's user and be writable by no one else.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
@@ -45,8 +47,8 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use crate::core::config::Config;
-use crate::daemon::policy::ActiveMode;
+use crate::core::config::{Config, PressureConfig, ScannerConfig};
+use crate::daemon::policy::{ActiveMode, PolicyConfig};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle};
 use crate::monitor::pid::PressureLevel;
 use crate::platform::pal::Platform;
@@ -219,8 +221,11 @@ impl RchRunner {
     }
 
     /// Run rch with `args`; its stdout, or why the run failed. A set `stop`
-    /// kills it.
+    /// refuses a new invocation and kills an invocation already in flight.
     fn run(&self, args: &[OsString], stop: &AtomicBool) -> Result<Vec<u8>, String> {
+        if stop.load(Ordering::Acquire) {
+            return Err("rch stopped with the pass".to_string());
+        }
         let mut child = Command::new(&self.binary)
             .args(args)
             .env_clear()
@@ -600,6 +605,13 @@ fn run_base(
             report.leave(reason);
             continue;
         }
+        // The process/marker checks may have blocked across a reload or a
+        // pressure recovery. Their old snapshot does not retain permission
+        // to launch a destructive command after the pass was revoked.
+        if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+            report.leave("next_pass");
+            continue;
+        }
         let outcome = runner
             .run(
                 &clean_args(base, min_idle, &[project_arg, OsString::from("--execute")]),
@@ -622,6 +634,34 @@ fn run_base(
     report
 }
 
+/// Configuration that authorizes a pass. Keep the complete scanner settings
+/// so a newly added safety or idle-age setting cannot silently escape reload
+/// revocation. Pressure thresholds and policy settings also affect admission.
+#[derive(Debug)]
+struct PassScope {
+    scanner: ScannerConfig,
+    pressure: PressureConfig,
+    policy: PolicyConfig,
+}
+
+impl PassScope {
+    fn matches(&self, config: &Config) -> bool {
+        self.scanner == config.scanner
+            && self.pressure == config.pressure
+            && self.policy == config.policy
+    }
+}
+
+/// One base admitted under a particular mount's observed pressure. Remember
+/// that mount so later ticks can withdraw permission without filesystem I/O.
+#[derive(Debug)]
+struct DueBase {
+    base: PathBuf,
+    mount: PathBuf,
+    level: PressureLevel,
+    min_idle: Duration,
+}
+
 /// Scheduling state of the tier: at most one pass in flight.
 #[derive(Debug, Default)]
 pub struct RchStagingTier {
@@ -632,9 +672,36 @@ pub struct RchStagingTier {
     last_run: HashMap<PathBuf, Instant>,
     last_probe: Option<Instant>,
     last_unavailable_note: Option<Instant>,
+    scope: Option<PassScope>,
+    admitted_mounts: Vec<(PathBuf, Duration)>,
 }
 
 impl RchStagingTier {
+    /// Revoke old authority before publishing a reloaded configuration. No
+    /// filesystem work or waiting: a blocked worker keeps its slot until it
+    /// exits, and its stop flag is never cleared even if the settings revert.
+    pub fn update_config(&mut self, config: &Config) {
+        if self
+            .scope
+            .as_ref()
+            .is_none_or(|previous| !previous.matches(config))
+        {
+            self.stop_running_pass();
+            self.last_probe = None;
+            self.scope = Some(PassScope {
+                scanner: config.scanner.clone(),
+                pressure: config.pressure.clone(),
+                policy: config.policy.clone(),
+            });
+        }
+        if config.policy.kill_switch
+            || config.scanner.dry_run
+            || config.scanner.rch_staging_bases.is_empty()
+        {
+            self.stop_running_pass();
+        }
+    }
+
     /// Start a pass on its own thread when a base is due. `mounts` maps each
     /// monitored mount to its pressure level and urgency.
     pub fn tick(
@@ -646,22 +713,37 @@ impl RchStagingTier {
         mode: ActiveMode,
         logger: &ActivityLoggerHandle,
     ) {
+        self.update_config(config);
         if config.scanner.rch_staging_bases.is_empty()
             || config.scanner.dry_run
+            || config.policy.kill_switch
             || mode != ActiveMode::Enforce
         {
-            self.stop.store(true, Ordering::Release);
+            self.stop_running_pass();
             return;
         }
-        if self.running.load(Ordering::Acquire)
-            || self
-                .last_probe
-                .is_some_and(|last| now.saturating_duration_since(last) < PROBE_INTERVAL)
+        if self.running.load(Ordering::Acquire) {
+            // A missing mount is missing authority. Partial recovery also
+            // revokes a pass whose age cutoff is now too aggressive, e.g.
+            // a Critical (24 h) pass after the mount returns to Red (48 h).
+            if self.admitted_mounts.iter().any(|(mount, admitted_idle)| {
+                mounts
+                    .get(mount)
+                    .and_then(|(level, _)| min_idle_for(*level))
+                    .is_none_or(|current_idle| current_idle > *admitted_idle)
+            }) {
+                self.stop_running_pass();
+            }
+            return;
+        }
+        if self
+            .last_probe
+            .is_some_and(|last| now.saturating_duration_since(last) < PROBE_INTERVAL)
         {
             return;
         }
         self.last_probe = Some(now);
-        let due: Vec<(PathBuf, PressureLevel, Duration)> = config
+        let due: Vec<DueBase> = config
             .scanner
             .rch_staging_bases
             .iter()
@@ -674,7 +756,12 @@ impl RchStagingTier {
             .filter_map(|base| {
                 let stats = platform.fs_stats(base).ok()?;
                 let &(level, _) = mounts.get(&stats.mount_point)?;
-                Some((base.clone(), level, min_idle_for(level)?))
+                Some(DueBase {
+                    base: base.clone(),
+                    mount: stats.mount_point,
+                    level,
+                    min_idle: min_idle_for(level)?,
+                })
             })
             .collect();
         if due.is_empty() {
@@ -697,8 +784,27 @@ impl RchStagingTier {
                 return;
             }
         };
-        for (base, _, _) in &due {
-            self.last_run.insert(base.clone(), now);
+        self.start_pass(now, config, platform, due, runner, logger);
+    }
+
+    /// Launch only after the tick has admitted the bases and resolved a
+    /// trusted runner. Kept separate so tests can exercise the real worker
+    /// lifecycle with a stand-in binary outside the trusted system paths.
+    fn start_pass(
+        &mut self,
+        now: Instant,
+        config: &Config,
+        platform: &Arc<dyn Platform>,
+        due: Vec<DueBase>,
+        runner: RchRunner,
+        logger: &ActivityLoggerHandle,
+    ) {
+        self.admitted_mounts = due
+            .iter()
+            .map(|entry| (entry.mount.clone(), entry.min_idle))
+            .collect();
+        for entry in &due {
+            self.last_run.insert(entry.base.clone(), now);
         }
         self.stop = Arc::new(AtomicBool::new(false));
         self.running.store(true, Ordering::Release);
@@ -711,13 +817,19 @@ impl RchStagingTier {
             .name("sbh-rch-staging".to_string())
             .spawn(move || {
                 let _guard = guard;
-                for (base, level, min_idle) in due {
+                for entry in due {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    let report =
-                        run_base(&base, min_idle, &config, platform.as_ref(), &runner, &stop);
-                    let summary = report.summary(&base, level, min_idle);
+                    let report = run_base(
+                        &entry.base,
+                        entry.min_idle,
+                        &config,
+                        platform.as_ref(),
+                        &runner,
+                        &stop,
+                    );
+                    let summary = report.summary(&entry.base, entry.level, entry.min_idle);
                     eprintln!("[SBH-RCH] {summary}");
                     match report.error {
                         Some(error) => logger.send(ActivityEvent::Warning {
@@ -762,15 +874,21 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use serde_json::json;
 
     use super::*;
-    use crate::platform::pal::MockPlatform;
-    use crate::platform::types::{OpenFile, OpenFileKind, OpenFileMode};
+    use crate::core::errors::Result as SbhResult;
+    use crate::platform::pal::{
+        FsStats, MemoryInfo, MockPlatform, MountPoint, PlatformPaths, ServiceManager,
+    };
+    use crate::platform::types::{
+        ExecutablesResult, MappedRegion, OpenFile, OpenFileKind, OpenFileMode, OpenFilesResult,
+        ProcessInfo,
+    };
 
     /// A scratch directory, resolved so the paths rch would print match the
     /// ones sbh resolves.
@@ -856,6 +974,196 @@ mod tests {
             .collect()
     }
 
+    /// Pause a real worker after its project's fresh dry run, inside the
+    /// safety check immediately preceding `--execute`. The old configuration
+    /// still permits the tree when this call eventually returns.
+    struct PausedReferences {
+        inner: MockPlatform,
+        entered: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+        fs_probes: AtomicUsize,
+    }
+
+    impl Platform for PausedReferences {
+        fn fs_stats(&self, path: &Path) -> SbhResult<FsStats> {
+            self.fs_probes.fetch_add(1, Ordering::Relaxed);
+            self.inner.fs_stats(path)
+        }
+
+        fn mount_points(&self) -> SbhResult<Vec<MountPoint>> {
+            self.inner.mount_points()
+        }
+
+        fn is_ram_backed(&self, path: &Path) -> SbhResult<bool> {
+            self.inner.is_ram_backed(path)
+        }
+
+        fn default_paths(&self) -> PlatformPaths {
+            self.inner.default_paths()
+        }
+
+        fn memory_info(&self) -> SbhResult<MemoryInfo> {
+            self.inner.memory_info()
+        }
+
+        fn service_manager(&self) -> Box<dyn ServiceManager> {
+            self.inner.service_manager()
+        }
+
+        fn process_list(&self) -> SbhResult<Vec<ProcessInfo>> {
+            self.entered.send(()).unwrap();
+            self.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20))
+                .expect("test must release the active-reference check");
+            self.inner.process_list()
+        }
+
+        fn open_files_under(&self, path: &Path) -> SbhResult<OpenFilesResult> {
+            self.inner.open_files_under(path)
+        }
+
+        fn executables_under(&self, path: &Path) -> SbhResult<ExecutablesResult> {
+            self.inner.executables_under(path)
+        }
+
+        fn mmap_regions_under(&self, path: &Path) -> SbhResult<Vec<MappedRegion>> {
+            self.inner.mmap_regions_under(path)
+        }
+    }
+
+    struct PausedPass {
+        tier: RchStagingTier,
+        config: Config,
+        platform: Arc<PausedReferences>,
+        started: Instant,
+        root: PathBuf,
+        resume: Option<mpsc::Sender<()>>,
+        logger: Logger,
+        _dir: tempfile::TempDir,
+    }
+
+    impl PausedPass {
+        fn new(level: PressureLevel) -> Self {
+            let (dir, root) = scratch();
+            let base = root.join("rch");
+            let path = base.join("clean/tree");
+            tree(&path);
+            let runner = fake_rch(&root);
+            let planned = plan(&[(path.as_path(), 4096, 100, "prune")]);
+            fs::write(root.join("plan.json"), &planned).unwrap();
+            fs::write(root.join("plan-clean.json"), &planned).unwrap();
+            fs::write(
+                root.join("outcome-clean.json"),
+                envelope(&json!({"removed_count": 1, "removed_bytes": 4096, "failed": []})),
+            )
+            .unwrap();
+            let mut config = Config::default();
+            config.scanner.rch_staging_bases = vec![base.clone()];
+            config.scanner.rch_binary = Some(runner.binary.clone());
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let platform = Arc::new(PausedReferences {
+                inner: MockPlatform::healthy(),
+                entered: entered_tx,
+                resume: Mutex::new(resume_rx),
+                fs_probes: AtomicUsize::new(0),
+            });
+            let logger = Logger::new();
+            let mut tier = RchStagingTier::default();
+            tier.update_config(&config);
+            let started = Instant::now();
+            let worker_platform: Arc<dyn Platform> = platform.clone();
+            tier.start_pass(
+                started,
+                &config,
+                &worker_platform,
+                vec![DueBase {
+                    base,
+                    mount: PathBuf::from("/"),
+                    level,
+                    min_idle: min_idle_for(level).unwrap(),
+                }],
+                runner,
+                &logger.handle,
+            );
+            let pass = Self {
+                tier,
+                config,
+                platform,
+                started,
+                root,
+                resume: Some(resume_tx),
+                logger,
+                _dir: dir,
+            };
+            entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("worker must reach the final safety check");
+            assert!(pass.tier.running.load(Ordering::Acquire));
+            assert!(!pass.tier.stop.load(Ordering::Acquire));
+            assert_eq!(calls(&pass.root).len(), 2, "both dry runs completed");
+            pass
+        }
+
+        fn tick(
+            &mut self,
+            config: &Config,
+            mounts: &HashMap<PathBuf, (PressureLevel, f64)>,
+            mode: ActiveMode,
+        ) {
+            let platform: Arc<dyn Platform> = self.platform.clone();
+            // Make every interval eligible: only the occupied worker slot
+            // may prevent a replacement pass from starting.
+            self.tier.tick(
+                self.started + BASE_INTERVAL + PROBE_INTERVAL,
+                config,
+                &platform,
+                mounts,
+                mode,
+                &self.logger.handle,
+            );
+            assert_eq!(
+                self.platform.fs_probes.load(Ordering::Relaxed),
+                0,
+                "revocation must not perform monitor-thread filesystem probes"
+            );
+        }
+
+        fn release(&mut self) {
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.send(());
+            }
+        }
+
+        fn wait_for_exit(&self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.tier.running.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn finish(mut self) -> Vec<String> {
+            self.release();
+            self.wait_for_exit();
+            assert!(!self.tier.running.load(Ordering::Acquire));
+            calls(&self.root)
+        }
+    }
+
+    impl Drop for PausedPass {
+        fn drop(&mut self) {
+            self.tier.stop_running_pass();
+            self.release();
+            self.wait_for_exit();
+        }
+    }
+
+    fn mount_at(level: PressureLevel) -> HashMap<PathBuf, (PressureLevel, f64)> {
+        HashMap::from([(PathBuf::from("/"), (level, 0.8))])
+    }
+
     #[test]
     fn the_age_rch_may_prune_at_shrinks_with_pressure_and_stops_below_orange() {
         let hours = |level| min_idle_for(level).map(|idle| idle.as_secs() / 3600);
@@ -864,6 +1172,166 @@ mod tests {
         assert_eq!(hours(PressureLevel::Orange), Some(72));
         assert_eq!(hours(PressureLevel::Red), Some(48));
         assert_eq!(hours(PressureLevel::Critical), Some(24));
+    }
+
+    #[test]
+    fn reload_revokes_a_blocked_pass_before_execute_and_retains_its_worker_slot() {
+        for change in [
+            "bases",
+            "excluded",
+            "protected",
+            "binary",
+            "idle",
+            "dry_run",
+            "disabled",
+            "kill_switch",
+            "pressure",
+        ] {
+            let mut pass = PausedPass::new(PressureLevel::Red);
+            let original = pass.config.clone();
+            let mut changed = original.clone();
+            let protected = pass.root.join("rch/clean/tree");
+            match change {
+                "bases" => changed.scanner.rch_staging_bases = vec![pass.root.join("other")],
+                "excluded" => changed.scanner.excluded_paths.push(protected),
+                "protected" => changed
+                    .scanner
+                    .protected_paths
+                    .push(protected.display().to_string()),
+                "binary" => changed.scanner.rch_binary = Some(PathBuf::from("/usr/bin/false")),
+                "idle" => changed.scanner.min_file_age_minutes += 1,
+                "dry_run" => changed.scanner.dry_run = true,
+                "disabled" => changed.scanner.rch_staging_bases.clear(),
+                "kill_switch" => changed.policy.kill_switch = true,
+                "pressure" => changed.pressure.green_min_free_pct += 1.0,
+                _ => unreachable!(),
+            }
+            let old_stop = Arc::clone(&pass.tier.stop);
+            pass.tier.update_config(&changed);
+            assert!(old_stop.load(Ordering::Acquire), "{change}");
+            assert!(pass.tier.running.load(Ordering::Acquire), "{change}");
+
+            // Even restoring the old settings and advancing past all
+            // cooldowns cannot revive or replace the blocked worker.
+            pass.tick(
+                &original,
+                &mount_at(PressureLevel::Red),
+                ActiveMode::Enforce,
+            );
+            assert!(Arc::ptr_eq(&old_stop, &pass.tier.stop), "{change}");
+            assert!(old_stop.load(Ordering::Acquire), "{change}");
+            assert!(pass.tier.running.load(Ordering::Acquire), "{change}");
+            let calls = pass.finish();
+            assert_eq!(calls.len(), 2, "{change}: {calls:?}");
+            assert!(
+                calls.iter().all(|call| !call.contains("--execute")),
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn tick_also_revokes_changed_scope_before_its_running_shortcut() {
+        let mut pass = PausedPass::new(PressureLevel::Red);
+        let mut changed = pass.config.clone();
+        changed.scanner.excluded_paths.push(pass.root.join("rch"));
+        pass.tick(&changed, &mount_at(PressureLevel::Red), ActiveMode::Enforce);
+        assert!(pass.tier.stop.load(Ordering::Acquire));
+        let calls = pass.finish();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls.iter().all(|call| !call.contains("--execute")));
+    }
+
+    #[test]
+    fn pressure_recovery_or_a_missing_sample_revokes_before_execute() {
+        for (admitted, recovered) in [
+            (PressureLevel::Critical, Some(PressureLevel::Red)),
+            (PressureLevel::Red, Some(PressureLevel::Orange)),
+            (PressureLevel::Orange, Some(PressureLevel::Yellow)),
+            (PressureLevel::Red, Some(PressureLevel::Green)),
+            (PressureLevel::Red, None),
+        ] {
+            let mut pass = PausedPass::new(admitted);
+            let config = pass.config.clone();
+            let mut mounts = recovered.map_or_else(HashMap::new, mount_at);
+            // Pressure elsewhere cannot renew this base's permission.
+            mounts.insert(PathBuf::from("/unrelated"), (PressureLevel::Critical, 1.0));
+            let old_stop = Arc::clone(&pass.tier.stop);
+            pass.tick(&config, &mounts, ActiveMode::Enforce);
+            assert!(
+                old_stop.load(Ordering::Acquire),
+                "{admitted:?} -> {recovered:?}"
+            );
+            assert!(pass.tier.running.load(Ordering::Acquire));
+
+            // A bounce back to the old level does not restore authority to
+            // this pass or free the blocked worker's slot.
+            pass.tick(&config, &mount_at(admitted), ActiveMode::Enforce);
+            assert!(Arc::ptr_eq(&old_stop, &pass.tier.stop));
+            assert!(old_stop.load(Ordering::Acquire));
+            let calls = pass.finish();
+            assert_eq!(calls.len(), 2, "{admitted:?} -> {recovered:?}: {calls:?}");
+            assert!(calls.iter().all(|call| !call.contains("--execute")));
+        }
+    }
+
+    #[test]
+    fn unchanged_scope_and_sustained_or_worsening_pressure_still_execute() {
+        for (admitted, current) in [
+            (PressureLevel::Red, PressureLevel::Red),
+            (PressureLevel::Orange, PressureLevel::Critical),
+        ] {
+            let mut pass = PausedPass::new(admitted);
+            let config = pass.config.clone();
+            pass.tier.update_config(&config);
+            pass.tick(&config, &mount_at(current), ActiveMode::Enforce);
+            assert!(!pass.tier.stop.load(Ordering::Acquire));
+            let calls = pass.finish();
+            assert_eq!(calls.len(), 3, "{calls:?}");
+            assert!(calls[2].ends_with("--project=clean --execute"), "{calls:?}");
+            assert!(
+                calls[2].contains(&format!(
+                    "--older={}h",
+                    min_idle_for(admitted).unwrap().as_secs() / 3600
+                )),
+                "the admitted conservative cutoff must be retained: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaving_enforce_revokes_an_existing_pass_before_execute() {
+        for mode in [
+            ActiveMode::Observe,
+            ActiveMode::Canary,
+            ActiveMode::FallbackSafe,
+        ] {
+            let mut pass = PausedPass::new(PressureLevel::Red);
+            let config = pass.config.clone();
+            pass.tick(&config, &mount_at(PressureLevel::Red), mode);
+            assert!(pass.tier.stop.load(Ordering::Acquire), "{mode:?}");
+            let calls = pass.finish();
+            assert_eq!(calls.len(), 2, "{mode:?}: {calls:?}");
+            assert!(calls.iter().all(|call| !call.contains("--execute")));
+        }
+    }
+
+    #[test]
+    fn an_already_stopped_runner_never_attempts_to_start_a_command() {
+        let (_temp, root) = scratch();
+        let mut runner = fake_rch(&root);
+        let stop = AtomicBool::new(true);
+        let args = [OsString::from("--execute")];
+        let error = runner.run(&args, &stop).unwrap_err();
+        assert!(error.contains("stopped"), "{error}");
+        assert!(!root.join("calls.log").exists());
+
+        // A stopped pass must not even try to resolve/launch an executable.
+        // This also detects the old spawn-then-kill behavior deterministically,
+        // regardless of whether a valid child ran before it was killed.
+        runner.binary = root.join("no-such-rch");
+        let error = runner.run(&args, &stop).unwrap_err();
+        assert!(error.contains("stopped"), "{error}");
     }
 
     #[test]
