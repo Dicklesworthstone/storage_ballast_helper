@@ -8,6 +8,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Forecasts and cleanup goals honor each volume's absolute byte thresholds.**
+  The rate estimator and calibration guard now use the same effective boundary
+  as the pressure controller, and cleanup requests target the effective Green
+  goal instead of the raw percentage. Reaching a forecast boundary publishes
+  zero seconds of remaining runway. A changed boundary discards pending
+  calibration outcomes, and an already satisfied cleanup goal remains a zero
+  byte budget instead of becoming an unlimited request.
+
 - **Large btrfs walks limit competing directory work per device.** CLI and
   daemon scans now admit one directory task at a time on each detected btrfs
   device while keeping other devices and filesystems available to the worker

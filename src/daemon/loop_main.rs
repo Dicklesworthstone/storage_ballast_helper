@@ -2313,6 +2313,7 @@ fn recovery_probe_surface_allowed(base: &Path, resolved: &Path, scanner: &Scanne
 struct GuardSample {
     at: Instant,
     available_bytes: u64,
+    threshold_bytes: u64,
     predicted_rate: f64,
     predicted_tte: f64,
 }
@@ -2407,6 +2408,24 @@ impl MountMonitor {
         threshold_bytes: u64,
         rate_estimate: &RateEstimate,
     ) -> GuardDiagnostics {
+        // A reload or capacity change can move the effective boundary. Old
+        // pending forecasts describe a different event; crossing the new
+        // boundary must not resolve them as successes or failures.
+        if self
+            .last_guard_sample
+            .as_ref()
+            .is_some_and(|previous| previous.threshold_bytes != threshold_bytes)
+        {
+            self.last_guard_sample = None;
+            self.conformal.discard_pending();
+        }
+        // Use the same mount-specific boundary as the forecast and PID,
+        // including the first observation after startup or a policy change.
+        self.guard.set_material_rate(
+            crate::monitor::guardrails::material_rate_for_headroom(
+                available_bytes.saturating_sub(threshold_bytes),
+            ),
+        );
         if let Some(previous) = &self.last_guard_sample
             && let Some(dt) = now.checked_duration_since(previous.at)
         {
@@ -2425,13 +2444,6 @@ impl MountMonitor {
                 // these as calibration failures permanently poisons the guard on
                 // machines with bursty workloads (rustc, cargo build, etc.).
                 let burst_outlier = rate_estimate.burst_state.is_burst_outlier(actual_rate);
-                // A fill rate that could not reach the red threshold within a
-                // day is calibration noise on this mount, not evidence.
-                self.guard.set_material_rate(
-                    crate::monitor::guardrails::material_rate_for_headroom(
-                        available_bytes.saturating_sub(threshold_bytes),
-                    ),
-                );
                 self.guard.observe(CalibrationObservation {
                     predicted_rate: previous.predicted_rate,
                     actual_rate,
@@ -2487,6 +2499,7 @@ impl MountMonitor {
         self.last_guard_sample = Some(GuardSample {
             at: now,
             available_bytes,
+            threshold_bytes,
             predicted_rate,
             predicted_tte,
         });
@@ -5898,10 +5911,16 @@ impl MonitoringDaemon {
                 .entry(mount_path.clone())
                 .or_insert_with(|| MountMonitor::new(&self.config));
 
-            // Update EWMA rate estimator.
+            // Forecast the same boundary the mount's PID uses. On a large
+            // volume an absolute byte floor can be far below the raw percent;
+            // predicting the latter hides all remaining runway once crossed.
+            let [_, _, _, red_min_free_pct] = self
+                .config
+                .pressure
+                .free_pct_thresholds_for(stats.total_bytes);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let red_threshold_bytes =
-                (stats.total_bytes as f64 * self.config.pressure.red_min_free_pct / 100.0) as u64;
+                (stats.total_bytes as f64 * red_min_free_pct / 100.0) as u64;
 
             let rate_estimate =
                 monitor
@@ -5915,9 +5934,10 @@ impl MonitoringDaemon {
             );
 
             // Predicted time to red threshold: the point estimate, and the
-            // conformal lower bound the controllers act on.
+            // conformal lower bound the controllers act on. Zero means the
+            // boundary has been reached, not that the forecast is unavailable.
             let predicted_point = if rate_estimate.seconds_to_threshold.is_finite()
-                && rate_estimate.seconds_to_threshold > 0.0
+                && rate_estimate.seconds_to_threshold >= 0.0
             {
                 Some(rate_estimate.seconds_to_threshold)
             } else {
@@ -7379,12 +7399,14 @@ impl MonitoringDaemon {
                     .then(|| self.fs_collector.collect(&response.causing_mount).ok())
                     .flatten()
                     .map(|stats| {
-                        let wanted = (stats.total_bytes as f64
-                            * self.config.pressure.green_min_free_pct
-                            / 100.0) as u64;
+                        let [green_min_free_pct, _, _, _] = self
+                            .config
+                            .pressure
+                            .free_pct_thresholds_for(stats.total_bytes);
+                        let wanted =
+                            (stats.total_bytes as f64 * green_min_free_pct / 100.0) as u64;
                         wanted.saturating_sub(stats.available_bytes)
                     })
-                    .filter(|bytes| *bytes > 0)
             });
         let request = ScanRequest {
             paths,
@@ -13279,6 +13301,229 @@ mod tests {
             prediction_confident: false,
             imminent_danger: false,
             rate: MountRateState::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn install_disk_pressure_probe(
+        fixture: &mut RegretDaemonFixture,
+        total_bytes: u64,
+        available_bytes: u64,
+        absolute_floors: bool,
+    ) -> PathBuf {
+        use crate::platform::pal::{FsStats, MountPoint, PlatformPaths};
+
+        let mount = fixture.daemon.config.scanner.root_paths[0].clone();
+        let stats = FsStats {
+            total_bytes,
+            free_bytes: available_bytes,
+            available_bytes,
+            fs_type: "ext4".into(),
+            mount_point: mount.clone(),
+            is_readonly: false,
+        };
+        let platform: Arc<dyn Platform> = Arc::new(
+            MockPlatform::new(
+                vec![MountPoint {
+                    path: mount.clone(),
+                    device: "mock-disk".into(),
+                    fs_type: "ext4".into(),
+                    is_ram_backed: false,
+                }],
+                HashMap::from([(mount.clone(), stats)]),
+                MemoryInfo {
+                    total_bytes: 64 << 30,
+                    available_bytes: 32 << 30,
+                    swap_total_bytes: 0,
+                    swap_free_bytes: 0,
+                },
+                PlatformPaths::default(),
+            )
+            .with_home(fixture.directory.path())
+            .with_temp_dirs(Vec::new())
+            .with_cache_roots(Vec::new()),
+        );
+        fixture.daemon.platform = Arc::clone(&platform);
+        fixture.daemon.fs_collector = FsStatsCollector::new(platform, Duration::ZERO);
+        let floors: [u64; 4] = if absolute_floors {
+            [80, 60, 40, 10]
+        } else {
+            [0; 4]
+        };
+        let pressure = &mut fixture.daemon.config.pressure;
+        pressure.green_min_free_bytes = floors[0] << 30;
+        pressure.yellow_min_free_bytes = floors[1] << 30;
+        pressure.orange_min_free_bytes = floors[2] << 30;
+        pressure.red_min_free_bytes = floors[3] << 30;
+        mount
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pressure_forecasts_and_state_use_the_effective_volume_boundary() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        for (case, total, available, floors, red_boundary, level) in [
+            (
+                "large-byte-floor",
+                4096 * GIB,
+                11 * GIB,
+                true,
+                10 * GIB,
+                PressureLevel::Red,
+            ),
+            (
+                "percentage-only",
+                100 * GIB,
+                7 * GIB,
+                false,
+                6 * GIB,
+                PressureLevel::Red,
+            ),
+            (
+                "small-volume",
+                100 * GIB,
+                7 * GIB,
+                true,
+                6 * GIB,
+                PressureLevel::Red,
+            ),
+            (
+                "imminent",
+                4096 * GIB,
+                10 * GIB + MIB,
+                true,
+                10 * GIB,
+                PressureLevel::Red,
+            ),
+            (
+                "reached",
+                4096 * GIB,
+                10 * GIB,
+                true,
+                10 * GIB,
+                PressureLevel::Red,
+            ),
+            (
+                "crossed",
+                4096 * GIB,
+                10 * GIB - MIB,
+                true,
+                10 * GIB,
+                PressureLevel::Critical,
+            ),
+        ] {
+            let mut fixture = RegretDaemonFixture::new();
+            let mount = install_disk_pressure_probe(&mut fixture, total, available, floors);
+            let daemon = &mut fixture.daemon;
+            let mut monitor = MountMonitor::new(&daemon.config);
+            // A steady GiB/hour history makes the expected runway independent
+            // of the host's capacity, workload and sub-second test scheduling.
+            monitor.rate_estimator = DiskRateEstimator::new(1.0, 1.0, 1.0, 3);
+            let start = Instant::now() - Duration::from_hours(4);
+            for step in 0_u64..4 {
+                let at = start + Duration::from_hours(step);
+                let free = available + (4 - step) * GIB;
+                let estimate = monitor.rate_estimator.update(free, at, red_boundary);
+                monitor.observe_guard(at, free, red_boundary, &estimate);
+            }
+            daemon.mount_monitors.insert(mount.clone(), monitor);
+
+            let response = daemon.check_pressure().unwrap();
+            assert_eq!(response.causing_mount, mount, "{case}");
+            assert_eq!(response.level, level, "{case}");
+            let seconds = response.predicted_seconds.expect(case);
+            if available <= red_boundary {
+                assert!(seconds.abs() < f64::EPSILON, "{case}: {seconds}");
+            } else {
+                let expected = (available - red_boundary) as f64 / GIB as f64 * 3600.0;
+                assert!(
+                    (0.8 * expected..=1.2 * expected).contains(&seconds),
+                    "{case}: {seconds}, expected about {expected} seconds"
+                );
+            }
+            let monitor = &daemon.mount_monitors[&mount];
+            let material_rate =
+                (available.saturating_sub(red_boundary) as f64 / 86_400.0).max(10.0);
+            assert!(
+                (monitor.guard.material_rate() - material_rate).abs() < f64::EPSILON,
+                "{case}: guard must use the same remaining headroom"
+            );
+
+            daemon.maybe_write_self_monitor_state(&response);
+            let state = SelfMonitor::read_state(&daemon.config.paths.state_file).unwrap();
+            let mount_name = mount.to_string_lossy();
+            let recorded = &state.rates[mount_name.as_ref()];
+            assert_eq!(recorded.seconds_to_red, response.predicted_seconds, "{case}");
+            assert_eq!(
+                recorded.forecast.as_ref().unwrap().tte_point_s,
+                response.predicted_seconds,
+                "{case}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_scan_targets_the_effective_green_goal_and_keeps_a_satisfied_goal_bounded() {
+        const GIB: u64 = 1 << 30;
+        for (total, available, floors, expected) in [
+            (4096 * GIB, 30 * GIB, true, 50 * GIB),
+            (100 * GIB, 12 * GIB, true, 8 * GIB),
+            (100 * GIB, 12 * GIB, false, 8 * GIB),
+            (4096 * GIB, 80 * GIB, true, 0),
+            (4096 * GIB, 81 * GIB, true, 0),
+        ] {
+            let mut fixture = RegretDaemonFixture::new();
+            let mount = install_disk_pressure_probe(&mut fixture, total, available, floors);
+            let daemon = &mut fixture.daemon;
+            let mut response = daemon.check_pressure().unwrap();
+            // The mount may recover while a pressure request is pending, or
+            // its PID may retain a higher level during recovery hysteresis.
+            response.level = response.level.max(PressureLevel::Orange);
+            let (send, receive) = bounded(2);
+            daemon.send_scan_request(
+                &send,
+                &receive,
+                &response,
+                vec![mount.clone()],
+                None,
+                None,
+            );
+            let request = receive.try_recv().expect("pressure scan must be enqueued");
+            assert_eq!(request.paths, vec![mount]);
+            assert_eq!(request.target_bytes, Some(expected));
+            assert!(request.ram_reclaim.is_none() && request.inode_reclaim.is_none());
+        }
+    }
+
+    #[test]
+    fn changing_the_forecast_boundary_discards_pending_crossings_without_scoring_them() {
+        const GIB: u64 = 1 << 30;
+        for next_boundary in [GIB / 2, 7 * GIB / 2] {
+            let mut monitor = MountMonitor::new(&Config::default());
+            let mut estimator = DiskRateEstimator::new(1.0, 1.0, 1.0, 1);
+            let start = Instant::now();
+            estimator.update(6 * GIB, start, GIB);
+            estimator.update(5 * GIB, start + Duration::from_secs(1), GIB);
+            let at = start + Duration::from_secs(2);
+            let estimate = estimator.update(4 * GIB, at, GIB);
+            monitor.observe_guard(at, 4 * GIB, GIB, &estimate);
+            assert_eq!(monitor.conformal.pending(), 1);
+            assert_eq!(monitor.conformal.resolved_total(), 0);
+
+            // The new boundary moves above the current sample or farther
+            // away. Neither move says whether the old forecast was correct.
+            let at = start + Duration::from_secs(3);
+            let estimate = estimator.update(3 * GIB, at, next_boundary);
+            monitor.observe_guard(at, 3 * GIB, next_boundary, &estimate);
+            assert_eq!(monitor.conformal.resolved_total(), 0);
+            assert_eq!(monitor.conformal.samples(), 0);
+            assert_eq!(
+                monitor.conformal.pending(),
+                usize::from(next_boundary < 3 * GIB)
+            );
         }
     }
 
