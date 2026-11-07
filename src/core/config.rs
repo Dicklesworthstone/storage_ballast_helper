@@ -2890,9 +2890,21 @@ impl Config {
             // A zero critical horizon is supported; the others are positive.
             for (name, val, allow_zero) in [
                 ("action_horizon_minutes", pred.action_horizon_minutes, false),
-                ("warning_horizon_minutes", pred.warning_horizon_minutes, false),
-                ("imminent_danger_minutes", pred.imminent_danger_minutes, false),
-                ("critical_danger_minutes", pred.critical_danger_minutes, true),
+                (
+                    "warning_horizon_minutes",
+                    pred.warning_horizon_minutes,
+                    false,
+                ),
+                (
+                    "imminent_danger_minutes",
+                    pred.imminent_danger_minutes,
+                    false,
+                ),
+                (
+                    "critical_danger_minutes",
+                    pred.critical_danger_minutes,
+                    true,
+                ),
             ] {
                 if !val.is_finite()
                     || val < 0.0
@@ -2911,8 +2923,9 @@ impl Config {
             // Finite floating-point seconds can still exceed its range.
             if std::time::Duration::try_from_secs_f64(pred.action_horizon_minutes * 60.0).is_err() {
                 return Err(SbhError::InvalidConfig {
-                    details: "prediction.action_horizon_minutes must convert to a representable duration"
-                        .to_string(),
+                    details:
+                        "prediction.action_horizon_minutes must convert to a representable duration"
+                            .to_string(),
                 });
             }
 
@@ -5176,7 +5189,9 @@ mod tests {
 
     #[test]
     fn valid_byte_pressure_settings_recover_to_green_at_full_capacity() {
-        use crate::monitor::pid::{PidConfig, PidPressureController, PressureLevel, PressureReading};
+        use crate::monitor::pid::{
+            PidConfig, PidPressureController, PressureLevel, PressureReading,
+        };
         use std::time::{Duration, Instant};
 
         for (green, hysteresis) in [(20.0, 0.0), (20.0, 1.0), (99.0, 1.0), (100.0, 0.0)] {
@@ -5184,10 +5199,8 @@ mod tests {
             cfg.pressure.green_min_free_pct = green;
             cfg.pressure.controller.hysteresis_pct = hysteresis;
             cfg.validate().expect("reachable recovery boundary");
-            let mut controller = PidPressureController::new(
-                &PidConfig::from(&cfg.pressure),
-                Duration::from_secs(1),
-            );
+            let mut controller =
+                PidPressureController::new(&PidConfig::from(&cfg.pressure), Duration::from_secs(1));
             let reading = |free_bytes| PressureReading {
                 free_bytes,
                 total_bytes: 100,

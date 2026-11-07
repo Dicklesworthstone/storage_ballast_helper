@@ -230,6 +230,8 @@ struct SharedExecutorConfig {
     ram_reclaim_blocks_ordinary_deletion: AtomicBool,
     /// Live inode policy revokes queued relief after configuration changes.
     inode_pressure: RwLock<InodePressureConfig>,
+    /// Current byte-pressure thresholds for ordinary deletion admission.
+    disk_pressure: RwLock<PidConfig>,
     /// Inode relief cannot borrow RAM's exception to a memory/behavior hold.
     inode_cleanup_enabled: AtomicBool,
     /// Layer 7: Green batches quarantine instead of removing.
@@ -264,6 +266,7 @@ impl SharedExecutorConfig {
             ram_reclaim_certainty_floor: AtomicU8::new(ArtifactCertainty::Unclear.rank()),
             ram_reclaim_blocks_ordinary_deletion: AtomicBool::new(false),
             inode_pressure: RwLock::new(InodePressureConfig::default()),
+            disk_pressure: RwLock::new(PidConfig::default()),
             inode_cleanup_enabled: AtomicBool::new(true),
             quarantine_enabled: AtomicBool::new(quarantine_enabled),
             quarantine_ttl_secs: AtomicU64::new(quarantine_ttl_secs),
@@ -362,6 +365,49 @@ impl SharedExecutorConfig {
             // An Enforce-approved batch has not passed Canary's quota.
             // Leave it for fresh policy evaluation after this restriction.
             || (approved_mode == ActiveMode::Enforce && current_mode == ActiveMode::Canary)
+        {
+            return Err(SkipReason::PolicyChanged);
+        }
+        Ok(())
+    }
+
+    /// Stop queued pressure-driven cleanup when its own filesystem reaches
+    /// Green. Intermediate recovery retains the admitted batch's allowance
+    /// to finish that goal: Yellow scans need not walk without dirty roots.
+    /// At Green a fresh plan applies maintenance policy and quarantine.
+    /// Green maintenance/predictive work and resource-only relief retain
+    /// their existing admission paths.
+    fn authorize_disk_reclaim_goal(
+        &self,
+        candidate: &CandidacyScore,
+        planned_pressure: PressureLevel,
+        platform: &dyn Platform,
+    ) -> std::result::Result<(), SkipReason> {
+        let policy = self.disk_pressure.read().clone();
+        // Bypass the monitor's cache: earlier removals in this very batch
+        // may have recovered the filesystem since the last monitor tick.
+        let stats = platform
+            .fs_stats(&candidate.path)
+            .map_err(|_| SkipReason::PolicyChanged)?;
+        if stats.is_readonly
+            || stats.total_bytes == 0
+            || stats.free_bytes > stats.total_bytes
+            || stats.available_bytes > stats.free_bytes
+            || !stats.mount_point.is_absolute()
+        {
+            return Err(SkipReason::PolicyChanged);
+        }
+        let response = PidPressureController::new(&policy, Duration::ZERO).update(
+            PressureReading {
+                free_bytes: stats.available_bytes,
+                total_bytes: stats.total_bytes,
+                mount: stats.mount_point,
+            },
+            None,
+            Instant::now(),
+        );
+        if (planned_pressure != PressureLevel::Green && response.level == PressureLevel::Green)
+            || *self.disk_pressure.read() != policy
         {
             return Err(SkipReason::PolicyChanged);
         }
@@ -2427,11 +2473,10 @@ impl MountMonitor {
         }
         // Use the same mount-specific boundary as the forecast and PID,
         // including the first observation after startup or a policy change.
-        self.guard.set_material_rate(
-            crate::monitor::guardrails::material_rate_for_headroom(
+        self.guard
+            .set_material_rate(crate::monitor::guardrails::material_rate_for_headroom(
                 available_bytes.saturating_sub(threshold_bytes),
-            ),
-        );
+            ));
         if let Some(previous) = &self.last_guard_sample
             && let Some(dt) = now.checked_duration_since(previous.at)
         {
@@ -4150,6 +4195,7 @@ impl MonitoringDaemon {
             config.scoring.false_positive_loss,
         );
         *shared_executor_config.inode_pressure.write() = config.pressure.inodes.clone();
+        *shared_executor_config.disk_pressure.write() = PidConfig::from(&config.pressure);
         let compress_tier =
             CompressTier::with_first(Arc::clone(&shared_executor_config.compression_first));
 
@@ -5925,8 +5971,7 @@ impl MonitoringDaemon {
                 .pressure
                 .free_pct_thresholds_for(stats.total_bytes);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let red_threshold_bytes =
-                (stats.total_bytes as f64 * red_min_free_pct / 100.0) as u64;
+            let red_threshold_bytes = (stats.total_bytes as f64 * red_min_free_pct / 100.0) as u64;
 
             let rate_estimate =
                 monitor
@@ -7409,8 +7454,7 @@ impl MonitoringDaemon {
                             .config
                             .pressure
                             .free_pct_thresholds_for(stats.total_bytes);
-                        let wanted =
-                            (stats.total_bytes as f64 * green_min_free_pct / 100.0) as u64;
+                        let wanted = (stats.total_bytes as f64 * green_min_free_pct / 100.0) as u64;
                         wanted.saturating_sub(stats.available_bytes)
                     })
             });
@@ -8085,6 +8129,8 @@ impl MonitoringDaemon {
                     );
                     *self.shared_executor_config.inode_pressure.write() =
                         new_config.pressure.inodes.clone();
+                    *self.shared_executor_config.disk_pressure.write() =
+                        PidConfig::from(&new_config.pressure);
 
                     // Update FS collector TTL.
                     self.fs_collector
@@ -8431,6 +8477,7 @@ impl MonitoringDaemon {
         let shared_guard_diagnostics = Arc::clone(&self.shared_guard_diagnostics);
         let shutdown = self.signal_handler.shutdown_token();
         let platform_sacred_paths = self.platform.sacred_paths();
+        let platform = Arc::clone(&self.platform);
 
         thread::Builder::new()
             .name("sbh-executor".to_string())
@@ -8448,6 +8495,7 @@ impl MonitoringDaemon {
                     &index_feedback_tx,
                     &platform_sacred_paths,
                     &regret,
+                    platform.as_ref(),
                 );
             })
             .map_err(|source| SbhError::Runtime {
@@ -11857,6 +11905,7 @@ fn executor_thread_main(
     index_feedback_tx: &Sender<ScannerIndexFeedback>,
     platform_sacred_paths: &[crate::platform::types::SacredPath],
     regret: &Arc<SharedRegret>,
+    platform: &dyn Platform,
 ) {
     let mut tracker = RepeatDeletionTracker::new(
         Duration::from_secs(shared_config.repeat_base_cooldown_secs()),
@@ -12086,6 +12135,13 @@ fn executor_thread_main(
         let dry_run = shared_config.dry_run.load(Ordering::Relaxed);
         let max_batch_size = shared_config.max_batch_size.load(Ordering::Relaxed);
         let min_score = shared_config.min_score();
+        // RAM/inode relief renews its own resource authority; explicit
+        // scan-now already checks current pressure and its selected mount.
+        // Green maintenance retains its existing quarantine admission.
+        let ordinary_disk_pressure = batch.pressure_level != PressureLevel::Green
+            && batch.ram_reclaim.is_none()
+            && batch.inode_reclaim.is_none()
+            && batch.scan_now.is_none();
 
         // Behavior-cell certainty gate (v0.6 matrix): Green/Yellow cells dispatch
         // only structurally definite artifacts; Orange adds likely ones; Red and
@@ -12100,7 +12156,7 @@ fn executor_thread_main(
                         scope.certainty_floor(batch.pressure_level)
                     }),
             );
-        let (approved_candidates, held_back_by_certainty) =
+        let (mut approved_candidates, held_back_by_certainty) =
             retain_dispatchable_by_certainty(approved_candidates, min_certainty);
         if held_back_by_certainty > 0 {
             let message = format!(
@@ -12113,6 +12169,27 @@ fn executor_thread_main(
         }
         if approved_candidates.is_empty() {
             continue;
+        }
+
+        if !dry_run && ordinary_disk_pressure {
+            let before = approved_candidates.len();
+            approved_candidates.retain(|candidate| {
+                shared_config
+                    .authorize_disk_reclaim_goal(candidate, batch.pressure_level, platform)
+                    .is_ok()
+            });
+            let held = before - approved_candidates.len();
+            if held > 0 {
+                let message = format!(
+                    "held back {held} candidate(s): queued pressure {:?} no longer confirmed on their filesystems",
+                    batch.pressure_level,
+                );
+                eprintln!("[SBH-EXECUTOR] {message}");
+                logger.send(ActivityEvent::Info { message });
+            }
+            if approved_candidates.is_empty() {
+                continue;
+            }
         }
 
         let pre_plan_count = approved_candidates.len();
@@ -12379,6 +12456,14 @@ fn executor_thread_main(
                         return Err(SkipReason::PolicyChanged);
                     }
                 }
+                if ordinary_disk_pressure {
+                    shared_config.authorize_disk_reclaim_goal(
+                        candidate,
+                        batch.pressure_level,
+                        platform,
+                    )?;
+                }
+                // A pressure probe can block; renew permissions after it.
                 authorize_scanner_mutation_scope(&batch, &scanner_snapshot, shared_scanner_config)?;
                 shared_config.authorize_dispatch(
                     batch.ram_reclaim.is_some(),
@@ -13461,7 +13546,10 @@ mod tests {
             let state = SelfMonitor::read_state(&daemon.config.paths.state_file).unwrap();
             let mount_name = mount.to_string_lossy();
             let recorded = &state.rates[mount_name.as_ref()];
-            assert_eq!(recorded.seconds_to_red, response.predicted_seconds, "{case}");
+            assert_eq!(
+                recorded.seconds_to_red, response.predicted_seconds,
+                "{case}"
+            );
             assert_eq!(
                 recorded.forecast.as_ref().unwrap().tte_point_s,
                 response.predicted_seconds,
@@ -13489,14 +13577,7 @@ mod tests {
             // its PID may retain a higher level during recovery hysteresis.
             response.level = response.level.max(PressureLevel::Orange);
             let (send, receive) = bounded(2);
-            daemon.send_scan_request(
-                &send,
-                &receive,
-                &response,
-                vec![mount.clone()],
-                None,
-                None,
-            );
+            daemon.send_scan_request(&send, &receive, &response, vec![mount.clone()], None, None);
             let request = receive.try_recv().expect("pressure scan must be enqueued");
             assert_eq!(request.paths, vec![mount]);
             assert_eq!(request.target_bytes, Some(expected));
@@ -21015,6 +21096,350 @@ mod tests {
         assert!(outside.join("target/debug/deps/libdemo.rlib").exists());
     }
 
+    fn disk_pressure_sample(
+        mount: &str,
+        total_bytes: u64,
+        available_bytes: u64,
+    ) -> crate::platform::pal::FsStats {
+        crate::platform::pal::FsStats {
+            total_bytes,
+            free_bytes: available_bytes,
+            available_bytes,
+            fs_type: "mockfs".to_string(),
+            mount_point: PathBuf::from(mount),
+            is_readonly: false,
+        }
+    }
+
+    fn disk_pressure_platform(samples: Vec<crate::platform::pal::FsStats>) -> MockPlatform {
+        use crate::platform::pal::{MountPoint, PlatformPaths};
+
+        let mounts = samples
+            .iter()
+            .map(|sample| MountPoint {
+                path: sample.mount_point.clone(),
+                device: sample.mount_point.display().to_string(),
+                fs_type: sample.fs_type.clone(),
+                is_ram_backed: false,
+            })
+            .collect();
+        MockPlatform::new(
+            mounts,
+            samples
+                .into_iter()
+                .map(|sample| (sample.mount_point.clone(), sample))
+                .collect(),
+            MockPlatform::healthy().memory_info().unwrap(),
+            PlatformPaths::default(),
+        )
+    }
+
+    #[test]
+    fn ordinary_disk_pressure_is_renewed_on_each_candidates_filesystem() {
+        let shared = SharedExecutorConfig::new(false, 10, 0.5, 300, 3600, true, 86_400);
+        let platform = disk_pressure_platform(vec![
+            disk_pressure_sample("/pressured", 1_000_000, 1_000),
+            disk_pressure_sample("/healthy", 1_000_000, 500_000),
+        ]);
+        let pressured = test_candidate("/pressured/target", 2.0);
+        let healthy = test_candidate("/healthy/target", 2.0);
+
+        assert!(
+            shared
+                .authorize_disk_reclaim_goal(&pressured, PressureLevel::Critical, &platform)
+                .is_ok()
+        );
+        assert_eq!(
+            shared.authorize_disk_reclaim_goal(&healthy, PressureLevel::Critical, &platform),
+            Err(SkipReason::PolicyChanged),
+            "a neighboring pressured filesystem cannot authorize this deletion",
+        );
+        assert!(
+            shared
+                .authorize_disk_reclaim_goal(&healthy, PressureLevel::Green, &platform)
+                .is_ok()
+        );
+        assert!(
+            shared
+                .authorize_disk_reclaim_goal(&pressured, PressureLevel::Orange, &platform)
+                .is_ok()
+        );
+        assert_eq!(
+            shared.authorize_disk_reclaim_goal(
+                &test_candidate("/unobserved/target", 2.0),
+                PressureLevel::Critical,
+                &platform,
+            ),
+            Err(SkipReason::PolicyChanged),
+        );
+
+        // A fresh pressure sample renews permission, not the byte target.
+        for (target_bytes, expected_items) in [(0, 0), (1, 1)] {
+            let candidate = test_candidate("/pressured/target", 2.0);
+            assert!(
+                shared
+                    .authorize_disk_reclaim_goal(&candidate, PressureLevel::Critical, &platform)
+                    .is_ok()
+            );
+            let (chosen, plan) = plan_batch(
+                vec![candidate],
+                &PlanRequest {
+                    level: PressureLevel::Critical,
+                    target_bytes: Some(target_bytes),
+                    max_items: 10,
+                    risk_budget: None,
+                    false_positive_loss: 50.0,
+                    include_review: false,
+                },
+            );
+            assert_eq!(chosen.len(), expected_items);
+            assert_eq!(plan.planned_bytes, target_bytes);
+            assert!(plan.target_met);
+        }
+    }
+
+    #[test]
+    fn ordinary_disk_reclaim_continues_until_the_effective_green_target() {
+        let shared = SharedExecutorConfig::new(false, 10, 0.5, 300, 3600, true, 86_400);
+        let candidate = test_candidate("/tmp/target", 2.0);
+
+        for planned in [
+            PressureLevel::Yellow,
+            PressureLevel::Orange,
+            PressureLevel::Red,
+            PressureLevel::Critical,
+        ] {
+            // In particular, keep going through Critical's hysteresis gap
+            // and through Yellow, where the scanner need not walk again.
+            for available in [5_900, 6_100, 7_000, 15_000, 19_999] {
+                let platform =
+                    disk_pressure_platform(vec![disk_pressure_sample("/", 100_000, available)]);
+                assert!(
+                    shared
+                        .authorize_disk_reclaim_goal(&candidate, planned, &platform)
+                        .is_ok(),
+                    "{planned:?} must continue toward Green with {available} bytes available",
+                );
+            }
+            for available in [20_000, 20_001, 50_000] {
+                let platform =
+                    disk_pressure_platform(vec![disk_pressure_sample("/", 100_000, available)]);
+                assert_eq!(
+                    shared.authorize_disk_reclaim_goal(&candidate, planned, &platform),
+                    Err(SkipReason::PolicyChanged),
+                    "{planned:?} must stop at Green with {available} bytes available",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_disk_pressure_refuses_invalid_and_readonly_samples() {
+        let shared = SharedExecutorConfig::new(false, 10, 0.5, 300, 3600, true, 86_400);
+        let candidate = test_candidate("/tmp/target", 2.0);
+        let valid = disk_pressure_sample("/", 1_000_000, 1_000);
+
+        for sample in [
+            crate::platform::pal::FsStats {
+                total_bytes: 0,
+                free_bytes: 0,
+                available_bytes: 0,
+                ..valid.clone()
+            },
+            crate::platform::pal::FsStats {
+                free_bytes: valid.total_bytes + 1,
+                ..valid.clone()
+            },
+            crate::platform::pal::FsStats {
+                available_bytes: valid.free_bytes + 1,
+                ..valid.clone()
+            },
+            crate::platform::pal::FsStats {
+                is_readonly: true,
+                ..valid
+            },
+        ] {
+            let platform = disk_pressure_platform(vec![sample]);
+            assert_eq!(
+                shared.authorize_disk_reclaim_goal(&candidate, PressureLevel::Critical, &platform),
+                Err(SkipReason::PolicyChanged),
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_disk_pressure_uses_live_absolute_byte_floors() {
+        let shared = SharedExecutorConfig::new(false, 10, 0.5, 300, 3600, true, 86_400);
+        let candidate = test_candidate("/tmp/target", 2.0);
+        let total = 2_u64 << 40;
+        let platform = disk_pressure_platform(vec![disk_pressure_sample("/", total, 90_u64 << 30)]);
+
+        assert!(
+            shared
+                .authorize_disk_reclaim_goal(&candidate, PressureLevel::Critical, &platform)
+                .is_ok()
+        );
+        shared.disk_pressure.write().min_free_bytes =
+            [80_u64 << 30, 60_u64 << 30, 40_u64 << 30, 25_u64 << 30];
+
+        let below_target =
+            disk_pressure_platform(vec![disk_pressure_sample("/", total, 79_u64 << 30)]);
+        assert!(
+            shared
+                .authorize_disk_reclaim_goal(&candidate, PressureLevel::Critical, &below_target)
+                .is_ok()
+        );
+        for available in [80_u64 << 30, 90_u64 << 30] {
+            let recovered =
+                disk_pressure_platform(vec![disk_pressure_sample("/", total, available)]);
+            assert_eq!(
+                shared.authorize_disk_reclaim_goal(&candidate, PressureLevel::Critical, &recovered),
+                Err(SkipReason::PolicyChanged),
+                "the current absolute Green floor must end the queued batch",
+            );
+        }
+        assert!(
+            shared
+                .authorize_disk_reclaim_goal(&candidate, PressureLevel::Green, &platform)
+                .is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_holds_a_queued_critical_batch_before_planning_after_recovery() {
+        let mut fixture = RegretDaemonFixture::new();
+        let path = fixture.daemon.config.scanner.root_paths[0].join("queued.o");
+        std::fs::write(&path, b"retained").unwrap();
+        let mut candidate = test_candidate(&path.to_string_lossy(), 2.0);
+        candidate.identity = Some(crate::scanner::walker::identity_for_path(&path, false).unwrap());
+        let (send, receive) = bounded(1);
+        let (reports, _report_rx) = bounded(8);
+        let (feedback, _feedback_rx) = bounded(8);
+        send.send(DeletionBatch {
+            candidates: vec![candidate],
+            pressure_level: PressureLevel::Critical,
+            urgency: 1.0,
+            scan_now: None,
+            target_bytes: Some(1),
+            ram_reclaim: None,
+            inode_reclaim: None,
+            target_only_root: None,
+            target_only_consent: None,
+        })
+        .unwrap();
+        drop(send);
+        fixture
+            .daemon
+            .spawn_executor_thread(
+                receive,
+                fixture.daemon.logger_handle.clone(),
+                Arc::clone(&fixture.daemon.executor_heartbeat),
+                reports,
+                feedback,
+            )
+            .unwrap()
+            .join()
+            .unwrap();
+        fixture.flush_logger();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"retained");
+        let events = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
+        assert!(
+            events.contains("queued pressure Critical no longer confirmed"),
+            "{events}",
+        );
+        let db = crate::logger::sqlite::SqliteLogger::open_read_only(
+            &fixture.daemon.config.paths.sqlite_db,
+        )
+        .unwrap();
+        assert!(
+            db.successful_deletions_since("1970-01-01T00:00:00.000Z")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_disk_recovery_stops_permanent_removal_at_each_mutation() {
+        for (initially_recovered, recover_after_first, expected_deleted) in
+            [(false, false, 2), (true, false, 0), (false, true, 1)]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let paths = [
+                directory.path().join("first.o"),
+                directory.path().join("second.o"),
+            ];
+            let candidates = paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| {
+                    std::fs::write(path, b"x").unwrap();
+                    let mut candidate =
+                        test_candidate(&path.to_string_lossy(), if index == 0 { 2.0 } else { 1.9 });
+                    candidate.identity =
+                        Some(crate::scanner::walker::identity_for_path(path, false).unwrap());
+                    candidate
+                })
+                .collect();
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    min_score: 0.0,
+                    require_identity: true,
+                    ..DeletionConfig::default()
+                },
+                None,
+            )
+            .with_platform(Arc::new(MockPlatform::healthy()));
+            let plan = executor.plan(candidates);
+            assert_eq!(plan.candidates.len(), 2);
+            let shared = SharedExecutorConfig::new(false, 10, 0.0, 300, 3600, true, 86_400);
+            let pressured =
+                disk_pressure_platform(vec![disk_pressure_sample("/", 1_000_000, 1_000)]);
+            let recovered = MockPlatform::healthy();
+            let recovery = AtomicBool::new(initially_recovered);
+            let authorize = |candidate: &CandidacyScore| {
+                let platform = if recovery.load(Ordering::Acquire) {
+                    &recovered
+                } else {
+                    &pressured
+                };
+                shared.authorize_disk_reclaim_goal(candidate, PressureLevel::Critical, platform)
+            };
+            let report = executor.execute_with_hooks(
+                &plan,
+                None,
+                Some(&authorize),
+                Some(&|_, _| {
+                    if recover_after_first {
+                        recovery.store(true, Ordering::Release);
+                    }
+                }),
+            );
+
+            assert_eq!(report.items_deleted, expected_deleted, "{report:?}");
+            assert_eq!(report.items_failed, 0, "{report:?}");
+            assert_eq!(
+                report
+                    .skipped_by_reason
+                    .get("policy_changed")
+                    .copied()
+                    .unwrap_or_default(),
+                2 - expected_deleted,
+            );
+            assert!(report.backoff_candidates.is_empty());
+            for (index, path) in paths.iter().enumerate() {
+                assert_eq!(
+                    path.exists(),
+                    index >= expected_deleted,
+                    "{}",
+                    path.display()
+                );
+            }
+        }
+    }
+
     #[test]
     fn backing_pressure_cannot_lower_unrelated_disk_certainty() {
         let shared = SharedExecutorConfig::new(false, 10, 0.5, 300, 3600, true, 86_400);
@@ -22384,7 +22809,14 @@ mod tests {
         );
 
         config.pressure.prediction.enabled = false;
-        for minutes in [30.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, -1.0] {
+        for minutes in [
+            30.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            -1.0,
+        ] {
             config.pressure.prediction.action_horizon_minutes = minutes;
             assert_eq!(
                 mount_controller_config(&config).action_horizon,

@@ -8,6 +8,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Queued pressure-driven deletions stop when their filesystem reaches its
+  Green goal.** The executor checks current candidate-local filesystem stats
+  against live volume-aware thresholds before planning and before each removal.
+  Missing, invalid, or read-only evidence holds the work. Intermediate recovery
+  remains eligible to finish the Green target, while Green maintenance and
+  dedicated RAM, inode, and operator scan-now admission keep their existing
+  behavior. Live scope and mode checks run again after the filesystem probe.
+
 - **Prediction settings cannot panic the mount controller or trap pressure in a
   permanent recovery state.** Enabled horizons must stay finite in seconds,
   the action horizon must fit a duration, and burst confidence must be a valid
