@@ -320,7 +320,8 @@ mod unix {
                 "quarantine payload identity changed; refusing purge",
             ));
         }
-        let Some(removed) = remove_child(&entry, name, payload, 0, false, budget, gate, hook)? else {
+        let Some(removed) = remove_child(&entry, name, payload, 0, false, budget, gate, hook)?
+        else {
             // The manifest remains the recovery anchor. Never finalize a
             // partially removed payload or give it a failed-deletion cooldown.
             return Ok(None);

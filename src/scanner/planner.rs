@@ -320,7 +320,10 @@ mod tests {
             let (chosen, plan) = plan_batch(candidates.clone(), &req);
             assert_eq!(plan, reference);
             assert_eq!(
-                chosen.iter().map(|c| c.path.clone()).collect::<BTreeSet<_>>(),
+                chosen
+                    .iter()
+                    .map(|c| c.path.clone())
+                    .collect::<BTreeSet<_>>(),
                 expected
             );
             assert_eq!(plan.planned_bytes, 0);

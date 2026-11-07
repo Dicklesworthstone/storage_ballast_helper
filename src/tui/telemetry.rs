@@ -2129,12 +2129,18 @@ mod tests {
             else {
                 panic!("legacy purge fields must remain readable");
             };
-            assert_eq!(entry.event, crate::logger::jsonl::EventType::QuarantinePurge);
+            assert_eq!(
+                entry.event,
+                crate::logger::jsonl::EventType::QuarantinePurge
+            );
             assert_eq!(entry.path.as_deref(), Some("/cache/original"));
             assert_eq!(entry.size, Some(0));
             assert_eq!(entry.ok, Some(true));
             assert_eq!(entry.decision_id.as_deref(), Some("0123456789ab"));
-            assert_eq!(entry.details.as_deref(), Some("completed permanent removal"));
+            assert_eq!(
+                entry.details.as_deref(),
+                Some("completed permanent removal")
+            );
             assert!(entry.quarantined.is_none());
         }
     }

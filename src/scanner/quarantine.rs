@@ -121,13 +121,7 @@ impl QuarantineCompletion {
     /// Legacy or malformed snapshots stay unknown; paths are never guessed.
     #[must_use]
     pub fn category(&self) -> Option<ArtifactCategory> {
-        self.record
-            .decision
-            .as_ref()?
-            .get("category")?
-            .as_str()?
-            .parse()
-            .ok()
+        self.record.category()
     }
 }
 
@@ -241,6 +235,31 @@ pub struct QuarantineRecord {
     /// A compact decision snapshot for `sbh explain`.
     #[serde(default)]
     pub decision: Option<serde_json::Value>,
+}
+
+impl QuarantineRecord {
+    /// Structural classification captured by the original cleanup decision.
+    /// Legacy or malformed snapshots stay unknown; paths are never guessed.
+    #[must_use]
+    pub fn category(&self) -> Option<ArtifactCategory> {
+        self.decision
+            .as_ref()?
+            .get("category")?
+            .as_str()?
+            .parse()
+            .ok()
+    }
+
+    /// Evidence required to spend RAM- or inode-only deletion authority.
+    /// A prior recoverable move does not upgrade a weaker or missing decision.
+    #[must_use]
+    pub fn definite_category(&self) -> Option<ArtifactCategory> {
+        if self.decision.as_ref()?.get("certainty")?.as_str()? != "Definite" {
+            return None;
+        }
+        self.category()
+            .filter(|category| *category != ArtifactCategory::Unknown)
+    }
 }
 
 /// Why a recoverable move was refused. This does not authorize an unlink.
@@ -449,10 +468,34 @@ impl QuarantineStore {
         budget: &mut PurgeBudget,
         gate: &mut impl FnMut(&QuarantineRecord) -> bool,
     ) -> bool {
+        self.try_purge_with_filter(record, now_unix, out, budget, &mut |_| true, gate)
+    }
+
+    fn try_purge_with_filter(
+        &self,
+        record: &QuarantineRecord,
+        now_unix: u64,
+        out: &mut DrainOutcome,
+        budget: &mut PurgeBudget,
+        select: &mut impl FnMut(&QuarantineRecord) -> bool,
+        gate: &mut impl FnMut(&QuarantineRecord) -> bool,
+    ) -> bool {
+        // Selection runs on the fresh locked manifest, including subsequent
+        // checkpoints within a partial payload. An ineligible oldest record
+        // must not prevent later eligible records from relieving pressure.
+        let mut filtered = false;
+        let mut admit = |fresh: &QuarantineRecord| {
+            if select(fresh) {
+                gate(fresh)
+            } else {
+                filtered = true;
+                false
+            }
+        };
         // Charge attempted records as well as tree traversal, so a long run
         // of manifest/permission errors cannot receive a fresh budget per item.
         let result = if budget.take() {
-            safety::purge_with_budget_and_gate(self, record, budget, gate)
+            safety::purge_with_budget_and_gate(self, record, budget, &mut admit)
         } else {
             Ok(None)
         };
@@ -465,7 +508,7 @@ impl QuarantineStore {
             Ok(None) => {
                 out.deferred_entries += 1;
                 out.budget_exhausted |= budget.exhausted();
-                return false;
+                return filtered && !budget.exhausted();
             }
             Err(SbhError::Io { source, .. }) if source.kind() == io::ErrorKind::WouldBlock => {
                 // Another cooperating operation owns the store, or the
@@ -704,6 +747,26 @@ impl QuarantineStore {
         &self,
         now_unix: u64,
         mode: SweepMode,
+        gate: impl FnMut(&QuarantineRecord) -> bool,
+    ) -> Result<SweepOutcome> {
+        self.sweep_with_pressure_filter(now_unix, mode, |_| true, gate)
+    }
+
+    /// Apply narrower resource eligibility without starving later entries.
+    ///
+    /// Both callbacks inspect the fresh locked manifest and are renewed at the
+    /// same bounded checkpoints. A false selection retains this entry and
+    /// continues to the next one; a false gate stops the sweep. Both defer
+    /// without failure, cooldown or completed-removal credit. Rejected entries
+    /// consume the same record-attempt budget as accepted entries.
+    ///
+    /// Maintenance ignores both callbacks and retains its TTL/cap authority.
+    /// Callbacks must not reenter or modify the quarantine store.
+    pub fn sweep_with_pressure_filter(
+        &self,
+        now_unix: u64,
+        mode: SweepMode,
+        mut select: impl FnMut(&QuarantineRecord) -> bool,
         mut gate: impl FnMut(&QuarantineRecord) -> bool,
     ) -> Result<SweepOutcome> {
         let records = self.records()?;
@@ -718,11 +781,12 @@ impl QuarantineStore {
                 reason = "pressure";
                 let mut budget = PurgeBudget::bounded(DEFAULT_DRAIN_WORK);
                 for entry in &records {
-                    if !self.try_purge_with_gate(
+                    if !self.try_purge_with_filter(
                         entry,
                         now_unix,
                         &mut drained,
                         &mut budget,
+                        &mut select,
                         &mut gate,
                     ) {
                         break;

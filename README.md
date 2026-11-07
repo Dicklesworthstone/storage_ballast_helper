@@ -1482,6 +1482,15 @@ mutation. Enforce-to-Canary transitions defer the remaining candidates for
 fresh quota evaluation. Temporary policy refusals do not create per-path
 backoff, and batches already planned as dry-runs retain their preview counts.
 
+RAM- and inode-only pressure apply their narrower artifact rules to held
+payloads too. A record needs a known structural category and a stored
+`Definite` decision; current exclusions for its original path and live
+category suspensions are checked again before removal. Ineligible records
+are retained while the bounded sweep considers later entries. Legacy records
+without that evidence remain available for restore or normal TTL/cap cleanup.
+RAM relief requires a positive byte estimate; inode relief can also remove a
+verified directory whose byte estimate is zero.
+
 Restore with `sbh undo <decision-id>` (the id is on the `[SBH-QUARANTINE]` line, in `sbh explain`, and in `sbh undo --list`), `sbh undo --path <original>`, or `sbh undo --all-since 2h`. A restore is a rename back, byte-identical; it refuses when the original path exists again unless `--force-suffix`, which restores beside it as `<name>.restored-<decision-id>`. The ledger marks the decision `restored`.
 
 A candidate that cannot be quarantined (different filesystem from the root, unusable store) is removed for good and the fallback is logged as `quarantine_unavailable` with its reason. `status` shows the bytes held per mount in the Reserve column; `stats` reports `quarantined_count` and `quarantined_bytes` and excludes held bytes from `total_bytes_freed`.
@@ -1535,7 +1544,8 @@ inode yield is used to claim success.
 
 These passes unlink eligible artifacts because quarantine renames retain
 their inodes. They retain protection markers, age checks, active-reference
-checks, policy mode, dry-run, and the exclusion of zero-byte targets. Inode
+checks, policy mode, and dry-run. A zero-byte estimate is eligible only for a
+verified directory, whose own inode can be reclaimed. Inode
 pressure does not start compression, log truncation, unrelated-device cleanup,
 or a broader emergency policy. Byte counters and bytes-freed reports keep
 their original meaning.

@@ -736,28 +736,23 @@ mod tests {
     fn a_post_unlink_failure_is_not_replayed_as_a_new_success() {
         let dir = tempfile::tempdir().unwrap();
         let (store, record) = held(dir.path(), "post-unlink");
-        let failed = purge_with(
-            &store,
-            "post-unlink",
-            Some(&record),
-            |lock, selected| {
-                assert!(confined_purge::remove_payload(lock, selected)?);
-                // Model a finalization interruption after permanent removal.
-                Err(io::Error::other("injected post-unlink finalization failure"))
-            },
-        );
+        let failed = purge_with(&store, "post-unlink", Some(&record), |lock, selected| {
+            assert!(confined_purge::remove_payload(lock, selected)?);
+            // Model a finalization interruption after permanent removal.
+            Err(io::Error::other(
+                "injected post-unlink finalization failure",
+            ))
+        });
         assert!(failed.is_err());
         assert!(!record.quarantine_path.exists());
         assert_eq!(store.record("post-unlink").unwrap(), Some(record.clone()));
 
-        let resumed = purge_with_budget_and_gate(
-            &store,
-            &record,
-            &mut PurgeBudget::bounded(32),
-            &mut |_| true,
-        )
-        .unwrap()
-        .unwrap();
+        let resumed =
+            purge_with_budget_and_gate(&store, &record, &mut PurgeBudget::bounded(32), &mut |_| {
+                true
+            })
+            .unwrap()
+            .unwrap();
         assert_eq!(resumed.bytes, 0);
         assert!(resumed.completed.is_none());
         assert!(store.record("post-unlink").unwrap().is_none());

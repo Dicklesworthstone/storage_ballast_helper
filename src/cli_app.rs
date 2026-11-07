@@ -18773,7 +18773,6 @@ mod tests {
         assert!(report.backoff_candidates.is_empty());
     }
 
-
     #[cfg(unix)]
     #[test]
     fn quarantine_completion_receipts_follow_real_finalization_and_decision_evidence() {
@@ -18804,7 +18803,10 @@ mod tests {
                 executor.delete_candidate_checked(&candidate, None).unwrap(),
                 CheckedDeletion::Quarantined,
             );
-            assert!(!ledger.exists(), "a reversible move creates no purge receipt");
+            assert!(
+                !ledger.exists(),
+                "a reversible move creates no purge receipt"
+            );
             let store = QuarantineStore::under(directory.path());
             let before = SystemTime::now();
             let drained = store.drain_all().unwrap();
@@ -18943,7 +18945,10 @@ mod tests {
 
             assert!(drained.completed.is_empty(), "{mode}: {drained:?}");
             record_quarantine_completions(&ledger, drained.completed);
-            assert!(!ledger.exists(), "{mode} must not create an activity ledger");
+            assert!(
+                !ledger.exists(),
+                "{mode} must not create an activity ledger"
+            );
             assert!(!directory.path().join("unopened").exists());
         }
     }
@@ -18977,11 +18982,13 @@ mod tests {
         assert!(store.records().unwrap().is_empty());
         record_quarantine_completions(&ledger, drained.completed);
         assert!(store.records().unwrap().is_empty());
-        assert!(SqliteLogger::open_read_only(&ledger)
-            .unwrap()
-            .recent_activity(10)
-            .unwrap()
-            .is_empty());
+        assert!(
+            SqliteLogger::open_read_only(&ledger)
+                .unwrap()
+                .recent_activity(10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

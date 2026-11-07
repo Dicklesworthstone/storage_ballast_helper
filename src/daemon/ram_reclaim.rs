@@ -13,6 +13,7 @@ use crate::core::config::ScannerConfig;
 use crate::monitor::ram_scratch::swap_reclaim_pressure;
 use crate::platform::pal::Platform;
 use crate::scanner::deletion::SkipReason;
+use crate::scanner::quarantine::QuarantineRecord;
 use crate::scanner::scoring::{ArtifactCertainty, CandidacyScore, DecisionAction};
 use crate::scanner::walker::{FsIdentity, device_id, identity_for_path};
 
@@ -117,6 +118,36 @@ impl RamReclaimRequest {
             && candidate
                 .identity
                 .is_some_and(|identity| identity.device_id == self.device_id)
+    }
+
+    /// A held artifact must retain this resource pass's narrower admission.
+    /// The caller supplies the current category suspension and still renews
+    /// original scope and backing pressure at the purge boundary.
+    #[must_use]
+    pub fn accepts_quarantined(&self, record: &QuarantineRecord, category_suspended: bool) -> bool {
+        self.remaining_bytes() > 0
+            && record.size_bytes > 0
+            && record.device_id == self.device_id
+            && record.definite_category().is_some()
+            && !category_suspended
+    }
+
+    /// Renew the original artifact's scope even though its leaf was renamed.
+    /// Checking only the store would miss a newly excluded original subtree.
+    pub fn authorize_quarantine_scope(
+        &self,
+        record: &QuarantineRecord,
+        scanner: &ScannerConfig,
+    ) -> Result<PathBuf, SkipReason> {
+        let original =
+            std::path::absolute(&record.original_path).map_err(|_| SkipReason::PolicyChanged)?;
+        let parent = original.parent().ok_or(SkipReason::PolicyChanged)?;
+        let name = original.file_name().ok_or(SkipReason::PolicyChanged)?;
+        let resolved = self.authorize_scope(parent, scanner)?.join(name);
+        if excluded(&original, &resolved, &scanner.excluded_paths) {
+            return Err(SkipReason::PolicyChanged);
+        }
+        Ok(resolved)
     }
 
     /// A device check for shallow discovery and requested roots. Only a
@@ -411,6 +442,112 @@ mod tests {
             candidate.decision.certainty = certainty;
             assert!(!request.accepts_candidate(&candidate));
         }
+    }
+
+    #[test]
+    fn quarantined_ram_relief_requires_definite_unsuspended_same_device_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let candidate = candidate(temp.path().join("target"));
+        let request = RamReclaimRequest::new(
+            temp.path().to_path_buf(),
+            candidate.identity.unwrap().device_id,
+            candidate.size_bytes,
+            &[temp.path().to_path_buf()],
+        );
+        let store = crate::scanner::quarantine::QuarantineStore::under(temp.path());
+        let mut record = store
+            .quarantine(
+                &candidate.path,
+                "ram-admission",
+                candidate.size_bytes,
+                Duration::from_hours(24),
+                Some(serde_json::json!({"category": "GoCache", "certainty": "Definite"})),
+            )
+            .unwrap();
+        assert!(request.accepts_quarantined(&record, false));
+        assert!(!request.accepts_quarantined(&record, true));
+        record.size_bytes = 0;
+        assert!(!request.accepts_quarantined(&record, false));
+        record.size_bytes = candidate.size_bytes;
+        record.device_id ^= 1;
+        assert!(!request.accepts_quarantined(&record, false));
+        record.device_id ^= 1;
+        for snapshot in [
+            None,
+            Some(serde_json::json!({"category": "GoCache"})),
+            Some(serde_json::json!({"category": "GoCache", "certainty": "Likely"})),
+            Some(serde_json::json!({"category": "GoCache", "certainty": "Unclear"})),
+            Some(serde_json::json!({"category": "GoCache", "certainty": "definite"})),
+            Some(serde_json::json!({"category": "Unknown", "certainty": "Definite"})),
+            Some(serde_json::json!({"category": "unknown-category", "certainty": "Definite"})),
+            Some(serde_json::json!({"category": 1, "certainty": "Definite"})),
+        ] {
+            record.decision = snapshot;
+            assert!(!request.accepts_quarantined(&record, false));
+        }
+        record.decision = Some(serde_json::json!({"category": "GoCache", "certainty": "Definite"}));
+        request.record_unlinked_bytes(record.size_bytes);
+        assert!(!request.accepts_quarantined(&record, false));
+        assert!(record.quarantine_path.exists());
+        assert!(store.stuck_entries().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantined_ram_scope_checks_absent_original_leaf_and_root_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let alias = temp.path().join("alias");
+        fs::create_dir_all(root.join("project")).unwrap();
+        let resolved_root = fs::canonicalize(&root).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let candidate = candidate(alias.join("project/target"));
+        let request = RamReclaimRequest::new(
+            root.clone(),
+            candidate.identity.unwrap().device_id,
+            candidate.size_bytes,
+            std::slice::from_ref(&alias),
+        );
+        let store = crate::scanner::quarantine::QuarantineStore::under(&root);
+        let record = store
+            .quarantine(
+                &candidate.path,
+                "ram-scope",
+                candidate.size_bytes,
+                Duration::ZERO,
+                None,
+            )
+            .unwrap();
+        let mut scanner = ScannerConfig {
+            root_paths: vec![alias.clone()],
+            excluded_paths: Vec::new(),
+            ..ScannerConfig::default()
+        };
+        assert!(!record.original_path.exists());
+        assert_eq!(
+            request.authorize_quarantine_scope(&record, &scanner),
+            Ok(resolved_root.join("project/target")),
+        );
+        for excluded in [
+            alias.join("project/target"),
+            resolved_root.join("project/target"),
+        ] {
+            scanner.excluded_paths = vec![excluded];
+            assert_eq!(
+                request.authorize_quarantine_scope(&record, &scanner),
+                Err(SkipReason::PolicyChanged),
+            );
+        }
+        scanner.excluded_paths.clear();
+        let replacement = temp.path().join("replacement");
+        fs::create_dir_all(replacement.join("project")).unwrap();
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+        assert_eq!(
+            request.authorize_quarantine_scope(&record, &scanner),
+            Err(SkipReason::PolicyChanged),
+        );
+        assert!(record.quarantine_path.exists());
     }
 
     #[test]

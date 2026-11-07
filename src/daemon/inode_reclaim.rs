@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::core::config::{InodePressureConfig, ScannerConfig};
 use crate::platform::pal::Platform;
 use crate::scanner::deletion::SkipReason;
+use crate::scanner::quarantine::QuarantineRecord;
 use crate::scanner::scoring::{ArtifactCertainty, CandidacyScore, DecisionAction};
 use crate::scanner::walker::{FsEntryKind, FsIdentity, device_id, identity_for_path};
 
@@ -131,6 +132,41 @@ impl InodeReclaimRequest {
             && candidate
                 .identity
                 .is_some_and(|identity| identity.device_id == self.device_id)
+    }
+
+    /// Preserve definite-artifact and exact-device admission for held entries.
+    /// Zero-byte relief still requires a matching observed directory, rather
+    /// than inferring inode yield from a historical size estimate.
+    #[must_use]
+    pub fn accepts_quarantined(&self, record: &QuarantineRecord, category_suspended: bool) -> bool {
+        self.remaining_artifacts() > 0
+            && record.device_id == self.device_id
+            && record.definite_category().is_some()
+            && !category_suspended
+            && (record.size_bytes > 0
+                || identity_for_path(&record.quarantine_path, false).is_ok_and(|identity| {
+                    identity.device_id == record.device_id
+                        && identity.inode == record.inode
+                        && identity.kind == FsEntryKind::Directory
+                }))
+    }
+
+    /// Renew the absent original leaf's parent/root identity and exclusions.
+    /// A store beneath an admitted root cannot override a revoked child path.
+    pub fn authorize_quarantine_scope(
+        &self,
+        record: &QuarantineRecord,
+        scanner: &ScannerConfig,
+    ) -> Result<PathBuf, SkipReason> {
+        let original =
+            std::path::absolute(&record.original_path).map_err(|_| SkipReason::PolicyChanged)?;
+        let parent = original.parent().ok_or(SkipReason::PolicyChanged)?;
+        let name = original.file_name().ok_or(SkipReason::PolicyChanged)?;
+        let resolved = self.authorize_scope(parent, scanner)?.join(name);
+        if excluded(&original, &resolved, &scanner.excluded_paths) {
+            return Err(SkipReason::PolicyChanged);
+        }
+        Ok(resolved)
     }
 
     /// Nested mounts and symlink aliases cannot widen the sampled device.
@@ -399,9 +435,7 @@ mod tests {
         let exhausted = platform(temp.path(), InodeStats::new(10_000, 0, 0));
         assert!(request.accepts_candidate(&candidate));
         assert_eq!(request.authorize(&candidate, &exhausted), Ok(()));
-        assert!(
-            (exhausted.fs_stats(temp.path()).unwrap().free_pct() - 70.0).abs() < f64::EPSILON
-        );
+        assert!((exhausted.fs_stats(temp.path()).unwrap().free_pct() - 70.0).abs() < f64::EPSILON);
         for kind in [FsEntryKind::File, FsEntryKind::Symlink, FsEntryKind::Other] {
             let mut altered = candidate.clone();
             altered.identity.as_mut().unwrap().kind = kind;
@@ -441,6 +475,120 @@ mod tests {
                 assert!(!request.accepts_candidate(&altered));
             }
         }
+    }
+
+    #[test]
+    fn quarantined_inode_relief_requires_definite_evidence_and_real_zero_byte_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let candidate = candidate(temp.path().join("target"));
+        let request = request(temp.path(), &candidate, 1);
+        let store = crate::scanner::quarantine::QuarantineStore::under(temp.path());
+        let mut record = store
+            .quarantine(
+                &candidate.path,
+                "inode-admission",
+                0,
+                Duration::from_hours(24),
+                Some(serde_json::json!({"category": "RustTarget", "certainty": "Definite"})),
+            )
+            .unwrap();
+        assert!(request.accepts_quarantined(&record, false));
+        assert!(!request.accepts_quarantined(&record, true));
+        record.device_id ^= 1;
+        assert!(!request.accepts_quarantined(&record, false));
+        record.device_id ^= 1;
+        for snapshot in [
+            None,
+            Some(serde_json::json!({"category": "RustTarget", "certainty": "Likely"})),
+            Some(serde_json::json!({"category": "Unknown", "certainty": "Definite"})),
+        ] {
+            record.decision = snapshot;
+            assert!(!request.accepts_quarantined(&record, false));
+        }
+        record.decision =
+            Some(serde_json::json!({"category": "RustTarget", "certainty": "Definite"}));
+        let original_inode = record.inode;
+        record.inode ^= 1;
+        assert!(!request.accepts_quarantined(&record, false));
+        record.inode = original_inode;
+        let file = temp.path().join("empty.o");
+        fs::write(&file, b"").unwrap();
+        let held_file = store
+            .quarantine(
+                &file,
+                "zero-file",
+                0,
+                Duration::ZERO,
+                record.decision.clone(),
+            )
+            .unwrap();
+        assert!(!request.accepts_quarantined(&held_file, false));
+        request.record_unlinked();
+        assert!(!request.accepts_quarantined(&record, false));
+        assert!(record.quarantine_path.exists());
+        assert!(held_file.quarantine_path.exists());
+        assert!(store.stuck_entries().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantined_inode_scope_checks_absent_original_leaf_and_root_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let alias = temp.path().join("alias");
+        fs::create_dir_all(root.join("project")).unwrap();
+        let resolved_root = fs::canonicalize(&root).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let candidate = candidate(alias.join("project/target"));
+        let request = InodeReclaimRequest::new(
+            root.clone(),
+            candidate.identity.unwrap().device_id,
+            10_000,
+            1_050,
+            1,
+            &InodePressureConfig::default(),
+            std::slice::from_ref(&alias),
+        );
+        let store = crate::scanner::quarantine::QuarantineStore::under(&root);
+        let record = store
+            .quarantine(
+                &candidate.path,
+                "inode-scope",
+                candidate.size_bytes,
+                Duration::ZERO,
+                None,
+            )
+            .unwrap();
+        let mut scanner = ScannerConfig {
+            root_paths: vec![alias.clone()],
+            excluded_paths: Vec::new(),
+            ..ScannerConfig::default()
+        };
+        assert!(!record.original_path.exists());
+        assert_eq!(
+            request.authorize_quarantine_scope(&record, &scanner),
+            Ok(resolved_root.join("project/target")),
+        );
+        for excluded in [
+            alias.join("project/target"),
+            resolved_root.join("project/target"),
+        ] {
+            scanner.excluded_paths = vec![excluded];
+            assert_eq!(
+                request.authorize_quarantine_scope(&record, &scanner),
+                Err(SkipReason::PolicyChanged),
+            );
+        }
+        scanner.excluded_paths.clear();
+        let replacement = temp.path().join("replacement");
+        fs::create_dir_all(replacement.join("project")).unwrap();
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+        assert_eq!(
+            request.authorize_quarantine_scope(&record, &scanner),
+            Err(SkipReason::PolicyChanged),
+        );
+        assert!(record.quarantine_path.exists());
     }
 
     #[test]

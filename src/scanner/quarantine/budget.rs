@@ -318,7 +318,10 @@ mod tests {
         assert_eq!(remaining_files(&record), 8);
         assert_eq!(store.record("recovered").unwrap(), Some(record));
         assert_eq!(fs::read(store.record_path("recovered")).unwrap(), manifest);
-        assert_eq!(fs::read(store.root().join("recovered.stuck")).unwrap(), stuck);
+        assert_eq!(
+            fs::read(store.root().join("recovered.stuck")).unwrap(),
+            stuck
+        );
     }
 
     #[test]
@@ -361,7 +364,10 @@ mod tests {
             assert!(out.drained.failures.is_empty());
             assert!(!records[0].quarantine_path.exists());
             assert_eq!(records[1].quarantine_path.exists(), recover_after_first);
-            assert_eq!(store.records().unwrap().len(), usize::from(recover_after_first));
+            assert_eq!(
+                store.records().unwrap().len(),
+                usize::from(recover_after_first)
+            );
             assert!(!store.root().join("a.stuck").exists());
             assert!(!store.root().join("b.stuck").exists());
         }
@@ -393,16 +399,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(checks, 2, "one admission and one bounded renewal");
-        assert_eq!(
-            remaining_files(&record),
-            before - PRESSURE_RECHECK_UNLINKS,
-        );
+        assert_eq!(remaining_files(&record), before - PRESSURE_RECHECK_UNLINKS,);
         assert_eq!(out.drained.counts(), (0, 0));
         assert_eq!(out.drained.deferred_entries, 1);
-        assert!(!out.drained.budget_exhausted, "policy hold is not work exhaustion");
+        assert!(
+            !out.drained.budget_exhausted,
+            "policy hold is not work exhaustion"
+        );
         assert!(out.drained.failures.is_empty());
         assert_eq!(out.held_bytes, record.size_bytes);
-        assert_eq!(store.record("partial-pressure").unwrap(), Some(record.clone()));
+        assert_eq!(
+            store.record("partial-pressure").unwrap(),
+            Some(record.clone())
+        );
         assert!(!store.root().join("partial-pressure.stuck").exists());
 
         let resumed = store
@@ -433,16 +442,24 @@ mod tests {
                 record.expires_at
             };
             let out = store
-                .sweep_with_pressure_gate(
+                .sweep_with_pressure_filter(
                     now,
                     crate::scanner::quarantine::SweepMode::Maintenance { cap_bytes },
+                    |_| panic!("maintenance must not borrow resource selection"),
                     |_| panic!("maintenance must not borrow pressure authority"),
                 )
                 .unwrap();
 
             assert_eq!(out.drained.counts(), (1, record.size_bytes));
             assert_eq!(out.held_bytes, 0);
-            assert_eq!(out.reason, if cap_bytes.is_some() { "size cap" } else { "ttl" });
+            assert_eq!(
+                out.reason,
+                if cap_bytes.is_some() {
+                    "size cap"
+                } else {
+                    "ttl"
+                }
+            );
             assert!(!out.drained.budget_exhausted);
             assert!(out.drained.failures.is_empty());
         }
@@ -488,6 +505,95 @@ mod tests {
             assert_eq!(completed.category(), None);
         }
         assert!(store.drain_all().unwrap().completed.is_empty());
+    }
+
+    #[test]
+    fn pressure_selection_retains_weak_records_without_starving_definite_successors() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::under(temp.path());
+        let mut records = Vec::new();
+        for (id, snapshot) in [
+            (
+                "a",
+                Some(serde_json::json!({"category": "GoCache", "certainty": "Likely"})),
+            ),
+            ("b", None),
+            (
+                "c",
+                Some(serde_json::json!({"category": "GoCache", "certainty": "Definite"})),
+            ),
+        ] {
+            let source = temp.path().join(format!("go-build-{id}"));
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("cached"), b"recoverable").unwrap();
+            records.push(
+                store
+                    .quarantine(&source, id, 100, Duration::from_hours(24), snapshot)
+                    .unwrap(),
+            );
+        }
+        let mut authorized = Vec::new();
+        let swept = store
+            .sweep_with_pressure_filter(
+                0,
+                crate::scanner::quarantine::SweepMode::Pressure,
+                |record| record.definite_category().is_some(),
+                |record| {
+                    authorized.push(record.decision_id.clone());
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(authorized, ["c"]);
+        assert_eq!(swept.drained.counts(), (1, 100));
+        assert_eq!(swept.drained.completed.len(), 1);
+        assert_eq!(swept.drained.deferred_entries, 2);
+        assert_eq!(swept.held_bytes, 200);
+        assert!(!swept.drained.budget_exhausted);
+        assert!(swept.drained.failures.is_empty());
+        assert!(store.stuck_entries().unwrap().is_empty());
+        for record in &records[..2] {
+            let restored = store.restore(&record.decision_id, false).unwrap();
+            assert_eq!(
+                fs::read(restored.restored_to.join("cached")).unwrap(),
+                b"recoverable"
+            );
+        }
+        assert!(!records[2].quarantine_path.exists());
+    }
+
+    #[test]
+    fn rejected_pressure_records_consume_the_shared_work_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, record) = held_tree(temp.path(), "ineligible", 2);
+        let mut out = DrainOutcome::default();
+        let mut budget = PurgeBudget::bounded(3);
+        let mut selected = 0;
+        let mut select = |_record: &QuarantineRecord| {
+            selected += 1;
+            false
+        };
+        for expected_continue in [true, true, false] {
+            assert_eq!(
+                store.try_purge_with_filter(
+                    &record,
+                    0,
+                    &mut out,
+                    &mut budget,
+                    &mut select,
+                    &mut |_| panic!("an ineligible record cannot spend pressure authority"),
+                ),
+                expected_continue,
+            );
+        }
+        assert_eq!(selected, 2);
+        assert_eq!(out.deferred_entries, 3);
+        assert!(out.budget_exhausted);
+        assert_eq!(out.counts(), (0, 0));
+        assert!(out.completed.is_empty());
+        assert!(out.failures.is_empty());
+        assert_eq!(remaining_files(&record), 2);
+        assert!(store.stuck_entries().unwrap().is_empty());
     }
 
     #[test]

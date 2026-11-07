@@ -859,7 +859,13 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
             let mut entry = LogEntry::new(EventType::QuarantinePurge, Severity::Info);
             entry.ts = chrono::DateTime::<chrono::Utc>::from(completion.completed_at)
                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            entry.path = Some(completion.record.original_path.to_string_lossy().into_owned());
+            entry.path = Some(
+                completion
+                    .record
+                    .original_path
+                    .to_string_lossy()
+                    .into_owned(),
+            );
             entry.size = Some(completion.record.size_bytes);
             entry.score = quarantine_purge_score(completion);
             entry.ok = Some(true);
@@ -1045,7 +1051,13 @@ pub(crate) fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow
                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             event_type: "quarantine_purge".to_string(),
             severity: "info".to_string(),
-            path: Some(completion.record.original_path.to_string_lossy().into_owned()),
+            path: Some(
+                completion
+                    .record
+                    .original_path
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             size_bytes: Some(i64::try_from(completion.record.size_bytes).unwrap_or(i64::MAX)),
             score: quarantine_purge_score(completion),
             score_factors: None,
@@ -1942,7 +1954,10 @@ mod tests {
             snapshot.receipts[0].value.path,
             "/data/shared/arbitrary-cache-name"
         );
-        assert_eq!(snapshot.receipts[0].value.category.as_deref(), Some("GoCache"));
+        assert_eq!(
+            snapshot.receipts[0].value.category.as_deref(),
+            Some("GoCache")
+        );
         assert!(snapshot.receipts[1].value.category.is_none());
         for receipt in &snapshot.receipts {
             assert_eq!(receipt.run_id.as_deref(), Some("purge-run"));

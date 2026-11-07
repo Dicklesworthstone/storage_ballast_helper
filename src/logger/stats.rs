@@ -1956,7 +1956,11 @@ mod tests {
         let (_dir, db) = temp_db();
         for (path, bytes, details) in [
             ("/cache/unlinked", 256, None),
-            ("/cache/held", 4096, Some("decision_id=0123456789ab;quarantined")),
+            (
+                "/cache/held",
+                4096,
+                Some("decision_id=0123456789ab;quarantined"),
+            ),
         ] {
             db.log_activity(&ActivityRow {
                 timestamp: ts(5),
@@ -2001,12 +2005,9 @@ mod tests {
         ] {
             db.log_activity_event(&event).unwrap();
         }
-        let mut failed = crate::logger::dual::event_to_activity_row(&purge(
-            "/cache/failed",
-            1_000_000,
-            now,
-        ))
-        .unwrap();
+        let mut failed =
+            crate::logger::dual::event_to_activity_row(&purge("/cache/failed", 1_000_000, now))
+                .unwrap();
         failed.success = 0;
         db.log_activity(&failed).unwrap();
 
