@@ -1401,11 +1401,18 @@ checks cancellation after its process and marker checks and before starting
 each rch command. Restoring the earlier settings or pressure cannot revive
 that pass; a blocked worker keeps its slot until it exits.
 
+Staging admission also runs off the monitor: one worker probes the configured
+bases and resolves the trusted rch executable. The monitor admits its result
+only while the same configuration remains active and the bases' mounts still
+need cleanup. Evidence expires after <!-- claim:constants.daemon.RCH_STAGING_PROBE_SECS -->60<!-- /claim --> seconds, including the
+wait for the monitor to receive it. A blocked admission worker holds its slot
+without delaying monitoring or starting additional workers.
+
 Target-only root expansion, filesystem probes, and surveys run on one retained
 worker, so a slow or stuck scratch filesystem does not block the monitor.
 Reloading the target policy revokes the old worker without starting overlapping
 replacements. Before submitting a batch, it checks the root's identity and
-mount again, requires a pressure observation less than one minute old, and
+mount again, requires pressure evidence younger than <!-- claim:constants.daemon.TARGET_ROOT_PROBE_SECS -->60<!-- /claim --> seconds, and
 defers candidates if pressure has fallen since they were scored. A worker
 stuck in a native filesystem call holds its slot until that call returns.
 

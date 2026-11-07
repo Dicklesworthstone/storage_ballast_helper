@@ -62,6 +62,9 @@ use crate::tuning::writeback::human_bytes;
 pub const BASE_INTERVAL: Duration = Duration::from_mins(30);
 /// Shortest gap between two checks of whether a base is due.
 const PROBE_INTERVAL: Duration = Duration::from_mins(1);
+/// Admission evidence may cover at most this much time, including blocked
+/// filesystem calls and the wait for the monitor to consume the result.
+pub const ADMISSION_MAX_AGE: Duration = Duration::from_secs(60);
 /// Longest one rch invocation may run before it is killed.
 const RCH_TIMEOUT: Duration = Duration::from_mins(10);
 /// Wall time of one pass; the projects it did not reach wait for the next.
@@ -662,6 +665,58 @@ struct DueBase {
     min_idle: Duration,
 }
 
+/// Read-only evidence from the worker. Pressure and the age cutoff are
+/// deliberately absent: the monitor must authorize them from its current tick.
+#[derive(Debug)]
+struct Admission {
+    bases: Vec<(PathBuf, PathBuf)>,
+    runner: Result<RchRunner, String>,
+}
+
+/// Retain even a cancelled native probe until it exits. A timeout withdraws
+/// its evidence; it never frees a slot for another thread on the same stall.
+#[derive(Debug)]
+struct AdmissionProbe {
+    receive: mpsc::Receiver<Option<Admission>>,
+    stop: Arc<AtomicBool>,
+    started: Instant,
+    worker: std::thread::JoinHandle<()>,
+}
+
+/// Every filesystem call involved in admission runs on the probe worker,
+/// including the trusted binary's canonicalization and ancestor checks.
+fn probe_admission(
+    bases: Vec<PathBuf>,
+    config: &Config,
+    platform: &dyn Platform,
+    stop: &AtomicBool,
+) -> Option<Admission> {
+    let mut probed = Vec::new();
+    for base in bases {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        if !base.is_dir() {
+            continue;
+        }
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        let Ok(stats) = platform.fs_stats(&base) else {
+            continue;
+        };
+        probed.push((base, stats.mount_point));
+    }
+    if probed.is_empty() || stop.load(Ordering::Acquire) {
+        return None;
+    }
+    let runner = RchRunner::resolve(config);
+    (!stop.load(Ordering::Acquire)).then_some(Admission {
+        bases: probed,
+        runner,
+    })
+}
+
 /// Scheduling state of the tier: at most one pass in flight.
 #[derive(Debug, Default)]
 pub struct RchStagingTier {
@@ -674,6 +729,7 @@ pub struct RchStagingTier {
     last_unavailable_note: Option<Instant>,
     scope: Option<PassScope>,
     admitted_mounts: Vec<(PathBuf, Duration)>,
+    probe: Option<AdmissionProbe>,
 }
 
 impl RchStagingTier {
@@ -702,8 +758,32 @@ impl RchStagingTier {
         }
     }
 
-    /// Start a pass on its own thread when a base is due. `mounts` maps each
-    /// monitored mount to its pressure level and urgency.
+    /// Consume only a finished probe; never wait on native I/O or join a
+    /// running thread. A revoked or old result cannot authorize a pass.
+    fn poll_probe(&mut self, now: Instant) -> Option<Admission> {
+        let probe = self.probe.as_ref()?;
+        // The monitor captures its tick time before other work. A delayed
+        // caller must not make old evidence look fresh when it reaches us.
+        let observed_now = now.max(Instant::now());
+        if observed_now.saturating_duration_since(probe.started) > ADMISSION_MAX_AGE {
+            probe.stop.store(true, Ordering::Release);
+        }
+        if !probe.worker.is_finished() {
+            return None;
+        }
+        let probe = self.probe.take()?;
+        let current = !probe.stop.load(Ordering::Acquire);
+        let admission = probe.receive.try_recv().ok().flatten();
+        if probe.worker.join().is_err() {
+            eprintln!("[SBH-RCH] admission probe failed");
+            return None;
+        }
+        current.then_some(admission).flatten()
+    }
+
+    /// Start a read-only probe or admit its result using this tick's pressure.
+    /// Filesystem and executable checks never run on the monitor thread.
+    /// `mounts` maps each monitored mount to its pressure level and urgency.
     pub fn tick(
         &mut self,
         now: Instant,
@@ -714,10 +794,15 @@ impl RchStagingTier {
         logger: &ActivityLoggerHandle,
     ) {
         self.update_config(config);
+        let had_probe = self.probe.is_some();
+        let admission = self.poll_probe(now);
         if config.scanner.rch_staging_bases.is_empty()
             || config.scanner.dry_run
             || config.policy.kill_switch
             || mode != ActiveMode::Enforce
+            || !mounts
+                .values()
+                .any(|(level, _)| min_idle_for(*level).is_some())
         {
             self.stop_running_pass();
             return;
@@ -736,14 +821,19 @@ impl RchStagingTier {
             }
             return;
         }
+        if had_probe {
+            if let Some(admission) = admission {
+                self.admit_probe(now, config, platform, mounts, admission, logger);
+            }
+            return;
+        }
         if self
             .last_probe
             .is_some_and(|last| now.saturating_duration_since(last) < PROBE_INTERVAL)
         {
             return;
         }
-        self.last_probe = Some(now);
-        let due: Vec<DueBase> = config
+        let bases: Vec<PathBuf> = config
             .scanner
             .rch_staging_bases
             .iter()
@@ -751,14 +841,65 @@ impl RchStagingTier {
                 self.last_run
                     .get(*base)
                     .is_none_or(|last| now.saturating_duration_since(*last) >= BASE_INTERVAL)
-                    && base.is_dir()
             })
-            .filter_map(|base| {
-                let stats = platform.fs_stats(base).ok()?;
-                let &(level, _) = mounts.get(&stats.mount_point)?;
+            .cloned()
+            .collect();
+        if !bases.is_empty() {
+            self.start_probe(now, config, platform, bases);
+        }
+    }
+
+    fn start_probe(
+        &mut self,
+        now: Instant,
+        config: &Config,
+        platform: &Arc<dyn Platform>,
+        bases: Vec<PathBuf>,
+    ) {
+        self.last_probe = Some(now);
+        self.stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&self.stop);
+        let worker_stop = Arc::clone(&stop);
+        let config = config.clone();
+        let platform = Arc::clone(platform);
+        let (send, receive) = mpsc::sync_channel(1);
+        match std::thread::Builder::new()
+            .name("sbh-rch-probe".to_string())
+            .spawn(move || {
+                let admission = probe_admission(bases, &config, platform.as_ref(), &worker_stop);
+                let _ = send.send(admission);
+            }) {
+            Ok(worker) => {
+                self.probe = Some(AdmissionProbe {
+                    receive,
+                    stop,
+                    started: now,
+                    worker,
+                });
+            }
+            Err(error) => eprintln!("[SBH-RCH] admission probe thread failed to start: {error}"),
+        }
+    }
+
+    /// The probe only identifies mounts. Missing or recovered pressure never
+    /// inherits the level which happened to trigger that probe.
+    fn admit_probe(
+        &mut self,
+        now: Instant,
+        config: &Config,
+        platform: &Arc<dyn Platform>,
+        mounts: &HashMap<PathBuf, (PressureLevel, f64)>,
+        admission: Admission,
+        logger: &ActivityLoggerHandle,
+    ) {
+        let due: Vec<DueBase> = admission
+            .bases
+            .into_iter()
+            .filter_map(|(base, mount)| {
+                let &(level, _) = mounts.get(&mount)?;
                 Some(DueBase {
-                    base: base.clone(),
-                    mount: stats.mount_point,
+                    base,
+                    mount,
                     level,
                     min_idle: min_idle_for(level)?,
                 })
@@ -767,7 +908,7 @@ impl RchStagingTier {
         if due.is_empty() {
             return;
         }
-        let runner = match RchRunner::resolve(config) {
+        let runner = match admission.runner {
             Ok(runner) => runner,
             Err(why) => {
                 if self.last_unavailable_note.is_none_or(|last| {
@@ -856,6 +997,13 @@ impl RchStagingTier {
     #[cfg(test)]
     fn started_since(&self, base: &Path, now: Instant) -> bool {
         self.last_run.get(base).is_some_and(|last| *last >= now)
+    }
+}
+
+impl Drop for RchStagingTier {
+    fn drop(&mut self) {
+        // Do not join a probe or pass that may be stuck in a native syscall.
+        self.stop_running_pass();
     }
 }
 
@@ -974,19 +1122,39 @@ mod tests {
             .collect()
     }
 
-    /// Pause a real worker after its project's fresh dry run, inside the
-    /// safety check immediately preceding `--execute`. The old configuration
-    /// still permits the tree when this call eventually returns.
-    struct PausedReferences {
+    #[derive(Clone, Copy)]
+    enum PauseAt {
+        References,
+        Filesystem,
+    }
+
+    /// Block either the initial admission probe or the final reference check.
+    /// All other observations still come from the healthy mock platform.
+    struct PausedPlatform {
         inner: MockPlatform,
         entered: mpsc::Sender<()>,
         resume: Mutex<mpsc::Receiver<()>>,
         fs_probes: AtomicUsize,
+        pause_at: PauseAt,
     }
 
-    impl Platform for PausedReferences {
+    impl PausedPlatform {
+        fn pause(&self) {
+            self.entered.send(()).unwrap();
+            self.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20))
+                .expect("test must release the blocked platform call");
+        }
+    }
+
+    impl Platform for PausedPlatform {
         fn fs_stats(&self, path: &Path) -> SbhResult<FsStats> {
-            self.fs_probes.fetch_add(1, Ordering::Relaxed);
+            let previous = self.fs_probes.fetch_add(1, Ordering::Relaxed);
+            if matches!(self.pause_at, PauseAt::Filesystem) && previous == 0 {
+                self.pause();
+            }
             self.inner.fs_stats(path)
         }
 
@@ -1011,12 +1179,9 @@ mod tests {
         }
 
         fn process_list(&self) -> SbhResult<Vec<ProcessInfo>> {
-            self.entered.send(()).unwrap();
-            self.resume
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(20))
-                .expect("test must release the active-reference check");
+            if matches!(self.pause_at, PauseAt::References) {
+                self.pause();
+            }
             self.inner.process_list()
         }
 
@@ -1036,7 +1201,7 @@ mod tests {
     struct PausedPass {
         tier: RchStagingTier,
         config: Config,
-        platform: Arc<PausedReferences>,
+        platform: Arc<PausedPlatform>,
         started: Instant,
         root: PathBuf,
         resume: Option<mpsc::Sender<()>>,
@@ -1064,11 +1229,12 @@ mod tests {
             config.scanner.rch_binary = Some(runner.binary.clone());
             let (entered_tx, entered_rx) = mpsc::channel();
             let (resume_tx, resume_rx) = mpsc::channel();
-            let platform = Arc::new(PausedReferences {
+            let platform = Arc::new(PausedPlatform {
                 inner: MockPlatform::healthy(),
                 entered: entered_tx,
                 resume: Mutex::new(resume_rx),
                 fs_probes: AtomicUsize::new(0),
+                pause_at: PauseAt::References,
             });
             let logger = Logger::new();
             let mut tier = RchStagingTier::default();
@@ -1160,8 +1326,281 @@ mod tests {
         }
     }
 
+    struct BlockedAdmission {
+        tier: RchStagingTier,
+        config: Config,
+        platform: Arc<PausedPlatform>,
+        base: PathBuf,
+        started: Instant,
+        resume: Option<mpsc::Sender<()>>,
+        logger: Logger,
+        _dir: tempfile::TempDir,
+    }
+
+    impl BlockedAdmission {
+        fn new() -> Self {
+            let (dir, root) = scratch();
+            let base = root.join("rch");
+            fs::create_dir(&base).unwrap();
+            let mut config = Config::default();
+            config.scanner.rch_staging_bases = vec![base.clone()];
+            config.scanner.rch_binary = Some(PathBuf::from("/usr/bin/false"));
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let platform = Arc::new(PausedPlatform {
+                inner: MockPlatform::healthy(),
+                entered: entered_tx,
+                resume: Mutex::new(resume_rx),
+                fs_probes: AtomicUsize::new(0),
+                pause_at: PauseAt::Filesystem,
+            });
+            let mut probe = Self {
+                tier: RchStagingTier::default(),
+                config,
+                platform,
+                base,
+                started: Instant::now(),
+                resume: Some(resume_tx),
+                logger: Logger::new(),
+                _dir: dir,
+            };
+            probe.tick(probe.started, &mount_at(PressureLevel::Critical));
+            entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("admission worker must reach the filesystem probe");
+            assert!(probe.tier.probe.is_some());
+            assert!(!probe.tier.running.load(Ordering::Acquire));
+            assert!(probe.tier.last_run.is_empty());
+            probe
+        }
+
+        /// Run the monitor call with a bounded response. A regression that
+        /// moves the held filesystem call back to tick fails instead of
+        /// making the test itself wait for the platform gate's timeout.
+        fn tick(&mut self, now: Instant, mounts: &HashMap<PathBuf, (PressureLevel, f64)>) {
+            let mut tier = std::mem::take(&mut self.tier);
+            let config = self.config.clone();
+            let platform: Arc<dyn Platform> = self.platform.clone();
+            let mounts = mounts.clone();
+            let logger = self.logger.handle.clone();
+            let (send, receive) = mpsc::channel();
+            let monitor = std::thread::spawn(move || {
+                tier.tick(
+                    now,
+                    &config,
+                    &platform,
+                    &mounts,
+                    ActiveMode::Enforce,
+                    &logger,
+                );
+                let _ = send.send(tier);
+            });
+            match receive.recv_timeout(Duration::from_secs(3)) {
+                Ok(tier) => self.tier = tier,
+                Err(error) => {
+                    self.release();
+                    let _ = monitor.join();
+                    panic!("monitor waited for the blocked admission probe: {error}");
+                }
+            }
+            monitor.join().unwrap();
+        }
+
+        fn release(&mut self) {
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.send(());
+            }
+        }
+
+        fn finish_probe(&mut self) {
+            self.release();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self
+                .tier
+                .probe
+                .as_ref()
+                .is_some_and(|probe| !probe.worker.is_finished())
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                self.tier
+                    .probe
+                    .as_ref()
+                    .is_some_and(|probe| probe.worker.is_finished())
+            );
+        }
+    }
+
+    impl Drop for BlockedAdmission {
+        fn drop(&mut self) {
+            self.tier.stop_running_pass();
+            self.release();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while (self.tier.running.load(Ordering::Acquire)
+                || self
+                    .tier
+                    .probe
+                    .as_ref()
+                    .is_some_and(|probe| !probe.worker.is_finished()))
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
     fn mount_at(level: PressureLevel) -> HashMap<PathBuf, (PressureLevel, f64)> {
         HashMap::from([(PathBuf::from("/"), (level, 0.8))])
+    }
+
+    fn tick_through_probe(
+        tier: &mut RchStagingTier,
+        now: Instant,
+        config: &Config,
+        platform: &Arc<dyn Platform>,
+        mounts: &HashMap<PathBuf, (PressureLevel, f64)>,
+        mode: ActiveMode,
+        logger: &ActivityLoggerHandle,
+    ) {
+        tier.tick(now, config, platform, mounts, mode, logger);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tier.probe.is_some() {
+            assert!(Instant::now() < deadline, "admission probe did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+            tier.tick(now, config, platform, mounts, mode, logger);
+        }
+    }
+
+    #[test]
+    fn blocked_admission_keeps_monitor_responsive_and_retains_one_worker() {
+        let mut probe = BlockedAdmission::new();
+        let stop = Arc::clone(&probe.tier.stop);
+        for seconds in [1, 61, 181] {
+            probe.tick(
+                probe.started + Duration::from_secs(seconds),
+                &mount_at(PressureLevel::Critical),
+            );
+            assert!(Arc::ptr_eq(&stop, &probe.tier.stop));
+            assert!(probe.tier.probe.is_some());
+            assert!(!probe.tier.running.load(Ordering::Acquire));
+            assert_eq!(probe.platform.fs_probes.load(Ordering::Relaxed), 1);
+        }
+        assert!(stop.load(Ordering::Acquire), "expired evidence is revoked");
+        probe.finish_probe();
+        probe.tick(
+            probe.started + Duration::from_secs(182),
+            &mount_at(PressureLevel::Critical),
+        );
+        assert!(probe.tier.probe.is_none());
+        assert!(probe.tier.last_run.is_empty());
+    }
+
+    #[test]
+    fn a_revoked_admission_probe_cannot_revive_when_reenabled() {
+        let mut probe = BlockedAdmission::new();
+        let stop = Arc::clone(&probe.tier.stop);
+        let original = probe.config.clone();
+        probe.config.scanner.rch_staging_bases.clear();
+        probe.tick(
+            probe.started + Duration::from_secs(1),
+            &mount_at(PressureLevel::Red),
+        );
+        assert!(stop.load(Ordering::Acquire));
+        probe.config = original;
+        probe.tick(
+            probe.started + Duration::from_secs(2),
+            &mount_at(PressureLevel::Red),
+        );
+        assert!(Arc::ptr_eq(&stop, &probe.tier.stop));
+        assert_eq!(probe.platform.fs_probes.load(Ordering::Relaxed), 1);
+        probe.finish_probe();
+        probe.tick(
+            probe.started + Duration::from_secs(3),
+            &mount_at(PressureLevel::Red),
+        );
+        assert!(probe.tier.last_run.is_empty(), "old evidence was discarded");
+        assert!(probe.tier.probe.is_none());
+
+        // A fresh probe is permitted only after the old native worker exits.
+        probe.tick(
+            probe.started + Duration::from_secs(4),
+            &mount_at(PressureLevel::Red),
+        );
+        assert!(!Arc::ptr_eq(&stop, &probe.tier.stop));
+        assert!(stop.load(Ordering::Acquire));
+        probe.finish_probe();
+        let admitted_at = probe.started + Duration::from_secs(5);
+        probe.tick(admitted_at, &mount_at(PressureLevel::Red));
+        assert!(probe.tier.started_since(&probe.base, admitted_at));
+        assert_eq!(probe.platform.fs_probes.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn completed_admission_refuses_recovered_or_missing_mount_pressure() {
+        for level in [Some(PressureLevel::Green), None] {
+            let mut probe = BlockedAdmission::new();
+            let mut mounts = level.map_or_else(HashMap::new, mount_at);
+            mounts.insert(PathBuf::from("/unrelated"), (PressureLevel::Critical, 1.0));
+            probe.tick(probe.started + Duration::from_millis(500), &mounts);
+            probe.finish_probe();
+            probe.tick(probe.started + Duration::from_secs(1), &mounts);
+            assert!(probe.tier.probe.is_none());
+            assert!(probe.tier.last_run.is_empty(), "{level:?}");
+            assert!(!probe.tier.running.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn fresh_admission_uses_current_pressure_to_choose_its_age_cutoff() {
+        let mut probe = BlockedAdmission::new();
+        probe.tick(
+            probe.started + Duration::from_millis(500),
+            &mount_at(PressureLevel::Orange),
+        );
+        probe.finish_probe();
+        let admitted_at = probe.started + Duration::from_secs(1);
+        probe.tick(admitted_at, &mount_at(PressureLevel::Orange));
+        assert!(probe.tier.started_since(&probe.base, admitted_at));
+        assert_eq!(
+            probe.tier.admitted_mounts,
+            [(PathBuf::from("/"), Duration::from_hours(72))],
+            "the initial Critical sample must not supply a 24-hour cutoff"
+        );
+    }
+
+    #[test]
+    fn completed_admission_older_than_a_minute_cannot_start_a_pass() {
+        let mut probe = BlockedAdmission::new();
+        probe.finish_probe();
+        probe.tick(
+            probe.started + ADMISSION_MAX_AGE + Duration::from_millis(1),
+            &mount_at(PressureLevel::Critical),
+        );
+        assert!(probe.tier.probe.is_none());
+        assert!(probe.tier.last_run.is_empty());
+        assert!(!probe.tier.running.load(Ordering::Acquire));
+        assert_eq!(probe.platform.fs_probes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn an_old_tick_timestamp_cannot_refresh_expired_admission_evidence() {
+        let mut probe = BlockedAdmission::new();
+        probe.finish_probe();
+        let expired_start = Instant::now() - ADMISSION_MAX_AGE - Duration::from_secs(1);
+        probe.tier.probe.as_mut().unwrap().started = expired_start;
+        // Simulate a tick captured before unrelated monitor work stalled.
+        // Its timestamp says one second elapsed; real monotonic time says
+        // the admission is already too old. No wall-clock sleep is needed.
+        probe.tick(
+            expired_start + Duration::from_secs(1),
+            &mount_at(PressureLevel::Critical),
+        );
+        assert!(probe.tier.probe.is_none());
+        assert!(probe.tier.last_run.is_empty());
+        assert!(!probe.tier.running.load(Ordering::Acquire));
+        assert_eq!(probe.platform.fs_probes.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1634,7 +2073,15 @@ mod tests {
         let starts = |config: &Config, mounts: &HashMap<_, _>, mode| {
             let mut tier = RchStagingTier::default();
             let now = Instant::now();
-            tier.tick(now, config, &platform, mounts, mode, &logger.handle);
+            tick_through_probe(
+                &mut tier,
+                now,
+                config,
+                &platform,
+                mounts,
+                mode,
+                &logger.handle,
+            );
             tier.started_since(&base, now)
         };
         assert!(starts(&config, &red, ActiveMode::Enforce));
@@ -1665,7 +2112,8 @@ mod tests {
         // One pass per base per interval, however often the loop ticks.
         let mut tier = RchStagingTier::default();
         let first = Instant::now();
-        tier.tick(
+        tick_through_probe(
+            &mut tier,
             first,
             &config,
             &platform,
@@ -1680,7 +2128,8 @@ mod tests {
         }
         assert!(!tier.running.load(Ordering::Acquire));
         let later = first + PROBE_INTERVAL;
-        tier.tick(
+        tick_through_probe(
+            &mut tier,
             later,
             &config,
             &platform,
@@ -1690,7 +2139,8 @@ mod tests {
         );
         assert!(!tier.started_since(&base, later));
         let due = first + BASE_INTERVAL;
-        tier.tick(
+        tick_through_probe(
+            &mut tier,
             due,
             &config,
             &platform,

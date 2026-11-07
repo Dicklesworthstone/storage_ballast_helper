@@ -84,7 +84,7 @@ const PROBE_INTERVAL: Duration = Duration::from_mins(1);
 /// An admission observation must finish inside this window and use a monitor
 /// sample no older than it. A blocked native probe cannot refresh old evidence
 /// merely by eventually returning.
-const PRESSURE_MAX_AGE: Duration = Duration::from_mins(1);
+pub const PRESSURE_MAX_AGE: Duration = Duration::from_mins(1);
 
 /// What one pass found under one root.
 #[derive(Debug, Default)]
@@ -935,7 +935,7 @@ impl TargetTier {
         if self
             .worker
             .as_ref()
-            .is_some_and(|worker| worker.is_finished())
+            .is_some_and(std::thread::JoinHandle::is_finished)
             && let Some(worker) = self.worker.take()
             && worker.join().is_err()
         {

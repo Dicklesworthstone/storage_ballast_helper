@@ -23,7 +23,7 @@ struct Opportunity {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PressureOrder {
+pub struct PressureOrder {
     history: BTreeMap<PathBuf, Opportunity>,
     sequence: u64,
 }

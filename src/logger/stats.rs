@@ -920,28 +920,7 @@ impl<'a> StatsEngine<'a> {
         let most_common = self.most_common_deleted_pattern(since)?;
 
         // Failed deletions, and the same rows grouped by error code.
-        let failures: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM activity_log
-             WHERE event_type = 'artifact_delete' AND success = 0
-               AND timestamp >= ?1",
-            params![since],
-            |row| row.get(0),
-        )?;
-        let failures_by_reason = conn
-            .prepare(
-                "SELECT COALESCE(error_code, 'unknown') AS code, COUNT(*) AS n
-                 FROM activity_log
-                 WHERE event_type = 'artifact_delete' AND success = 0
-                   AND timestamp >= ?1
-                 GROUP BY code ORDER BY n DESC, code ASC",
-            )?
-            .query_map(params![since], |row| {
-                Ok(FailureReason {
-                    code: row.get(0)?,
-                    count: row.get::<_, i64>(1).map_or(0, |n| n.max(0) as u64),
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let (failures, failures_by_reason) = self.deletion_failures(since)?;
 
         // Age at deletion comes from the evidence ledger: the decision that
         // approved each deletion recorded the candidate's age.
@@ -974,6 +953,34 @@ impl<'a> StatsEngine<'a> {
             failures: failures.max(0) as u64,
             failures_by_reason,
         })
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    fn deletion_failures(&self, since: &str) -> Result<(i64, Vec<FailureReason>)> {
+        let conn = self.db.connection();
+        let failures = conn.query_row(
+            "SELECT COUNT(*) FROM activity_log
+             WHERE event_type = 'artifact_delete' AND success = 0
+               AND timestamp >= ?1",
+            params![since],
+            |row| row.get(0),
+        )?;
+        let failures_by_reason = conn
+            .prepare(
+                "SELECT COALESCE(error_code, 'unknown') AS code, COUNT(*) AS n
+                 FROM activity_log
+                 WHERE event_type = 'artifact_delete' AND success = 0
+                   AND timestamp >= ?1
+                 GROUP BY code ORDER BY n DESC, code ASC",
+            )?
+            .query_map(params![since], |row| {
+                Ok(FailureReason {
+                    code: row.get(0)?,
+                    count: row.get::<_, i64>(1).map_or(0, |n| n.max(0) as u64),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok((failures, failures_by_reason))
     }
 
     fn most_common_deleted_pattern(&self, since: &str) -> Result<Option<String>> {

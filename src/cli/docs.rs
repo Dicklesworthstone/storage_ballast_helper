@@ -1818,9 +1818,23 @@ fn daemon_constants() -> Vec<ConstantDoc> {
         ),
         constant(
             "daemon",
+            "TARGET_ROOT_PROBE_SECS",
+            crate::daemon::target_tier::PRESSURE_MAX_AGE.as_secs(),
+            "Seconds target root admission and monitor pressure evidence stay fresh",
+            "src/daemon/target_tier.rs",
+        ),
+        constant(
+            "daemon",
             "RCH_STAGING_PASS_MINUTES",
             crate::daemon::rch_staging::BASE_INTERVAL.as_secs() / 60,
             "Shortest gap between two rch staging passes over one base",
+            "src/daemon/rch_staging.rs",
+        ),
+        constant(
+            "daemon",
+            "RCH_STAGING_PROBE_SECS",
+            crate::daemon::rch_staging::ADMISSION_MAX_AGE.as_secs(),
+            "Seconds staging admission evidence stays fresh including delivery",
             "src/daemon/rch_staging.rs",
         ),
         constant(

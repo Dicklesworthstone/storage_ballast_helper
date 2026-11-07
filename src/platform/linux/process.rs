@@ -159,6 +159,7 @@ fn cached_process_clock(
     {
         *current = Some((deadline, clock));
     }
+    drop(current);
     Ok(clock)
 }
 

@@ -102,7 +102,7 @@ impl Outcome {
 }
 
 /// The inclusive window of resolved outcomes used for category calibration.
-pub const REGRET_EVIDENCE_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+pub const REGRET_EVIDENCE_WINDOW: Duration = Duration::from_hours(720);
 
 /// One category observation with its original wall-clock time. Ingestion time
 /// must not extend the useful life of evidence read from the ledger.
