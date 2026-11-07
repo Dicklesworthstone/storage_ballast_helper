@@ -33,7 +33,7 @@ use crate::platform::pal::{
 use crate::platform::types::{
     Capacity, ExecutablesResult, FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion,
     MemoryPressure, MemoryPressureCallback, MountInfo, OpenFilesResult, ProcessInfo, ProcessIo,
-    SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
+    ProcessIoSnapshot, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
 };
 use crate::tuning::writeback::WritebackState;
 
@@ -384,6 +384,14 @@ impl Platform for TestOverlayPlatform {
 
     fn process_list_brief(&self) -> Result<Vec<ProcessInfo>> {
         self.inner.process_list_brief()
+    }
+
+    fn process_ids(&self, deadline: Instant) -> Result<Vec<i32>> {
+        self.inner.process_ids(deadline)
+    }
+
+    fn process_io_snapshot(&self, pid: i32, deadline: Instant) -> Result<ProcessIoSnapshot> {
+        self.inner.process_io_snapshot(pid, deadline)
     }
 
     fn process_io(&self, pid: i32) -> Result<ProcessIo> {

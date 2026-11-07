@@ -346,6 +346,16 @@ pub struct ProcessIo {
     pub bytes_written_recent_15m: Option<u64>,
 }
 
+/// I/O counters bracketed by matching native process identities.
+///
+/// Unlike an inventory entry, this sample requires a known start time and
+/// proves that the same process existed before and after the counter read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIoSnapshot {
+    pub io: ProcessIo,
+    pub start_time_unix_ms: i64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OpenFileKind {
     Regular,

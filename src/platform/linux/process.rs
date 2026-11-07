@@ -4,12 +4,18 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use parking_lot::RwLock;
 
 use crate::core::errors::{Result, SbhError};
 use crate::core::paths::resolve_absolute_path;
+use crate::platform::pal::{
+    check_process_sampling_deadline, sample_process_io_with_identity,
+};
 use crate::platform::types::{
     ExecutablesResult, MappedRegion, OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET, OpenFileKind,
-    OpenFileMode, OpenFilesResult, PalError, ProcessInfo, ProcessIo, SelfStats,
+    OpenFileMode, OpenFilesResult, PalError, ProcessInfo, ProcessIo, ProcessIoSnapshot, SelfStats,
 };
 
 const PROC_SELF_STATUS: &str = "/proc/self/status";
@@ -39,8 +45,150 @@ struct IoCounters {
     bytes_written: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProcessClock {
+    boot_time_unix_ms: i64,
+    ticks_per_second: u64,
+}
+
+/// Every selected PID in a pass shares its exact deadline. Retain successful
+/// boot conversion only for that pass: wall-clock adjustments can change btime,
+/// and full process inventories independently read the current value.
+#[derive(Debug, Default)]
+pub(super) struct ProcessClockCache {
+    current: RwLock<Option<(Instant, ProcessClock)>>,
+}
+
 pub(super) fn read_process_list() -> Result<Vec<ProcessInfo>> {
     read_processes(true)
+}
+
+/// Enumerate PID names without reading stat, cwd, executable or argv data.
+/// Returning a partial inventory would restart the rotating sampler against
+/// an arbitrary directory prefix, so deadline exhaustion fails the pass.
+pub(super) fn read_process_ids(deadline: Instant) -> Result<Vec<i32>> {
+    check_process_sampling_deadline("linux", "process_ids", deadline)?;
+    let mut entries = fs::read_dir(PROC_ROOT).map_err(|source| SbhError::Io {
+        path: PathBuf::from(PROC_ROOT),
+        source,
+    })?;
+    let current_pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
+    let mut pids = Vec::new();
+    loop {
+        check_process_sampling_deadline("linux", "process_ids", deadline)?;
+        let Some(entry) = entries.next() else {
+            break;
+        };
+        let entry = entry.map_err(|source| SbhError::Io {
+            path: PathBuf::from(PROC_ROOT),
+            source,
+        })?;
+        if let Some(pid) = pid_from_proc_entry_name(&entry.file_name().to_string_lossy())
+            && pid > 0
+            && pid != current_pid
+        {
+            pids.push(pid);
+        }
+    }
+    check_process_sampling_deadline("linux", "process_ids", deadline)?;
+    Ok(pids)
+}
+
+pub(super) fn read_process_io_snapshot(
+    pid: i32,
+    deadline: Instant,
+    clock_cache: &ProcessClockCache,
+) -> Result<ProcessIoSnapshot> {
+    check_process_sampling_deadline("linux", "process_io_snapshot", deadline)?;
+    let clock = cached_process_clock(clock_cache, deadline, |cached_ticks| {
+        check_process_sampling_deadline("linux", "process_io_snapshot", deadline)?;
+        let boot_time_unix_ms = parse_proc_boot_time_unix_ms(&read_proc_file(PROC_STAT)?)?;
+        check_process_sampling_deadline("linux", "process_io_snapshot", deadline)?;
+        let ticks_per_second = match cached_ticks {
+            Some(ticks) => ticks,
+            None => nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
+                .ok()
+                .flatten()
+                .and_then(|ticks| u64::try_from(ticks).ok())
+                .filter(|ticks| *ticks > 0)
+                .ok_or_else(|| {
+                    process_parse_error("process_io_snapshot", "clock tick rate unavailable")
+                })?,
+        };
+        if boot_time_unix_ms < 0 || boot_time_unix_ms == i64::MAX {
+            return Err(process_parse_error(
+                "process_io_snapshot",
+                "invalid boot time",
+            ));
+        }
+        Ok(ProcessClock {
+            boot_time_unix_ms,
+            ticks_per_second,
+        })
+    })?;
+    sample_process_io_with_identity(
+        "linux",
+        pid,
+        deadline,
+        || {
+            let path = pid_proc_path(pid).join("stat");
+            let raw = fs::read_to_string(&path)
+                .map_err(|source| SbhError::Io { path, source })?;
+            process_identity_from_stat(pid, &raw, clock)
+        },
+        || read_process_io(pid),
+    )
+}
+
+fn cached_process_clock(
+    cache: &ProcessClockCache,
+    deadline: Instant,
+    read: impl FnOnce(Option<u64>) -> Result<ProcessClock>,
+) -> Result<ProcessClock> {
+    let previous = *cache.current.read();
+    if let Some((cached_deadline, clock)) = previous
+        && cached_deadline == deadline
+    {
+        return Ok(clock);
+    }
+    // Never hold the cache lock during /proc or sysconf I/O, and never serve
+    // the previous pass's btime if a fresh read fails. CLK_TCK is stable and
+    // may be reused from the last successful conversion.
+    let clock = read(previous.map(|(_, clock)| clock.ticks_per_second))?;
+    let mut current = cache.current.write();
+    if current
+        .as_ref()
+        .is_none_or(|(cached_deadline, _)| *cached_deadline <= deadline)
+    {
+        *current = Some((deadline, clock));
+    }
+    Ok(clock)
+}
+
+fn process_identity_from_stat(
+    pid: i32,
+    raw: &str,
+    clock: ProcessClock,
+) -> Result<(u64, i64)> {
+    let observed_pid = raw
+        .split_once('(')
+        .and_then(|(prefix, _)| prefix.trim().parse::<i32>().ok());
+    if observed_pid != Some(pid) {
+        return Err(process_parse_error(
+            "process_io_snapshot",
+            "stat PID did not match the selected process",
+        ));
+    }
+    let fields = proc_stat_fields_after_comm(raw)?;
+    let start_ticks = parse_stat_tick_field(&fields, 19, "starttime")?;
+    let start_ms = u128::from(start_ticks)
+        .checked_mul(1_000)
+        .and_then(|millis| millis.checked_div(u128::from(clock.ticks_per_second)))
+        .and_then(|millis| i64::try_from(millis).ok())
+        .and_then(|millis| clock.boot_time_unix_ms.checked_add(millis))
+        .filter(|millis| *millis >= 0)
+        .ok_or_else(|| process_parse_error("process_io_snapshot", "invalid process start time"))?;
+    Ok((start_ticks, start_ms))
 }
 
 /// The process list without reading any process's `cmdline`, which takes
@@ -568,14 +716,149 @@ fn process_parse_error(method: &'static str, details: impl Into<String>) -> SbhE
 #[cfg(test)]
 mod tests {
     use super::{
-        brief_process_info, mapped_region_from_maps_line, parse_fdinfo_flags,
+        ProcessClock, ProcessClockCache, brief_process_info, cached_process_clock,
+        mapped_region_from_maps_line, parse_fdinfo_flags,
         parse_proc_boot_time_unix_ms, parse_proc_io, parse_proc_self_stat, parse_proc_self_status,
-        parse_proc_start_time_unix_ms, read_executables_under, read_mmap_regions_under,
-        read_open_files_under, read_process_io, read_process_list, read_process_list_brief,
+        parse_proc_start_time_unix_ms, process_identity_from_stat, read_executables_under,
+        read_mmap_regions_under, read_open_files_under, read_process_ids, read_process_io,
+        read_process_io_snapshot, read_process_list, read_process_list_brief,
         read_process_list_without_command_lines, read_self_stats, ticks_to_micros,
     };
     use crate::core::paths::resolve_absolute_path;
     use crate::platform::types::{OpenFileKind, OpenFileMode};
+
+    #[test]
+    fn sampled_identity_retains_raw_start_ticks_and_rejects_wrong_pid() {
+        let raw =
+            "12345 (sbh worker thread) S 1 2 3 4 5 6 7 8 9 10 345 67 0 0 20 0 1 0 12345";
+        let clock = ProcessClock {
+            boot_time_unix_ms: 1_700_000_000_000,
+            ticks_per_second: 100,
+        };
+        assert_eq!(
+            process_identity_from_stat(12345, raw, clock).unwrap(),
+            (12345, 1_700_000_123_450)
+        );
+        assert!(process_identity_from_stat(999, raw, clock).is_err());
+        assert!(
+            process_identity_from_stat(
+                12345,
+                raw,
+                ProcessClock {
+                    ticks_per_second: 0,
+                    ..clock
+                },
+            )
+            .is_err()
+        );
+        assert!(process_identity_from_stat(12345, "12345 (short) S", clock).is_err());
+    }
+
+    #[test]
+    fn process_clock_cache_retries_errors_and_reuses_only_successes() {
+        let cache = ProcessClockCache::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let error = cached_process_clock(&cache, deadline, |ticks| {
+            assert_eq!(ticks, None);
+            Err(super::process_parse_error("test", "transient boot read failure"))
+        });
+        assert!(error.is_err());
+        assert!(cache.current.read().is_none());
+
+        let expected = ProcessClock {
+            boot_time_unix_ms: 1_700_000_000_000,
+            ticks_per_second: 100,
+        };
+        assert_eq!(
+            cached_process_clock(&cache, deadline, |ticks| {
+                assert_eq!(ticks, None);
+                Ok(expected)
+            })
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            cached_process_clock(&cache, deadline, |_| {
+                panic!("successful boot context must be reused throughout the pass")
+            })
+            .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn each_sampling_pass_refreshes_btime_without_losing_validated_tick_rate() {
+        use std::time::{Duration, Instant};
+
+        let cache = ProcessClockCache::default();
+        let first_pass = Instant::now() + Duration::from_secs(60);
+        let original = ProcessClock {
+            boot_time_unix_ms: 1_700_000_000_000,
+            ticks_per_second: 100,
+        };
+        cached_process_clock(&cache, first_pass, |_| Ok(original)).unwrap();
+        let next_pass = first_pass + Duration::from_secs(30);
+        assert!(
+            cached_process_clock(&cache, next_pass, |ticks| {
+                assert_eq!(ticks, Some(100));
+                Err(super::process_parse_error("test", "temporary btime failure"))
+            })
+            .is_err(),
+            "a failed refresh must not serve the previous pass's boot time"
+        );
+
+        let adjusted = ProcessClock {
+            boot_time_unix_ms: original.boot_time_unix_ms + 5_000,
+            ..original
+        };
+        let refreshed = cached_process_clock(&cache, next_pass, |ticks| {
+            assert_eq!(ticks, Some(100));
+            Ok(adjusted)
+        })
+        .unwrap();
+        assert_eq!(refreshed, adjusted);
+        assert_eq!(
+            cached_process_clock(&cache, next_pass, |_| panic!("same pass must share btime"))
+                .unwrap(),
+            adjusted
+        );
+
+        let raw =
+            "12345 (sbh worker thread) S 1 2 3 4 5 6 7 8 9 10 345 67 0 0 20 0 1 0 12345";
+        let (_, sampled_start) = process_identity_from_stat(12345, raw, refreshed).unwrap();
+        assert_eq!(
+            sampled_start,
+            parse_proc_start_time_unix_ms(raw, adjusted.boot_time_unix_ms, 100).unwrap(),
+            "the refreshed key must match independently collected ProcessInfo"
+        );
+        assert_eq!(
+            sampled_start - process_identity_from_stat(12345, raw, original).unwrap().1,
+            5_000
+        );
+    }
+
+    #[test]
+    fn native_selected_io_sample_has_identity_and_respects_expired_deadline() {
+        use std::time::{Duration, Instant};
+
+        let cache = ProcessClockCache::default();
+        let pid = i32::try_from(std::process::id()).unwrap();
+        assert!(read_process_ids(Instant::now()).is_err());
+        assert!(read_process_io_snapshot(pid, Instant::now(), &cache).is_err());
+        assert!(
+            cache.current.read().is_none(),
+            "expired work must not initialize the clock"
+        );
+
+        let sample =
+            read_process_io_snapshot(pid, Instant::now() + Duration::from_secs(60), &cache)
+                .expect("current process should have readable identity and counters");
+        assert_eq!(sample.io.pid, pid);
+        assert!(sample.start_time_unix_ms > 0);
+        assert!(cache.current.read().is_some());
+        let pids = read_process_ids(Instant::now() + Duration::from_secs(60)).unwrap();
+        assert!(pids.iter().all(|&visible| visible > 0 && visible != pid));
+    }
 
     #[test]
     fn parses_proc_status_memory_fields() {

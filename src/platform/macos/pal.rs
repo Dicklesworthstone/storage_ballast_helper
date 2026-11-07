@@ -21,14 +21,14 @@ use crate::platform::macos::sys::{
 };
 use crate::platform::pal::{
     FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
-    verify_preallocated_blocks,
+    check_process_sampling_deadline, sample_process_io_with_identity, verify_preallocated_blocks,
 };
 use crate::platform::types::{
     Capacity, ExecutablesResult, FullDiskAccessState, FullDiskAccessStatus, LocalSnapshotInfo,
     MappedRegion, MemoryPressure, MemoryPressureCallback, MemoryPressureLevel, MountInfo,
     OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET, OpenFile, OpenFileKind, OpenFileMode,
-    OpenFilesResult, PalError, ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind,
-    SnapshotThinningEstimate, SubscriptionHandle,
+    OpenFilesResult, PalError, ProcessInfo, ProcessIo, ProcessIoSnapshot, SacredPath, SelfStats,
+    ServiceKind, SnapshotThinningEstimate, SubscriptionHandle,
 };
 use parking_lot::RwLock;
 
@@ -196,6 +196,50 @@ impl Platform for MacOsPal {
             .filter_map(process_info_for_pid_without_command_line)
             .collect();
         Ok(processes)
+    }
+
+    fn process_ids(&self, deadline: Instant) -> Result<Vec<i32>> {
+        check_process_sampling_deadline("macos", "process_ids", deadline)?;
+        let mut pids = proc_listpids_safe()
+            .map_err(|error| macos_method_error("process_ids", &error))?;
+        check_process_sampling_deadline("macos", "process_ids", deadline)?;
+        let current_pid = current_process_pid();
+        pids.retain(|pid| *pid > 0 && *pid != current_pid);
+        check_process_sampling_deadline("macos", "process_ids", deadline)?;
+        Ok(pids)
+    }
+
+    fn process_io_snapshot(&self, pid: i32, deadline: Instant) -> Result<ProcessIoSnapshot> {
+        sample_process_io_with_identity(
+            "macos",
+            pid,
+            deadline,
+            || {
+                let raw = proc_pidinfo_task_all(pid)
+                    .map_err(|error| macos_method_error("process_io_snapshot", &error))?;
+                if positive_pid(raw.pbsd.pbi_pid.0) != Some(pid)
+                    || raw.pbsd.pbi_start_tvusec >= 1_000_000
+                {
+                    return Err(PalError::method_failed(
+                        "macos",
+                        "process_io_snapshot",
+                        "invalid process identity",
+                    )
+                    .into());
+                }
+                let seconds = raw.pbsd.pbi_start_tvsec;
+                let micros = raw.pbsd.pbi_start_tvusec;
+                let start = start_time_unix_ms(seconds, micros).ok_or_else(|| {
+                    PalError::method_failed(
+                        "macos",
+                        "process_io_snapshot",
+                        "process start time unavailable",
+                    )
+                })?;
+                Ok(((seconds, micros), start))
+            },
+            || self.process_io(pid),
+        )
     }
 
     fn build_directories_in_use(&self) -> Vec<(i32, PathBuf)> {
@@ -1228,6 +1272,30 @@ mod tests {
         let platform = MacOsPal::new();
         assert_platform(&platform);
         assert_eq!(platform.name(), "macos");
+    }
+
+    #[test]
+    fn process_io_snapshot_brackets_native_identity_without_full_inventory() {
+        use std::time::Instant;
+
+        let platform = MacOsPal::new();
+        let pid = super::current_process_pid();
+        assert!(platform.process_ids(Instant::now()).is_err());
+        assert!(platform.process_io_snapshot(pid, Instant::now()).is_err());
+
+        let sample = platform
+            .process_io_snapshot(pid, Instant::now() + Duration::from_secs(60))
+            .expect("current process should expose stable identity and I/O");
+        let raw = super::proc_pidinfo_task_all(pid).unwrap();
+        assert_eq!(sample.io.pid, pid);
+        assert_eq!(
+            Some(sample.start_time_unix_ms),
+            super::start_time_unix_ms(raw.pbsd.pbi_start_tvsec, raw.pbsd.pbi_start_tvusec)
+        );
+        let pids = platform
+            .process_ids(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        assert!(pids.iter().all(|&visible| visible > 0 && visible != pid));
     }
 
     #[test]

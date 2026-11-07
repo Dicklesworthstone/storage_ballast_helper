@@ -26,7 +26,8 @@ use crate::platform::sacred_catalog::cross_platform_sacred_paths;
 #[cfg(target_os = "linux")]
 use crate::platform::types::{
     ExecutablesResult, MemoryPressure, MemoryPressureCallback, OpenFilesResult, PalError,
-    ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
+    ProcessInfo, ProcessIo, ProcessIoSnapshot, SacredPath, SelfStats, ServiceKind,
+    SubscriptionHandle,
 };
 
 #[cfg(target_os = "linux")]
@@ -48,6 +49,7 @@ pub mod writeback;
 pub struct LinuxPal {
     mounts_cache: RwLock<Option<(Vec<MountPoint>, Instant)>>,
     cache_ttl: Duration,
+    process_clock: process::ProcessClockCache,
 }
 
 #[cfg(target_os = "linux")]
@@ -64,6 +66,7 @@ impl LinuxPal {
         Self {
             mounts_cache: RwLock::new(None),
             cache_ttl: Duration::from_secs(5),
+            process_clock: process::ProcessClockCache::default(),
         }
     }
 
@@ -191,6 +194,14 @@ impl Platform for LinuxPal {
 
     fn process_list_brief(&self) -> Result<Vec<ProcessInfo>> {
         process::read_process_list_brief()
+    }
+
+    fn process_ids(&self, deadline: Instant) -> Result<Vec<i32>> {
+        process::read_process_ids(deadline)
+    }
+
+    fn process_io_snapshot(&self, pid: i32, deadline: Instant) -> Result<ProcessIoSnapshot> {
+        process::read_process_io_snapshot(pid, deadline, &self.process_clock)
     }
 
     fn process_io(&self, pid: i32) -> Result<ProcessIo> {

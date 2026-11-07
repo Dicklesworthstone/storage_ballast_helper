@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -14,8 +15,8 @@ use crate::core::errors::{Result, SbhError};
 use crate::platform::types::{
     Capacity, ExecutablesResult, FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion,
     MemoryPressure, MemoryPressureCallback, MemoryPressureLevel, MountInfo, OpenFile,
-    OpenFilesResult, PalError, ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind,
-    SubscriptionHandle,
+    OpenFilesResult, PalError, ProcessInfo, ProcessIo, ProcessIoSnapshot, SacredPath, SelfStats,
+    ServiceKind, SubscriptionHandle,
 };
 
 /// Filesystem statistics for a path/mount.
@@ -226,6 +227,58 @@ impl Default for PlatformPaths {
 
 fn pal_not_implemented<T>(os_name: &'static str, method_name: &'static str) -> Result<T> {
     Err(PalError::not_implemented(os_name, method_name).into())
+}
+
+/// Bound optional process telemetry without changing mutation-safety inventories.
+/// A native operation already in progress cannot be preempted; callers check
+/// again before starting the next operation.
+pub(crate) fn check_process_sampling_deadline(
+    os_name: &'static str,
+    method: &'static str,
+    deadline: Instant,
+) -> Result<()> {
+    if Instant::now() >= deadline {
+        return Err(PalError::method_failed(os_name, method, "sampling deadline expired").into());
+    }
+    Ok(())
+}
+
+/// Read counters only between matching native identities. Native readers use
+/// their unrounded start token as `I`, so converting a token to milliseconds
+/// cannot hide an identity change during the counter read.
+pub(crate) fn sample_process_io_with_identity<I: Eq>(
+    os_name: &'static str,
+    pid: i32,
+    deadline: Instant,
+    mut read_identity: impl FnMut() -> Result<(I, i64)>,
+    read_io: impl FnOnce() -> Result<ProcessIo>,
+) -> Result<ProcessIoSnapshot> {
+    const METHOD: &str = "process_io_snapshot";
+    if pid <= 0 {
+        return Err(PalError::method_failed(os_name, METHOD, "PID must be positive").into());
+    }
+    check_process_sampling_deadline(os_name, METHOD, deadline)?;
+    let (before, start_time_unix_ms) = read_identity()?;
+    if start_time_unix_ms < 0 {
+        return Err(PalError::method_failed(os_name, METHOD, "unknown process start time").into());
+    }
+    check_process_sampling_deadline(os_name, METHOD, deadline)?;
+    let io = read_io()?;
+    check_process_sampling_deadline(os_name, METHOD, deadline)?;
+    let (after, after_start_time) = read_identity()?;
+    check_process_sampling_deadline(os_name, METHOD, deadline)?;
+    if before != after || start_time_unix_ms != after_start_time || io.pid != pid {
+        return Err(PalError::method_failed(
+            os_name,
+            METHOD,
+            "process identity changed while reading I/O counters",
+        )
+        .into());
+    }
+    Ok(ProcessIoSnapshot {
+        io,
+        start_time_unix_ms,
+    })
 }
 
 pub(crate) fn verify_preallocated_blocks(
@@ -446,12 +499,26 @@ pub trait Platform: Send + Sync {
 
     /// [`Self::process_list_without_command_lines`] cut to what one
     /// `/proc/<pid>/stat` read gives on Linux: pid, parent, name, start time
-    /// and CPU times, with no executable, cwd or memory counters. For a
-    /// sampler that keys processes by (pid, start time): the full list reads
-    /// three files and two links per process, every 30 s on the monitor
-    /// thread for the I/O history (~2,000 processes on trj, bd-du48).
+    /// and CPU times, with no executable, cwd or memory counters. Callers that
+    /// need every process's metadata may use this; bounded I/O telemetry uses
+    /// `process_ids` and selected `process_io_snapshot` probes instead.
     fn process_list_brief(&self) -> Result<Vec<ProcessInfo>> {
         self.process_list_without_command_lines()
+    }
+
+    /// PID-only inventory for optional, bounded I/O telemetry. This must not
+    /// read per-process metadata or replace any complete safety inventory.
+    /// An incomplete deadline-limited inventory is an error.
+    fn process_ids(&self, _deadline: Instant) -> Result<Vec<i32>> {
+        pal_not_implemented(self.name(), "process_ids")
+    }
+
+    /// Counters for one selected PID, bracketed by equal native start tokens.
+    /// Unknown, exited or reused identities must fail; no fallback to separate
+    /// inventory and counter reads is safe. Do not start another native probe
+    /// once the supplied deadline has expired.
+    fn process_io_snapshot(&self, _pid: i32, _deadline: Instant) -> Result<ProcessIoSnapshot> {
+        pal_not_implemented(self.name(), "process_io_snapshot")
     }
 
     fn process_io(&self, _pid: i32) -> Result<ProcessIo> {
@@ -957,6 +1024,42 @@ impl Platform for MockPlatform {
         Ok(self.processes.clone())
     }
 
+    fn process_ids(&self, deadline: Instant) -> Result<Vec<i32>> {
+        check_process_sampling_deadline(self.name(), "process_ids", deadline)?;
+        let mut pids = Vec::with_capacity(self.processes.len());
+        for process in &self.processes {
+            check_process_sampling_deadline(self.name(), "process_ids", deadline)?;
+            if process.pid > 0 {
+                pids.push(process.pid);
+            }
+        }
+        Ok(pids)
+    }
+
+    fn process_io_snapshot(&self, pid: i32, deadline: Instant) -> Result<ProcessIoSnapshot> {
+        sample_process_io_with_identity(
+            self.name(),
+            pid,
+            deadline,
+            || {
+                let start = self
+                    .processes
+                    .iter()
+                    .find(|process| process.pid == pid)
+                    .and_then(|process| process.start_time_unix_ms)
+                    .ok_or_else(|| {
+                        PalError::method_failed(
+                            self.name(),
+                            "process_io_snapshot",
+                            "mock process identity unavailable",
+                        )
+                    })?;
+                Ok((start, start))
+            },
+            || self.process_io(pid),
+        )
+    }
+
     fn process_io(&self, pid: i32) -> Result<ProcessIo> {
         self.process_io
             .get(&pid)
@@ -1188,12 +1291,119 @@ fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'a MountPoin
 
 #[cfg(test)]
 mod tests {
-    use super::{InodeStats, MockPlatform, Platform, ServiceKind};
+    use super::{
+        InodeStats, MockPlatform, Platform, ServiceKind, sample_process_io_with_identity,
+    };
     use crate::platform::types::{
         MappedRegion, OpenFile, OpenFileKind, OpenFileMode, ProcessInfo, ProcessIo, SacredPath,
         SacredPathKind, SacredPathSource,
     };
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    fn sampled_io(pid: i32) -> ProcessIo {
+        ProcessIo {
+            pid,
+            bytes_read_total: 10,
+            bytes_written_total: 20,
+            bytes_read_recent_15m: None,
+            bytes_written_recent_15m: None,
+        }
+    }
+
+    #[test]
+    fn io_snapshot_requires_identity_on_both_sides_of_the_counter_read() {
+        use std::cell::Cell;
+
+        let reads = Cell::new(0);
+        let io_read = Cell::new(false);
+        let snapshot = sample_process_io_with_identity(
+            "test",
+            42,
+            Instant::now() + Duration::from_secs(60),
+            || {
+                let seen = reads.get();
+                assert_eq!(io_read.get(), seen != 0);
+                reads.set(seen + 1);
+                Ok((123_u64, 456_i64))
+            },
+            || {
+                assert_eq!(reads.get(), 1);
+                io_read.set(true);
+                Ok(sampled_io(42))
+            },
+        )
+        .unwrap();
+        assert_eq!(reads.get(), 2);
+        assert_eq!(snapshot.start_time_unix_ms, 456);
+        assert_eq!(snapshot.io.bytes_written_total, 20);
+    }
+
+    #[test]
+    fn io_snapshot_rejects_reused_pid_even_when_start_milliseconds_match() {
+        let mut identities = [(123_u64, 456_i64), (124, 456)].into_iter();
+        let result = sample_process_io_with_identity(
+            "test",
+            42,
+            Instant::now() + Duration::from_secs(60),
+            || Ok(identities.next().unwrap()),
+            || Ok(sampled_io(42)),
+        );
+        assert!(result.is_err());
+
+        let mut reads = 0;
+        let result = sample_process_io_with_identity(
+            "test",
+            42,
+            Instant::now() + Duration::from_secs(60),
+            || {
+                reads += 1;
+                if reads == 1 {
+                    Ok((123_u64, 456_i64))
+                } else {
+                    Err(crate::platform::types::PalError::method_failed(
+                        "test",
+                        "identity",
+                        "process exited",
+                    )
+                    .into())
+                }
+            },
+            || Ok(sampled_io(42)),
+        );
+        assert!(result.is_err());
+        assert_eq!(reads, 2);
+    }
+
+    #[test]
+    fn io_snapshot_unknown_identity_and_expired_budget_do_not_read_counters() {
+        let result = sample_process_io_with_identity(
+            "test",
+            42,
+            Instant::now() + Duration::from_secs(60),
+            || Ok((123_u64, -1_i64)),
+            || panic!("unknown identity must not read counters"),
+        );
+        assert!(result.is_err());
+
+        let result = sample_process_io_with_identity::<u64>(
+            "test",
+            42,
+            Instant::now(),
+            || panic!("expired budget must not read identity"),
+            || panic!("expired budget must not read counters"),
+        );
+        assert!(result.is_err());
+
+        let result = sample_process_io_with_identity(
+            "test",
+            42,
+            Instant::now() + Duration::from_secs(60),
+            || Ok((123_u64, 456_i64)),
+            || Ok(sampled_io(99)),
+        );
+        assert!(result.is_err());
+    }
 
     #[test]
     fn inode_stats_require_finite_consistent_counters() {

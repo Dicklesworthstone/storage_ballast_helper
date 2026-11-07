@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::errors::Result;
 use crate::platform::pal::Platform;
-use crate::platform::types::{ProcessInfo, ProcessIo};
+use crate::platform::types::ProcessIo;
 
 mod snapshot;
 
@@ -148,12 +148,13 @@ impl ProcessIoHistory {
         }
 
         self.last_sample_at = Some(now);
+        let deadline = Instant::now() + SAMPLE_TIME_BUDGET;
         let collected_at_unix_ms = unix_time_ms();
         self.prune_history(collected_at_unix_ms);
-        // Runs on the monitor thread: no argv reads, which can block behind
-        // another process's memory-map lock. Only pid and start time are
-        // used, so the brief list (one stat read per process) is enough.
-        let processes = match platform.process_list_brief() {
+        // Inventory is names only. Start its budget before enumeration, then
+        // read identity and counters only for the selected slice of the sweep.
+        // The same deadline follows every native probe in that slice.
+        let processes = match platform.process_ids(deadline) {
             Ok(processes) => processes,
             Err(error) => {
                 return (
@@ -173,7 +174,7 @@ impl ProcessIoHistory {
             platform,
             processes,
             collected_at_unix_ms,
-            Instant::now() + SAMPLE_TIME_BUDGET,
+            deadline,
         );
         let persist_due = self
             .last_persist_at
@@ -194,10 +195,13 @@ impl ProcessIoHistory {
     fn sample_processes(
         &mut self,
         platform: &dyn Platform,
-        mut processes: Vec<ProcessInfo>,
+        mut processes: Vec<i32>,
         collected_at_unix_ms: i64,
         deadline: Instant,
     ) -> ProcessIoHistoryReport {
+        processes.retain(|pid| *pid > 0);
+        processes.sort_unstable();
+        processes.dedup();
         let mut report = ProcessIoHistoryReport {
             sampled: true,
             pids_seen: processes.len(),
@@ -205,43 +209,47 @@ impl ProcessIoHistory {
             pid_errors: 0,
             persisted: false,
         };
-        processes.sort_unstable_by_key(|process| process.pid);
-        let mut start = self.last_sampled_pid.map_or(0, |pid| {
-            processes.partition_point(|process| process.pid <= pid)
-        });
-        let mut end = self.sweep_upper_pid.map_or(0, |pid| {
-            processes.partition_point(|process| process.pid <= pid)
-        });
+        let mut start = self
+            .last_sampled_pid
+            .map_or(0, |pid| processes.partition_point(|process| *process <= pid));
+        let mut end = self
+            .sweep_upper_pid
+            .map_or(0, |pid| processes.partition_point(|process| *process <= pid));
         let upper_pid = if self.sweep_upper_pid.is_none() || start >= end {
             // A fixed upper boundary makes the sweep finite even when new
             // higher PIDs arrive faster than we can sample. Also restart when
             // the old boundary PID (and all remaining peers) has exited.
             start = 0;
             end = processes.len();
-            processes.last().map(|process| process.pid)
+            processes.last().copied()
         } else {
             self.sweep_upper_pid
         };
         // Do not wrap within a pass or sample a small inventory repeatedly.
         // Failed probes advance too; an inaccessible PID cannot hold the sweep.
-        for process in processes[start..end].iter().take(self.max_samples_per_pass) {
+        for &pid in processes[start..end].iter().take(self.max_samples_per_pass) {
             if Instant::now() >= deadline {
                 break;
             }
             // Publish a new sweep boundary only when a probe actually starts.
             // An expired deadline at rollover must not skip its lowest PIDs.
             self.sweep_upper_pid = upper_pid;
-            self.last_sampled_pid = Some(process.pid);
-            match platform.process_io(process.pid) {
-                Ok(io) => {
+            self.last_sampled_pid = Some(pid);
+            match platform.process_io_snapshot(pid, deadline) {
+                Ok(snapshot)
+                    if snapshot.io.pid == pid
+                        && snapshot.start_time_unix_ms >= 0
+                        && snapshot.start_time_unix_ms <= collected_at_unix_ms
+                        && Instant::now() < deadline =>
+                {
                     let _ = self.record_process_sample_at(
-                        io,
-                        process.start_time_unix_ms,
+                        snapshot.io,
+                        Some(snapshot.start_time_unix_ms),
                         collected_at_unix_ms,
                     );
                     report.pids_recorded += 1;
                 }
-                Err(_) => report.pid_errors += 1,
+                Ok(_) | Err(_) => report.pid_errors += 1,
             }
         }
         self.enforce_pid_limit();
@@ -524,7 +532,13 @@ fn duration_ms_i64(duration: Duration) -> i64 {
 mod tests {
     use super::*;
 
-    use crate::platform::pal::MockPlatform;
+    use crate::platform::pal::{
+        FsStats, MemoryInfo, MockPlatform, MountPoint, PlatformPaths, ServiceManager,
+    };
+    use crate::platform::types::{ProcessInfo, ProcessIoSnapshot};
+    use std::sync::Mutex;
+
+    const SAMPLING_TEST_EPOCH_MS: i64 = 3_600_000;
 
     fn process(pid: i32) -> ProcessInfo {
         ProcessInfo {
@@ -534,7 +548,7 @@ mod tests {
             command_line: vec![format!("proc-{pid}")],
             executable: None,
             cwd: None,
-            start_time_unix_ms: None,
+            start_time_unix_ms: Some(0),
             virtual_memory_bytes: None,
             resident_memory_bytes: None,
             cpu_user_micros: None,
@@ -659,14 +673,167 @@ mod tests {
         timestamp: i64,
     ) -> ProcessIoHistoryReport {
         let platform = pids.iter().fold(MockPlatform::healthy(), |platform, &pid| {
-            platform.with_process_io(io(pid, 0, written))
+            platform
+                .with_process(process(pid))
+                .with_process_io(io(pid, 0, written))
         });
         history.sample_processes(
             &platform,
-            pids.iter().copied().map(process).collect(),
-            timestamp,
+            pids.to_vec(),
+            SAMPLING_TEST_EPOCH_MS + timestamp,
             Instant::now() + Duration::from_secs(60),
         )
+    }
+
+    struct SamplingPlatform {
+        inner: MockPlatform,
+        selected: Mutex<Vec<i32>>,
+        exhaust_inventory_budget: bool,
+        snapshot_override: Option<ProcessIoSnapshot>,
+    }
+
+    impl SamplingPlatform {
+        fn new(pids: &[i32]) -> Self {
+            let inner = pids.iter().fold(MockPlatform::healthy(), |platform, &pid| {
+                platform
+                    .with_process(process(pid))
+                    .with_process_io(io(pid, 0, 100))
+            });
+            Self {
+                inner,
+                selected: Mutex::new(Vec::new()),
+                exhaust_inventory_budget: false,
+                snapshot_override: None,
+            }
+        }
+    }
+
+    impl Platform for SamplingPlatform {
+        fn fs_stats(&self, path: &Path) -> Result<FsStats> {
+            self.inner.fs_stats(path)
+        }
+
+        fn mount_points(&self) -> Result<Vec<MountPoint>> {
+            self.inner.mount_points()
+        }
+
+        fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+            self.inner.is_ram_backed(path)
+        }
+
+        fn default_paths(&self) -> PlatformPaths {
+            self.inner.default_paths()
+        }
+
+        fn memory_info(&self) -> Result<MemoryInfo> {
+            self.inner.memory_info()
+        }
+
+        fn service_manager(&self) -> Box<dyn ServiceManager> {
+            self.inner.service_manager()
+        }
+
+        fn process_list(&self) -> Result<Vec<ProcessInfo>> {
+            panic!("bounded I/O sampling must never request full process metadata");
+        }
+
+        fn process_list_brief(&self) -> Result<Vec<ProcessInfo>> {
+            panic!("bounded I/O sampling must never read stat for the entire inventory");
+        }
+
+        fn process_ids(&self, deadline: Instant) -> Result<Vec<i32>> {
+            let pids = self.inner.process_ids(deadline)?;
+            if self.exhaust_inventory_budget {
+                // Simulate a native inventory operation that returns after its
+                // deadline. The caller must not renew the budget for sampling.
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            }
+            Ok(pids)
+        }
+
+        fn process_io_snapshot(&self, pid: i32, deadline: Instant) -> Result<ProcessIoSnapshot> {
+            self.selected.lock().unwrap().push(pid);
+            match &self.snapshot_override {
+                Some(snapshot) => Ok(snapshot.clone()),
+                None => self.inner.process_io_snapshot(pid, deadline),
+            }
+        }
+    }
+
+    #[test]
+    fn monitor_samples_only_selected_pids_without_eager_metadata_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = ProcessIoHistory::new(dir.path().join("history"));
+        history.max_samples_per_pass = 2;
+        let platform = SamplingPlatform::new(&[60, 10, 50, 20, 40, 30]);
+        let now = Instant::now();
+        let (report, error) = history.maybe_sample(&platform, now);
+        assert!(error.is_none());
+        assert_eq!(report.pids_seen, 6);
+        assert_eq!(report.pids_recorded, 2);
+        assert_eq!(*platform.selected.lock().unwrap(), vec![10, 20]);
+        assert!(history.samples_by_process.keys().all(|key| key.start_time_unix_ms == Some(0)));
+
+        let (report, error) =
+            history.maybe_sample(&platform, now + DEFAULT_BUCKET_INTERVAL);
+        assert!(error.is_none());
+        assert_eq!(report.pids_recorded, 2);
+        assert_eq!(*platform.selected.lock().unwrap(), vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn inventory_time_is_part_of_the_sampling_budget_and_never_advances_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = ProcessIoHistory::new(dir.path().join("history"));
+        history.last_sampled_pid = Some(10);
+        history.sweep_upper_pid = Some(30);
+        let mut platform = SamplingPlatform::new(&[10, 20, 30]);
+        platform.exhaust_inventory_budget = true;
+
+        let (report, error) = history.maybe_sample(&platform, Instant::now());
+        assert!(error.is_none());
+        assert_eq!(report.pids_seen, 3);
+        assert_eq!(report.pids_recorded, 0);
+        assert_eq!(report.pid_errors, 0);
+        assert!(platform.selected.lock().unwrap().is_empty());
+        assert_eq!(history.last_sampled_pid, Some(10));
+        assert_eq!(history.sweep_upper_pid, Some(30));
+    }
+
+    #[test]
+    fn unknown_or_invalid_sample_identity_never_enters_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = ProcessIoHistory::new(dir.path().join("history"));
+        let mut unknown = process(42);
+        unknown.start_time_unix_ms = None;
+        let platform = MockPlatform::healthy()
+            .with_process(unknown)
+            .with_process_io(io(42, 0, 100));
+        let report = history.sample_processes(
+            &platform,
+            vec![42],
+            SAMPLING_TEST_EPOCH_MS,
+            Instant::now() + Duration::from_secs(60),
+        );
+        assert_eq!(report.pid_errors, 1);
+        assert!(history.samples_by_process.is_empty());
+
+        for (pid, start) in [(99, 0), (42, -1), (42, SAMPLING_TEST_EPOCH_MS + 1)] {
+            let mut platform = SamplingPlatform::new(&[42]);
+            platform.snapshot_override = Some(ProcessIoSnapshot {
+                io: io(pid, 0, 100),
+                start_time_unix_ms: start,
+            });
+            let report = history.sample_processes(
+                &platform,
+                vec![42],
+                SAMPLING_TEST_EPOCH_MS,
+                Instant::now() + Duration::from_secs(60),
+            );
+            assert_eq!(report.pids_recorded, 0);
+            assert_eq!(report.pid_errors, 1);
+            assert!(history.samples_by_process.is_empty());
+        }
     }
 
     #[test]
@@ -687,7 +854,12 @@ mod tests {
         }
         for pid in pids {
             let recent = history
-                .recent_totals_for_process(&io(pid, 0, 900), None, 6_000, Duration::from_mins(15))
+                .recent_totals_for_process(
+                    &io(pid, 0, 900),
+                    Some(0),
+                    SAMPLING_TEST_EPOCH_MS + 6_000,
+                    Duration::from_mins(15),
+                )
                 .unwrap();
             assert_eq!(recent.bytes_written, 800, "writer {pid} lost its baseline");
         }
@@ -704,7 +876,12 @@ mod tests {
         sample_pass(&mut history, &pids, 900, 60_000);
         assert_eq!(history.samples_by_process.len(), 600);
         let recent = history
-            .recent_totals_for_process(&io(600, 0, 900), None, 60_001, Duration::from_mins(15))
+            .recent_totals_for_process(
+                &io(600, 0, 900),
+                Some(0),
+                SAMPLING_TEST_EPOCH_MS + 60_001,
+                Duration::from_mins(15),
+            )
             .unwrap();
         assert_eq!(recent.bytes_written, 800);
     }
@@ -735,8 +912,8 @@ mod tests {
         history.sweep_upper_pid = Some(20);
         let report = history.sample_processes(
             &MockPlatform::healthy(),
-            vec![process(10), process(20)],
-            0,
+            vec![10, 20],
+            SAMPLING_TEST_EPOCH_MS,
             Instant::now(),
         );
         assert_eq!(report.pids_recorded, 0);
@@ -754,8 +931,8 @@ mod tests {
         history.max_samples_per_pass = 1;
         let report = history.sample_processes(
             &MockPlatform::healthy(),
-            vec![process(10), process(20)],
-            0,
+            vec![10, 20],
+            SAMPLING_TEST_EPOCH_MS,
             Instant::now() + Duration::from_secs(60),
         );
         assert_eq!(report.pid_errors, 1);
@@ -945,7 +1122,12 @@ mod tests {
         assert_eq!(history.last_sampled_pid, Some(10));
         assert_eq!(history.sweep_upper_pid, Some(40));
         let recent = history
-            .recent_totals_for_process(&io(10, 0, 900), None, 2_001, Duration::from_mins(15))
+            .recent_totals_for_process(
+                &io(10, 0, 900),
+                Some(0),
+                SAMPLING_TEST_EPOCH_MS + 2_001,
+                Duration::from_mins(15),
+            )
             .unwrap();
         assert_eq!(recent.bytes_written, 800);
         sample_pass(&mut history, &[10, 20, 30, 40, 50], 900, 3_000);
@@ -975,8 +1157,8 @@ mod tests {
         sample_pass(&mut history, &[10], 100, 0);
         let report = history.sample_processes(
             &MockPlatform::healthy(),
-            vec![process(10), process(20)],
-            1_000,
+            vec![10, 20],
+            SAMPLING_TEST_EPOCH_MS + 1_000,
             Instant::now(),
         );
         assert_eq!(report.pids_recorded, 0);
