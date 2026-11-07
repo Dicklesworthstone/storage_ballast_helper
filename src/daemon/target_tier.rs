@@ -43,7 +43,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
+use parking_lot::RwLock;
 
 use crate::core::config::{Config, ScannerConfig};
 use crate::core::paths::resolve_absolute_path;
@@ -78,9 +79,12 @@ const DISCOVERY_BUDGET: Duration = Duration::from_secs(30);
 const SURVEY_MAX_ENTRIES: u64 = 2_000_000;
 /// Wall time for surveying all of one root's candidates.
 const SURVEY_BUDGET: Duration = Duration::from_secs(120);
-/// Shortest gap between two checks of whether any root is due, so the main
-/// loop does not expand the root patterns on every tick.
+/// Shortest gap between two checks of whether any root is due.
 const PROBE_INTERVAL: Duration = Duration::from_mins(1);
+/// An admission observation must finish inside this window and use a monitor
+/// sample no older than it. A blocked native probe cannot refresh old evidence
+/// merely by eventually returning.
+const PRESSURE_MAX_AGE: Duration = Duration::from_mins(1);
 
 /// What one pass found under one root.
 #[derive(Debug, Default)]
@@ -797,6 +801,63 @@ pub struct DueRoot {
     pub level: PressureLevel,
     /// That mount's urgency, for scoring and the executor's dampening.
     pub urgency: f64,
+    /// The probe binds pressure to this mount and this root incarnation.
+    mount: PathBuf,
+    identity: FsIdentity,
+}
+
+/// The monitor publishes already-computed controller output without touching
+/// the filesystem. Workers consult it after I/O, never while holding its lock.
+#[derive(Debug, Default)]
+struct MountPressure {
+    observed_at: Option<Instant>,
+    mounts: HashMap<PathBuf, (PressureLevel, f64)>,
+}
+
+impl MountPressure {
+    fn current(&self, mount: &Path, now: Instant) -> Option<(PressureLevel, f64)> {
+        if self
+            .observed_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= PRESSURE_MAX_AGE)
+        {
+            return None;
+        }
+        self.mounts
+            .get(mount)
+            .copied()
+            .filter(|(level, urgency)| *level >= START_LEVEL && urgency.is_finite())
+    }
+}
+
+/// Filesystem work belongs exclusively to the retained tier worker. Repeating
+/// this after a survey renews pressure and refuses a changed root or mount.
+fn probe_root(
+    root: &Path,
+    platform: &dyn Platform,
+    pressure: &RwLock<MountPressure>,
+) -> Option<DueRoot> {
+    let started = Instant::now();
+    let stats = platform.fs_stats(root).ok()?;
+    if stats.is_readonly
+        || stats.total_bytes == 0
+        || stats.free_bytes > stats.total_bytes
+        || stats.available_bytes > stats.free_bytes
+    {
+        return None;
+    }
+    let identity = current_identity(root)?;
+    let completed = Instant::now();
+    if completed.saturating_duration_since(started) >= PRESSURE_MAX_AGE {
+        return None;
+    }
+    let (level, urgency) = pressure.read().current(&stats.mount_point, completed)?;
+    Some(DueRoot {
+        root: root.to_path_buf(),
+        level,
+        urgency,
+        mount: stats.mount_point,
+        identity,
+    })
 }
 
 /// Revocable authority for the protection exception carried by a target-only
@@ -836,6 +897,12 @@ impl TargetOnlyConsent {
 #[derive(Debug, Default)]
 pub struct TargetTier {
     running: Arc<AtomicBool>,
+    /// Retain even a cancelled, blocked worker until it actually exits. Never
+    /// create replacement threads to work around uninterruptible native I/O.
+    worker: Option<std::thread::JoinHandle<()>>,
+    /// A probe which finds no due roots must not spend the pass cooldown.
+    started: Option<Receiver<Instant>>,
+    pressure: Arc<RwLock<MountPressure>>,
     last_start: Option<Instant>,
     /// When the roots were last expanded to see whether one is due.
     last_probe: Option<Instant>,
@@ -855,14 +922,38 @@ impl TargetTier {
         }) {
             self.revoked.store(true, Ordering::Release);
             self.revoked = Arc::new(AtomicBool::new(false));
+            self.started = None;
             self.last_probe = None;
             self.last_start = None;
         }
         self.scanner = Some(scanner.clone());
     }
 
-    /// Start a pass on its own thread when one is due. `mounts` maps each
-    /// monitored mount to its pressure level and urgency.
+    /// Reap only an already-finished worker and consume its one start notice.
+    /// No filesystem I/O, blocking receive or join on a running thread.
+    fn poll_worker(&mut self) {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+            && let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            eprintln!("[SBH-TARGETS] pass thread failed");
+        }
+        if let Some(started) = self
+            .started
+            .as_ref()
+            .and_then(|receive| receive.try_recv().ok())
+        {
+            self.last_start = Some(started);
+            self.started = None;
+        }
+    }
+
+    /// Publish live pressure and start one worker when a probe is due. Root
+    /// pattern expansion, filesystem probes and target surveys all happen on
+    /// that worker; a stuck filesystem never blocks the monitor's next tick.
     pub fn tick(
         &mut self,
         now: Instant,
@@ -873,8 +964,14 @@ impl TargetTier {
         logger: &ActivityLoggerHandle,
     ) {
         self.update_config(&config.scanner);
+        *self.pressure.write() = MountPressure {
+            observed_at: Some(now),
+            mounts: mounts.clone(),
+        };
+        self.poll_worker();
         if config.scanner.target_only_roots.is_empty()
             || self.running.load(Ordering::Acquire)
+            || self.worker.is_some()
             || self
                 .last_start
                 .is_some_and(|last| now.saturating_duration_since(last) < PASS_INTERVAL)
@@ -885,22 +982,6 @@ impl TargetTier {
             return;
         }
         self.last_probe = Some(now);
-        let due: Vec<DueRoot> = expand_roots(&config.scanner.target_only_roots)
-            .into_iter()
-            .filter_map(|root| {
-                let stats = platform.fs_stats(&root).ok()?;
-                let &(level, urgency) = mounts.get(&stats.mount_point)?;
-                (level >= START_LEVEL).then_some(DueRoot {
-                    root,
-                    level,
-                    urgency,
-                })
-            })
-            .collect();
-        if due.is_empty() {
-            return;
-        }
-        self.last_start = Some(now);
         self.running.store(true, Ordering::Release);
         let guard = RunningGuard(Arc::clone(&self.running));
         let config = config.clone();
@@ -908,30 +989,61 @@ impl TargetTier {
         let del_tx = del_tx.clone();
         let logger = logger.clone();
         let revoked = Arc::clone(&self.revoked);
+        let pressure = Arc::clone(&self.pressure);
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
         let spawned = std::thread::Builder::new()
             .name("sbh-targets".to_string())
             .spawn(move || {
                 let _guard = guard;
-                for root in due {
+                if revoked.load(Ordering::Acquire) {
+                    return;
+                }
+                let roots = expand_roots(&config.scanner.target_only_roots);
+                let mut pass_started = false;
+                for root in roots {
                     if revoked.load(Ordering::Acquire) {
                         break;
                     }
+                    let Some(due) = probe_root(&root, platform.as_ref(), &pressure) else {
+                        continue;
+                    };
+                    if revoked.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if !pass_started {
+                        let _ = started_tx.try_send(Instant::now());
+                        pass_started = true;
+                    }
                     let message = run_root(
-                        &root,
+                        &due,
                         &config,
                         platform.as_ref(),
                         &del_tx,
                         SystemTime::now(),
                         &revoked,
+                        &pressure,
                     );
                     eprintln!("[SBH-TARGETS] {message}");
                     logger.send(ActivityEvent::Info { message });
                 }
             });
-        if let Err(error) = spawned {
-            // The closure, and with it the guard, was dropped: running is clear.
-            eprintln!("[SBH-TARGETS] pass thread failed to start: {error}");
+        match spawned {
+            Ok(worker) => {
+                self.worker = Some(worker);
+                self.started = Some(started_rx);
+            }
+            Err(error) => {
+                // The closure, and with it the guard, was dropped: running is clear.
+                eprintln!("[SBH-TARGETS] pass thread failed to start: {error}");
+            }
         }
+    }
+}
+
+impl Drop for TargetTier {
+    fn drop(&mut self) {
+        // Revocation is nonblocking even if the worker cannot leave a syscall.
+        self.revoked.store(true, Ordering::Release);
     }
 }
 
@@ -944,6 +1056,7 @@ fn run_root(
     del_tx: &Sender<DeletionBatch>,
     now: SystemTime,
     revoked: &Arc<AtomicBool>,
+    pressure: &RwLock<MountPressure>,
 ) -> String {
     if revoked.load(Ordering::Acquire) {
         return format!("root={} target-only consent revoked", due.root.display());
@@ -957,10 +1070,23 @@ fn run_root(
         return summary;
     }
     let root = resolve_absolute_path(&due.root);
+    let Some(current) = probe_root(&due.root, platform, pressure) else {
+        return format!("{summary}; current pressure unavailable; no batch submitted");
+    };
+    if current.mount != due.mount
+        || current.identity != due.identity
+        || current.level < due.level
+        || current.urgency < due.urgency
+    {
+        return format!("{summary}; root or pressure changed; no batch submitted");
+    }
+    if revoked.load(Ordering::Acquire) {
+        return format!("{summary}; target-only consent revoked; no batch submitted");
+    }
     let batch = DeletionBatch {
         candidates: selection.candidates,
-        pressure_level: due.level,
-        urgency: due.urgency,
+        pressure_level: current.level,
+        urgency: current.urgency,
         target_bytes: None,
         ram_reclaim: None,
         inode_reclaim: None,
@@ -975,7 +1101,10 @@ fn run_root(
         )),
     };
     match del_tx.try_send(batch) {
-        Ok(()) => format!("{summary}; sent to the executor (level={:?})", due.level),
+        Ok(()) => format!(
+            "{summary}; sent to the executor (level={:?})",
+            current.level
+        ),
         Err(_) => format!("{summary}; executor queue full, next pass retries"),
     }
 }
@@ -1056,6 +1185,17 @@ mod tests {
 
     fn select_in(root: &Path, platform: &MockPlatform) -> Selection {
         select(root, &Config::default(), platform, 0.5, later())
+    }
+
+    fn red_mounts() -> HashMap<PathBuf, (PressureLevel, f64)> {
+        HashMap::from([(PathBuf::from("/"), (PressureLevel::Red, 0.8))])
+    }
+
+    fn red_pressure() -> RwLock<MountPressure> {
+        RwLock::new(MountPressure {
+            observed_at: Some(Instant::now()),
+            mounts: red_mounts(),
+        })
     }
 
     fn names(selection: &Selection) -> Vec<String> {
@@ -1390,21 +1530,20 @@ mod tests {
         cargo_target(&root.join("s1/target"));
         age(&root, 48);
         let (del_tx, del_rx) = crossbeam_channel::bounded(1);
-        let due = DueRoot {
-            root: root.clone(),
-            level: PressureLevel::Red,
-            urgency: 0.8,
-        };
+        let platform = MockPlatform::healthy();
+        let pressure = red_pressure();
+        let due = probe_root(&root, &platform, &pressure).unwrap();
         let mut config = Config::default();
         config.scanner.target_only_roots = vec![root.clone()];
 
         let summary = run_root(
             &due,
             &config,
-            &MockPlatform::healthy(),
+            &platform,
             &del_tx,
             later(),
             &Arc::new(AtomicBool::new(false)),
+            &pressure,
         );
         let batch = del_rx
             .try_recv()
@@ -1528,19 +1667,18 @@ mod tests {
         let mut tier = TargetTier::default();
         tier.update_config(&config.scanner);
         let old_token = Arc::clone(&tier.revoked);
-        let due = DueRoot {
-            root,
-            level: PressureLevel::Red,
-            urgency: 0.8,
-        };
+        let platform = MockPlatform::healthy();
+        let pressure = red_pressure();
+        let due = probe_root(&root, &platform, &pressure).unwrap();
         let (send, receive) = crossbeam_channel::bounded(1);
         let summary = run_root(
             &due,
             &config,
-            &MockPlatform::healthy(),
+            &platform,
             &send,
             later(),
             &old_token,
+            &pressure,
         );
         let batch = receive.try_recv().unwrap_or_else(|_| panic!("{summary}"));
         let witness = batch.target_only_consent.as_ref().unwrap();
@@ -1555,10 +1693,11 @@ mod tests {
         let summary = run_root(
             &due,
             &config,
-            &MockPlatform::healthy(),
+            &platform,
             &send,
             later(),
             &old_token,
+            &pressure,
         );
         assert!(summary.contains("consent revoked"));
         assert!(
@@ -1697,6 +1836,383 @@ mod tests {
             "wasm32-replay",
         ] {
             assert!(!is_target_triple(other), "{other}");
+        }
+    }
+
+    mod scheduling {
+        use super::*;
+        use crate::core::errors::Result;
+        use crate::platform::pal::{
+            FsStats, MemoryInfo, MountPoint, PlatformPaths, ServiceManager,
+        };
+        use crate::platform::types::{ExecutablesResult, MappedRegion, OpenFilesResult};
+
+        struct ProbePlatform {
+            inner: MockPlatform,
+            requests: Sender<PathBuf>,
+            permits: Receiver<()>,
+        }
+
+        impl Platform for ProbePlatform {
+            fn fs_stats(&self, path: &Path) -> Result<FsStats> {
+                let _ = self.requests.send(path.to_path_buf());
+                let _ = self.permits.recv();
+                self.inner.fs_stats(path)
+            }
+
+            fn mount_points(&self) -> Result<Vec<MountPoint>> {
+                self.inner.mount_points()
+            }
+
+            fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+                self.inner.is_ram_backed(path)
+            }
+
+            fn default_paths(&self) -> PlatformPaths {
+                self.inner.default_paths()
+            }
+
+            fn memory_info(&self) -> Result<MemoryInfo> {
+                self.inner.memory_info()
+            }
+
+            fn service_manager(&self) -> Box<dyn ServiceManager> {
+                self.inner.service_manager()
+            }
+
+            fn process_list(&self) -> Result<Vec<ProcessInfo>> {
+                self.inner.process_list()
+            }
+
+            fn open_files_under(&self, path: &Path) -> Result<OpenFilesResult> {
+                self.inner.open_files_under(path)
+            }
+
+            fn executables_under(&self, path: &Path) -> Result<ExecutablesResult> {
+                self.inner.executables_under(path)
+            }
+
+            fn mmap_regions_under(&self, path: &Path) -> Result<Vec<MappedRegion>> {
+                self.inner.mmap_regions_under(path)
+            }
+        }
+
+        struct ProbeFixture {
+            platform: Arc<dyn Platform>,
+            requests: Receiver<PathBuf>,
+            permits: parking_lot::Mutex<Option<Sender<()>>>,
+        }
+
+        impl ProbeFixture {
+            fn new() -> Self {
+                let (requests_tx, requests) = crossbeam_channel::unbounded();
+                let (permits_tx, permits) = crossbeam_channel::unbounded();
+                Self {
+                    platform: Arc::new(ProbePlatform {
+                        inner: MockPlatform::healthy(),
+                        requests: requests_tx,
+                        permits,
+                    }),
+                    requests,
+                    permits: parking_lot::Mutex::new(Some(permits_tx)),
+                }
+            }
+
+            fn requested(&self, root: &Path) {
+                assert_eq!(
+                    self.requests.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    root
+                );
+            }
+
+            fn release_next(&self) {
+                self.permits.lock().as_ref().unwrap().send(()).unwrap();
+            }
+
+            fn release_all(&self) {
+                // Disconnecting wakes both the current probe and any later
+                // probe, including during failure cleanup.
+                self.permits.lock().take();
+            }
+
+            fn monitor(
+                &self,
+                mut tier: TargetTier,
+                work: impl FnOnce(&mut TargetTier) + Send + 'static,
+            ) -> TargetTier {
+                let (send, receive) = crossbeam_channel::bounded(1);
+                let caller = std::thread::spawn(move || {
+                    work(&mut tier);
+                    let _ = send.send(tier);
+                });
+                let result = receive.recv_timeout(Duration::from_secs(5));
+                if result.is_err() {
+                    self.release_all();
+                }
+                caller.join().unwrap();
+                result.expect("monitor tick waited for a blocked target-only filesystem probe")
+            }
+        }
+
+        impl Drop for ProbeFixture {
+            fn drop(&mut self) {
+                self.release_all();
+            }
+        }
+
+        struct ProbeLogger {
+            handle: ActivityLoggerHandle,
+            join: Option<std::thread::JoinHandle<()>>,
+            _directory: tempfile::TempDir,
+        }
+
+        impl ProbeLogger {
+            fn new() -> Self {
+                let directory = tempfile::tempdir().unwrap();
+                let (handle, join) =
+                    crate::logger::dual::spawn_logger(crate::logger::dual::DualLoggerConfig {
+                        sqlite_path: None,
+                        jsonl_config: crate::logger::jsonl::JsonlConfig {
+                            path: directory.path().join("activity.jsonl"),
+                            fallback_path: None,
+                            max_size_bytes: 1_048_576,
+                            max_rotated_files: 0,
+                            fsync_interval_secs: 0,
+                        },
+                        channel_capacity: 32,
+                        run_id: None,
+                    })
+                    .unwrap();
+                Self {
+                    handle,
+                    join: Some(join),
+                    _directory: directory,
+                }
+            }
+        }
+
+        impl Drop for ProbeLogger {
+            fn drop(&mut self) {
+                self.handle.shutdown();
+                if let Some(join) = self.join.take() {
+                    join.join().unwrap();
+                }
+            }
+        }
+
+        fn config(root: &Path) -> Config {
+            let mut config = Config::default();
+            config.scanner.target_only_roots = vec![root.to_path_buf()];
+            // The test's files have just been born. Exercise the scheduler
+            // without waiting for their configured idle window to elapse.
+            config.scanner.target_only_idle_hours = 0;
+            config.scanner.min_file_age_minutes = 0;
+            config
+        }
+
+        fn finish(tier: &mut TargetTier) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while tier.worker.is_some() {
+                tier.poll_worker();
+                assert!(Instant::now() < deadline, "released worker did not finish");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!tier.running.load(Ordering::Acquire));
+        }
+
+        #[test]
+        fn blocked_target_probe_leaves_monitor_responsive_and_keeps_one_worker() {
+            let (_temp, root) = scratch_root();
+            let fixture = ProbeFixture::new();
+            let logger = ProbeLogger::new();
+            let config = config(&root);
+            let (del_tx, del_rx) = crossbeam_channel::bounded(1);
+            let first_config = config.clone();
+            let first_platform = Arc::clone(&fixture.platform);
+            let first_logger = logger.handle.clone();
+            let first_tx = del_tx.clone();
+            let tier = fixture.monitor(TargetTier::default(), move |tier| {
+                tier.tick(
+                    Instant::now(),
+                    &first_config,
+                    &first_platform,
+                    &red_mounts(),
+                    &first_tx,
+                    &first_logger,
+                );
+            });
+            fixture.requested(&root);
+            assert!(tier.running.load(Ordering::Acquire));
+            let platform = Arc::clone(&fixture.platform);
+            let handle = logger.handle.clone();
+            let mut tier = fixture.monitor(tier, move |tier| {
+                for multiplier in 1..=4 {
+                    tier.tick(
+                        Instant::now() + PASS_INTERVAL * multiplier,
+                        &config,
+                        &platform,
+                        &red_mounts(),
+                        &del_tx,
+                        &handle,
+                    );
+                }
+            });
+            assert!(
+                fixture.requests.try_recv().is_err(),
+                "one native worker only"
+            );
+            assert!(del_rx.try_recv().is_err());
+            fixture.release_all();
+            finish(&mut tier);
+            assert!(
+                tier.last_start.is_some(),
+                "the released, due root was surveyed"
+            );
+        }
+
+        #[test]
+        fn revoked_blocked_target_probe_never_revives_after_reenable() {
+            let (_temp, root) = scratch_root();
+            cargo_target(&root.join("session/target"));
+            let fixture = ProbeFixture::new();
+            let logger = ProbeLogger::new();
+            let config = config(&root);
+            let (del_tx, del_rx) = crossbeam_channel::bounded(1);
+            let first_config = config.clone();
+            let first_platform = Arc::clone(&fixture.platform);
+            let first_logger = logger.handle.clone();
+            let first_tx = del_tx.clone();
+            let mut tier = fixture.monitor(TargetTier::default(), move |tier| {
+                tier.tick(
+                    Instant::now(),
+                    &first_config,
+                    &first_platform,
+                    &red_mounts(),
+                    &first_tx,
+                    &first_logger,
+                );
+            });
+            fixture.requested(&root);
+            let mut disabled = config.clone();
+            disabled.scanner.target_only_roots.clear();
+            for next in [&disabled, &config] {
+                tier.tick(
+                    Instant::now(),
+                    next,
+                    &fixture.platform,
+                    &red_mounts(),
+                    &del_tx,
+                    &logger.handle,
+                );
+            }
+            assert!(fixture.requests.try_recv().is_err());
+            fixture.release_all();
+            finish(&mut tier);
+            assert!(
+                del_rx.try_recv().is_err(),
+                "old scope cannot submit a batch"
+            );
+            assert!(
+                tier.last_start.is_none(),
+                "old work cannot spend the new cooldown"
+            );
+
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &red_mounts(),
+                &del_tx,
+                &logger.handle,
+            );
+            finish(&mut tier);
+            let batch = del_rx
+                .try_recv()
+                .expect("a fresh generation still nominates the target");
+            assert_eq!(batch.candidates.len(), 1);
+            assert_eq!(batch.target_only_root, Some(resolve_absolute_path(&root)));
+        }
+
+        #[test]
+        fn pressure_recovery_while_final_probe_waits_prevents_dispatch() {
+            let (_temp, root) = scratch_root();
+            cargo_target(&root.join("session/target"));
+            let fixture = ProbeFixture::new();
+            let logger = ProbeLogger::new();
+            let config = config(&root);
+            let (del_tx, del_rx) = crossbeam_channel::bounded(1);
+            let first_config = config.clone();
+            let first_platform = Arc::clone(&fixture.platform);
+            let first_logger = logger.handle.clone();
+            let first_tx = del_tx.clone();
+            let mut tier = fixture.monitor(TargetTier::default(), move |tier| {
+                tier.tick(
+                    Instant::now(),
+                    &first_config,
+                    &first_platform,
+                    &red_mounts(),
+                    &first_tx,
+                    &first_logger,
+                );
+            });
+            fixture.requested(&root);
+            fixture.release_next();
+            // Selection completed. The second probe, immediately before
+            // publication, must use the new controller sample after it wakes.
+            fixture.requested(&root);
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &HashMap::from([(PathBuf::from("/"), (PressureLevel::Green, 0.0))]),
+                &del_tx,
+                &logger.handle,
+            );
+            assert!(del_rx.try_recv().is_err());
+            fixture.release_all();
+            finish(&mut tier);
+            assert!(
+                del_rx.try_recv().is_err(),
+                "recovered pressure revokes dispatch"
+            );
+
+            tier.tick(
+                Instant::now() + PASS_INTERVAL,
+                &config,
+                &fixture.platform,
+                &red_mounts(),
+                &del_tx,
+                &logger.handle,
+            );
+            finish(&mut tier);
+            assert_eq!(del_rx.try_recv().unwrap().candidates.len(), 1);
+        }
+
+        #[test]
+        fn expired_monitor_evidence_cannot_publish_a_surveyed_target() {
+            let (_temp, root) = scratch_root();
+            cargo_target(&root.join("session/target"));
+            age(&root, 48);
+            let platform = MockPlatform::healthy();
+            let pressure = red_pressure();
+            let due = probe_root(&root, &platform, &pressure).unwrap();
+            pressure.write().observed_at = Some(Instant::now() - PRESSURE_MAX_AGE);
+            let (del_tx, del_rx) = crossbeam_channel::bounded(1);
+            let summary = run_root(
+                &due,
+                &config(&root),
+                &platform,
+                &del_tx,
+                later(),
+                &Arc::new(AtomicBool::new(false)),
+                &pressure,
+            );
+            assert!(summary.contains("nominated=1"), "{summary}");
+            assert!(
+                summary.contains("current pressure unavailable"),
+                "{summary}"
+            );
+            assert!(del_rx.try_recv().is_err());
         }
     }
 
