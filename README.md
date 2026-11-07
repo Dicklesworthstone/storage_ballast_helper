@@ -1873,6 +1873,11 @@ paths = ["/data/projects/*/*.log", "~/.local/share/*/logs/*.log"]
 
 Manual operator truncation is available via `sbh truncate-logs [--dry-run] [--yes]`.
 
+Automatic log truncation requires Enforce mode. Observe, Canary, FallbackSafe
+(including the kill switch), and `scanner.dry_run` report potential reclamation
+without truncating logs. The daemon rechecks live policy and configuration before
+each mutation, so a reload or policy demotion revokes an in-flight sweep.
+
 Source: `src/scanner/log_truncator.rs`
 
 ### Guardrails and Drift Detection

@@ -31,6 +31,7 @@ fn run(
         open_candidate_for_truncate,
         history,
         || now,
+        &|| true,
     )
     .unwrap()
 }
@@ -209,6 +210,7 @@ fn failed_truncation_releases_its_reservation_without_recording_success() {
         |path| fs::File::open(path).map_err(|error| error.to_string()),
         &history,
         || now,
+        &|| true,
     );
     assert!(failed.is_err());
     assert_eq!(fs::metadata(&path).unwrap().len(), 4096);
@@ -286,6 +288,7 @@ fn a_file_shrunk_before_reservation_is_rechecked_without_crediting_old_bytes() {
             }
             now
         },
+        &|| true,
     )
     .unwrap();
     assert!(matches!(result, Outcome::Skipped(SkipReason::BelowMinSize)));
@@ -318,6 +321,7 @@ fn a_file_refreshed_before_reservation_still_obeys_the_age_gate() {
             .unwrap();
             now
         },
+        &|| true,
     )
     .unwrap();
     assert!(matches!(

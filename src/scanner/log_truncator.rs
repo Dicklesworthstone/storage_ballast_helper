@@ -93,6 +93,9 @@ pub enum SkipReason {
     /// A recent truncation has ambiguous regrowth, an operation on this file
     /// is already running, or the bounded identity table is full.
     RecentTruncation,
+    /// The caller revoked mutation authority during this sweep. A policy
+    /// change is not an I/O failure and does not start a retry cooldown.
+    PolicyChanged,
 }
 
 /// Execute one truncation pass.
@@ -109,14 +112,42 @@ pub fn truncate_oversized_logs(
     free_pct: f64,
     dry_run: bool,
 ) -> LogTruncationReport {
+    truncate_oversized_logs_guarded(config, free_pct, dry_run, &|| true)
+}
+
+/// Execute a sweep whose mutation authority can be revoked while it runs.
+///
+/// The guard is checked before opening each eligible file for writing and
+/// again immediately before truncating its verified descriptor. Callers must
+/// read live policy in the guard rather than capture an approval at sweep
+/// start. A refusal preserves the file and both retry histories. Dry runs
+/// inspect candidates without invoking this mutation-only guard.
+pub fn truncate_oversized_logs_guarded(
+    config: &LogTruncationConfig,
+    free_pct: f64,
+    dry_run: bool,
+    authorize: &dyn Fn() -> bool,
+) -> LogTruncationReport {
     let backoff = FAILURE_BACKOFF.get_or_init(|| Mutex::new(FailureBackoff::default()));
+    let recent = RECENT_TRUNCATIONS.get_or_init(|| Mutex::new(RecentTruncations::default()));
     truncate_with_backoff(
         config,
         free_pct,
         dry_run,
         backoff,
         Instant::now,
-        process_candidate,
+        |path, config, bypass_age_gate, dry_run| {
+            process_candidate_with_history(
+                path,
+                config,
+                bypass_age_gate,
+                dry_run,
+                open_candidate_for_truncate,
+                recent,
+                Instant::now,
+                authorize,
+            )
+        },
     )
 }
 
@@ -217,6 +248,7 @@ enum Outcome {
     Skipped(SkipReason),
 }
 
+#[cfg(test)]
 fn process_candidate(
     path: &Path,
     config: &LogTruncationConfig,
@@ -232,6 +264,7 @@ fn process_candidate(
     )
 }
 
+#[cfg(test)]
 fn process_candidate_with_opener(
     path: &Path,
     config: &LogTruncationConfig,
@@ -248,9 +281,11 @@ fn process_candidate_with_opener(
         open,
         recent,
         Instant::now,
+        &|| true,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_candidate_with_history(
     path: &Path,
     config: &LogTruncationConfig,
@@ -259,6 +294,7 @@ fn process_candidate_with_history(
     open: impl FnOnce(&Path) -> Result<fs::File, String>,
     recent: &Mutex<RecentTruncations>,
     clock: impl Fn() -> Instant,
+    authorize: &dyn Fn() -> bool,
 ) -> Result<Outcome, String> {
     let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if let Some(reason) = candidate_skip(&meta, config, bypass_age_gate)? {
@@ -266,6 +302,9 @@ fn process_candidate_with_history(
     }
     if dry_run {
         return Ok(Outcome::WouldTruncate(reclaimable_bytes(&meta)));
+    }
+    if !authorize() {
+        return Ok(Outcome::Skipped(SkipReason::PolicyChanged));
     }
     let f = open(path)?;
     let opened_meta = f.metadata().map_err(|e| e.to_string())?;
@@ -294,6 +333,11 @@ fn process_candidate_with_history(
         return Ok(Outcome::Skipped(SkipReason::RecentTruncation));
     }
     let bytes = reclaimable_bytes(&opened_meta);
+    // Metadata, opening and refill inspection can block. A sweep-start
+    // approval must not outlive a live kill switch or configuration change.
+    if !authorize() {
+        return Ok(Outcome::Skipped(SkipReason::PolicyChanged));
+    }
     f.set_len(0).map_err(|e| e.to_string())?;
     reservation.commit(opened_meta.len(), clock());
     Ok(Outcome::Truncated(bytes))
@@ -698,6 +742,7 @@ mod tests {
                 }
                 now
             },
+            &|| true,
         )
         .unwrap();
         assert!(linked.get());

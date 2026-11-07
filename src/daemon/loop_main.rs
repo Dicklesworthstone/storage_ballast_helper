@@ -3807,6 +3807,40 @@ fn compress_tier_may_run(config: &Config, mode: ActiveMode) -> bool {
     config.compress.enabled && !config.scanner.dry_run && mode.allows_deletion()
 }
 
+/// Active logs do not pass through scored deletion or Canary accounting.
+/// Only Enforce may truncate them automatically; other modes keep the
+/// inspection useful as a dry run. Renew the live mode and log policy at
+/// each mutation boundary so a blocking open cannot outlive a stop request.
+fn truncate_daemon_logs(
+    config: &ScannerConfig,
+    free_pct: f64,
+    shared_scanner_config: &RwLock<ScannerConfig>,
+    executor_config: &SharedExecutorConfig,
+    policy_engine: &Mutex<PolicyEngine>,
+    shutdown: &AtomicBool,
+) -> crate::scanner::log_truncator::LogTruncationReport {
+    let dry_run = config.dry_run
+        || executor_config.dry_run.load(Ordering::Relaxed)
+        || policy_engine.lock().mode() != ActiveMode::Enforce;
+    crate::scanner::log_truncator::truncate_oversized_logs_guarded(
+        &config.log_truncation,
+        free_pct,
+        dry_run,
+        &|| {
+            if shutdown.load(Ordering::Relaxed) || executor_config.dry_run.load(Ordering::Relaxed) {
+                return false;
+            }
+            {
+                let live = shared_scanner_config.read();
+                if live.dry_run || live.log_truncation != config.log_truncation {
+                    return false;
+                }
+            }
+            policy_engine.lock().mode() == ActiveMode::Enforce
+        },
+    )
+}
+
 fn fallback_log_truncation_free_pct(pressure_level: PressureLevel) -> f64 {
     match pressure_level {
         PressureLevel::Green | PressureLevel::Yellow => 100.0,
@@ -8608,6 +8642,7 @@ impl MonitoringDaemon {
         let executor_config = Arc::clone(&self.shared_executor_config);
         let regret = Arc::clone(&self.regret);
         let scan_now_queue = Arc::clone(&self.scan_now_queue);
+        let policy_engine = Arc::clone(&self.policy_engine);
         thread::Builder::new()
             .name("sbh-scanner".to_string())
             .spawn(move || {
@@ -8628,6 +8663,7 @@ impl MonitoringDaemon {
                     &executor_config,
                     &regret,
                     Some(&scan_now_queue),
+                    &policy_engine,
                 );
             })
             .map_err(|source| SbhError::Runtime {
@@ -9879,6 +9915,7 @@ fn scanner_thread_main(
     executor_config: &Arc<SharedExecutorConfig>,
     regret: &Arc<SharedRegret>,
     scan_now_queue: Option<&Arc<Mutex<ScanNowQueue>>>,
+    policy_engine: &Mutex<PolicyEngine>,
 ) {
     const DIR_SIZE_FLOOR: u64 = 100 * 1_048_576; // 100 MiB
 
@@ -10442,13 +10479,15 @@ fn scanner_thread_main(
             && request.scan_now.is_none()
         {
             let truncation_free_pct = log_truncation_free_pct_for_request(&request);
-            let trunc_report = crate::scanner::log_truncator::truncate_oversized_logs(
-                &current_scanner_config.log_truncation,
+            let trunc_report = truncate_daemon_logs(
+                &current_scanner_config,
                 truncation_free_pct,
-                current_scanner_config.dry_run,
+                shared_scanner_config,
+                executor_config,
+                policy_engine,
+                shutdown,
             );
-            let (truncate_verb, truncate_bytes, truncate_files) = if current_scanner_config.dry_run
-            {
+            let (truncate_verb, truncate_bytes, truncate_files) = if trunc_report.dry_run {
                 (
                     "would_free",
                     trunc_report.bytes_would_reclaim,
@@ -13582,6 +13621,122 @@ mod tests {
             if let Some(logger) = self.daemon.logger_join.take() {
                 let _ = logger.join();
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_log_truncation_uses_the_executors_live_policy() {
+        for mode in ["enforce", "canary", "observe", "kill-switch", "dry-run"] {
+            let mut fixture = RegretDaemonFixture::new();
+            let log = fixture.directory.path().join("active.log");
+            let contents = vec![b'x'; 4096];
+            std::fs::write(&log, &contents).unwrap();
+            let daemon = &mut fixture.daemon;
+            daemon.config.scanner.log_truncation = crate::core::config::LogTruncationConfig {
+                enabled: true,
+                paths: vec![log.to_string_lossy().into_owned()],
+                min_size_bytes: 1024,
+                pressure_free_pct_ceiling: 100,
+                min_age_minutes: 0,
+            };
+            daemon.config.scanner.dry_run = mode == "dry-run";
+            *daemon.shared_scanner_config.write() = daemon.config.scanner.clone();
+            // Keep initial_mode at Enforce: the control socket and guardrails
+            // change the live engine independently of that startup setting.
+            assert_eq!(daemon.config.policy.initial_mode, ActiveMode::Enforce);
+            if matches!(mode, "canary" | "observe") {
+                assert!(daemon.policy_engine.lock().demote());
+            }
+            if mode == "observe" {
+                assert!(daemon.policy_engine.lock().demote());
+            }
+            if mode == "kill-switch" {
+                let mut policy = daemon.config.policy.clone();
+                policy.kill_switch = true;
+                daemon.policy_engine.lock().update_config(policy);
+            }
+            let (scan_tx, scan_rx) = bounded(1);
+            let (del_tx, _del_rx) = bounded(4);
+            let (report_tx, report_rx) = bounded(4);
+            let (_feedback_tx, feedback_rx) = bounded(4);
+            let worker = daemon
+                .spawn_scanner_thread(
+                    scan_rx,
+                    del_tx,
+                    daemon.logger_handle.clone(),
+                    ThreadHeartbeat::new("log-policy-test"),
+                    report_tx,
+                    feedback_rx,
+                )
+                .unwrap();
+            scan_tx
+                .send(ScanRequest {
+                    paths: daemon.config.scanner.root_paths.clone(),
+                    urgency: 1.0,
+                    pressure_level: PressureLevel::Critical,
+                    free_pct: Some(0.0),
+                    max_delete_batch: 1,
+                    force_full_scan: true,
+                    scan_now: None,
+                    inode_reclaim: None,
+                    config_update: None,
+                    catalog_roots: Vec::new(),
+                    maintenance: false,
+                    target_bytes: None,
+                    ram_reclaim: None,
+                })
+                .unwrap();
+            drop(scan_tx);
+            worker.join().unwrap();
+            assert!(report_rx.try_recv().is_ok(), "{mode}: the scan must run");
+            if mode == "enforce" {
+                assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+            } else {
+                assert_eq!(std::fs::read(&log).unwrap(), contents, "{mode}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_log_truncation_rejects_revoked_config_and_shutdown() {
+        for change in ["disabled", "paths", "size", "dry-run", "shutdown"] {
+            let directory = tempfile::tempdir().unwrap();
+            let log = directory.path().join("revoked.log");
+            let contents = vec![b'x'; 4096];
+            std::fs::write(&log, &contents).unwrap();
+            let mut scanner = Config::default().scanner;
+            scanner.log_truncation = crate::core::config::LogTruncationConfig {
+                enabled: true,
+                paths: vec![log.to_string_lossy().into_owned()],
+                min_size_bytes: 1024,
+                pressure_free_pct_ceiling: 100,
+                min_age_minutes: 0,
+            };
+            let mut changed = scanner.clone();
+            match change {
+                "disabled" => changed.log_truncation.enabled = false,
+                "paths" => changed.log_truncation.paths.clear(),
+                "size" => changed.log_truncation.min_size_bytes = 8192,
+                "dry-run" => changed.dry_run = true,
+                "shutdown" => {}
+                _ => unreachable!(),
+            }
+            let live = RwLock::new(changed);
+            let executor = SharedExecutorConfig::new(false, 10, 0.0, 60, 3600, false, 0);
+            let policy = Mutex::new(PolicyEngine::new(Default::default()));
+            let shutdown = AtomicBool::new(change == "shutdown");
+            let report = truncate_daemon_logs(&scanner, 0.0, &live, &executor, &policy, &shutdown);
+            assert_eq!(report.files_truncated, 0, "{change}");
+            assert_eq!(report.bytes_reclaimed, 0, "{change}");
+            assert_eq!(std::fs::read(&log).unwrap(), contents, "{change}");
+            assert!(report.errors.is_empty());
+
+            *live.write() = scanner.clone();
+            shutdown.store(false, Ordering::Relaxed);
+            let retry = truncate_daemon_logs(&scanner, 0.0, &live, &executor, &policy, &shutdown);
+            assert_eq!(retry.files_truncated, 1, "{change}: no failure cooldown");
         }
     }
 
@@ -18203,6 +18358,7 @@ mod tests {
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
             None,
+            &Mutex::new(PolicyEngine::new(Default::default())),
         );
         logger.shutdown();
         logger_join.join().unwrap();
@@ -18333,6 +18489,7 @@ mod tests {
                 )),
                 &Arc::new(SharedRegret::new(&Config::default())),
                 None,
+                &Mutex::new(PolicyEngine::new(Default::default())),
             );
             logger.shutdown();
             logger_join.join().unwrap();
@@ -20893,6 +21050,7 @@ mod tests {
                     &executor_config,
                     &regret,
                     None,
+                    &Mutex::new(PolicyEngine::new(Default::default())),
                 );
             });
             // Do not panic while the worker can be waiting on scan_rx: always
@@ -21157,6 +21315,7 @@ mod tests {
             &executor_config,
             &Arc::new(SharedRegret::new(&config)),
             None,
+            &Mutex::new(PolicyEngine::new(Default::default())),
         );
         logger.shutdown();
         logger_join.join().unwrap();
@@ -21275,6 +21434,7 @@ mod tests {
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
             None,
+            &Mutex::new(PolicyEngine::new(Default::default())),
         );
 
         assert!(
@@ -21924,6 +22084,7 @@ mod tests {
                 &executor_config,
                 &Arc::new(SharedRegret::new(&config)),
                 None,
+                &Mutex::new(PolicyEngine::new(Default::default())),
             );
             logger.shutdown();
             logger_join.join().unwrap();
@@ -22057,6 +22218,7 @@ mod tests {
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
             None,
+            &Mutex::new(PolicyEngine::new(Default::default())),
         );
 
         // The pre-scan's batch is dispatched first. The walk may follow with
@@ -22192,6 +22354,7 @@ mod tests {
                 )),
                 &Arc::new(SharedRegret::new(&Config::default())),
                 None,
+                &Mutex::new(PolicyEngine::new(Default::default())),
             );
             let mut dispatched = Vec::new();
             while let Ok(batch) = del_rx.try_recv() {
@@ -22444,6 +22607,7 @@ mod tests {
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
             None,
+            &Mutex::new(PolicyEngine::new(Default::default())),
         );
 
         let report = report_rx
@@ -22664,6 +22828,7 @@ mod tests {
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
             None,
+            &Mutex::new(PolicyEngine::new(Default::default())),
         );
 
         assert!(
@@ -22906,6 +23071,7 @@ mod tests {
                 &executor_config,
                 &Arc::new(SharedRegret::new(&Config::default())),
                 None,
+                &Mutex::new(PolicyEngine::new(Default::default())),
             );
             logger.shutdown();
             logger_join.join().unwrap();
@@ -23052,6 +23218,7 @@ mod tests {
                 &executor_config,
                 &Arc::new(SharedRegret::new(&Config::default())),
                 None,
+                &Mutex::new(PolicyEngine::new(Default::default())),
             );
             logger.shutdown();
             logger_join.join().unwrap();
@@ -23329,6 +23496,7 @@ mod tests {
             )),
             &Arc::new(SharedRegret::new(&Config::default())),
             None,
+            &Mutex::new(PolicyEngine::new(Default::default())),
         );
 
         let report = report_rx
@@ -25841,6 +26009,7 @@ mod tests {
                     )),
                     &Arc::new(SharedRegret::new(&Config::default())),
                     None,
+                    &Mutex::new(PolicyEngine::new(Default::default())),
                 );
             });
             for (path, dirty, catalog) in [

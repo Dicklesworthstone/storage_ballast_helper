@@ -25,6 +25,105 @@ fn log(path: &Path) {
 }
 
 #[test]
+fn revoked_authority_preserves_logs_before_open_and_after_blocking_work() {
+    for revoke_at in ["before open", "during open", "during reservation"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revoked.log");
+        log(&path);
+        let config = config(std::slice::from_ref(&path));
+        let recent = Mutex::new(RecentTruncations::default());
+        let allowed = Cell::new(revoke_at != "before open");
+        let opened = Cell::new(false);
+        let now = Instant::now();
+        let result = process_candidate_with_history(
+            &path,
+            &config,
+            true,
+            false,
+            |path| {
+                opened.set(true);
+                let file = open_candidate_for_truncate(path)?;
+                if revoke_at == "during open" {
+                    allowed.set(false);
+                }
+                Ok(file)
+            },
+            &recent,
+            || {
+                if revoke_at == "during reservation" {
+                    allowed.set(false);
+                }
+                now
+            },
+            &|| allowed.get(),
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            Outcome::Skipped(SkipReason::PolicyChanged)
+        ));
+        assert_eq!(opened.get(), revoke_at != "before open");
+        assert_eq!(fs::read(&path).unwrap(), vec![b'x'; 4096], "{revoke_at}");
+        let metadata = fs::metadata(&path).unwrap();
+        let reservation = RecentTruncations::acquire(&recent, &path, &metadata, now)
+            .expect("revocation releases the in-flight reservation");
+        assert_eq!(
+            reservation.previous_size(),
+            None,
+            "no false success receipt"
+        );
+    }
+}
+
+#[test]
+fn authority_is_renewed_per_log_without_backing_off_revoked_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.log");
+    let second = dir.path().join("second.log");
+    log(&first);
+    log(&second);
+    let config = config(&[first.clone(), second.clone()]);
+    let checks = Cell::new(0);
+    let report = truncate_oversized_logs_guarded(&config, 0.0, false, &|| {
+        let check = checks.get();
+        checks.set(check + 1);
+        check < 2 // Only the first file retains authority through mutation.
+    });
+    assert_eq!(report.files_truncated, 1);
+    assert_eq!(report.bytes_reclaimed, 4096);
+    assert_eq!(report.files_would_truncate, 0);
+    assert!(report.errors.is_empty());
+    assert_eq!(
+        report.skipped_with_reason,
+        vec![(second.clone(), SkipReason::PolicyChanged)]
+    );
+    assert_eq!(fs::metadata(&first).unwrap().len(), 0);
+    assert_eq!(fs::read(&second).unwrap(), vec![b'x'; 4096]);
+
+    // A fresh approval works immediately: revocation is neither a failed
+    // filesystem operation nor a successfully truncated inode.
+    let retry = truncate_oversized_logs_guarded(&config, 0.0, false, &|| true);
+    assert_eq!(retry.files_truncated, 1);
+    assert_eq!(fs::metadata(&second).unwrap().len(), 0);
+}
+
+#[test]
+fn guarded_dry_run_inspects_without_requesting_mutation_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("observe.log");
+    log(&path);
+    let config = config(std::slice::from_ref(&path));
+    let report = truncate_oversized_logs_guarded(&config, 0.0, true, &|| {
+        panic!("inspection must not request mutation authority")
+    });
+    assert!(report.dry_run);
+    assert_eq!(report.files_truncated, 0);
+    assert_eq!(report.bytes_reclaimed, 0);
+    assert_eq!(report.files_would_truncate, 1);
+    assert_eq!(fs::read(&path).unwrap(), vec![b'x'; 4096]);
+}
+
+#[test]
 fn failed_paths_back_off_but_independent_logs_keep_reclaiming() {
     let dir = tempfile::tempdir().unwrap();
     let bad = dir.path().join("bad.log");

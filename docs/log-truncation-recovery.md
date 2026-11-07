@@ -4,6 +4,23 @@ The active-log truncator is a separate reclamation path for configured log files
 whose writers keep file descriptors open. It truncates in place rather than
 unlinking the file and leaving its blocks pinned by the writer.
 
+## Live policy controls automatic truncation
+
+The daemon truncates active logs only in **Enforce** mode. Observe, Canary,
+FallbackSafe (including the kill switch), and `scanner.dry_run` inspect eligible
+logs as dry runs. Canary's scored-artifact deletion quota does not authorize
+unscored log truncation.
+
+Every automatic truncation checks the live mode, dry-run setting, shutdown flag,
+and log-truncation configuration before opening the log for writing and again
+immediately before truncating its verified descriptor. A configuration change
+revokes the old sweep; the next pass can reconsider the new policy. Refused files
+retain their bytes, receive no reclaimed-byte credit, and enter no failure
+cooldown. Files already truncated before revocation remain completed actions.
+
+Explicit `sbh truncate-logs` invocations retain their own confirmation and
+`--dry-run` behavior; they do not borrow a running daemon's policy authority.
+
 ## Failed attempts back off
 
 The daemon's repeated calls now share a process-local failure history. A failed
