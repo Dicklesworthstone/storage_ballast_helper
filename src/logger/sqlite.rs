@@ -6,10 +6,10 @@
 #![allow(missing_docs)]
 
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::core::errors::{Result, SbhError};
 use crate::scanner::decision_record::DecisionRecord;
@@ -33,6 +33,46 @@ pub struct StoredOutcome {
     pub after_secs: u64,
     pub detail: String,
 }
+
+/// Append positions in the two independent persisted evidence streams.
+/// These are AUTOINCREMENT sequence values, so retention does not rewind them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistoryWatermark {
+    pub activity_id: i64,
+    pub outcome_id: i64,
+}
+
+/// Persisted provenance is separate from the public evidence payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryRecord<T> {
+    pub row_id: i64,
+    pub run_id: Option<String>,
+    pub value: T,
+}
+
+/// A consistent startup view and the append boundary that follows it.
+#[derive(Debug)]
+pub struct HistorySnapshot {
+    pub watermark: HistoryWatermark,
+    pub receipts: Vec<HistoryRecord<StoredDeletion>>,
+    pub outcomes: Vec<HistoryRecord<StoredOutcome>>,
+}
+
+/// One bounded read of both streams. Rejected records still advance the cursor.
+#[derive(Debug)]
+pub struct HistoryPage {
+    pub watermark: HistoryWatermark,
+    /// Both append frontiers captured in the page's read transaction.
+    pub frontier: HistoryWatermark,
+    pub receipts: Vec<HistoryRecord<StoredDeletion>>,
+    pub outcomes: Vec<HistoryRecord<StoredOutcome>>,
+    pub more: bool,
+    /// The ledger's append sequence was reset; do not apply this empty page.
+    pub reset: bool,
+}
+
+/// Bound raw rows examined per table, including unrelated and malformed rows.
+const MAX_HISTORY_PAGE_ROWS: u32 = 256;
 
 /// A successful irreversible mutation, independent of its later regret label.
 /// Older receipts lack a completion time and may need their decision record
@@ -102,6 +142,52 @@ fn stored_outcome_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredOu
         after_secs: u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
         detail: row.get(7)?,
     })
+}
+
+fn history_receipt_from_row(
+    row: &rusqlite::Row<'_>,
+    since: &str,
+) -> rusqlite::Result<Option<HistoryRecord<StoredDeletion>>> {
+    let (Some(timestamp), Some(path), Some(details)) = (
+        row.get::<_, Option<String>>(2)?,
+        row.get::<_, Option<String>>(3)?,
+        row.get::<_, Option<String>>(4)?,
+    ) else {
+        return Ok(None);
+    };
+    if timestamp.as_str() < since {
+        return Ok(None);
+    }
+    let Some(value) = StoredDeletion::from_activity(&timestamp, path, &details) else {
+        return Ok(None);
+    };
+    Ok(Some(HistoryRecord {
+        row_id: row.get(0)?,
+        run_id: row.get(1)?,
+        value,
+    }))
+}
+
+fn history_outcome_from_row(
+    row: &rusqlite::Row<'_>,
+    since: &str,
+) -> rusqlite::Result<Option<HistoryRecord<StoredOutcome>>> {
+    // Negative durations are corrupt evidence, not a deletion at observation time.
+    if row.get::<_, i64>(6)? < 0 {
+        return Ok(None);
+    }
+    let value = stored_outcome_from_row(row)?;
+    if value.observed_at.as_str() < since
+        || chrono::DateTime::parse_from_rfc3339(&value.observed_at).is_err()
+        || crate::scanner::regret::Outcome::from_name(&value.outcome).is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(HistoryRecord {
+        row_id: row.get(8)?,
+        run_id: row.get(9)?,
+        value,
+    }))
 }
 
 impl SqliteLogger {
@@ -177,6 +263,14 @@ impl SqliteLogger {
         })
     }
 
+    /// A short-lived read-only connection for background evidence ingestion.
+    /// A contended ledger must not stall a scanner pass behind the writer.
+    pub fn open_history_reader(path: &Path) -> Result<Self> {
+        let db = Self::open_read_only(path)?;
+        db.conn.busy_timeout(Duration::from_millis(50))?;
+        Ok(db)
+    }
+
     /// Path to the database file.
     pub fn path(&self) -> &Path {
         &self.path
@@ -184,15 +278,20 @@ impl SqliteLogger {
 
     // ──────────────────── activity_log ────────────────────
 
-    /// Insert a row into `activity_log`.
+    /// Insert an activity row without claiming a daemon run.
     pub fn log_activity(&self, row: &ActivityRow) -> Result<()> {
+        self.log_activity_for_run(row, None)
+    }
+
+    /// Preserve writer provenance so a daemon can recognize its own live evidence.
+    pub fn log_activity_for_run(&self, row: &ActivityRow, run_id: Option<&str>) -> Result<()> {
         self.conn
             .prepare_cached(
                 "INSERT INTO activity_log (
                 timestamp, event_type, severity, path, size_bytes, score,
                 score_factors, pressure_level, free_pct, duration_ms,
-                success, error_code, error_message, details
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                success, error_code, error_message, details, run_id
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             )?
             .execute(params![
                 row.timestamp,
@@ -209,6 +308,7 @@ impl SqliteLogger {
                 row.error_code,
                 row.error_message,
                 row.details,
+                run_id,
             ])?;
         Ok(())
     }
@@ -325,6 +425,217 @@ impl SqliteLogger {
             receipts.push(receipt);
         }
         Ok(receipts)
+    }
+
+    // ──────────────────── incremental scoring history ────────────────────
+
+    /// Read startup evidence and both append frontiers from one SQLite snapshot.
+    /// The caller owns time-window policy; this never creates or migrates a ledger.
+    pub fn history_snapshot(
+        &self,
+        outcome_since: &str,
+        receipt_since: &str,
+    ) -> Result<HistorySnapshot> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let watermark = self.history_frontier()?;
+        let receipt_source = self.history_run_id("PRAGMA table_info(activity_log)")?;
+        let outcome_source = self.history_run_id("PRAGMA table_info(decision_outcome)")?;
+        let mut receipts = Vec::new();
+        {
+            let mut statement = self.conn.prepare_cached(&format!(
+                "SELECT id, {receipt_source}, timestamp, path, details FROM activity_log
+                 WHERE event_type = 'artifact_delete' AND success = 1
+                   AND timestamp >= ?1 AND id <= ?2
+                 ORDER BY id ASC"
+            ))?;
+            let mut rows = statement.query(params![receipt_since, watermark.activity_id])?;
+            while let Some(row) = rows.next()? {
+                if let Some(mut record) = history_receipt_from_row(row, receipt_since).ok().flatten() {
+                    self.hydrate_history_receipt(&mut record.value)?;
+                    receipts.push(record);
+                }
+            }
+        }
+        let mut outcomes = Vec::new();
+        {
+            let mut statement = self.conn.prepare_cached(&format!(
+                "SELECT decision_id, path, category, certainty, outcome, observed_at,
+                        after_secs, detail, id, {outcome_source}
+                 FROM decision_outcome
+                 WHERE observed_at >= ?1 AND id <= ?2 ORDER BY id ASC"
+            ))?;
+            let mut rows = statement.query(params![outcome_since, watermark.outcome_id])?;
+            while let Some(row) = rows.next()? {
+                if let Some(record) = history_outcome_from_row(row, outcome_since).ok().flatten() {
+                    outcomes.push(record);
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(HistorySnapshot {
+            watermark,
+            receipts,
+            outcomes,
+        })
+    }
+
+    /// Consume at most `limit` raw rows per table, capped at 256.
+    ///
+    /// Time/type validity is checked after the bounded ID selection, so a long
+    /// run of irrelevant or malformed rows cannot turn one page into a table
+    /// scan. Both streams share a short read transaction. New writes above
+    /// `frontier` are left for a later page; errors publish no reader progress.
+    #[allow(clippy::too_many_lines)]
+    pub fn history_page(
+        &self,
+        after: HistoryWatermark,
+        outcome_since: &str,
+        receipt_since: &str,
+        limit: u32,
+    ) -> Result<HistoryPage> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let frontier = self.history_frontier()?;
+        if after.activity_id > frontier.activity_id || after.outcome_id > frontier.outcome_id {
+            transaction.commit()?;
+            return Ok(HistoryPage {
+                watermark: after,
+                frontier,
+                receipts: Vec::new(),
+                outcomes: Vec::new(),
+                more: false,
+                reset: true,
+            });
+        }
+        let limit = i64::from(limit.clamp(1, MAX_HISTORY_PAGE_ROWS));
+        let receipt_source = self.history_run_id("PRAGMA table_info(activity_log)")?;
+        let outcome_source = self.history_run_id("PRAGMA table_info(decision_outcome)")?;
+        let mut watermark = after;
+        let mut receipts = Vec::new();
+        {
+            // Project payloads only for successful deletions, while consuming
+            // all IDs. Large unrelated planner/diagnostic strings stay in SQLite.
+            let mut statement = self.conn.prepare_cached(&format!(
+                "SELECT id, {receipt_source},
+                        CASE WHEN event_type = 'artifact_delete' AND success = 1 THEN timestamp END,
+                        CASE WHEN event_type = 'artifact_delete' AND success = 1 THEN path END,
+                        CASE WHEN event_type = 'artifact_delete' AND success = 1 THEN details END
+                 FROM activity_log WHERE id > ?1 AND id <= ?2
+                 ORDER BY id ASC LIMIT ?3"
+            ))?;
+            let mut rows = statement.query(params![
+                after.activity_id.max(0),
+                frontier.activity_id,
+                limit,
+            ])?;
+            let mut consumed = 0;
+            while let Some(row) = rows.next()? {
+                watermark.activity_id = row.get(0)?;
+                consumed += 1;
+                if let Some(mut record) = history_receipt_from_row(row, receipt_since).ok().flatten() {
+                    self.hydrate_history_receipt(&mut record.value)?;
+                    receipts.push(record);
+                }
+            }
+            if consumed < limit {
+                // Retention may have removed the tail, but never reuses its IDs.
+                watermark.activity_id = frontier.activity_id;
+            }
+        }
+        let mut outcomes = Vec::new();
+        {
+            let mut statement = self.conn.prepare_cached(&format!(
+                "SELECT decision_id, path, category, certainty, outcome, observed_at,
+                        after_secs, detail, id, {outcome_source}
+                 FROM decision_outcome WHERE id > ?1 AND id <= ?2
+                 ORDER BY id ASC LIMIT ?3"
+            ))?;
+            let mut rows = statement.query(params![
+                after.outcome_id.max(0),
+                frontier.outcome_id,
+                limit,
+            ])?;
+            let mut consumed = 0;
+            while let Some(row) = rows.next()? {
+                watermark.outcome_id = row.get(8)?;
+                consumed += 1;
+                if let Some(record) = history_outcome_from_row(row, outcome_since).ok().flatten() {
+                    outcomes.push(record);
+                }
+            }
+            if consumed < limit {
+                watermark.outcome_id = frontier.outcome_id;
+            }
+        }
+        transaction.commit()?;
+        Ok(HistoryPage {
+            watermark,
+            frontier,
+            receipts,
+            outcomes,
+            more: watermark.activity_id < frontier.activity_id
+                || watermark.outcome_id < frontier.outcome_id,
+            reset: false,
+        })
+    }
+
+    fn history_frontier(&self) -> Result<HistoryWatermark> {
+        // MAX(id) can move backwards when retention removes the newest row.
+        // sqlite_sequence is the committed append frontier of AUTOINCREMENT.
+        Ok(self.conn.query_row(
+            "SELECT
+                COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'activity_log'), 0),
+                COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'decision_outcome'), 0)",
+            [],
+            |row| {
+                Ok(HistoryWatermark {
+                    activity_id: row.get(0)?,
+                    outcome_id: row.get(1)?,
+                })
+            },
+        )?)
+    }
+
+    fn history_run_id(&self, schema_query: &str) -> Result<&'static str> {
+        Ok(if has_column(&self.conn, schema_query, "run_id")? {
+            "run_id"
+        } else {
+            // Read-side clients must not migrate a ledger written by an older sbh.
+            "NULL"
+        })
+    }
+
+    fn hydrate_history_receipt(&self, receipt: &mut StoredDeletion) -> Result<()> {
+        if receipt.category.is_some() {
+            return Ok(());
+        }
+        let timestamp = chrono::DateTime::<chrono::Utc>::from(receipt.recorded_at)
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let record: Option<String> = self
+            .conn
+            .prepare_cached(
+                "SELECT record FROM decision_log
+                 WHERE decision_id = ?1 AND path = ?2 AND timestamp <= ?3
+                 ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row(params![receipt.decision_id, receipt.path, timestamp], |row| {
+                // A malformed legacy JSON payload cannot hold the append cursor
+                // forever. Statement, locking and I/O errors still propagate.
+                Ok(row.get::<_, String>(0).ok())
+            })
+            .optional()?
+            .flatten();
+        receipt.category = record.and_then(|record| {
+            serde_json::from_str::<serde_json::Value>(&record)
+                .ok()?
+                .get("classification")?
+                .get("category")?
+                .as_str()
+                .filter(|category| {
+                    category.parse::<crate::scanner::patterns::ArtifactCategory>().is_ok()
+                })
+                .map(str::to_string)
+        });
+        Ok(())
     }
 
     // ──────────────────── pressure_history ────────────────────
@@ -446,8 +757,17 @@ impl SqliteLogger {
         Ok(())
     }
 
-    /// Record what became of a deletion (regret label).
+    /// Record a regret label without claiming a daemon run.
     pub fn log_outcome(&self, outcome: &crate::scanner::regret::DecisionOutcome) -> Result<()> {
+        self.log_outcome_for_run(outcome, None)
+    }
+
+    /// Record a regret label with the same writer identity as its activity rows.
+    pub fn log_outcome_for_run(
+        &self,
+        outcome: &crate::scanner::regret::DecisionOutcome,
+        run_id: Option<&str>,
+    ) -> Result<()> {
         let observed_at =
             chrono::DateTime::from_timestamp(i64::try_from(outcome.observed_at).unwrap_or(0), 0)
                 .unwrap_or_default()
@@ -455,8 +775,8 @@ impl SqliteLogger {
         self.conn
             .prepare_cached(
                 "INSERT INTO decision_outcome (
-                    decision_id, path, category, certainty, outcome, observed_at, after_secs, detail
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    decision_id, path, category, certainty, outcome, observed_at, after_secs, detail, run_id
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             )?
             .execute(params![
                 outcome.decision_id,
@@ -467,6 +787,7 @@ impl SqliteLogger {
                 observed_at,
                 i64::try_from(outcome.after_secs).unwrap_or(i64::MAX),
                 outcome.detail,
+                run_id,
             ])?;
         Ok(())
     }
@@ -956,7 +1277,9 @@ fn apply_pragmas(conn: &Connection, db_bytes: u64) -> Result<()> {
 }
 
 fn apply_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
+    // Serialize schema inspection and additive migrations across daemon/CLI opens.
+    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS activity_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
@@ -972,7 +1295,8 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             success INTEGER NOT NULL DEFAULT 1,
             error_code TEXT,
             error_message TEXT,
-            details TEXT
+            details TEXT,
+            run_id TEXT
         );
 
         CREATE TABLE IF NOT EXISTS pressure_history (
@@ -1024,7 +1348,8 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             outcome TEXT NOT NULL,
             observed_at TEXT NOT NULL,
             after_secs INTEGER NOT NULL,
-            detail TEXT NOT NULL
+            detail TEXT NOT NULL,
+            run_id TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_outcome_decision_id ON decision_outcome(decision_id);
@@ -1040,7 +1365,34 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_pressure_mount_timestamp
             ON pressure_history(mount_point, timestamp);",
     )?;
+    for (schema_query, migration) in [
+        (
+            "PRAGMA table_info(activity_log)",
+            "ALTER TABLE activity_log ADD COLUMN run_id TEXT",
+        ),
+        (
+            "PRAGMA table_info(decision_outcome)",
+            "ALTER TABLE decision_outcome ADD COLUMN run_id TEXT",
+        ),
+    ] {
+        if !has_column(&transaction, schema_query, "run_id")? {
+            transaction.execute_batch(migration)?;
+        }
+    }
+    transaction.commit()?;
     Ok(())
+}
+
+/// Schema inspection is also used by read-only history readers of older ledgers.
+fn has_column(conn: &Connection, schema_query: &str, column: &str) -> Result<bool> {
+    let mut statement = conn.prepare_cached(schema_query)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // ──────────────────── tests ────────────────────
@@ -1490,6 +1842,300 @@ mod tests {
             assert!(leads_an_index(table, column), "{table}.{column}");
         }
         assert!(!leads_an_index("decision_log", "record"));
+    }
+
+    fn history_activity(seconds: u32) -> ActivityRow {
+        ActivityRow {
+            timestamp: stamp(seconds),
+            event_type: "artifact_delete".to_string(),
+            severity: "info".to_string(),
+            path: Some("/data/shared/go-cache".to_string()),
+            size_bytes: Some(4096),
+            score: None,
+            score_factors: None,
+            pressure_level: None,
+            free_pct: None,
+            duration_ms: None,
+            success: 1,
+            error_code: None,
+            error_message: None,
+            details: Some(format!(
+                "decision_id=0123456789ab;category=GoCache;completed_at={}",
+                stamp(seconds)
+            )),
+        }
+    }
+
+    fn history_outcome(seconds: u32) -> crate::scanner::regret::DecisionOutcome {
+        crate::scanner::regret::DecisionOutcome {
+            decision_id: "0123456789ab".to_string(),
+            path: PathBuf::from("/data/shared/go-cache"),
+            category: "GoCache".to_string(),
+            certainty: "definite".to_string(),
+            outcome: crate::scanner::regret::Outcome::Regret,
+            observed_at: 1_790_000_000 + u64::from(seconds),
+            after_secs: 1,
+            detail: "recreated during use".to_string(),
+        }
+    }
+
+    #[test]
+    fn history_snapshot_followed_by_pages_keeps_equal_and_regressing_timestamps() {
+        let (_dir, writer) = temp_db();
+        writer
+            .log_activity_for_run(&history_activity(10), Some("source-a"))
+            .unwrap();
+        writer
+            .log_outcome_for_run(&history_outcome(10), Some("source-a"))
+            .unwrap();
+        let reader = SqliteLogger::open_history_reader(writer.path()).unwrap();
+        let snapshot = reader.history_snapshot(&stamp(0), &stamp(0)).unwrap();
+        assert_eq!(
+            snapshot.watermark,
+            HistoryWatermark {
+                activity_id: 1,
+                outcome_id: 1,
+            }
+        );
+        assert_eq!(snapshot.receipts.len(), 1);
+        assert_eq!(snapshot.outcomes.len(), 1);
+        assert_eq!(snapshot.receipts[0].run_id.as_deref(), Some("source-a"));
+        assert_eq!(snapshot.outcomes[0].run_id.as_deref(), Some("source-a"));
+        assert_eq!(
+            reader
+                .conn
+                .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            50
+        );
+
+        // IDs, not timestamps, identify the unread suffix. Both writes follow
+        // the snapshot even when their wall-clock labels do not move forward.
+        for seconds in [10, 5] {
+            writer.log_activity(&history_activity(seconds)).unwrap();
+            writer.log_outcome(&history_outcome(seconds)).unwrap();
+        }
+        let first = reader
+            .history_page(snapshot.watermark, &stamp(0), &stamp(0), 1)
+            .unwrap();
+        assert_eq!(first.receipts[0].row_id, 2);
+        assert_eq!(first.outcomes[0].row_id, 2);
+        assert!(first.receipts[0].run_id.is_none());
+        assert!(first.more);
+        let second = reader
+            .history_page(first.watermark, &stamp(0), &stamp(0), 1)
+            .unwrap();
+        assert_eq!(second.receipts[0].row_id, 3);
+        assert_eq!(second.outcomes[0].value.observed_at, stamp(5));
+        assert_eq!(second.watermark, second.frontier);
+        assert!(!second.more);
+        assert!(!second.reset);
+    }
+
+    #[test]
+    fn history_pages_bound_raw_work_and_advance_past_malformed_rows() {
+        let (_dir, writer) = temp_db();
+        fill_activity(&writer, 0, 258);
+        let mut malformed = history_activity(3);
+        malformed.details = Some("missing the decision identity".to_string());
+        writer.log_activity(&malformed).unwrap();
+        writer.log_activity(&history_activity(4)).unwrap();
+        writer
+            .conn
+            .execute(
+                "INSERT INTO decision_outcome (
+                    decision_id, path, category, certainty, outcome, observed_at,
+                    after_secs, detail
+                 ) VALUES ('bad', '/bad', 'GoCache', 'definite', 'regret', ?1, 1, '')",
+                ["not-a-timestamp"],
+            )
+            .unwrap();
+        writer.log_outcome(&history_outcome(4)).unwrap();
+        writer
+            .conn
+            .execute(
+                "INSERT INTO decision_outcome (
+                    decision_id, path, category, certainty, outcome, observed_at,
+                    after_secs, detail
+                 ) VALUES ('bad', '/bad', 'GoCache', 'definite', 'regret', ?1, -1, '')",
+                [stamp(4)],
+            )
+            .unwrap();
+        let reader = SqliteLogger::open_history_reader(writer.path()).unwrap();
+        let first = reader
+            .history_page(HistoryWatermark::default(), &stamp(0), &stamp(0), u32::MAX)
+            .unwrap();
+        assert_eq!(first.watermark.activity_id, 256);
+        assert_eq!(first.watermark.outcome_id, 3);
+        assert!(first.receipts.is_empty());
+        assert_eq!(first.outcomes.len(), 1);
+        assert_eq!(first.outcomes[0].row_id, 2);
+        assert!(first.more);
+
+        let second = reader
+            .history_page(first.watermark, &stamp(0), &stamp(0), 2)
+            .unwrap();
+        assert_eq!(second.watermark.activity_id, 258);
+        assert!(second.receipts.is_empty());
+        let third = reader
+            .history_page(second.watermark, &stamp(0), &stamp(0), 1)
+            .unwrap();
+        assert_eq!(third.watermark.activity_id, 259);
+        assert!(third.receipts.is_empty());
+        assert!(third.more);
+        let fourth = reader
+            .history_page(third.watermark, &stamp(0), &stamp(0), 1)
+            .unwrap();
+        assert_eq!(fourth.watermark.activity_id, 260);
+        assert_eq!(fourth.receipts.len(), 1);
+        assert!(!fourth.more);
+    }
+
+    #[test]
+    fn history_retention_does_not_rewind_the_frontier_but_sequence_reset_is_reported() {
+        let (_dir, writer) = temp_db();
+        for seconds in [1, 2] {
+            writer.log_activity(&history_activity(seconds)).unwrap();
+            writer.log_outcome(&history_outcome(seconds)).unwrap();
+        }
+        let reader = SqliteLogger::open_history_reader(writer.path()).unwrap();
+        let before = reader.history_snapshot(&stamp(0), &stamp(0)).unwrap();
+        writer
+            .conn
+            .execute_batch("DELETE FROM activity_log; DELETE FROM decision_outcome;")
+            .unwrap();
+        let empty = reader
+            .history_page(before.watermark, &stamp(0), &stamp(0), 1)
+            .unwrap();
+        assert_eq!(empty.frontier, before.watermark);
+        assert_eq!(empty.watermark, before.watermark);
+        assert!(!empty.reset);
+        assert!(!empty.more);
+        let catchup = reader
+            .history_page(HistoryWatermark::default(), &stamp(0), &stamp(0), 1)
+            .unwrap();
+        assert_eq!(catchup.watermark, before.watermark);
+        assert!(!catchup.more);
+
+        writer
+            .conn
+            .execute(
+                "DELETE FROM sqlite_sequence WHERE name IN ('activity_log', 'decision_outcome')",
+                [],
+            )
+            .unwrap();
+        let reset = reader
+            .history_page(before.watermark, &stamp(0), &stamp(0), 1)
+            .unwrap();
+        assert!(reset.reset);
+        assert_eq!(reset.watermark, before.watermark);
+        assert_eq!(reset.frontier, HistoryWatermark::default());
+        assert!(reset.receipts.is_empty());
+        assert!(reset.outcomes.is_empty());
+    }
+
+    #[test]
+    fn legacy_history_is_read_without_migration_and_writers_add_provenance() {
+        let (_dir, writer) = temp_db();
+        writer.log_activity(&history_activity(1)).unwrap();
+        writer.log_outcome(&history_outcome(2)).unwrap();
+        writer
+            .conn
+            .execute_batch(
+                "ALTER TABLE activity_log DROP COLUMN run_id;
+                 ALTER TABLE decision_outcome DROP COLUMN run_id;",
+            )
+            .unwrap();
+        let path = writer.path().to_path_buf();
+        drop(writer);
+
+        let reader = SqliteLogger::open_history_reader(&path).unwrap();
+        let old = reader.history_snapshot(&stamp(0), &stamp(0)).unwrap();
+        assert_eq!(old.receipts.len(), 1);
+        assert_eq!(old.outcomes.len(), 1);
+        assert!(old.receipts[0].run_id.is_none());
+        assert!(old.outcomes[0].run_id.is_none());
+        for schema in [
+            "PRAGMA table_info(activity_log)",
+            "PRAGMA table_info(decision_outcome)",
+        ] {
+            assert!(!has_column(&reader.conn, schema, "run_id").unwrap());
+        }
+        assert!(reader.log_activity(&history_activity(3)).is_err());
+        drop(reader);
+
+        let migrated = SqliteLogger::open(&path).unwrap();
+        migrated
+            .log_activity_for_run(&history_activity(3), Some("new-daemon"))
+            .unwrap();
+        migrated
+            .log_outcome_for_run(&history_outcome(4), Some("new-daemon"))
+            .unwrap();
+        drop(migrated);
+        let reopened = SqliteLogger::open(&path).unwrap();
+        let after = reopened.history_snapshot(&stamp(0), &stamp(0)).unwrap();
+        assert_eq!(after.receipts.len(), 2);
+        assert_eq!(after.outcomes.len(), 2);
+        assert!(after.receipts[0].run_id.is_none());
+        assert!(after.outcomes[0].run_id.is_none());
+        assert_eq!(after.receipts[1].run_id.as_deref(), Some("new-daemon"));
+        assert_eq!(after.outcomes[1].run_id.as_deref(), Some("new-daemon"));
+    }
+
+    #[test]
+    fn history_query_failure_retries_the_whole_unpublished_page() {
+        let (_dir, writer) = temp_db();
+        let reader = SqliteLogger::open_history_reader(writer.path()).unwrap();
+        let before = reader.history_snapshot(&stamp(0), &stamp(0)).unwrap();
+        writer.log_activity(&history_activity(1)).unwrap();
+        writer
+            .conn
+            .execute_batch("ALTER TABLE decision_outcome RENAME TO temporarily_unavailable;")
+            .unwrap();
+        assert!(
+            reader
+                .history_page(before.watermark, &stamp(0), &stamp(0), 8)
+                .is_err()
+        );
+        writer
+            .conn
+            .execute_batch("ALTER TABLE temporarily_unavailable RENAME TO decision_outcome;")
+            .unwrap();
+        let retried = reader
+            .history_page(before.watermark, &stamp(0), &stamp(0), 8)
+            .unwrap();
+        assert_eq!(retried.receipts.len(), 1);
+        assert_eq!(retried.receipts[0].row_id, 1);
+        assert_eq!(retried.watermark.activity_id, 1);
+    }
+
+    #[test]
+    fn malformed_legacy_category_payload_does_not_stall_history() {
+        let (_dir, writer) = temp_db();
+        let mut receipt = history_activity(2);
+        receipt.details = Some("decision_id=0123456789ab".to_string());
+        writer.log_activity(&receipt).unwrap();
+        writer
+            .conn
+            .execute(
+                "INSERT INTO decision_log (
+                    decision_id, timestamp, path, action, policy_mode, total_score,
+                    posterior_abandoned, expected_loss_keep, expected_loss_delete, record
+                 ) VALUES (
+                    '0123456789ab', ?1, '/data/shared/go-cache', 'delete', 'live',
+                    0.9, 0.9, 1.0, 0.1, X'ff'
+                 )",
+                [stamp(1)],
+            )
+            .unwrap();
+        let reader = SqliteLogger::open_history_reader(writer.path()).unwrap();
+        let page = reader
+            .history_page(HistoryWatermark::default(), &stamp(0), &stamp(0), 8)
+            .unwrap();
+        assert_eq!(page.watermark.activity_id, 1);
+        assert_eq!(page.receipts.len(), 1);
+        assert!(page.receipts[0].value.category.is_none());
+        assert!(!page.more);
     }
 
     #[test]

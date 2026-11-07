@@ -478,8 +478,8 @@ fn logger_thread_main(
     let _ = sqlite_path;
 
     let mut jsonl = JsonlWriter::open(jsonl_config);
-    if let Some(run_id) = run_id {
-        jsonl.set_run_id(run_id);
+    if let Some(run_id) = &run_id {
+        jsonl.set_run_id(run_id.clone());
     }
     #[cfg(feature = "sqlite")]
     let mut sqlite_failures: u32 = 0;
@@ -611,7 +611,7 @@ fn logger_thread_main(
             if let Some(db) = &sqlite {
                 let activity_ok = activity_row
                     .as_ref()
-                    .map(|row| db.log_activity(row).is_ok());
+                    .map(|row| db.log_activity_for_run(row, run_id.as_deref()).is_ok());
                 let pressure_ok = pressure_row
                     .as_ref()
                     .map(|row| db.log_pressure(row).is_ok());
@@ -624,7 +624,7 @@ fn logger_thread_main(
                         Some(ok)
                     }
                     ActivityEvent::DecisionOutcome(outcome) => {
-                        Some(db.log_outcome(outcome).is_ok())
+                        Some(db.log_outcome_for_run(outcome, run_id.as_deref()).is_ok())
                     }
                     _ => None,
                 };
@@ -1241,12 +1241,37 @@ mod tests {
     #[test]
     fn sqlite_trips_after_three_failures_and_reopens_after_fifty_events() {
         let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
+        let mut config = test_config(dir.path());
+        config.run_id = Some("recovered-run".to_string());
         let db_path = dir.path().join("test.db");
         drop(SqliteLogger::open(&db_path).unwrap());
         let (handle, join) = spawn_logger(config).unwrap();
 
         let blocker = rusqlite::Connection::open(&db_path).unwrap();
+        // Wait for the asynchronous logger's schema transaction and first
+        // write before deliberately blocking subsequent writes.
+        handle.send(ActivityEvent::Error {
+            code: "SBH-READY".to_string(),
+            message: "sqlite startup handshake".to_string(),
+        });
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let ready: i64 = blocker
+                .query_row(
+                    "SELECT COUNT(*) FROM activity_log WHERE error_code = 'SBH-READY'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if ready == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "logger did not finish SQLite startup"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
         for i in 0..3 {
             handle.send(ActivityEvent::Error {
@@ -1291,6 +1316,15 @@ mod tests {
         assert_eq!(count("SBH-LOCKED-"), 0, "locked writes must not land");
         assert_eq!(count("SBH-TRIPPED-"), 0, "tripped events are JSONL-only");
         assert_eq!(count("SBH-AFTER-"), 5, "rows resume after the reopen");
+        let recovered: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM activity_log
+                 WHERE error_code LIKE 'SBH-AFTER-%' AND run_id = 'recovered-run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovered, 5, "backend recovery must retain writer provenance");
         let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
         assert_eq!(jsonl.matches("SBH-LOCKED-").count(), 3);
         assert_eq!(jsonl.matches("SBH-TRIPPED-").count(), 50);
@@ -1689,7 +1723,9 @@ mod tests {
     #[test]
     fn deletion_receipts_keep_completion_and_category_without_a_later_outcome() {
         let dir = tempfile::tempdir().unwrap();
-        let (handle, join) = spawn_logger(test_config(dir.path())).unwrap();
+        let mut config = test_config(dir.path());
+        config.run_id = Some("receipt-run".to_string());
+        let (handle, join) = spawn_logger(config).unwrap();
         let completed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
         let event = |path: &str, quarantined| ActivityEvent::ArtifactDeleted {
             path: path.to_string(),
@@ -1732,6 +1768,12 @@ mod tests {
         assert_eq!(receipts[0].path, "/tmp/structural-go-cache");
         assert_eq!(receipts[0].category.as_deref(), Some("GoCache"));
         assert_eq!(receipts[0].completed_at, Some(completed_at));
+        let snapshot = db
+            .history_snapshot("2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(snapshot.receipts.len(), 1);
+        assert_eq!(snapshot.receipts[0].run_id.as_deref(), Some("receipt-run"));
+        assert!(snapshot.outcomes.is_empty());
         assert!(
             db.outcomes_since("2020-01-01T00:00:00Z")
                 .unwrap()
@@ -1748,6 +1790,47 @@ mod tests {
         );
         assert_eq!(entry.details.as_deref(), Some("category=GoCache"));
         assert_eq!(entry.quarantined, Some(false));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn decision_outcomes_keep_the_same_writer_identity_as_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.run_id = Some("outcome-run".to_string());
+        let (handle, join) = spawn_logger(config).unwrap();
+        handle.send(ActivityEvent::DecisionOutcome(Box::new(
+            crate::scanner::regret::DecisionOutcome {
+                decision_id: "0123456789ab".to_string(),
+                path: std::path::PathBuf::from("/data/shared/go-cache"),
+                category: "GoCache".to_string(),
+                certainty: "definite".to_string(),
+                outcome: crate::scanner::regret::Outcome::Regret,
+                observed_at: 1_790_000_000,
+                after_secs: 10,
+                detail: "recreated during use".to_string(),
+            },
+        )));
+        handle.shutdown();
+        join.join().unwrap();
+
+        let db = SqliteLogger::open_history_reader(&dir.path().join("test.db")).unwrap();
+        let snapshot = db
+            .history_snapshot("2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(snapshot.outcomes.len(), 1);
+        assert_eq!(snapshot.outcomes[0].run_id.as_deref(), Some("outcome-run"));
+        assert_eq!(snapshot.outcomes[0].value.outcome, "regret");
+
+        let contents = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        let entries: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(!entries.is_empty());
+        for entry in entries {
+            assert_eq!(entry["run_id"], "outcome-run");
+        }
     }
 
     #[test]

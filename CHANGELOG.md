@@ -119,6 +119,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Added
 
+- **Cleanup history retains writer provenance and supports bounded reads.**
+  SQLite records the daemon run on receipts and outcomes, including after
+  logger recovery. A read-only history API captures consistent startup
+  boundaries and consumes capped pages by append ID. It advances past malformed
+  records, preserves progress across retention, and reads older schemas without
+  migration. Writable opens serialize the additive provenance migration.
+
 - **Finite inode pressure can reclaim eligible artifacts despite ample free
   bytes.** Linux monitors available inodes independently, using validated
   `[pressure.inodes]` thresholds and recovery hysteresis. Inode-driven passes
