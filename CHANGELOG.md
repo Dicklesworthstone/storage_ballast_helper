@@ -8,6 +8,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Interrupted child dispatch preserves useful discovery across slices.**
+  Name-only daemon walks give interrupted pages resumable child turns while
+  ordinary scans retain parallel dispatch. Scheduling priority advances when
+  the consumer receives a real result, including progress below nested
+  parents; queued and unconsumed work remains unfinished. Short scans avoid
+  repeatedly returning the same parent before reaching its children.
+
 - **Quarantine maintenance renews live removal permission.** TTL and size-cap
   cleanup now stop when mode, dry-run, shutdown or ordinary-cleanup holds revoke
   the admitted sweep. Permission is renewed after durable preparation and

@@ -6,8 +6,9 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::RecvTimeoutError;
@@ -232,4 +233,246 @@ fn interleaved_scopes_each_rotate_their_actual_first_results() {
     assert_eq!(right_seen, right.iter().cloned().collect());
     assert_retained(&left);
     assert_retained(&right);
+}
+
+fn slice_config(roots: Vec<PathBuf>) -> WalkerConfig {
+    WalkerConfig {
+        root_paths: roots,
+        max_depth: 4,
+        follow_symlinks: false,
+        cross_devices: false,
+        parallelism: 1,
+        excluded_paths: HashSet::new(),
+        opaque_pruning: false,
+    }
+}
+
+/// Schedule the consumer at each real walker heartbeat. Only results produced
+/// before that tick and received before cancellation count as useful work.
+/// Once the slice ends, all other output goes directly to unfinished receipts.
+/// This is deterministic finite-work accounting, not a fleet CPU measurement.
+fn finite_slice(
+    config: WalkerConfig,
+    allowance: usize,
+    stop_on: impl Fn(&WalkEntry) -> bool,
+) -> (Vec<WalkEntry>, Vec<PathBuf>) {
+    let (tick_tx, tick_rx) = crossbeam_channel::bounded(0);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(0);
+    let walker =
+        DirectoryWalker::new(config, ProtectionRegistry::marker_only()).without_file_sizes();
+    let cancel = walker.cancel_token();
+    let stop = Arc::clone(&cancel);
+    let ticks = AtomicUsize::new(0);
+    let walker = walker.with_heartbeat(move || {
+        let tick = ticks.fetch_add(1, Ordering::Relaxed) + 1;
+        if tick_tx.send(tick).is_err()
+            || resume_rx.recv_timeout(Duration::from_secs(5)).is_err()
+            || tick >= allowance
+        {
+            stop.store(true, Ordering::Relaxed);
+        }
+    });
+    let mut stream = walker.stream().unwrap();
+    drop(walker);
+    let mut received = Vec::new();
+    loop {
+        let tick = match tick_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(tick) => Some(tick),
+            Err(RecvTimeoutError::Disconnected) => None,
+            Err(RecvTimeoutError::Timeout) => {
+                cancel.store(true, Ordering::Relaxed);
+                panic!("walker did not reach its next cooperative boundary");
+            }
+        };
+        while !cancel.load(Ordering::Relaxed) {
+            match stream.recv_timeout(Duration::ZERO) {
+                Ok(entry) => {
+                    let done = stop_on(&entry);
+                    received.push(entry);
+                    if done {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let Some(tick) = tick else { break };
+        if tick >= allowance {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        resume_tx.send(()).unwrap();
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+    let unfinished = stream
+        .unfinished_after_cancel(Duration::from_secs(5))
+        .expect("the canceled workers must return their unfinished pages");
+    (received, unfinished)
+}
+
+fn child_fixture(root: &Path, count: usize) -> BTreeSet<PathBuf> {
+    (0..count)
+        .map(|index| {
+            let child = root.join(format!("child-{index:04}"));
+            fs::create_dir_all(&child).unwrap();
+            fs::write(child.join("payload"), b"preserved").unwrap();
+            child
+        })
+        .collect()
+}
+
+#[test]
+fn equally_finite_slices_deliver_every_child_of_an_interrupted_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let expected = child_fixture(&root, 520);
+    let config = slice_config(vec![root.clone()]);
+    let (first, unfinished) = finite_slice(config.clone(), 6, |_| false);
+    assert!(
+        first.is_empty(),
+        "this slice must stop while only queueing children"
+    );
+    assert!(
+        unfinished
+            .iter()
+            .any(|path| root.starts_with(path) || path.starts_with(&root))
+    );
+
+    let mut seen = BTreeSet::new();
+    for _ in 0..expected.len() + 8 {
+        let (entries, unfinished) = finite_slice(config.clone(), 6, |_| false);
+        seen.extend(entries.into_iter().map(|entry| entry.path));
+        assert!(
+            !unfinished.is_empty(),
+            "a partial page cannot prove a finished subtree"
+        );
+        if seen == expected {
+            break;
+        }
+    }
+    assert_eq!(
+        seen, expected,
+        "only results consumed before cancellation count"
+    );
+    for child in &expected {
+        assert_eq!(fs::read(child.join("payload")).unwrap(), b"preserved");
+    }
+}
+
+#[test]
+fn canceling_after_one_received_result_rotates_nested_branches_and_leaves() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let branches = [root.join("branch-a"), root.join("branch-b")];
+    let mut leaves = BTreeSet::new();
+    for branch in &branches {
+        leaves.extend(child_fixture(branch, 32));
+    }
+    let config = slice_config(vec![root.clone()]);
+    let (_, unfinished) = finite_slice(config.clone(), 8, |_| false);
+    assert!(!unfinished.is_empty());
+    let mut seen = BTreeSet::new();
+    let mut parents = BTreeSet::new();
+    for _ in 0..4 * leaves.len() + 8 {
+        let (entries, _) = finite_slice(config.clone(), usize::MAX, |_| true);
+        assert_eq!(
+            entries.len(),
+            1,
+            "cancel immediately after one actual result"
+        );
+        let entry = &entries[0];
+        if entry.depth == 1 {
+            parents.insert(entry.path.clone());
+        } else {
+            seen.insert(entry.path.clone());
+        }
+        if seen == leaves && parents.len() == branches.len() {
+            break;
+        }
+    }
+    assert_eq!(parents, branches.into_iter().collect());
+    assert_eq!(
+        seen, leaves,
+        "inner progress must also give other branches a turn"
+    );
+
+    // Prior parent observations must not remove rows from an uninterrupted
+    // later walk. Every in-scope directory appears exactly once in that walk.
+    let entries = DirectoryWalker::new(config, ProtectionRegistry::marker_only())
+        .without_file_sizes()
+        .walk()
+        .unwrap();
+    let all: BTreeSet<_> = entries.iter().map(|entry| entry.path.clone()).collect();
+    assert_eq!(entries.len(), all.len());
+    assert_eq!(all, leaves.union(&parents).cloned().collect());
+    for child in leaves {
+        assert_eq!(fs::read(child.join("payload")).unwrap(), b"preserved");
+    }
+}
+
+#[test]
+fn interrupted_dispatch_reapplies_scope_depth_exclusions_and_markers() {
+    let temp = tempfile::tempdir().unwrap();
+    let left = temp.path().join("left");
+    let right = temp.path().join("right");
+    let left_children = child_fixture(&left, 32);
+    let right_children = child_fixture(&right, 32);
+    let (_, unfinished) = finite_slice(slice_config(vec![left.clone()]), 4, |_| false);
+    assert!(!unfinished.is_empty());
+
+    let (scoped, _) = finite_slice(slice_config(vec![right.clone()]), usize::MAX, |_| true);
+    assert_eq!(scoped.len(), 1);
+    assert!(scoped[0].path.starts_with(&right));
+    let mut shallow = slice_config(vec![left.clone()]);
+    shallow.max_depth = 0;
+    assert!(
+        DirectoryWalker::new(shallow, ProtectionRegistry::marker_only())
+            .without_file_sizes()
+            .walk()
+            .unwrap()
+            .is_empty()
+    );
+
+    let excluded = left_children.first().unwrap().clone();
+    let mut policy = slice_config(vec![left.clone()]);
+    policy.excluded_paths.insert(excluded.clone());
+    let entries = DirectoryWalker::new(policy, ProtectionRegistry::marker_only())
+        .without_file_sizes()
+        .walk()
+        .unwrap();
+    assert!(entries.iter().all(|entry| entry.path != excluded));
+    assert_eq!(entries.len(), left_children.len() - 1);
+
+    fs::write(left.join(".sbh-protect"), b"hold").unwrap();
+    assert!(
+        DirectoryWalker::new(slice_config(vec![left]), ProtectionRegistry::marker_only())
+            .without_file_sizes()
+            .walk()
+            .unwrap()
+            .is_empty()
+    );
+    for child in left_children.union(&right_children) {
+        assert_eq!(fs::read(child.join("payload")).unwrap(), b"preserved");
+    }
+}
+
+#[test]
+fn a_replacement_directory_cannot_inherit_an_interrupted_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    child_fixture(&root, 32);
+    let (_, unfinished) = finite_slice(slice_config(vec![root.clone()]), 4, |_| false);
+    assert!(!unfinished.is_empty());
+    fs::rename(&root, temp.path().join("retained-original")).unwrap();
+    let replacement = root.join("new-child");
+    fs::create_dir_all(&replacement).unwrap();
+    fs::write(replacement.join("payload"), b"new data").unwrap();
+    let entries = DirectoryWalker::new(slice_config(vec![root]), ProtectionRegistry::marker_only())
+        .without_file_sizes()
+        .walk()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, replacement);
+    assert_eq!(fs::read(replacement.join("payload")).unwrap(), b"new data");
 }

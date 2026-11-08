@@ -34,7 +34,9 @@ use build_scopes::BuildDirectoryScopes;
 mod code_sign_clones;
 use code_sign_clones::AppInstance;
 mod read_ahead;
-use read_ahead::{DirectoryRead, ReadAhead, ReadReservation};
+use read_ahead::{
+    ChildProgress, DirectoryRead, DispatchPermit, DispatchReceipt, ReadAhead, ReadReservation,
+};
 #[cfg(all(test, unix))]
 mod read_ahead_tests;
 mod work_queue;
@@ -213,8 +215,59 @@ pub struct WalkEntry {
     pub opaque_tree: Option<OpaqueTreeClassification>,
 }
 
+/// Scheduling acknowledgements travel with output until the consumer actually
+/// receives it. A queued/sent-but-unconsumed result cannot advance priority.
+#[derive(Debug)]
+struct WalkResult {
+    entry: Option<WalkEntry>,
+    progress: Vec<ChildProgress>,
+    observed: Option<Arc<AtomicBool>>,
+}
+
+impl WalkResult {
+    fn plain(entry: WalkEntry) -> Self {
+        Self {
+            entry: Some(entry),
+            progress: Vec::new(),
+            observed: None,
+        }
+    }
+
+    fn receive(mut self) -> WalkEntry {
+        for progress in &self.progress {
+            progress.observed();
+        }
+        if let Some(observed) = &self.observed {
+            observed.store(true, Ordering::Relaxed);
+        }
+        self.entry
+            .take()
+            .expect("a result is consumed exactly once")
+    }
+
+    fn unfinished(mut self) -> PathBuf {
+        for progress in &self.progress {
+            progress.unfinished();
+        }
+        self.entry
+            .take()
+            .expect("a result is consumed exactly once")
+            .path
+    }
+}
+
+impl Drop for WalkResult {
+    fn drop(&mut self) {
+        if self.entry.is_some() {
+            for progress in &self.progress {
+                progress.unfinished();
+            }
+        }
+    }
+}
+
 /// Item in the internal work queue.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct WorkItem {
     path: PathBuf,
     depth: usize,
@@ -224,6 +277,115 @@ struct WorkItem {
     /// Roots, opaque candidates, and crossed mounts retain their observed
     /// identity while waiting. Admission refuses a changed object.
     expected_metadata: Option<Box<fs::Metadata>>,
+    dispatch: Option<Box<DispatchFrame>>,
+    completion: TaskCompletion,
+}
+
+/// A canceled page changes traversal priority, never coverage evidence. The
+/// parent task is absent while this frame itself is queued as that parent,
+/// so the ownership chain cannot contain a cycle.
+#[derive(Debug)]
+struct DispatchFrame {
+    path: PathBuf,
+    parent: Option<WorkItem>,
+    read: Option<DirectoryRead>,
+    remaining: usize,
+    next_child: usize,
+    emitted: bool,
+    finished: bool,
+    permit: DispatchPermit,
+    unfinished: Arc<parking_lot::Mutex<Vec<PathBuf>>>,
+}
+
+impl DispatchFrame {
+    fn child_handled(&mut self) {
+        let read = self.read.as_ref().expect("a waiting parent owns its page");
+        advance_dispatch(
+            &mut self.next_child,
+            read.children.len(),
+            &mut self.remaining,
+        );
+    }
+
+    fn resume(mut self: Box<Self>) -> WorkItem {
+        let mut parent = self.parent.take().expect("a child retains its parent task");
+        parent.dispatch = Some(self);
+        parent
+    }
+}
+
+impl Drop for DispatchFrame {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.unfinished.lock().push(self.path.clone());
+        }
+        if let Some(read) = self.read.take() {
+            read.dispatch_interrupted.store(true, Ordering::Relaxed);
+            self.permit.retain(&self.path, read);
+        }
+    }
+}
+
+/// Kept outside `process_directory` so every early return, cancellation and
+/// unwind either handles a child or returns its parent page for a later walk.
+#[derive(Debug, Default)]
+struct TaskCompletion {
+    parent: Option<Box<DispatchFrame>>,
+    receipt: Option<DispatchReceipt>,
+    flush: bool,
+    interrupted: bool,
+    emitted: bool,
+}
+
+impl TaskCompletion {
+    fn progress(&self) -> Vec<ChildProgress> {
+        let mut progress = Vec::new();
+        let mut completion = Some(self);
+        while let Some(current) = completion {
+            if let Some(receipt) = &current.receipt
+                && let Some(child) = &receipt.0
+            {
+                progress.push(child.clone());
+            }
+            let Some(parent) = &current.parent else {
+                break;
+            };
+            let read = parent
+                .read
+                .as_ref()
+                .expect("a waiting parent owns its page");
+            progress.push(ChildProgress::new(read, parent.next_child));
+            completion = parent.parent.as_ref().map(|item| &item.completion);
+        }
+        progress
+    }
+
+    fn defer_to(&mut self, item: &mut WorkItem) {
+        item.completion = std::mem::take(self);
+    }
+
+    fn handled(mut self, work: &WorkQueue, cancel: &AtomicBool) {
+        if !self.emitted {
+            for progress in self.progress() {
+                progress.skipped();
+            }
+        }
+        if let Some(mut parent) = self.parent.take() {
+            parent.child_handled();
+            if !cancel.load(Ordering::Relaxed) {
+                work.enqueue(parent.resume());
+            }
+        }
+        if let Some(receipt) = self.receipt.take() {
+            receipt.handled();
+        }
+    }
+}
+
+fn advance_dispatch(next_child: &mut usize, children: usize, remaining: &mut usize) {
+    debug_assert!(*remaining > 0 && children > 0);
+    *next_child = (*next_child + 1) % children;
+    *remaining -= 1;
 }
 
 /// Entries of a running walk, one at a time.
@@ -233,8 +395,8 @@ struct WorkItem {
 /// the stream cancels the walk.
 #[derive(Debug)]
 pub struct WalkStream {
-    rx: channel::Receiver<Vec<WalkEntry>>,
-    pending: std::vec::IntoIter<WalkEntry>,
+    rx: channel::Receiver<Vec<WalkResult>>,
+    pending: std::vec::IntoIter<WalkResult>,
     /// The walk's work queue: what is still in it was never listed.
     work: Option<Arc<WorkQueue>>,
     /// Paths the workers recorded as unfinished (see [`ResultBatch`]).
@@ -245,7 +407,7 @@ pub struct WalkStream {
 
 impl WalkStream {
     fn new(
-        rx: channel::Receiver<Vec<WalkEntry>>,
+        rx: channel::Receiver<Vec<WalkResult>>,
         work: Option<Arc<WorkQueue>>,
         unfinished: Arc<parking_lot::Mutex<Vec<PathBuf>>>,
         cancel: Arc<AtomicBool>,
@@ -264,7 +426,7 @@ impl WalkStream {
     pub fn from_entries(entries: Vec<WalkEntry>) -> Self {
         let (tx, rx) = channel::bounded(1);
         // Room for exactly this batch, and the receiver is alive.
-        let _ = tx.send(entries);
+        let _ = tx.send(entries.into_iter().map(WalkResult::plain).collect());
         Self::new(rx, None, Arc::default(), Arc::default())
     }
 
@@ -280,13 +442,13 @@ impl WalkStream {
     pub fn unfinished_after_cancel(mut self, wait: Duration) -> Option<Vec<PathBuf>> {
         let deadline = Instant::now() + wait;
         let mut unfinished: HashSet<PathBuf> =
-            self.pending.by_ref().map(|entry| entry.path).collect();
+            self.pending.by_ref().map(WalkResult::unfinished).collect();
         loop {
             match self
                 .rx
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             {
-                Ok(batch) => unfinished.extend(batch.into_iter().map(|entry| entry.path)),
+                Ok(batch) => unfinished.extend(batch.into_iter().map(WalkResult::unfinished)),
                 Err(channel::RecvTimeoutError::Disconnected) => break,
                 Err(channel::RecvTimeoutError::Timeout) => return None,
             }
@@ -307,7 +469,7 @@ impl WalkStream {
     ) -> std::result::Result<WalkEntry, channel::RecvTimeoutError> {
         loop {
             if let Some(entry) = self.pending.next() {
-                return Ok(entry);
+                return Ok(entry.receive());
             }
             self.pending = self.rx.recv_timeout(timeout)?.into_iter();
         }
@@ -330,7 +492,7 @@ impl Iterator for WalkStream {
     fn next(&mut self) -> Option<WalkEntry> {
         loop {
             if let Some(entry) = self.pending.next() {
-                return Some(entry);
+                return Some(entry.receive());
             }
             self.pending = self.rx.recv().ok()?.into_iter();
         }
@@ -342,15 +504,15 @@ impl Iterator for WalkStream {
 /// (or still held when the worker stops), and directories the worker left
 /// part-done. [`WalkStream::unfinished_after_cancel`] reports them.
 struct ResultBatch<'a> {
-    tx: &'a channel::Sender<Vec<WalkEntry>>,
-    pending: Vec<WalkEntry>,
+    tx: &'a channel::Sender<Vec<WalkResult>>,
+    pending: Vec<WalkResult>,
     capacity: usize,
     unfinished: &'a parking_lot::Mutex<Vec<PathBuf>>,
 }
 
 impl<'a> ResultBatch<'a> {
     fn new(
-        tx: &'a channel::Sender<Vec<WalkEntry>>,
+        tx: &'a channel::Sender<Vec<WalkResult>>,
         capacity: usize,
         unfinished: &'a parking_lot::Mutex<Vec<PathBuf>>,
     ) -> Self {
@@ -368,17 +530,36 @@ impl<'a> ResultBatch<'a> {
         self.unfinished.lock().push(dir.to_path_buf());
     }
 
-    fn lose(&self, batch: Vec<WalkEntry>) {
+    fn lose(&self, batch: Vec<WalkResult>) {
         self.unfinished
             .lock()
-            .extend(batch.into_iter().map(|entry| entry.path));
+            .extend(batch.into_iter().map(WalkResult::unfinished));
     }
 
     /// Queue `entry`, sending the batch once it is full. False when the walk
     /// was cancelled or the collector is gone.
+    #[cfg(test)]
     fn push(&mut self, entry: WalkEntry, cancel: &AtomicBool) -> bool {
-        self.pending.push(entry);
+        self.pending.push(WalkResult::plain(entry));
         self.pending.len() < self.capacity || self.flush(cancel)
+    }
+
+    fn push_observed(
+        &mut self,
+        entry: WalkEntry,
+        completion: &mut TaskCompletion,
+        observed: Option<Arc<AtomicBool>>,
+        cancel: &AtomicBool,
+    ) -> bool {
+        completion.emitted = true;
+        self.pending.push(WalkResult {
+            entry: Some(entry),
+            progress: completion.progress(),
+            observed,
+        });
+        let delivered = self.pending.len() < self.capacity || self.flush(cancel);
+        completion.interrupted |= !delivered;
+        delivered
     }
 
     /// Send the queued entries, waiting while the channel is full. False,
@@ -930,7 +1111,7 @@ impl DirectoryWalker {
             work.mark_btrfs(*device);
         }
         let (result_tx, result_rx) =
-            channel::bounded::<Vec<WalkEntry>>(RESULT_CHANNEL_CAP / WALK_BATCH_ENTRIES);
+            channel::bounded::<Vec<WalkResult>>(RESULT_CHANNEL_CAP / WALK_BATCH_ENTRIES);
         let unfinished = Arc::new(parking_lot::Mutex::new(Vec::new()));
 
         // Seed work queue with root paths.
@@ -971,6 +1152,8 @@ impl DirectoryWalker {
                 opaque_tree: None,
                 filesystem: work.filesystem(root, dev),
                 expected_metadata: Some(Box::new(meta)),
+                dispatch: None,
+                completion: TaskCompletion::default(),
             });
         }
 
@@ -978,6 +1161,7 @@ impl DirectoryWalker {
             size: self.dir_window,
             starts: oversized_window_starts().lock().clone(),
             reads: read_ahead::shared(),
+            unfinished: Arc::clone(&unfinished),
         });
         // Clone sender for workers; drop original so channel closes when workers finish.
         for _ in 0..parallelism {
@@ -1027,7 +1211,7 @@ impl DirectoryWalker {
 #[allow(clippy::too_many_arguments)]
 fn walker_thread(
     work: &WorkQueue,
-    result_tx: &channel::Sender<Vec<WalkEntry>>,
+    result_tx: &channel::Sender<Vec<WalkResult>>,
     config: &WalkerConfig,
     windows: &DirWindows,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
@@ -1040,12 +1224,17 @@ fn walker_thread(
     loop {
         // Check cancellation flag before doing any work.
         if cancel.load(Ordering::Relaxed) {
+            results.flush(cancel);
             return;
         }
 
         // Beat the heart if configured.
         if let Some(hb) = heartbeat {
             hb();
+        }
+        if cancel.load(Ordering::Relaxed) {
+            results.flush(cancel);
+            return;
         }
 
         // Send what this worker holds before waiting for work, so the
@@ -1055,8 +1244,10 @@ fn walker_thread(
         }
 
         match work.recv_timeout(WORK_RECV_TIMEOUT) {
-            Ok(item) => {
+            Ok(mut item) => {
                 let filesystem = item.filesystem;
+                let mut completion = std::mem::take(&mut item.completion);
+                completion.flush |= completion.parent.is_some() || item.dispatch.is_some();
                 process_directory(
                     item,
                     work,
@@ -1067,12 +1258,23 @@ fn walker_thread(
                     heartbeat,
                     cancel,
                     measure_files,
+                    &mut completion,
                 );
+                // A short funded slice must publish the real child result,
+                // not only advance a cursor while its batch is later lost.
+                let delivered = !completion.flush || results.flush(cancel);
+                if delivered && !completion.interrupted {
+                    completion.handled(work, cancel);
+                }
                 work.complete(filesystem);
+                if !delivered {
+                    return;
+                }
             }
             Err(channel::RecvTimeoutError::Timeout) => {
                 // Check cancel on timeout too, so threads don't linger waiting for work.
                 if cancel.load(Ordering::Relaxed) {
+                    results.flush(cancel);
                     return;
                 }
                 // Another worker may have taken the item this one saw queued,
@@ -1108,6 +1310,7 @@ fn process_directory(
     heartbeat: Option<&Arc<dyn Fn() + Send + Sync>>,
     cancel: &AtomicBool,
     measure_files: bool,
+    completion: &mut TaskCompletion,
 ) {
     let WorkItem {
         path,
@@ -1116,6 +1319,8 @@ fn process_directory(
         opaque_tree,
         filesystem,
         expected_metadata,
+        mut dispatch,
+        completion: _,
     } = item;
     let dir_path = path.as_path();
     // Check exclusion list.
@@ -1175,14 +1380,18 @@ fn process_directory(
         && device_id(meta) != filesystem.device_id
     {
         let actual = work.filesystem(dir_path, device_id(meta));
-        work.enqueue(WorkItem {
+        let mut handoff = WorkItem {
             path,
             depth,
             root_device_id: root_dev,
             opaque_tree,
             filesystem: actual,
             expected_metadata: dir_meta.map(Box::new),
-        });
+            dispatch,
+            completion: TaskCompletion::default(),
+        };
+        completion.defer_to(&mut handoff);
+        work.enqueue(handoff);
         return;
     }
 
@@ -1203,6 +1412,7 @@ fn process_directory(
                 config,
                 results,
                 cancel,
+                completion,
             );
         }
         return;
@@ -1219,17 +1429,26 @@ fn process_directory(
         results.mark_unfinished(dir_path);
         return;
     };
-    let retained = retain_reads
-        .then(|| {
-            windows.reads.lock().take(
-                dir_path,
-                meta,
-                window_start,
-                windows.size,
-                config.follow_symlinks,
-            )
+    let retained = dispatch
+        .as_mut()
+        .and_then(|frame| frame.read.take())
+        .map(|mut read| {
+            read.reused = true;
+            read
         })
-        .flatten();
+        .or_else(|| {
+            retain_reads
+                .then(|| {
+                    windows.reads.lock().take(
+                        dir_path,
+                        meta,
+                        window_start,
+                        windows.size,
+                        config.follow_symlinks,
+                    )
+                })
+                .flatten()
+        });
     let mut read = if let Some(read) = retained {
         read
     } else {
@@ -1248,7 +1467,7 @@ fn process_directory(
         }
         read
     };
-    let _reservation = ReadReservation::new(&windows.reads, dir_path, &read);
+    let reservation = ReadReservation::new(&windows.reads, dir_path, &read);
     let mut names_this_visit = 0;
     while !read.exhausted {
         // Large flat directories can take a long time to iterate. Honor
@@ -1257,6 +1476,7 @@ fn process_directory(
         // directory to finish.
         if cancel.load(Ordering::Relaxed) {
             results.mark_unfinished(dir_path);
+            completion.interrupted = true;
             if retain_reads {
                 windows.reads.lock().retain(dir_path, read);
             }
@@ -1270,6 +1490,7 @@ fn process_directory(
         // cap, rather than treating a potentially unseen marker as absent.
         if names_this_visit >= MAX_NAMES_READ_PER_DIR {
             results.mark_unfinished(dir_path);
+            completion.interrupted = true;
             if retain_reads {
                 windows.reads.lock().retain(dir_path, read);
             }
@@ -1287,6 +1508,7 @@ fn process_directory(
         // and lose the next name from a reader that will be resumed.
         if cancel.load(Ordering::Relaxed) {
             results.mark_unfinished(dir_path);
+            completion.interrupted = true;
             if retain_reads {
                 windows.reads.lock().retain(dir_path, read);
             }
@@ -1457,7 +1679,11 @@ fn process_directory(
                 return;
             }
         }
-        read.signals.has_cachedir_tag = is_valid_cachedir_tag(&dir_path.join("CACHEDIR.TAG"));
+        let tagged = is_valid_cachedir_tag(&dir_path.join("CACHEDIR.TAG"));
+        if tagged != read.signals.has_cachedir_tag {
+            read.observed.store(false, Ordering::Relaxed);
+        }
+        read.signals.has_cachedir_tag = tagged;
     }
 
     // A listing longer than one window still leaves ground unseen. Advance
@@ -1467,6 +1693,59 @@ fn process_directory(
     if next_start.is_some() || read.entries_incomplete {
         // A window or failed child observation left part of this ground unseen.
         results.mark_unfinished(dir_path);
+    }
+
+    if read.total_count > 0 && read.object_count > 0 {
+        read.signals.mostly_object_files = read.object_count.saturating_mul(2) >= read.total_count;
+    }
+
+    // Keep ordinary parallel dispatch. Only a page whose dispatch or queued
+    // child was interrupted opts into child/parent turns on its next visit.
+    // A full turn cycle restores the fast path. Admission also bounds pages
+    // waiting in the work queue, not just pages currently held by workers.
+    if dispatch.is_none()
+        && retain_reads
+        && depth < config.max_depth
+        && !read.children.is_empty()
+        && (read.dispatch_interrupted.load(Ordering::Relaxed) || completion.parent.is_some())
+        && let Some(permit) = DispatchPermit::reserve(&windows.reads, read.children.len())
+    {
+        dispatch = Some(Box::new(DispatchFrame {
+            path: path.clone(),
+            parent: None,
+            read: None,
+            remaining: read.children.len(),
+            next_child: read.next_child.load(Ordering::Relaxed) % read.children.len(),
+            emitted: false,
+            finished: false,
+            permit,
+            unfinished: Arc::clone(&windows.unfinished),
+        }));
+    }
+    if let Some(frame) = dispatch {
+        drop(reservation);
+        dispatch_turn(
+            WorkItem {
+                path,
+                depth,
+                root_device_id: root_dev,
+                opaque_tree,
+                filesystem,
+                expected_metadata: dir_meta.map(Box::new),
+                dispatch: None,
+                completion: TaskCompletion::default(),
+            },
+            read,
+            frame,
+            work,
+            results,
+            config,
+            windows,
+            heartbeat,
+            cancel,
+            completion,
+        );
+        return;
     }
 
     // ─── Deferred Recursion Dispatch ───
@@ -1485,63 +1764,31 @@ fn process_directory(
         }
         if cancel.load(Ordering::Relaxed) {
             results.mark_unfinished(dir_path);
+            completion.interrupted = true;
+            read.dispatch_interrupted.store(true, Ordering::Relaxed);
             if retain_reads {
                 windows.reads.lock().retain(dir_path, read);
             }
             return;
         }
         let child_path = dir_path.join(child_name);
-        if config.excluded_paths.contains(&child_path) {
-            continue;
-        }
-        let opaque_tree = if config.opaque_pruning {
-            classify_opaque_tree(
-                &child_path,
-                OpaqueTreeContext {
-                    parent_has_cargo_toml: read.signals.has_cargo_toml,
-                    parent_has_node_manifest: read.parent_has_node_manifest,
-                },
-            )
-        } else {
-            None
-        };
-        if opaque_tree
-            .as_ref()
-            .is_some_and(|opaque| opaque.disposition == OpaqueTreeDisposition::ProtectedOpaque)
-        {
-            continue;
-        }
-        let expected_metadata = if opaque_tree
-            .as_ref()
-            .is_some_and(|opaque| opaque.disposition == OpaqueTreeDisposition::CandidateOpaque)
-        {
-            // Classification may have read structural cache evidence. Bind
-            // it to this object before the queue can defer its sizing probe,
-            // as the former inline probe did immediately after classifying.
-            let Ok(meta) = metadata_for_path(&child_path, config.follow_symlinks) else {
-                results.mark_unfinished(&child_path);
-                continue;
-            };
-            if !config.cross_devices && device_id(&meta) != root_dev {
-                continue;
-            }
-            Some(Box::new(meta))
-        } else {
-            None
-        };
-        work.enqueue(WorkItem {
-            path: child_path,
-            depth: depth + 1,
-            root_device_id: root_dev,
-            opaque_tree,
+        if let Some(mut child) = child_work_item(
+            child_path,
+            depth + 1,
+            root_dev,
             filesystem,
-            expected_metadata,
-        });
-    }
-
-    // Finalize structural signals.
-    if read.total_count > 0 && read.object_count > 0 {
-        read.signals.mostly_object_files = read.object_count.saturating_mul(2) >= read.total_count;
+            OpaqueTreeContext {
+                parent_has_cargo_toml: read.signals.has_cargo_toml,
+                parent_has_node_manifest: read.parent_has_node_manifest,
+            },
+            config,
+            results,
+        ) {
+            if retain_reads {
+                child.completion.receipt = Some(DispatchReceipt::new(&read, child_index));
+            }
+            work.enqueue(child);
+        }
     }
 
     // Emit a WalkEntry for this directory itself (reuse stat from top of function).
@@ -1565,10 +1812,22 @@ fn process_directory(
             opaque_tree,
         };
 
-        results.push(walk_entry, cancel);
+        if !results.push_observed(
+            walk_entry,
+            completion,
+            retain_reads.then(|| Arc::clone(&read.observed)),
+            cancel,
+        ) {
+            if retain_reads {
+                read.dispatch_interrupted.store(true, Ordering::Relaxed);
+                windows.reads.lock().retain(dir_path, read);
+            }
+            return;
+        }
     }
     if cancel.load(Ordering::Relaxed) {
         results.mark_unfinished(dir_path);
+        read.dispatch_interrupted.store(true, Ordering::Relaxed);
     } else if next_start.is_some() || window_start > 0 {
         let mut starts = oversized_window_starts().lock();
         match next_start {
@@ -1583,6 +1842,187 @@ fn process_directory(
     }
 }
 
+/// Dispatch one child before returning to the parent. The frame carries the
+/// current child until its task is handled, including a crossed-mount handoff.
+/// Across walks only the read page survives; current roots/policy are reapplied
+/// by the normal root-to-child traversal, never by replaying queued work.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn dispatch_turn(
+    mut parent: WorkItem,
+    read: DirectoryRead,
+    mut frame: Box<DispatchFrame>,
+    work: &WorkQueue,
+    results: &mut ResultBatch<'_>,
+    config: &WalkerConfig,
+    windows: &DirWindows,
+    heartbeat: Option<&Arc<dyn Fn() + Send + Sync>>,
+    cancel: &AtomicBool,
+    completion: &mut TaskCompletion,
+) {
+    completion.flush = true;
+    // A completed listing is useful discovery even when its child cycle
+    // needs several slices. It is not a completed subtree: frame and queue
+    // receipts keep every unfinished descendant visible to the collector.
+    if !frame.emitted && !read.observed.load(Ordering::Relaxed) {
+        frame.emitted = true;
+        if !emit_dispatch_parent(&parent, &read, results, completion, cancel) {
+            frame.read = Some(read);
+            return;
+        }
+    }
+
+    let mut skipped = 0usize;
+    while frame.remaining > 0 && parent.depth < config.max_depth {
+        if skipped.is_multiple_of(256)
+            && let Some(beat) = heartbeat
+        {
+            beat();
+        }
+        if cancel.load(Ordering::Relaxed) {
+            completion.interrupted = true;
+            frame.read = Some(read);
+            return;
+        }
+        let child_path = parent.path.join(&read.children[frame.next_child]);
+        if let Some(mut child) = child_work_item(
+            child_path,
+            parent.depth + 1,
+            parent.root_device_id,
+            parent.filesystem,
+            OpaqueTreeContext {
+                parent_has_cargo_toml: read.signals.has_cargo_toml,
+                parent_has_node_manifest: read.parent_has_node_manifest,
+            },
+            config,
+            results,
+        ) {
+            completion.defer_to(&mut parent);
+            completion.flush = true;
+            frame.parent = Some(parent);
+            frame.read = Some(read);
+            child.completion.parent = Some(frame);
+            work.enqueue(child);
+            return;
+        }
+        ChildProgress::new(&read, frame.next_child).skipped();
+        advance_dispatch(
+            &mut frame.next_child,
+            read.children.len(),
+            &mut frame.remaining,
+        );
+        skipped += 1;
+    }
+    if cancel.load(Ordering::Relaxed) {
+        completion.interrupted = true;
+        frame.read = Some(read);
+        return;
+    }
+    // Resumed short walks need not repeat a parent already observed before
+    // reaching its children. An uninterrupted walk still emits that parent
+    // exactly once, after completing this pass's child cycle.
+    if !frame.emitted && !emit_dispatch_parent(&parent, &read, results, completion, cancel) {
+        frame.read = Some(read);
+        return;
+    }
+
+    // Only this pass's full circular cycle can finish dispatch. The saved
+    // starting index is scheduling priority, not cumulative coverage.
+    frame.finished = true;
+    read.dispatch_interrupted.store(false, Ordering::Relaxed);
+    let window_start = windows.starts.get(&parent.path).copied().unwrap_or(0);
+    let next_start = next_window_start(window_start, read.total_count, windows.size);
+    if next_start.is_some() || window_start > 0 {
+        let mut starts = oversized_window_starts().lock();
+        match next_start {
+            Some(start) => starts.insert(parent.path.clone(), start),
+            None => starts.remove(&parent.path),
+        };
+    }
+    windows.reads.lock().retain(&parent.path, read);
+}
+
+fn emit_dispatch_parent(
+    parent: &WorkItem,
+    read: &DirectoryRead,
+    results: &mut ResultBatch<'_>,
+    completion: &mut TaskCompletion,
+    cancel: &AtomicBool,
+) -> bool {
+    if parent.depth == 0 {
+        return true;
+    }
+    let Some(meta) = parent.expected_metadata.as_deref() else {
+        return true;
+    };
+    let mut metadata = entry_metadata(meta);
+    if read.content_size > 0 {
+        metadata.content_size_bytes = read.content_size;
+    }
+    results.push_observed(
+        WalkEntry {
+            path: parent.path.clone(),
+            metadata,
+            depth: parent.depth,
+            structural_signals: read.signals,
+            is_open: false,
+            opaque_tree: parent.opaque_tree.clone(),
+        },
+        completion,
+        Some(Arc::clone(&read.observed)),
+        cancel,
+    )
+}
+
+fn child_work_item(
+    path: PathBuf,
+    depth: usize,
+    root_device_id: u64,
+    filesystem: WalkFilesystem,
+    context: OpaqueTreeContext,
+    config: &WalkerConfig,
+    results: &ResultBatch<'_>,
+) -> Option<WorkItem> {
+    if config.excluded_paths.contains(&path) {
+        return None;
+    }
+    let opaque_tree = config
+        .opaque_pruning
+        .then(|| classify_opaque_tree(&path, context))
+        .flatten();
+    if opaque_tree
+        .as_ref()
+        .is_some_and(|opaque| opaque.disposition == OpaqueTreeDisposition::ProtectedOpaque)
+    {
+        return None;
+    }
+    let expected_metadata = if opaque_tree
+        .as_ref()
+        .is_some_and(|opaque| opaque.disposition == OpaqueTreeDisposition::CandidateOpaque)
+    {
+        // Bind structural classification to this object before admission.
+        let Ok(meta) = metadata_for_path(&path, config.follow_symlinks) else {
+            results.mark_unfinished(&path);
+            return None;
+        };
+        if !config.cross_devices && device_id(&meta) != root_device_id {
+            return None;
+        }
+        Some(Box::new(meta))
+    } else {
+        None
+    };
+    Some(WorkItem {
+        path,
+        depth,
+        root_device_id,
+        opaque_tree,
+        filesystem,
+        expected_metadata,
+        dispatch: None,
+        completion: TaskCompletion::default(),
+    })
+}
+
 /// Preserve the opaque probe's allocated-byte, freshness, and structural
 /// evidence while running it under the candidate's device admission.
 #[allow(clippy::too_many_arguments)]
@@ -1595,6 +2035,7 @@ fn emit_opaque_candidate(
     config: &WalkerConfig,
     results: &mut ResultBatch<'_>,
     cancel: &AtomicBool,
+    completion: &mut TaskCompletion,
 ) {
     let mut emeta = entry_metadata(meta);
     let mut probe_signals = StructuralSignals::default();
@@ -1627,7 +2068,7 @@ fn emit_opaque_candidate(
         is_open: false,
         opaque_tree,
     };
-    results.push(walk_entry, cancel);
+    results.push_observed(walk_entry, completion, None, cancel);
 }
 
 /// The parent-directory context [`classify_opaque_tree`] needs for `path`,
@@ -2005,6 +2446,8 @@ struct DirWindows {
     starts: HashMap<PathBuf, u32>,
     /// Speculative name enumeration, never subtree-completion evidence.
     reads: Arc<parking_lot::Mutex<ReadAhead>>,
+    /// Shared receipt also used by queued dispatch frames on cancellation.
+    unfinished: Arc<parking_lot::Mutex<Vec<PathBuf>>>,
 }
 
 /// Where the next pass's window starts, after a pass that processed
@@ -4936,11 +5379,11 @@ mod tests {
         fs::write(dir.join("file.bin"), b"payload").unwrap();
 
         let work = WorkQueue::new();
-        let (result_tx, result_rx) = channel::bounded::<Vec<WalkEntry>>(1);
+        let (result_tx, result_rx) = channel::bounded::<Vec<WalkResult>>(1);
 
         // Fill the result channel so the directory emitter must wait.
         result_tx
-            .send(vec![WalkEntry {
+            .send(vec![WalkResult::plain(WalkEntry {
                 path: tmp.path().join("placeholder"),
                 metadata: EntryMetadata {
                     size_bytes: 0,
@@ -4958,7 +5401,7 @@ mod tests {
                 structural_signals: StructuralSignals::default(),
                 is_open: false,
                 opaque_tree: None,
-            }])
+            })])
             .unwrap();
 
         let protection = parking_lot::RwLock::new(ProtectionRegistry::marker_only());
@@ -4989,6 +5432,7 @@ mod tests {
                 size: MAX_ENTRIES_PER_DIR,
                 starts: HashMap::new(),
                 reads: Arc::default(),
+                unfinished: Arc::clone(&worker_unfinished),
             };
             process_directory(
                 WorkItem {
@@ -4998,6 +5442,8 @@ mod tests {
                     root_device_id: root_dev,
                     opaque_tree: None,
                     expected_metadata: None,
+                    dispatch: None,
+                    completion: TaskCompletion::default(),
                 },
                 &work,
                 &mut results,
@@ -5007,6 +5453,7 @@ mod tests {
                 None,
                 &worker_cancel,
                 true,
+                &mut TaskCompletion::default(),
             );
         });
 
@@ -5054,14 +5501,14 @@ mod tests {
     fn result_batches_send_full_batches_then_the_remainder_on_flush() {
         use crossbeam_channel as channel;
 
-        let (tx, rx) = channel::unbounded::<Vec<WalkEntry>>();
+        let (tx, rx) = channel::unbounded::<Vec<WalkResult>>();
         let cancel = AtomicBool::new(false);
         let unfinished = parking_lot::Mutex::new(Vec::new());
         let mut results = ResultBatch::new(&tx, 4, &unfinished);
         for i in 0..10 {
             assert!(results.push(bare_entry(&format!("/d{i}")), &cancel));
         }
-        let sizes = |rx: &channel::Receiver<Vec<WalkEntry>>| {
+        let sizes = |rx: &channel::Receiver<Vec<WalkResult>>| {
             rx.try_iter().map(|batch| batch.len()).collect::<Vec<_>>()
         };
         assert_eq!(sizes(&rx), [4, 4]);
@@ -5077,9 +5524,13 @@ mod tests {
     fn a_walk_stream_yields_batched_entries_one_at_a_time_then_ends() {
         use crossbeam_channel as channel;
 
-        let (tx, rx) = channel::unbounded::<Vec<WalkEntry>>();
-        tx.send(vec![bare_entry("/a"), bare_entry("/b")]).unwrap();
-        tx.send(vec![bare_entry("/c")]).unwrap();
+        let (tx, rx) = channel::unbounded::<Vec<WalkResult>>();
+        tx.send(vec![
+            WalkResult::plain(bare_entry("/a")),
+            WalkResult::plain(bare_entry("/b")),
+        ])
+        .unwrap();
+        tx.send(vec![WalkResult::plain(bare_entry("/c"))]).unwrap();
         drop(tx);
         let mut stream = WalkStream::new(rx, None, Arc::default(), Arc::default());
         let wait = Duration::from_secs(1);
@@ -5095,6 +5546,83 @@ mod tests {
             .map(|entry| entry.path)
             .collect();
         assert_eq!(catalog, [PathBuf::from("/x"), PathBuf::from("/y")]);
+    }
+
+    #[test]
+    fn only_received_results_advance_dispatch_priority() {
+        let temp = TempDir::new().unwrap();
+        let mut page = DirectoryRead::open(
+            temp.path(),
+            fs::metadata(temp.path()).unwrap(),
+            0,
+            MAX_ENTRIES_PER_DIR,
+            false,
+        )
+        .unwrap();
+        page.children = vec!["first".into(), "second".into()];
+        let mut first = WalkResult::plain(bare_entry("/parent/first"));
+        first.progress.push(ChildProgress::new(&page, 0));
+        first.observed = Some(Arc::clone(&page.observed));
+        let mut second = WalkResult::plain(bare_entry("/parent/second"));
+        second.progress.push(ChildProgress::new(&page, 1));
+        let (tx, rx) = channel::unbounded();
+        tx.send(vec![first, second]).unwrap();
+        drop(tx);
+        assert_eq!(page.next_child.load(Ordering::Relaxed), 0);
+
+        let mut stream = WalkStream::new(rx, None, Arc::default(), Arc::default());
+        assert_eq!(
+            stream.recv_timeout(Duration::ZERO).unwrap().path,
+            Path::new("/parent/first")
+        );
+        assert_eq!(page.next_child.load(Ordering::Relaxed), 1);
+        assert!(page.observed.load(Ordering::Relaxed));
+        let unfinished = stream.unfinished_after_cancel(Duration::ZERO).unwrap();
+        assert_eq!(unfinished, [PathBuf::from("/parent/second")]);
+        assert_eq!(
+            page.next_child.load(Ordering::Relaxed),
+            1,
+            "draining is not discovery"
+        );
+        assert!(page.dispatch_interrupted.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn failed_full_batch_cannot_be_acknowledged_by_a_later_empty_flush() {
+        let temp = TempDir::new().unwrap();
+        let mut page = DirectoryRead::open(
+            temp.path(),
+            fs::metadata(temp.path()).unwrap(),
+            0,
+            MAX_ENTRIES_PER_DIR,
+            false,
+        )
+        .unwrap();
+        page.children = vec!["first".into(), "second".into()];
+        let (tx, _rx) = channel::bounded(1);
+        tx.send(vec![WalkResult::plain(bare_entry("/occupied"))])
+            .unwrap();
+        let cancel = AtomicBool::new(true);
+        let unfinished = parking_lot::Mutex::new(Vec::new());
+        let mut results = ResultBatch::new(&tx, 1, &unfinished);
+        let mut completion = TaskCompletion {
+            receipt: Some(DispatchReceipt::new(&page, 0)),
+            ..TaskCompletion::default()
+        };
+        assert!(!results.push_observed(
+            bare_entry("/parent/first"),
+            &mut completion,
+            None,
+            &cancel
+        ));
+        assert!(results.flush(&cancel), "an empty follow-up flush succeeds");
+        assert!(
+            completion.interrupted,
+            "that success cannot erase the failed send"
+        );
+        assert_eq!(page.next_child.load(Ordering::Relaxed), 0);
+        assert!(page.dispatch_interrupted.load(Ordering::Relaxed));
+        assert_eq!(*unfinished.lock(), [PathBuf::from("/parent/first")]);
     }
 
     /// bd-vf9z: batching loses nothing and duplicates nothing, including the
@@ -5207,21 +5735,23 @@ mod tests {
     }
 
     fn process_queued_directory_for_test(
-        item: WorkItem,
+        mut item: WorkItem,
         work: &WorkQueue,
         config: &WalkerConfig,
     ) -> (Vec<WalkEntry>, Vec<PathBuf>) {
         let (tx, rx) = channel::unbounded();
-        let unfinished = parking_lot::Mutex::new(Vec::new());
+        let unfinished = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let mut results = ResultBatch::new(&tx, 1, &unfinished);
         let windows = DirWindows {
             size: MAX_ENTRIES_PER_DIR,
             starts: HashMap::new(),
             reads: Arc::default(),
+            unfinished: Arc::clone(&unfinished),
         };
         let protection = parking_lot::RwLock::new(ProtectionRegistry::marker_only());
         let cancel = AtomicBool::new(false);
         let filesystem = item.filesystem;
+        let mut completion = std::mem::take(&mut item.completion);
         process_directory(
             item,
             work,
@@ -5232,11 +5762,17 @@ mod tests {
             None,
             &cancel,
             true,
+            &mut completion,
         );
-        work.complete(filesystem);
         assert!(results.flush(&cancel));
+        completion.handled(work, &cancel);
+        work.complete(filesystem);
         drop(results);
-        (rx.try_iter().flatten().collect(), unfinished.into_inner())
+        let pending = unfinished.lock().clone();
+        (
+            rx.try_iter().flatten().map(WalkResult::receive).collect(),
+            pending,
+        )
     }
 
     #[test]
@@ -5259,6 +5795,8 @@ mod tests {
             opaque_tree: None,
             filesystem,
             expected_metadata: Some(Box::new(seed_metadata)),
+            dispatch: None,
+            completion: TaskCompletion::default(),
         });
         let parent = work.recv_timeout(Duration::from_secs(1)).unwrap();
         // This task is ahead of the parent's children in the device queue.
@@ -5270,6 +5808,8 @@ mod tests {
             opaque_tree: None,
             filesystem,
             expected_metadata: None,
+            dispatch: None,
+            completion: TaskCompletion::default(),
         });
         let mut config = test_config(&root);
         config.opaque_pruning = true;
@@ -5324,6 +5864,8 @@ mod tests {
             opaque_tree: None,
             filesystem: actual_filesystem,
             expected_metadata: None,
+            dispatch: None,
+            completion: TaskCompletion::default(),
         });
         let running = work.recv_timeout(Duration::from_secs(1)).unwrap();
         let opaque = classify_opaque_tree(&target, opaque_context_for_path(&target));
@@ -5339,6 +5881,8 @@ mod tests {
             opaque_tree: opaque,
             filesystem: parent_filesystem,
             expected_metadata: None,
+            dispatch: None,
+            completion: TaskCompletion::default(),
         });
         let item = work.recv_timeout(Duration::from_secs(1)).unwrap();
         let mut config = test_config(tmp.path());
@@ -5438,6 +5982,8 @@ mod tests {
                 opaque_tree: None,
                 filesystem,
                 expected_metadata: None,
+                dispatch: None,
+                completion: TaskCompletion::default(),
             });
             let running = work.recv_timeout(Duration::from_secs(1)).unwrap();
             work.enqueue(WorkItem {
@@ -5447,6 +5993,8 @@ mod tests {
                 opaque_tree: None,
                 filesystem,
                 expected_metadata: Some(Box::new(seed_metadata)),
+                dispatch: None,
+                completion: TaskCompletion::default(),
             });
             assert!(work.ready_is_empty());
             if retarget {

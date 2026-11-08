@@ -131,14 +131,31 @@ failed observation cannot become a permanently cached complete page. Children
 are queued only after actual enumeration EOF, and cancellation during child
 dispatch does not advance the directory's processing window.
 
+When dispatch or a queued child is interrupted, the page uses one-child turns
+on later visits. An unchanged parent listing is revalidated before each turn;
+ordinary pages keep parallel dispatch. Queued and active continuations share
+an additional allowance of sixteen frames and 65,536 child names. If that
+allowance is occupied, discovery retains the existing full-dispatch path.
+
+Output advances saved scheduling priority only when the walk stream returns it
+to the consumer. Fresh policy refusals may move past an ineligible child without
+claiming completion. A result's receipt also gives held ancestors a turn, so an
+inner page need not finish in one slice before another branch can be reached.
+Output left in a batch or
+channel at cancellation remains unfinished. Each pass still attempts a whole
+circular page: accumulated priority is never subtree-completion evidence. A
+parent already received during an interrupted walk is delayed until its child
+cycle finishes, while an uninterrupted walk still returns every directory once.
+No queued work item or old traversal policy is replayed across walks.
+
 The 1,048,576-name per-visit cap yields a retained reader on these daemon walks.
 File-sizing, follow-symlink and non-Unix walks do not retain observations: at
 the cap they leave the directory unfinished, dispatch no children from that
 listing, and retry from its start on a later walk. This preserves the requirement
 to inspect the entire listing for a protection marker. Retained enumeration
 does not guarantee completion for every topology or a continuously changing or
-unreadable tree. A child-dispatch window that itself exhausts every slice can
-still repeat its queued prefix; dispatch position is not retained.
+unreadable tree. Finite frame/page admission, expensive individual filesystem
+calls and changes that invalidate retained membership remain limits on progress.
 
 ## Scope and tests
 
@@ -174,6 +191,12 @@ directory replacement, changed traversal policy, changed tag contents and
 cancellation during child dispatch. Cache tests cover bounded admission and
 completed pages, expiration, unwind cleanup and failed-observation retries.
 These tests do not establish a fleet completion rate or qualify native macOS.
+
+Public walker regressions also cover equally finite child-dispatch slices,
+cancellation after receiving nested parent/leaf results, retained full-walk
+output, and changed scope/protection/identity. Their heartbeat schedule lets
+the consumer receive published results before each funded boundary; output
+drained after cancellation is counted only as unfinished, never as discovery.
 
 `prescan_cursor::enumeration::tests` covers bounded chunks, retained completed
 pages, root replacement, independent scratch progress, forced resets, descriptor

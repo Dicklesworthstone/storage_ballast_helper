@@ -191,6 +191,7 @@ const fn filesystem_kind(_path: &Path) -> FilesystemKind {
 
 #[cfg(test)]
 mod tests {
+    use super::super::TaskCompletion;
     use super::*;
 
     fn item(path: &str, device_id: u64, kind: FilesystemKind) -> WorkItem {
@@ -201,6 +202,8 @@ mod tests {
             opaque_tree: None,
             filesystem: WalkFilesystem { device_id, kind },
             expected_metadata: None,
+            dispatch: None,
+            completion: TaskCompletion::default(),
         }
     }
 

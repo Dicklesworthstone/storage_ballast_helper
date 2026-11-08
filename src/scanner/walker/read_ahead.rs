@@ -8,10 +8,12 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::{self, Metadata, ReadDir};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -21,6 +23,8 @@ use super::{MAX_ENTRIES_PER_DIR, StructuralSignals};
 const MAX_PENDING_READERS: usize = 4;
 const MAX_READY_PAGES: usize = 16;
 const MAX_READY_CHILDREN: usize = MAX_ENTRIES_PER_DIR as usize;
+const MAX_DISPATCH_FRAMES: usize = 16;
+const MAX_DISPATCH_CHILDREN: usize = MAX_READY_CHILDREN;
 const IDLE_LIFETIME: Duration = Duration::from_hours(1);
 
 thread_local! {
@@ -36,6 +40,7 @@ pub(super) fn shared() -> Arc<Mutex<ReadAhead>> {
 /// One read in progress, or a proven name page waiting for its next traversal.
 // These flags record independent observations, not mutually exclusive modes.
 #[allow(clippy::struct_excessive_bools)]
+#[derive(Debug)]
 pub(super) struct DirectoryRead {
     pub(super) entries: ReadDir,
     stamp: Metadata,
@@ -53,6 +58,10 @@ pub(super) struct DirectoryRead {
     pub(super) entries_incomplete: bool,
     // Store basenames rather than repeating a potentially long parent path.
     pub(super) children: Vec<OsString>,
+    /// Scheduling priority only: a new walk still visits a whole circular page.
+    pub(super) next_child: Arc<AtomicUsize>,
+    pub(super) dispatch_interrupted: Arc<AtomicBool>,
+    pub(super) observed: Arc<AtomicBool>,
 }
 
 impl DirectoryRead {
@@ -79,6 +88,9 @@ impl DirectoryRead {
             parent_has_node_manifest: false,
             entries_incomplete: false,
             children: Vec::new(),
+            next_child: Arc::new(AtomicUsize::new(0)),
+            dispatch_interrupted: Arc::new(AtomicBool::new(false)),
+            observed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -91,6 +103,112 @@ impl DirectoryRead {
 
     pub(super) fn same_stamp(&self, stamp: &Metadata) -> bool {
         same_stamp(&self.stamp, stamp)
+    }
+}
+
+/// A queued child cannot acknowledge its parent merely by being enqueued.
+/// Dropping an unhandled receipt opts the page into resumable dispatch.
+#[derive(Debug, Clone)]
+pub(super) struct ChildProgress {
+    priority: Arc<AtomicUsize>,
+    interrupted: Arc<AtomicBool>,
+    current: usize,
+    next: usize,
+}
+
+impl ChildProgress {
+    pub(super) fn new(read: &DirectoryRead, current: usize) -> Self {
+        Self {
+            priority: Arc::clone(&read.next_child),
+            interrupted: Arc::clone(&read.dispatch_interrupted),
+            current,
+            next: (current + 1) % read.children.len(),
+        }
+    }
+
+    pub(super) fn observed(&self) {
+        self.priority.store(self.next, Ordering::Relaxed);
+    }
+
+    pub(super) fn skipped(&self) {
+        // A policy refusal may advance the current priority, but must not
+        // jump past an earlier result the consumer has not received yet.
+        let _ = self.priority.compare_exchange(
+            self.current,
+            self.next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(super) fn unfinished(&self) {
+        self.interrupted.store(true, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct DispatchReceipt(pub(super) Option<ChildProgress>);
+
+impl DispatchReceipt {
+    pub(super) fn new(read: &DirectoryRead, current: usize) -> Self {
+        Self(Some(ChildProgress::new(read, current)))
+    }
+
+    pub(super) fn handled(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for DispatchReceipt {
+    fn drop(&mut self) {
+        if let Some(progress) = &self.0 {
+            progress.unfinished();
+        }
+    }
+}
+
+/// Count queued and checked-out dispatch pages, including their retained names.
+/// Neither a canceled queue nor an unwinding worker can leak its allowance.
+pub(super) struct DispatchPermit {
+    cache: Arc<Mutex<ReadAhead>>,
+    children: usize,
+}
+
+impl fmt::Debug for DispatchPermit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DispatchPermit")
+            .field("children", &self.children)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DispatchPermit {
+    pub(super) fn reserve(cache: &Arc<Mutex<ReadAhead>>, children: usize) -> Option<Self> {
+        let mut reads = cache.lock();
+        if reads.dispatch_frames >= MAX_DISPATCH_FRAMES
+            || children > MAX_DISPATCH_CHILDREN.saturating_sub(reads.dispatch_children)
+        {
+            return None;
+        }
+        reads.dispatch_frames += 1;
+        reads.dispatch_children += children;
+        Some(Self {
+            cache: Arc::clone(cache),
+            children,
+        })
+    }
+
+    pub(super) fn retain(&self, path: &Path, read: DirectoryRead) {
+        self.cache.lock().retain(path, read);
+    }
+}
+
+impl Drop for DispatchPermit {
+    fn drop(&mut self) {
+        let mut reads = self.cache.lock();
+        reads.dispatch_frames -= 1;
+        reads.dispatch_children -= self.children;
     }
 }
 
@@ -166,6 +284,8 @@ pub(super) struct ReadAhead {
     pending: HashMap<PathBuf, Pending>,
     ready: HashMap<PathBuf, Ready>,
     ticket: u64,
+    dispatch_frames: usize,
+    dispatch_children: usize,
 }
 
 impl ReadAhead {
@@ -442,5 +562,22 @@ mod tests {
         assert!(cache.pending.contains_key(&running_path));
         cache.discard(&running_path, &running);
         assert!(cache.pending.is_empty());
+    }
+
+    #[test]
+    fn queued_dispatch_frames_have_count_and_aggregate_name_bounds() {
+        let cache = Arc::new(Mutex::new(ReadAhead::default()));
+        let permits: Vec<_> = (0..MAX_DISPATCH_FRAMES)
+            .map(|_| DispatchPermit::reserve(&cache, 1).unwrap())
+            .collect();
+        assert!(DispatchPermit::reserve(&cache, 1).is_none());
+        drop(permits);
+        assert_eq!(cache.lock().dispatch_frames, 0);
+        assert_eq!(cache.lock().dispatch_children, 0);
+
+        let full = DispatchPermit::reserve(&cache, MAX_DISPATCH_CHILDREN).unwrap();
+        assert!(DispatchPermit::reserve(&cache, 1).is_none());
+        drop(full);
+        assert!(DispatchPermit::reserve(&cache, MAX_DISPATCH_CHILDREN).is_some());
     }
 }

@@ -38,6 +38,7 @@ pub use executable::capture_sbh_binary_path;
 use executable::resolve_sbh_binary;
 pub use launchctl::{LaunchctlDomain, LaunchctlServiceTarget};
 pub use launchd::{LaunchdConfig, LaunchdServiceManager, LaunchdStatusReport};
+#[cfg(feature = "cli")]
 pub(crate) use systemd::test_unit_dir_override;
 pub use systemd::{
     ConditionGate, DirectiveChange, DriftSeverity, ForeignDropIn, ReinstallReport, ServiceSandbox,
