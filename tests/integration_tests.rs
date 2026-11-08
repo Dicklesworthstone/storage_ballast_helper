@@ -2357,7 +2357,7 @@ fn updater_resolves_the_live_release_asset_layout() {
         .args([
             "-sIL",
             "-A",
-            storage_ballast_helper::cli::HTTP_USER_AGENT,
+            storage_ballast_helper::core::HTTP_USER_AGENT,
             "-o",
             "/dev/null",
             "-w",
