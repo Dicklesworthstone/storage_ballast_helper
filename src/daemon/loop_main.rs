@@ -8840,6 +8840,38 @@ impl MonitoringDaemon {
         Ok(())
     }
 
+    /// Prior selection does not retain permission across operator changes or
+    /// shutdown, including TTL/cap cleanup without a pressure goal.
+    fn authorize_quarantine_mutation(
+        &self,
+        approved_mode: ActiveMode,
+    ) -> std::result::Result<(), SkipReason> {
+        let scanner_dry_run = self.shared_scanner_config.read().dry_run;
+        if self.signal_handler.should_shutdown() || scanner_dry_run {
+            return Err(SkipReason::PolicyChanged);
+        }
+        let current_mode = self.policy_engine.lock().mode();
+        self.shared_executor_config
+            .authorize_mutation(approved_mode, current_mode)
+    }
+
+    fn authorize_quarantine_maintenance(
+        &self,
+        mount: &Path,
+        level: PressureLevel,
+        approved_mode: ActiveMode,
+    ) -> std::result::Result<(), SkipReason> {
+        let shared = &self.shared_executor_config;
+        shared.authorize_dispatch(false, false)?;
+        if shared
+            .compression_first
+            .defers_mount(mount, level, Instant::now())
+        {
+            return Err(SkipReason::CompressionFirst);
+        }
+        self.authorize_quarantine_mutation(approved_mode)
+    }
+
     /// A pressure tick is evidence to start a sweep, not authority to empty
     /// the quarantine after ballast release or an earlier purge recovers it.
     /// Resource-only relief renews its own goal instead of borrowing disk
@@ -8854,7 +8886,7 @@ impl MonitoringDaemon {
         let shared = &self.shared_executor_config;
         let mount = &tick.response.causing_mount;
         let level = tick.response.level;
-        shared.authorize_mutation(approved_mode, self.policy_engine.lock().mode())?;
+        self.authorize_quarantine_mutation(approved_mode)?;
         match (&tick.ram_reclaim, &tick.inode_reclaim) {
             (Some(relief), None) => {
                 relief.authorize_scope(store.root(), &self.shared_scanner_config.read())?;
@@ -8894,7 +8926,7 @@ impl MonitoringDaemon {
         // policy gates one final time at the mutation boundary.
         self.authorize_quarantine_resource_record(tick, record)?;
         shared.authorize_dispatch(tick.ram_reclaim.is_some(), tick.inode_reclaim.is_some())?;
-        shared.authorize_mutation(approved_mode, self.policy_engine.lock().mode())?;
+        self.authorize_quarantine_mutation(approved_mode)?;
         if tick.inode_reclaim.is_none()
             && shared
                 .compression_first
@@ -9000,7 +9032,11 @@ impl MonitoringDaemon {
                     self.authorize_quarantine_pressure(tick, &store, record, approved_mode)
                         .is_ok()
                 };
-                match store.sweep_with_pressure_filter(now_unix, mode, select, gate) {
+                let maintenance_gate = |_: &QuarantineRecord| {
+                    self.authorize_quarantine_maintenance(mount, level, approved_mode)
+                        .is_ok()
+                };
+                match store.sweep_with_gates(now_unix, mode, select, gate, maintenance_gate) {
                     Ok(swept) => {
                         held = held.saturating_add(swept.held_bytes);
                         let (why, mut drained) = (swept.reason, swept.drained);
@@ -16009,6 +16045,164 @@ mod tests {
         assert!(store.record("held").unwrap().is_some());
         assert_eq!(fixture.daemon.quarantine_held.get(&mount), Some(&8));
         assert!(store.stuck_entries().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_quarantine_maintenance_renews_live_controls_at_mutation() {
+        for cap_only in [false, true] {
+            for change in [
+                "executor-dry-run",
+                "scanner-dry-run",
+                "shutdown",
+                "ordinary-hold",
+                "unchanged",
+            ] {
+                let mut fixture = RegretDaemonFixture::new();
+                let root = fixture.daemon.config.scanner.root_paths[0].clone();
+                let source = root.join("maintenance.o");
+                std::fs::write(&source, b"recoverable").unwrap();
+                let store = QuarantineStore::under(&root);
+                let ttl = if cap_only {
+                    Duration::from_hours(24)
+                } else {
+                    Duration::ZERO
+                };
+                let record = store
+                    .quarantine(&source, "maintenance", 11, ttl, None)
+                    .unwrap();
+                let daemon = &mut fixture.daemon;
+                daemon.config.scanner.quarantine_max_bytes_pct = 0;
+                assert!(!daemon.config.scanner.dry_run);
+                assert_eq!(daemon.policy_engine.lock().mode(), ActiveMode::Enforce);
+                match change {
+                    "executor-dry-run" => daemon
+                        .shared_executor_config
+                        .dry_run
+                        .store(true, Ordering::Relaxed),
+                    "scanner-dry-run" => daemon.shared_scanner_config.write().dry_run = true,
+                    "shutdown" => daemon.signal_handler.request_shutdown(),
+                    "ordinary-hold" => daemon
+                        .shared_executor_config
+                        .ram_reclaim_blocks_ordinary_deletion
+                        .store(true, Ordering::Release),
+                    "unchanged" => {}
+                    _ => unreachable!(),
+                }
+                let mount = PathBuf::from("/");
+                daemon.sweep_quarantines(
+                    &[quarantine_tick(PressureLevel::Green, &mount)],
+                    &[(root, Some(mount.clone()))],
+                    Instant::now(),
+                );
+                let held = change != "unchanged";
+                assert_eq!(
+                    record.quarantine_path.exists(),
+                    held,
+                    "{change}, cap_only={cap_only}"
+                );
+                assert_eq!(
+                    daemon.quarantine_held.get(&mount),
+                    Some(&if held { 11 } else { 0 })
+                );
+                if held {
+                    assert_eq!(
+                        std::fs::read(&record.quarantine_path).unwrap(),
+                        b"recoverable"
+                    );
+                    assert!(
+                        store
+                            .record("maintenance")
+                            .unwrap()
+                            .unwrap()
+                            .recovery_state
+                            .is_intact()
+                    );
+                } else {
+                    assert!(store.record("maintenance").unwrap().is_none());
+                }
+                assert!(store.stuck_entries().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_maintenance_rechecks_operator_policy_between_payloads() {
+        use crate::daemon::policy::PolicyConfig;
+
+        for mode in [
+            ActiveMode::Observe,
+            ActiveMode::Canary,
+            ActiveMode::FallbackSafe,
+        ] {
+            for cap_only in [false, true] {
+                let fixture = RegretDaemonFixture::new();
+                let root = fixture.daemon.config.scanner.root_paths[0].clone();
+                let store = QuarantineStore::under(&root);
+                let ttl = if cap_only {
+                    Duration::from_hours(24)
+                } else {
+                    Duration::ZERO
+                };
+                let records: Vec<_> = ["a", "b"]
+                    .into_iter()
+                    .map(|id| {
+                        let source = root.join(id);
+                        std::fs::write(&source, b"retained").unwrap();
+                        store.quarantine(&source, id, 8, ttl, None).unwrap()
+                    })
+                    .collect();
+                let now = if cap_only {
+                    records[0].quarantined_at
+                } else {
+                    records
+                        .iter()
+                        .map(|record| record.expires_at)
+                        .max()
+                        .unwrap()
+                };
+                let swept = store
+                    .sweep_with_gates(
+                        now,
+                        QuarantineSweepMode::Maintenance { cap_bytes: Some(0) },
+                        |_| panic!("maintenance cannot borrow resource eligibility"),
+                        |_| panic!("maintenance cannot borrow pressure authority"),
+                        |_| {
+                            if !records[0].quarantine_path.exists() {
+                                *fixture.daemon.policy_engine.lock() =
+                                    PolicyEngine::new(PolicyConfig {
+                                        initial_mode: mode,
+                                        ..PolicyConfig::default()
+                                    });
+                            }
+                            fixture
+                                .daemon
+                                .authorize_quarantine_maintenance(
+                                    Path::new("/"),
+                                    PressureLevel::Green,
+                                    ActiveMode::Enforce,
+                                )
+                                .is_ok()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    swept.drained.counts(),
+                    (1, 8),
+                    "{mode:?}, cap_only={cap_only}"
+                );
+                assert_eq!(swept.held_bytes, 8);
+                assert_eq!(swept.drained.deferred_entries, 1);
+                assert!(swept.drained.failures.is_empty());
+                assert!(!swept.drained.budget_exhausted);
+                assert_eq!(
+                    std::fs::read(&records[1].quarantine_path).unwrap(),
+                    b"retained"
+                );
+                assert!(store.stuck_entries().unwrap().is_empty());
+            }
+        }
     }
 
     #[cfg(unix)]

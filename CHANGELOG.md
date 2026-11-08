@@ -8,6 +8,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Quarantine maintenance renews live removal permission.** TTL and size-cap
+  cleanup now stop when mode, dry-run, shutdown or ordinary-cleanup holds revoke
+  the admitted sweep. Permission is renewed after durable preparation and
+  within large payloads; an expiry hold cannot fall through to a new cap phase.
+  Remaining data stays recoverable without a failure cooldown or removal credit.
+
 - **Large deep directories retain enumeration across finite daemon scans.**
   Unix name-only, no-follow walks preserve bounded partial reads and parent
   listings, so a canceled pass can reach descendants on later slices. Reuse

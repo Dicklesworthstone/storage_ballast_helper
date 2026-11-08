@@ -800,8 +800,49 @@ impl QuarantineStore {
         &self,
         now_unix: u64,
         mode: SweepMode,
+        select: impl FnMut(&QuarantineRecord) -> bool,
+        gate: impl FnMut(&QuarantineRecord) -> bool,
+    ) -> Result<SweepOutcome> {
+        self.sweep_with_gates(now_unix, mode, select, gate, |_| true)
+    }
+
+    fn drain_pressure_records(
+        &self,
+        records: &[QuarantineRecord],
+        now_unix: u64,
+        select: &mut impl FnMut(&QuarantineRecord) -> bool,
+        gate: &mut impl FnMut(&QuarantineRecord) -> bool,
+    ) -> DrainOutcome {
+        let mut drained = DrainOutcome::default();
+        let mut budget = PurgeBudget::bounded(DEFAULT_DRAIN_WORK);
+        for entry in records {
+            if !self.try_purge_with_filter(entry, now_unix, &mut drained, &mut budget, select, gate)
+            {
+                break;
+            }
+        }
+        drained
+    }
+
+    /// Sweep with distinct pressure and maintenance mutation authority.
+    ///
+    /// Pressure uses `select` and `pressure_gate` exactly as
+    /// [`Self::sweep_with_pressure_filter`]. TTL/cap maintenance instead renews
+    /// `maintenance_gate` after manifest admission, after durable recovery-state
+    /// updates, and at the same bounded payload checkpoints. Maintenance never
+    /// borrows resource selection or a pressure goal.
+    ///
+    /// A refused maintenance gate pauses the entire sweep, including any cap
+    /// phase that would otherwise follow expiry. Remaining payloads stay
+    /// recoverable without a failure, cooldown or completed-removal credit.
+    /// None of these callbacks may reenter or modify the quarantine store.
+    pub fn sweep_with_gates(
+        &self,
+        now_unix: u64,
+        mode: SweepMode,
         mut select: impl FnMut(&QuarantineRecord) -> bool,
-        mut gate: impl FnMut(&QuarantineRecord) -> bool,
+        mut pressure_gate: impl FnMut(&QuarantineRecord) -> bool,
+        mut maintenance_gate: impl FnMut(&QuarantineRecord) -> bool,
     ) -> Result<SweepOutcome> {
         let records = self.records()?;
         let mut held = records
@@ -813,30 +854,30 @@ impl QuarantineStore {
         match mode {
             SweepMode::Pressure => {
                 reason = "pressure";
-                let mut budget = PurgeBudget::bounded(DEFAULT_DRAIN_WORK);
-                for entry in &records {
-                    if !self.try_purge_with_filter(
-                        entry,
-                        now_unix,
-                        &mut drained,
-                        &mut budget,
-                        &mut select,
-                        &mut gate,
-                    ) {
-                        break;
-                    }
-                }
+                drained = self.drain_pressure_records(
+                    &records,
+                    now_unix,
+                    &mut select,
+                    &mut pressure_gate,
+                );
             }
             SweepMode::Maintenance { cap_bytes } => {
                 let mut purged = std::collections::HashSet::new();
                 let mut budget = PurgeBudget::bounded(DEFAULT_DRAIN_WORK);
+                let mut keep_going = true;
                 for entry in records.iter().filter(|r| r.expires_at <= now_unix) {
                     if self.cooling_down(&entry.decision_id, now_unix) {
                         drained.skipped_stuck += 1;
                         continue;
                     }
                     let before = drained.entries;
-                    let keep_going = self.try_purge(entry, now_unix, &mut drained, &mut budget);
+                    keep_going = self.try_purge_with_gate(
+                        entry,
+                        now_unix,
+                        &mut drained,
+                        &mut budget,
+                        &mut maintenance_gate,
+                    );
                     if drained.entries > before {
                         purged.insert(entry.decision_id.as_str());
                     }
@@ -845,7 +886,8 @@ impl QuarantineStore {
                     }
                 }
                 let remaining = held.saturating_sub(drained.bytes);
-                if let Some(cap) = cap_bytes
+                if keep_going
+                    && let Some(cap) = cap_bytes
                     && remaining > cap
                 {
                     let needed = remaining - cap;
@@ -862,7 +904,13 @@ impl QuarantineStore {
                             capped.skipped_stuck += 1;
                             continue;
                         }
-                        if !self.try_purge(entry, now_unix, &mut capped, &mut budget) {
+                        if !self.try_purge_with_gate(
+                            entry,
+                            now_unix,
+                            &mut capped,
+                            &mut budget,
+                            &mut maintenance_gate,
+                        ) {
                             break;
                         }
                     }

@@ -50,6 +50,22 @@ Mutating store operations use a non-blocking, process-scoped directory lock. No
 lock file needs allocation on a full disk, and process exit releases the lock.
 A concurrent operation is refused rather than waiting indefinitely.
 
+## Live permission during maintenance
+
+Expiry and a store's size cap select entries for routine cleanup; they do not
+retain permission to remove them after operator policy changes. The daemon
+renews live mode, dry-run, shutdown and ordinary-cleanup holds after admitting
+each manifest, after the durable recovery-state update, and at bounded payload
+checkpoints. An Enforce-approved sweep stops if the operator moves to Canary,
+Observe or fallback-safe mode. Pressure sweeps also honor shutdown and current
+scanner dry-run settings at these boundaries.
+
+A hold during expiry stops the entire sweep, so a following size-cap phase
+cannot restart removal under the old selection. The next sweep needs fresh
+authority. A held or partially purged entry retains its recovery metadata and
+remaining contents, receives no failure cooldown, and contributes no completed
+removal credit until its payload and manifest are finalized.
+
 ## Relief from inode or swap pressure
 
 At Orange or worse, inode and tmpfs swap relief considers eligible quarantined

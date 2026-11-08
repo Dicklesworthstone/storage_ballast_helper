@@ -17,7 +17,9 @@ use storage_ballast_helper::scanner::deletion::{
     CheckedDeletion, DeletionConfig, DeletionExecutor, DeletionMode, DeletionPlan, SkipReason,
 };
 use storage_ballast_helper::scanner::patterns::{ArtifactCategory, ArtifactClassification};
-use storage_ballast_helper::scanner::quarantine::QuarantineStore;
+use storage_ballast_helper::scanner::quarantine::{
+    QuarantineRecord, QuarantineStore, RecoveryState, SweepMode,
+};
 use storage_ballast_helper::scanner::scoring::{
     ArtifactCertainty, CandidacyScore, DecisionAction, DecisionOutcome, EvidenceLedger,
     ScoreFactors,
@@ -922,4 +924,173 @@ fn byte_estimates_saturate_instead_of_overflowing_a_valid_plan_or_report() {
     assert_eq!(report.items_would_delete, 2);
     assert_eq!(report.bytes_would_free, u64::MAX);
     assert_eq!(report.bytes_freed, 0);
+}
+
+fn held_quarantine_tree(
+    root: &Path,
+    id: &str,
+    files: usize,
+    ttl: Duration,
+) -> (QuarantineStore, QuarantineRecord) {
+    let source = root.join(format!("artifact-{id}"));
+    fs::create_dir(&source).unwrap();
+    for index in 0..files {
+        fs::write(source.join(format!("part-{index:04}")), PAYLOAD).unwrap();
+    }
+    let store = QuarantineStore::under(root);
+    let bytes = u64::try_from(files * PAYLOAD.len()).unwrap();
+    let record = store.quarantine(&source, id, bytes, ttl, None).unwrap();
+    (store, record)
+}
+
+#[test]
+fn quarantine_maintenance_renews_permission_between_payloads_and_stops_both_phases() {
+    for (expired, cap_bytes) in [(true, None), (true, Some(0)), (false, Some(0))] {
+        let dir = scratch();
+        let ttl = if expired {
+            Duration::ZERO
+        } else {
+            Duration::from_hours(24)
+        };
+        let (store, first) = held_quarantine_tree(dir.path(), "a", 1, ttl);
+        let (_, second) = held_quarantine_tree(dir.path(), "b", 1, ttl);
+        let now = if expired {
+            first.expires_at.max(second.expires_at)
+        } else {
+            first.quarantined_at
+        };
+        let mode = SweepMode::Maintenance { cap_bytes };
+        let mut refusals = 0;
+        let out = store
+            .sweep_with_gates(
+                now,
+                mode,
+                |_| panic!("maintenance cannot borrow resource selection"),
+                |_| panic!("maintenance cannot borrow pressure authority"),
+                |_| {
+                    if first.quarantine_path.exists() {
+                        true
+                    } else {
+                        refusals += 1;
+                        // A later invocation would permit work again. Once
+                        // refused, this sweep must not restart at its cap phase.
+                        refusals > 1
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(out.drained.counts(), (1, first.size_bytes));
+        assert_eq!(out.held_bytes, second.size_bytes);
+        assert_eq!(out.drained.deferred_entries, 1);
+        assert_eq!(refusals, 1, "expired={expired}, cap={cap_bytes:?}");
+        assert!(out.drained.failures.is_empty());
+        assert!(!out.drained.budget_exhausted);
+        assert_eq!(
+            fs::read(second.quarantine_path.join("part-0000")).unwrap(),
+            PAYLOAD
+        );
+        assert_eq!(
+            store.record("b").unwrap().unwrap().recovery_state,
+            RecoveryState::Intact
+        );
+        assert!(store.stuck_entries().unwrap().is_empty());
+
+        let retry = store
+            .sweep_with_gates(now, mode, |_| false, |_| false, |_| true)
+            .unwrap();
+        assert_eq!(retry.drained.counts(), (1, second.size_bytes));
+        assert_eq!(retry.held_bytes, 0);
+        assert_eq!(retry.drained.completed[0].record.decision_id, "b");
+        assert!(store.record("a").unwrap().is_none());
+        assert!(store.record("b").unwrap().is_none());
+    }
+}
+
+#[test]
+fn quarantine_maintenance_stops_inside_a_large_payload_and_resumes_without_double_credit() {
+    let dir = scratch();
+    let (store, record) = held_quarantine_tree(dir.path(), "wide", 128, Duration::ZERO);
+    let outside = dir.path().join("unrelated");
+    fs::write(&outside, b"operator data").unwrap();
+    let mut calls = 0;
+    let mode = SweepMode::Maintenance { cap_bytes: Some(0) };
+    let out = store
+        .sweep_with_gates(
+            record.expires_at,
+            mode,
+            |_| false,
+            |_| false,
+            |_| {
+                calls += 1;
+                // Admission and the durable witness update are allowed. Revoke
+                // at the first bounded payload checkpoint, then permit a fresh
+                // sweep; a second cap phase in this call must not exploit that.
+                calls != 3
+            },
+        )
+        .unwrap();
+    assert_eq!(calls, 3);
+    assert_eq!(out.drained.counts(), (0, 0));
+    assert_eq!(out.drained.deferred_entries, 1);
+    assert_eq!(out.held_bytes, record.size_bytes);
+    assert!(out.drained.completed.is_empty());
+    assert!(out.drained.failures.is_empty());
+    assert!(!out.drained.budget_exhausted);
+    let remaining = fs::read_dir(&record.quarantine_path).unwrap().count();
+    assert!(remaining > 0 && remaining < 128, "remaining={remaining}");
+    assert!(
+        128 - remaining <= 64,
+        "revocation is renewed within its unlink bound"
+    );
+    assert_eq!(
+        store.record("wide").unwrap().unwrap().recovery_state,
+        RecoveryState::PurgeStarted
+    );
+    assert!(store.stuck_entries().unwrap().is_empty());
+
+    let reopened = QuarantineStore::under(dir.path());
+    let retry = reopened
+        .sweep_with_gates(record.expires_at, mode, |_| false, |_| false, |_| true)
+        .unwrap();
+    assert_eq!(retry.drained.counts(), (1, record.size_bytes));
+    assert_eq!(retry.drained.completed.len(), 1);
+    assert_eq!(retry.held_bytes, 0);
+    assert!(!record.quarantine_path.exists());
+    assert_eq!(fs::read(outside).unwrap(), b"operator data");
+}
+
+#[test]
+fn quarantine_maintenance_renews_permission_after_the_durable_witness_update() {
+    let dir = scratch();
+    let (store, record) = held_quarantine_tree(dir.path(), "witness", 4, Duration::ZERO);
+    let mut calls = 0;
+    let out = store
+        .sweep_with_gates(
+            record.expires_at,
+            SweepMode::Maintenance { cap_bytes: Some(0) },
+            |_| false,
+            |_| false,
+            |_| {
+                calls += 1;
+                calls == 1
+            },
+        )
+        .unwrap();
+    assert_eq!(calls, 2);
+    assert_eq!(out.drained.counts(), (0, 0));
+    assert_eq!(out.drained.deferred_entries, 1);
+    assert!(out.drained.failures.is_empty());
+    assert_eq!(fs::read_dir(&record.quarantine_path).unwrap().count(), 4);
+    assert_eq!(
+        store.record("witness").unwrap().unwrap().recovery_state,
+        RecoveryState::PurgeStarted
+    );
+    assert!(store.stuck_entries().unwrap().is_empty());
+    let restored = store.restore("witness", false).unwrap();
+    for index in 0..4 {
+        assert_eq!(
+            fs::read(restored.restored_to.join(format!("part-{index:04}"))).unwrap(),
+            PAYLOAD
+        );
+    }
 }
