@@ -14,6 +14,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   within large payloads; an expiry hold cannot fall through to a new cap phase.
   Remaining data stays recoverable without a failure cooldown or removal credit.
 
+- **Config reload publishes worker restrictions before ballast discovery.**
+  New dry-run, protection, batch and policy settings now reach workers, and
+  queued operator scans are revoked, before mount or ballast inventory I/O can
+  block. A failed rediscovery retains pools under the new configuration.
+  Library notifications also build independently of the optional CLI.
+
 - **Large deep directories retain enumeration across finite daemon scans.**
   Unix name-only, no-follow walks preserve bounded partial reads and parent
   listings, so a canceled pass can reach descendants on later slices. Reuse

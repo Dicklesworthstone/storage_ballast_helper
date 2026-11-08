@@ -1290,7 +1290,7 @@ fn github_api_json(api_url: &str) -> std::result::Result<serde_json::Value, Stri
         .args([
             "-sL",
             "-A",
-            super::HTTP_USER_AGENT,
+            crate::core::HTTP_USER_AGENT,
             "-H",
             "Accept: application/json",
             api_url,
@@ -1311,7 +1311,7 @@ fn github_api_json(api_url: &str) -> std::result::Result<serde_json::Value, Stri
 
 fn curl_download(url: &str, dest: &Path) -> std::result::Result<(), String> {
     let status = Command::new("curl")
-        .args(["-fsSL", "-A", super::HTTP_USER_AGENT, "-o"])
+        .args(["-fsSL", "-A", crate::core::HTTP_USER_AGENT, "-o"])
         .arg(dest)
         .arg(url)
         .status()

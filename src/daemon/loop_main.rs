@@ -8480,30 +8480,6 @@ impl MonitoringDaemon {
                     );
                     self.release_controller
                         .set_replenish_cooldown(new_config.ballast.replenish_cooldown_minutes);
-                    let discovery_paths =
-                        ballast_discovery_paths(&new_config, &self.special_locations);
-                    match BallastPoolCoordinator::discover_inner(
-                        &new_config.ballast,
-                        &discovery_paths,
-                        self.platform.as_ref(),
-                        &self.platform,
-                        Some(new_config.paths.ballast_dir.as_path()),
-                    ) {
-                        Ok(coordinator) => {
-                            self.ballast_coordinator = coordinator;
-                            self.ballast_coordinator
-                                .set_provision_floor_rule(new_config.ballast_provision_floor());
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "[SBH-DAEMON] ballast coordinator rediscovery failed during reload: {err}"
-                            );
-                            self.ballast_coordinator.update_config(&new_config.ballast);
-                            // The kept pools still follow the new thresholds.
-                            self.ballast_coordinator
-                                .set_provision_floor_rule(new_config.ballast_provision_floor());
-                        }
-                    }
 
                     // Propagate pressure thresholds and EWMA params to all active monitors.
                     for monitor in self.mount_monitors.values_mut() {
@@ -8629,6 +8605,34 @@ impl MonitoringDaemon {
                         controller.set_config(controller_config);
                     }
                     self.wake_next_tick.reload = true;
+                    // Publish worker restrictions and revoke queued operator
+                    // scans before filesystem discovery can block. A valid
+                    // reload must not leave old deletion authority running
+                    // while a mount or ballast directory is unresponsive.
+                    let discovery_paths =
+                        ballast_discovery_paths(&self.config, &self.special_locations);
+                    match BallastPoolCoordinator::discover_inner(
+                        &self.config.ballast,
+                        &discovery_paths,
+                        self.platform.as_ref(),
+                        &self.platform,
+                        Some(self.config.paths.ballast_dir.as_path()),
+                    ) {
+                        Ok(coordinator) => {
+                            self.ballast_coordinator = coordinator;
+                            self.ballast_coordinator
+                                .set_provision_floor_rule(self.config.ballast_provision_floor());
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[SBH-DAEMON] ballast coordinator rediscovery failed during reload: {err}"
+                            );
+                            self.ballast_coordinator.update_config(&self.config.ballast);
+                            // The kept pools still follow the new thresholds.
+                            self.ballast_coordinator
+                                .set_provision_floor_rule(self.config.ballast_provision_floor());
+                        }
+                    }
                     eprintln!("[SBH-DAEMON] config reloaded successfully");
                 }
             }
@@ -13724,6 +13728,136 @@ mod tests {
             if let Some(logger) = self.daemon.logger_join.take() {
                 let _ = logger.join();
             }
+        }
+    }
+
+    #[cfg(unix)]
+    struct ReloadProbePlatform {
+        inner: Arc<dyn Platform>,
+        before_probe: Box<dyn Fn() + Send + Sync>,
+    }
+
+    #[cfg(unix)]
+    impl Platform for ReloadProbePlatform {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn fs_stats(&self, path: &Path) -> Result<crate::platform::pal::FsStats> {
+            (self.before_probe)();
+            self.inner.fs_stats(path)
+        }
+
+        fn mount_points(&self) -> Result<Vec<crate::platform::pal::MountPoint>> {
+            (self.before_probe)();
+            self.inner.mount_points()
+        }
+
+        fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+            self.inner.is_ram_backed(path)
+        }
+
+        fn default_paths(&self) -> crate::platform::pal::PlatformPaths {
+            self.inner.default_paths()
+        }
+
+        fn memory_info(&self) -> Result<MemoryInfo> {
+            self.inner.memory_info()
+        }
+
+        fn service_manager(&self) -> Box<dyn crate::platform::pal::ServiceManager> {
+            self.inner.service_manager()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_reload_publishes_worker_restrictions_before_ballast_probes() {
+        for change in [
+            "dry-run",
+            "kill-switch",
+            "protected-path",
+            "batch-limit",
+            "unchanged",
+        ] {
+            let mut fixture = RegretDaemonFixture::new();
+            let daemon = &mut fixture.daemon;
+            let scope = ScanNowScope::capture(&[], false, &daemon.config.scanner).unwrap();
+            daemon
+                .scan_now_queue
+                .lock()
+                .enqueue(vec![scope], 1)
+                .unwrap();
+            let mut updated = daemon.config.clone();
+            // The positive control changes a setting without revoking
+            // ordinary mutation permission, but still performs real reload I/O.
+            updated.notifications.min_notify_interval_secs += 1;
+            match change {
+                "dry-run" => updated.scanner.dry_run = true,
+                "kill-switch" => updated.policy.kill_switch = true,
+                "protected-path" => updated.scanner.protected_paths.push(
+                    fixture
+                        .directory
+                        .path()
+                        .join("project")
+                        .display()
+                        .to_string(),
+                ),
+                "batch-limit" => updated.scanner.max_delete_batch = 1,
+                "unchanged" => {}
+                _ => unreachable!(),
+            }
+            std::fs::write(
+                &updated.paths.config_file,
+                toml::to_string(&updated).unwrap(),
+            )
+            .unwrap();
+            let scanner = Arc::clone(&daemon.shared_scanner_config);
+            let executor = Arc::clone(&daemon.shared_executor_config);
+            let policy = Arc::clone(&daemon.policy_engine);
+            let queue = Arc::clone(&daemon.scan_now_queue);
+            let probes = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&probes);
+            let expected = updated.scanner.clone();
+            daemon.platform = Arc::new(ReloadProbePlatform {
+                inner: Arc::clone(&daemon.platform),
+                before_probe: Box::new(move || {
+                    // These are the same live values consulted by queued
+                    // workers. Inspect them at the first native boundary,
+                    // before its implementation could block indefinitely.
+                    let current = scanner.read();
+                    assert_eq!(current.dry_run, expected.dry_run, "{change}");
+                    assert_eq!(
+                        current.protected_paths, expected.protected_paths,
+                        "{change}"
+                    );
+                    drop(current);
+                    assert_eq!(
+                        executor.dry_run.load(Ordering::Relaxed),
+                        expected.dry_run,
+                        "{change}"
+                    );
+                    assert_eq!(
+                        executor.max_batch_size.load(Ordering::Relaxed),
+                        expected.max_delete_batch,
+                        "{change}"
+                    );
+                    let mode = policy.lock().mode();
+                    assert_eq!(
+                        executor
+                            .authorize_mutation(ActiveMode::Enforce, mode)
+                            .is_err(),
+                        matches!(change, "dry-run" | "kill-switch"),
+                        "{change}",
+                    );
+                    assert!(queue.lock().paths().is_empty(), "{change}");
+                    observed.fetch_add(1, Ordering::Relaxed);
+                }),
+            });
+            let (scan_tx, _scan_rx) = bounded(1);
+            daemon.handle_config_reload(&scan_tx);
+            assert!(probes.load(Ordering::Relaxed) > 0, "{change}");
+            assert!(daemon.wake_next_tick.reload, "{change}");
         }
     }
 

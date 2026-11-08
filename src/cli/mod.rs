@@ -295,10 +295,6 @@ pub struct VerificationOutcome {
     pub warnings: Vec<String>,
 }
 
-/// User-Agent every outbound HTTP request from sbh must carry (AGENTS.md rule).
-pub const HTTP_USER_AGENT: &str =
-    "sbh (+https://github.com/Dicklesworthstone/storage_ballast_helper)";
-
 /// Aggregate checksum manifest published next to raw `sbh_<os>_<arch>` binaries.
 pub const RAW_CHECKSUM_MANIFEST: &str = "SHA256SUMS";
 
