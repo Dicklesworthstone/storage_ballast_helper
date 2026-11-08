@@ -59,6 +59,31 @@ impl PassControl<'_> {
     }
 }
 
+/// Preparation can block while the monitor revokes a pass. Renew authority
+/// after it returns and before each native range, including ranges within one
+/// logical chunk. The clock is supplied so expiry during preparation or a
+/// previous range can be exercised without timing-dependent tests.
+fn apply_chunk(
+    control: &PassControl<'_>,
+    file_deadline: Instant,
+    prepare: impl FnOnce() -> io::Result<Vec<(u64, u64)>>,
+    mut compress: impl FnMut(u64, u64) -> io::Result<()>,
+    mut now: impl FnMut() -> Instant,
+) -> io::Result<()> {
+    let mut authorize = || {
+        control.check_stop()?;
+        budget_at(file_deadline, now())
+    };
+    authorize()?;
+    let ranges = prepare()?;
+    authorize()?;
+    for (start, length) in ranges {
+        authorize()?;
+        compress(start, length)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)] // one bounded pass, in order
 pub(super) fn run(
     paths: &[std::path::PathBuf],
@@ -365,30 +390,30 @@ fn process_file(
     while report.processed_bytes < before.stamp.size {
         let offset = report.processed_bytes;
         let length = (before.stamp.size - offset).min(MAX_CHUNK_BYTES);
-        let result = (|| -> io::Result<()> {
-            control.check_stop()?;
-            budget(file_deadline)?;
-            check_protection(&canonical, config, platform)?;
-            if let Some(selection) = selection {
-                selection.validate_scope(&canonical)?;
-            }
-            // Three /proc sweeps per check: between chunks, at most every
-            // few seconds. A writer is caught by the stamp check on every
-            // chunk and by the final hash; this keeps users' readers and
-            // executables from sharing the file with a rewrite.
-            if last_active_check.is_none_or(|at| at.elapsed() >= ACTIVE_RECHECK_INTERVAL) {
-                check_active(&canonical, file.as_raw_fd(), platform)?;
-                last_active_check = Some(Instant::now());
-            }
-            check_headroom(&file, policy.min_free_bytes)?;
-            verify_path(&canonical, &file, expected)?;
-            budget(file_deadline)?;
-            // Ranges an earlier pass compressed are left as they are: a pass
-            // that resumes a part-compressed file rewrites only what is raw.
-            for (raw_start, raw_length) in
-                sbh_btrfs::raw_ranges(&file, offset, length, file_deadline)?
-            {
-                report.mutation_attempted = true;
+        let result = apply_chunk(
+            control,
+            file_deadline,
+            || {
+                check_protection(&canonical, config, platform)?;
+                if let Some(selection) = selection {
+                    selection.validate_scope(&canonical)?;
+                }
+                // Three /proc sweeps per check: between chunks, at most every
+                // few seconds. A writer is caught by the stamp check on every
+                // chunk and by the final hash; this keeps users' readers and
+                // executables from sharing the file with a rewrite.
+                if last_active_check.is_none_or(|at| at.elapsed() >= ACTIVE_RECHECK_INTERVAL) {
+                    check_active(&canonical, file.as_raw_fd(), platform)?;
+                    last_active_check = Some(Instant::now());
+                }
+                check_headroom(&file, policy.min_free_bytes)?;
+                verify_path(&canonical, &file, expected)?;
+                budget(file_deadline)?;
+                // Ranges an earlier pass compressed are left as they are: a
+                // resumed file rewrites only its remaining raw ranges.
+                sbh_btrfs::raw_ranges(&file, offset, length, file_deadline)
+            },
+            |raw_start, raw_length| {
                 sbh_btrfs::compress_range(
                     &file,
                     raw_start,
@@ -396,23 +421,35 @@ fn process_file(
                     before.inode_flags,
                     consent,
                     file_deadline,
-                )?;
-            }
+                    &mut || {
+                        // The native range performs more inode/FIEMAP reads.
+                        // Renew after those too, at its first actual ioctl.
+                        control.check_stop()?;
+                        budget(file_deadline)?;
+                        report.mutation_attempted = true;
+                        Ok(())
+                    },
+                )
+            },
+            Instant::now,
+        )
+        .and_then(|()| {
             expected = FileStamp::read(&file)?;
             Ok(())
-        })();
+        });
         match result {
             Ok(()) => report.processed_bytes += length,
             Err(error) => {
-                operation_error = Some(error.to_string());
+                operation_error = Some(error);
                 break;
             }
         }
     }
     if !report.mutation_attempted {
-        return Err(io::Error::other(
-            operation_error.unwrap_or_else(|| "compression stopped before mutation".into()),
-        ));
+        // Preserve Interrupted so a revoked pass remains a refusal rather
+        // than being reported as an attempted or failed filesystem rewrite.
+        return Err(operation_error
+            .unwrap_or_else(|| io::Error::other("compression stopped before mutation")));
     }
     // Postflight has a separate, bounded budget. A rewrite timeout must not
     // suppress content verification or erase the fact that mutation happened.
@@ -438,16 +475,15 @@ fn process_file(
             report.content_verified = stable && hash_before == hash_after;
             report.sha256_after = Some(hash_after);
             if !report.content_verified {
-                operation_error = Some(
-                    "content or file identity changed; stop and investigate concurrent writers"
-                        .into(),
-                );
+                operation_error = Some(io::Error::other(
+                    "content or file identity changed; stop and investigate concurrent writers",
+                ));
             }
         }
         Err(error) => {
-            operation_error = Some(format!(
+            operation_error = Some(io::Error::other(format!(
                 "postflight content verification incomplete: {error}"
-            ));
+            )));
         }
     }
     let accounting_deadline = Instant::now() + Duration::from_secs(30);
@@ -477,7 +513,7 @@ fn process_file(
     }
     if let Some(error) = operation_error {
         report.outcome = "partial".into();
-        report.detail = error;
+        report.detail = error.to_string();
     } else if let Some(error) = &report.accounting_error {
         report.outcome = "partial".into();
         report.detail =
@@ -688,7 +724,11 @@ fn file_allowance(size: u64) -> Duration {
 }
 
 fn budget(deadline: Instant) -> io::Result<()> {
-    if Instant::now() >= deadline {
+    budget_at(deadline, Instant::now())
+}
+
+fn budget_at(deadline: Instant, now: Instant) -> io::Result<()> {
+    if now >= deadline {
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "compression work budget exhausted",

@@ -81,6 +81,13 @@ candidates also cannot hide later files indefinitely: discovery remains
 resumable even when the executor accepts none of an earlier page.
 
 An in-flight kernel operation cannot be forcibly interrupted by this deadline.
+Before each raw range's first mutating ioctl, apply renews cancellation and the
+started file's allowance after process, identity and native extent inspection.
+A stop or expiry while those checks block refuses the range before mutation.
+An admitted range retains its bounded finish allowance; each later range needs
+fresh permission, even within the same logical chunk. A refusal before any
+rewrite leaves `mutation_attempted` false.
+
 After any attempted rewrite, content verification has its own 120-second
 cooperative budget and accounting its own 30-second budget. Exhaustion is
 reported as incomplete, never as successful verification. Partial/unverified
@@ -244,8 +251,11 @@ needs, so running it during the rewrite still works and closing it reports no
 modification. The tier runs only when the policy may change the filesystem: not
 in observe or fallback-safe mode, under the kill switch, or with
 `scanner.dry_run`. When the daemon enters one of these during a pass, the pass
-stops before its next file, or before the next chunk of the file it is
-rewriting.
+stops before its next file, or before the next raw range of the file it is
+rewriting. Reloading compression settings, protected paths or control-file
+locations revokes old work before ballast rediscovery can perform filesystem
+I/O. Dry-run and kill-switch reloads do so at the same boundary. Restoring the
+previous settings cannot revive a worker that already received cancellation.
 
 A file is started only while the pass has time left, and once started it is
 finished on its own allowance (a minute plus 4 MiB/s, at most an hour): a file

@@ -367,6 +367,12 @@ fn cheap_exclusion(inode_flags: u32, mappings: &[ioctl::MappedExtent]) -> Option
 /// ioctl compresses past it). The flag is left in place: it is btrfs's record
 /// that the file holds incompressible data, and [`ExtentMap::exclusion`]
 /// skips the file in later passes instead of rewriting that data again.
+///
+/// `authorize` renews the caller's live permission after native preparation,
+/// immediately before the first mutating ioctl. It must perform only cheap
+/// authority checks. A refusal leaves the range unchanged. Once admitted, the
+/// range retains its bounded finish allowance; the caller must renew permission
+/// for every subsequent range as well.
 pub fn compress_range(
     file: &File,
     start: u64,
@@ -374,6 +380,7 @@ pub fn compress_range(
     inode_flags_before: u32,
     _consent: ZstdConsent,
     deadline: Instant,
+    authorize: &mut impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     check_deadline(deadline)?;
     let stamp = FileStamp::read(file)?;
@@ -406,6 +413,7 @@ pub fn compress_range(
     let allowance = Instant::now() + RANGE_FINISH_ALLOWANCE;
     let original = ioctl::fiemap_extents(file, start, length, allowance)?;
     let mut previous = u64::MAX;
+    let mut started = false;
     for _ in 0..MAX_DEFRAG_PASSES {
         let todo = still_original(file, start, length, &original, allowance)?;
         let remaining: u64 = todo.iter().map(|&(_, len)| len).sum();
@@ -418,6 +426,14 @@ pub fn compress_range(
             let mut offset = range_start;
             while offset < range_end {
                 let cluster = (range_end - offset).min(DEFRAG_CLUSTER_BYTES);
+                check_deadline(allowance)?;
+                if !started {
+                    // Extent inspection above can block after an earlier
+                    // admission. No mutation may inherit that stale verdict.
+                    check_deadline(deadline)?;
+                    authorize()?;
+                    started = true;
+                }
                 ioctl::defrag_zstd(file, offset, cluster)?;
                 ioctl::sync_range_wait(file, offset, cluster)?;
                 offset += cluster;

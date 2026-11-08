@@ -69,6 +69,7 @@ fn native_compression_preserves_every_byte_size_and_mtime() {
     );
     assert_eq!(discovery_exclusion(&file, deadline()).unwrap(), None);
     let priority = IdleIoPriority::enter().unwrap();
+    let mut admissions = 0;
     compress_range(
         &file,
         0,
@@ -76,8 +77,13 @@ fn native_compression_preserves_every_byte_size_and_mtime() {
         before.inode_flags,
         consent(),
         deadline(),
+        &mut || {
+            admissions += 1;
+            Ok(())
+        },
     )
     .unwrap();
+    assert_eq!(admissions, 1, "one admission starts the bounded range");
     priority.restore().unwrap();
     let after = inspect(&file, deadline()).unwrap();
     assert!(stamp.same_contents_and_identity(after.stamp));
@@ -97,6 +103,42 @@ fn native_compression_preserves_every_byte_size_and_mtime() {
     assert!(evidence.confirmed_data_bytes_reclaimed <= evidence.referenced_bytes_saved);
     // Keep the runner-owned fixture for diagnostics. CI unmounts its disposable
     // filesystem; this test never recursively deletes an operator-supplied path.
+}
+
+#[test]
+#[ignore = "requires an explicitly supplied disposable Btrfs mount and root"]
+fn revoked_authority_after_native_preparation_leaves_every_extent_unchanged() {
+    let (path, bytes, file) = fixture();
+    let before = inspect(&file, deadline()).unwrap();
+    assert_eq!(before.exclusion(), None);
+    let mut admissions = 0;
+    let error = compress_range(
+        &file,
+        0,
+        before.stamp.size,
+        before.inode_flags,
+        consent(),
+        deadline(),
+        &mut || {
+            admissions += 1;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "the daemon revoked this range while native checks ran",
+            ))
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        admissions, 1,
+        "the final gate follows successful native checks"
+    );
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    let after = inspect(&file, deadline()).unwrap();
+    assert_eq!(after.stamp, before.stamp);
+    assert_eq!(after.extents, before.extents);
+    assert_eq!(after.physical_data_bytes, before.physical_data_bytes);
+    assert_eq!(after.inode_flags, before.inode_flags);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
 }
 
 #[test]
@@ -128,7 +170,8 @@ fn reflinked_files_are_rejected_without_modifying_either_copy() {
             before.stamp.size,
             before.inode_flags,
             consent(),
-            deadline()
+            deadline(),
+            &mut || panic!("shared extents must be refused before mutation admission"),
         )
         .is_err()
     );
@@ -161,7 +204,16 @@ fn an_incompressible_range_marks_the_file_but_does_not_stop_the_rest() {
     let (path, bytes, file) = fixture_with(bytes);
     let before = inspect(&file, deadline()).unwrap();
     assert_eq!(before.exclusion(), None);
-    compress_range(&file, 0, noise, before.inode_flags, consent(), deadline()).unwrap();
+    compress_range(
+        &file,
+        0,
+        noise,
+        before.inode_flags,
+        consent(),
+        deadline(),
+        &mut || Ok(()),
+    )
+    .unwrap();
     let marked = inspect(&file, deadline()).unwrap();
     assert_ne!(
         marked.inode_flags & FS_NOCOMP_FL,
@@ -177,7 +229,8 @@ fn an_incompressible_range_marks_the_file_but_does_not_stop_the_rest() {
             rest,
             marked.inode_flags,
             consent(),
-            deadline()
+            deadline(),
+            &mut || Ok(()),
         )
         .is_err()
     );
@@ -189,6 +242,7 @@ fn an_incompressible_range_marks_the_file_but_does_not_stop_the_rest() {
         before.inode_flags,
         consent(),
         deadline(),
+        &mut || Ok(()),
     )
     .unwrap();
     let after = inspect(&file, deadline()).unwrap();

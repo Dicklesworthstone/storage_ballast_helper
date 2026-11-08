@@ -316,7 +316,7 @@ fn due_start_level(
 pub struct CompressTier {
     running: Arc<AtomicBool>,
     /// Raised by [`CompressTier::stop_running_pass`]; the pass checks it
-    /// before each file and between the chunks of a started one.
+    /// before each file and before every raw range of a started one.
     stop: Arc<AtomicBool>,
     last_start: Option<Instant>,
     /// Independent root continuations and the next pass's starting order.
@@ -338,6 +338,27 @@ impl CompressTier {
         Self {
             first,
             ..Self::default()
+        }
+    }
+
+    /// Revoke captured authority before a reload performs any native I/O.
+    /// This does not wait for workers, refresh probes or clear an old stop
+    /// token when the previous settings are restored.
+    pub fn update_config(&mut self, config: &Config) {
+        let scope = CompressionScope::from(config);
+        if self
+            .scope
+            .as_ref()
+            .is_some_and(|previous| previous != &scope)
+        {
+            self.stop_running_pass();
+            // Late publication belongs to the old scope. Newly admitted work
+            // must not inherit the old worker's discovery continuation.
+            self.resume_after = Arc::new(Mutex::new(PassProgress::default()));
+        }
+        self.scope = Some(scope);
+        if !config.compress.enabled || config.scanner.dry_run || config.policy.kill_switch {
+            self.stop_running_pass();
         }
     }
 
@@ -431,24 +452,12 @@ impl CompressTier {
         mount_levels: &HashMap<PathBuf, PressureLevel>,
         logger: &ActivityLoggerHandle,
     ) {
-        let scope = CompressionScope::from(config);
-        if self
-            .scope
-            .as_ref()
-            .is_some_and(|previous| previous != &scope)
-        {
-            self.stop_running_pass();
-            // An old pass may still finish discovery or cancellation. Give
-            // the new scope its own cursor so that late publication cannot
-            // skip work under the new roots or newly admitted policy.
-            self.resume_after = Arc::new(Mutex::new(PassProgress::default()));
-        }
-        self.scope = Some(scope);
+        self.update_config(config);
         self.first.update_levels(mount_levels);
-        if !config.compress.enabled {
-            self.stop_running_pass();
-        }
         self.poll_probes(&config.compress.roots, now);
+        if config.scanner.dry_run || config.policy.kill_switch {
+            return;
+        }
         let running = self.running.load(Ordering::Acquire);
         if due_start_level(&config.compress, running, self.last_start, now).is_none() {
             return;
@@ -549,7 +558,7 @@ impl CompressTier {
     /// Tell a running pass to stop: the daemon's policy no longer allows
     /// changes (observe or fallback-safe mode, the kill switch, dry-run, the
     /// tier was switched off, or shutdown). It stops before its next file, or before
-    /// the next chunk of the file it is rewriting, whose raw remainder a
+    /// the next raw range of the file it is rewriting, whose raw remainder a
     /// later pass picks up. Also invalidates pending admission evidence, without
     /// waiting for a blocked root probe or starting a replacement worker.
     pub fn stop_running_pass(&self) {
@@ -1723,13 +1732,9 @@ mod tests {
             );
             let mut reloaded = config.clone();
             change(&mut reloaded);
-            tier.tick(
-                Instant::now(),
-                &reloaded,
-                &fixture.platform,
-                &HashMap::new(),
-                &logger.handle,
-            );
+            // Reload revokes before its next monitor tick or ballast I/O.
+            // The already-blocked native probe must not delay that change.
+            tier = fixture.monitor(tier, move |tier| tier.update_config(&reloaded));
             assert!(tier.stop.load(Ordering::Acquire), "{label}");
             assert!(tier.running.load(Ordering::Acquire), "{label}");
             assert!(!Arc::ptr_eq(&old_cursor, &tier.resume_after), "{label}");
@@ -1793,13 +1798,7 @@ mod tests {
         config.notifications.enabled = !config.notifications.enabled;
         config.notifications.min_notify_interval_secs += 30;
         config.dashboard.kill_switch = !config.dashboard.kill_switch;
-        tier.tick(
-            Instant::now(),
-            &config,
-            &fixture.platform,
-            &HashMap::new(),
-            &logger.handle,
-        );
+        tier = fixture.monitor(tier, move |tier| tier.update_config(&config));
         assert!(!tier.stop.load(Ordering::Acquire));
         assert!(tier.running.load(Ordering::Acquire));
         assert!(Arc::ptr_eq(&cursor, &tier.resume_after));
@@ -1810,10 +1809,72 @@ mod tests {
             Some(root.join("progress"))
         );
         fixture.gate.release_all();
-        drain_finished_probe(&mut tier, &config.compress.roots);
+        drain_finished_probe(&mut tier, std::slice::from_ref(&root));
         assert!(tier.evidence.contains_key(&root));
         drop(guard);
         tier.stop_running_pass();
+    }
+
+    #[test]
+    fn dry_run_and_kill_switch_reload_revoke_workers_before_another_tick() {
+        type StopChange = (&'static str, fn(&mut Config));
+        let changes: [StopChange; 2] = [
+            ("dry-run", |config| config.scanner.dry_run = true),
+            ("kill switch", |config| config.policy.kill_switch = true),
+        ];
+        let logger = ProbeLogger::new();
+        for (label, change) in changes {
+            let root = PathBuf::from("/sbh-test-stop-reload/scratch");
+            let fixture =
+                ProbeFixture::new(vec![volume("/sbh-test-stop-reload", "btrfs", 1000, 120)]);
+            let config = probe_config(&["/sbh-test-stop-reload/scratch"]);
+            let mut tier = CompressTier::default();
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &HashMap::new(),
+                &logger.handle,
+            );
+            fixture.requested(&root);
+            tier.running.store(true, Ordering::Release);
+            let guard = RunningGuard {
+                running: Arc::clone(&tier.running),
+                first: Arc::clone(&tier.first),
+            };
+            let old_stop = Arc::clone(&tier.stop);
+            let mut reloaded = config.clone();
+            change(&mut reloaded);
+            tier = fixture.monitor(tier, move |tier| tier.update_config(&reloaded));
+            assert!(old_stop.load(Ordering::Acquire), "{label}");
+            assert!(tier.running.load(Ordering::Acquire), "{label}");
+            assert!(
+                tier.probe
+                    .as_ref()
+                    .unwrap()
+                    .cancelled
+                    .load(Ordering::Acquire),
+                "{label}",
+            );
+            // Returning to allowed settings does not revive the occupied
+            // worker or replace the blocked native probe with another one.
+            tier.update_config(&config);
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &HashMap::new(),
+                &logger.handle,
+            );
+            assert!(old_stop.load(Ordering::Acquire), "{label}");
+            assert!(tier.running.load(Ordering::Acquire), "{label}");
+            assert!(tier.last_start.is_none(), "{label}");
+            assert!(fixture.requests.try_recv().is_err(), "{label}");
+            fixture.gate.release_all();
+            drain_finished_probe(&mut tier, &config.compress.roots);
+            assert!(tier.evidence.is_empty(), "{label}");
+            drop(guard);
+        }
     }
 
     #[test]

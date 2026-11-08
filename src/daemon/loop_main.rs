@@ -8470,6 +8470,9 @@ impl MonitoringDaemon {
                 if old_hash == new_hash {
                     eprintln!("[SBH-DAEMON] config unchanged, skipping reload");
                 } else {
+                    // A rewritten root or new protection takes effect before
+                    // ballast rediscovery can block in native filesystem I/O.
+                    self.compress_tier.update_config(&new_config);
                     // Update components that can be reconfigured at runtime.
                     self.scoring_engine = ScoringEngine::from_config(
                         &new_config.scoring,

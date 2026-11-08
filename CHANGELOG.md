@@ -21,6 +21,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   policy. Reaching the name cap no longer dispatches children before proving
   the listing contains no protection marker.
 
+- **Compression renews permission at every raw-range rewrite boundary.** A
+  stop or expired file allowance during process or extent inspection now
+  refuses the next mutation. Scope, dry-run and kill-switch reloads revoke
+  running work before ballast rediscovery can block, and restoring settings
+  cannot revive an old worker. Pre-write refusals retain their unattempted
+  outcome; an already admitted range keeps its bounded finish allowance.
+
 - **Inode and swap relief drain eligible quarantine before new cleanup.**
   Resource pressure now reaches the existing scoped quarantine drain, renews
   live shortage and original-path protection, and shares its finite allowance

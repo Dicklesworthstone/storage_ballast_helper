@@ -294,6 +294,188 @@ fn a_stop_ends_a_started_file_between_chunks_but_the_deadline_does_not() {
 }
 
 #[test]
+fn a_revocation_or_expiry_during_chunk_preparation_prevents_the_first_rewrite() {
+    use std::os::unix::fs::FileExt;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc;
+
+    for (case, expected) in [
+        ("revoked", Some(io::ErrorKind::Interrupted)),
+        ("expired", Some(io::ErrorKind::TimedOut)),
+        ("unchanged", None),
+    ] {
+        let temp = crate::tempdir_outside_git();
+        let path = temp.path().canonicalize().unwrap().join("cold.bin");
+        fs::write(&path, b"original contents").unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let stop = AtomicBool::new(false);
+        let elapsed = AtomicU64::new(0);
+        let started = Instant::now();
+        let control = PassControl {
+            // A started file owns its file allowance; an expired pass clock
+            // must not stop the unchanged positive control.
+            deadline: started,
+            stop: Some(&stop),
+        };
+        let (entered, probe_started) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let (result, mutations) = std::thread::scope(|scope| {
+            let file = &file;
+            let path = &path;
+            let elapsed = &elapsed;
+            let worker = scope.spawn(move || {
+                let mut mutations = 0;
+                let result = apply_chunk(
+                    &control,
+                    started + Duration::from_secs(10),
+                    || {
+                        // This is the same preparation/mutation boundary used
+                        // by process_file. Real descriptor checks surround a
+                        // controlled preparation pause; the test
+                        // does not require a writable Btrfs filesystem.
+                        let stamp = FileStamp::read(file)?;
+                        check_active(path, file.as_raw_fd(), &MockPlatform::healthy())?;
+                        entered.send(()).unwrap();
+                        resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                        verify_path(path, file, stamp)?;
+                        Ok(vec![(0, 4), (4, 4)])
+                    },
+                    |offset, length| {
+                        assert_eq!(length, 4);
+                        mutations += 1;
+                        file.write_all_at(b"DONE", offset)
+                    },
+                    || started + Duration::from_secs(elapsed.load(Ordering::Acquire)),
+                );
+                (result, mutations)
+            });
+            probe_started.recv_timeout(Duration::from_secs(5)).unwrap();
+            match case {
+                "revoked" => stop.store(true, Ordering::Release),
+                "expired" => elapsed.store(10, Ordering::Release),
+                _ => {}
+            }
+            release.send(()).unwrap();
+            worker.join().unwrap()
+        });
+        if let Some(kind) = expected {
+            assert_eq!(result.unwrap_err().kind(), kind, "{case}");
+            assert_eq!(mutations, 0, "{case}");
+            assert_eq!(fs::read(&path).unwrap(), b"original contents", "{case}");
+        } else {
+            result.unwrap();
+            assert_eq!(mutations, 2);
+            assert_eq!(fs::read(&path).unwrap(), b"DONEDONE contents");
+        }
+    }
+}
+
+#[test]
+fn each_native_range_renews_revocation_and_the_started_files_deadline() {
+    use std::cell::Cell;
+    use std::os::unix::fs::FileExt;
+
+    for (case, expected) in [
+        ("revoked", Some(io::ErrorKind::Interrupted)),
+        ("expired", Some(io::ErrorKind::TimedOut)),
+        ("unchanged", None),
+    ] {
+        let temp = crate::tempdir_outside_git();
+        let path = temp.path().join("cold.bin");
+        fs::write(&path, b"original contents").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        let elapsed = Cell::new(0);
+        let control = PassControl {
+            deadline: started,
+            stop: Some(&stop),
+        };
+        let mut mutations = 0;
+        let result = apply_chunk(
+            &control,
+            started + Duration::from_secs(10),
+            || Ok(vec![(0, 4), (4, 4)]),
+            |offset, length| {
+                assert_eq!(length, 4);
+                file.write_all_at(b"DONE", offset)?;
+                mutations += 1;
+                // A single logical chunk can contain several raw extents.
+                // Finishing the first one grants no permission for the next.
+                match case {
+                    "revoked" => stop.store(true, Ordering::Release),
+                    "expired" => elapsed.set(10),
+                    _ => {}
+                }
+                Ok(())
+            },
+            || started + Duration::from_secs(elapsed.get()),
+        );
+        if let Some(kind) = expected {
+            assert_eq!(result.unwrap_err().kind(), kind, "{case}");
+            assert_eq!(mutations, 1, "{case}");
+            assert_eq!(fs::read(&path).unwrap(), b"DONEinal contents", "{case}");
+        } else {
+            result.unwrap();
+            assert_eq!(mutations, 2);
+            assert_eq!(fs::read(&path).unwrap(), b"DONEDONE contents");
+        }
+    }
+}
+
+#[test]
+fn a_refused_or_failed_chunk_never_reaches_a_later_range() {
+    let stop = AtomicBool::new(true);
+    let control = PassControl {
+        deadline: Instant::now() + Duration::from_secs(30),
+        stop: Some(&stop),
+    };
+    let error = apply_chunk(
+        &control,
+        control.deadline,
+        || panic!("revoked work must not start native preparation"),
+        |_, _| panic!("revoked work must not reach the rewrite"),
+        Instant::now,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+
+    stop.store(false, Ordering::Release);
+    let error = apply_chunk(
+        &control,
+        control.deadline,
+        || {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "probe refused",
+            ))
+        },
+        |_, _| panic!("a failed preparation must not reach the rewrite"),
+        Instant::now,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    let mut mutations = 0;
+    let error = apply_chunk(
+        &control,
+        control.deadline,
+        || Ok(vec![(0, 4), (4, 4)]),
+        |_, _| {
+            mutations += 1;
+            Err(io::Error::new(io::ErrorKind::StorageFull, "rewrite failed"))
+        },
+        Instant::now,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+    assert_eq!(mutations, 1, "native errors stop the remaining ranges");
+}
+
+#[test]
 fn a_raised_stop_ends_the_pass_before_any_file_is_opened() {
     let temp = crate::tempdir_outside_git();
     let path = temp.path().join("cold.bin");
