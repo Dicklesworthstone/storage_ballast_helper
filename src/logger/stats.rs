@@ -221,6 +221,24 @@ pub struct DeletionDetail {
     pub timestamp: String,
 }
 
+// ──────────────────── recent warnings ────────────────────
+
+/// One warning row, newest first, as [`StatsEngine::recent_warnings`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentWarning {
+    /// When the daemon logged it (RFC 3339).
+    pub logged_at: String,
+    /// Elapsed whole seconds since logging; unknown for invalid or future times.
+    pub age_seconds: Option<u64>,
+    /// The message, cut to the byte budget (lossy UTF-8).
+    pub message: String,
+    /// Whether the message was longer than the byte budget.
+    pub truncated: bool,
+}
+
+/// Bytes read from one warning's message.
+const RECENT_WARNING_MAX_BYTES: usize = 16 * 1024;
+
 // ──────────────────── RAM-scratch notices ────────────────────
 
 const RAM_SCRATCH_NOTICE_SCHEMA: &str = "sbh.ram_scratch.observation.v1";
@@ -486,6 +504,45 @@ impl<'a> StatsEngine<'a> {
             .iter()
             .map(|&w| self.window_stats(w))
             .collect()
+    }
+
+    /// Warnings logged under `code` within `window`, newest first, at most
+    /// `limit` rows. The range scan uses the (`event_type`, timestamp) index,
+    /// and each message is read up to a fixed byte budget.
+    pub fn recent_warnings(
+        &self,
+        code: &str,
+        window: Duration,
+        limit: usize,
+    ) -> Result<Vec<RecentWarning>> {
+        let conn = self.db.connection();
+        let since = since_timestamp(window);
+        // CAST to BLOB makes substr's bound bytes, not Unicode code points;
+        // one extra byte tells a full message from a cut one.
+        let mut statement = conn.prepare_cached(
+            "SELECT timestamp, substr(CAST(details AS BLOB), 1, ?3)
+             FROM activity_log
+             WHERE event_type = 'info' AND timestamp >= ?1 AND error_code = ?2
+             ORDER BY timestamp DESC, id DESC LIMIT ?4",
+        )?;
+        let byte_budget = i64::try_from(RECENT_WARNING_MAX_BYTES + 1).unwrap_or(i64::MAX);
+        let row_budget = i64::try_from(limit).unwrap_or(i64::MAX);
+        let now = chrono::Utc::now();
+        let mut rows = statement.query(params![since, code, byte_budget, row_budget])?;
+        let mut warnings = Vec::new();
+        while let Some(row) = rows.next()? {
+            let logged_at: String = row.get(0)?;
+            let details = row.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default();
+            let truncated = details.len() > RECENT_WARNING_MAX_BYTES;
+            let kept = &details[..details.len().min(RECENT_WARNING_MAX_BYTES)];
+            warnings.push(RecentWarning {
+                age_seconds: notice_timestamp_age(&logged_at, now).map(|age| age.as_secs()),
+                logged_at,
+                message: String::from_utf8_lossy(kept).into_owned(),
+                truncated,
+            });
+        }
+        Ok(warnings)
     }
 
     /// The latest RAM-scratch notice in append order, including stale evidence.
@@ -2338,5 +2395,56 @@ mod tests {
         assert_eq!(extract_pattern("/data/foo/pi_agent_1"), "pi_*");
         assert_eq!(extract_pattern("/data/foo/node_modules"), "node_modules/");
         assert_eq!(extract_pattern("/data/foo/random_dir"), "random_dir");
+    }
+
+    #[test]
+    fn recent_warnings_reads_one_code_newest_first_within_its_window_and_budget() {
+        let (_dir, db) = temp_db();
+        let row = |minutes_ago: i64, code: &str, details: String| ActivityRow {
+            timestamp: ts(minutes_ago),
+            event_type: "info".to_string(),
+            severity: "warning".to_string(),
+            path: None,
+            size_bytes: None,
+            score: None,
+            score_factors: None,
+            pressure_level: None,
+            free_pct: None,
+            duration_ms: None,
+            success: 1,
+            error_code: Some(code.to_string()),
+            error_message: None,
+            details: Some(details),
+        };
+        for (minutes_ago, code, details) in [
+            (200, "SBH-2007", "too old".to_string()),
+            (30, "SBH-2007", "older".to_string()),
+            (5, "SBH-2003", "another code".to_string()),
+            (10, "SBH-2007", "x".repeat(RECENT_WARNING_MAX_BYTES + 10)),
+        ] {
+            db.log_activity(&row(minutes_ago, code, details)).unwrap();
+        }
+        let engine = StatsEngine::new(&db);
+        let window = Duration::from_hours(3);
+        let warnings = engine.recent_warnings("SBH-2007", window, 8).unwrap();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].truncated);
+        assert_eq!(warnings[0].message.len(), RECENT_WARNING_MAX_BYTES);
+        assert!(
+            warnings[0]
+                .age_seconds
+                .is_some_and(|age| (540..=660).contains(&age))
+        );
+        assert_eq!(warnings[1].message, "older");
+        assert!(!warnings[1].truncated);
+        let newest = engine.recent_warnings("SBH-2007", window, 1).unwrap();
+        assert_eq!(newest.len(), 1);
+        assert!(newest[0].truncated);
+        assert!(
+            engine
+                .recent_warnings("SBH-9999", window, 8)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

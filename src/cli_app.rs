@@ -10277,6 +10277,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     // Keep old incomplete notices visible and distinguish missing evidence
     // from an examined database with no recorded notice (GitHub #40).
     let ram_scratch = read_ram_scratch_status(&config.paths.sqlite_db);
+    // Where the bytes are on mounts reclaim is not keeping up with: the
+    // daemon logs it to the journal and activity log, which nobody reads
+    // during a sweep, so status repeats the latest report per mount.
+    let space_reports = read_space_reports(&config.paths.sqlite_db);
     let memory_info = platform.memory_info().ok();
     let memory_pressure = platform.memory_pressure().ok();
     let process_visibility =
@@ -10394,6 +10398,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 println!(
                     "  sbh reports purgeable storage separately and does not count it as free space for pressure decisions."
                 );
+            }
+
+            for line in space_report_status_lines(&space_reports) {
+                println!("{line}");
             }
 
             if let Some(memory) = &memory_info {
@@ -10918,6 +10926,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 "memory_pressure": memory_pressure.as_ref().map(status_memory_pressure_json),
                 // Latest recorded notice with explicit availability and age.
                 "ram_scratch": ram_scratch,
+                "space_reports": space_reports_json(&space_reports),
                 "process_attribution": {
                     "visibility": process_visibility.as_ref().map(process_attribution_visibility_json),
                 },
@@ -11548,6 +11557,122 @@ enum RamScratchStatus {
     Unavailable {
         detail: String,
     },
+}
+
+/// How far back `sbh status` looks for the daemon's growth-attribution
+/// reports. They repeat hourly per mount while reclaim is not keeping up.
+const SPACE_REPORT_WINDOW: std::time::Duration = std::time::Duration::from_hours(3);
+/// `SBH-2007` rows examined for them. The scanner's budget warnings share the
+/// code and can be logged every five minutes.
+const SPACE_REPORT_MAX_ROWS: usize = 256;
+/// Mounts shown, the newest report first.
+const SPACE_REPORT_MAX_MOUNTS: usize = 8;
+
+/// The daemon's latest report of where one mount's bytes are.
+#[derive(Debug, Clone, Serialize)]
+struct SpaceReport {
+    mount: String,
+    level: String,
+    logged_at: String,
+    age_seconds: Option<u64>,
+    report: String,
+    truncated: bool,
+}
+
+/// The latest growth-attribution report per mount within
+/// `SPACE_REPORT_WINDOW`, newest first.
+fn read_space_reports(database: &Path) -> Result<Vec<SpaceReport>, String> {
+    let warnings = SqliteLogger::open_read_only(database)
+        .and_then(|db| {
+            StatsEngine::new(&db).recent_warnings(
+                "SBH-2007",
+                SPACE_REPORT_WINDOW,
+                SPACE_REPORT_MAX_ROWS,
+            )
+        })
+        .map_err(|error| error.to_string())?;
+    let mut reports: Vec<SpaceReport> = Vec::new();
+    for warning in &warnings {
+        let Some((level, mount)) =
+            storage_ballast_helper::daemon::attribution::parse_report(&warning.message)
+        else {
+            continue;
+        };
+        if reports.iter().any(|report| report.mount == mount) {
+            continue;
+        }
+        reports.push(SpaceReport {
+            mount: mount.to_string(),
+            level: level.to_string(),
+            logged_at: warning.logged_at.clone(),
+            age_seconds: warning.age_seconds,
+            report: warning.message.clone(),
+            truncated: warning.truncated,
+        });
+        if reports.len() == SPACE_REPORT_MAX_MOUNTS {
+            break;
+        }
+    }
+    Ok(reports)
+}
+
+fn space_reports_json(reports: &Result<Vec<SpaceReport>, String>) -> Value {
+    match reports {
+        Ok(reports) => json!({
+            "window_seconds": SPACE_REPORT_WINDOW.as_secs(),
+            "reports": reports,
+        }),
+        Err(detail) => json!({
+            "window_seconds": SPACE_REPORT_WINDOW.as_secs(),
+            "reports": Value::Null,
+            "unavailable": detail,
+        }),
+    }
+}
+
+/// Nothing when no mount was reported; the reports are leads for a person,
+/// so the line keeps their sizes and advice and drops the repeated header.
+fn space_report_status_lines(reports: &Result<Vec<SpaceReport>, String>) -> Vec<String> {
+    let reports = match reports {
+        Ok(reports) if reports.is_empty() => return Vec::new(),
+        Ok(reports) => reports,
+        Err(detail) => {
+            return vec![format!(
+                "\nSpace Attribution: UNKNOWN (activity evidence unavailable): {}",
+                detail.escape_debug()
+            )];
+        }
+    };
+    let mut lines = vec![format!(
+        "\nSpace Attribution (daemon reports, last {} h):",
+        SPACE_REPORT_WINDOW.as_secs() / 3600
+    )];
+    for report in reports {
+        let age = report.age_seconds.map_or_else(
+            || "age unknown".to_string(),
+            |secs| format!("{} min ago", secs / 60),
+        );
+        let body = report
+            .report
+            .find("largest directories: ")
+            .map_or(report.report.as_str(), |start| &report.report[start..]);
+        // The report already escapes every path it names; the mount and level
+        // come from the log, so control characters are blanked here too.
+        let body: String = body
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let cut = if report.truncated { " [cut]" } else { "" };
+        lines.push(format!(
+            "  {} {}, {age}: {body}{cut}",
+            report.mount.escape_debug(),
+            report.level.to_uppercase().escape_debug(),
+        ));
+    }
+    lines.push(
+        "  Sizes are observations of where the bytes are, never deletion authority.".to_string(),
+    );
+    lines
 }
 
 fn read_ram_scratch_status(database: &Path) -> RamScratchStatus {

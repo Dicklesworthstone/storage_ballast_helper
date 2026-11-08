@@ -6,7 +6,7 @@
 mod common;
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// Run the binary in human output mode (stdout is a pipe here, which would
@@ -328,6 +328,112 @@ fn status_ram_scratch_unavailable_is_explicit_and_does_not_create_database() {
     assert_eq!(human.status.code(), Some(0), "{human:?}");
     assert!(stdout(&human).contains("RAM scratch: UNKNOWN (activity evidence unavailable)"));
     assert!(!database.exists());
+}
+
+fn append_warning(database: &Path, minutes_ago: i64, code: &str, message: &str) {
+    use storage_ballast_helper::logger::sqlite::{ActivityRow, SqliteLogger};
+
+    let at = chrono::Utc::now() - chrono::Duration::minutes(minutes_ago);
+    let db = SqliteLogger::open(database).unwrap();
+    db.log_activity(&ActivityRow {
+        timestamp: at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        event_type: "info".to_string(),
+        severity: "warning".to_string(),
+        path: None,
+        size_bytes: None,
+        score: None,
+        score_factors: None,
+        pressure_level: None,
+        free_pct: None,
+        duration_ms: None,
+        success: 1,
+        error_code: Some(code.to_string()),
+        error_message: None,
+        details: Some(message.to_string()),
+    })
+    .unwrap();
+}
+
+/// The daemon's growth-attribution reports reach `sbh status`: the latest per
+/// mount within the window, read-only, and not the budget warnings that share
+/// their code.
+#[test]
+fn status_shows_the_latest_space_report_per_mount_read_only() {
+    use storage_ballast_helper::daemon::attribution::{Consumer, report};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(dir.path());
+    let database = dir.path().join("data/activity.sqlite3");
+    let missing = sbh(&config, &["--json", "status"]);
+    let json: serde_json::Value = serde_json::from_str(stdout(&missing).trim()).unwrap();
+    assert!(json["space_reports"]["unavailable"].is_string(), "{json}");
+    assert!(!database.exists());
+
+    let consumer = |path: &str, gib: u64| Consumer {
+        path: PathBuf::from(path),
+        bytes: gib << 30,
+        complete: true,
+        estimated: None,
+    };
+    let older = report(
+        "red",
+        Path::new("/"),
+        10,
+        &[consumer("/home/ubuntu", 90)],
+        &[],
+    );
+    let newer = report(
+        "critical",
+        Path::new("/"),
+        10,
+        &[consumer("/home/ubuntu", 120)],
+        &[(
+            PathBuf::from("/home/ubuntu"),
+            vec![consumer("/home/ubuntu/.cache", 100)],
+        )],
+    );
+    append_warning(
+        &database,
+        300,
+        "SBH-2007",
+        &older.replace("red on /", "red on /old"),
+    );
+    append_warning(&database, 70, "SBH-2007", &older);
+    append_warning(&database, 12, "SBH-2007", &newer);
+    append_warning(
+        &database,
+        2,
+        "SBH-2007",
+        "priority pre-scan stopped by cpu after 38 entries in 1.0s",
+    );
+    let before = fs::read(&database).unwrap();
+
+    let output = sbh(&config, &["--json", "status"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let json: serde_json::Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    let reports = json["space_reports"]["reports"].as_array().unwrap();
+    assert_eq!(reports.len(), 1, "{json}");
+    assert_eq!(reports[0]["mount"], "/");
+    assert_eq!(reports[0]["level"], "critical");
+    assert_eq!(reports[0]["report"], newer.as_str());
+    assert!((660..=780).contains(&reports[0]["age_seconds"].as_u64().unwrap()));
+
+    let human = sbh(&config, &["status"]);
+    assert_eq!(human.status.code(), Some(0), "{human:?}");
+    let rendered = stdout(&human);
+    assert!(
+        rendered.contains("Space Attribution (daemon reports, last 3 h):"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("/ CRITICAL, 12 min ago: largest directories: \"/home/ubuntu\" 120.0 GiB; inside \"/home/ubuntu\": \"/home/ubuntu/.cache\" 100.0 GiB"),
+        "{rendered}"
+    );
+    assert_eq!(
+        fs::read(&database).unwrap(),
+        before,
+        "status changed the database"
+    );
 }
 
 fn append_ram_scratch_notice(database: &Path, timestamp: &str, details: &serde_json::Value) {

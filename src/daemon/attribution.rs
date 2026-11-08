@@ -206,17 +206,59 @@ fn collect_consumers(mount: &Path, top: usize, work: &mut WorkBudget) -> Vec<Con
     let Ok(root) = root else {
         return unknown(mount);
     };
+    consumers_below(&root, mount, true, top, work)
+}
+
+/// Largest directories inside `directory`, a consumer an earlier probe of
+/// `mount` observed. Its children are listed as they are, with no container
+/// expansion. A display path is not authority, so it is reopened without
+/// following a final symlink and measured only while it is still a
+/// directory on the mount's filesystem.
+fn collect_within(
+    mount: &Path,
+    directory: &Path,
+    top: usize,
+    work: &mut WorkBudget,
+) -> Vec<Consumer> {
+    if top == 0 {
+        return Vec::new();
+    }
+    if work.remaining == 0 || Instant::now() >= work.deadline {
+        return unknown(directory);
+    }
+    let Ok(mount_device) = std::fs::metadata(mount).map(|metadata| metadata.dev()) else {
+        return unknown(directory);
+    };
+    let Ok(root) = open(directory, DIRECTORY_FLAGS, Mode::empty()).map(File::from) else {
+        return unknown(directory);
+    };
+    if !root
+        .metadata()
+        .is_ok_and(|metadata| metadata.dev() == mount_device)
+    {
+        return unknown(directory);
+    }
+    consumers_below(&root, directory, false, top, work)
+}
+
+fn consumers_below(
+    root: &File,
+    path: &Path,
+    expand: bool,
+    top: usize,
+    work: &mut WorkBudget,
+) -> Vec<Consumer> {
     let Ok(stamp) = root.metadata() else {
-        return unknown(mount);
+        return unknown(path);
     };
     let device = stamp.dev();
     let mut candidates = Vec::new();
     let mut discovery = work.remaining.min(MAX_DISCOVERY_READS);
     let discovery_complete = discover(
-        &root,
-        mount,
+        root,
+        path,
         device,
-        true,
+        expand,
         &mut candidates,
         work,
         &mut discovery,
@@ -225,7 +267,7 @@ fn collect_consumers(mount: &Path, top: usize, work: &mut WorkBudget) -> Vec<Con
         return if discovery_complete {
             Vec::new()
         } else {
-            unknown(mount)
+            unknown(path)
         };
     }
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
@@ -733,10 +775,137 @@ fn same_stamp(left: &Metadata, right: &Metadata) -> bool {
         && left.ctime_nsec() == right.ctime_nsec()
 }
 
+/// Levels a report follows the largest directory down. A top-level name
+/// such as `/home/ubuntu` or `/data/projects` holding 100+ GiB tells an
+/// operator where to start, not what to move; the trees inside it do.
+pub const DRILL_LEVELS: usize = 2;
+/// Entries named inside each drilled directory.
+pub const DRILL_TOP: usize = 5;
+
+/// A drilled directory and the largest directories observed inside it.
+pub type Drilled = (PathBuf, Vec<Consumer>);
+
+/// The largest directories inside the largest consumer, level by level.
+///
+/// The descent continues into the largest child while it holds at least half
+/// of its parent, up to [`DRILL_LEVELS`] levels. Each level is its own
+/// bounded probe under the shared admission gate, with its own `budget`; a
+/// busy, stalled, failed or empty level ends the descent and the levels
+/// already observed stand.
+#[must_use]
+pub fn drill_down(mount: &Path, consumers: &[Consumer], budget: usize) -> Vec<Drilled> {
+    let active = Arc::clone(PROBE_ACTIVE.get_or_init(|| Arc::new(AtomicBool::new(false))));
+    drill_down_with_gate(mount, consumers, budget, &active)
+}
+
+fn drill_down_with_gate(
+    mount: &Path,
+    consumers: &[Consumer],
+    budget: usize,
+    active: &Arc<AtomicBool>,
+) -> Vec<Drilled> {
+    let mut drilled = Vec::new();
+    let Some(mut parent) = consumers.first().cloned() else {
+        return drilled;
+    };
+    for _ in 0..DRILL_LEVELS {
+        if budget == 0 || parent.path == mount || parent.rank_bytes() == 0 {
+            break;
+        }
+        let started = Instant::now();
+        let anchor = mount.to_path_buf();
+        let directory = parent.path.clone();
+        let children = bounded_probe(Arc::clone(active), started + PROBE_WAIT_BUDGET, move || {
+            let mut work = WorkBudget {
+                remaining: budget.min(PROBE_BUDGET_ENTRIES),
+                examined: 0,
+                deadline: started + PROBE_TIME_BUDGET,
+            };
+            collect_within(&anchor, &directory, DRILL_TOP, &mut work)
+        });
+        let Some(children) =
+            children.filter(|children| !children.is_empty() && *children != unknown(&parent.path))
+        else {
+            break;
+        };
+        let next = children[0].clone();
+        let dominant = next.rank_bytes().saturating_mul(2) >= parent.rank_bytes();
+        drilled.push((parent.path, children));
+        if !dominant {
+            break;
+        }
+        parent = next;
+    }
+    drilled
+}
+
+/// Words that follow the sustained duration in every growth-attribution
+/// report; [`parse_report`] tells the reports apart from the other
+/// `SBH-2007` warnings by them.
+const REPORT_MARKER: &str = " min and reclaim is not keeping up; largest directories: ";
+const PARTIAL_NOTE: &str =
+    " (partial observation: >= is the part measured, ~ a sampled estimate of the whole)";
+
+/// The `SBH-2007` growth-attribution report for `mount`: its largest
+/// directories, then the largest inside each drilled directory, then what to
+/// do. Sizes are observations, never deletion authority.
+#[must_use]
+pub fn report(
+    level: &str,
+    mount: &Path,
+    sustained_minutes: u64,
+    consumers: &[Consumer],
+    drilled: &[Drilled],
+) -> String {
+    let mut out = format!(
+        "pressure {level} on {} for over {sustained_minutes}{REPORT_MARKER}",
+        mount.display()
+    );
+    push_entries(&mut out, consumers);
+    let mut partial = consumers.iter().any(|consumer| !consumer.complete);
+    for (directory, inside) in drilled {
+        // Debug escaping, as for every display path in a report.
+        #[allow(clippy::unnecessary_debug_formatting)]
+        let _ = write!(out, "; inside {directory:?}: ");
+        push_entries(&mut out, inside);
+        partial |= inside.iter().any(|consumer| !consumer.complete);
+    }
+    if partial {
+        out.push_str(PARTIAL_NOTE);
+    }
+    out.push_str(
+        ". Next: move or clean one of these, or add a scanner.root_path covering disposable \
+         data in it; `sbh explain --why-not <dir>` names what keeps sbh from reclaiming one",
+    );
+    out
+}
+
+/// The level and mount of a message [`report`] wrote, or `None` for any
+/// other message.
+#[must_use]
+pub fn parse_report(message: &str) -> Option<(&str, &str)> {
+    let (head, _) = message.split_once(REPORT_MARKER)?;
+    let (level, rest) = head.strip_prefix("pressure ")?.split_once(" on ")?;
+    let (mount, minutes) = rest.rsplit_once(" for over ")?;
+    (!level.is_empty()
+        && !mount.is_empty()
+        && !minutes.is_empty()
+        && minutes.bytes().all(|byte| byte.is_ascii_digit()))
+    .then_some((level, mount))
+}
+
 /// Describe observations; `>=` marks lower bounds, not reclaimable bytes.
 #[must_use]
 pub fn describe(consumers: &[Consumer]) -> String {
     let mut out = String::new();
+    push_entries(&mut out, consumers);
+    if consumers.iter().any(|consumer| !consumer.complete) {
+        out.push_str(PARTIAL_NOTE);
+    }
+    out
+}
+
+fn push_entries(out: &mut String, consumers: &[Consumer]) {
     for (index, consumer) in consumers.iter().enumerate() {
         if index > 0 {
             out.push_str(", ");
@@ -757,12 +926,6 @@ pub fn describe(consumers: &[Consumer]) -> String {
         #[allow(clippy::unnecessary_debug_formatting)]
         let _ = write!(out, "{:?} {mark}{gib:.1} GiB{suffix}", consumer.path);
     }
-    if consumers.iter().any(|consumer| !consumer.complete) {
-        out.push_str(
-            " (partial observation: >= is the part measured, ~ a sampled estimate of the whole)",
-        );
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1171,5 +1334,140 @@ mod tests {
         assert_eq!(consumers.len(), 1);
         assert_eq!(consumers[0].bytes, expected);
         assert!(consumers[0].complete);
+    }
+
+    fn drill(mount: &Path, consumers: &[Consumer]) -> Vec<Drilled> {
+        drill_down_with_gate(
+            mount,
+            consumers,
+            PROBE_BUDGET_ENTRIES,
+            &Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn drilled_paths(drilled: &[Drilled]) -> Vec<(PathBuf, Vec<PathBuf>)> {
+        drilled
+            .iter()
+            .map(|(directory, inside)| {
+                (
+                    directory.clone(),
+                    inside
+                        .iter()
+                        .map(|consumer| consumer.path.clone())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn drill_down_follows_the_largest_directory_while_it_dominates() {
+        let mount = tempfile::tempdir().unwrap();
+        let alice = mount.path().join("home/alice");
+        let cache = alice.join("cache");
+        for (dir, bytes) in [
+            (cache.join("run-a"), 4 << 20),
+            (cache.join("run-b"), 1 << 20),
+            (alice.join("notes"), 64 << 10),
+            (mount.path().join("tools"), 64 << 10),
+        ] {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("blob"), vec![7u8; bytes]).unwrap();
+        }
+        let consumers = top_consumers(mount.path(), PROBE_BUDGET_ENTRIES, REPORT_TOP);
+        assert_eq!(consumers[0].path, alice);
+        assert_eq!(
+            drilled_paths(&drill(mount.path(), &consumers)),
+            vec![
+                (alice.clone(), vec![cache.clone(), alice.join("notes")]),
+                (
+                    cache.clone(),
+                    vec![cache.join("run-a"), cache.join("run-b")]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn drill_down_stops_where_no_directory_dominates() {
+        let mount = tempfile::tempdir().unwrap();
+        let tree = mount.path().join("tree");
+        for name in ["a", "b", "c"] {
+            let dir = tree.join(name).join("deeper");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("blob"), vec![7u8; 1 << 20]).unwrap();
+        }
+        let consumers = top_consumers(mount.path(), PROBE_BUDGET_ENTRIES, REPORT_TOP);
+        let drilled = drill(mount.path(), &consumers);
+        assert_eq!(drilled.len(), 1);
+        assert_eq!(drilled[0].0, tree);
+        assert_eq!(drilled[0].1.len(), 3);
+    }
+
+    #[test]
+    fn drill_down_never_follows_a_replaced_directory_or_an_unknown_mount() {
+        let mount = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(outside.path().join("inner")).unwrap();
+        fs::write(outside.path().join("inner/large"), vec![1u8; 1 << 20]).unwrap();
+        let replaced = mount.path().join("tree");
+        std::os::unix::fs::symlink(outside.path(), &replaced).unwrap();
+        let observed = Consumer {
+            path: replaced,
+            bytes: 1 << 20,
+            complete: true,
+            estimated: None,
+        };
+        assert!(drill(mount.path(), std::slice::from_ref(&observed)).is_empty());
+        assert!(drill(mount.path(), &unknown(mount.path())).is_empty());
+        assert!(drill(mount.path(), &[]).is_empty());
+        // A probe still holding admission blocks the drill as it blocks a report.
+        let busy = Arc::new(AtomicBool::new(true));
+        let real = mount.path().join("real");
+        fs::create_dir_all(real.join("inner")).unwrap();
+        let observed = Consumer {
+            path: real,
+            bytes: 1 << 20,
+            complete: true,
+            estimated: None,
+        };
+        assert!(
+            drill_down_with_gate(mount.path(), &[observed], PROBE_BUDGET_ENTRIES, &busy).is_empty()
+        );
+    }
+
+    #[test]
+    fn report_names_drilled_directories_and_parses_back_to_its_mount() {
+        let measured = |path: &str, complete: bool| Consumer {
+            path: PathBuf::from(path),
+            bytes: 3 << 30,
+            complete,
+            estimated: None,
+        };
+        let drilled = vec![(
+            PathBuf::from("/home/ubuntu"),
+            vec![measured("/home/ubuntu/.cache\n\x1b[2J", false)],
+        )];
+        let text = report(
+            "critical",
+            Path::new("/data"),
+            10,
+            &[measured("/home/ubuntu", true)],
+            &drilled,
+        );
+        assert!(text.starts_with("pressure critical on /data for over 10 min"));
+        assert!(text.contains("; inside \"/home/ubuntu\": \"/home/ubuntu/.cache"));
+        assert!(!text.contains('\n') && !text.contains('\x1b'));
+        assert_eq!(text.matches("partial observation").count(), 1);
+        assert!(text.contains("sbh explain --why-not"));
+        assert_eq!(parse_report(&text), Some(("critical", "/data")));
+        let spaced = report("red", Path::new("/mnt/a for over b"), 10, &[], &[]);
+        assert_eq!(parse_report(&spaced), Some(("red", "/mnt/a for over b")));
+        // Budget warnings share the code and are not reports.
+        assert_eq!(
+            parse_report("priority pre-scan stopped by cpu after 38 entries in 1.0s"),
+            None
+        );
+        assert_eq!(parse_report(REPORT_MARKER), None);
     }
 }

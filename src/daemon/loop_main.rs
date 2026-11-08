@@ -7415,13 +7415,19 @@ impl MonitoringDaemon {
                     if consumers.is_empty() {
                         return;
                     }
-                    let message = format!(
-                        "pressure {level} on {} for over {} min and reclaim is not keeping \
-                         up; largest directories: {}. Next: move or clean one of these, or \
-                         add a scanner.root_path covering disposable data in it",
-                        mount.display(),
+                    // Name the trees inside the largest directory too: a
+                    // home or project root is where to look, not what to move.
+                    let drilled = crate::daemon::attribution::drill_down(
+                        &mount,
+                        &consumers,
+                        crate::daemon::attribution::PROBE_BUDGET_ENTRIES,
+                    );
+                    let message = crate::daemon::attribution::report(
+                        &level,
+                        &mount,
                         ATTRIBUTION_SUSTAINED_PRESSURE.as_secs() / 60,
-                        crate::daemon::attribution::describe(&consumers)
+                        &consumers,
+                        &drilled,
                     );
                     eprintln!("[SBH-DAEMON] {message}");
                     logger.send(ActivityEvent::Warning {
