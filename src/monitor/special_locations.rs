@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::core::config::TelemetryConfig;
 use crate::core::errors::Result;
+use crate::monitor::ewma::DiskRateEstimator;
+use crate::monitor::fs_stats::FsStatsSample;
 use crate::platform::pal::{FsStats, MountPoint, Platform};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +167,145 @@ fn is_actionable_special_mount(mount: &MountPoint) -> bool {
         || path_str.starts_with("/run/user/")
         || path_str == "/run/lock"
         || path_str == "/run")
+}
+
+/// Rate evidence for special mounts which need not be scanner roots. Each
+/// location learns from capacity observations; a current main-monitor rate is
+/// only a prior while this independent estimator warms up.
+#[derive(Debug, Default)]
+pub(crate) struct SpecialLocationRates {
+    locations: HashMap<PathBuf, LocationRate>,
+    mount_priors: HashMap<PathBuf, (FsStatsSample, f64)>,
+}
+
+#[derive(Debug)]
+struct LocationRate {
+    sample: FsStatsSample,
+    estimator: DiskRateEstimator,
+    rate: Option<f64>,
+    allow_prior: bool,
+}
+
+impl SpecialLocationRates {
+    /// Main-monitor observations remain available after pressure dispatch
+    /// consumes its mount responses, but never survive a new sampling tick.
+    pub fn begin_tick(&mut self) {
+        self.mount_priors.clear();
+    }
+
+    pub fn record_mount(&mut self, sample: &FsStatsSample, rate: f64) {
+        if rate.is_finite()
+            && sample.stats.total_bytes > 0
+            && sample.stats.free_bytes <= sample.stats.total_bytes
+            && sample.stats.available_bytes <= sample.stats.free_bytes
+        {
+            self.mount_priors
+                .insert(sample.stats.mount_point.clone(), (sample.clone(), rate));
+        } else {
+            self.mount_priors.remove(&sample.stats.mount_point);
+        }
+    }
+
+    pub fn retain(&mut self, registry: &SpecialLocationRegistry) {
+        self.locations
+            .retain(|path, _| registry.all().iter().any(|location| &location.path == path));
+    }
+
+    pub fn forget(&mut self, path: &Path) {
+        self.locations.remove(path);
+    }
+
+    /// Cached observations retain their original timestamp and never train
+    /// the estimator twice. Three missed nominal polls break continuity;
+    /// invalid, future-dated and stale samples provide no horizon evidence.
+    /// A replacement filesystem or resized volume begins a new history.
+    pub fn observe(
+        &mut self,
+        location: &SpecialLocation,
+        sample: &FsStatsSample,
+        now: Instant,
+        poll_interval: Duration,
+        telemetry: &TelemetryConfig,
+    ) -> Option<f64> {
+        let max_gap = location
+            .scan_interval
+            .max(poll_interval)
+            .max(Duration::from_secs(1))
+            .saturating_mul(3);
+        let stats = &sample.stats;
+        if stats.total_bytes == 0
+            || stats.free_bytes > stats.total_bytes
+            || stats.available_bytes > stats.free_bytes
+            || now
+                .checked_duration_since(sample.collected_at)
+                .is_none_or(|age| age > max_gap)
+        {
+            self.forget(&location.path);
+            return None;
+        }
+        let reset = self.locations.get(&location.path).is_some_and(|old| {
+            !old.sample.same_filesystem_as(sample)
+                || sample
+                    .collected_at
+                    .checked_duration_since(old.sample.collected_at)
+                    .is_none_or(|gap| gap > max_gap)
+        });
+        if reset {
+            self.forget(&location.path);
+        }
+        let mount_prior = self
+            .mount_priors
+            .get(&stats.mount_point)
+            .filter(|(prior, _)| {
+                prior.same_filesystem_as(sample)
+                    && sample.collected_at >= prior.collected_at
+                    && now
+                        .checked_duration_since(prior.collected_at)
+                        .is_some_and(|age| age <= max_gap)
+            })
+            .map(|(_, rate)| *rate);
+        let rate_state = self
+            .locations
+            .entry(location.path.clone())
+            .or_insert_with(|| {
+                let mut estimator = DiskRateEstimator::with_history_cap(
+                    telemetry.ewma_base_alpha,
+                    telemetry.ewma_min_alpha,
+                    telemetry.ewma_max_alpha,
+                    telemetry.ewma_min_samples,
+                    telemetry.ewma_rate_history_size,
+                );
+                estimator.update(stats.available_bytes, sample.collected_at, 0);
+                LocationRate {
+                    sample: sample.clone(),
+                    estimator,
+                    rate: None,
+                    allow_prior: !reset,
+                }
+            });
+        if sample.collected_at > rate_state.sample.collected_at {
+            let estimate =
+                rate_state
+                    .estimator
+                    .update(stats.available_bytes, sample.collected_at, 0);
+            // A positive trailing EWMA must not keep a horizon alert alive
+            // once the current interval shows that space stopped shrinking.
+            rate_state.rate = if stats.available_bytes >= rate_state.sample.stats.available_bytes {
+                Some(0.0)
+            } else {
+                (!estimate.fallback_active && estimate.bytes_per_second.is_finite())
+                    .then(|| estimate.bytes_per_second.max(0.0))
+            };
+            rate_state.sample = sample.clone();
+        }
+        let prior = rate_state
+            .allow_prior
+            .then_some(mount_prior)
+            .flatten()
+            .filter(|rate| rate.is_finite())
+            .map(|rate| rate.max(0.0));
+        Some(rate_state.rate.or(prior).unwrap_or(0.0))
+    }
 }
 
 // ──────────────────── horizon rule (Q2) ────────────────────
@@ -377,6 +519,267 @@ impl AlertThrottle {
             }
         }
         emit
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+    use crate::monitor::fs_stats::FsStatsCollector;
+    use crate::platform::pal::{MemoryInfo, MockPlatform, PlatformPaths};
+    use std::sync::Arc;
+
+    const GIB: u64 = 1 << 30;
+
+    fn location() -> SpecialLocation {
+        SpecialLocation {
+            path: PathBuf::from("/special-only"),
+            kind: SpecialKind::DevShm,
+            buffer_pct: 20,
+            scan_interval: Duration::from_secs(5),
+            priority: 255,
+        }
+    }
+
+    fn sample(mount: &str, device: &str, free: u64, at: Instant) -> FsStatsSample {
+        let mount = PathBuf::from(mount);
+        let platform = Arc::new(MockPlatform::new(
+            vec![MountPoint {
+                path: mount.clone(),
+                device: device.into(),
+                fs_type: "tmpfs".into(),
+                is_ram_backed: true,
+            }],
+            HashMap::from([(
+                mount.clone(),
+                FsStats {
+                    total_bytes: 16 * GIB,
+                    free_bytes: free,
+                    available_bytes: free,
+                    fs_type: "tmpfs".into(),
+                    mount_point: mount.clone(),
+                    is_readonly: false,
+                },
+            )]),
+            MemoryInfo {
+                total_bytes: 32 * GIB,
+                available_bytes: 24 * GIB,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            },
+            PlatformPaths::default(),
+        ));
+        let collector = FsStatsCollector::new(platform, Duration::ZERO);
+        let mut sample = collector.collect_sample(&mount).unwrap();
+        sample.collected_at = at;
+        sample
+    }
+
+    fn observe(
+        rates: &mut SpecialLocationRates,
+        sample: &FsStatsSample,
+        now: Instant,
+        prior: Option<f64>,
+    ) -> Option<f64> {
+        rates.begin_tick();
+        if let Some(rate) = prior {
+            rates.record_mount(sample, rate);
+        }
+        rates.observe(
+            &location(),
+            sample,
+            now,
+            Duration::from_secs(5),
+            &TelemetryConfig::default(),
+        )
+    }
+
+    fn filling_history(rates: &mut SpecialLocationRates, start: Instant) -> FsStatsSample {
+        let mut last = sample("/", "tmpfs-a", 12 * GIB, start);
+        for step in 0..=4 {
+            let at = start + Duration::from_secs(step * 5);
+            last = sample("/", "tmpfs-a", (12 - step) * GIB, at);
+            observe(rates, &last, at, None).unwrap();
+        }
+        last
+    }
+
+    #[test]
+    fn unmonitored_special_mount_warns_before_fullness_and_stops_on_recovery() {
+        let start = Instant::now();
+        let mut rates = SpecialLocationRates::default();
+        let last = filling_history(&mut rates, start);
+        let rate = observe(&mut rates, &last, last.collected_at, None).unwrap();
+        let rule = HorizonRule::default();
+        assert!(last.stats.free_pct() > RAM_BACKED_MIN_FREE_PCT);
+        assert_eq!(
+            rule.assess(&location(), &last.stats, 0.0, true).alert,
+            SpecialAlert::None,
+            "the old zero-rate path missed this shrinking but not-full mount",
+        );
+        let filling = rule.assess(&location(), &last.stats, rate, true);
+        assert_eq!(filling.alert, SpecialAlert::Critical);
+        assert!(filling.horizon_secs < rule.alert_horizon.as_secs_f64());
+
+        for (offset, free) in [(25, 8 * GIB), (30, 10 * GIB)] {
+            let at = start + Duration::from_secs(offset);
+            let recovered = sample("/", "tmpfs-a", free, at);
+            let rate = observe(&mut rates, &recovered, at, Some(1e12)).unwrap();
+            assert_eq!(rate, 0.0, "observed nonconsumption beats a positive prior");
+            assert_eq!(
+                rule.assess(&location(), &recovered.stats, rate, true).alert,
+                SpecialAlert::None,
+            );
+        }
+    }
+
+    #[test]
+    fn cache_hits_do_not_train_or_renew_rate_evidence() {
+        let start = Instant::now();
+        let mut rates = SpecialLocationRates::default();
+        let seed = sample("/", "tmpfs-a", 12 * GIB, start);
+        for seconds in 0..=15 {
+            assert_eq!(
+                observe(
+                    &mut rates,
+                    &seed,
+                    start + Duration::from_secs(seconds),
+                    None
+                ),
+                Some(0.0),
+            );
+        }
+        assert_eq!(
+            rates.locations[&location().path].estimator.sample_count(),
+            0
+        );
+        assert_eq!(
+            observe(
+                &mut rates,
+                &seed,
+                start + Duration::from_secs(16),
+                Some(1e12)
+            ),
+            None,
+            "a warm main-monitor prior cannot refresh stale capacity",
+        );
+        assert!(rates.locations.is_empty());
+    }
+
+    #[test]
+    fn replacement_resized_and_interrupted_mounts_restart_without_old_rate_or_prior() {
+        let start = Instant::now();
+        for case in ["device", "mount", "resize", "readonly", "gap"] {
+            let mut rates = SpecialLocationRates::default();
+            filling_history(&mut rates, start);
+            let at = start + Duration::from_secs(if case == "gap" { 60 } else { 25 });
+            let mut next = sample(
+                if case == "mount" { "/new-special" } else { "/" },
+                if case == "device" {
+                    "tmpfs-b"
+                } else {
+                    "tmpfs-a"
+                },
+                4 * GIB,
+                at,
+            );
+            if case == "resize" {
+                next.stats.total_bytes = 8 * GIB;
+            }
+            if case == "readonly" {
+                next.stats.is_readonly = true;
+            }
+            assert_eq!(
+                observe(&mut rates, &next, at, Some(1e12)),
+                Some(0.0),
+                "{case}"
+            );
+            assert_eq!(
+                observe(&mut rates, &next, at + Duration::from_secs(1), Some(1e12)),
+                Some(0.0),
+                "cache hits must not resurrect the replaced mount's prior: {case}",
+            );
+            assert_eq!(
+                rates.locations[&location().path].estimator.sample_count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_future_and_failed_observations_cannot_bridge_a_history() {
+        let start = Instant::now();
+        for case in ["capacity", "available", "zero", "future", "missing"] {
+            let mut rates = SpecialLocationRates::default();
+            filling_history(&mut rates, start);
+            let now = start + Duration::from_secs(25);
+            let mut bad = sample("/", "tmpfs-a", 7 * GIB, now);
+            match case {
+                "capacity" => bad.stats.free_bytes = 17 * GIB,
+                "available" => bad.stats.available_bytes = 8 * GIB,
+                "zero" => {
+                    bad.stats.total_bytes = 0;
+                    bad.stats.free_bytes = 0;
+                    bad.stats.available_bytes = 0;
+                }
+                "future" => bad.collected_at = now + Duration::from_secs(1),
+                _ => rates.forget(&location().path),
+            }
+            if case != "missing" {
+                assert_eq!(observe(&mut rates, &bad, now, Some(1e12)), None, "{case}");
+            }
+            assert!(rates.locations.is_empty(), "{case}");
+            let next = sample("/", "tmpfs-a", GIB, now + Duration::from_secs(5));
+            assert_eq!(
+                observe(&mut rates, &next, next.collected_at, None),
+                Some(0.0),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_start_uses_only_a_finite_prior_and_removed_locations_drop_their_state() {
+        let start = Instant::now();
+        let mut rates = SpecialLocationRates::default();
+        let seed = sample("/", "tmpfs-a", 12 * GIB, start);
+        assert_eq!(observe(&mut rates, &seed, start, Some(123.0)), Some(123.0));
+        for prior in [f64::INFINITY, f64::NAN, -12.0] {
+            assert_eq!(observe(&mut rates, &seed, start, Some(prior)), Some(0.0));
+        }
+        rates.retain(&SpecialLocationRegistry::default());
+        assert!(rates.locations.is_empty());
+    }
+
+    #[test]
+    fn mount_prior_must_match_fresh_capacity_evidence_from_the_current_tick() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(20);
+        let current = sample("/", "tmpfs-a", 12 * GIB, now);
+        for case in ["fresh", "stale", "replacement", "future", "next_tick"] {
+            let mut rates = SpecialLocationRates::default();
+            let prior = match case {
+                "stale" => sample("/", "tmpfs-a", 12 * GIB, start),
+                "replacement" => sample("/", "tmpfs-b", 12 * GIB, now),
+                "future" => sample("/", "tmpfs-a", 12 * GIB, now + Duration::from_secs(1)),
+                _ => current.clone(),
+            };
+            rates.record_mount(&prior, 123.0);
+            if case == "next_tick" {
+                rates.begin_tick();
+            }
+            assert_eq!(
+                rates.observe(
+                    &location(),
+                    &current,
+                    now,
+                    Duration::from_secs(5),
+                    &TelemetryConfig::default(),
+                ),
+                Some(if case == "fresh" { 123.0 } else { 0.0 }),
+                "{case}",
+            );
+        }
     }
 }
 

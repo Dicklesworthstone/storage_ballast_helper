@@ -67,7 +67,7 @@ use crate::logger::sqlite::{HistoryPage, HistoryWatermark, SqliteLogger};
 use crate::monitor::burst::BurstStats;
 use crate::monitor::conformal::{ConformalCalibrator, ConformalConfig, TteInterval};
 use crate::monitor::ewma::{DiskRateEstimator, RateEstimate};
-use crate::monitor::fs_stats::FsStatsCollector;
+use crate::monitor::fs_stats::{FsStatsCollector, FsStatsSample};
 use crate::monitor::guardrails::ForecastSnapshot;
 use crate::monitor::guardrails::{
     AdaptiveGuard, CalibrationObservation, DeletionFailureMonitor, GuardDiagnostics, GuardStatus,
@@ -80,7 +80,7 @@ use crate::monitor::pid::{
 use crate::monitor::predictive::{PredictiveAction, PredictiveActionPolicy};
 use crate::monitor::ram_scratch::{SwapReclaimPressure, swap_reclaim_pressure};
 use crate::monitor::special_locations::{
-    AlertThrottle, HorizonRule, SpecialAlert, SpecialLocationRegistry,
+    AlertThrottle, HorizonRule, SpecialAlert, SpecialLocationRates, SpecialLocationRegistry,
 };
 use crate::monitor::voi_scheduler::VoiScheduler;
 use crate::monitor::voi_scheduler::pressure_order::PressureOrder;
@@ -2964,6 +2964,8 @@ pub struct MonitoringDaemon {
     logging_ram_checked_at: Option<Instant>,
     /// Per-location alert throttle for the special-location horizon rule.
     special_alerts: AlertThrottle,
+    /// Independent capacity trends for special mounts outside scanner roots.
+    special_rates: SpecialLocationRates,
     /// When the last Green maintenance pass was dispatched.
     last_maintenance_scan: Option<Instant>,
     /// Layer 7: when the quarantines were last swept for expired entries
@@ -4682,6 +4684,7 @@ impl MonitoringDaemon {
             logging_level_logged: None,
             logging_ram_checked_at: None,
             special_alerts: AlertThrottle::default(),
+            special_rates: SpecialLocationRates::default(),
             last_maintenance_scan: None,
             last_quarantine_sweep: None,
             last_forecast_log: HashMap::new(),
@@ -6264,6 +6267,7 @@ impl MonitoringDaemon {
 
     #[allow(clippy::too_many_lines)]
     fn check_pressure(&mut self) -> Result<crate::monitor::pid::PressureResponse> {
+        self.special_rates.begin_tick();
         // Collect stats for all root paths PLUS "/". Always monitoring "/"
         // is defensive: if a user configures scanner.root_paths to specific
         // subdirs, the root mount may still fill from non-monitored sources
@@ -6276,14 +6280,14 @@ impl MonitoringDaemon {
         }
 
         // Group paths by mount point to avoid redundant updates.
-        let mut stats_by_mount: HashMap<PathBuf, crate::platform::pal::FsStats> = HashMap::new();
+        let mut stats_by_mount: HashMap<PathBuf, FsStatsSample> = HashMap::new();
 
         for path in &paths {
-            if let Ok(stats) = self.fs_collector.collect(path) {
+            if let Ok(sample) = self.fs_collector.collect_sample(path) {
                 // If multiple paths share a mount, we just need one valid reading.
                 stats_by_mount
-                    .entry(stats.mount_point.clone())
-                    .or_insert(stats);
+                    .entry(sample.stats.mount_point.clone())
+                    .or_insert(sample);
             }
         }
 
@@ -6318,7 +6322,8 @@ impl MonitoringDaemon {
         };
 
         // Update monitors for each active mount.
-        for (mount_path, stats) in stats_by_mount {
+        for (mount_path, sample) in stats_by_mount {
+            let stats = &sample.stats;
             self.release_controller
                 .update_effectiveness(&mount_path, stats.available_bytes, now);
 
@@ -6560,6 +6565,8 @@ impl MonitoringDaemon {
             // Keep this mount's own reading for the per-mount controllers.
             self.mount_rates
                 .insert(mount_path.clone(), rate_estimate.bytes_per_second);
+            self.special_rates
+                .record_mount(&sample, rate_estimate.bytes_per_second);
             // One used-bytes reading per tick feeds the reserve-sizing
             // windows (peak growth per reaction window).
             self.burst_stats.observe(
@@ -8222,6 +8229,7 @@ impl MonitoringDaemon {
     ) {
         let now = Instant::now();
         let locations = self.special_locations.all().to_vec();
+        self.special_rates.retain(&self.special_locations);
 
         let rule = HorizonRule {
             alert_horizon: Duration::from_secs(
@@ -8239,16 +8247,19 @@ impl MonitoringDaemon {
                 continue;
             }
 
-            let Ok(stats) = self.fs_collector.collect(&location.path) else {
+            let Ok(sample) = self.fs_collector.collect_sample(&location.path) else {
+                self.special_rates.forget(&location.path);
                 continue;
             };
+            let stats = &sample.stats;
 
             self.last_special_scan.insert(location.path.clone(), now);
 
             // Q2: alert on time-to-harm and real shortage of room, not on a
-            // percentage alone. The write rate is the mount's EWMA; a location
-            // on an unmonitored mount (typically /dev/shm) gets the floored
-            // rate, and its fullness rule still applies.
+            // percentage alone. Special-only mounts (typically /dev/shm)
+            // learn their own rate instead of remaining permanently at zero.
+            // Only sample-bound evidence from this tick can seed the prior;
+            // pressure dispatch already consumed the mount_responses vector.
             let ram_backed = self
                 .platform
                 .is_ram_backed(&location.path)
@@ -8258,12 +8269,16 @@ impl MonitoringDaemon {
                         | crate::monitor::special_locations::SpecialKind::DevShm
                         | crate::monitor::special_locations::SpecialKind::Ramfs
                 ));
-            let rate = self
-                .mount_rates
-                .get(&stats.mount_point)
-                .copied()
-                .unwrap_or(0.0);
-            let assessment = rule.assess(location, &stats, rate, ram_backed);
+            let Some(rate) = self.special_rates.observe(
+                location,
+                &sample,
+                Instant::now(),
+                Duration::from_millis(self.config.pressure.poll_interval_ms.max(1)),
+                &self.config.telemetry,
+            ) else {
+                continue;
+            };
+            let assessment = rule.assess(location, stats, rate, ram_backed);
             let emit = self.special_alerts.should_emit(
                 &location.path,
                 assessment.alert,
@@ -8474,6 +8489,9 @@ impl MonitoringDaemon {
                     for monitor in self.mount_monitors.values_mut() {
                         monitor.update_config(&new_config);
                     }
+                    // A new sampling configuration starts new local histories;
+                    // cached samples still carry their original observation time.
+                    self.special_rates = SpecialLocationRates::default();
 
                     // Propagate executor-critical settings via shared atomics.
                     self.shared_executor_config
@@ -17706,7 +17724,9 @@ mod tests {
         }]);
         // Filling fast: 10 GB at 100 MB/s is 100 s from full, urgency ~0.94,
         // which the release controller answers with every file in the pool.
-        daemon.mount_rates.insert(mount.clone(), 100_000_000.0);
+        daemon.check_pressure().unwrap();
+        let sample = daemon.fs_collector.collect_sample(&tmp).unwrap();
+        daemon.special_rates.record_mount(&sample, 100_000_000.0);
         let (scan_tx, scan_rx) = crossbeam_channel::bounded(4);
         daemon.check_special_locations(&scan_tx, &scan_rx);
 
@@ -17743,6 +17763,184 @@ mod tests {
         if let Some(logger) = daemon.logger_join.take() {
             logger.join().unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_mount_prior_survives_pressure_dispatch_but_not_a_failed_sampling_tick() {
+        use crate::platform::pal::PlatformPaths;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        let special = daemon.config.scanner.root_paths[0].clone();
+        daemon.config.ballast.file_count = 0;
+        daemon
+            .ballast_coordinator
+            .update_config(&daemon.config.ballast);
+        daemon.config.notifications.enabled = false;
+        daemon
+            .notification_manager
+            .update_config(&daemon.config.notifications);
+        daemon.config.pressure.prediction.enabled = false;
+        daemon.predictive_policy =
+            PredictiveActionPolicy::from_config(daemon.config.pressure.prediction.clone());
+        daemon.config.scanner.target_only_roots.clear();
+        daemon.config.scanner.rch_staging_bases.clear();
+        daemon.behavior_state.mode = mock_behavior_mode(
+            ScanAggressiveness::Skip,
+            CleanupAction::None,
+            BallastAction::None,
+            NotificationPriority::None,
+        );
+        daemon.special_locations = SpecialLocationRegistry::new(vec![SpecialLocation {
+            path: special.clone(),
+            kind: SpecialKind::UserTmp,
+            buffer_pct: 15,
+            scan_interval: Duration::ZERO,
+            priority: 160,
+        }]);
+        daemon.fs_collector.set_ttl(Duration::ZERO);
+        let mut monitor = MountMonitor::new(&daemon.config);
+        let start = Instant::now() - Duration::from_secs(30);
+        for step in 0..=3 {
+            monitor.rate_estimator.update(
+                (900 - step * 100) * 1_000_000_000,
+                start + Duration::from_secs(step * 5),
+                0,
+            );
+        }
+        daemon.mount_monitors.insert(PathBuf::from("/"), monitor);
+        let (scan_tx, scan_rx) = bounded(8);
+        let (del_tx, _del_rx) = bounded(4);
+
+        // Follow the production ordering: check_pressure produces the prior,
+        // handle_pressure consumes mount_responses, then special locations run.
+        let response = daemon.check_pressure().unwrap();
+        assert!(daemon.mount_rates[Path::new("/")] > 500_000_000_000.0 / 1800.0);
+        daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+        assert!(daemon.mount_responses.is_empty());
+        assert!(scan_rx.is_empty());
+        daemon.check_special_locations(&scan_tx, &scan_rx);
+        let request = scan_rx
+            .try_recv()
+            .expect("the first local sample uses the current mount prior");
+        assert_eq!(request.pressure_level, PressureLevel::Orange);
+        assert_eq!(request.free_pct, Some(50.0));
+
+        // A failed next pressure tick cannot leave the old prior available,
+        // even if the special path becomes readable again immediately.
+        let unavailable: Arc<dyn Platform> = Arc::new(MockPlatform::new(
+            Vec::new(),
+            HashMap::new(),
+            MockPlatform::healthy().memory_info().unwrap(),
+            PlatformPaths::default(),
+        ));
+        daemon.fs_collector = FsStatsCollector::new(unavailable, Duration::ZERO);
+        assert!(daemon.check_pressure().is_err());
+        daemon.fs_collector = FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::ZERO);
+        daemon.special_rates.forget(&special);
+        daemon.check_special_locations(&scan_tx, &scan_rx);
+        assert!(
+            scan_rx.is_empty(),
+            "the historical mount_rates value is not renewed evidence"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_only_mount_learns_horizon_without_expanding_scan_roots() {
+        use crate::platform::pal::{FsStats, MountPoint, PlatformPaths};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let special = fixture.directory.path().join("special-only");
+        std::fs::create_dir(&special).unwrap();
+        let daemon = &mut fixture.daemon;
+        daemon.config.notifications.enabled = false;
+        daemon
+            .notification_manager
+            .update_config(&daemon.config.notifications);
+        let configured_roots = daemon.config.scanner.root_paths.clone();
+        assert!(
+            !configured_roots
+                .iter()
+                .any(|root| special.starts_with(root))
+        );
+        daemon.special_locations = SpecialLocationRegistry::new(vec![SpecialLocation {
+            path: special.clone(),
+            kind: SpecialKind::DevShm,
+            buffer_pct: 20,
+            scan_interval: Duration::ZERO,
+            priority: 255,
+        }]);
+        daemon.mount_responses.clear();
+        // An unavailable mount's old rate is deliberately alarming. It must
+        // not seed fresh local observations or defeat the warm-up/recovery.
+        daemon.mount_rates.insert(special.clone(), 1e12);
+        let observe = |daemon: &mut MonitoringDaemon, free_gib: u64, device: &str| {
+            let platform: Arc<dyn Platform> = Arc::new(MockPlatform::new(
+                vec![MountPoint {
+                    path: special.clone(),
+                    device: device.into(),
+                    fs_type: "tmpfs".into(),
+                    is_ram_backed: true,
+                }],
+                HashMap::from([(
+                    special.clone(),
+                    FsStats {
+                        total_bytes: 16 << 30,
+                        free_bytes: free_gib << 30,
+                        available_bytes: free_gib << 30,
+                        fs_type: "tmpfs".into(),
+                        mount_point: special.clone(),
+                        is_readonly: false,
+                    },
+                )]),
+                MockPlatform::healthy().memory_info().unwrap(),
+                PlatformPaths::default(),
+            ));
+            daemon.fs_collector = FsStatsCollector::new(Arc::clone(&platform), Duration::ZERO);
+            daemon.platform = platform;
+        };
+        let (scan_tx, scan_rx) = crossbeam_channel::bounded(8);
+        for step in 0..=4 {
+            observe(daemon, 12 - step, "special-device-a");
+            daemon.check_special_locations(&scan_tx, &scan_rx);
+            if step < daemon.config.telemetry.ewma_min_samples {
+                assert!(
+                    scan_rx.is_empty(),
+                    "stale main-monitor history is not a prior"
+                );
+            }
+        }
+        let requests: Vec<_> = scan_rx.try_iter().collect();
+        assert!(
+            !requests.is_empty(),
+            "the learned horizon must reach daemon alert handling"
+        );
+        for request in requests {
+            assert!(
+                request.free_pct.unwrap() > 20.0,
+                "fullness alone would not alert"
+            );
+            assert_eq!(request.pressure_level, PressureLevel::Red);
+            assert_eq!(
+                request.paths, configured_roots,
+                "observation adds no cleanup roots"
+            );
+        }
+        observe(daemon, 10, "special-device-a");
+        daemon.check_special_locations(&scan_tx, &scan_rx);
+        assert!(
+            scan_rx.is_empty(),
+            "recovery must clear the positive trailing rate"
+        );
+        observe(daemon, 4, "special-device-b");
+        daemon.check_special_locations(&scan_tx, &scan_rx);
+        assert!(
+            scan_rx.is_empty(),
+            "a replacement device starts without the old drain rate"
+        );
+        assert_eq!(daemon.config.scanner.root_paths, configured_roots);
     }
 
     /// GitHub #38: the behavior mode follows the worst mount, so a mount idle

@@ -8,6 +8,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Special-only mounts learn their own time-to-full horizon.** A tmpfs such
+  as `/dev/shm` no longer receives a permanent zero write rate merely because
+  it is outside the main scanner roots. Independent rate histories use actual
+  observation times and reset on mount changes, invalid capacity, missed reads
+  or long gaps. Fresh sample-bound mount priors survive pressure dispatch,
+  while failed sampling ticks discard them. Recovery clears the consumption
+  signal without widening cleanup scope or releasing disk ballast.
+
 - **Automatic log truncation renews each file's own pressure evidence.**
   A young log no longer loses its retention window because a queued scan
   captured low free space or a different filesystem filled up. The daemon

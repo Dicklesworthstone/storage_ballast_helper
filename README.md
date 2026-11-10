@@ -1839,6 +1839,15 @@ RAM-backed filesystems (`/dev/shm`, tmpfs, ramfs) require tighter monitoring tha
 
 Priority determines scan order when multiple locations need attention in the same cycle. Higher-priority locations are checked first.
 
+Each location learns its own capacity-consumption rate, including mounts outside
+`scanner.root_paths`. A fresh observation from the main mount monitor supplies a
+prior while the local estimator warms up. Cached readings retain their original
+timestamps and never count as new samples. A changed filesystem, resized volume,
+failed read, or gap longer than three nominal polling intervals restarts local
+learning. Stable or increasing available space clears the consumption signal.
+The horizon can therefore warn about a rapidly filling tmpfs before its fullness
+threshold is crossed, without adding cleanup roots or releasing disk ballast.
+
 The registry asks the active Platform Abstraction Layer (PAL) for mount inventory. Linux reads `/proc/mounts`; macOS uses its PAL mount inventory from `statfs`/`getmntinfo` and APFS metadata. Fallback entries for `/tmp` and `/data/tmp` are added when they are not already covered. Operator-provided custom paths can override auto-discovered defaults. Duplicate paths are deduplicated, with later entries taking precedence.
 
 #### Swap-Thrash Detection

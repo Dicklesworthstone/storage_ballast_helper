@@ -12,11 +12,24 @@ use parking_lot::RwLock;
 use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::{FsStats, MountPoint, Platform};
 
+/// A capacity observation with its original time and discovered filesystem
+/// binding. Reading it from the cache does not make it a new rate sample.
+/// The binding has the same PAL/discovery-TTL limits as the collector itself.
 #[derive(Debug, Clone)]
-struct CachedStats {
+pub(crate) struct FsStatsSample {
     binding: MountBinding,
-    stats: FsStats,
-    collected_at: Instant,
+    pub stats: FsStats,
+    pub collected_at: Instant,
+}
+
+impl FsStatsSample {
+    /// Rates cannot span a replaced mount, a capacity change or a transition
+    /// to read-only, even if the caller's pathname stayed the same.
+    pub fn same_filesystem_as(&self, other: &Self) -> bool {
+        self.binding == other.binding
+            && self.stats.total_bytes == other.stats.total_bytes
+            && self.stats.is_readonly == other.stats.is_readonly
+    }
 }
 
 /// The PAL's ownership evidence, including the resolved mount spelling.
@@ -56,7 +69,7 @@ struct MountSnapshot {
 
 #[derive(Default)]
 struct CollectorState {
-    cache: HashMap<PathBuf, CachedStats>,
+    cache: HashMap<PathBuf, FsStatsSample>,
     mounts: Option<MountSnapshot>,
     generation: u64,
 }
@@ -85,6 +98,11 @@ impl FsStatsCollector {
     }
 
     pub fn collect(&self, path: &Path) -> Result<FsStats> {
+        self.collect_sample(path).map(|sample| sample.stats)
+    }
+
+    /// Retain provenance for consumers that derive rates between readings.
+    pub(crate) fn collect_sample(&self, path: &Path) -> Result<FsStatsSample> {
         let mounts = self.cached_mounts()?;
         let lookup_path = self.platform.mount_lookup_path(path)?;
         let mount =
@@ -119,7 +137,7 @@ impl FsStatsCollector {
 
         let mut per_mount = HashMap::<PathBuf, FsStats>::new();
         for (mount_path, mount) in mounts_needed {
-            let stats = self.collect_for_mount(mount, mounts.generation)?;
+            let stats = self.collect_for_mount(mount, mounts.generation)?.stats;
             per_mount.insert(mount_path, stats);
         }
 
@@ -218,7 +236,7 @@ impl FsStatsCollector {
         Ok(snapshot)
     }
 
-    fn collect_for_mount(&self, mount: &MountBinding, generation: u64) -> Result<FsStats> {
+    fn collect_for_mount(&self, mount: &MountBinding, generation: u64) -> Result<FsStatsSample> {
         let collected_at = Instant::now();
         // Compare in the binding's own namespace. `resolved` was spelled by
         // the platform's mount lookup, so a plain path resolution reports
@@ -234,7 +252,7 @@ impl FsStatsCollector {
                 && hit.binding == *mount
                 && hit.collected_at.elapsed() <= self.cache_ttl
             {
-                return Ok(hit.stats.clone());
+                return Ok(hit.clone());
             }
         }
 
@@ -245,6 +263,13 @@ impl FsStatsCollector {
                 return Err(error);
             }
         };
+        if fresh.free_bytes > fresh.total_bytes || fresh.available_bytes > fresh.free_bytes {
+            self.invalidate(mount, generation, collected_at);
+            return Err(SbhError::FsStats {
+                path: mount.path.clone(),
+                details: "inconsistent filesystem capacity counters".to_string(),
+            });
+        }
         // Re-resolve both spellings in the binding's namespace (the platform's
         // mount lookup, which also catches an alias retargeted since discovery).
         let resolved_now = self.platform.mount_lookup_path(&mount.path);
@@ -270,16 +295,14 @@ impl FsStatsCollector {
                 details: "filesystem reading superseded by a newer observation".to_string(),
             });
         }
-        state.cache.insert(
-            mount.path.clone(),
-            CachedStats {
-                binding: mount.clone(),
-                stats: fresh.clone(),
-                collected_at,
-            },
-        );
+        let sample = FsStatsSample {
+            binding: mount.clone(),
+            stats: fresh,
+            collected_at,
+        };
+        state.cache.insert(mount.path.clone(), sample.clone());
         drop(state);
-        Ok(fresh)
+        Ok(sample)
     }
 
     fn invalidate(&self, mount: &MountBinding, generation: u64, started: Instant) {
@@ -470,14 +493,17 @@ mod tests {
         ));
         let collector = FsStatsCollector::new(platform.clone(), Duration::from_secs(10));
 
-        let _first = collector
-            .collect(Path::new("/tmp/work"))
+        let first = collector
+            .collect_sample(Path::new("/tmp/work"))
             .expect("first collect should work");
-        let _second = collector
-            .collect(Path::new("/tmp/work"))
+        let second = collector
+            .collect_sample(Path::new("/tmp/work"))
             .expect("second collect should hit cache");
 
         assert_eq!(platform.fs_stats_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.collected_at, second.collected_at);
+        assert!(first.same_filesystem_as(&second));
+        assert_eq!(first.stats, second.stats);
     }
 
     #[test]

@@ -207,7 +207,8 @@ fn expire_sample(collector: &FsStatsCollector, path: &Path) {
 fn refreshed_device_type_and_ram_bindings_do_not_reuse_a_paths_old_capacity() {
     for changed_field in 0..3 {
         let (_temp, path, platform, collector) = fixture();
-        assert_eq!(collector.collect(&path).unwrap().available_bytes, 80);
+        let before = collector.collect_sample(&path).unwrap();
+        assert_eq!(before.stats.available_bytes, 80);
         let mut replacement = mount(&path, "device-a");
         match changed_field {
             0 => replacement.device = "device-b".to_string(),
@@ -217,8 +218,45 @@ fn refreshed_device_type_and_ram_bindings_do_not_reuse_a_paths_old_capacity() {
         platform.install(replacement, 2);
         // Only the discovery aged out. The old capacity sample is still fresh.
         expire_discovery(&collector);
-        assert_eq!(collector.collect(&path).unwrap().available_bytes, 2);
+        let after = collector.collect_sample(&path).unwrap();
+        assert_eq!(after.stats.available_bytes, 2);
+        assert!(!after.same_filesystem_as(&before));
         assert_eq!(platform.calls.lock().len(), 2);
+    }
+}
+
+#[test]
+fn inconsistent_capacity_is_not_cached_and_a_recovered_read_is_fresh() {
+    for invalid_available in [false, true] {
+        let (_temp, path, platform, collector) = fixture();
+        collector.collect_sample(&path).unwrap();
+        expire_sample(&collector, &path);
+        {
+            let mut readings = platform.stats.write();
+            let reading = readings.get_mut(&path).unwrap();
+            if invalid_available {
+                reading.available_bytes = reading.free_bytes + 1;
+            } else {
+                reading.free_bytes = reading.total_bytes + 1;
+            }
+        }
+        let error = collector.collect_sample(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("inconsistent filesystem capacity")
+        );
+        assert!(!collector.state.read().cache.contains_key(&path));
+        platform.install(mount(&path, "device-a"), 45);
+        assert_eq!(
+            collector
+                .collect_sample(&path)
+                .unwrap()
+                .stats
+                .available_bytes,
+            45
+        );
+        assert_eq!(platform.calls.lock().len(), 3);
     }
 }
 
