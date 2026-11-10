@@ -22,7 +22,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{
-    Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError, TrySendError, bounded,
+    Receiver, RecvTimeoutError, SendTimeoutError, Sender, TrySendError, bounded,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
@@ -129,8 +129,9 @@ use crate::scanner::walker::{
 /// Monitor → Scanner: bounded(2), one buffered request while the scanner
 /// processes another.
 ///
-/// Under urgent pressure we replace one stale queued request with the latest
-/// signal so high-priority actions are not starved.
+/// On saturation, refresh a matching automatic scope or replace weaker work.
+/// Distinct emergencies retain their turns, as do accepted operator requests
+/// and configuration updates.
 pub const SCANNER_CHANNEL_CAP: usize = 2;
 /// Scanner → Executor: bounded(64). Natural backpressure — scanner blocks on send.
 pub const EXECUTOR_CHANNEL_CAP: usize = 64;
@@ -3014,6 +3015,9 @@ pub struct MonitoringDaemon {
     last_swap_thrash_warning: Option<Instant>,
     swap_thrash_active: bool,
     last_scan_channel_warn: Option<Instant>,
+    /// Last accepted automatic request per mount. Deferred mounts keep their
+    /// place ahead of peers that repeatedly refresh an already queued scope.
+    last_scan_admission: HashMap<PathBuf, Instant>,
     scan_channel_warn_suppressed: u64,
     /// When a SIGUSR1 scan the full scan queue could not take yet arrived;
     /// it is retried every tick until queued.
@@ -4061,6 +4065,75 @@ enum ScanEnqueueStatus {
     Disconnected,
 }
 
+/// Configuration delivery and explicit operator work must not disappear
+/// behind routine alerts. Emergency automatic relief still precedes an
+/// operator scan, matching the scanner's dispatch policy. Urgency alone is
+/// not a priority: a special location can be filling quickly while another
+/// filesystem is already out of bytes or inodes.
+fn queued_scan_priority(request: &ScanRequest) -> (u8, PressureLevel) {
+    let tier = if request.config_update.is_some() {
+        3
+    } else if request.pressure_level >= PressureLevel::Red {
+        2
+    } else {
+        u8::from(
+            request.scan_now.is_some()
+                || (request.force_full_scan && !request.has_resource_reclaim()),
+        )
+    };
+    (tier, request.pressure_level)
+}
+
+/// Pressure wins first; peers that have not obtained a queue slot wait ahead
+/// of repeatedly admitted mounts. Attempting a full queue spends no turn.
+fn scan_mount_dispatch_order(
+    left: &PressureResponse,
+    right: &PressureResponse,
+    admitted: &HashMap<PathBuf, Instant>,
+) -> std::cmp::Ordering {
+    right
+        .level
+        .cmp(&left.level)
+        .then_with(|| {
+            admitted
+                .get(&left.causing_mount)
+                .cmp(&admitted.get(&right.causing_mount))
+        })
+        .then_with(|| left.causing_mount.cmp(&right.causing_mount))
+}
+
+/// Accepted operator and configuration work must run even if later monitor
+/// observations take priority over it.
+fn replaceable_queued_scan(request: &ScanRequest) -> bool {
+    request.config_update.is_none()
+        && request.scan_now.is_none()
+        && (!request.force_full_scan || request.has_resource_reclaim())
+}
+
+/// Only automatic requests with the same discovery and resource scope can
+/// supersede one another. Never union paths or combine finite reclaim
+/// allowances: the replacement keeps its own live authority and budget.
+fn same_queued_scan_scope(left: &ScanRequest, right: &ScanRequest) -> bool {
+    replaceable_queued_scan(left)
+        && replaceable_queued_scan(right)
+        && left.ram_reclaim.is_some() == right.ram_reclaim.is_some()
+        && left.inode_reclaim.is_some() == right.inode_reclaim.is_some()
+        && left.maintenance == right.maintenance
+        && left.target_bytes.is_some() == right.target_bytes.is_some()
+        && left.paths.len() == right.paths.len()
+        && left.paths.iter().all(|path| right.paths.contains(path))
+        && right.paths.iter().all(|path| left.paths.contains(path))
+        && left.catalog_roots.len() == right.catalog_roots.len()
+        && left
+            .catalog_roots
+            .iter()
+            .all(|root| right.catalog_roots.contains(root))
+        && right
+            .catalog_roots
+            .iter()
+            .all(|root| left.catalog_roots.contains(root))
+}
+
 fn enqueue_scan_request(
     scan_tx: &Sender<ScanRequest>,
     scan_rx: &Receiver<ScanRequest>,
@@ -4074,15 +4147,60 @@ fn enqueue_scan_request(
                 return ScanEnqueueStatus::DeferredFull;
             }
 
-            match scan_rx.try_recv() {
-                Ok(_) => match scan_tx.try_send(request) {
-                    Ok(()) => ScanEnqueueStatus::ReplacedStale,
-                    Err(TrySendError::Full(_)) => ScanEnqueueStatus::DeferredFull,
-                    Err(TrySendError::Disconnected(_)) => ScanEnqueueStatus::Disconnected,
-                },
-                Err(TryRecvError::Empty) => ScanEnqueueStatus::DeferredFull,
-                Err(TryRecvError::Disconnected) => ScanEnqueueStatus::Disconnected,
+            // The monitor is the only producer; the scanner may concurrently
+            // remove work. Inspect at most the channel's fixed capacity, so a
+            // low-priority special-location alert cannot blindly evict the
+            // oldest Critical or scoped inode/RAM recovery request.
+            let capacity = scan_tx.capacity().unwrap_or(SCANNER_CHANNEL_CAP);
+            let mut queued: Vec<_> = scan_rx.try_iter().take(capacity).collect();
+            let priority = queued_scan_priority(&request);
+            let same_scope = queued.iter().position(|old| {
+                same_queued_scan_scope(old, &request) && queued_scan_priority(old) <= priority
+            });
+            let status = if let Some(index) = same_scope {
+                // Refresh in the original slot. Moving repeated observations
+                // to the tail would keep resetting this scope's wait time.
+                queued[index] = request;
+                ScanEnqueueStatus::ReplacedStale
+            } else if queued.len() < capacity {
+                // The scanner made room after try_send reported Full.
+                queued.push(request);
+                ScanEnqueueStatus::Queued
+            } else {
+                let weaker = queued
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, old)| {
+                        replaceable_queued_scan(old) && queued_scan_priority(old) < priority
+                    })
+                    .min_by_key(|(_, old)| queued_scan_priority(old))
+                    .map(|(index, _)| index);
+                let duplicate = (0..queued.len()).rev().find(|&index| {
+                    queued_scan_priority(&queued[index]) <= priority
+                        && queued[..index]
+                            .iter()
+                            .any(|old| same_queued_scan_scope(old, &queued[index]))
+                });
+                // Equal-priority work for another scope retains its turn.
+                // Its timestamp alone is not evidence that it is stale.
+                weaker
+                    .or(duplicate)
+                    .map_or(ScanEnqueueStatus::DeferredFull, |index| {
+                        queued[index] = request;
+                        ScanEnqueueStatus::ReplacedStale
+                    })
+            };
+            // Stable ordering keeps FIFO among peers while putting emergency
+            // recovery ahead of weaker work. Reinstating at most capacity
+            // items cannot block: this producer owns all available slots and
+            // the concurrent scanner can only make more room.
+            queued.sort_by_key(|item| std::cmp::Reverse(queued_scan_priority(item)));
+            for item in queued {
+                if scan_tx.send(item).is_err() {
+                    return ScanEnqueueStatus::Disconnected;
+                }
             }
+            status
         }
         Err(TrySendError::Disconnected(_)) => ScanEnqueueStatus::Disconnected,
     }
@@ -4716,6 +4834,7 @@ impl MonitoringDaemon {
             last_swap_thrash_warning: None,
             swap_thrash_active: false,
             last_scan_channel_warn: None,
+            last_scan_admission: HashMap::new(),
             forced_scan_pending_since: None,
             scan_now_queue: Arc::new(Mutex::new(ScanNowQueue::default())),
             scan_channel_warn_suppressed: 0,
@@ -6783,6 +6902,11 @@ impl MonitoringDaemon {
         let cross_device_fallback = self.config.scanner.cross_devices && !root_paths.is_empty();
 
         let responses = std::mem::take(&mut self.mount_responses);
+        self.last_scan_admission.retain(|mount, _| {
+            responses
+                .iter()
+                .any(|tick| &tick.response.causing_mount == mount)
+        });
         let mut pending_scans = Vec::new();
         let mut cadence = Vec::with_capacity(responses.len());
         let mut replenished_this_tick = false;
@@ -7074,13 +7198,14 @@ impl MonitoringDaemon {
             &root_mounts,
             sweep_due,
         );
+        pending_scans.sort_by(|left, right| {
+            scan_mount_dispatch_order(left.0, right.0, &self.last_scan_admission)
+        });
         let (emergency_scans, pending_scans): (Vec<_>, Vec<_>) = pending_scans
             .into_iter()
             .partition(|(response, _, _, _, _)| response.level >= PressureLevel::Red);
         for (response, paths, catalog, ram_reclaim, inode_reclaim) in emergency_scans {
             if let Some(catalog) = catalog {
-                self.catalog_epochs
-                    .insert(response.causing_mount.clone(), (response.level, now));
                 self.send_catalog_scan_request(scan_tx, scan_rx, response, catalog);
             } else {
                 self.send_scan_request(
@@ -7130,9 +7255,6 @@ impl MonitoringDaemon {
                 continue;
             }
             if let Some(catalog) = catalog {
-                // A held scan has not run. Leave its epoch due until dispatch.
-                self.catalog_epochs
-                    .insert(response.causing_mount.clone(), (response.level, now));
                 self.send_catalog_scan_request(scan_tx, scan_rx, response, catalog);
             } else {
                 self.send_scan_request(
@@ -7943,7 +8065,17 @@ impl MonitoringDaemon {
             target_bytes: None,
             ram_reclaim: None,
         };
-        self.enqueue_scan_logged(scan_tx, scan_rx, response, request);
+        // Compression holds and channel saturation do not count as a catalog
+        // visit. Leave its epoch due until the queue actually accepts work.
+        if matches!(
+            self.enqueue_scan_logged(scan_tx, scan_rx, response, request),
+            ScanEnqueueStatus::Queued | ScanEnqueueStatus::ReplacedStale
+        ) {
+            self.catalog_epochs.insert(
+                response.causing_mount.clone(),
+                (response.level, Instant::now()),
+            );
+        }
     }
 
     fn enqueue_scan_logged(
@@ -7952,9 +8084,17 @@ impl MonitoringDaemon {
         scan_rx: &Receiver<ScanRequest>,
         response: &crate::monitor::pid::PressureResponse,
         request: ScanRequest,
-    ) {
+    ) -> ScanEnqueueStatus {
         let replace_on_full = response.level >= PressureLevel::Red || response.urgency >= 0.90;
-        match enqueue_scan_request(scan_tx, scan_rx, request, replace_on_full) {
+        let status = enqueue_scan_request(scan_tx, scan_rx, request, replace_on_full);
+        if matches!(
+            status,
+            ScanEnqueueStatus::Queued | ScanEnqueueStatus::ReplacedStale
+        ) {
+            self.last_scan_admission
+                .insert(response.causing_mount.clone(), Instant::now());
+        }
+        match status {
             ScanEnqueueStatus::Queued => {}
             ScanEnqueueStatus::ReplacedStale | ScanEnqueueStatus::DeferredFull => {
                 // Rate-limit to once per hour. Scans routinely take 300-600s
@@ -7986,6 +8126,7 @@ impl MonitoringDaemon {
                 eprintln!("[SBH-DAEMON] scan channel disconnected, dropping scan request");
             }
         }
+        status
     }
 
     /// Queue the SIGUSR1 scan from physical filesystem pressure. `false` means
@@ -28154,7 +28295,7 @@ mod tests {
     }
 
     #[test]
-    fn scanner_channel_replaces_stale_request_when_priority() {
+    fn scanner_channel_refreshes_matching_scope_without_losing_its_turn() {
         let (tx, rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
 
         let make_request = |urgency: f64| ScanRequest {
@@ -28179,14 +28320,281 @@ mod tests {
         tx.try_send(make_request(0.2))
             .expect("should buffer within capacity");
 
-        // Priority enqueue should evict oldest and queue new request.
+        // The fresh observation replaces its matching scope in the original
+        // slot instead of resetting that scope's wait behind other work.
         let status = enqueue_scan_request(&tx, &rx, make_request(1.0), true);
         assert_eq!(status, ScanEnqueueStatus::ReplacedStale);
 
         let queued_first = rx.recv().unwrap();
         let queued_second = rx.recv().unwrap();
-        assert_eq!(queued_first.urgency.to_bits(), 0.2_f64.to_bits());
-        assert_eq!(queued_second.urgency.to_bits(), 1.0_f64.to_bits());
+        assert_eq!(queued_first.urgency.to_bits(), 1.0_f64.to_bits());
+        assert_eq!(queued_second.urgency.to_bits(), 0.2_f64.to_bits());
+    }
+
+    fn queued_request(path: &str, level: PressureLevel) -> ScanRequest {
+        let mut request = cooldown_request(level);
+        request.paths = vec![PathBuf::from(path)];
+        request
+    }
+
+    #[test]
+    fn scanner_channel_keeps_critical_recovery_when_a_special_alert_arrives() {
+        let (tx, rx) = bounded(SCANNER_CHANNEL_CAP);
+        tx.send(queued_request("/disk", PressureLevel::Critical))
+            .unwrap();
+        tx.send(queued_request("/maintenance", PressureLevel::Green))
+            .unwrap();
+        let mut alert = queued_request("/tmp", PressureLevel::Yellow);
+        alert.urgency = 1.0;
+        assert_eq!(
+            enqueue_scan_request(&tx, &rx, alert, true),
+            ScanEnqueueStatus::ReplacedStale,
+        );
+        let retained: Vec<_> = rx.try_iter().collect();
+        assert_eq!(retained.len(), SCANNER_CHANNEL_CAP);
+        assert_eq!(retained[0].paths, vec![PathBuf::from("/disk")]);
+        assert_eq!(retained[1].paths, vec![PathBuf::from("/tmp")]);
+    }
+
+    #[test]
+    fn scanner_channel_preserves_distinct_emergencies_over_repeated_alerts() {
+        let (tx, rx) = bounded(SCANNER_CHANNEL_CAP);
+        tx.send(queued_request("/first", PressureLevel::Critical))
+            .unwrap();
+        tx.send(queued_request("/second", PressureLevel::Critical))
+            .unwrap();
+        for level in [
+            PressureLevel::Yellow,
+            PressureLevel::Orange,
+            PressureLevel::Red,
+            PressureLevel::Critical,
+        ] {
+            let mut incoming = queued_request("/another", level);
+            incoming.urgency = 1.0;
+            assert_eq!(
+                enqueue_scan_request(&tx, &rx, incoming, true),
+                ScanEnqueueStatus::DeferredFull,
+            );
+        }
+        assert_eq!(rx.recv().unwrap().paths, vec![PathBuf::from("/first")]);
+        assert_eq!(rx.recv().unwrap().paths, vec![PathBuf::from("/second")]);
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn scanner_channel_uses_a_duplicate_slot_for_another_pressured_mount() {
+        let (tx, rx) = bounded(SCANNER_CHANNEL_CAP);
+        for _ in 0..SCANNER_CHANNEL_CAP {
+            tx.send(queued_request("/first", PressureLevel::Critical))
+                .unwrap();
+        }
+        assert_eq!(
+            enqueue_scan_request(
+                &tx,
+                &rx,
+                queued_request("/second", PressureLevel::Critical),
+                true,
+            ),
+            ScanEnqueueStatus::ReplacedStale,
+        );
+        assert_eq!(rx.recv().unwrap().paths, vec![PathBuf::from("/first")]);
+        assert_eq!(rx.recv().unwrap().paths, vec![PathBuf::from("/second")]);
+    }
+
+    #[test]
+    fn scanner_channel_keeps_operator_and_config_requests_during_pressure() {
+        let (tx, rx) = bounded(SCANNER_CHANNEL_CAP);
+        let mut operator = queued_request("/selected", PressureLevel::Green);
+        operator.force_full_scan = true;
+        let mut config = queued_request("/reload", PressureLevel::Green);
+        config.config_update = Some((Config::default().scoring, Config::default().scanner));
+        tx.send(operator).unwrap();
+        tx.send(config).unwrap();
+        assert_eq!(
+            enqueue_scan_request(
+                &tx,
+                &rx,
+                queued_request("/critical", PressureLevel::Critical),
+                true,
+            ),
+            ScanEnqueueStatus::DeferredFull,
+        );
+        assert!(rx.recv().unwrap().config_update.is_some());
+        assert!(rx.recv().unwrap().force_full_scan);
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn scanner_channel_never_merges_byte_inode_or_swap_allowances() {
+        for inode in [false, true] {
+            let (tx, rx) = bounded(SCANNER_CHANNEL_CAP);
+            let mut scoped = queued_request("/same-root", PressureLevel::Critical);
+            if inode {
+                scoped.force_full_scan = true;
+                scoped.inode_reclaim = Some(InodeReclaimRequest::new(
+                    PathBuf::from("/same-root"),
+                    1,
+                    100,
+                    10,
+                    7,
+                    &InodePressureConfig::default(),
+                    &[],
+                ));
+            } else {
+                scoped.ram_reclaim = Some(RamReclaimRequest::new(
+                    PathBuf::from("/same-root"),
+                    1,
+                    4096,
+                    &[],
+                ));
+            }
+            let incoming_scoped = scoped.clone();
+            tx.send(scoped).unwrap();
+            tx.send(queued_request("/other", PressureLevel::Critical))
+                .unwrap();
+            assert_eq!(
+                enqueue_scan_request(
+                    &tx,
+                    &rx,
+                    queued_request("/same-root", PressureLevel::Critical),
+                    true,
+                ),
+                ScanEnqueueStatus::DeferredFull,
+            );
+            let retained = rx.recv().unwrap();
+            assert_eq!(retained.paths, vec![PathBuf::from("/same-root")]);
+            if inode {
+                assert_eq!(retained.inode_reclaim.unwrap().remaining_artifacts(), 7);
+            } else {
+                assert_eq!(retained.ram_reclaim.unwrap().remaining_bytes(), 4096);
+            }
+            assert_eq!(rx.recv().unwrap().paths, vec![PathBuf::from("/other")]);
+
+            // Inode/swap pressure is a different resource, not a reason to
+            // discard an equally Critical byte shortage already in line.
+            tx.send(queued_request("/same-root", PressureLevel::Critical))
+                .unwrap();
+            tx.send(queued_request("/other", PressureLevel::Critical))
+                .unwrap();
+            assert_eq!(
+                enqueue_scan_request(&tx, &rx, incoming_scoped, true),
+                ScanEnqueueStatus::DeferredFull,
+            );
+            let retained = rx.recv().unwrap();
+            assert!(!retained.has_resource_reclaim());
+            assert_eq!(retained.paths, vec![PathBuf::from("/same-root")]);
+            assert_eq!(rx.recv().unwrap().paths, vec![PathBuf::from("/other")]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_channel_eventually_admits_every_sustained_critical_mount() {
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        let (tx, rx) = bounded(SCANNER_CHANNEL_CAP);
+        let mut responses: Vec<_> = ["/a", "/b", "/c", "/d", "/e"]
+            .into_iter()
+            .map(|mount| quarantine_tick(PressureLevel::Critical, Path::new(mount)).response)
+            .collect();
+        let expected: BTreeSet<_> = responses
+            .iter()
+            .map(|response| response.causing_mount.clone())
+            .collect();
+        let mut served = BTreeSet::new();
+        // A scanner completes only one pass per four monitor ticks. Merely
+        // rotating by attempted ticks can phase-lock and starve a mount.
+        for tick in 0..40 {
+            responses.sort_by(|left, right| {
+                scan_mount_dispatch_order(left, right, &daemon.last_scan_admission)
+            });
+            for response in &responses {
+                let request =
+                    queued_request(response.causing_mount.to_str().unwrap(), response.level);
+                let previous = daemon
+                    .last_scan_admission
+                    .get(&response.causing_mount)
+                    .copied();
+                let status = daemon.enqueue_scan_logged(&tx, &rx, response, request);
+                if status == ScanEnqueueStatus::DeferredFull {
+                    assert_eq!(
+                        daemon
+                            .last_scan_admission
+                            .get(&response.causing_mount)
+                            .copied(),
+                        previous,
+                        "a failed attempt must not spend the mount's turn",
+                    );
+                }
+            }
+            if tick % 4 == 3 {
+                served.extend(rx.try_recv().unwrap().paths);
+            }
+            assert!(rx.len() <= SCANNER_CHANNEL_CAP);
+        }
+        assert_eq!(served, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_channel_deferred_catalog_work_does_not_spend_its_epoch() {
+        use crate::platform::cleanup_catalog::CleanupConfidence;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        let (tx, rx) = bounded(SCANNER_CHANNEL_CAP);
+        tx.send(queued_request("/critical-a", PressureLevel::Critical))
+            .unwrap();
+        tx.send(queued_request("/critical-b", PressureLevel::Critical))
+            .unwrap();
+        let response = quarantine_tick(PressureLevel::Orange, Path::new("/catalog-mount")).response;
+        let catalog = vec![ExpandedCatalogRoot {
+            path: PathBuf::from("/catalog-mount/cache"),
+            rule: "test-cache",
+            confidence: CleanupConfidence::Definite,
+            min_age: Duration::from_hours(24),
+        }];
+        daemon.send_catalog_scan_request(&tx, &rx, &response, catalog.clone());
+        assert!(!daemon.catalog_epochs.contains_key(&response.causing_mount));
+        assert!(
+            !daemon
+                .last_scan_admission
+                .contains_key(&response.causing_mount)
+        );
+
+        let _ = rx.recv().unwrap();
+        daemon.send_catalog_scan_request(&tx, &rx, &response, catalog.clone());
+        assert_eq!(
+            daemon.catalog_epochs[&response.causing_mount].0,
+            PressureLevel::Orange,
+        );
+        assert!(
+            daemon
+                .last_scan_admission
+                .contains_key(&response.causing_mount)
+        );
+        let _ = rx.recv().unwrap();
+        assert_eq!(rx.recv().unwrap().catalog_roots, catalog);
+    }
+
+    #[test]
+    fn scanner_channel_promotes_an_emergency_over_queued_routine_work() {
+        let (tx, rx) = bounded(SCANNER_CHANNEL_CAP);
+        tx.send(queued_request("/yellow", PressureLevel::Yellow))
+            .unwrap();
+        tx.send(queued_request("/orange", PressureLevel::Orange))
+            .unwrap();
+        assert_eq!(
+            enqueue_scan_request(
+                &tx,
+                &rx,
+                queued_request("/critical", PressureLevel::Critical),
+                true,
+            ),
+            ScanEnqueueStatus::ReplacedStale,
+        );
+        assert_eq!(rx.recv().unwrap().paths, vec![PathBuf::from("/critical")]);
+        assert_eq!(rx.recv().unwrap().paths, vec![PathBuf::from("/orange")]);
     }
 
     #[test]

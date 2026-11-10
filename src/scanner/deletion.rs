@@ -804,7 +804,9 @@ pub enum CheckedDeletion {
 type AuthorizationCheck<'a> = &'a dyn Fn(&CandidacyScore) -> std::result::Result<(), SkipReason>;
 type UnlinkObserver<'a> = &'a dyn Fn(&CandidacyScore, Instant);
 /// A caller's per-candidate check run before preflight and renewed after
-/// recursive inspection: the reason to leave this path alone now (target free
+/// recursive inspection.
+///
+/// Returns the reason to leave this path alone now (target free
 /// space reached, a protection refusal, a shutdown), or `None` to continue.
 /// Repeated checks must not consume permission or prompt for confirmation.
 pub type SkipCheck<'a> = &'a dyn Fn(&Path) -> Option<SkipReason>;

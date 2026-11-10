@@ -193,6 +193,7 @@ impl DispatchPermit {
         }
         reads.dispatch_frames += 1;
         reads.dispatch_children += children;
+        drop(reads);
         Some(Self {
             cache: Arc::clone(cache),
             children,

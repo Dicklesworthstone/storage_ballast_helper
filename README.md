@@ -1076,7 +1076,17 @@ The daemon runs four threads connected by bounded channels:
 3. **Executor thread** receives deletion batches and executes them through the circuit breaker and pre-flight safety checks.
 4. **Logger thread** receives activity events and writes them to both SQLite and JSONL backends.
 
-Channels use bounded capacities (scanner: <!-- claim:constants.daemon.SCANNER_CHANNEL_CAP -->2<!-- /claim -->, executor: <!-- claim:constants.daemon.EXECUTOR_CHANNEL_CAP -->64<!-- /claim -->, logger: <!-- claim:constants.logger.CHANNEL_CAPACITY -->1024<!-- /claim -->) to provide natural backpressure. If the scanner can't keep up with pressure changes, the newest request wins and older ones are dropped. If the logger falls behind, a dropped-event counter is incremented and reported periodically rather than blocking the monitor loop.
+Channels use bounded capacities (scanner: <!-- claim:constants.daemon.SCANNER_CHANNEL_CAP -->2<!-- /claim -->, executor: <!-- claim:constants.daemon.EXECUTOR_CHANNEL_CAP -->64<!-- /claim -->, logger: <!-- claim:constants.logger.CHANNEL_CAPACITY -->1024<!-- /claim -->) to provide natural backpressure.
+
+When the scanner queue fills, automatic observations can refresh a matching
+scope or replace weaker automatic work. Accepted operator and configuration
+requests stay queued, and distinct emergencies of equal severity retain their
+turns. Refreshes preserve queue position without merging cleanup paths or byte,
+inode and swap allowances. Among equally pressured mounts, a mount that could
+not obtain a queue slot runs ahead of repeatedly admitted peers. A rejected
+catalog request remains due for retry instead of consuming its scan epoch.
+
+If the logger falls behind, a dropped-event counter is incremented and reported periodically rather than blocking the monitor loop.
 
 Each worker thread has panic recovery: up to 3 respawns within a 5-minute window before the daemon shuts down. Thread health is tracked by the self-monitor, which also watches RSS memory usage and state-file write success.
 

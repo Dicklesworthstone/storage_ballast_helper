@@ -157,11 +157,7 @@ fn filesystem_free_pct(path: &Path, opened: Option<&fs::File>) -> Option<f64> {
     {
         use nix::sys::statvfs::{FsFlags, fstatvfs, statvfs};
 
-        let stats = match opened {
-            Some(file) => fstatvfs(file),
-            None => statvfs(path),
-        }
-        .ok()?;
+        let stats = opened.map_or_else(|| statvfs(path), fstatvfs).ok()?;
         let total = stats.blocks();
         let free = stats.blocks_free();
         let available = stats.blocks_available();

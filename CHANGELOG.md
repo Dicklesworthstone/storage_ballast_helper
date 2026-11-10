@@ -8,6 +8,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Saturated scan queues preserve emergency work and fair mount turns.**
+  Frequent special-location alerts can no longer discard queued Critical
+  recovery, operator scans or configuration updates. Automatic refreshes
+  preserve their scope and queue position; distinct byte, inode and swap
+  allowances stay separate. Equally pressured mounts that could not enqueue
+  run ahead of repeatedly admitted peers, and rejected catalog requests keep
+  their scan epoch due for retry.
+
 - **Special-only mounts learn their own time-to-full horizon.** A tmpfs such
   as `/dev/shm` no longer receives a permanent zero write rate merely because
   it is outside the main scanner roots. Independent rate histories use actual
