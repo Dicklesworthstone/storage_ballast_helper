@@ -42,16 +42,38 @@ pub fn plan_batch(
     candidates: Vec<CandidacyScore>,
     request: &PlanRequest,
 ) -> (Vec<CandidacyScore>, BatchPlan) {
+    optimization::plan_batch(admit_candidates(candidates), request)
+}
+
+/// Plan a streaming batch without discarding its admissible alternatives.
+///
+/// Returns chosen candidates in execution order, deferred candidates, and the
+/// same accounting as [`plan_batch`]. Deferred candidates include alternatives
+/// overlapping the chosen set: a caller whose dispatch fails can retry all of
+/// them, while a successful dispatch must exclude its paths and identities
+/// from later batches. Hard-vetoed, suspended and otherwise inadmissible
+/// observations are never returned as deferred work.
+///
+/// Scores move between the two result vectors; the streaming scanner does not
+/// clone its entire candidate buffer merely to preserve unchosen alternatives.
+#[must_use]
+pub fn partition_batch(
+    candidates: Vec<CandidacyScore>,
+    request: &PlanRequest,
+) -> (Vec<CandidacyScore>, Vec<CandidacyScore>, BatchPlan) {
+    optimization::partition_batch(admit_candidates(candidates), request)
+}
+
+fn admit_candidates(candidates: Vec<CandidacyScore>) -> Vec<CandidacyScore> {
     if !candidates.iter().any(hard_veto) {
-        return optimization::plan_batch(candidates, request);
+        return candidates;
     }
     let rejected = rejected_observations(&candidates);
-    let admitted = candidates
+    candidates
         .into_iter()
         .zip(rejected)
         .filter_map(|(candidate, rejected)| (!rejected).then_some(candidate))
-        .collect();
-    optimization::plan_batch(admitted, request)
+        .collect()
 }
 
 fn hard_veto(candidate: &CandidacyScore) -> bool {
@@ -293,6 +315,61 @@ mod tests {
             false_positive_loss: 50.0,
             include_review: true,
         }
+    }
+
+    #[test]
+    fn streaming_partition_preserves_alternatives_and_identical_plan() {
+        let mut candidates = vec![
+            candidate("/cache/large", 200, Some((7, 1))),
+            candidate("/cache/large/child", 20, Some((7, 2))),
+            candidate("/cache/small", 10, Some((7, 3))),
+        ];
+        candidates[0].decision.posterior_abandoned = 0.95;
+        candidates[1].decision.posterior_abandoned = 0.90;
+        candidates[2].decision.posterior_abandoned = 0.90;
+        let request = request(Some(100));
+        let expected = plan_batch(candidates.clone(), &request);
+        for _ in 0..candidates.len() {
+            let (chosen, deferred, plan) = partition_batch(candidates.clone(), &request);
+            assert_eq!((chosen.clone(), plan), expected);
+            assert_eq!(chosen[0].path, Path::new("/cache/large"));
+            assert_eq!(
+                deferred
+                    .iter()
+                    .map(|score| score.path.as_path())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([Path::new("/cache/large/child"), Path::new("/cache/small")]),
+                "meeting the target must not discard streaming alternatives",
+            );
+            let mut retry = chosen;
+            retry.extend(deferred);
+            assert_eq!(plan_batch(retry, &request), expected);
+            candidates.rotate_left(1);
+        }
+    }
+
+    #[test]
+    fn streaming_partition_never_revives_rejected_or_suspended_scopes() {
+        let mut candidates = vec![
+            candidate("/cache/tree", 100, Some((7, 1))),
+            candidate("/cache/alias", 100, Some((7, 1))),
+            veto(candidate("/cache/tree/busy", 20, Some((7, 2)))),
+            candidate("/cache/suspended", 100, Some((7, 3))),
+            candidate("/cache/invalid", 100, Some((7, 4))),
+            candidate("/cache/review", 100, Some((7, 5))),
+            candidate("/cache/valid", 1, Some((7, 6))),
+        ];
+        candidates[3].decision.category_suspended = true;
+        candidates[4].decision.posterior_abandoned = f64::NAN;
+        candidates[5].decision.action = DecisionAction::Review;
+        let mut request = request(None);
+        request.include_review = false;
+        request.max_items = 0;
+        let (chosen, deferred, plan) = partition_batch(candidates, &request);
+        assert!(chosen.is_empty());
+        assert!(plan.chosen.is_empty());
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].path, Path::new("/cache/valid"));
     }
 
     #[test]

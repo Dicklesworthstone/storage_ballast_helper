@@ -106,7 +106,9 @@ use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, OpaqueTreeDisposition,
     StructuralSignals,
 };
-use crate::scanner::planner::{PlanObjective, PlanRequest, RiskBudgetByLevel, plan_batch};
+use crate::scanner::planner::{
+    PlanObjective, PlanRequest, RiskBudgetByLevel, partition_batch, plan_batch,
+};
 use crate::scanner::prescan_cursor::{PrescanCursor, RootPage};
 use crate::scanner::protection::{self, ProtectionRegistry};
 use crate::scanner::quarantine::{
@@ -1639,6 +1641,37 @@ pub struct DeletionBatch {
     /// Revocable permission captured by the target-only tier. A root name
     /// alone never authorizes lifting protection after configuration reload.
     pub target_only_consent: Option<crate::daemon::target_tier::TargetOnlyConsent>,
+}
+
+impl DeletionBatch {
+    /// Both dispatch selection and execution use the same objective and live
+    /// risk table. Resource allowances are read here and charged only after
+    /// successful mutations, never when candidates are queued.
+    fn plan_request(&self, config: &SharedExecutorConfig, max_items: usize) -> PlanRequest {
+        let (table, false_positive_loss) = *config.planner.read();
+        PlanRequest {
+            level: self.pressure_level,
+            objective: if self.inode_reclaim.is_some() {
+                PlanObjective::ArtifactRemovals
+            } else {
+                PlanObjective::Bytes
+            },
+            target_bytes: if self.inode_reclaim.is_some() {
+                None
+            } else {
+                self.ram_reclaim
+                    .as_ref()
+                    .map(RamReclaimRequest::remaining_bytes)
+                    .or(self.target_bytes)
+            },
+            max_items: self.inode_reclaim.as_ref().map_or(max_items, |relief| {
+                max_items.min(relief.remaining_artifacts())
+            }),
+            risk_budget: table.budget(self.pressure_level, false_positive_loss),
+            false_positive_loss,
+            include_review: false,
+        }
+    }
 }
 
 /// Results reported from worker threads back to the main monitoring loop.
@@ -9500,6 +9533,40 @@ struct PassDispatch {
     /// live process was deleted twice). Within a pass, no candidate at, under
     /// or above an already dispatched path is dispatched again.
     paths: HashSet<PathBuf>,
+    /// Identity aliases are alternative observations of the same artifact,
+    /// even when their paths do not overlap lexically.
+    identities: HashSet<crate::scanner::walker::FsIdentity>,
+    /// Estimated bytes actually accepted by the executor queue. This is not
+    /// successful reclaim and does not spend any resource allowance.
+    bytes: u64,
+}
+
+/// Keep a held candidate window from invoking the planner on every walker
+/// entry. Successful sends retain the immediate size trigger; a queue, risk,
+/// or behavior hold retries at the existing maximum-wait deadline instead.
+struct ScannerDispatchPacer {
+    threshold: usize,
+    deadline: Instant,
+    held: bool,
+}
+
+impl ScannerDispatchPacer {
+    fn new(batch_limit: usize, started_at: Instant) -> Self {
+        Self {
+            threshold: batch_limit.max(1).saturating_mul(EARLY_DISPATCH_MULTIPLIER),
+            deadline: started_at + EARLY_DISPATCH_MAX_WAIT,
+            held: false,
+        }
+    }
+
+    fn should_attempt(&self, buffered: usize, now: Instant) -> bool {
+        buffered > 0 && (now >= self.deadline || (!self.held && buffered >= self.threshold))
+    }
+
+    fn record_attempt(&mut self, progressed: bool, now: Instant) {
+        self.held = !progressed;
+        self.deadline = now + EARLY_DISPATCH_MAX_WAIT;
+    }
 }
 
 /// Renew the physical behavior gate at every scanner dispatch, including
@@ -9521,7 +9588,7 @@ fn dispatch_with_behavior_gate(
     {
         return true;
     }
-    dispatch_top_candidates(scored, request, del_tx, dispatched)
+    dispatch_top_candidates(scored, request, del_tx, dispatched, executor_config)
 }
 
 fn dispatch_top_candidates(
@@ -9529,6 +9596,7 @@ fn dispatch_top_candidates(
     request: &ScanRequest,
     del_tx: &Sender<DeletionBatch>,
     dispatched: &mut PassDispatch,
+    executor_config: &SharedExecutorConfig,
 ) -> bool {
     // Neither a path under a dispatched tree nor one containing it: deleting
     // an ancestor would take a subtree rebuilt since its own deletion. The
@@ -9552,6 +9620,9 @@ fn dispatch_top_candidates(
                 .paths
                 .iter()
                 .any(|sent| candidate.path.starts_with(sent) || sent.starts_with(&candidate.path))
+            && candidate
+                .identity
+                .is_none_or(|identity| !dispatched.identities.contains(&identity))
     });
     if scored.is_empty() {
         return true;
@@ -9561,20 +9632,8 @@ fn dispatch_top_candidates(
         return true;
     }
 
-    scored.sort_by(|a, b| {
-        b.total_score
-            .partial_cmp(&a.total_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let max_batch = request.max_delete_batch.max(1);
-    let overflow = if scored.len() > max_batch {
-        scored.split_off(max_batch)
-    } else {
-        Vec::new()
-    };
-
-    let batch = DeletionBatch {
-        candidates: std::mem::replace(scored, overflow),
+    let mut batch = DeletionBatch {
+        candidates: Vec::new(),
         pressure_level: request.pressure_level,
         urgency: request.urgency,
         scan_now: request.scan_now.clone(),
@@ -9584,8 +9643,28 @@ fn dispatch_top_candidates(
         target_only_root: None,
         target_only_consent: None,
     };
+    let max_items = request
+        .max_delete_batch
+        .min(executor_config.max_batch_size.load(Ordering::Relaxed));
+    // Give the planner every buffered observation before limiting the queue
+    // batch. A composite-score prefix can spend the entire batch on tiny
+    // artifacts and hide a lower-scored, lower-risk target-covering choice.
+    // This is a bounded streaming choice, not a whole-filesystem optimum.
+    let (selected, deferred, _) = partition_batch(
+        std::mem::take(scored),
+        &batch.plan_request(executor_config, max_items),
+    );
+    *scored = deferred;
+    batch.candidates = selected;
+    if batch.candidates.is_empty() {
+        return true;
+    }
     let batch_len = batch.candidates.len();
     let batch_paths: Vec<PathBuf> = batch.candidates.iter().map(|c| c.path.clone()).collect();
+    let batch_identities: Vec<_> = batch.candidates.iter().filter_map(|c| c.identity).collect();
+    let batch_bytes = batch.candidates.iter().fold(0u64, |bytes, candidate| {
+        bytes.saturating_add(candidate.size_bytes)
+    });
 
     // Non-blocking send preserves scanner progress and avoids deadlock when
     // executor is slow. If channel is full, re-queue candidates locally so the
@@ -9598,6 +9677,8 @@ fn dispatch_top_candidates(
             // surfaced candidates but dispatched none (all protected/dampened).
             dispatched.count += batch_len;
             dispatched.paths.extend(batch_paths);
+            dispatched.identities.extend(batch_identities);
+            dispatched.bytes = dispatched.bytes.saturating_add(batch_bytes);
             true
         }
         Err(TrySendError::Full(mut deferred)) => {
@@ -9610,6 +9691,60 @@ fn dispatch_top_candidates(
         }
         Err(TrySendError::Disconnected(_)) => false, // Channel closed, exit
     }
+}
+
+/// Revalidate at most one early-dispatch window of persisted hints. The index
+/// is ordered by composite score, so this gives the target/risk planner useful
+/// alternatives without turning replay into an unbounded full-index scan. It
+/// is a shortlist, not a globally optimal plan over all persisted records.
+fn scanner_replay_limit(request: &ScanRequest, config: &SharedExecutorConfig) -> usize {
+    request
+        .max_delete_batch
+        .min(config.max_batch_size.load(Ordering::Relaxed))
+        .saturating_mul(EARLY_DISPATCH_MULTIPLIER)
+        .min(SCAN_ENTRY_BUDGET)
+}
+
+/// Finish a pass without draining alternatives after its dispatch target was
+/// covered. A full queue or a planner hold leaves the work for rediscovery.
+fn flush_scanner_candidates(
+    scored: &mut Vec<CandidacyScore>,
+    request: &ScanRequest,
+    del_tx: &Sender<DeletionBatch>,
+    dispatched: &mut PassDispatch,
+    executor_config: &SharedExecutorConfig,
+    shutdown: &AtomicBool,
+    target_bytes: Option<u64>,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !scored.is_empty() {
+        if shutdown.load(Ordering::Relaxed)
+            || target_bytes.is_some_and(|target| dispatched.bytes >= target)
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "[SBH-SCANNER] flush deadline reached; {} candidates will be rediscovered on next pass",
+                scored.len()
+            );
+            break;
+        }
+        let pending_before = scored.len();
+        if !dispatch_with_behavior_gate(scored, request, del_tx, dispatched, executor_config) {
+            return false;
+        }
+        // A full queue, a held behavior cell, or an exhausted planner budget
+        // can leave no dispatchable work; avoid a busy-loop.
+        if scored.len() >= pending_before {
+            eprintln!(
+                "[SBH-SCANNER] no dispatch progress at scan end; {} candidates will be rediscovered on next pass",
+                scored.len()
+            );
+            break;
+        }
+    }
+    true
 }
 
 fn drain_scanner_index_feedback(
@@ -10884,6 +11019,10 @@ fn scanner_thread_main(
         // the B6 empty-pass cooldown). A pass can surface many candidates yet
         // dispatch zero when they are all protected/dampened.
         let mut dispatched_this_pass = PassDispatch::default();
+        // Replay and the priority pre-scan may find more useful candidates
+        // than fit one batch. Carry those alternatives into the walk instead
+        // of discarding them when a stage hands off its first batch.
+        let mut deferred_candidates = Vec::new();
         let reclaim_at_pass_start = executor_config.reclaim_events();
         let mut scanner_should_exit = false;
         let mut scan_timed_out = false;
@@ -10940,11 +11079,15 @@ fn scanner_thread_main(
             // classification and age) before it may be dispatched. Anything
             // the fresh evidence rejects is backed off in the index.
             let replay_now = SystemTime::now();
-            let records =
-                index.ranked_records_within(&request.paths, replay_now, request.max_delete_batch);
+            let records = index.ranked_records_within(
+                &request.paths,
+                replay_now,
+                scanner_replay_limit(&request, executor_config),
+            );
             let index_generation = index.event_generation();
             let mut indexed_candidates: Vec<CandidacyScore> = Vec::with_capacity(records.len());
             let mut revetoed = 0usize;
+            let mut replayed = 0usize;
             if !records.is_empty() {
                 let replay_open_files = collect_open_path_ancestors_cached(
                     &active_scan_paths,
@@ -10974,9 +11117,18 @@ fn scanner_thread_main(
                 replay_engine.set_regret(regret_view.0.clone(), regret_view.1.clone());
                 replay_engine.set_cache_redeletions(cache_redeletions.clone());
                 for record in &records {
+                    heartbeat.beat();
+                    if shutdown.load(Ordering::Relaxed) {
+                        scanner_should_exit = true;
+                        break;
+                    }
+                    if limits.prescan_stop().is_some() {
+                        break;
+                    }
                     if !request.permits_reclaim_path(&record.path) {
                         continue;
                     }
+                    replayed += 1;
                     match replay_indexed_record(
                         record,
                         index_generation,
@@ -11046,7 +11198,10 @@ fn scanner_thread_main(
                 }
                 carried_verdicts = replay_protection.verdict_cache_snapshot();
             }
-            replay_counts.set((records.len(), revetoed));
+            if scanner_should_exit {
+                break;
+            }
+            replay_counts.set((replayed, revetoed));
             for candidate in &indexed_candidates {
                 record_root_candidate(
                     &mut root_stats_map,
@@ -11055,13 +11210,8 @@ fn scanner_thread_main(
                     candidate.size_bytes,
                 );
             }
-            let indexed_bytes = indexed_candidates
-                .iter()
-                .map(|candidate| candidate.size_bytes)
-                .sum::<u64>();
             let indexed_count = indexed_candidates.len();
             if indexed_count > 0 {
-                let indexed_before_dispatch = indexed_candidates.len();
                 if !dispatch_with_behavior_gate(
                     &mut indexed_candidates,
                     &request,
@@ -11071,12 +11221,9 @@ fn scanner_thread_main(
                 ) {
                     break;
                 }
-                let indexed_dispatched =
-                    indexed_before_dispatch.saturating_sub(indexed_candidates.len());
                 candidates_found += indexed_count;
-                if indexed_dispatched > 0 {
-                    v2_candidate_bytes_seen = v2_candidate_bytes_seen.saturating_add(indexed_bytes);
-                }
+                v2_candidate_bytes_seen = dispatched_this_pass.bytes;
+                deferred_candidates.append(&mut indexed_candidates);
                 if v2_candidate_byte_target.is_some_and(|target| v2_candidate_bytes_seen >= target)
                 {
                     logger.send(ActivityEvent::ScanCompleted {
@@ -11640,20 +11787,6 @@ fn scanner_thread_main(
                 );
             }
             let count = priority_candidates.len();
-            priority_candidates.sort_by(|a, b| {
-                b.total_score
-                    .partial_cmp(&a.total_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let priority_dispatch_bytes = if request.max_delete_batch == 0 {
-                0
-            } else {
-                priority_candidates
-                    .iter()
-                    .take(request.max_delete_batch)
-                    .map(|candidate| candidate.size_bytes)
-                    .sum()
-            };
             // Build pattern frequency breakdown for the log line.
             let mut pattern_counts: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
@@ -11676,7 +11809,7 @@ fn scanner_thread_main(
                     "[SBH-SCANNER] priority pre-scan identified {count} candidates without cleanup ({breakdown_str})"
                 );
             } else {
-                let remaining_before_dispatch = priority_candidates.len();
+                let dispatched_before = dispatched_this_pass.count;
                 if dispatch_with_behavior_gate(
                     &mut priority_candidates,
                     &request,
@@ -11685,11 +11818,10 @@ fn scanner_thread_main(
                     executor_config,
                 ) {
                     let dispatched_count =
-                        remaining_before_dispatch.saturating_sub(priority_candidates.len());
+                        dispatched_this_pass.count.saturating_sub(dispatched_before);
                     candidates_found += count;
+                    v2_candidate_bytes_seen = dispatched_this_pass.bytes;
                     if dispatched_count > 0 {
-                        v2_candidate_bytes_seen =
-                            v2_candidate_bytes_seen.saturating_add(priority_dispatch_bytes);
                         eprintln!(
                             "[SBH-SCANNER] priority pre-scan dispatched {dispatched_count}/{count} candidates ({breakdown_str})"
                         );
@@ -11702,6 +11834,7 @@ fn scanner_thread_main(
                     scanner_should_exit = true;
                 }
             }
+            deferred_candidates.append(&mut priority_candidates);
         }
         if scanner_should_exit {
             break;
@@ -11941,16 +12074,12 @@ fn scanner_thread_main(
         scan_timed_out |= prewalk_stop.is_some();
         let mut walk_exhausted = false;
         let mut opaque_pruned_dirs = 0usize;
-        let mut scored: Vec<CandidacyScore> = Vec::with_capacity(1024);
+        let mut scored = deferred_candidates;
 
         // Track directories for the incremental scan cursor.
         let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
         let mut non_barren_dirs: HashSet<PathBuf> = HashSet::new();
-        let dispatch_threshold = request
-            .max_delete_batch
-            .max(1)
-            .saturating_mul(EARLY_DISPATCH_MULTIPLIER);
-        let mut next_dispatch_deadline = scan_start + EARLY_DISPATCH_MAX_WAIT;
+        let mut dispatch_pacer = ScannerDispatchPacer::new(request.max_delete_batch, scan_start);
 
         // Process entries with timeout to handle walker deadlocks.
         // The walker can deadlock when both worker threads block on a full work queue
@@ -12289,7 +12418,6 @@ fn scanner_thread_main(
             } else if deletable {
                 candidates_found += 1;
                 let potential_bytes = score.size_bytes;
-                v2_candidate_bytes_seen = v2_candidate_bytes_seen.saturating_add(potential_bytes);
                 record_root_candidate(
                     &mut root_stats_map,
                     &mut observed_candidates,
@@ -12307,9 +12435,8 @@ fn scanner_thread_main(
             // Do not wait for full walk completion before sending the first deletion batch.
             // On very large trees this starts reclaim work earlier and avoids long periods with
             // zero deletion progress while the scanner is still traversing.
-            let should_dispatch = !scored.is_empty()
-                && (scored.len() >= dispatch_threshold || Instant::now() >= next_dispatch_deadline);
-            if should_dispatch {
+            if dispatch_pacer.should_attempt(scored.len(), Instant::now()) {
+                let dispatched_before = dispatched_this_pass.count;
                 if !dispatch_with_behavior_gate(
                     &mut scored,
                     &request,
@@ -12320,20 +12447,15 @@ fn scanner_thread_main(
                     scanner_should_exit = true;
                     break;
                 }
-                next_dispatch_deadline = Instant::now() + EARLY_DISPATCH_MAX_WAIT;
+                v2_candidate_bytes_seen = dispatched_this_pass.bytes;
+                dispatch_pacer.record_attempt(
+                    dispatched_this_pass.count > dispatched_before,
+                    Instant::now(),
+                );
             }
             if let Some(target_bytes) = v2_candidate_byte_target
                 && v2_candidate_bytes_seen >= target_bytes
             {
-                if !dispatch_with_behavior_gate(
-                    &mut scored,
-                    &request,
-                    del_tx,
-                    &mut dispatched_this_pass,
-                    executor_config,
-                ) {
-                    scanner_should_exit = true;
-                }
                 cancel_token.store(true, Ordering::Relaxed);
                 break;
             }
@@ -12372,6 +12494,22 @@ fn scanner_thread_main(
                 visited_dirs.clear();
             }
         }
+
+        // Flush before completion accounting so a pass whose only successful
+        // sends happen here reports their bytes too. Retained alternatives do
+        // not authorize more work after the pressure dispatch target is met.
+        if !flush_scanner_candidates(
+            &mut scored,
+            &request,
+            del_tx,
+            &mut dispatched_this_pass,
+            executor_config,
+            shutdown,
+            v2_candidate_byte_target,
+        ) {
+            scanner_should_exit = true;
+        }
+        v2_candidate_bytes_seen = dispatched_this_pass.bytes;
 
         // Only proven root coverage trains full-scan cost estimates. The
         // walker interleaves roots, so completed passes divide their cost;
@@ -12463,41 +12601,6 @@ fn scanner_thread_main(
             pressure_level: request.pressure_level,
             background: request_background,
         });
-
-        // Flush remaining candidates in bounded batches.
-        // Hard cap: never spend more than 30s flushing after the scan loop ends.
-        let flush_deadline = Instant::now() + Duration::from_secs(30);
-        while !scored.is_empty() {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-            if Instant::now() >= flush_deadline {
-                eprintln!(
-                    "[SBH-SCANNER] flush deadline reached; {} candidates will be rediscovered on next pass",
-                    scored.len()
-                );
-                break;
-            }
-            let pending_before = scored.len();
-            if !dispatch_with_behavior_gate(
-                &mut scored,
-                &request,
-                del_tx,
-                &mut dispatched_this_pass,
-                executor_config,
-            ) {
-                scanner_should_exit = true;
-                break;
-            }
-            // No progress means executor channel stayed full; avoid busy-loop.
-            if scored.len() >= pending_before {
-                eprintln!(
-                    "[SBH-SCANNER] executor backlog persisted at scan end; {} candidates will be rediscovered on next pass",
-                    scored.len()
-                );
-                break;
-            }
-        }
 
         // B6: arm/clear the inter-pass cooldown. A pass that completed (not
         // timed out) yet *dispatched nothing* to the deletion executor made no
@@ -13191,38 +13294,10 @@ fn executor_thread_main(
         // W1 planner (G16): of the approved candidates, the set that reaches
         // the pass's byte target with the least expected loss inside the
         // level's risk budget, instead of the top-N by score.
-        let (approved_candidates, batch_plan) = {
-            let (table, false_positive_loss) = *shared_config.planner.read();
-            plan_batch(
-                approved_candidates,
-                &PlanRequest {
-                    level: batch.pressure_level,
-                    objective: if batch.inode_reclaim.is_some() {
-                        PlanObjective::ArtifactRemovals
-                    } else {
-                        PlanObjective::Bytes
-                    },
-                    target_bytes: if batch.inode_reclaim.is_some() {
-                        None
-                    } else {
-                        batch
-                            .ram_reclaim
-                            .as_ref()
-                            .map(RamReclaimRequest::remaining_bytes)
-                            .or(batch.target_bytes)
-                    },
-                    max_items: batch
-                        .inode_reclaim
-                        .as_ref()
-                        .map_or(max_batch_size, |relief| {
-                            max_batch_size.min(relief.remaining_artifacts())
-                        }),
-                    risk_budget: table.budget(batch.pressure_level, false_positive_loss),
-                    false_positive_loss,
-                    include_review: false,
-                },
-            )
-        };
+        let (approved_candidates, batch_plan) = plan_batch(
+            approved_candidates,
+            &batch.plan_request(shared_config, max_batch_size),
+        );
         if !batch_plan.chosen.is_empty() || !batch_plan.skipped_for_budget.is_empty() {
             let line = batch_plan.summary_line();
             eprintln!("[SBH-PLANNER] {line}");
@@ -20076,6 +20151,10 @@ mod tests {
         }
     }
 
+    fn test_dispatch_config() -> SharedExecutorConfig {
+        SharedExecutorConfig::new(false, usize::MAX, 0.0, 60, 3600, false, 0)
+    }
+
     const fn test_self_monitor_tick(rss_bytes: u64, rss_warning_bytes: u64) -> SelfMonitorTick {
         SelfMonitorTick {
             rss_bytes,
@@ -21710,6 +21789,7 @@ mod tests {
                 &request,
                 &send,
                 &mut PassDispatch::default(),
+                &test_dispatch_config(),
             ));
             if mode == "inode" {
                 let dispatched = receive.try_recv().unwrap();
@@ -21830,6 +21910,7 @@ mod tests {
             &request,
             &send,
             &mut PassDispatch::default(),
+            &test_dispatch_config(),
         ));
         let mut batch = receive.try_recv().unwrap();
         assert_eq!(drop_zero_byte_candidates(&mut batch), 0);
@@ -25697,7 +25778,8 @@ mod tests {
             &mut scored,
             &request,
             &del_tx,
-            &mut PassDispatch::default()
+            &mut PassDispatch::default(),
+            &test_dispatch_config(),
         ));
         assert!(
             scored.is_empty(),
@@ -25749,13 +25831,15 @@ mod tests {
             &mut scored,
             &request,
             &send,
-            &mut dispatch
+            &mut dispatch,
+            &test_dispatch_config(),
         ));
         assert!(dispatch_top_candidates(
             &mut scored,
             &request,
             &send,
-            &mut dispatch
+            &mut dispatch,
+            &test_dispatch_config(),
         ));
         let first_batch = receive.try_recv().unwrap();
         let second_batch = receive.try_recv().unwrap();
@@ -26297,7 +26381,8 @@ mod tests {
             &mut scored,
             &request,
             &del_tx,
-            &mut PassDispatch::default()
+            &mut PassDispatch::default(),
+            &test_dispatch_config(),
         ));
         assert!(scored.is_empty());
         assert!(
@@ -26310,7 +26395,8 @@ mod tests {
             &mut scored,
             &request,
             &del_tx,
-            &mut PassDispatch::default()
+            &mut PassDispatch::default(),
+            &test_dispatch_config(),
         ));
         let batch = del_rx.try_recv().expect("the non-empty candidate is sent");
         let paths: Vec<_> = batch.candidates.iter().map(|c| c.path.clone()).collect();
@@ -28848,6 +28934,491 @@ mod tests {
     }
 
     #[test]
+    fn scanner_replay_shortlist_keeps_target_alternatives_with_bounded_work() {
+        use crate::scanner::index::{CandidateSafetyState, IndexedPruneDecision};
+        use crate::scanner::walker::{FsEntryKind, FsIdentity};
+
+        let mut request = event_test_request(vec![PathBuf::from("/tmp")]);
+        request.pressure_level = PressureLevel::Critical;
+        request.max_delete_batch = 1;
+        request.target_bytes = Some(100);
+        let config = test_dispatch_config();
+        let scanner = ScannerConfig::default();
+        let mut index = ScannerCandidateIndex::new(ScannerIndexContext::from_roots_and_config(
+            &request.paths,
+            &scanner,
+        ));
+        for ordinal in 1..=8u32 {
+            let identity = FsIdentity {
+                device_id: 7,
+                inode: u64::from(ordinal),
+                kind: FsEntryKind::Directory,
+            };
+            index.upsert(CandidateIndexRecord {
+                path: PathBuf::from(format!("/tmp/artifact-{ordinal}")),
+                identity: identity.into(),
+                parent_identity: None,
+                parent_mtime_nanos: None,
+                candidate_mtime_nanos: 0,
+                candidate_ctime_nanos: None,
+                size_estimate_bytes: if ordinal == 4 { 100 } else { 1 },
+                prune_decision: IndexedPruneDecision::CandidateOpaque,
+                score: Some(1.0 - f64::from(ordinal) * 0.01),
+                safety_state: CandidateSafetyState::Safe,
+                fail_count: 0,
+                cooldown_until_nanos: None,
+                event_generation: 0,
+                structural_signals: StructuralSignals::default(),
+            });
+        }
+        let records = index.ranked_records_within(
+            &request.paths,
+            SystemTime::now(),
+            scanner_replay_limit(&request, &config),
+        );
+        assert_eq!(records.len(), 4);
+        // Supply the fresh scores that successful revalidation would return;
+        // persisted hints themselves never become deletion authority.
+        let mut scored: Vec<_> = records
+            .into_iter()
+            .map(|record| {
+                let mut score =
+                    test_candidate(&record.path.to_string_lossy(), record.score.unwrap());
+                score.size_bytes = record.size_estimate_bytes;
+                score
+            })
+            .collect();
+        let (send, receive) = bounded(1);
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut PassDispatch::default(),
+            &config
+        ));
+        assert_eq!(
+            receive.try_recv().unwrap().candidates[0].path,
+            Path::new("/tmp/artifact-4")
+        );
+        assert_eq!(scored.len(), 3);
+        config.max_batch_size.store(0, Ordering::Relaxed);
+        assert_eq!(scanner_replay_limit(&request, &config), 0);
+        config.max_batch_size.store(usize::MAX, Ordering::Relaxed);
+        request.max_delete_batch = usize::MAX;
+        assert_eq!(scanner_replay_limit(&request, &config), SCAN_ENTRY_BUDGET);
+    }
+
+    #[test]
+    fn scanner_dispatch_paces_held_plans_without_losing_new_alternatives() {
+        for full_queue in [false, true] {
+            let mut request = event_test_request(vec![PathBuf::from("/tmp")]);
+            request.pressure_level = PressureLevel::Critical;
+            request.max_delete_batch = 1;
+            request.target_bytes = Some(100);
+            let config = test_dispatch_config();
+            let (send, receive) = bounded(1);
+            if full_queue {
+                let mut previous = vec![test_candidate("/tmp/previous-pass", 0.9)];
+                assert!(dispatch_top_candidates(
+                    &mut previous,
+                    &request,
+                    &send,
+                    &mut PassDispatch::default(),
+                    &config,
+                ));
+            } else {
+                config.set_planner(
+                    RiskBudgetByLevel {
+                        critical: Some(0.0),
+                        ..Default::default()
+                    },
+                    50.0,
+                );
+            }
+            let mut scored: Vec<_> = (0..4)
+                .map(|index| test_candidate(&format!("/tmp/small-{index}"), 0.99))
+                .collect();
+            let mut dispatched = PassDispatch::default();
+            let started = Instant::now();
+            let mut pacer = ScannerDispatchPacer::new(request.max_delete_batch, started);
+            assert!(pacer.should_attempt(scored.len(), started));
+            assert!(dispatch_top_candidates(
+                &mut scored,
+                &request,
+                &send,
+                &mut dispatched,
+                &config,
+            ));
+            assert_eq!(dispatched.count, 0);
+            pacer.record_attempt(dispatched.count > 0, started);
+
+            let mut target = test_candidate("/tmp/target-alternative", 0.5);
+            target.size_bytes = 100;
+            scored.push(target.clone());
+            for seconds in 0..EARLY_DISPATCH_MAX_WAIT.as_secs() {
+                assert!(
+                    !pacer.should_attempt(scored.len(), started + Duration::from_secs(seconds)),
+                    "a held window must not replan on every walker entry (full_queue={full_queue})",
+                );
+            }
+            assert_eq!(
+                scored.len(),
+                5,
+                "both old and new alternatives are retained"
+            );
+            let retry_at = started + EARLY_DISPATCH_MAX_WAIT;
+            assert!(pacer.should_attempt(scored.len(), retry_at));
+            assert!(!pacer.should_attempt(0, retry_at));
+            if full_queue {
+                receive.try_recv().unwrap();
+            } else {
+                config.set_planner(RiskBudgetByLevel::default(), 50.0);
+            }
+            assert!(dispatch_top_candidates(
+                &mut scored,
+                &request,
+                &send,
+                &mut dispatched,
+                &config,
+            ));
+            assert_eq!(receive.try_recv().unwrap().candidates, vec![target]);
+            assert_eq!((dispatched.count, dispatched.bytes), (1, 100));
+            pacer.record_attempt(true, retry_at);
+            assert!(
+                pacer.should_attempt(scored.len(), retry_at),
+                "successful dispatch restores the size trigger"
+            );
+        }
+    }
+
+    #[test]
+    fn scanner_dispatch_plans_before_score_truncation_and_stops_flush_at_target() {
+        let mut request = event_test_request(vec![PathBuf::from("/tmp")]);
+        request.pressure_level = PressureLevel::Critical;
+        request.max_delete_batch = 1;
+        request.target_bytes = Some(100);
+        let mut small = test_candidate("/tmp/high-score-small", 0.99);
+        small.size_bytes = 8;
+        small.decision.posterior_abandoned = 0.9999;
+        let mut large = test_candidate("/tmp/lower-score-target", 0.65);
+        large.size_bytes = 100;
+        large.decision.posterior_abandoned = 0.99;
+        let mut child = test_candidate("/tmp/lower-score-target/child", 0.8);
+        child.size_bytes = 10;
+        let mut scored = vec![small.clone(), child, large.clone()];
+        let config = test_dispatch_config();
+        let (send, receive) = bounded(4);
+        let mut dispatched = PassDispatch::default();
+
+        assert!(flush_scanner_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut dispatched,
+            &config,
+            &AtomicBool::new(false),
+            Some(100),
+        ));
+        let batch = receive.try_recv().unwrap();
+        assert_eq!(batch.candidates, vec![large]);
+        assert_eq!((dispatched.count, dispatched.bytes), (1, 100));
+        assert_eq!(scored.len(), 2, "unused alternatives remain available");
+        assert!(scored.iter().any(|candidate| candidate == &small));
+        assert!(
+            receive.try_recv().is_err(),
+            "meeting the target stops the flush"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn scanner_dispatch_enforces_live_limits_and_planner_admission() {
+        let mut request = event_test_request(vec![PathBuf::from("/tmp")]);
+        request.pressure_level = PressureLevel::Critical;
+        let config = test_dispatch_config();
+        config.max_batch_size.store(1, Ordering::Relaxed);
+        config.set_planner(
+            RiskBudgetByLevel {
+                critical: Some(0.02),
+                ..Default::default()
+            },
+            50.0,
+        );
+        let mut safe = test_candidate("/tmp/safe", 0.5);
+        safe.size_bytes = 100;
+        safe.decision.posterior_abandoned = 0.99;
+        let mut risky = test_candidate("/tmp/risky", 0.99);
+        risky.size_bytes = 200;
+        let mut review = test_candidate("/tmp/review", 1.0);
+        review.decision.action = DecisionAction::Review;
+        let mut keep = test_candidate("/tmp/keep", 1.0);
+        keep.decision.action = DecisionAction::Keep;
+        let mut veto = test_candidate("/tmp/veto", 1.0);
+        veto.vetoed = true;
+        let veto_child = test_candidate("/tmp/veto/target", 1.0);
+        let mut suspended = test_candidate("/tmp/suspended", 1.0);
+        suspended.decision.category_suspended = true;
+        let mut invalid = test_candidate("/tmp/invalid", 1.0);
+        invalid.decision.posterior_abandoned = f64::NAN;
+        let mut empty = test_candidate("/tmp/empty", 1.0);
+        empty.size_bytes = 0;
+        let mut scored = vec![
+            risky.clone(),
+            review,
+            keep,
+            veto,
+            veto_child,
+            suspended,
+            invalid,
+            empty,
+            safe.clone(),
+        ];
+        let (send, receive) = bounded(4);
+        let mut dispatched = PassDispatch::default();
+
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut dispatched,
+            &config
+        ));
+        assert_eq!(receive.try_recv().unwrap().candidates, vec![safe]);
+        assert_eq!(scored, vec![risky.clone()]);
+        assert_eq!((dispatched.count, dispatched.bytes), (1, 100));
+
+        config.set_planner(
+            RiskBudgetByLevel {
+                critical: Some(0.0),
+                ..Default::default()
+            },
+            50.0,
+        );
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut dispatched,
+            &config
+        ));
+        assert!(
+            receive.try_recv().is_err(),
+            "a live zero risk budget holds the candidate"
+        );
+        config.set_planner(RiskBudgetByLevel::default(), 50.0);
+        config.max_batch_size.store(0, Ordering::Relaxed);
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut dispatched,
+            &config
+        ));
+        assert!(
+            receive.try_recv().is_err(),
+            "a live zero batch limit holds the candidate"
+        );
+        config.max_batch_size.store(1, Ordering::Relaxed);
+        request.target_bytes = Some(0);
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut dispatched,
+            &config
+        ));
+        assert!(
+            receive.try_recv().is_err(),
+            "a satisfied byte target dispatches nothing"
+        );
+        assert_eq!(scored, vec![risky.clone()]);
+        request.target_bytes = None;
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut dispatched,
+            &config
+        ));
+        assert_eq!(receive.try_recv().unwrap().candidates, vec![risky]);
+        assert_eq!((dispatched.count, dispatched.bytes), (2, 300));
+    }
+
+    #[test]
+    fn scanner_dispatch_uses_remaining_ram_target_without_spending_allowance() {
+        use crate::scanner::walker::{FsEntryKind, FsIdentity};
+
+        let relief =
+            RamReclaimRequest::new(PathBuf::from("/tmp"), 17, 100, &[PathBuf::from("/tmp")]);
+        relief.record_unlinked_bytes(80);
+        let mut request = event_test_request(vec![PathBuf::from("/tmp")]);
+        request.pressure_level = PressureLevel::Critical;
+        request.ram_reclaim = Some(relief.clone());
+        request.target_bytes = Some(100);
+        let mut small = test_candidate("/tmp/remaining-target", 0.5);
+        small.size_bytes = 20;
+        small.identity = Some(FsIdentity {
+            device_id: 17,
+            inode: 1,
+            kind: FsEntryKind::Directory,
+        });
+        let mut large = small.clone();
+        large.path = PathBuf::from("/tmp/old-target");
+        large.identity.as_mut().unwrap().inode = 2;
+        large.size_bytes = 80;
+        large.total_score = 0.99;
+        let mut scored = vec![large, small.clone()];
+        let (send, receive) = bounded(4);
+        let config = test_dispatch_config();
+        let mut dispatched = PassDispatch::default();
+
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut dispatched,
+            &config
+        ));
+        let batch = receive.try_recv().unwrap();
+        assert_eq!(batch.candidates, vec![small]);
+        assert_eq!(batch.plan_request(&config, 10).target_bytes, Some(20));
+        assert_eq!(
+            relief.remaining_bytes(),
+            20,
+            "queueing does not spend the allowance"
+        );
+        assert_eq!(dispatched.bytes, 20);
+        relief.record_unlinked_bytes(20);
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut dispatched,
+            &config
+        ));
+        assert!(
+            receive.try_recv().is_err(),
+            "later dispatch sees the live remaining allowance"
+        );
+        assert_eq!(dispatched.count, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn scanner_dispatch_uses_inode_risk_and_remaining_artifact_allowance() {
+        let temp = temp_root_scratch_dir();
+        let root = temp.path().join("root");
+        let empty_path = root.join("empty");
+        let large_path = root.join("large");
+        std::fs::create_dir_all(&empty_path).unwrap();
+        std::fs::create_dir_all(&large_path).unwrap();
+        let identity = crate::scanner::walker::identity_for_path(&root, true).unwrap();
+        let policy = Config::default().pressure.inodes;
+        let relief = InodeReclaimRequest::new(
+            root.clone(),
+            identity.device_id,
+            1_000,
+            200,
+            2,
+            &policy,
+            std::slice::from_ref(&root),
+        );
+        relief.record_unlinked();
+        let mut request = event_test_request(vec![root]);
+        request.pressure_level = PressureLevel::Critical;
+        request.inode_reclaim = Some(relief.clone());
+        request.target_bytes = Some(u64::MAX);
+        let mut empty = test_candidate(&empty_path.to_string_lossy(), 0.5);
+        empty.size_bytes = 0;
+        empty.identity = crate::scanner::walker::identity_for_path(&empty_path, false).ok();
+        empty.decision.posterior_abandoned = 0.999;
+        let mut large = test_candidate(&large_path.to_string_lossy(), 0.99);
+        large.size_bytes = 1 << 30;
+        large.identity = crate::scanner::walker::identity_for_path(&large_path, false).ok();
+        let mut scored = vec![large, empty.clone()];
+        let config = test_dispatch_config();
+        let (send, receive) = bounded(4);
+        let mut dispatched = PassDispatch::default();
+
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut dispatched,
+            &config
+        ));
+        let batch = receive.try_recv().unwrap();
+        assert_eq!(batch.candidates, vec![empty]);
+        let plan = batch.plan_request(&config, 10);
+        assert_eq!(plan.objective, PlanObjective::ArtifactRemovals);
+        assert_eq!(plan.target_bytes, None);
+        assert_eq!(plan.max_items, 1);
+        assert_eq!(
+            relief.remaining_artifacts(),
+            1,
+            "queueing does not spend the allowance"
+        );
+        assert_eq!((dispatched.count, dispatched.bytes), (1, 0));
+        relief.record_unlinked();
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut dispatched,
+            &config
+        ));
+        assert!(receive.try_recv().is_err());
+        assert_eq!(dispatched.count, 1);
+        assert!(empty_path.is_dir());
+        assert!(large_path.is_dir());
+    }
+
+    #[test]
+    fn scanner_dispatch_never_requeues_an_identity_alias_after_success() {
+        use crate::scanner::walker::{FsEntryKind, FsIdentity};
+
+        let mut request = event_test_request(vec![PathBuf::from("/tmp")]);
+        request.max_delete_batch = 1;
+        let mut original = test_candidate("/tmp/original", 0.9);
+        original.identity = Some(FsIdentity {
+            device_id: 7,
+            inode: 1,
+            kind: FsEntryKind::Directory,
+        });
+        let mut alias = original.clone();
+        alias.path = PathBuf::from("/tmp/alias");
+        let mut scored = vec![original, alias];
+        let config = test_dispatch_config();
+        let (send, receive) = bounded(4);
+        let mut dispatched = PassDispatch::default();
+
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut dispatched,
+            &config
+        ));
+        assert_eq!(receive.try_recv().unwrap().candidates.len(), 1);
+        assert_eq!(
+            scored.len(),
+            1,
+            "an unsuccessful send could still retry the alias"
+        );
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &send,
+            &mut dispatched,
+            &config
+        ));
+        assert!(receive.try_recv().is_err());
+        assert!(scored.is_empty());
+        assert_eq!((dispatched.count, dispatched.bytes), (1, 1));
+    }
+
+    #[test]
     fn dispatch_top_candidates_retains_overflow_after_send() {
         let request = ScanRequest {
             paths: vec![PathBuf::from("/tmp")],
@@ -28875,7 +29446,8 @@ mod tests {
             &mut scored,
             &request,
             &del_tx,
-            &mut PassDispatch::default()
+            &mut PassDispatch::default(),
+            &test_dispatch_config(),
         ));
         let batch = del_rx.recv().expect("batch should be dispatched");
         assert_eq!(batch.candidates.len(), 1);
@@ -28919,21 +29491,36 @@ mod tests {
 
         let mut scored = vec![test_candidate("/tmp/a", 0.4), test_candidate("/tmp/b", 0.6)];
         let before = scored.len();
+        let mut dispatched = PassDispatch::default();
         assert!(dispatch_top_candidates(
             &mut scored,
             &request,
             &del_tx,
-            &mut PassDispatch::default()
+            &mut dispatched,
+            &test_dispatch_config(),
         ));
 
         // Channel remained full, so scanner should still retain all candidates.
         assert_eq!(scored.len(), before);
         assert!(scored.iter().any(|c| c.path == Path::new("/tmp/a")));
         assert!(scored.iter().any(|c| c.path == Path::new("/tmp/b")));
+        assert_eq!((dispatched.count, dispatched.bytes), (0, 0));
+        assert!(dispatched.paths.is_empty());
+        assert!(dispatched.identities.is_empty());
 
         // Existing queued batch should still be the one currently in the channel.
         let queued = del_rx.recv().expect("prefilled batch still queued");
         assert_eq!(queued.candidates[0].path, Path::new("/tmp/already-queued"));
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &del_tx,
+            &mut dispatched,
+            &test_dispatch_config(),
+        ));
+        assert_eq!(del_rx.try_recv().unwrap().candidates.len(), 1);
+        assert_eq!(scored.len(), 1);
+        assert_eq!((dispatched.count, dispatched.bytes), (1, 1));
     }
 
     /// The pre-scan and the walk nominated the same target in one pass; the
@@ -28965,7 +29552,8 @@ mod tests {
             &mut prescan,
             &request,
             &del_tx,
-            &mut pass
+            &mut pass,
+            &test_dispatch_config(),
         ));
         assert_eq!(del_rx.try_recv().unwrap().candidates.len(), 1);
 
@@ -28975,7 +29563,11 @@ mod tests {
             test_candidate("/tmp/other/target", 0.7),
         ];
         assert!(dispatch_top_candidates(
-            &mut walk, &request, &del_tx, &mut pass
+            &mut walk,
+            &request,
+            &del_tx,
+            &mut pass,
+            &test_dispatch_config(),
         ));
         let second = del_rx.try_recv().unwrap();
         let paths: Vec<_> = second.candidates.iter().map(|c| c.path.clone()).collect();
@@ -28988,7 +29580,8 @@ mod tests {
             &mut ancestor,
             &request,
             &del_tx,
-            &mut pass
+            &mut pass,
+            &test_dispatch_config(),
         ));
         assert!(del_rx.try_recv().is_err());
         assert_eq!(pass.count, 2);
@@ -28996,7 +29589,11 @@ mod tests {
         // Nothing new: no batch at all.
         let mut again = vec![test_candidate("/tmp/proj/target", 0.9)];
         assert!(dispatch_top_candidates(
-            &mut again, &request, &del_tx, &mut pass
+            &mut again,
+            &request,
+            &del_tx,
+            &mut pass,
+            &test_dispatch_config(),
         ));
         assert!(del_rx.try_recv().is_err());
     }

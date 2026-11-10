@@ -607,11 +607,21 @@ fn lower_risk_cover(
 /// identity before optimization. Invalid loss units or risk bounds fail
 /// closed, even at Critical pressure.
 #[must_use]
-#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 pub fn plan_batch(
     candidates: Vec<CandidacyScore>,
     request: &PlanRequest,
 ) -> (Vec<CandidacyScore>, BatchPlan) {
+    let (chosen, _, plan) = partition_batch(candidates, request);
+    (chosen, plan)
+}
+
+/// Preserve admissible alternatives for a later streaming dispatch. The
+/// public entry point applies the same hard-veto admission as `plan_batch`.
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+pub(super) fn partition_batch(
+    candidates: Vec<CandidacyScore>,
+    request: &PlanRequest,
+) -> (Vec<CandidacyScore>, Vec<CandidacyScore>, BatchPlan) {
     let valid_loss = valid_loss_unit(request.false_positive_loss)
         && (request.objective == PlanObjective::Bytes || request.target_bytes.is_none());
     let risk_budget = if valid_loss {
@@ -772,6 +782,7 @@ pub fn plan_batch(
     }
     let mut chosen = Vec::with_capacity(chosen_idx.len());
     let mut chosen_scores = Vec::with_capacity(chosen_idx.len());
+    let mut deferred_scores = Vec::new();
     let mut skipped = Vec::new();
     let mut overlapping = Vec::new();
     for (index, (mut planned, score)) in plannable.into_iter().enumerate() {
@@ -784,8 +795,10 @@ pub fn plan_batch(
             chosen_scores.push(score);
         } else if selected.overlaps(&score) {
             overlapping.push(planned);
+            deferred_scores.push(score);
         } else {
             skipped.push(planned);
+            deferred_scores.push(score);
         }
     }
     // Only budget/size skips are worth listing; a target already met is a
@@ -807,7 +820,7 @@ pub fn plan_batch(
         top_n_bytes,
         target_met,
     };
-    (chosen_scores, plan)
+    (chosen_scores, deferred_scores, plan)
 }
 
 #[cfg(test)]
