@@ -112,7 +112,9 @@ pub fn truncate_oversized_logs(
     free_pct: f64,
     dry_run: bool,
 ) -> LogTruncationReport {
-    truncate_oversized_logs_guarded(config, free_pct, dry_run, &|| true)
+    truncate_with_age_gate(config, dry_run, &|| true, &|_, _| {
+        pressure_bypasses_age(config, Some(free_pct))
+    })
 }
 
 /// Execute a sweep whose mutation authority can be revoked while it runs.
@@ -120,27 +122,84 @@ pub fn truncate_oversized_logs(
 /// The guard is checked before opening each eligible file for writing and
 /// again immediately before truncating its verified descriptor. Callers must
 /// read live policy in the guard rather than capture an approval at sweep
-/// start. A refusal preserves the file and both retry histories. Dry runs
-/// inspect candidates without invoking this mutation-only guard.
+/// start. Each log's own filesystem supplies its pressure exception to the
+/// retention age, renewed on the verified descriptor before mutation. Pressure
+/// on another mount, or an old queued scan, cannot shorten that retention.
+/// A refusal preserves the file and both retry histories. Dry runs inspect
+/// candidates without invoking this mutation-only guard.
 pub fn truncate_oversized_logs_guarded(
     config: &LogTruncationConfig,
-    free_pct: f64,
     dry_run: bool,
     authorize: &dyn Fn() -> bool,
 ) -> LogTruncationReport {
+    truncate_with_age_gate(config, dry_run, authorize, &|path, opened| {
+        config.min_age_minutes == 0
+            || config.pressure_free_pct_ceiling == 100
+            || pressure_bypasses_age(config, filesystem_free_pct(path, opened))
+    })
+}
+
+fn pressure_bypasses_age(config: &LogTruncationConfig, free_pct: Option<f64>) -> bool {
+    config.min_age_minutes == 0
+        || config.pressure_free_pct_ceiling == 100
+        || free_pct.is_some_and(|pct| {
+            pct.is_finite()
+                && (0.0..=100.0).contains(&pct)
+                && pct <= f64::from(config.pressure_free_pct_ceiling)
+        })
+}
+
+/// The descriptor query binds the final reading to the file being truncated,
+/// even if a parent pathname changed after opening it. Unknown or read-only
+/// capacity cannot authorize an exception to the ordinary retention age.
+fn filesystem_free_pct(path: &Path, opened: Option<&fs::File>) -> Option<f64> {
+    #[cfg(unix)]
+    {
+        use nix::sys::statvfs::{FsFlags, fstatvfs, statvfs};
+
+        let stats = match opened {
+            Some(file) => fstatvfs(file),
+            None => statvfs(path),
+        }
+        .ok()?;
+        let total = stats.blocks();
+        let free = stats.blocks_free();
+        let available = stats.blocks_available();
+        if total == 0
+            || free > total
+            || available > free
+            || stats.flags().contains(FsFlags::ST_RDONLY)
+        {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        Some(available as f64 / total as f64 * 100.0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, opened);
+        None
+    }
+}
+
+fn truncate_with_age_gate(
+    config: &LogTruncationConfig,
+    dry_run: bool,
+    authorize: &dyn Fn() -> bool,
+    bypass_age_gate: &dyn Fn(&Path, Option<&fs::File>) -> bool,
+) -> LogTruncationReport {
     let backoff = FAILURE_BACKOFF.get_or_init(|| Mutex::new(FailureBackoff::default()));
     let recent = RECENT_TRUNCATIONS.get_or_init(|| Mutex::new(RecentTruncations::default()));
-    truncate_with_backoff(
+    sweep_with_backoff(
         config,
-        free_pct,
         dry_run,
         backoff,
         Instant::now,
-        |path, config, bypass_age_gate, dry_run| {
+        |path, config, dry_run| {
             process_candidate_with_history(
                 path,
                 config,
-                bypass_age_gate,
+                |opened| bypass_age_gate(path, opened),
                 dry_run,
                 open_candidate_for_truncate,
                 recent,
@@ -151,13 +210,12 @@ pub fn truncate_oversized_logs_guarded(
     )
 }
 
-fn truncate_with_backoff(
+fn sweep_with_backoff(
     config: &LogTruncationConfig,
-    free_pct: f64,
     dry_run: bool,
     backoff: &Mutex<FailureBackoff>,
     clock: impl Fn() -> Instant,
-    mut process: impl FnMut(&Path, &LogTruncationConfig, bool, bool) -> Result<Outcome, String>,
+    mut process: impl FnMut(&Path, &LogTruncationConfig, bool) -> Result<Outcome, String>,
 ) -> LogTruncationReport {
     let start = Instant::now();
     let mut report = LogTruncationReport {
@@ -170,8 +228,6 @@ fn truncate_with_backoff(
         return report;
     }
 
-    let bypass_age_gate =
-        free_pct <= f64::from(config.pressure_free_pct_ceiling) || config.min_age_minutes == 0;
     let mut seen_patterns = HashSet::new();
     let mut seen_paths = HashSet::new();
 
@@ -209,7 +265,7 @@ fn truncate_with_backoff(
                 continue;
             }
             // Never hold the shared history lock across filesystem I/O.
-            match process(&path, config, bypass_age_gate, dry_run) {
+            match process(&path, config, dry_run) {
                 Ok(Outcome::Truncated(bytes)) => {
                     backoff.lock().succeeded(&key);
                     report.files_truncated += 1;
@@ -235,6 +291,26 @@ fn truncate_with_backoff(
 
     report.duration = start.elapsed();
     report
+}
+
+/// Inject a fixed pressure and per-file outcome into the retry-history tests.
+#[cfg(test)]
+fn truncate_with_backoff(
+    config: &LogTruncationConfig,
+    free_pct: f64,
+    dry_run: bool,
+    backoff: &Mutex<FailureBackoff>,
+    clock: impl Fn() -> Instant,
+    mut process: impl FnMut(&Path, &LogTruncationConfig, bool, bool) -> Result<Outcome, String>,
+) -> LogTruncationReport {
+    sweep_with_backoff(config, dry_run, backoff, clock, |path, config, dry_run| {
+        process(
+            path,
+            config,
+            pressure_bypasses_age(config, Some(free_pct)),
+            dry_run,
+        )
+    })
 }
 
 fn record_skip(report: &mut LogTruncationReport, path: PathBuf, reason: SkipReason) {
@@ -276,7 +352,7 @@ fn process_candidate_with_opener(
     process_candidate_with_history(
         path,
         config,
-        bypass_age_gate,
+        |_| bypass_age_gate,
         dry_run,
         open,
         recent,
@@ -289,7 +365,7 @@ fn process_candidate_with_opener(
 fn process_candidate_with_history(
     path: &Path,
     config: &LogTruncationConfig,
-    bypass_age_gate: bool,
+    bypass_age_gate: impl Fn(Option<&fs::File>) -> bool,
     dry_run: bool,
     open: impl FnOnce(&Path) -> Result<fs::File, String>,
     recent: &Mutex<RecentTruncations>,
@@ -297,7 +373,13 @@ fn process_candidate_with_history(
     authorize: &dyn Fn() -> bool,
 ) -> Result<Outcome, String> {
     let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if let Some(reason) = candidate_skip(&meta, config, bypass_age_gate)? {
+    // Refuse symlinks, special files, aliases and undersized logs before a
+    // capacity query can follow their path or touch another filesystem.
+    if let Some(reason) = candidate_skip(&meta, config, true)? {
+        return Ok(Outcome::Skipped(reason));
+    }
+    let initial_bypass = bypass_age_gate(None);
+    if let Some(reason) = candidate_skip(&meta, config, initial_bypass)? {
         return Ok(Outcome::Skipped(reason));
     }
     if dry_run {
@@ -313,7 +395,7 @@ fn process_candidate_with_history(
     if !same_file(&meta, &opened_meta) {
         return Ok(Outcome::Skipped(SkipReason::IdentityChanged));
     }
-    if let Some(reason) = candidate_skip(&opened_meta, config, bypass_age_gate)? {
+    if let Some(reason) = candidate_skip(&opened_meta, config, initial_bypass)? {
         return Ok(Outcome::Skipped(reason));
     }
     let Some(reservation) = RecentTruncations::acquire(recent, path, &opened_meta, clock()) else {
@@ -322,7 +404,7 @@ fn process_candidate_with_history(
     // A competing sweep may have finished between our first stat and this
     // reservation. Never credit its old size or truncate a now-small refill.
     let opened_meta = f.metadata().map_err(|e| e.to_string())?;
-    if let Some(reason) = candidate_skip(&opened_meta, config, bypass_age_gate)? {
+    if let Some(reason) = candidate_skip(&opened_meta, config, initial_bypass)? {
         return Ok(Outcome::Skipped(reason));
     }
     if let Some(previous_size) = reservation.previous_size()
@@ -331,6 +413,14 @@ fn process_candidate_with_history(
         // Dropping the reservation preserves the previous completion time.
         // A skipped attempt never extends the one-minute recovery window.
         return Ok(Outcome::Skipped(SkipReason::RecentTruncation));
+    }
+    // Refill inspection and native filesystem calls can take long enough for
+    // another reclaim operation to restore headroom. Refresh pressure first,
+    // then metadata, and finally the live policy immediately before set_len.
+    let bypass_age_gate = bypass_age_gate(Some(&f));
+    let opened_meta = f.metadata().map_err(|e| e.to_string())?;
+    if let Some(reason) = candidate_skip(&opened_meta, config, bypass_age_gate)? {
+        return Ok(Outcome::Skipped(reason));
     }
     let bytes = reclaimable_bytes(&opened_meta);
     // Metadata, opening and refill inspection can block. A sweep-start
@@ -731,7 +821,7 @@ mod tests {
         let result = process_candidate_with_history(
             &path,
             &config,
-            true,
+            |_| true,
             false,
             open_candidate_for_truncate,
             &recent,

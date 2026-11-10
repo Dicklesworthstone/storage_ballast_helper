@@ -38,7 +38,7 @@ fn revoked_authority_preserves_logs_before_open_and_after_blocking_work() {
         let result = process_candidate_with_history(
             &path,
             &config,
-            true,
+            |_| true,
             false,
             |path| {
                 opened.set(true);
@@ -84,7 +84,7 @@ fn authority_is_renewed_per_log_without_backing_off_revoked_paths() {
     log(&second);
     let config = config(&[first.clone(), second.clone()]);
     let checks = Cell::new(0);
-    let report = truncate_oversized_logs_guarded(&config, 0.0, false, &|| {
+    let report = truncate_oversized_logs_guarded(&config, false, &|| {
         let check = checks.get();
         checks.set(check + 1);
         check < 2 // Only the first file retains authority through mutation.
@@ -102,7 +102,7 @@ fn authority_is_renewed_per_log_without_backing_off_revoked_paths() {
 
     // A fresh approval works immediately: revocation is neither a failed
     // filesystem operation nor a successfully truncated inode.
-    let retry = truncate_oversized_logs_guarded(&config, 0.0, false, &|| true);
+    let retry = truncate_oversized_logs_guarded(&config, false, &|| true);
     assert_eq!(retry.files_truncated, 1);
     assert_eq!(fs::metadata(&second).unwrap().len(), 0);
 }
@@ -113,7 +113,7 @@ fn guarded_dry_run_inspects_without_requesting_mutation_authority() {
     let path = dir.path().join("observe.log");
     log(&path);
     let config = config(std::slice::from_ref(&path));
-    let report = truncate_oversized_logs_guarded(&config, 0.0, true, &|| {
+    let report = truncate_oversized_logs_guarded(&config, true, &|| {
         panic!("inspection must not request mutation authority")
     });
     assert!(report.dry_run);
@@ -121,6 +121,220 @@ fn guarded_dry_run_inspects_without_requesting_mutation_authority() {
     assert_eq!(report.bytes_reclaimed, 0);
     assert_eq!(report.files_would_truncate, 1);
     assert_eq!(fs::read(&path).unwrap(), vec![b'x'; 4096]);
+}
+
+#[test]
+fn age_exceptions_belong_to_each_logs_own_filesystem() {
+    for dry_run in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let pressured = dir.path().join("pressured.log");
+        let healthy = dir.path().join("healthy.log");
+        log(&pressured);
+        log(&healthy);
+        let mut config = config(&[pressured.clone(), healthy.clone()]);
+        config.min_age_minutes = 60;
+        let descriptor_checks = Cell::new(0);
+        let report = truncate_with_age_gate(&config, dry_run, &|| true, &|path, opened| {
+            if let Some(file) = opened {
+                descriptor_checks.set(descriptor_checks.get() + 1);
+                assert_eq!(
+                    file.metadata().unwrap().ino(),
+                    fs::metadata(path).unwrap().ino(),
+                    "renew pressure for the descriptor whose contents will change"
+                );
+            }
+            let free_pct = if path == pressured { 0.0 } else { 80.0 };
+            pressure_bypasses_age(&config, Some(free_pct))
+        });
+        assert!(report.errors.is_empty());
+        assert_eq!(
+            report.skipped_with_reason,
+            vec![(healthy.clone(), SkipReason::YoungerThanMinAge)]
+        );
+        assert_eq!(fs::read(&healthy).unwrap(), vec![b'x'; 4096]);
+        if dry_run {
+            assert_eq!(report.files_would_truncate, 1);
+            assert_eq!(report.files_truncated, 0);
+            assert_eq!(descriptor_checks.get(), 0);
+            assert_eq!(fs::read(&pressured).unwrap(), vec![b'x'; 4096]);
+        } else {
+            assert_eq!(report.files_truncated, 1);
+            assert_eq!(report.bytes_reclaimed, 4096);
+            assert_eq!(descriptor_checks.get(), 1);
+            assert_eq!(fs::metadata(&pressured).unwrap().len(), 0);
+        }
+    }
+}
+
+#[test]
+fn recovered_pressure_preserves_young_logs_through_blocking_work_without_backoff() {
+    for recover_at in ["open", "reservation", "final observation"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovering.log");
+        log(&path);
+        let mut config = config(std::slice::from_ref(&path));
+        config.min_age_minutes = 60;
+        let recent = Mutex::new(RecentTruncations::default());
+        let free_pct = Cell::new(0.0);
+        let now = Instant::now();
+        let result = process_candidate_with_history(
+            &path,
+            &config,
+            |opened| {
+                if opened.is_some() && recover_at == "final observation" {
+                    free_pct.set(80.0);
+                }
+                pressure_bypasses_age(&config, Some(free_pct.get()))
+            },
+            false,
+            |path| {
+                let file = open_candidate_for_truncate(path)?;
+                if recover_at == "open" {
+                    free_pct.set(80.0);
+                }
+                Ok(file)
+            },
+            &recent,
+            || {
+                if recover_at == "reservation" {
+                    free_pct.set(80.0);
+                }
+                now
+            },
+            &|| true,
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            Outcome::Skipped(SkipReason::YoungerThanMinAge)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), vec![b'x'; 4096], "{recover_at}");
+        let metadata = fs::metadata(&path).unwrap();
+        let reservation = RecentTruncations::acquire(&recent, &path, &metadata, now)
+            .expect("recovery releases the in-flight reservation");
+        assert_eq!(
+            reservation.previous_size(),
+            None,
+            "no false success receipt"
+        );
+        drop(reservation);
+
+        let retry = process_candidate_with_history(
+            &path,
+            &config,
+            |_| pressure_bypasses_age(&config, Some(0.0)),
+            false,
+            open_candidate_for_truncate,
+            &recent,
+            || now,
+            &|| true,
+        )
+        .unwrap();
+        assert!(matches!(retry, Outcome::Truncated(4096)), "{recover_at}");
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    }
+}
+
+#[test]
+fn unknown_or_invalid_local_pressure_keeps_retention_without_blocking_aged_logs() {
+    for free_pct in [
+        None,
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        Some(-1.0),
+        Some(101.0),
+    ] {
+        for aged in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("unknown.log");
+            log(&path);
+            if aged {
+                let old = SystemTime::now() - Duration::from_secs(7200);
+                filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(old)).unwrap();
+            }
+            let mut config = config(std::slice::from_ref(&path));
+            config.min_age_minutes = 60;
+            let report = truncate_with_age_gate(&config, false, &|| true, &|_, opened| {
+                // The file was admitted under pressure, but the descriptor's
+                // final observation failed or was invalid.
+                pressure_bypasses_age(
+                    &config,
+                    if opened.is_none() {
+                        Some(0.0)
+                    } else {
+                        free_pct
+                    },
+                )
+            });
+            assert!(report.errors.is_empty());
+            assert_eq!(report.files_truncated, usize::from(aged), "{free_pct:?}");
+            if aged {
+                assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+            } else {
+                assert_eq!(report.bytes_reclaimed, 0);
+                assert_eq!(fs::read(&path).unwrap(), vec![b'x'; 4096]);
+                // A normal retry must not inherit an I/O-failure cooldown.
+                let retry = truncate_oversized_logs(&config, 0.0, false);
+                assert_eq!(retry.files_truncated, 1, "{free_pct:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn live_authority_is_renewed_after_the_final_filesystem_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("revoked-during-pressure.log");
+    log(&path);
+    let mut config = config(std::slice::from_ref(&path));
+    config.min_age_minutes = 60;
+    let allowed = Cell::new(true);
+    let report = truncate_with_age_gate(&config, false, &|| allowed.get(), &|_, opened| {
+        if opened.is_some() {
+            allowed.set(false);
+        }
+        pressure_bypasses_age(&config, Some(0.0))
+    });
+    assert_eq!(report.files_truncated, 0);
+    assert_eq!(report.bytes_reclaimed, 0);
+    assert_eq!(
+        report.skipped_with_reason,
+        vec![(path.clone(), SkipReason::PolicyChanged)]
+    );
+    assert_eq!(fs::read(&path).unwrap(), vec![b'x'; 4096]);
+}
+
+#[test]
+fn explicitly_disabled_age_gates_do_not_need_pressure_evidence() {
+    for (minimum_age, ceiling) in [(0, 15), (60, 100)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unconditional.log");
+        log(&path);
+        let mut config = config(std::slice::from_ref(&path));
+        config.min_age_minutes = minimum_age;
+        config.pressure_free_pct_ceiling = ceiling;
+        let report = truncate_with_age_gate(&config, false, &|| true, &|_, _| {
+            pressure_bypasses_age(&config, None)
+        });
+        assert_eq!(report.files_truncated, 1);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    }
+}
+
+#[test]
+fn final_filesystem_pressure_comes_from_the_open_descriptor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("renamed.log");
+    let moved = dir.path().join("moved.log");
+    log(&path);
+    let file = fs::File::open(&path).unwrap();
+    fs::rename(&path, &moved).unwrap();
+    assert_eq!(filesystem_free_pct(&path, None), None);
+    assert!(filesystem_free_pct(&path, Some(&file)).is_some());
+    assert_eq!(
+        file.metadata().unwrap().ino(),
+        fs::metadata(&moved).unwrap().ino()
+    );
 }
 
 #[test]

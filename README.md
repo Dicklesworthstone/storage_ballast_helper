@@ -1900,6 +1900,12 @@ Automatic log truncation requires Enforce mode. Observe, Canary, FallbackSafe
 without truncating logs. The daemon rechecks live policy and configuration before
 each mutation, so a reload or policy demotion revokes an in-flight sweep.
 
+The automatic age exception uses each log's own filesystem free percentage
+against `pressure_free_pct_ceiling`. It is renewed on the verified open file
+immediately before truncation. A queued scan's old pressure, or a full tmpfs
+on another mount, cannot shorten `min_age_minutes`. If local pressure recovers
+or cannot be established, ordinary age-qualified maintenance remains eligible.
+
 Source: `src/scanner/log_truncator.rs`
 
 ### Guardrails and Drift Detection

@@ -3815,7 +3815,6 @@ fn compress_tier_may_run(config: &Config, mode: ActiveMode) -> bool {
 /// each mutation boundary so a blocking open cannot outlive a stop request.
 fn truncate_daemon_logs(
     config: &ScannerConfig,
-    free_pct: f64,
     shared_scanner_config: &RwLock<ScannerConfig>,
     executor_config: &SharedExecutorConfig,
     policy_engine: &Mutex<PolicyEngine>,
@@ -3826,7 +3825,6 @@ fn truncate_daemon_logs(
         || policy_engine.lock().mode() != ActiveMode::Enforce;
     crate::scanner::log_truncator::truncate_oversized_logs_guarded(
         &config.log_truncation,
-        free_pct,
         dry_run,
         &|| {
             if shutdown.load(Ordering::Relaxed) || executor_config.dry_run.load(Ordering::Relaxed) {
@@ -3841,21 +3839,6 @@ fn truncate_daemon_logs(
             policy_engine.lock().mode() == ActiveMode::Enforce
         },
     )
-}
-
-fn fallback_log_truncation_free_pct(pressure_level: PressureLevel) -> f64 {
-    match pressure_level {
-        PressureLevel::Green | PressureLevel::Yellow => 100.0,
-        PressureLevel::Orange => 10.0,
-        PressureLevel::Red | PressureLevel::Critical => 0.0,
-    }
-}
-
-fn log_truncation_free_pct_for_request(request: &ScanRequest) -> f64 {
-    request
-        .free_pct
-        .filter(|pct| pct.is_finite())
-        .unwrap_or_else(|| fallback_log_truncation_free_pct(request.pressure_level))
 }
 
 /// Which of a pass's limits stopped it.
@@ -10571,17 +10554,15 @@ fn scanner_thread_main(
         // executor would otherwise prevent recovery of these files — the failure
         // mode that drove css/ts2/trj to 99% disk on 2026-05-13. Cheap when the
         // policy is disabled (just an enabled-check) so it's safe to call every
-        // scan cycle. Uses the actual triggering free-pct when available so
-        // the policy's pressure_free_pct_ceiling gate keeps its configured
-        // meaning across Yellow/Orange boundary conditions.
+        // scan cycle. The truncator samples each log's own filesystem and
+        // renews pressure on its open descriptor before shortening retention;
+        // another mount's pressure or a queued request is not that evidence.
         if current_scanner_config.log_truncation.enabled
             && !request.has_resource_reclaim()
             && request.scan_now.is_none()
         {
-            let truncation_free_pct = log_truncation_free_pct_for_request(&request);
             let trunc_report = truncate_daemon_logs(
                 &current_scanner_config,
-                truncation_free_pct,
                 shared_scanner_config,
                 executor_config,
                 policy_engine,
@@ -13970,7 +13951,7 @@ mod tests {
             let executor = SharedExecutorConfig::new(false, 10, 0.0, 60, 3600, false, 0);
             let policy = Mutex::new(PolicyEngine::new(PolicyConfig::default()));
             let shutdown = AtomicBool::new(change == "shutdown");
-            let report = truncate_daemon_logs(&scanner, 0.0, &live, &executor, &policy, &shutdown);
+            let report = truncate_daemon_logs(&scanner, &live, &executor, &policy, &shutdown);
             assert_eq!(report.files_truncated, 0, "{change}");
             assert_eq!(report.bytes_reclaimed, 0, "{change}");
             assert_eq!(std::fs::read(&log).unwrap(), contents, "{change}");
@@ -13978,7 +13959,7 @@ mod tests {
 
             *live.write() = scanner.clone();
             shutdown.store(false, Ordering::Relaxed);
-            let retry = truncate_daemon_logs(&scanner, 0.0, &live, &executor, &policy, &shutdown);
+            let retry = truncate_daemon_logs(&scanner, &live, &executor, &policy, &shutdown);
             assert_eq!(retry.files_truncated, 1, "{change}: no failure cooldown");
         }
     }
@@ -25947,56 +25928,84 @@ mod tests {
         assert_eq!(request.free_pct, Some(8.5));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn fallback_log_truncation_free_pct_is_conservative_before_orange() {
-        assert_eq!(
-            fallback_log_truncation_free_pct(PressureLevel::Green).to_bits(),
-            100.0_f64.to_bits()
-        );
-        assert_eq!(
-            fallback_log_truncation_free_pct(PressureLevel::Yellow).to_bits(),
-            100.0_f64.to_bits()
-        );
-        assert_eq!(
-            fallback_log_truncation_free_pct(PressureLevel::Orange).to_bits(),
-            10.0_f64.to_bits()
-        );
-        assert_eq!(
-            fallback_log_truncation_free_pct(PressureLevel::Critical).to_bits(),
-            0.0_f64.to_bits()
-        );
-    }
+    fn scanner_log_retention_ignores_another_mounts_pressure_and_stale_requests() {
+        for (trigger, pressure_level, free_pct) in [
+            ("special-location", PressureLevel::Red, Some(0.0)),
+            ("queued-critical", PressureLevel::Critical, Some(0.0)),
+            ("missing-capacity", PressureLevel::Critical, None),
+        ] {
+            let mut fixture = RegretDaemonFixture::new();
+            let young = fixture.directory.path().join("active.log");
+            let aged = fixture.directory.path().join("aged.log");
+            let contents = vec![b'x'; 4096];
+            std::fs::write(&young, &contents).unwrap();
+            std::fs::write(&aged, &contents).unwrap();
+            let old = SystemTime::now() - Duration::from_secs(7200);
+            filetime::set_file_mtime(&aged, filetime::FileTime::from_system_time(old)).unwrap();
+            let daemon = &mut fixture.daemon;
+            daemon.config.scanner.log_truncation = crate::core::config::LogTruncationConfig {
+                enabled: true,
+                paths: vec![young.display().to_string(), aged.display().to_string()],
+                min_size_bytes: 1024,
+                // Only an actually exhausted log filesystem can shorten
+                // retention, whatever pressure the queued scan carries.
+                pressure_free_pct_ceiling: 0,
+                min_age_minutes: 60,
+            };
+            *daemon.shared_scanner_config.write() = daemon.config.scanner.clone();
+            let (scan_tx, scan_rx) = bounded(1);
+            let (del_tx, _del_rx) = bounded(4);
+            let (report_tx, report_rx) = bounded(4);
+            let (_feedback_tx, feedback_rx) = bounded(4);
+            let worker = daemon
+                .spawn_scanner_thread(
+                    scan_rx,
+                    del_tx,
+                    daemon.logger_handle.clone(),
+                    ThreadHeartbeat::new("log-retention-test"),
+                    report_tx,
+                    feedback_rx,
+                )
+                .unwrap();
+            scan_tx
+                .send(ScanRequest {
+                    paths: daemon.config.scanner.root_paths.clone(),
+                    urgency: 1.0,
+                    pressure_level,
+                    free_pct,
+                    max_delete_batch: 1,
+                    force_full_scan: true,
+                    scan_now: None,
+                    inode_reclaim: None,
+                    config_update: None,
+                    catalog_roots: Vec::new(),
+                    maintenance: false,
+                    target_bytes: None,
+                    ram_reclaim: None,
+                })
+                .unwrap();
+            drop(scan_tx);
+            worker.join().unwrap();
+            assert!(report_rx.try_recv().is_ok(), "{trigger}: the scan must run");
+            assert_eq!(std::fs::read(&young).unwrap(), contents, "{trigger}");
+            assert_eq!(
+                std::fs::metadata(&aged).unwrap().len(),
+                0,
+                "{trigger}: routine age-qualified maintenance still works"
+            );
 
-    #[test]
-    fn log_truncation_free_pct_prefers_actual_scan_pressure() {
-        let request = ScanRequest {
-            paths: vec![PathBuf::from("/tmp")],
-            urgency: 0.4,
-            pressure_level: PressureLevel::Yellow,
-            free_pct: Some(18.0),
-            max_delete_batch: 0,
-            force_full_scan: false,
-            scan_now: None,
-            inode_reclaim: None,
-            config_update: None,
-            catalog_roots: Vec::new(),
-            maintenance: false,
-            target_bytes: None,
-            ram_reclaim: None,
-        };
-        assert_eq!(
-            log_truncation_free_pct_for_request(&request).to_bits(),
-            18.0_f64.to_bits()
-        );
-
-        let missing_free_pct = ScanRequest {
-            free_pct: None,
-            ..request
-        };
-        assert_eq!(
-            log_truncation_free_pct_for_request(&missing_free_pct).to_bits(),
-            100.0_f64.to_bits()
-        );
+            // The explicit CLI API still accepts the caller's pressure. The
+            // automatic refusal did not create an I/O-failure retry penalty.
+            let manual = crate::scanner::log_truncator::truncate_oversized_logs(
+                &daemon.config.scanner.log_truncation,
+                0.0,
+                false,
+            );
+            assert_eq!(manual.files_truncated, 1, "{trigger}");
+            assert_eq!(std::fs::metadata(&young).unwrap().len(), 0);
+        }
     }
 
     #[test]

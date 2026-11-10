@@ -26,7 +26,7 @@ fn run(
     process_candidate_with_history(
         path,
         config,
-        true,
+        |_| true,
         dry_run,
         open_candidate_for_truncate,
         history,
@@ -205,7 +205,7 @@ fn failed_truncation_releases_its_reservation_without_recording_success() {
     let failed = process_candidate_with_history(
         &path,
         &config,
-        true,
+        |_| true,
         false,
         |path| fs::File::open(path).map_err(|error| error.to_string()),
         &history,
@@ -276,7 +276,7 @@ fn a_file_shrunk_before_reservation_is_rechecked_without_crediting_old_bytes() {
     let result = process_candidate_with_history(
         &path,
         &config,
-        true,
+        |_| true,
         false,
         open_candidate_for_truncate,
         &history,
@@ -309,7 +309,7 @@ fn a_file_refreshed_before_reservation_still_obeys_the_age_gate() {
     let result = process_candidate_with_history(
         &path,
         &config,
-        false,
+        |_| false,
         false,
         open_candidate_for_truncate,
         &history,

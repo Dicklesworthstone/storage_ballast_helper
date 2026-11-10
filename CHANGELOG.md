@@ -8,6 +8,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Automatic log truncation renews each file's own pressure evidence.**
+  A young log no longer loses its retention window because a queued scan
+  captured low free space or a different filesystem filled up. The daemon
+  checks local capacity and renews it on the verified open descriptor before
+  truncation, then checks live policy again. Recovered or unavailable pressure
+  preserves the age rule; age-qualified maintenance remains available.
+
 - **Cleanup renews live permission after its final recursive inspection.**
   A policy demotion, dry-run change, shutdown, or recovered free-space goal
   can now hold a candidate after the executor finishes inspecting its

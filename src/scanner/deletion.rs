@@ -1173,21 +1173,18 @@ impl DeletionExecutor {
                 }
                 Ok(())
             };
-            let metadata = match self.check_before_mutation(
-                candidate,
-                &mut sacred,
-                Some(&renew_authority),
-            ) {
-                Ok(metadata) => metadata,
-                Err(reason) => {
-                    report.record_skip(reason);
-                    consecutive_failures = 0;
-                    if should_backoff_skip(reason) {
-                        report.backoff_candidates.push(candidate.clone());
+            let metadata =
+                match self.check_before_mutation(candidate, &mut sacred, Some(&renew_authority)) {
+                    Ok(metadata) => metadata,
+                    Err(reason) => {
+                        report.record_skip(reason);
+                        consecutive_failures = 0;
+                        if should_backoff_skip(reason) {
+                            report.backoff_candidates.push(candidate.clone());
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
+                };
 
             if self.config.dry_run {
                 report.items_would_delete += 1;
