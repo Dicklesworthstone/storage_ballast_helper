@@ -10,7 +10,7 @@
 //! safe namespace: an unlink identity check is not an atomic compare-and-unlink.
 //! Pool directories and the platform implementation remain trust boundaries.
 
-use super::BallastManager;
+use super::{BallastManager, ProvisionControl};
 use crate::core::errors::{Result, SbhError};
 
 /// A new slot of the full length whose blocks do not cover it. Whatever the
@@ -36,14 +36,18 @@ pub(super) fn is_underallocated(error: &SbhError) -> bool {
     false
 }
 
-pub(super) fn create(manager: &BallastManager, index: u32) -> Result<()> {
+pub(super) fn create(
+    manager: &BallastManager,
+    index: u32,
+    control: Option<ProvisionControl<'_>>,
+) -> Result<()> {
     #[cfg(unix)]
     {
-        unix::create_with(manager, index, unix::prepare)
+        unix::create_with_guarded(manager, index, control, unix::prepare_guarded)
     }
     #[cfg(not(unix))]
     {
-        let _ = (manager, index);
+        let _ = (manager, index, control);
         Err(SbhError::UnsupportedPlatform {
             details:
                 "safe ballast creation requires Unix descriptor-relative filesystem operations"
@@ -63,7 +67,8 @@ mod unix {
     use rustix::fs::{AtFlags, Mode, OFlags, openat, statat, unlinkat};
 
     use super::super::{
-        HEADER_SIZE, ballast_file_name, ballast_header_buffer, is_storage_exhausted_error,
+        AllocationGuard, HEADER_SIZE, ProvisionControl, ballast_file_name, ballast_header_buffer,
+        is_storage_exhausted_error,
     };
     use crate::platform::types::PalError;
 
@@ -185,10 +190,28 @@ mod unix {
         }
     }
 
-    pub(super) fn create_with(
+    #[cfg(test)]
+    fn create_with(
         manager: &BallastManager,
         index: u32,
         prepare: impl FnOnce(&BallastManager, &mut File, &Path, u64) -> Result<Reserve>,
+    ) -> Result<()> {
+        create_with_guarded(manager, index, None, |manager, file, path, size, _| {
+            prepare(manager, file, path, size)
+        })
+    }
+
+    pub(super) fn create_with_guarded(
+        manager: &BallastManager,
+        index: u32,
+        control: Option<ProvisionControl<'_>>,
+        prepare: impl FnOnce(
+            &BallastManager,
+            &mut File,
+            &Path,
+            u64,
+            Option<&AllocationGuard<'_>>,
+        ) -> Result<Reserve>,
     ) -> Result<()> {
         let size = manager.config.file_size_bytes;
         if size < HEADER_SIZE as u64 {
@@ -199,17 +222,40 @@ mod unix {
         let header = ballast_header_buffer(index, size)?;
         let path = manager.file_path(index);
         let io = |error| SbhError::io(&path, error);
+        if let Some(control) = control {
+            control.check(&path)?;
+        }
         let mut slot = NewSlot::open(manager, index).map_err(io)?;
+        let guard = control
+            .map(|control| {
+                Ok::<_, SbhError>(AllocationGuard {
+                    control,
+                    pool: slot.pool.metadata().map_err(io)?,
+                    initial: slot.identity.clone(),
+                })
+            })
+            .transpose()?;
         // Persist the ordinary slot name before allocation. An interrupted
         // process leaves discoverable reserve, never a hidden staging pool.
         slot.pool.sync_all().map_err(io)?;
-        let reserve = prepare(manager, &mut slot.file, &path, size)?;
+        let reserve = prepare(manager, &mut slot.file, &path, size, guard.as_ref())?;
         slot.current().map_err(io)?;
+        if let Some(guard) = &guard {
+            let header_cost = if reserve == Reserve::Written {
+                HEADER_SIZE as u64
+            } else {
+                0
+            };
+            guard.renew(manager, &slot.file, &path, header_cost)?;
+        }
         slot.file.seek(SeekFrom::Start(0)).map_err(io)?;
         slot.file.write_all(&header).map_err(io)?;
         slot.file.set_len(size).map_err(io)?;
         slot.file.sync_all().map_err(io)?;
         slot.current().map_err(io)?;
+        if let Some(guard) = &guard {
+            guard.renew(manager, &slot.file, &path, 0)?;
+        }
         let metadata = slot.file.metadata().map_err(io)?;
         // ZFS charges a file's blocks when its transaction group syncs, which
         // can be seconds after fsync returns. A block count read here is then
@@ -226,6 +272,9 @@ mod unix {
         }
         slot.pool.sync_all().map_err(io)?;
         slot.current().map_err(io)?;
+        if let Some(guard) = &guard {
+            guard.renew(manager, &slot.file, &path, 0)?;
+        }
         slot.committed = true;
         Ok(())
     }
@@ -262,12 +311,26 @@ mod unix {
         }
     }
 
-    pub(super) fn prepare(
+    #[cfg(test)]
+    fn prepare(
         manager: &BallastManager,
         file: &mut File,
         path: &Path,
         size: u64,
     ) -> Result<Reserve> {
+        prepare_guarded(manager, file, path, size, None)
+    }
+
+    pub(super) fn prepare_guarded(
+        manager: &BallastManager,
+        file: &mut File,
+        path: &Path,
+        size: u64,
+        guard: Option<&AllocationGuard<'_>>,
+    ) -> Result<Reserve> {
+        if let Some(guard) = guard {
+            guard.renew(manager, file, path, size)?;
+        }
         if !manager.skip_fallocate {
             match manager.platform.preallocate_open_file(file, path, size) {
                 Ok(()) => {
@@ -286,7 +349,7 @@ mod unix {
         }
         file.seek(SeekFrom::Start(HEADER_SIZE as u64))
             .map_err(|error| SbhError::io(path, error))?;
-        manager.write_random_data(file, size - HEADER_SIZE as u64, path)?;
+        manager.write_random_data_guarded(file, size - HEADER_SIZE as u64, path, guard)?;
         Ok(Reserve::Written)
     }
 
@@ -331,6 +394,40 @@ mod unix {
                 assert!(allocated(&metadata, SIZE));
                 assert_eq!(manager.verify().unwrap().files_ok, 1);
                 assert_eq!(manager.release(1).unwrap().bytes_freed, SIZE);
+            }
+        }
+
+        #[test]
+        fn revocation_while_allocation_finishes_prevents_header_publication() {
+            for random in [false, true] {
+                let (_temp, mut manager) = fixture();
+                manager.set_skip_fallocate(random);
+                let allowed = std::cell::Cell::new(true);
+                let still_allowed = || allowed.get();
+                let control = ProvisionControl {
+                    still_allowed: &still_allowed,
+                    free_pct_check: None,
+                };
+                let result = create_with_guarded(
+                    &manager,
+                    1,
+                    Some(control),
+                    |manager, file, path, size, guard| {
+                        let reserve = prepare_guarded(manager, file, path, size, guard)?;
+                        // The kernel call may return after a policy/recovery
+                        // transition. Its success is not renewed permission.
+                        allowed.set(false);
+                        Ok(reserve)
+                    },
+                );
+                assert!(matches!(
+                    result,
+                    Err(SbhError::Io { source, .. }) if source.kind() == io::ErrorKind::Interrupted
+                ));
+                assert!(!manager.file_path(1).exists());
+                allowed.set(true);
+                create_with_guarded(&manager, 1, Some(control), prepare_guarded).unwrap();
+                assert!(manager.verify_single_file(&manager.file_path(1), 1).is_ok());
             }
         }
 

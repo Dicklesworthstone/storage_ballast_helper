@@ -11,16 +11,21 @@
 //! file size against live headroom (including possible CoW allocation). No
 //! temporary reserve or hidden recovery file is created.
 
-use super::BallastManager;
+use super::{BallastManager, ProvisionControl};
 use crate::core::errors::{Result, SbhError};
 
-pub(super) fn existing(manager: &BallastManager, index: u32) -> Result<bool> {
+pub(super) fn existing(
+    manager: &BallastManager,
+    index: u32,
+    control: Option<ProvisionControl<'_>>,
+) -> Result<bool> {
     #[cfg(unix)]
     {
-        unix::repair_with(manager, index, unix::prepare_storage)
+        unix::repair_with_guarded(manager, index, control, unix::prepare_storage)
     }
     #[cfg(not(unix))]
     {
+        let _ = control;
         let path = manager.file_path(index);
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -42,7 +47,9 @@ mod unix {
 
     use rustix::fs::OFlags;
 
-    use super::super::{HEADER_SIZE, ballast_file_name, ballast_header_buffer};
+    use super::super::{
+        AllocationGuard, HEADER_SIZE, ProvisionControl, ballast_file_name, ballast_header_buffer,
+    };
 
     fn invalid(message: &str) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, message)
@@ -81,10 +88,28 @@ mod unix {
     // The production allocator and deterministic failure injections use the
     // same open/identity/finalization boundary. A preparation error never enters
     // the shrinking/header-finalization path and never invokes unlink cleanup.
-    pub(super) fn repair_with(
+    #[cfg(test)]
+    fn repair_with(
         manager: &BallastManager,
         index: u32,
         prepare: impl FnOnce(&BallastManager, &mut File, &Path, u64) -> Result<()>,
+    ) -> Result<bool> {
+        repair_with_guarded(manager, index, None, |manager, file, path, size, _| {
+            prepare(manager, file, path, size)
+        })
+    }
+
+    pub(super) fn repair_with_guarded(
+        manager: &BallastManager,
+        index: u32,
+        control: Option<ProvisionControl<'_>>,
+        prepare: impl FnOnce(
+            &BallastManager,
+            &mut File,
+            &Path,
+            u64,
+            Option<&AllocationGuard<'_>>,
+        ) -> Result<()>,
     ) -> Result<bool> {
         let path = manager.file_path(index);
         let size = manager.config.file_size_bytes;
@@ -130,15 +155,26 @@ mod unix {
             return Err(io(invalid("ballast changed before repair started")));
         }
 
-        prepare(manager, &mut file, &path, size)?;
+        let guard = control.map(|control| AllocationGuard {
+            control,
+            pool: pool_meta.clone(),
+            initial: before.clone(),
+        });
+        prepare(manager, &mut file, &path, size, guard.as_ref())?;
         file.sync_all().map_err(io)?;
         current(manager, &path, &pool_meta, &file, &before).map_err(io)?;
+        if let Some(guard) = &guard {
+            guard.renew(manager, &file, &path, HEADER_SIZE as u64)?;
+        }
         // Write a complete new header only after storage preparation succeeds.
         // A failed or interrupted header write still leaves the reserve linked.
         file.seek(SeekFrom::Start(0)).map_err(io)?;
         file.write_all(&header).map_err(io)?;
         file.sync_all().map_err(io)?;
         current(manager, &path, &pool_meta, &file, &before).map_err(io)?;
+        if let Some(guard) = &guard {
+            guard.renew(manager, &file, &path, 0)?;
+        }
         // Shrink an oversized slot only at the end, never before replacement
         // allocation/writes succeed. Failure after this point retains at least
         // the requested logical length, not necessarily the old larger length.
@@ -151,6 +187,9 @@ mod unix {
                 details: format!("repaired ballast failed verification: {details}"),
             })?;
         current(manager, &path, &pool_meta, &file, &before).map_err(io)?;
+        if let Some(guard) = &guard {
+            guard.renew(manager, &file, &path, 0)?;
+        }
         Ok(true)
     }
 
@@ -159,7 +198,11 @@ mod unix {
         file: &mut File,
         path: &Path,
         size: u64,
+        guard: Option<&AllocationGuard<'_>>,
     ) -> Result<()> {
+        if let Some(guard) = guard {
+            guard.renew(manager, file, path, size)?;
+        }
         #[cfg(target_os = "linux")]
         if !manager.skip_fallocate {
             use rustix::fs::{FallocateFlags, fallocate};
@@ -184,7 +227,7 @@ mod unix {
         // Rewriting the full data range also fills holes in sparse reserves.
         file.seek(SeekFrom::Start(HEADER_SIZE as u64))
             .map_err(|error| SbhError::io(path, error))?;
-        manager.write_random_data(file, size - HEADER_SIZE as u64, path)
+        manager.write_random_data_guarded(file, size - HEADER_SIZE as u64, path, guard)
     }
 
     #[cfg(test)]
@@ -273,6 +316,48 @@ mod unix {
             assert!(result.is_err());
             assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
             assert_eq!(fs::read(&path).unwrap(), before);
+        }
+
+        #[test]
+        fn revocation_after_repair_allocation_preserves_the_old_header_and_inode() {
+            for random in [false, true] {
+                let (_temp, mut manager, path) = fixture();
+                manager.set_skip_fallocate(random);
+                corrupt_header(&path);
+                let before = fs::metadata(&path).unwrap();
+                let mut header = [0; HEADER_SIZE];
+                File::open(&path).unwrap().read_exact(&mut header).unwrap();
+                let allowed = std::cell::Cell::new(true);
+                let still_allowed = || allowed.get();
+                let control = ProvisionControl {
+                    still_allowed: &still_allowed,
+                    free_pct_check: None,
+                };
+                let result = repair_with_guarded(
+                    &manager,
+                    1,
+                    Some(control),
+                    |manager, file, path, size, guard| {
+                        prepare_storage(manager, file, path, size, guard)?;
+                        allowed.set(false);
+                        Ok(())
+                    },
+                );
+                assert!(matches!(
+                    result,
+                    Err(SbhError::Io { source, .. }) if source.kind() == io::ErrorKind::Interrupted
+                ));
+                let after = fs::metadata(&path).unwrap();
+                assert_eq!(after.ino(), before.ino());
+                assert_eq!(after.len(), before.len());
+                let mut retained = [0; HEADER_SIZE];
+                File::open(&path)
+                    .unwrap()
+                    .read_exact(&mut retained)
+                    .unwrap();
+                assert_eq!(retained, header);
+                assert_eq!(manager.release(1).unwrap().bytes_freed, SIZE);
+            }
         }
 
         #[test]

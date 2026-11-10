@@ -469,6 +469,103 @@ enum Admission {
     Refuse { free_pct_after: f64, floor_pct: f64 },
 }
 
+/// Cooperative authority for a daemon refill. The callbacks are evaluated on
+/// its worker, including after filesystem calls which may have blocked.
+#[derive(Clone, Copy)]
+struct ProvisionControl<'a> {
+    still_allowed: &'a dyn Fn() -> bool,
+    free_pct_check: Option<&'a dyn Fn() -> f64>,
+}
+
+impl ProvisionControl<'_> {
+    fn check(self, path: &Path) -> Result<()> {
+        if (self.still_allowed)() {
+            Ok(())
+        } else {
+            Err(SbhError::io(
+                path,
+                std::io::Error::new(ErrorKind::Interrupted, "ballast replenishment cancelled"),
+            ))
+        }
+    }
+}
+
+/// Identity captured before storage preparation, never re-bound by a later
+/// probe. A still-authorized worker must also stop when its slot or pool moves.
+struct AllocationGuard<'a> {
+    control: ProvisionControl<'a>,
+    pool: fs::Metadata,
+    initial: fs::Metadata,
+}
+
+impl AllocationGuard<'_> {
+    #[cfg(unix)]
+    fn check_identity(&self, manager: &BallastManager, file: &File, path: &Path) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let io = |error| SbhError::io(path, error);
+        let pool = fs::symlink_metadata(&manager.ballast_dir).map_err(io)?;
+        let named = fs::symlink_metadata(path).map_err(io)?;
+        let opened = file.metadata().map_err(io)?;
+        let same = |left: &fs::Metadata, right: &fs::Metadata| {
+            left.dev() == right.dev() && left.ino() == right.ino()
+        };
+        if !pool.is_dir()
+            || !same(&self.pool, &pool)
+            || !named.is_file()
+            || !opened.is_file()
+            || named.nlink() != 1
+            || opened.nlink() != 1
+            || opened.dev() != self.pool.dev()
+            || !same(&self.initial, &named)
+            || !same(&self.initial, &opened)
+        {
+            return Err(io(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "ballast slot or pool changed during replenishment",
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn check_identity(&self, _manager: &BallastManager, _file: &File, path: &Path) -> Result<()> {
+        Err(SbhError::io(
+            path,
+            std::io::Error::new(
+                ErrorKind::Unsupported,
+                "guarded ballast replenishment requires Unix file identities",
+            ),
+        ))
+    }
+
+    fn renew(
+        &self,
+        manager: &BallastManager,
+        file: &File,
+        path: &Path,
+        remaining_bytes: u64,
+    ) -> Result<()> {
+        self.control.check(path)?;
+        self.check_identity(manager, file, path)?;
+        let headroom =
+            admission::check_remaining(manager, self.control.free_pct_check, remaining_bytes)?;
+        // A slow capacity/identity probe cannot renew revoked authority.
+        self.check_identity(manager, file, path)?;
+        self.control.check(path)?;
+        if matches!(headroom, Admission::Refuse { .. }) {
+            return Err(SbhError::io(
+                path,
+                std::io::Error::new(
+                    ErrorKind::Interrupted,
+                    "ballast replenishment stopped at the live headroom floor",
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl BallastManager {
     /// Create a new manager for the given directory and configuration.
     pub fn new(ballast_dir: PathBuf, config: BallastConfig) -> Result<Self> {
@@ -498,6 +595,21 @@ impl BallastManager {
         };
         mgr.scan_existing();
         Ok(mgr)
+    }
+
+    /// Take the worker's starting view without probing or locking the disk.
+    /// The coordinator must reject late completion after its pool changes or
+    /// an emergency release updates the original inventory.
+    pub(crate) fn worker_snapshot(&self) -> Self {
+        Self {
+            ballast_dir: self.ballast_dir.clone(),
+            config: self.config.clone(),
+            inventory: self.inventory.clone(),
+            platform: Arc::clone(&self.platform),
+            skip_fallocate: self.skip_fallocate,
+            provision_floor: self.provision_floor,
+            release_history: self.release_history,
+        }
     }
 
     /// Files in the pool directory whose index is outside `1..=file_count`
@@ -729,7 +841,7 @@ impl BallastManager {
                 }
             }
 
-            match self.create_ballast_file(index) {
+            match self.create_ballast_file(index, None) {
                 Ok(()) => {
                     report.files_created += 1;
                     let actual_size =
@@ -841,7 +953,40 @@ impl BallastManager {
         &mut self,
         free_pct_check: Option<&dyn Fn() -> f64>,
     ) -> Result<ProvisionReport> {
+        self.replenish_one_inner(free_pct_check, None)
+    }
+
+    /// Rebuild at most one file while the daemon still authorizes growth.
+    ///
+    /// Rechecks authority, the pinned file/pool identities and live headroom
+    /// between random-data chunks and around native allocation/finalization.
+    /// Cancellation never waits for a blocked syscall; the caller must retain
+    /// its occupied worker until this call actually returns. A cancelled new
+    /// slot is removed only if still owned; an interrupted repair stays linked
+    /// as emergency reserve. Ordinary CLI replenishment keeps its synchronous
+    /// API and per-file admission behavior.
+    pub fn replenish_one_guarded(
+        &mut self,
+        free_pct_check: Option<&dyn Fn() -> f64>,
+        still_allowed: &dyn Fn() -> bool,
+    ) -> Result<ProvisionReport> {
+        let control = ProvisionControl {
+            still_allowed,
+            free_pct_check,
+        };
+        control.check(&self.ballast_dir)?;
+        self.replenish_one_inner(free_pct_check, Some(control))
+    }
+
+    fn replenish_one_inner(
+        &mut self,
+        free_pct_check: Option<&dyn Fn() -> f64>,
+        control: Option<ProvisionControl<'_>>,
+    ) -> Result<ProvisionReport> {
         let _lock = self.acquire_lock(true)?;
+        if let Some(control) = control {
+            control.check(&self.ballast_dir)?;
+        }
         let mut report = ProvisionReport {
             files_created: 0,
             files_skipped: 0,
@@ -853,12 +998,22 @@ impl BallastManager {
             created: Vec::new(),
         };
 
-        // Ensure no orphans exist before replenishing.
-        self.prune_orphans();
+        // Background growth does not prune surplus reserve. Its configuration
+        // may be revoked while a native directory lookup is blocked, and an
+        // emergency can still release those independently verified files.
+        if control.is_none() {
+            self.prune_orphans();
+        }
 
         for i in 1..=self.config.file_count {
             let index = i as u32;
             let path = self.file_path(index);
+            if let Some(control) = control
+                && let Err(error) = control.check(&path)
+            {
+                report.errors.push(error.to_string());
+                break;
+            }
 
             // Keep the existing reserve linked throughout an admitted repair.
             if path.exists() && self.verify_single_file(&path, index).is_ok() {
@@ -895,7 +1050,13 @@ impl BallastManager {
                 }
             }
 
-            match self.create_ballast_file(index) {
+            if let Some(control) = control
+                && let Err(error) = control.check(&path)
+            {
+                report.errors.push(error.to_string());
+                break;
+            }
+            match self.create_ballast_file(index, control) {
                 Ok(()) => {
                     report.files_created += 1;
                     let actual_size =
@@ -906,7 +1067,7 @@ impl BallastManager {
                     break;
                 }
                 Err(e) => {
-                    if record_create_error(&mut report, index, &path, &e) {
+                    if record_create_error(&mut report, index, &path, &e) || control.is_some() {
                         break;
                     }
                 }
@@ -943,7 +1104,7 @@ impl BallastManager {
         observation::verify(self, path, expected_index)
     }
 
-    fn create_ballast_file(&self, index: u32) -> Result<()> {
+    fn create_ballast_file(&self, index: u32, control: Option<ProvisionControl<'_>>) -> Result<()> {
         let size = self.config.file_size_bytes;
         if size < HEADER_SIZE as u64 {
             return Err(SbhError::InvalidConfig {
@@ -954,16 +1115,29 @@ impl BallastManager {
         // Existing allocations never enter the new-file cleanup path. Even
         // a failed/partial repair leaves the configured reserve available for
         // emergency release; symlinks and shared inodes are refused untouched.
-        if repair::existing(self, index)? {
+        if let Some(control) = control {
+            control.check(&self.file_path(index))?;
+        }
+        if repair::existing(self, index, control)? {
             return Ok(());
         }
         // The absent check above is advisory: creation itself must be
         // exclusive, and only its owned inode may be removed on failure.
-        creation::create(self, index)
+        creation::create(self, index, control)
     }
 
-    #[allow(clippy::unused_self)]
+    #[cfg(test)]
     fn write_random_data(&self, file: &mut File, data_size: u64, path: &Path) -> Result<()> {
+        self.write_random_data_guarded(file, data_size, path, None)
+    }
+
+    fn write_random_data_guarded(
+        &self,
+        file: &mut File,
+        data_size: u64,
+        path: &Path,
+        guard: Option<&AllocationGuard<'_>>,
+    ) -> Result<()> {
         let mut rng = rand::rng();
         let mut written: u64 = 0;
         let mut chunk = vec![0u8; CHUNK_SIZE];
@@ -971,6 +1145,16 @@ impl BallastManager {
 
         while written < data_size {
             let remaining = data_size - written;
+            if let Some(guard) = guard {
+                // The header is written only after the payload succeeds. Its
+                // allocation must remain part of the outstanding headroom.
+                guard.renew(
+                    self,
+                    file,
+                    path,
+                    remaining.saturating_add(HEADER_SIZE as u64),
+                )?;
+            }
             let to_write = if remaining > CHUNK_SIZE as u64 {
                 CHUNK_SIZE
             } else {
@@ -978,6 +1162,9 @@ impl BallastManager {
             };
 
             rng.fill_bytes(&mut chunk[..to_write]);
+            if let Some(guard) = guard {
+                guard.control.check(path)?;
+            }
             file.write_all(&chunk[..to_write])
                 .map_err(|e| SbhError::io(path, e))?;
             written += to_write as u64;
@@ -987,6 +1174,10 @@ impl BallastManager {
                 file.sync_all().map_err(|e| SbhError::io(path, e))?;
                 bytes_since_fsync = 0;
             }
+        }
+
+        if let Some(guard) = guard {
+            guard.renew(self, file, path, HEADER_SIZE as u64)?;
         }
 
         Ok(())
@@ -1026,6 +1217,10 @@ fn record_create_error(
             "file {index}: {error}; skipping remaining ballast provisioning because each further file at {} would repeat the same write",
             path.parent().unwrap_or(path).display()
         ));
+        true
+    } else if matches!(error, SbhError::Io { source, .. } if source.kind() == ErrorKind::Interrupted)
+    {
+        report.errors.push(format!("file {index}: {error}"));
         true
     } else {
         report.errors.push(format!("file {index}: {error}"));
@@ -1912,5 +2107,244 @@ mod tests {
         let availability = BallastAvailability::observe(dir.path(), &config);
         assert_eq!(availability.configured_pool_bytes, 0);
         assert_eq!(availability.health, BallastHealth::Unconfigured);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod guarded_replenishment_tests {
+    use super::*;
+    use crate::platform::pal::{FsStats, MemoryInfo, MockPlatform, MountPoint, PlatformPaths};
+    use std::cell::Cell;
+    use std::collections::{BTreeMap, HashMap};
+    use std::io::{Seek, SeekFrom};
+    use std::os::unix::fs::MetadataExt;
+
+    const SIZE: u64 = 2 * CHUNK_SIZE as u64 + HEADER_SIZE as u64;
+
+    fn fixture() -> (tempfile::TempDir, BallastManager) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = BallastManager::new_unfloored(
+            temp.path().join("pool"),
+            BallastConfig {
+                file_count: 2,
+                file_size_bytes: SIZE,
+                replenish_cooldown_minutes: 0,
+                auto_provision: true,
+                overrides: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        manager.set_skip_fallocate(true);
+        (temp, manager)
+    }
+
+    fn file_len(path: &Path) -> u64 {
+        fs::symlink_metadata(path).map_or(0, |meta| meta.len())
+    }
+
+    fn assert_stopped(report: &ProvisionReport) {
+        assert_eq!(report.files_created, 0, "{report:?}");
+        assert_eq!(report.total_bytes, 0, "{report:?}");
+        assert!(report.created.is_empty(), "{report:?}");
+        assert_eq!(report.errors.len(), 1, "{report:?}");
+    }
+
+    #[test]
+    fn revoked_growth_never_creates_a_pool_or_lock() {
+        let (_temp, mut manager) = fixture();
+        let result = manager.replenish_one_guarded(None, &|| false);
+        assert!(matches!(
+            result,
+            Err(SbhError::Io { source, .. }) if source.kind() == ErrorKind::Interrupted
+        ));
+        assert!(!manager.ballast_dir.exists());
+    }
+
+    #[test]
+    fn cancellation_after_a_real_chunk_discards_only_the_incomplete_new_slot() {
+        let (temp, mut manager) = fixture();
+        let path = manager.file_path(1);
+        let neighbor = temp.path().join("unrelated");
+        fs::write(&neighbor, b"retain unrelated data").unwrap();
+        let observed = Cell::new(0);
+        let allowed = || {
+            let length = file_len(&path);
+            observed.set(observed.get().max(length));
+            length <= HEADER_SIZE as u64
+        };
+        let report = manager.replenish_one_guarded(None, &allowed).unwrap();
+        assert_stopped(&report);
+        assert_eq!(observed.get(), CHUNK_SIZE as u64 + HEADER_SIZE as u64);
+        assert!(!path.exists());
+        assert!(!manager.file_path(2).exists());
+        assert_eq!(fs::read(neighbor).unwrap(), b"retain unrelated data");
+        // A new generation with current authority can make a complete file.
+        let completed = manager.replenish_one_guarded(None, &|| true).unwrap();
+        assert_eq!(completed.files_created, 1, "{completed:?}");
+        assert!(manager.verify_single_file(&path, 1).is_ok());
+    }
+
+    #[test]
+    fn lost_headroom_or_revocation_during_its_probe_stops_between_chunks() {
+        for revoke in [false, true] {
+            let (_temp, mut manager) = fixture();
+            let path = manager.file_path(1);
+            let allowed = Cell::new(true);
+            let observed = Cell::new(0);
+            let free_check = || {
+                let length = file_len(&path);
+                observed.set(observed.get().max(length));
+                if length > HEADER_SIZE as u64 {
+                    if revoke {
+                        allowed.set(false);
+                        100.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    100.0
+                }
+            };
+            let report = manager
+                .replenish_one_guarded(Some(&free_check), &|| allowed.get())
+                .unwrap();
+            assert_stopped(&report);
+            assert_eq!(observed.get(), CHUNK_SIZE as u64 + HEADER_SIZE as u64);
+            assert!(!path.exists());
+            assert!(!manager.file_path(2).exists());
+        }
+    }
+
+    #[test]
+    fn changing_the_slot_or_pool_during_a_chunk_probe_keeps_replacements() {
+        for replace_pool in [false, true] {
+            let (temp, mut manager) = fixture();
+            let path = manager.file_path(1);
+            let original = temp.path().join("retained-original");
+            let changed = Cell::new(false);
+            let free_check = || {
+                if !changed.get() && file_len(&path) > HEADER_SIZE as u64 {
+                    changed.set(true);
+                    if replace_pool {
+                        fs::rename(path.parent().unwrap(), &original).unwrap();
+                        fs::create_dir(path.parent().unwrap()).unwrap();
+                    } else {
+                        fs::rename(&path, &original).unwrap();
+                    }
+                    fs::write(&path, b"replacement must survive").unwrap();
+                }
+                100.0
+            };
+            let report = manager
+                .replenish_one_guarded(Some(&free_check), &|| true)
+                .unwrap();
+            assert_stopped(&report);
+            assert!(changed.get());
+            assert_eq!(fs::read(&path).unwrap(), b"replacement must survive");
+            if replace_pool {
+                // New-slot rollback is relative to its original directory fd.
+                assert!(!original.join(ballast_file_name(1)).exists());
+            } else {
+                // A renamed inode is no longer this attempt's named slot.
+                assert_eq!(file_len(&original), CHUNK_SIZE as u64 + HEADER_SIZE as u64);
+            }
+            assert!(!manager.file_path(2).exists());
+        }
+    }
+
+    #[test]
+    fn cancelled_repair_keeps_the_existing_inode_header_and_reserve() {
+        let (_temp, mut manager) = fixture();
+        fs::create_dir_all(&manager.ballast_dir).unwrap();
+        let path = manager.file_path(1);
+        fs::write(&path, vec![7u8; SIZE as usize]).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let saw_payload_write = Cell::new(false);
+        let allowed = || {
+            let mut file = File::open(&path).unwrap();
+            file.seek(SeekFrom::Start(HEADER_SIZE as u64)).unwrap();
+            let mut bytes = [0; 32];
+            file.read_exact(&mut bytes).unwrap();
+            let changed = bytes != [7; 32];
+            saw_payload_write.set(saw_payload_write.get() || changed);
+            !changed
+        };
+        let report = manager.replenish_one_guarded(None, &allowed).unwrap();
+        assert_stopped(&report);
+        assert!(saw_payload_write.get());
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.len(), before.len());
+        assert!(after.blocks() >= before.blocks());
+        let mut header = [0; HEADER_SIZE];
+        File::open(&path).unwrap().read_exact(&mut header).unwrap();
+        assert_eq!(header, [7; HEADER_SIZE]);
+        assert!(!manager.file_path(2).exists());
+        assert_eq!(manager.available_count(), 1);
+        assert_eq!(manager.release(1).unwrap().bytes_freed, SIZE);
+    }
+
+    #[test]
+    fn chunk_headroom_charges_only_the_unwritten_remainder() {
+        let (_temp, mut manager) = fixture();
+        let path = manager.file_path(1);
+        let total = 100_000_000_u64;
+        manager.platform = Arc::new(
+            MockPlatform::new(
+                vec![MountPoint {
+                    path: PathBuf::from("/"),
+                    device: "test-device".to_string(),
+                    fs_type: "mockfs".to_string(),
+                    is_ram_backed: false,
+                }],
+                HashMap::from([(
+                    PathBuf::from("/"),
+                    FsStats {
+                        total_bytes: total,
+                        free_bytes: 90_000_000,
+                        available_bytes: 90_000_000,
+                        fs_type: "mockfs".to_string(),
+                        mount_point: PathBuf::from("/"),
+                        is_readonly: false,
+                    },
+                )]),
+                MemoryInfo {
+                    total_bytes: 1 << 30,
+                    available_bytes: 1 << 29,
+                    swap_total_bytes: 0,
+                    swap_free_bytes: 0,
+                },
+                PlatformPaths::default(),
+            )
+            .with_block_count(&path, SIZE / 512),
+        );
+        manager.set_provision_floor(20.0);
+        let free_check = || {
+            let written = file_len(&path).saturating_sub(HEADER_SIZE as u64);
+            let available = 20_000_000 + SIZE + 65_536 - written;
+            available as f64 / total as f64 * 100.0
+        };
+        let report = manager
+            .replenish_one_guarded(Some(&free_check), &|| true)
+            .unwrap();
+        assert_eq!(report.files_created, 1, "{report:?}");
+        assert_eq!(report.total_bytes, SIZE);
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(manager.verify_single_file(&path, 1).is_ok());
+    }
+
+    #[test]
+    fn worker_snapshot_preserves_memory_without_rescanning_the_pool() {
+        let (temp, mut manager) = fixture();
+        manager.replenish_one(None).unwrap();
+        let retained = temp.path().join("retained-pool");
+        fs::rename(&manager.ballast_dir, retained).unwrap();
+        let worker = manager.worker_snapshot();
+        assert_eq!(worker.available_count(), 1);
+        assert_eq!(worker.releasable_bytes(), SIZE);
+        assert_eq!(worker.ballast_dir, manager.ballast_dir);
+        assert_eq!(worker.config, manager.config);
+        assert_eq!(worker.provision_floor, manager.provision_floor);
+        assert_eq!(worker.skip_fallocate, manager.skip_fallocate);
     }
 }

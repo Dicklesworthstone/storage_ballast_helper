@@ -133,13 +133,13 @@ mod unix {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct Snapshot {
         directory: Identity,
         file: FileIdentity,
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug, Default, Clone)]
     pub(in super::super) struct StrandedReserve {
         files: Vec<(PathBuf, u64)>,
         snapshots: BTreeMap<PathBuf, Snapshot>,
@@ -520,7 +520,7 @@ pub(super) use unix::StrandedReserve;
 
 // No pathname-only fallback on platforms without anchored Unix file operations.
 #[cfg(not(unix))]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct StrandedReserve;
 
 #[cfg(not(unix))]

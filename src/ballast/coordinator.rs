@@ -201,6 +201,28 @@ pub struct BallastPoolCoordinator {
     /// mounts, e.g. the `ReadWritePaths=` binds a sandboxed systemd unit
     /// sees), mapped to the mount that holds that filesystem's pool.
     aliases: HashMap<PathBuf, PathBuf>,
+    /// Worker results belong to this discovery and this pool's latest mutation.
+    /// Neither cloning a task nor admitting its result performs filesystem I/O.
+    worker_origin: Arc<()>,
+    pool_revisions: HashMap<PathBuf, u64>,
+}
+
+/// An independent, memory-only pool snapshot for a bounded refill worker.
+/// The coordinator retains its own release handle while this task performs I/O.
+pub(crate) struct BallastReplenishment {
+    pool: BallastPool,
+    origin: Arc<()>,
+    revision: u64,
+}
+
+impl BallastReplenishment {
+    pub(crate) fn mount(&self) -> &Path {
+        &self.pool.mount_point
+    }
+
+    pub(crate) fn run(&mut self, still_allowed: &dyn Fn() -> bool) -> Result<ProvisionReport> {
+        provision::replenish_one_guarded(&mut self.pool, still_allowed)
+    }
 }
 
 /// The mount planning decided on: pools to build, mounts skipped with a
@@ -318,6 +340,8 @@ impl BallastPoolCoordinator {
             pools,
             skipped_pools,
             aliases,
+            worker_origin: Arc::new(()),
+            pool_revisions: HashMap::new(),
         })
     }
 
@@ -539,6 +563,7 @@ impl BallastPoolCoordinator {
     /// Apply one headroom floor to every pool (percent free that must remain
     /// after each ballast file is created).
     pub fn set_provision_floor(&mut self, floor_pct: f64) {
+        self.worker_origin = Arc::new(());
         for pool in self.pools.values_mut() {
             pool.manager.set_provision_floor(floor_pct);
         }
@@ -547,6 +572,7 @@ impl BallastPoolCoordinator {
     /// Apply one headroom rule to every pool; each pool evaluates it against
     /// the capacity of its own volume (see [`ProvisionFloor`]).
     pub fn set_provision_floor_rule(&mut self, floor: ProvisionFloor) {
+        self.worker_origin = Arc::new(());
         for pool in self.pools.values_mut() {
             pool.manager.set_provision_floor_rule(floor);
         }
@@ -554,11 +580,11 @@ impl BallastPoolCoordinator {
 
     /// Provision all pools (idempotent: skips existing valid files).
     pub fn provision_all(&mut self, platform: &dyn Platform) -> Result<MultiProvisionReport> {
-        self.provision_all_until(platform, &std::sync::atomic::AtomicBool::new(false))
+        Ok(self.provision_all_inner(platform, None))
     }
 
     /// [`Self::provision_all`] that stops when `stop` is set: the pool being
-    /// grown stops before its next file, and the remaining pools are skipped.
+    /// grown stops at its next allocation boundary, and remaining pools are skipped.
     /// Provisioning can write gigabytes at disk speed, and a daemon asked to
     /// stop in the middle of it must not hold the service manager's stop until
     /// every pool is full.
@@ -567,7 +593,16 @@ impl BallastPoolCoordinator {
         platform: &dyn Platform,
         stop: &std::sync::atomic::AtomicBool,
     ) -> Result<MultiProvisionReport> {
-        let stopped = || stop.load(std::sync::atomic::Ordering::Relaxed);
+        Ok(self.provision_all_inner(platform, Some(stop)))
+    }
+
+    fn provision_all_inner(
+        &mut self,
+        platform: &dyn Platform,
+        stop: Option<&std::sync::atomic::AtomicBool>,
+    ) -> MultiProvisionReport {
+        self.worker_origin = Arc::new(());
+        let stopped = || stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed));
         let mut per_volume = Vec::new();
         let mut skipped_volumes = Vec::new();
 
@@ -601,7 +636,15 @@ impl BallastPoolCoordinator {
                     .map_or(0.0, |s| s.free_pct())
             };
 
-            match provision::provision(pool, Some(&free_check)) {
+            // An explicit CLI provision retains the synchronous manager's
+            // repair/prune behavior. Daemon startup uses cancellable growth,
+            // which preserves surplus reserve while its authority can change.
+            let result = if stop.is_some() {
+                provision::provision_guarded(pool, Some(&free_check), &|| !stopped())
+            } else {
+                provision::provision(pool, Some(&free_check))
+            };
+            match result {
                 Ok(report) => per_volume.push((mount_path.clone(), report)),
                 Err(e) => {
                     skipped_volumes.push((mount_path.clone(), format!("provision failed: {e}")));
@@ -609,10 +652,10 @@ impl BallastPoolCoordinator {
             }
         }
 
-        Ok(MultiProvisionReport {
+        MultiProvisionReport {
             per_volume,
             skipped_volumes,
-        })
+        }
     }
 
     /// Release ballast files on a SPECIFIC mount point under pressure.
@@ -633,6 +676,11 @@ impl BallastPoolCoordinator {
         if count == 0 || pool.available_count() == 0 {
             return Ok(None);
         }
+
+        // A late worker snapshot must not resurrect inventory that this release
+        // has refreshed or removed, even if the release could only partly finish.
+        let revision = self.pool_revisions.entry(key).or_default();
+        *revision = revision.wrapping_add(1);
 
         let mut report = pool.stranded.release(count);
         let wanted = count.saturating_sub(report.files_released);
@@ -670,12 +718,57 @@ impl BallastPoolCoordinator {
             return Ok(None);
         };
 
+        let revision = self.pool_revisions.entry(key).or_default();
+        *revision = revision.wrapping_add(1);
+
         let report = provision::replenish_one(pool, free_pct_check)?;
         Ok(Some(report))
     }
 
+    /// Prepare one refill without probing storage on the monitoring thread.
+    pub(crate) fn prepare_replenishment(&self, mount_path: &Path) -> Option<BallastReplenishment> {
+        let key = self.pool_key(mount_path);
+        let pool = self.pools.get(key)?;
+        Some(BallastReplenishment {
+            pool: BallastPool {
+                mount_point: pool.mount_point.clone(),
+                ballast_dir: pool.ballast_dir.clone(),
+                fs_type: pool.fs_type.clone(),
+                strategy: pool.strategy,
+                manager: pool.manager.worker_snapshot(),
+                stranded: pool.stranded.clone(),
+                unreachable_reserve: pool.unreachable_reserve.clone(),
+            },
+            origin: Arc::clone(&self.worker_origin),
+            revision: self.pool_revisions.get(key).copied().unwrap_or(0),
+        })
+    }
+
+    /// Publish completed inventory only while its pool and mutation epoch match.
+    /// A release, reload or another refill keeps its newer inventory intact.
+    pub(crate) fn finish_replenishment(&mut self, task: BallastReplenishment) -> bool {
+        let key = &task.pool.mount_point;
+        if !Arc::ptr_eq(&task.origin, &self.worker_origin)
+            || self.pool_revisions.get(key).copied().unwrap_or(0) != task.revision
+        {
+            return false;
+        }
+        let Some(pool) = self.pools.get_mut(key) else {
+            return false;
+        };
+        if pool.ballast_dir != task.pool.ballast_dir {
+            return false;
+        }
+        pool.manager = task.pool.manager;
+        pool.stranded = task.pool.stranded;
+        let revision = self.pool_revisions.entry(key.clone()).or_default();
+        *revision = revision.wrapping_add(1);
+        true
+    }
+
     /// Verify integrity of all pools.
     pub fn verify_all(&mut self) -> Vec<(PathBuf, VerifyReport)> {
+        self.worker_origin = Arc::new(());
         self.pools
             .iter_mut()
             .map(|(mount, pool)| {
@@ -801,6 +894,7 @@ impl BallastPoolCoordinator {
 
     /// Propagate configuration updates to all pools.
     pub fn update_config(&mut self, config: &BallastConfig) {
+        self.worker_origin = Arc::new(());
         for (mount_path, pool) in &mut self.pools {
             let mount_str = mount_path.to_string_lossy();
             let pool_config = per_volume_config(config, &mount_str);
@@ -1818,6 +1912,240 @@ mod tests {
                 .available_count(),
             3
         );
+    }
+
+    #[cfg(unix)]
+    mod replenishment_tests {
+        use super::*;
+
+        fn fixture() -> (tempfile::TempDir, MockPlatform, BallastPoolCoordinator) {
+            let temp = tempfile::tempdir().unwrap();
+            let first = temp.path().join("first");
+            let second = temp.path().join("second");
+            fs::create_dir(&first).unwrap();
+            fs::create_dir(&second).unwrap();
+            let platform = mock_platform_two_volumes(&first, &second);
+            let mut coordinator = BallastPoolCoordinator::discover(
+                &tiny_ballast_config(),
+                &[first, second],
+                &platform,
+            )
+            .unwrap();
+            coordinator.set_provision_floor(0.0);
+            (temp, platform, coordinator)
+        }
+
+        #[test]
+        fn worker_credit_is_deferred_until_its_inventory_is_published() {
+            let (temp, _platform, mut coordinator) = fixture();
+            let mount = temp.path().join("first");
+            let mut task = coordinator.prepare_replenishment(&mount).unwrap();
+            assert_eq!(task.mount(), mount);
+            let report = task.run(&|| true).unwrap();
+            assert_eq!(report.files_created, 1, "{report:?}");
+            assert!(report.errors.is_empty(), "{report:?}");
+            assert_eq!(task.pool.available_count(), 1);
+            assert_eq!(
+                coordinator
+                    .pool_for_mount(&mount)
+                    .unwrap()
+                    .available_count(),
+                0
+            );
+
+            assert!(coordinator.finish_replenishment(task));
+            let pool = coordinator.pool_for_mount(&mount).unwrap();
+            assert_eq!(pool.available_count(), 1);
+            assert_eq!(
+                pool.releasable_bytes(),
+                tiny_ballast_config().file_size_bytes
+            );
+            assert_eq!(pool.expected_count(), 3);
+        }
+
+        #[test]
+        fn worker_snapshot_and_publication_do_not_rescan_storage() {
+            let (temp, _platform, mut coordinator) = fixture();
+            let mount = temp.path().join("first");
+            let mut task = coordinator.prepare_replenishment(&mount).unwrap();
+            assert_eq!(task.run(&|| true).unwrap().files_created, 1);
+            let pool_dir = task.pool.ballast_dir.clone();
+            fs::rename(&pool_dir, temp.path().join("retained-pool")).unwrap();
+            fs::write(&pool_dir, b"replacement is not a pool").unwrap();
+
+            // Completion consumes the worker's already observed result. The
+            // next background attempt, not the monitor, validates storage.
+            assert!(coordinator.finish_replenishment(task));
+            assert_eq!(
+                coordinator
+                    .pool_for_mount(&mount)
+                    .unwrap()
+                    .available_count(),
+                1
+            );
+            let snapshot = coordinator.prepare_replenishment(&mount).unwrap();
+            assert_eq!(snapshot.pool.available_count(), 1);
+            assert_eq!(snapshot.pool.ballast_dir, pool_dir);
+            assert_eq!(fs::read(&pool_dir).unwrap(), b"replacement is not a pool");
+            assert!(coordinator.prepare_replenishment(temp.path()).is_none());
+        }
+
+        #[test]
+        fn late_worker_completion_cannot_resurrect_released_inventory() {
+            let (temp, platform, mut coordinator) = fixture();
+            let mount = temp.path().join("first");
+            assert_eq!(
+                coordinator
+                    .provision_all(&platform)
+                    .unwrap()
+                    .total_files_created(),
+                6
+            );
+            coordinator.release_for_mount(&mount, 1).unwrap().unwrap();
+            let mut task = coordinator.prepare_replenishment(&mount).unwrap();
+            assert_eq!(task.run(&|| true).unwrap().files_created, 1);
+            assert_eq!(task.pool.available_count(), 3);
+
+            let released = coordinator.release_for_mount(&mount, 3).unwrap().unwrap();
+            assert_eq!(released.files_released, 3, "{released:?}");
+            assert!(!coordinator.finish_replenishment(task));
+            assert_eq!(
+                coordinator
+                    .pool_for_mount(&mount)
+                    .unwrap()
+                    .available_count(),
+                0
+            );
+            assert_eq!(
+                coordinator
+                    .pool_for_mount(&mount)
+                    .unwrap()
+                    .releasable_bytes(),
+                0
+            );
+        }
+
+        #[test]
+        fn config_and_floor_changes_reject_prior_worker_authority() {
+            for change in ["config", "fixed floor", "floor rule"] {
+                let (temp, _platform, mut coordinator) = fixture();
+                let mount = temp.path().join("first");
+                let mut task = coordinator.prepare_replenishment(&mount).unwrap();
+                assert_eq!(task.run(&|| true).unwrap().files_created, 1);
+                match change {
+                    "config" => {
+                        let mut config = tiny_ballast_config();
+                        config.file_count = 0;
+                        coordinator.update_config(&config);
+                    }
+                    "fixed floor" => coordinator.set_provision_floor(100.0),
+                    "floor rule" => {
+                        coordinator.set_provision_floor_rule(ProvisionFloor::Fixed(100.0));
+                    }
+                    _ => unreachable!(),
+                }
+                let count = coordinator
+                    .pool_for_mount(&mount)
+                    .unwrap()
+                    .available_count();
+                assert!(!coordinator.finish_replenishment(task), "{change}");
+                let pool = coordinator.pool_for_mount(&mount).unwrap();
+                assert_eq!(pool.available_count(), count, "{change}");
+                if change == "config" {
+                    assert_eq!(pool.expected_count(), 0);
+                    assert_eq!(count, 1, "disabled growth retains actual reserve");
+                } else {
+                    assert_eq!(pool.manager.provision_floor(), ProvisionFloor::Fixed(100.0));
+                    assert_eq!(count, 0, "an unpublished result stays unpublished");
+                }
+            }
+        }
+
+        #[test]
+        fn rediscovery_rejects_a_result_from_the_old_coordinator() {
+            let (temp, platform, coordinator) = fixture();
+            let mount = temp.path().join("first");
+            let mut task = coordinator.prepare_replenishment(&mount).unwrap();
+            let mut replacement = BallastPoolCoordinator::discover(
+                &tiny_ballast_config(),
+                &[mount.clone(), temp.path().join("second")],
+                &platform,
+            )
+            .unwrap();
+            assert_eq!(task.run(&|| true).unwrap().files_created, 1);
+            assert!(!replacement.finish_replenishment(task));
+            assert_eq!(
+                replacement
+                    .pool_for_mount(&mount)
+                    .unwrap()
+                    .available_count(),
+                0
+            );
+        }
+
+        #[test]
+        fn only_the_first_completion_can_publish_a_shared_revision() {
+            let (temp, _platform, mut coordinator) = fixture();
+            let mount = temp.path().join("first");
+            let mut first = coordinator.prepare_replenishment(&mount).unwrap();
+            let mut second = coordinator.prepare_replenishment(&mount).unwrap();
+            assert_eq!(first.run(&|| true).unwrap().files_created, 1);
+            assert_eq!(second.run(&|| true).unwrap().files_created, 1);
+            assert_eq!(first.pool.available_count(), 1);
+            assert_eq!(second.pool.available_count(), 2);
+
+            assert!(coordinator.finish_replenishment(second));
+            assert!(!coordinator.finish_replenishment(first));
+            assert_eq!(
+                coordinator
+                    .pool_for_mount(&mount)
+                    .unwrap()
+                    .available_count(),
+                2
+            );
+        }
+
+        #[test]
+        fn explicit_provision_prunes_surplus_but_guarded_growth_preserves_it() {
+            let (temp, platform, mut coordinator) = fixture();
+            let mount = temp.path().join("first");
+            let original = coordinator.provision_all(&platform).unwrap();
+            assert_eq!(original.total_files_created(), 6, "{original:?}");
+            let mut config = tiny_ballast_config();
+            config.file_count = 1;
+            coordinator.update_config(&config);
+            let pool_dir = coordinator
+                .pool_for_mount(&mount)
+                .unwrap()
+                .ballast_dir
+                .clone();
+            let surplus = pool_dir.join("SBH_BALLAST_FILE_00003.dat");
+            assert!(surplus.exists());
+
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let guarded = coordinator.provision_all_until(&platform, &stop).unwrap();
+            assert!(!guarded.has_errors(), "{guarded:?}");
+            assert_eq!(guarded.total_files_created(), 0);
+            assert!(
+                surplus.exists(),
+                "background growth preserves emergency reserve"
+            );
+
+            let explicit = coordinator.provision_all(&platform).unwrap();
+            assert!(!explicit.has_errors(), "{explicit:?}");
+            assert_eq!(explicit.total_files_created(), 0);
+            assert!(
+                !surplus.exists(),
+                "explicit provisioning applies the target count"
+            );
+            assert_eq!(
+                coordinator
+                    .pool_for_mount(&mount)
+                    .unwrap()
+                    .available_count(),
+                1
+            );
+        }
     }
 
     #[test]

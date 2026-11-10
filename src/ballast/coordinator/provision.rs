@@ -7,20 +7,45 @@
 
 use super::BallastPool;
 use crate::ballast::manager::{BallastManager, ProvisionReport};
-use crate::core::errors::Result;
+use crate::core::errors::{Result, SbhError};
 
 pub(super) fn provision(
     pool: &mut BallastPool,
     free_pct_check: Option<&dyn Fn() -> f64>,
 ) -> Result<ProvisionReport> {
-    grow(pool, free_pct_check, usize::MAX)
+    grow(pool, free_pct_check, usize::MAX, None)
 }
 
 pub(super) fn replenish_one(
     pool: &mut BallastPool,
     free_pct_check: Option<&dyn Fn() -> f64>,
 ) -> Result<ProvisionReport> {
-    grow(pool, free_pct_check, 1)
+    grow(pool, free_pct_check, 1, None)
+}
+
+pub(super) fn replenish_one_guarded(
+    pool: &mut BallastPool,
+    still_allowed: &dyn Fn() -> bool,
+) -> Result<ProvisionReport> {
+    grow(pool, None, 1, Some(still_allowed))
+}
+
+pub(super) fn provision_guarded(
+    pool: &mut BallastPool,
+    free_pct_check: Option<&dyn Fn() -> f64>,
+    still_allowed: &dyn Fn() -> bool,
+) -> Result<ProvisionReport> {
+    grow(pool, free_pct_check, usize::MAX, Some(still_allowed))
+}
+
+fn check_permission(pool: &BallastPool, guard: Option<&dyn Fn() -> bool>) -> Result<()> {
+    if guard.is_some_and(|allowed| !allowed()) {
+        return Err(SbhError::io(
+            &pool.ballast_dir,
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "ballast refill cancelled"),
+        ));
+    }
+    Ok(())
 }
 
 fn empty_report(manager: &BallastManager) -> ProvisionReport {
@@ -53,8 +78,10 @@ fn grow(
     pool: &mut BallastPool,
     free_pct_check: Option<&dyn Fn() -> f64>,
     max_files: usize,
+    guard: Option<&dyn Fn() -> bool>,
 ) -> Result<ProvisionReport> {
-    if pool.stranded.files().is_empty() {
+    check_permission(pool, guard)?;
+    if pool.stranded.files().is_empty() && guard.is_none() {
         // Preserve the manager's normal idempotent provision/repair behavior
         // when there is no retired reserve to credit.
         return if max_files == 1 {
@@ -66,6 +93,7 @@ fn grow(
 
     let mut report = empty_report(&pool.manager);
     report.errors = pool.stranded.refresh();
+    check_permission(pool, guard)?;
     if !report.errors.is_empty() {
         // Unknown is not empty. A provisioner holding an old pool's lock must
         // not cause us to allocate a duplicate pool, nor block this caller.
@@ -77,6 +105,7 @@ fn grow(
     // range, platform, allocation strategy, or configured headroom floor.
     let config = pool.manager.config().clone();
     pool.manager.update_config(config);
+    check_permission(pool, guard)?;
     report.files_skipped = pool
         .manager
         .inventory()
@@ -87,13 +116,24 @@ fn grow(
     let adopted = pool.stranded.bytes();
 
     for _ in 0..max_files.min(pool.expected_count()) {
+        if let Err(error) = check_permission(pool, guard) {
+            // Startup may have already completed another slot. Preserve its
+            // report and inventory when shutdown revokes the next allocation.
+            report.errors.push(error.to_string());
+            break;
+        }
         let before = valid_managed_bytes(&pool.manager);
         if missing_bytes(target, adopted, before) == 0 {
             break;
         }
         // Keep the full config. Each step still rechecks actual file integrity
         // and applies the live after-allocation free-space floor under .lock.
-        let step = match pool.manager.replenish_one(free_pct_check) {
+        let attempt = if let Some(guard) = guard {
+            pool.manager.replenish_one_guarded(free_pct_check, guard)
+        } else {
+            pool.manager.replenish_one(free_pct_check)
+        };
+        let step = match attempt {
             Ok(step) => step,
             Err(error) => {
                 report
@@ -346,6 +386,61 @@ mod tests {
         pool.manager.release(2).unwrap();
         assert_eq!(replenish_one(&mut pool, None).unwrap().files_created, 1);
         assert_eq!(pool.actual_count(), 2);
+    }
+
+    #[test]
+    fn guarded_startup_cancellation_preserves_completed_file_evidence() {
+        let (_temp, mut pool) = fixture(3, UNIT, 0, UNIT);
+        let first = file(&pool.ballast_dir, 1);
+        let lock_path = pool.ballast_dir.join(".lock");
+        // Revoke only after the first manager operation has returned and
+        // released its lock, so its finalized file must remain credited.
+        let allowed = || {
+            if !first.exists() {
+                return true;
+            }
+            let lock = File::open(&lock_path).unwrap();
+            if flock(&lock, FlockOperation::NonBlockingLockExclusive).is_err() {
+                return true;
+            }
+            flock(&lock, FlockOperation::Unlock).unwrap();
+            false
+        };
+        let report = provision_guarded(&mut pool, None, &allowed).unwrap();
+        assert_eq!(report.files_created, 1, "{report:?}");
+        assert_eq!(report.total_bytes, UNIT);
+        assert_eq!(report.created, vec![(first.clone(), UNIT)]);
+        assert_eq!(report.errors.len(), 1, "{report:?}");
+        assert!(report.errors[0].contains("cancelled"));
+        assert_eq!(pool.actual_count(), 1);
+        assert!(first.exists());
+        assert!(!file(&pool.ballast_dir, 2).exists());
+    }
+
+    #[test]
+    fn guarded_growth_revalidates_a_cached_full_pool_before_crediting_it() {
+        use std::io::Write as _;
+
+        for sparse in [false, true] {
+            let (_temp, mut pool) = fixture(3, UNIT, 0, UNIT);
+            assert_eq!(provision(&mut pool, None).unwrap().files_created, 3);
+            let damaged = file(&pool.ballast_dir, 1);
+            if sparse {
+                let header = fs::read(&damaged).unwrap()[..4096].to_vec();
+                let mut slot = File::create(&damaged).unwrap();
+                slot.set_len(UNIT).unwrap();
+                slot.write_all(&header).unwrap();
+                slot.sync_all().unwrap();
+            } else {
+                fs::write(&damaged, vec![7; UNIT as usize]).unwrap();
+            }
+            assert_eq!(valid_managed_bytes(&pool.manager), 3 * UNIT);
+            let report = replenish_one_guarded(&mut pool, &|| true).unwrap();
+            assert_eq!(report.files_created, 1, "sparse={sparse}: {report:?}");
+            assert_eq!(report.total_bytes, UNIT);
+            assert!(report.errors.is_empty(), "{report:?}");
+            assert_eq!(pool.manager.verify().unwrap().files_ok, 3);
+        }
     }
 
     #[test]

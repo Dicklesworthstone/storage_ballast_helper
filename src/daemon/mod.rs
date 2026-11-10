@@ -3,6 +3,8 @@
 
 pub mod attribution;
 #[cfg(feature = "daemon")]
+mod ballast_replenish;
+#[cfg(feature = "daemon")]
 pub mod compress_tier;
 pub mod control;
 pub mod coverage;

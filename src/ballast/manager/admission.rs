@@ -17,6 +17,17 @@ pub(super) fn check(
     manager: &BallastManager,
     free_pct_check: Option<&dyn Fn() -> f64>,
 ) -> Result<Admission> {
+    check_remaining(manager, free_pct_check, manager.config.file_size_bytes)
+}
+
+/// Re-admit only the allocation which has not yet been written. Charging the
+/// complete file after each chunk would count its existing allocation twice
+/// and prevent an otherwise admitted reserve from ever reaching the floor.
+pub(super) fn check_remaining(
+    manager: &BallastManager,
+    free_pct_check: Option<&dyn Fn() -> f64>,
+    remaining_bytes: u64,
+) -> Result<Admission> {
     let caller_pct = free_pct_check.map(|check| check());
     // Probe after the caller: even a cached optimistic callback cannot mask a
     // newly-full or read-only filesystem. Never turn a failed probe into zero
@@ -25,13 +36,7 @@ pub(super) fn check(
     // The floor in force on this volume: absolute byte floors lower it on a
     // large volume as they lower its pressure levels.
     let floor_pct = manager.provision_floor.pct_on(stats.total_bytes);
-    evaluate(
-        &stats,
-        manager.config.file_size_bytes,
-        floor_pct,
-        caller_pct,
-    )
-    .map_err(|details| SbhError::FsStats {
+    evaluate(&stats, remaining_bytes, floor_pct, caller_pct).map_err(|details| SbhError::FsStats {
         path: manager.ballast_dir.clone(),
         details: format!("cannot establish ballast headroom: {details}"),
     })
