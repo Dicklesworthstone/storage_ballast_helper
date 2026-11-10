@@ -8,6 +8,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Cleanup renews live permission after its final recursive inspection.**
+  A policy demotion, dry-run change, shutdown, or recovered free-space goal
+  can now hold a candidate after the executor finishes inspecting its
+  contents. Both unlink and quarantine retain their final protection,
+  lease, scope and identity checks after renewal. Refused work receives
+  no success receipt, reclaimed-byte credit, or transient-policy backoff.
+
 - **Interrupted child dispatch preserves useful discovery across slices.**
   Name-only daemon walks give interrupted pages resumable child turns while
   ordinary scans retain parallel dispatch. Scheduling priority advances when

@@ -803,9 +803,10 @@ pub enum CheckedDeletion {
 
 type AuthorizationCheck<'a> = &'a dyn Fn(&CandidacyScore) -> std::result::Result<(), SkipReason>;
 type UnlinkObserver<'a> = &'a dyn Fn(&CandidacyScore, Instant);
-/// A caller's per-candidate check run before preflight: the reason to leave
-/// this path alone now (target free space reached, a protection refusal, a
-/// shutdown), or `None` to continue.
+/// A caller's per-candidate check run before preflight and renewed after
+/// recursive inspection: the reason to leave this path alone now (target free
+/// space reached, a protection refusal, a shutdown), or `None` to continue.
+/// Repeated checks must not consume permission or prompt for confirmation.
 pub type SkipCheck<'a> = &'a dyn Fn(&Path) -> Option<SkipReason>;
 
 type ActivityObserver = Arc<dyn Fn(&ActivityEvent) + Send + Sync>;
@@ -949,8 +950,10 @@ impl DeletionExecutor {
     /// eligible candidate, but cannot override any earlier safety veto.
     ///
     /// A refusal is a typed skip, never a failed deletion or reclaimed bytes.
-    /// Content, source-root, lease and filesystem identity checks repeat after
-    /// authorization; an already-started removal is not cancelled.
+    /// Authorization is renewed after recursive content inspection, followed
+    /// by the final source-root, direct-protection, lease and identity checks.
+    /// Guards may run more than once and must not consume quotas. An
+    /// already-started removal is not cancelled.
     pub fn execute_with_guard(
         &self,
         plan: &DeletionPlan,
@@ -1161,7 +1164,20 @@ impl DeletionExecutor {
             // rails before either backend, retaining the checked identity.
             // A new protection is a skip, never reclaimed bytes, a deletion
             // failure, or an unavailable quarantine store.
-            let metadata = match self.check_before_mutation(candidate, &mut sacred) {
+            let renew_authority = |candidate: &CandidacyScore| {
+                if let Some(reason) = should_skip.and_then(|skip| skip(&candidate.path)) {
+                    return Err(reason);
+                }
+                if let Some(authorize) = authorize {
+                    authorize(candidate)?;
+                }
+                Ok(())
+            };
+            let metadata = match self.check_before_mutation(
+                candidate,
+                &mut sacred,
+                Some(&renew_authority),
+            ) {
                 Ok(metadata) => metadata,
                 Err(reason) => {
                     report.record_skip(reason);
@@ -1534,6 +1550,7 @@ impl DeletionExecutor {
         &self,
         candidate: &CandidacyScore,
         sacred: &mut SacredScanStats,
+        renew_authority: Option<AuthorizationCheck<'_>>,
     ) -> std::result::Result<fs::Metadata, SkipReason> {
         let path = &candidate.path;
         eligibility::check(candidate, &self.config)?;
@@ -1547,6 +1564,14 @@ impl DeletionExecutor {
         }
         self.verify_candidate_identity(candidate, &before)?;
         self.check_contents(candidate, &before, sacred)?;
+
+        // The recursive inspection can outlive a policy change, shutdown or
+        // recovery of the pressured filesystem. Earlier consent must not
+        // authorize a mutation after that work. Keep the final binding checks
+        // below: the renewal itself may also block or change the filesystem.
+        if let Some(renew_authority) = renew_authority {
+            renew_authority(candidate)?;
+        }
 
         // The shared policy can be replaced while the recursive work runs.
         // Renew scope before the final direct-protection and identity checks.
@@ -1579,7 +1604,7 @@ impl DeletionExecutor {
     }
 
     fn recheck_before_mutation(&self, candidate: &CandidacyScore) -> Result<fs::Metadata> {
-        self.check_before_mutation(candidate, &mut SacredScanStats::default())
+        self.check_before_mutation(candidate, &mut SacredScanStats::default(), None)
             .map_err(|reason| SbhError::SafetyVeto {
                 path: candidate.path.clone(),
                 reason: reason.explanation().to_string(),
@@ -3411,6 +3436,173 @@ mod tests {
         assert!(executor.delete_path(&candidate).is_err());
         assert!(file_path.exists());
         assert!(moved_path.exists());
+    }
+
+    #[test]
+    fn final_inspection_renews_live_permission_before_either_mutation_backend() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for use_skip in [false, true] {
+                for reason in [
+                    SkipReason::PolicyChanged,
+                    SkipReason::ShuttingDown,
+                    SkipReason::CategorySuspended,
+                ] {
+                    let dir = scratch_dir();
+                    let root = dir.path().join("scan-root");
+                    let target = root.join("target");
+                    let payload = target.join("debug/deps/artifact.o");
+                    fs::create_dir_all(payload.parent().unwrap()).unwrap();
+                    fs::write(&payload, b"keep these bytes").unwrap();
+                    let candidate = make_identity_candidate(&target, 15, 0.95);
+                    let executor = DeletionExecutor::new(
+                        DeletionConfig {
+                            require_identity: true,
+                            mode,
+                            quarantine_roots: vec![root.clone()],
+                            ..offline_config()
+                        },
+                        None,
+                    );
+                    let plan = executor.plan(vec![candidate.clone()]);
+                    let skip_checks = std::cell::Cell::new(0);
+                    let authorization_checks = std::cell::Cell::new(0);
+                    let should_skip = |_: &Path| {
+                        let checks = skip_checks.get() + 1;
+                        skip_checks.set(checks);
+                        (use_skip && checks > 1).then_some(reason)
+                    };
+                    let authorize = |_: &CandidacyScore| {
+                        let checks = authorization_checks.get() + 1;
+                        authorization_checks.set(checks);
+                        if !use_skip && checks > 1 {
+                            Err(reason)
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    let report = executor.execute_with_hooks(
+                        &plan,
+                        Some(&should_skip),
+                        Some(&authorize),
+                        Some(&|_, _| panic!("a refused candidate must not notify success")),
+                    );
+
+                    assert!(
+                        skip_checks.get() > 1,
+                        "the initial permission must expire before mutation"
+                    );
+                    assert_eq!(report.items_deleted, 0, "{mode:?}: {report:?}");
+                    assert_eq!(report.items_quarantined, 0);
+                    assert_eq!(report.items_failed, 0);
+                    assert_eq!(report.items_skipped, 1);
+                    assert_eq!(report.skipped_by_reason.get(reason.as_str()), Some(&1));
+                    assert_eq!(report.bytes_freed, 0);
+                    assert_eq!(report.bytes_quarantined, 0);
+                    assert!(report.backoff_candidates.is_empty());
+                    assert_eq!(fs::read(&payload).unwrap(), b"keep these bytes");
+                    assert_eq!(
+                        walker::identity_for_path(&target, false).ok(),
+                        candidate.identity
+                    );
+                    assert!(!QuarantineStore::under(&root).root().exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn renewed_permission_keeps_authorized_unlink_and_quarantine_working() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            let dir = scratch_dir();
+            let root = dir.path().join("scan-root");
+            let target = root.join("target");
+            fs::create_dir_all(target.join("deps")).unwrap();
+            fs::write(target.join("deps/artifact.o"), b"artifact").unwrap();
+            let candidate = make_identity_candidate(&target, 8, 0.95);
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    require_identity: true,
+                    mode,
+                    quarantine_roots: vec![root.clone()],
+                    ..offline_config()
+                },
+                None,
+            );
+            let authorization_checks = std::cell::Cell::new(0);
+            let report = executor.execute_with_guard(
+                &executor.plan(vec![candidate]),
+                None,
+                Some(&|_| {
+                    authorization_checks.set(authorization_checks.get() + 1);
+                    Ok(())
+                }),
+            );
+
+            assert!(authorization_checks.get() > 1);
+            assert_eq!(report.items_deleted, 1, "{mode:?}: {report:?}");
+            assert_eq!(report.items_skipped, 0);
+            assert_eq!(report.items_failed, 0);
+            assert!(!target.exists());
+            match mode {
+                DeletionMode::Unlink => {
+                    assert_eq!(report.bytes_freed, 8);
+                    assert_eq!(report.items_quarantined, 0);
+                }
+                DeletionMode::Quarantine => {
+                    assert_eq!(report.bytes_freed, 0);
+                    assert_eq!(report.items_quarantined, 1);
+                    let records = QuarantineStore::under(&root).records().unwrap();
+                    assert_eq!(records.len(), 1);
+                    assert_eq!(
+                        fs::read(records[0].quarantine_path.join("deps/artifact.o")).unwrap(),
+                        b"artifact"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn final_permission_renewal_cannot_bypass_a_new_direct_protection() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            let dir = scratch_dir();
+            let root = dir.path().join("scan-root");
+            let target = root.join("target");
+            fs::create_dir_all(target.join("deps")).unwrap();
+            let payload = target.join("deps/artifact.o");
+            fs::write(&payload, b"keep").unwrap();
+            let candidate = make_identity_candidate(&target, 4, 0.95);
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    require_identity: true,
+                    mode,
+                    quarantine_roots: vec![root.clone()],
+                    ..offline_config()
+                },
+                None,
+            );
+            let checks = std::cell::Cell::new(0);
+            let report = executor.execute_with_guard(
+                &executor.plan(vec![candidate]),
+                None,
+                Some(&|_| {
+                    checks.set(checks.get() + 1);
+                    if checks.get() == 2 {
+                        fs::write(target.join(".sbh-protect"), b"protect").unwrap();
+                    }
+                    Ok(())
+                }),
+            );
+
+            assert!(checks.get() > 1);
+            assert_eq!(report.items_deleted, 0, "{mode:?}: {report:?}");
+            assert_eq!(report.items_quarantined, 0);
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.items_skipped, 1);
+            assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+            assert_eq!(fs::read(&payload).unwrap(), b"keep");
+            assert!(!QuarantineStore::under(&root).root().exists());
+        }
     }
 
     fn assert_authorization_hook_preserves_nested_marker(mode: DeletionMode, marker: &str) {
