@@ -215,3 +215,33 @@ identity replacement and malformed-byte fallback. Its arbitrary-byte property
 checks representation round-trips, not filesystem filename admission: APFS and
 Linux filesystems need not admit the same names. Native platform execution is
 still required to qualify the filesystem paths.
+
+## Fair turns for protected-root target surveys
+
+The target-only tier has its own discovery and survey path. Surveys of targets
+found under one protected root share 120 seconds and 2,000,000 examined entries
+per pass. An incomplete candidate remains unsurveyed and cannot be nominated.
+The next pass starts after the last target which received its turn, wrapping
+through the freshly discovered, sorted candidates. A target interrupted after
+earlier targets used part of the allowance is retried first on the next pass.
+Only an incomplete target which received the first, full allowance spends its
+turn. A large target therefore cannot spend every later target's turn on every
+pass, while targets which individually fit a full allowance all get one.
+Each root keeps its own position; a missing or newly protected cursor target
+does not prevent its successor from being tried.
+
+This position is volatile scheduling state. A replaced root inode or material
+scanner configuration change starts a new sequence, and a late old worker
+cannot overwrite the new generation's state. Unrelated worker or event tuning
+keeps the position. Every attempted candidate receives fresh discovery, purity,
+age, active-reference and identity checks; prior attempts authorize nothing.
+An expired allowance before the first attempt spends no turn. The selection
+reports incomplete coverage whenever discovery or a survey is incomplete.
+
+Discovery itself still restarts with its existing 30-second, 50,000-directory,
+65,536-entry-per-directory and depth limits. This change gives fair survey turns
+only to targets that discovery reaches; it does not prove progress beyond a
+repeatedly truncated discovery prefix or interrupt a blocked filesystem call.
+Real-filesystem tests reduce the entry allowance to cover a large first target,
+independent roots, successive successful nominations, new protection markers,
+new activity and impurities, root replacement, and configuration generations.

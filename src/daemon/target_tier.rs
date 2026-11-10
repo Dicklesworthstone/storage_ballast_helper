@@ -35,6 +35,11 @@
 //! whole are not applied; one naming something inside it still is.
 //! Everything else under the root stays untouchable, and with no roots
 //! configured the tier never reads the disk.
+//!
+//! Surveys share finite time and entry allowances per root. Each root keeps
+//! a position in the target order as a scheduling hint, so an oversized target
+//! cannot repeatedly consume the turns of all targets discovered after it.
+//! Discovery and every safety observation remain fresh on every pass.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
@@ -44,7 +49,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::core::config::{Config, ScannerConfig};
 use crate::core::paths::resolve_absolute_path;
@@ -77,6 +82,10 @@ const MAX_LISTING_ENTRIES: usize = 65_536;
 const DISCOVERY_BUDGET: Duration = Duration::from_secs(30);
 /// Entries one candidate's survey may visit before it fails closed.
 const SURVEY_MAX_ENTRIES: u64 = 2_000_000;
+/// Aggregate entry allowance for surveying one root in a pass. A large
+/// incomplete target spends its turn, rather than every later target's next
+/// turn too: the next pass resumes with the next target awaiting a full turn.
+const SURVEY_PASS_MAX_ENTRIES: u64 = SURVEY_MAX_ENTRIES;
 /// Wall time for surveying all of one root's candidates.
 const SURVEY_BUDGET: Duration = Duration::from_secs(120);
 /// Shortest gap between two checks of whether any root is due.
@@ -95,7 +104,7 @@ pub struct Selection {
     pub discovered: usize,
     /// Why the others were left alone, by reason.
     pub left: BTreeMap<&'static str, usize>,
-    /// False when a budget stopped discovery before the root was covered.
+    /// False when a budget stopped discovery or left a candidate unsurveyed.
     pub complete: bool,
 }
 
@@ -390,6 +399,8 @@ struct Survey {
     identity: Option<FsIdentity>,
     newest: Option<SystemTime>,
     bytes: u64,
+    /// Entries examined, including the entry which exhausted the allowance.
+    examined: u64,
     /// `None` only when the walk covered the whole directory and found
     /// nothing that keeps it.
     kept: Option<Kept>,
@@ -425,6 +436,7 @@ fn survey_with_limits(
         identity: None,
         newest: None,
         bytes: 0,
+        examined: 0,
         kept: Some(Kept::Unsurveyed),
     };
     if Instant::now() >= deadline {
@@ -446,7 +458,6 @@ fn survey_with_limits(
         found.kept = Some(Kept::Recent);
         return found;
     }
-    let mut entries = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
         if Instant::now() >= deadline {
@@ -456,8 +467,8 @@ fn survey_with_limits(
             return found;
         };
         for entry in listing {
-            entries += 1;
-            if entries > max_entries || Instant::now() >= deadline {
+            found.examined += 1;
+            if found.examined > max_entries || Instant::now() >= deadline {
                 return found;
             }
             let Ok(entry) = entry else {
@@ -651,6 +662,64 @@ fn discover(root: &Path, excluded: &[PathBuf], found: &mut Vec<PathBuf>) -> bool
     covered
 }
 
+/// Scheduling hints only. Every pass discovers candidates anew and repeats
+/// their complete safety checks; no survey or nomination survives a pass.
+#[derive(Debug, Default)]
+struct SurveyProgress {
+    root_identity: Option<FsIdentity>,
+    after: Option<PathBuf>,
+}
+
+impl SurveyProgress {
+    fn order(&mut self, root: &Path, found: &mut [PathBuf]) {
+        let identity = current_identity(root);
+        if self.root_identity != identity {
+            self.root_identity = identity;
+            self.after = None;
+        }
+        found.sort();
+        if let Some(after) = &self.after {
+            // The last target may have disappeared or become protected.
+            // Its lexical successor still gets the next opportunity.
+            let next = found.partition_point(|path| path <= after);
+            found.rotate_left(next);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SurveyLimits {
+    entries: u64,
+    duration: Duration,
+}
+
+impl Default for SurveyLimits {
+    fn default() -> Self {
+        Self {
+            entries: SURVEY_PASS_MAX_ENTRIES,
+            duration: SURVEY_BUDGET,
+        }
+    }
+}
+
+struct SurveyBudget {
+    remaining_entries: u64,
+    deadline: Instant,
+}
+
+impl SurveyBudget {
+    fn new(limits: SurveyLimits) -> Self {
+        Self {
+            remaining_entries: limits.entries,
+            deadline: Instant::now() + limits.duration,
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.remaining_entries == 0 || Instant::now() >= self.deadline
+    }
+}
+
 /// A discovered directory that passed the purity check and its survey.
 struct Checked {
     /// Resolved: the reference index keys resolved paths, so a parent symlink
@@ -667,14 +736,20 @@ fn check(
     dir: &Path,
     idle_cutoff: SystemTime,
     now: SystemTime,
-    deadline: Instant,
+    budget: &mut SurveyBudget,
 ) -> std::result::Result<Checked, &'static str> {
     match first_impurity(dir, MAX_LISTING_ENTRIES) {
         Ok(None) => {}
         Ok(Some(_)) => return Err("impure"),
         Err(_) => return Err("unreadable"),
     }
-    let facts = survey(dir, idle_cutoff, deadline);
+    let facts = survey_with_limits(
+        dir,
+        idle_cutoff,
+        budget.deadline,
+        budget.remaining_entries.min(SURVEY_MAX_ENTRIES),
+    );
+    budget.remaining_entries = budget.remaining_entries.saturating_sub(facts.examined);
     if let Some(kept) = facts.kept {
         return Err(kept.reason());
     }
@@ -702,6 +777,27 @@ fn check(
     })
 }
 
+/// An oversized target spends a full turn, but one interrupted after earlier
+/// targets used the allowance must receive a fresh turn next time. Advancing
+/// past both would starve every second target when each fits a full pass but
+/// two do not fit together.
+fn check_with_progress(
+    dir: &Path,
+    idle_cutoff: SystemTime,
+    now: SystemTime,
+    budget: &mut SurveyBudget,
+    progress: &mut SurveyProgress,
+    first_attempt: bool,
+) -> std::result::Result<Checked, &'static str> {
+    let result = check(dir, idle_cutoff, now, budget);
+    let needs_full_turn =
+        matches!(&result, Err("unsurveyed")) && budget.exhausted() && !first_attempt;
+    if !needs_full_turn {
+        progress.after = Some(dir.to_path_buf());
+    }
+    result
+}
+
 /// Find, check and score target-only candidates under one root.
 #[must_use]
 pub fn select(
@@ -711,19 +807,48 @@ pub fn select(
     urgency: f64,
     now: SystemTime,
 ) -> Selection {
+    select_with_progress(
+        root,
+        config,
+        platform,
+        urgency,
+        now,
+        &mut SurveyProgress::default(),
+        SurveyLimits::default(),
+    )
+}
+
+fn select_with_progress(
+    root: &Path,
+    config: &Config,
+    platform: &dyn Platform,
+    urgency: f64,
+    now: SystemTime,
+    progress: &mut SurveyProgress,
+    limits: SurveyLimits,
+) -> Selection {
     let mut selection = Selection::default();
     let mut found = Vec::new();
     selection.complete = discover(root, &config.scanner.excluded_paths, &mut found);
     selection.discovered = found.len();
+    progress.order(root, &mut found);
 
     let idle = idle_window(&config.scanner);
     let idle_cutoff = now.checked_sub(idle).unwrap_or(SystemTime::UNIX_EPOCH);
-    let deadline = Instant::now() + SURVEY_BUDGET;
+    let mut budget = SurveyBudget::new(limits);
     let mut checked = Vec::new();
-    for dir in found {
-        match check(&dir, idle_cutoff, now, deadline) {
+    for (index, dir) in found.into_iter().enumerate() {
+        if budget.exhausted() {
+            selection.complete = false;
+            *selection.left.entry("unsurveyed").or_default() += selection.discovered - index;
+            break;
+        }
+        match check_with_progress(&dir, idle_cutoff, now, &mut budget, progress, index == 0) {
             Ok(candidate) => checked.push(candidate),
-            Err(reason) => selection.leave(reason),
+            Err(reason) => {
+                selection.complete &= reason != "unsurveyed";
+                selection.leave(reason);
+            }
         }
     }
     if checked.is_empty() {
@@ -910,6 +1035,9 @@ pub struct TargetTier {
     /// batches already queued for the executor. Re-enabling cannot revive it.
     revoked: Arc<AtomicBool>,
     scanner: Option<ScannerConfig>,
+    /// Independent fair turns for each root. Locks only move small scheduling
+    /// hints; no filesystem operation runs while this mutex is held.
+    survey_progress: Arc<Mutex<HashMap<PathBuf, SurveyProgress>>>,
 }
 
 impl TargetTier {
@@ -925,6 +1053,9 @@ impl TargetTier {
             self.started = None;
             self.last_probe = None;
             self.last_start = None;
+            // A blocked old worker can finish later. Its hints belong to its
+            // old scope and must not overwrite the replacement's progress.
+            self.survey_progress = Arc::default();
         }
         self.scanner = Some(scanner.clone());
     }
@@ -990,6 +1121,7 @@ impl TargetTier {
         let logger = logger.clone();
         let revoked = Arc::clone(&self.revoked);
         let pressure = Arc::clone(&self.pressure);
+        let survey_progress = Arc::clone(&self.survey_progress);
         let (started_tx, started_rx) = crossbeam_channel::bounded(1);
         let spawned = std::thread::Builder::new()
             .name("sbh-targets".to_string())
@@ -999,6 +1131,9 @@ impl TargetTier {
                     return;
                 }
                 let roots = expand_roots(&config.scanner.target_only_roots);
+                survey_progress
+                    .lock()
+                    .retain(|root, _| roots.binary_search(root).is_ok());
                 let mut pass_started = false;
                 for root in roots {
                     if revoked.load(Ordering::Acquire) {
@@ -1014,6 +1149,7 @@ impl TargetTier {
                         let _ = started_tx.try_send(Instant::now());
                         pass_started = true;
                     }
+                    let mut progress = survey_progress.lock().remove(&root).unwrap_or_default();
                     let message = run_root(
                         &due,
                         &config,
@@ -1022,7 +1158,11 @@ impl TargetTier {
                         SystemTime::now(),
                         &revoked,
                         &pressure,
+                        &mut progress,
                     );
+                    if !revoked.load(Ordering::Acquire) {
+                        survey_progress.lock().insert(root, progress);
+                    }
                     eprintln!("[SBH-TARGETS] {message}");
                     logger.send(ActivityEvent::Info { message });
                 }
@@ -1049,6 +1189,7 @@ impl Drop for TargetTier {
 
 /// One root: select, then hand the candidates to the executor as a
 /// target-only batch. Returns the summary line.
+#[allow(clippy::too_many_arguments)]
 fn run_root(
     due: &DueRoot,
     config: &Config,
@@ -1057,11 +1198,20 @@ fn run_root(
     now: SystemTime,
     revoked: &Arc<AtomicBool>,
     pressure: &RwLock<MountPressure>,
+    progress: &mut SurveyProgress,
 ) -> String {
     if revoked.load(Ordering::Acquire) {
         return format!("root={} target-only consent revoked", due.root.display());
     }
-    let selection = select(&due.root, config, platform, due.urgency, now);
+    let selection = select_with_progress(
+        &due.root,
+        config,
+        platform,
+        due.urgency,
+        now,
+        progress,
+        SurveyLimits::default(),
+    );
     let summary = selection.summary(&due.root);
     if revoked.load(Ordering::Acquire) {
         return format!("{summary}; target-only consent revoked; no batch submitted");
@@ -1105,7 +1255,7 @@ fn run_root(
             "{summary}; sent to the executor (level={:?})",
             current.level
         ),
-        Err(_) => format!("{summary}; executor queue full, next pass retries"),
+        Err(_) => format!("{summary}; executor queue full, a later pass retries"),
     }
 }
 
@@ -1502,6 +1652,261 @@ mod tests {
         ));
     }
 
+    fn five_entry_slice() -> SurveyLimits {
+        // cargo_target has five entries below its root. This is the same
+        // finite entry allowance as production, reduced to make exhaustion
+        // deterministic without waiting for the wall-clock guard.
+        SurveyLimits {
+            entries: 5,
+            duration: SURVEY_BUDGET,
+        }
+    }
+
+    #[test]
+    fn an_oversized_first_target_cannot_starve_later_targets_or_other_roots() {
+        let (_temp, root) = scratch_root();
+        let roots = [root.join("first-root"), root.join("second-root")];
+        for root in &roots {
+            for name in ["target-a-large", "target-b", "target-c"] {
+                cargo_target(&root.join(name));
+            }
+            for index in 0..8 {
+                fs::write(
+                    root.join(format!("target-a-large/debug/deps/extra-{index}.rlib")),
+                    b"old build output",
+                )
+                .unwrap();
+            }
+        }
+        age(&root, 48);
+        let config = Config::default();
+        let platform = MockPlatform::healthy();
+        let mut progress = HashMap::<PathBuf, SurveyProgress>::new();
+        // Interleave the roots in different orders: their cursors must not
+        // borrow one another's position or lose the unfinished large target.
+        for (round, expected) in [None, Some("target-b"), Some("target-c"), None]
+            .into_iter()
+            .enumerate()
+        {
+            for root in roots.iter().cycle().skip(round % 2).take(2) {
+                let selection = select_with_progress(
+                    root,
+                    &config,
+                    &platform,
+                    0.5,
+                    later(),
+                    progress.entry(root.clone()).or_default(),
+                    five_entry_slice(),
+                );
+                assert_eq!(
+                    names(&selection),
+                    expected.into_iter().collect::<Vec<_>>(),
+                    "round {round}: {}",
+                    selection.summary(root),
+                );
+                assert!(!selection.complete, "a finite slice is not full coverage");
+                assert!(selection.left.contains_key("unsurveyed"));
+                assert_eq!(selection.discovered, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn targets_that_fit_a_full_slice_are_retried_after_a_partial_slice() {
+        let (_temp, root) = scratch_root();
+        let targets = ["target-a", "target-b", "target-c", "target-d"];
+        for name in targets {
+            cargo_target(&root.join(name));
+            // Six entries per target: one fits in a ten-entry pass, two do
+            // not. Advancing past the partial second target starves B/D.
+            fs::write(root.join(name).join("debug/deps/extra.rlib"), b"x").unwrap();
+        }
+        age(&root, 48);
+        let mut progress = SurveyProgress::default();
+        for expected in targets {
+            let selection = select_with_progress(
+                &root,
+                &Config::default(),
+                &MockPlatform::healthy(),
+                0.5,
+                later(),
+                &mut progress,
+                SurveyLimits {
+                    entries: 10,
+                    duration: SURVEY_BUDGET,
+                },
+            );
+            assert_eq!(
+                names(&selection),
+                [expected],
+                "{}",
+                selection.summary(&root)
+            );
+            assert_eq!(progress.after, Some(root.join(expected)));
+            assert!(!selection.complete);
+        }
+    }
+
+    #[test]
+    fn a_deadline_reached_during_a_later_attempt_preserves_its_full_turn() {
+        let (_temp, root) = scratch_root();
+        let first = root.join("target-a");
+        let next = root.join("target-b");
+        cargo_target(&first);
+        cargo_target(&next);
+        age(&root, 48);
+        let now = later();
+        let cutoff = now - Duration::from_hours(24);
+        let mut progress = SurveyProgress::default();
+        progress.order(&root, &mut [first.clone(), next.clone()]);
+        let mut budget = SurveyBudget::new(SurveyLimits::default());
+        assert!(check_with_progress(&first, cutoff, now, &mut budget, &mut progress, true).is_ok());
+        // Model time expiring after the outer admission check, while a
+        // later target's native purity lookup uses the remaining time.
+        // The real survey observes that deadline and returns Unsurveyed.
+        budget.deadline = Instant::now();
+        assert!(matches!(
+            check_with_progress(&next, cutoff, now, &mut budget, &mut progress, false),
+            Err("unsurveyed"),
+        ));
+        assert_eq!(progress.after, Some(first));
+        let selection = select_with_progress(
+            &root,
+            &Config::default(),
+            &MockPlatform::healthy(),
+            0.5,
+            now,
+            &mut progress,
+            five_entry_slice(),
+        );
+        assert_eq!(names(&selection), ["target-b"]);
+    }
+
+    #[test]
+    fn resumed_surveys_repeat_discovery_purity_and_idle_checks() {
+        let (_temp, root) = scratch_root();
+        for name in [
+            "target-a-large",
+            "target-b-marked",
+            "target-c-recent",
+            "target-d-impure",
+            "target-e-idle",
+        ] {
+            cargo_target(&root.join(name));
+        }
+        fs::write(root.join("target-a-large/debug/deps/extra.rlib"), b"x").unwrap();
+        age(&root, 48);
+        let config = Config::default();
+        let platform = MockPlatform::healthy();
+        let mut progress = SurveyProgress::default();
+        let first = select_with_progress(
+            &root,
+            &config,
+            &platform,
+            0.5,
+            later(),
+            &mut progress,
+            five_entry_slice(),
+        );
+        assert!(first.candidates.is_empty());
+        assert_eq!(progress.after, Some(root.join("target-a-large")));
+
+        // These targets were discovered but not inspected in the first
+        // slice. Their new state, not that old discovery, decides the next.
+        fs::write(root.join("target-b-marked/.sbh-protect"), b"").unwrap();
+        touch_ahead(&root.join("target-c-recent/debug/deps/libdemo.rlib"), 2);
+        fs::create_dir(root.join("target-d-impure/trace")).unwrap();
+        let mut nominated = Vec::new();
+        let mut refusals = BTreeMap::new();
+        for _ in 0..3 {
+            let selection = select_with_progress(
+                &root,
+                &config,
+                &platform,
+                0.5,
+                later(),
+                &mut progress,
+                five_entry_slice(),
+            );
+            assert_eq!(selection.discovered, 4, "the new marker hides its target");
+            nominated.extend(names(&selection));
+            for (reason, count) in selection.left {
+                *refusals.entry(reason).or_insert(0) += count;
+            }
+        }
+        assert_eq!(nominated, ["target-e-idle"]);
+        assert!(refusals.contains_key("recent"));
+        assert!(refusals.contains_key("impure"));
+    }
+
+    #[test]
+    fn replaced_roots_start_fresh_and_expired_slices_spend_no_turn() {
+        let (_temp, root) = scratch_root();
+        for name in ["target-a", "target-b"] {
+            cargo_target(&root.join(name));
+        }
+        age(&root, 48);
+        let config = Config::default();
+        let platform = MockPlatform::healthy();
+        let mut progress = SurveyProgress::default();
+        let first = select_with_progress(
+            &root,
+            &config,
+            &platform,
+            0.5,
+            later(),
+            &mut progress,
+            five_entry_slice(),
+        );
+        assert_eq!(names(&first), ["target-a"]);
+        fs::write(root.join("target-a/.sbh-protect"), b"").unwrap();
+        let successor = select_with_progress(
+            &root,
+            &config,
+            &platform,
+            0.5,
+            later(),
+            &mut progress,
+            five_entry_slice(),
+        );
+        assert_eq!(names(&successor), ["target-b"]);
+        assert_eq!(successor.discovered, 1, "the cursor target is now hidden");
+        let identity = progress.root_identity;
+        let before = progress.after.clone();
+        let expired = select_with_progress(
+            &root,
+            &config,
+            &platform,
+            0.5,
+            later(),
+            &mut progress,
+            SurveyLimits {
+                duration: Duration::ZERO,
+                ..five_entry_slice()
+            },
+        );
+        assert!(expired.candidates.is_empty());
+        assert!(!expired.complete);
+        assert_eq!(progress.after, before);
+
+        fs::rename(&root, root.with_file_name("previous-scratch-root")).unwrap();
+        for name in ["target-a", "target-b"] {
+            cargo_target(&root.join(name));
+        }
+        age(&root, 48);
+        let replacement = select_with_progress(
+            &root,
+            &config,
+            &platform,
+            0.5,
+            later(),
+            &mut progress,
+            five_entry_slice(),
+        );
+        assert_ne!(progress.root_identity, identity);
+        assert_eq!(names(&replacement), ["target-a"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_directory_replaced_after_its_survey_no_longer_matches_its_identity() {
@@ -1544,6 +1949,7 @@ mod tests {
             later(),
             &Arc::new(AtomicBool::new(false)),
             &pressure,
+            &mut SurveyProgress::default(),
         );
         let batch = del_rx
             .try_recv()
@@ -1606,6 +2012,14 @@ mod tests {
             let guard = RunningGuard(Arc::clone(&tier.running));
             tier.last_start = Some(Instant::now());
             tier.last_probe = Some(Instant::now());
+            let old_progress = Arc::clone(&tier.survey_progress);
+            old_progress.lock().insert(
+                root.to_path_buf(),
+                SurveyProgress {
+                    root_identity: None,
+                    after: Some(root.join("target-before-reload")),
+                },
+            );
 
             let mut replacement = scanner.clone();
             change(&mut replacement);
@@ -1621,6 +2035,18 @@ mod tests {
             );
             assert!(tier.last_start.is_none(), "{label}");
             assert!(tier.last_probe.is_none(), "{label}");
+            assert!(
+                !Arc::ptr_eq(&old_progress, &tier.survey_progress),
+                "{label}"
+            );
+            old_progress.lock().insert(
+                root.to_path_buf(),
+                SurveyProgress {
+                    root_identity: None,
+                    after: Some(root.join("late-old-worker")),
+                },
+            );
+            assert!(tier.survey_progress.lock().is_empty(), "{label}");
 
             tier.update_config(&scanner);
             assert!(
@@ -1650,11 +2076,13 @@ mod tests {
         let mut tier = TargetTier::default();
         tier.update_config(&scanner);
         let consent = TargetOnlyConsent::new(root, &scanner, Arc::clone(&tier.revoked));
+        let progress = Arc::clone(&tier.survey_progress);
         scanner.parallelism += 1;
         scanner.event_watch_budget += 1;
         scanner.event_source = crate::core::config::ScannerEventSourceMode::ReconciliationOnly;
         tier.update_config(&scanner);
         assert!(consent.permits(root, &scanner));
+        assert!(Arc::ptr_eq(&progress, &tier.survey_progress));
     }
 
     #[test]
@@ -1679,6 +2107,7 @@ mod tests {
             later(),
             &old_token,
             &pressure,
+            &mut SurveyProgress::default(),
         );
         let batch = receive.try_recv().unwrap_or_else(|_| panic!("{summary}"));
         let witness = batch.target_only_consent.as_ref().unwrap();
@@ -1698,6 +2127,7 @@ mod tests {
             later(),
             &old_token,
             &pressure,
+            &mut SurveyProgress::default(),
         );
         assert!(summary.contains("consent revoked"));
         assert!(
@@ -2210,6 +2640,7 @@ mod tests {
                 later(),
                 &Arc::new(AtomicBool::new(false)),
                 &pressure,
+                &mut SurveyProgress::default(),
             );
             assert!(summary.contains("nominated=1"), "{summary}");
             assert!(
