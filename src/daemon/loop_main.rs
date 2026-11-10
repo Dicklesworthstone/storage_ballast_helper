@@ -3017,6 +3017,8 @@ pub struct MonitoringDaemon {
     ballast_replenisher: BallastReplenisher,
     release_controller: BallastReleaseController,
     notification_manager: NotificationManager,
+    /// Last notification loss total submitted to best-effort activity logging.
+    notification_drops_logged: u64,
     scoring_engine: ScoringEngine,
     voi_scheduler: VoiScheduler,
     /// When the last maintenance plan was made and what it chose, for the
@@ -4848,6 +4850,7 @@ impl MonitoringDaemon {
             ballast_replenisher: BallastReplenisher::default(),
             release_controller,
             notification_manager,
+            notification_drops_logged: 0,
             policy_engine,
             scoring_engine,
             voi_scheduler,
@@ -5720,6 +5723,17 @@ impl MonitoringDaemon {
                 self.last_voi_plan.as_ref(),
             ));
         let dropped_log_events = self.logger_handle.dropped_events();
+        let dropped_notifications = self.notification_manager.dropped_count();
+        if dropped_notifications > self.notification_drops_logged {
+            self.logger_handle.send(ActivityEvent::Info {
+                message: format!(
+                    "[SBH-NOTIFY] dropped_deliveries={} total={} reason=notification_backlog_or_worker_unavailable",
+                    dropped_notifications - self.notification_drops_logged,
+                    dropped_notifications,
+                ),
+            });
+            self.notification_drops_logged = dropped_notifications;
+        }
         let policy_mode = {
             let policy = self.policy_engine.lock();
             self.self_monitor.set_policy_snapshot(PolicyStateRecord {
@@ -9488,6 +9502,16 @@ impl MonitoringDaemon {
                 reason: exit_reason.to_string(),
                 uptime_secs,
             });
+        // Notification I/O stays off the monitor during normal operation.
+        // At shutdown, give every channel one shared, bounded window to send
+        // the final event; a stuck destination must not hold the process open.
+        if !self.notification_manager.drain(Duration::from_secs(1)) {
+            self.logger_handle.send(ActivityEvent::Info {
+                message:
+                    "[SBH-NOTIFY] shutdown delivery window elapsed; notifications may be incomplete"
+                        .to_string(),
+            });
+        }
 
         // 4. Shutdown logger thread.
         self.logger_handle.shutdown();

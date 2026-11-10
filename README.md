@@ -2022,6 +2022,16 @@ The daemon dispatches alerts through four notification channels, each with indep
 | Journal | systemd/launchd stderr capture; macOS unified logging | Warning |
 
 Default active channels are `journal` and `file`. Desktop and webhook channels are opt-in.
+Each channel has one retained delivery worker and a 64-entry queue. Notification
+enqueue and configuration reload do not wait for the destination; a stalled
+channel retains its worker while the other channels can continue. Reloads cancel
+queued deliveries for changed or disabled destinations, although a delivery
+already in progress may still finish. Full or disconnected queues drop new
+deliveries, and the daemon reports the loss count through `[SBH-NOTIFY]` activity
+events. Shutdown gives pending notifications one shared one-second delivery
+window. This is best-effort delivery, and other synchronous daemon diagnostics
+can still wait on service-log I/O.
+
 On macOS, the desktop channel uses `osascript -e 'display notification ...'` as the
 first supported user-notification path. Red and Critical events are still
 throttled per event category by `urgent_notify_interval_secs` (default five

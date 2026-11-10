@@ -1,8 +1,9 @@
 //! Multi-channel notification system: desktop, file, journal, and webhook channels.
 //!
 //! Dispatches structured notifications through configured channels with min-level
-//! filtering. Each channel is fire-and-forget — notification failures are logged
-//! but never block the monitoring loop.
+//! filtering. Each channel has one retained worker and a bounded queue, so
+//! notification enqueue, reload and drop never wait for a stalled sink. Other
+//! callers' synchronous service-log writes are outside this dispatch boundary.
 
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
@@ -12,9 +13,12 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::{Sender, bounded};
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::pid::PressureLevel;
@@ -24,6 +28,10 @@ mod journal;
 
 const DEFAULT_NOTIFY_INTERVAL_SECS: u64 = 60;
 const DEFAULT_URGENT_NOTIFY_INTERVAL_SECS: u64 = 300;
+/// Pending notifications per channel; an occupied worker is never replaced.
+const CHANNEL_QUEUE_CAPACITY: usize = 64;
+/// Desktop/webhook children get one bounded attempt on their channel's worker.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ──────────────────── notification level ────────────────────
 
@@ -498,6 +506,37 @@ trait Channel: Send + Sync {
     fn send(&self, event: &NotificationEvent);
 }
 
+/// Wait only on a channel worker. A child that outlives its allowance is
+/// killed and reaped before another delivery may start. A native spawn/wait
+/// that itself stalls retains this worker rather than leaking replacements.
+fn run_notification_command(command: &mut Command, timeout: Duration) -> bool {
+    let Ok(mut child) = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(
+                    Duration::from_millis(20)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 // ──── Desktop (notify-send / osascript) ────
 
 struct DesktopChannel {
@@ -584,33 +623,23 @@ impl Channel for DesktopChannel {
 
         #[cfg(target_os = "linux")]
         {
-            if let Ok(child) = Command::new("notify-send")
-                .arg("--urgency")
-                .arg(urgency)
-                .arg("--app-name=sbh")
-                .arg("Storage Ballast Helper")
-                .arg(&summary)
-                .spawn()
-            {
-                // Reap the child in a detached thread to prevent zombie accumulation.
-                std::thread::spawn(move || {
-                    let mut c = child;
-                    let _ = c.wait();
-                });
-            }
+            run_notification_command(
+                Command::new("notify-send")
+                    .arg("--urgency")
+                    .arg(urgency)
+                    .arg("--app-name=sbh")
+                    .arg("Storage Ballast Helper")
+                    .arg(&summary),
+                COMMAND_TIMEOUT,
+            );
         }
 
         #[cfg(target_os = "macos")]
         {
             let script = macos_display_notification_script(&summary);
             let euid = nix::unistd::geteuid().as_raw();
-            if let Some(argv) = macos_notification_argv(&script, euid, macos_console_uid())
-                && let Ok(child) = Command::new(&argv[0]).args(&argv[1..]).spawn()
-            {
-                std::thread::spawn(move || {
-                    let mut c = child;
-                    let _ = c.wait();
-                });
+            if let Some(argv) = macos_notification_argv(&script, euid, macos_console_uid()) {
+                run_notification_command(Command::new(&argv[0]).args(&argv[1..]), COMMAND_TIMEOUT);
             }
         }
 
@@ -833,41 +862,176 @@ impl Channel for WebhookChannel {
 
         let body = self.render_body(event);
 
-        // Fire-and-forget via curl. Timeout of 5 seconds to avoid blocking.
+        // The retained worker owns this child, including its timeout and reap.
         // Use "--" to prevent URL from being interpreted as a curl option.
-        // Reap the child in a detached thread to prevent zombie accumulation.
-        if let Ok(child) = Command::new("curl")
-            .arg("--silent")
-            .arg("--max-time")
-            .arg("5")
-            .arg("--user-agent")
-            .arg(crate::core::HTTP_USER_AGENT)
-            .arg("--header")
-            .arg("Content-Type: application/json")
-            .arg("--data-raw")
-            .arg(&body)
-            .arg("--")
-            .arg(&self.url)
-            .spawn()
-        {
-            std::thread::spawn(move || {
-                let mut c = child;
-                let _ = c.wait();
-            });
-        }
+        run_notification_command(
+            Command::new("curl")
+                .arg("--silent")
+                .arg("--max-time")
+                .arg("5")
+                .arg("--user-agent")
+                .arg(crate::core::HTTP_USER_AGENT)
+                .arg("--header")
+                .arg("Content-Type: application/json")
+                .arg("--data-raw")
+                .arg(&body)
+                .arg("--")
+                .arg(&self.url),
+            COMMAND_TIMEOUT,
+        );
     }
 }
 
 // ──────────────────── notification manager ────────────────────
 
+#[derive(Clone, PartialEq, Eq)]
+enum ChannelSettings {
+    Desktop(DesktopConfig),
+    File(FileConfig),
+    Journal(JournalConfig),
+    Webhook(WebhookConfig),
+}
+
+impl ChannelSettings {
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Desktop(_) => "desktop",
+            Self::File(_) => "file",
+            Self::Journal(_) => "journal",
+            Self::Webhook(_) => "webhook",
+        }
+    }
+
+    fn channel(&self) -> Arc<dyn Channel> {
+        match self {
+            Self::Desktop(config) => Arc::new(DesktopChannel::new(config)),
+            Self::File(config) => Arc::new(FileChannel::new(config)),
+            Self::Journal(config) => Arc::new(JournalChannel::new(config)),
+            Self::Webhook(config) => Arc::new(WebhookChannel::new(config)),
+        }
+    }
+
+    /// Apply filters before taking queue space. A flood below a channel's
+    /// threshold must not crowd out the alerts that channel is meant to show.
+    fn accepts(&self, level: NotificationLevel) -> bool {
+        match self {
+            Self::Desktop(config) => config.enabled && level >= config.min_level,
+            Self::File(_) => true,
+            Self::Journal(config) => level >= config.min_level,
+            Self::Webhook(config) => {
+                config.enabled && !config.url.is_empty() && level >= config.min_level
+            }
+        }
+    }
+
+    fn configured(config: &NotificationConfig) -> Vec<Self> {
+        if !config.enabled {
+            return Vec::new();
+        }
+        let mut configured: Vec<Self> = Vec::new();
+        for name in &config.channels {
+            let setting = match name.as_str() {
+                "desktop" if config.desktop.enabled => Self::Desktop(config.desktop.clone()),
+                "file" => Self::File(config.file.clone()),
+                "journal" => Self::Journal(config.journal.clone()),
+                "webhook" if config.webhook.enabled => Self::Webhook(config.webhook.clone()),
+                _ => continue,
+            };
+            if !configured.iter().any(|old| old.name() == setting.name()) {
+                configured.push(setting);
+            }
+        }
+        configured
+    }
+}
+
+struct ChannelTarget {
+    settings: ChannelSettings,
+    channel: Arc<dyn Channel>,
+    revoked: Arc<AtomicBool>,
+}
+
+impl ChannelTarget {
+    fn new(settings: ChannelSettings) -> Self {
+        Self {
+            channel: settings.channel(),
+            settings,
+            revoked: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+struct Delivery {
+    event: Arc<NotificationEvent>,
+    channel: Arc<dyn Channel>,
+    revoked: Arc<AtomicBool>,
+}
+
+enum Dispatch {
+    Event(Delivery),
+    /// A FIFO barrier used only by an explicit bounded shutdown drain.
+    Drain(Sender<()>),
+}
+
+/// The slot survives channel disable/re-enable and destination changes. If a
+/// delivery blocks in native I/O, reload can revoke queued work but cannot
+/// start another worker in its place. Dropping a sender never joins a worker.
+struct ChannelWorker {
+    name: &'static str,
+    send: Sender<Dispatch>,
+    target: Option<ChannelTarget>,
+}
+
+impl ChannelWorker {
+    fn new(settings: ChannelSettings) -> Self {
+        let name = settings.name();
+        let (send, receive) = bounded::<Dispatch>(CHANNEL_QUEUE_CAPACITY);
+        // A failed spawn drops the receiver. Later attempts to enqueue are
+        // counted as dropped, with no synchronous diagnostic I/O on the monitor.
+        let _ = std::thread::Builder::new()
+            .name(format!("sbh-notify-{name}"))
+            .spawn(move || {
+                for dispatch in receive {
+                    match dispatch {
+                        Dispatch::Event(delivery) => {
+                            if !delivery.revoked.load(Ordering::Acquire) {
+                                delivery.channel.send(&delivery.event);
+                            }
+                        }
+                        Dispatch::Drain(acknowledge) => {
+                            let _ = acknowledge.try_send(());
+                        }
+                    }
+                }
+            });
+        Self {
+            name,
+            send,
+            target: Some(ChannelTarget::new(settings)),
+        }
+    }
+
+    fn update(&mut self, settings: Option<&ChannelSettings>) {
+        if self.target.as_ref().map(|target| &target.settings) == settings {
+            return;
+        }
+        if let Some(old) = self.target.take() {
+            old.revoked.store(true, Ordering::Release);
+        }
+        self.target = settings.cloned().map(ChannelTarget::new);
+    }
+}
+
 /// Coordinates dispatching notification events to all enabled channels.
 ///
-/// The manager is designed to be cheap to call — each channel's `send()` is
-/// fire-and-forget (spawns child processes for desktop/webhook, appends for file,
-/// and writes to service logs for journal). Notification failures never propagate.
+/// Calls enqueue without waiting for channel I/O. At most one worker per
+/// supported channel is retained, including across reloads. Full queues drop
+/// new deliveries and increment [`Self::dropped_count`]. Call [`Self::drain`]
+/// explicitly at shutdown to give the final event a bounded delivery window.
 pub struct NotificationManager {
-    channels: Vec<Box<dyn Channel>>,
+    channels: Vec<ChannelWorker>,
     enabled: bool,
+    dropped: AtomicU64,
     /// Dispatch history by category, affected scope and severity. Lower-level
     /// events cannot hide an escalation or reset a previous urgent cooldown.
     last_send_by_scope: HashMap<(&'static str, String), BTreeMap<NotificationLevel, Instant>>,
@@ -879,55 +1043,37 @@ impl NotificationManager {
     /// Build a manager from configuration.
     #[must_use]
     pub fn from_config(config: &NotificationConfig) -> Self {
-        if !config.enabled {
-            return Self {
-                channels: Vec::new(),
-                enabled: false,
-                last_send_by_scope: HashMap::new(),
-                min_interval: Duration::ZERO,
-                urgent_min_interval: Duration::ZERO,
-            };
-        }
-
-        let mut channels: Vec<Box<dyn Channel>> = Vec::new();
-
-        for channel_name in &config.channels {
-            match channel_name.as_str() {
-                "desktop" if config.desktop.enabled => {
-                    channels.push(Box::new(DesktopChannel::new(&config.desktop)));
-                }
-                "file" => {
-                    channels.push(Box::new(FileChannel::new(&config.file)));
-                }
-                "journal" => {
-                    channels.push(Box::new(JournalChannel::new(&config.journal)));
-                }
-                "webhook" if config.webhook.enabled => {
-                    channels.push(Box::new(WebhookChannel::new(&config.webhook)));
-                }
-                _ => {
-                    // Unknown or disabled channel name — skip silently.
-                }
-            }
-        }
-
-        Self {
-            channels,
-            enabled: true,
-            last_send_by_scope: HashMap::new(),
-            min_interval: Duration::from_secs(config.min_notify_interval_secs),
-            urgent_min_interval: Duration::from_secs(config.urgent_notify_interval_secs),
-        }
+        let mut manager = Self::disabled();
+        manager.update_config(config);
+        manager
     }
 
     /// Replace this manager's configuration (e.g., after SIGHUP config reload).
     ///
-    /// Preserves scoped throttle history so a config reload doesn't open
-    /// a burst window where previously throttled events can fire immediately.
+    /// Preserves scoped throttle history and occupied worker slots. Queued
+    /// deliveries using a changed or disabled channel are revoked; an already
+    /// executing native operation may still complete under its old settings.
     pub fn update_config(&mut self, config: &NotificationConfig) {
-        let throttle_state = std::mem::take(&mut self.last_send_by_scope);
-        *self = Self::from_config(config);
-        self.last_send_by_scope = throttle_state;
+        let configured = ChannelSettings::configured(config);
+        for worker in &mut self.channels {
+            worker.update(
+                configured
+                    .iter()
+                    .find(|setting| setting.name() == worker.name),
+            );
+        }
+        for setting in configured {
+            if !self
+                .channels
+                .iter()
+                .any(|worker| worker.name == setting.name())
+            {
+                self.channels.push(ChannelWorker::new(setting));
+            }
+        }
+        self.enabled = config.enabled;
+        self.min_interval = Duration::from_secs(config.min_notify_interval_secs);
+        self.urgent_min_interval = Duration::from_secs(config.urgent_notify_interval_secs);
     }
 
     /// Create a disabled (no-op) manager.
@@ -936,6 +1082,7 @@ impl NotificationManager {
         Self {
             channels: Vec::new(),
             enabled: false,
+            dropped: AtomicU64::new(0),
             last_send_by_scope: HashMap::new(),
             min_interval: Duration::ZERO,
             urgent_min_interval: Duration::ZERO,
@@ -983,15 +1130,72 @@ impl NotificationManager {
 
         history.insert(level, now);
 
-        for channel in &self.channels {
-            channel.send(event);
+        let event = Arc::new(event.clone());
+        for worker in &self.channels {
+            let Some(target) = &worker.target else {
+                continue;
+            };
+            if target.settings.accepts(level)
+                && worker
+                    .send
+                    .try_send(Dispatch::Event(Delivery {
+                        event: Arc::clone(&event),
+                        channel: Arc::clone(&target.channel),
+                        revoked: Arc::clone(&target.revoked),
+                    }))
+                    .is_err()
+            {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// Deliveries lost to a full queue or an unavailable worker. Filtering,
+    /// throttling and deliberate reload revocation are not counted as losses.
+    #[must_use]
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Give already queued events a delivery window, typically at shutdown.
+    /// All channels share one deadline, even when one is blocked. This is
+    /// never called implicitly by notify, reload, or Drop.
+    #[must_use]
+    pub fn drain(&self, timeout: Duration) -> bool {
+        let Some(deadline) = Instant::now().checked_add(timeout) else {
+            return false;
+        };
+        let (acknowledge, completed) = bounded(self.channels.len().max(1));
+        for worker in &self.channels {
+            if worker
+                .send
+                .send_timeout(
+                    Dispatch::Drain(acknowledge.clone()),
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .is_err()
+            {
+                return false;
+            }
+        }
+        for _ in &self.channels {
+            if completed
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Number of active channels.
     #[must_use]
     pub fn channel_count(&self) -> usize {
-        self.channels.len()
+        self.channels
+            .iter()
+            .filter(|worker| worker.target.is_some())
+            .count()
     }
 
     /// Whether the manager is enabled.
@@ -1003,7 +1207,10 @@ impl NotificationManager {
     /// List the names of active channels.
     #[must_use]
     pub fn channel_names(&self) -> Vec<&str> {
-        self.channels.iter().map(|c| c.name()).collect()
+        self.channels
+            .iter()
+            .filter_map(|worker| worker.target.as_ref().map(|target| target.channel.name()))
+            .collect()
     }
 }
 
@@ -1496,6 +1703,7 @@ mod tests {
         };
 
         manager.notify(&event);
+        assert!(manager.drain(Duration::from_secs(5)));
 
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content.lines().count(), 1);
@@ -1503,6 +1711,213 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(parsed["type"], "pressure_changed");
         assert_eq!(parsed["mount"], "/data");
+    }
+
+    struct ProbeChannel {
+        name: &'static str,
+        delivered: Sender<String>,
+        release: Option<crossbeam_channel::Receiver<()>>,
+    }
+
+    impl Channel for ProbeChannel {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn send(&self, event: &NotificationEvent) {
+            let _ = self.delivered.try_send(event.throttle_scope().to_owned());
+            if let Some(release) = &self.release {
+                let _ = release.recv();
+            }
+        }
+    }
+
+    fn promptly<T: Send + 'static>(operation: impl FnOnce() -> T + Send + 'static) -> T {
+        let (send, receive) = bounded(1);
+        std::thread::spawn(move || {
+            let _ = send.send(operation());
+        });
+        receive
+            .recv_timeout(Duration::from_secs(2))
+            .expect("monitor operation waited on a blocked notification channel")
+    }
+
+    fn install_probe(
+        manager: &mut NotificationManager,
+        name: &'static str,
+        release: Option<crossbeam_channel::Receiver<()>>,
+    ) -> crossbeam_channel::Receiver<String> {
+        let (delivered, received) = bounded(CHANNEL_QUEUE_CAPACITY + 2);
+        let worker = manager
+            .channels
+            .iter_mut()
+            .find(|worker| worker.name == name)
+            .unwrap();
+        worker.target.as_mut().unwrap().channel = Arc::new(ProbeChannel {
+            name,
+            delivered,
+            release,
+        });
+        received
+    }
+
+    #[test]
+    fn blocked_delivery_does_not_block_notify_reload_or_another_channel() {
+        let (_directory, mut config, _) = notification_fixture();
+        config.channels = vec!["file".into(), "journal".into()];
+        config.min_notify_interval_secs = 0;
+        config.urgent_notify_interval_secs = 0;
+        let mut manager = NotificationManager::from_config(&config);
+        let (release, wait) = bounded(1);
+        let file_events = install_probe(&mut manager, "file", Some(wait));
+        let journal_events = install_probe(&mut manager, "journal", None);
+        let old_revoked = Arc::clone(&manager.channels[0].target.as_ref().unwrap().revoked);
+
+        manager = promptly(move || {
+            manager.notify(&pressure_event("/first", NotificationLevel::Critical));
+            manager
+        });
+        assert_eq!(
+            file_events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "/first"
+        );
+        assert_eq!(
+            journal_events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "/first"
+        );
+        manager.notify(&pressure_event("/old-queued", NotificationLevel::Critical));
+        assert_eq!(
+            journal_events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "/old-queued",
+            "the independent channel still delivers while file I/O is blocked"
+        );
+
+        let old_path = config.file.path.clone();
+        config.file.path = old_path.with_file_name("changed-notifications.jsonl");
+        config.channels = vec!["file".into()];
+        let next_config = config.clone();
+        manager = promptly(move || {
+            manager.update_config(&next_config);
+            manager.notify(&pressure_event(
+                "/changed-queued",
+                NotificationLevel::Critical,
+            ));
+            let mut disabled = next_config.clone();
+            disabled.enabled = false;
+            manager.update_config(&disabled);
+            manager.update_config(&next_config);
+            manager.notify(&pressure_event("/new", NotificationLevel::Critical));
+            manager
+        });
+        assert!(old_revoked.load(Ordering::Acquire));
+        assert_eq!(
+            manager.channels.len(),
+            2,
+            "reload retains existing worker slots"
+        );
+        assert_eq!(manager.channel_names(), ["file"]);
+        assert!(
+            !config.file.path.exists(),
+            "a blocked slot cannot acquire a replacement worker"
+        );
+
+        release.send(()).unwrap();
+        let records = recorded_notifications(&config, &manager);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["mount"], "/new");
+        assert!(
+            file_events.is_empty(),
+            "revoked queued events were not delivered"
+        );
+        assert!(!old_path.exists());
+        assert_eq!(manager.dropped_count(), 0);
+    }
+
+    #[test]
+    fn notification_backlog_is_bounded_and_shutdown_drain_has_a_deadline() {
+        let (_directory, mut config, _) = notification_fixture();
+        config.min_notify_interval_secs = 0;
+        config.urgent_notify_interval_secs = 0;
+        let mut manager = NotificationManager::from_config(&config);
+        let (release, wait) = bounded(1);
+        let entered = install_probe(&mut manager, "file", Some(wait));
+        manager.notify(&pressure_event("/first", NotificationLevel::Critical));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        manager = promptly(move || {
+            for index in 0..CHANNEL_QUEUE_CAPACITY + 3 {
+                manager.notify(&pressure_event(
+                    &format!("/queued-{index}"),
+                    NotificationLevel::Critical,
+                ));
+            }
+            manager
+        });
+        assert_eq!(manager.channels[0].send.len(), CHANNEL_QUEUE_CAPACITY);
+        assert_eq!(manager.dropped_count(), 3);
+        manager = promptly(move || {
+            assert!(!manager.drain(Duration::from_millis(20)));
+            manager
+        });
+
+        // Disable revokes the queued work, without giving up the blocked slot.
+        config.enabled = false;
+        manager.update_config(&config);
+        drop(release);
+        assert!(manager.drain(Duration::from_secs(5)));
+        assert!(entered.is_empty());
+        assert_eq!(manager.dropped_count(), 3);
+    }
+
+    #[test]
+    fn channel_filters_run_before_enqueue_and_drop_never_waits_for_delivery() {
+        let mut config = NotificationConfig {
+            channels: vec!["journal".into()],
+            min_notify_interval_secs: 0,
+            urgent_notify_interval_secs: 0,
+            ..NotificationConfig::default()
+        };
+        config.journal.min_level = NotificationLevel::Critical;
+        let mut manager = NotificationManager::from_config(&config);
+        let (release, wait) = bounded(1);
+        let entered = install_probe(&mut manager, "journal", Some(wait));
+        manager.notify(&pressure_event("/first", NotificationLevel::Critical));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        for index in 0..CHANNEL_QUEUE_CAPACITY * 2 {
+            manager.notify(&pressure_event(
+                &format!("/below-threshold-{index}"),
+                NotificationLevel::Warning,
+            ));
+        }
+        assert_eq!(manager.channels[0].send.len(), 0);
+        assert_eq!(manager.dropped_count(), 0);
+        promptly(move || drop(manager));
+        drop(release);
+    }
+
+    #[test]
+    fn duplicate_channel_names_deliver_each_event_once() {
+        let (_directory, mut config, _) = notification_fixture();
+        config.channels.push("file".into());
+        let mut manager = NotificationManager::from_config(&config);
+        assert_eq!(manager.channel_count(), 1);
+        manager.notify(&pressure_event("/data", NotificationLevel::Critical));
+        assert_eq!(recorded_notifications(&config, &manager).len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notification_child_timeout_reaps_a_stalled_command() {
+        assert!(run_notification_command(
+            Command::new("/bin/sh").args(["-c", "exit 0"]),
+            Duration::from_secs(1),
+        ));
+        let started = Instant::now();
+        assert!(!run_notification_command(
+            Command::new("/bin/sh").args(["-c", "exec sleep 30"]),
+            Duration::from_millis(50),
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
@@ -1534,6 +1949,7 @@ mod tests {
         manager.notify(&pressure_event);
         manager.notify(&pressure_event);
         manager.notify(&error_event);
+        assert!(manager.drain(Duration::from_secs(5)));
 
         let content = fs::read_to_string(&path).unwrap();
         let lines: Vec<_> = content.lines().collect();
@@ -1571,7 +1987,11 @@ mod tests {
         }
     }
 
-    fn recorded_notifications(config: &NotificationConfig) -> Vec<serde_json::Value> {
+    fn recorded_notifications(
+        config: &NotificationConfig,
+        manager: &NotificationManager,
+    ) -> Vec<serde_json::Value> {
+        assert!(manager.drain(Duration::from_secs(5)));
         fs::read_to_string(&config.file.path)
             .unwrap()
             .lines()
@@ -1594,7 +2014,7 @@ mod tests {
                 now + Duration::from_secs(seconds),
             );
         }
-        let records = recorded_notifications(&config);
+        let records = recorded_notifications(&config, &manager);
         let levels: Vec<_> = records
             .iter()
             .map(|record| record["level"].as_str().unwrap())
@@ -1626,7 +2046,7 @@ mod tests {
                 now,
             );
         }
-        let records = recorded_notifications(&config);
+        let records = recorded_notifications(&config, &manager);
         assert_eq!(records.len(), 6);
         assert_eq!(records[0]["mount"], "/data");
         assert_eq!(records[1]["mount"], "/data");
@@ -1650,7 +2070,7 @@ mod tests {
         for seconds in [62, 299, 300] {
             manager.notify_at(&critical, now + Duration::from_secs(seconds));
         }
-        let records = recorded_notifications(&config);
+        let records = recorded_notifications(&config, &manager);
         let levels: Vec<_> = records
             .iter()
             .map(|record| record["level"].as_str().unwrap())
@@ -1673,13 +2093,13 @@ mod tests {
             );
         }
         manager.notify_at(&critical, now + Duration::from_secs(3));
-        assert_eq!(recorded_notifications(&config).len(), 3);
+        assert_eq!(recorded_notifications(&config, &manager).len(), 3);
 
         config.urgent_notify_interval_secs = 0;
         manager.update_config(&config);
         manager.notify_at(&critical, now + Duration::from_secs(4));
         manager.notify_at(&critical, now + Duration::from_secs(4));
-        assert_eq!(recorded_notifications(&config).len(), 5);
+        assert_eq!(recorded_notifications(&config, &manager).len(), 5);
     }
 
     #[test]
