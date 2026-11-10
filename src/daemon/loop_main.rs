@@ -28963,7 +28963,7 @@ mod tests {
                 candidate_ctime_nanos: None,
                 size_estimate_bytes: if ordinal == 4 { 100 } else { 1 },
                 prune_decision: IndexedPruneDecision::CandidateOpaque,
-                score: Some(1.0 - f64::from(ordinal) * 0.01),
+                score: Some(f64::from(ordinal).mul_add(-0.01, 1.0)),
                 safety_state: CandidateSafetyState::Safe,
                 fail_count: 0,
                 cooldown_until_nanos: None,

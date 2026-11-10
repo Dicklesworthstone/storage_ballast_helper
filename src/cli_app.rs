@@ -13594,7 +13594,8 @@ fn clean_executor_with_receipts(
     };
     let ledger_path = ledger_path.to_path_buf();
     executor.with_activity_observer(move |event| {
-        if let Err(error) = db.lock().log_activity_event(event) {
+        let recorded = db.lock().log_activity_event(event);
+        if let Err(error) = recorded {
             eprintln!(
                 "[SBH-CLEAN] activity receipt not recorded in {}: {error}",
                 ledger_path.display()

@@ -364,7 +364,7 @@ mod tests {
                     .unwrap()
                     .permission
                     .observed_at
-                    .lock() = Instant::now() - PERMISSION_MAX_AGE;
+                    .lock() = Instant::now().checked_sub(PERMISSION_MAX_AGE).unwrap();
             } else {
                 shutdown.store(true, Ordering::Release);
             }

@@ -432,7 +432,7 @@ mod tests {
                 slot.write_all(&header).unwrap();
                 slot.sync_all().unwrap();
             } else {
-                fs::write(&damaged, vec![7; UNIT as usize]).unwrap();
+                fs::write(&damaged, vec![7; usize::try_from(UNIT).unwrap()]).unwrap();
             }
             assert_eq!(valid_managed_bytes(&pool.manager), 3 * UNIT);
             let report = replenish_one_guarded(&mut pool, &|| true).unwrap();
