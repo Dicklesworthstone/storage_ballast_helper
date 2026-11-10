@@ -9120,8 +9120,9 @@ impl MonitoringDaemon {
         Ok(())
     }
 
-    /// Prior selection does not retain permission across operator changes or
-    /// shutdown, including TTL/cap cleanup without a pressure goal.
+    /// Permanent purge does not pass through scored deletion or Canary quota
+    /// admission. Both the original sweep and its live mutation therefore
+    /// require Enforce, including TTL/cap cleanup without a pressure goal.
     fn authorize_quarantine_mutation(
         &self,
         approved_mode: ActiveMode,
@@ -9131,6 +9132,9 @@ impl MonitoringDaemon {
             return Err(SkipReason::PolicyChanged);
         }
         let current_mode = self.policy_engine.lock().mode();
+        if approved_mode != ActiveMode::Enforce || current_mode != ActiveMode::Enforce {
+            return Err(SkipReason::PolicyChanged);
+        }
         self.shared_executor_config
             .authorize_mutation(approved_mode, current_mode)
     }
@@ -9250,11 +9254,12 @@ impl MonitoringDaemon {
                 }
                 let store = QuarantineStore::under(root);
                 // A prior quarantine decision does not authorize irreversible
-                // cleanup after the operator selects observe/dry-run or the
-                // policy falls back. Inventory stays available in those modes.
+                // cleanup without current Enforce consent. Purges do not pass
+                // through Canary's scored admission or hourly quota, so that
+                // mode must retain held payloads too. Inventory stays available.
                 let approved_mode = self.policy_engine.lock().mode();
                 if self.config.scanner.dry_run
-                    || !approved_mode.allows_deletion()
+                    || approved_mode != ActiveMode::Enforce
                     // Resource-only Yellow cannot borrow maintenance's
                     // TTL/cap authority, which deliberately bypasses the
                     // pressure callbacks. Keep its inventory until Orange.
@@ -16621,11 +16626,17 @@ mod tests {
                         |_| panic!("maintenance cannot borrow pressure authority"),
                         |_| {
                             if !records[0].quarantine_path.exists() {
-                                *fixture.daemon.policy_engine.lock() =
-                                    PolicyEngine::new(PolicyConfig {
+                                let mut policy = fixture.daemon.policy_engine.lock();
+                                if mode == ActiveMode::Canary {
+                                    if policy.mode() == ActiveMode::Enforce {
+                                        assert!(policy.demote());
+                                    }
+                                } else {
+                                    *policy = PolicyEngine::new(PolicyConfig {
                                         initial_mode: mode,
                                         ..PolicyConfig::default()
                                     });
+                                }
                             }
                             fixture
                                 .daemon
@@ -16652,6 +16663,8 @@ mod tests {
                     b"retained"
                 );
                 assert!(store.stuck_entries().unwrap().is_empty());
+                let restored = store.restore(&records[1].decision_id, false).unwrap();
+                assert_eq!(std::fs::read(restored.restored_to).unwrap(), b"retained");
             }
         }
     }
@@ -16689,10 +16702,17 @@ mod tests {
             let tick = quarantine_tick(PressureLevel::Critical, Path::new("/"));
             let gate = |record: &QuarantineRecord| {
                 if !records[0].quarantine_path.exists() {
-                    *fixture.daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
-                        initial_mode: mode,
-                        ..PolicyConfig::default()
-                    });
+                    let mut policy = fixture.daemon.policy_engine.lock();
+                    if mode == ActiveMode::Canary {
+                        if policy.mode() == ActiveMode::Enforce {
+                            assert!(policy.demote());
+                        }
+                    } else {
+                        *policy = PolicyEngine::new(PolicyConfig {
+                            initial_mode: mode,
+                            ..PolicyConfig::default()
+                        });
+                    }
                     fixture
                         .daemon
                         .shared_executor_config
@@ -16712,6 +16732,8 @@ mod tests {
             assert!(swept.drained.failures.is_empty());
             assert!(!swept.drained.budget_exhausted);
             assert!(records[1].quarantine_path.exists());
+            let restored = store.restore(&records[1].decision_id, false).unwrap();
+            assert_eq!(std::fs::read(restored.restored_to).unwrap(), b"retained");
         }
     }
 
@@ -17557,7 +17579,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn quarantine_sweeps_preserve_payloads_in_observe_fallback_and_dry_run() {
+    fn quarantine_sweeps_require_enforce_without_consuming_canary_budget() {
         use crate::daemon::policy::PolicyConfig;
 
         for level in [
@@ -17580,14 +17602,17 @@ mod tests {
             fixture.daemon.platform = Arc::new(disk_pressure_platform(vec![disk_pressure_sample(
                 "/", 100_000, 1_000,
             )]));
-            for (mode, dry_run) in [
-                (ActiveMode::Observe, false),
-                (ActiveMode::FallbackSafe, false),
-                (ActiveMode::Enforce, true),
+            for (mode, dry_run, canary_budget) in [
+                (ActiveMode::Observe, false, 10),
+                (ActiveMode::FallbackSafe, false, 10),
+                (ActiveMode::Canary, false, 0),
+                (ActiveMode::Canary, false, 10),
+                (ActiveMode::Enforce, true, 10),
             ] {
                 let daemon = &mut fixture.daemon;
                 *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
                     initial_mode: mode,
+                    max_canary_deletes_per_hour: canary_budget,
                     ..PolicyConfig::default()
                 });
                 daemon.config.scanner.dry_run = dry_run;
@@ -17595,11 +17620,28 @@ mod tests {
                 assert_eq!(
                     std::fs::read(record.quarantine_path.join("artifact.o")).unwrap(),
                     b"recoverable",
-                    "{level:?} {mode:?} dry_run={dry_run}",
+                    "{level:?} {mode:?} dry_run={dry_run} canary_budget={canary_budget}",
                 );
-                assert!(store.record("held").unwrap().is_some());
+                assert!(
+                    store
+                        .record("held")
+                        .unwrap()
+                        .unwrap()
+                        .recovery_state
+                        .is_intact()
+                );
                 assert_eq!(daemon.quarantine_held.get(&mount), Some(&11));
                 assert!(daemon.last_quarantine_sweep.is_none());
+                assert_eq!(
+                    daemon
+                        .policy_engine
+                        .lock()
+                        .diagnostics()
+                        .canary_deletes_this_hour,
+                    0,
+                    "inventory is neither Canary approval nor a completed deletion",
+                );
+                assert!(store.stuck_entries().unwrap().is_empty());
             }
 
             // Positive control: the expired same entry is purged immediately

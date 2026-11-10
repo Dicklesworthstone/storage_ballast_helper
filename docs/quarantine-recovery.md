@@ -52,6 +52,10 @@ A concurrent operation is refused rather than waiting indefinitely.
 
 ## Live permission during maintenance
 
+Automatic permanent purge requires Enforce mode. Canary retains quarantine
+inventory because these purges have no scored admission or hourly quota;
+explicit manual cleanup and undo keep their existing behavior.
+
 Expiry and a store's size cap select entries for routine cleanup; they do not
 retain permission to remove them after operator policy changes. The daemon
 renews live mode, dry-run, shutdown and ordinary-cleanup holds after admitting
