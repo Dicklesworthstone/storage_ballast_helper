@@ -27,8 +27,9 @@
 //!    modified;
 //! 5. no process holds a file open in it or works inside it.
 //!
-//! The survivors are scored like any candidate and reach the executor as a
-//! target-only batch pinned to the inodes surveyed: the policy mode, the
+//! The survivors share the ordinary scanner's regret calibration, category
+//! suspensions and repeated-cache-deletion idle floors, then reach the executor
+//! as a target-only batch pinned to the inodes surveyed: the policy mode, the
 //! decision ledger, dampening, the certainty gate, the planner and every
 //! executor check still apply, and the executor drops any candidate outside
 //! the root. Only the `protected_paths` patterns that protect the root as a
@@ -56,7 +57,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::core::config::{Config, ScannerConfig};
 use crate::core::paths::resolve_absolute_path;
-use crate::daemon::loop_main::DeletionBatch;
+use crate::daemon::loop_main::{DeletionBatch, SharedRegret};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle};
 use crate::monitor::pid::PressureLevel;
 use crate::platform::pal::Platform;
@@ -1157,8 +1158,28 @@ fn select_with_limits(
 ) -> Selection {
     let mut selection = Selection::default();
     let checked = survey_page(root, &config.scanner, now, progress, limits, &mut selection);
+    score_checked(
+        checked,
+        platform,
+        urgency,
+        || ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes),
+        &mut selection,
+    );
+    selection
+}
+
+/// Build the learned scoring view after potentially slow filesystem and
+/// process-reference inspection. A target-only protection exception does not
+/// grant an exception to the scanner's deletion-feedback rules.
+fn score_checked(
+    checked: Vec<Checked>,
+    platform: &dyn Platform,
+    urgency: f64,
+    make_engine: impl FnOnce() -> ScoringEngine,
+    selection: &mut Selection,
+) {
     if checked.is_empty() {
-        return selection;
+        return;
     }
 
     let paths: Vec<PathBuf> = checked
@@ -1167,7 +1188,7 @@ fn select_with_limits(
         .collect();
     let references = collect_active_reference_index(platform, &paths);
     let registry = ArtifactPatternRegistry::default();
-    let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+    let engine = make_engine();
     for Checked {
         path: dir,
         bytes,
@@ -1220,7 +1241,6 @@ fn select_with_limits(
             .cmp(&a.size_bytes)
             .then_with(|| a.path.cmp(&b.path))
     });
-    selection
 }
 
 /// A root due for a pass, with its mount's pressure.
@@ -1327,6 +1347,9 @@ impl TargetOnlyConsent {
 /// Scheduling state of the tier: at most one pass in flight.
 #[derive(Debug, Default)]
 pub struct TargetTier {
+    /// Shared with the scanner and executor. The worker obtains its current
+    /// scoring view only after the candidate surveys and process checks.
+    regret: Option<Arc<SharedRegret>>,
     running: Arc<AtomicBool>,
     /// Retain even a cancelled, blocked worker until it actually exits. Never
     /// create replacement threads to work around uninterruptible native I/O.
@@ -1351,6 +1374,13 @@ pub struct TargetTier {
 }
 
 impl TargetTier {
+    pub(super) fn with_regret(regret: Arc<SharedRegret>) -> Self {
+        Self {
+            regret: Some(regret),
+            ..Self::default()
+        }
+    }
+
     /// Withdraw all previously granted target-only authority when the monitor
     /// cannot establish current pressure. A later healthy sample starts a new
     /// generation; it cannot revive a blocked worker or an already queued batch.
@@ -1498,6 +1528,7 @@ impl TargetTier {
         let revoked = Arc::clone(&self.revoked);
         let pressure = Arc::clone(&self.pressure);
         let survey_progress = Arc::clone(&self.survey_progress);
+        let regret = self.regret.clone();
         let (started_tx, started_rx) = crossbeam_channel::bounded(1);
         let spawned = std::thread::Builder::new()
             .name("sbh-targets".to_string())
@@ -1539,6 +1570,7 @@ impl TargetTier {
                         &revoked,
                         &pressure,
                         progress,
+                        regret.as_deref(),
                     );
                     if !retain_discovery {
                         // A small waiting root keeps its immediate fresh
@@ -1591,18 +1623,31 @@ fn run_root(
     revoked: &Arc<AtomicBool>,
     pressure: &RwLock<MountPressure>,
     progress: &mut SurveyProgress,
+    regret: Option<&SharedRegret>,
 ) -> String {
     if revoked.load(Ordering::Acquire) {
         return format!("root={} target-only consent revoked", due.root.display());
     }
-    let selection = select_with_progress(
+    let mut selection = Selection::default();
+    let checked = survey_page(
         &due.root,
-        config,
-        platform,
-        due.urgency,
+        &config.scanner,
         now,
         progress,
-        SurveyLimits::default(),
+        SelectionLimits::default(),
+        &mut selection,
+    );
+    score_checked(
+        checked,
+        platform,
+        due.urgency,
+        || {
+            regret.map_or_else(
+                || ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes),
+                |regret| regret.target_scoring_engine(config),
+            )
+        },
+        &mut selection,
     );
     let summary = selection.summary(&due.root);
     if revoked.load(Ordering::Acquire) {
@@ -1755,6 +1800,49 @@ pub(super) mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    pub(in crate::daemon) fn feedback_root(names: &[&str]) -> (tempfile::TempDir, PathBuf) {
+        let (temp, root) = scratch_root();
+        for name in names {
+            cargo_target(&root.join(name));
+        }
+        age(&root, 48);
+        (temp, root)
+    }
+
+    /// Exercise the production root-to-batch path with the daemon's actual
+    /// feedback attachment while moving only the survey clock past birth time.
+    pub(in crate::daemon) fn feedback_batch(
+        tier: &TargetTier,
+        root: &Path,
+        config: &Config,
+    ) -> Option<DeletionBatch> {
+        let (send, receive) = crossbeam_channel::bounded(1);
+        let platform = MockPlatform::healthy();
+        let pressure = red_pressure();
+        let due = probe_root(root, &platform, &pressure).unwrap();
+        let summary = run_root(
+            &due,
+            config,
+            &platform,
+            &send,
+            later(),
+            &Arc::new(AtomicBool::new(false)),
+            &pressure,
+            &mut SurveyProgress::default(),
+            Some(
+                tier.regret
+                    .as_deref()
+                    .expect("daemon feedback must be wired"),
+            ),
+        );
+        assert!(
+            !summary.contains("current pressure unavailable"),
+            "{summary}"
+        );
+        assert!(!summary.contains("consent revoked"), "{summary}");
+        receive.try_recv().ok()
     }
 
     #[test]
@@ -2911,6 +2999,7 @@ pub(super) mod tests {
             &Arc::new(AtomicBool::new(false)),
             &pressure,
             &mut SurveyProgress::default(),
+            None,
         );
         let batch = del_rx
             .try_recv()
@@ -3071,6 +3160,7 @@ pub(super) mod tests {
             &old_token,
             &pressure,
             &mut SurveyProgress::default(),
+            None,
         );
         let batch = receive.try_recv().unwrap_or_else(|_| panic!("{summary}"));
         let witness = batch.target_only_consent.as_ref().unwrap();
@@ -3091,6 +3181,7 @@ pub(super) mod tests {
             &old_token,
             &pressure,
             &mut SurveyProgress::default(),
+            None,
         );
         assert!(summary.contains("consent revoked"));
         assert!(
@@ -3754,6 +3845,7 @@ pub(super) mod tests {
                 &Arc::new(AtomicBool::new(false)),
                 &pressure,
                 &mut SurveyProgress::default(),
+                None,
             );
             assert!(summary.contains("nominated=1"), "{summary}");
             assert!(

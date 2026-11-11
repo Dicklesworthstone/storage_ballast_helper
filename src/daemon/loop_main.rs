@@ -49,7 +49,7 @@ use crate::daemon::policy::{
     ActiveMode, BallastAction, BehaviorDispatchTable, BehaviorMode, BehaviorPressureLevel,
     CleanupAction, NotificationPriority, PolicyEngine, ScanAggressiveness,
 };
-use crate::daemon::process_io_history::ProcessIoHistory;
+use crate::daemon::process_io_history::{ProcessIoHistory, ProcessIoSampler};
 use crate::daemon::ram_reclaim::RamReclaimRequest;
 use crate::daemon::rch_staging::RchStagingTier;
 use crate::daemon::scan_now::{ScanNowClaim, ScanNowQueue, ScanNowScope};
@@ -540,6 +540,7 @@ impl HistoryFileIdentity {
     }
 }
 
+#[derive(Debug)]
 struct LiveRegretHistory {
     path: PathBuf,
     epoch: u64,
@@ -660,7 +661,8 @@ fn read_history_pages(plan: &HistoryReadPlan, now: SystemTime) -> Option<History
 
 /// The regret detector the executor feeds and the tick resolves, and the
 /// calibrator whose per-category view the scanner applies before scoring.
-struct SharedRegret {
+#[derive(Debug)]
+pub(super) struct SharedRegret {
     detector: Mutex<RegretDetector>,
     calibrator: Mutex<RegretCalibrator>,
     /// When sbh deleted each warm-cache path, which sets that path's
@@ -856,6 +858,19 @@ impl SharedRegret {
             calibrator.calibrations(),
             calibrator.suspended_categories(now),
         )
+    }
+
+    /// Target-only discovery shares the ordinary scanner's learned category
+    /// calibration and warm-cache idle floors. Called on the target worker,
+    /// after its filesystem surveys, never on the pressure monitor.
+    pub(super) fn target_scoring_engine(&self, config: &Config) -> ScoringEngine {
+        self.refresh_history();
+        let (calibrations, suspended) = self.scoring_view(Instant::now());
+        let mut engine =
+            ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+        engine.set_regret(calibrations, suspended);
+        engine.set_cache_redeletions(self.cache_redeletions(SystemTime::now()));
+        engine
     }
 
     /// Recheck queued work at the execution boundary: its scoring snapshot
@@ -3214,7 +3229,7 @@ pub struct MonitoringDaemon {
     last_full_disk_access_check: Option<Instant>,
     last_full_disk_access_state: Option<FullDiskAccessState>,
     full_disk_access_granted_logged: bool,
-    process_io_history: ProcessIoHistory,
+    process_io_history: ProcessIoSampler,
     /// Per-mount write-burst windows and the reserve they imply
     /// (bd-rc-master-ajg1.2.18), persisted beside `state.json`.
     burst_stats: BurstStats,
@@ -4888,6 +4903,7 @@ impl MonitoringDaemon {
         // restart.
         let regret = Arc::new(SharedRegret::new(&config).with_run_id(run_id.clone()));
         replay_regret_outcomes(&regret, &config.paths.sqlite_db);
+        let target_tier = TargetTier::with_regret(Arc::clone(&regret));
 
         // 11. Self-monitor (writes state.json for CLI, tracks health).
         let mut self_monitor = SelfMonitor::from_telemetry_config(
@@ -4897,7 +4913,7 @@ impl MonitoringDaemon {
         );
         self_monitor.set_run_id(run_id);
         self_monitor.set_logging_snapshot(logging_placement.clone());
-        let process_io_history = ProcessIoHistory::load_or_new(
+        let process_io_history = ProcessIoSampler::new(
             ProcessIoHistory::snapshot_path_for_state_file(&config.paths.state_file),
         );
         let burst_stats = BurstStats::load_or_new(BurstStats::snapshot_path_for_state_file(
@@ -5009,7 +5025,7 @@ impl MonitoringDaemon {
             attribution_reported: HashMap::new(),
             attribution_pressured_since: HashMap::new(),
             compress_tier,
-            target_tier: TargetTier::default(),
+            target_tier,
             rch_staging: RchStagingTier::default(),
             last_summary_report: Instant::now(),
             summary_scans: 0,
@@ -5160,15 +5176,11 @@ impl MonitoringDaemon {
     }
 
     fn sample_process_io_history(&mut self) {
-        let platform = Arc::clone(&self.platform);
-        let (report, error) = self
-            .process_io_history
-            .maybe_sample(platform.as_ref(), Instant::now());
-        if !report.sampled {
-            return;
-        }
-
-        if let Some(error) = error {
+        if let Some((_, Some(error))) = self.process_io_history.tick(
+            Arc::clone(&self.platform),
+            self.signal_handler.shutdown_token(),
+            Instant::now(),
+        ) {
             self.logger_handle.send(ActivityEvent::Error {
                 code: "SBH-1102".to_string(),
                 message: format!("process I/O history sample failed: {error}"),
@@ -9423,6 +9435,7 @@ impl MonitoringDaemon {
 
         // 1. Broadcast cancellation, then drop channel senders to signal worker threads to exit.
         self.signal_handler.request_shutdown();
+        self.process_io_history.stop();
         self.ballast_replenisher.cancel();
         self.quarantine_sweeper.cancel();
         self.compress_tier.stop_running_pass();
@@ -21820,6 +21833,88 @@ mod tests {
             assert!(refused.candidates.is_empty());
             assert!(target.join("debug/libdemo.rlib").exists());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_only_scoring_retains_regret_calibration_after_suspension_expires() {
+        use crate::daemon::target_tier::tests::{feedback_batch, feedback_root};
+
+        let fixture = RegretDaemonFixture::new();
+        let (_scratch, root) = feedback_root(&["rust/target", "generic/cargo-output"]);
+        let mut config = fixture.daemon.config.clone();
+        config.scanner.target_only_roots = vec![root.clone()];
+        config.scanner.protected_paths = vec![root.to_string_lossy().into_owned()];
+        config.scoring.regret_suspend_minutes = 0;
+        fixture.daemon.regret.update_config(&config);
+        let initial = feedback_batch(&fixture.daemon.target_tier, &root, &config).unwrap();
+        assert_eq!(initial.candidates.len(), 2);
+        assert!(initial.candidates.iter().any(|candidate| {
+            candidate.classification.category == ArtifactCategory::RustTarget
+        }));
+        assert!(
+            initial.candidates.iter().any(|candidate| {
+                candidate.classification.category == ArtifactCategory::CacheDir
+            })
+        );
+        {
+            let mut calibrator = fixture.daemon.regret.calibrator.lock();
+            for _ in 0..3 {
+                calibrator.record(
+                    "RustTarget",
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    Instant::now(),
+                );
+            }
+            assert!(!calibrator.suspended("RustTarget", Instant::now()));
+            assert!(calibrator.calibrations()["RustTarget"] < 0.4);
+        }
+
+        let learned = feedback_batch(&fixture.daemon.target_tier, &root, &config).unwrap();
+        assert_eq!(learned.candidates.len(), 1);
+        assert_eq!(
+            learned.candidates[0].classification.category,
+            ArtifactCategory::CacheDir,
+            "an unaffected category remains reclaimable under the same pressure"
+        );
+        assert_eq!(learned.candidates[0].decision.regret_calibration, 1.0);
+        assert!(root.join("rust/target/debug/deps/libdemo.rlib").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_only_scoring_applies_path_specific_repeat_cache_floors() {
+        use crate::core::paths::resolve_absolute_path;
+        use crate::daemon::target_tier::tests::{feedback_batch, feedback_root};
+
+        let fixture = RegretDaemonFixture::new();
+        let (_scratch, root) = feedback_root(&[
+            "used/.rch-target-hz3-pool-abc",
+            "untouched/.rch-target-hz3-pool-def",
+        ]);
+        let repeated = resolve_absolute_path(&root.join("used/.rch-target-hz3-pool-abc"));
+        let untouched = resolve_absolute_path(&root.join("untouched/.rch-target-hz3-pool-def"));
+        let mut config = fixture.daemon.config.clone();
+        config.scanner.target_only_roots = vec![root.clone()];
+        config.scanner.protected_paths = vec![root.to_string_lossy().into_owned()];
+        let initial = feedback_batch(&fixture.daemon.target_tier, &root, &config).unwrap();
+        assert_eq!(initial.candidates.len(), 2);
+        // Both trees exceed the target-only 24-hour idle window. Six earlier
+        // deletions raise only the repeated pool's pressure floor to 64 hours;
+        // a first deletion keeps its existing one-hour floor.
+        let now = SystemTime::now();
+        for _ in 0..6 {
+            fixture.daemon.regret.cache_deletions.lock().push((
+                repeated.clone(),
+                ArtifactCategory::RustTarget,
+                now,
+            ));
+        }
+        let learned = feedback_batch(&fixture.daemon.target_tier, &root, &config).unwrap();
+        assert_eq!(learned.candidates.len(), 1);
+        assert_eq!(learned.candidates[0].path, untouched);
+        assert!(repeated.join("debug/deps/libdemo.rlib").exists());
     }
 
     #[cfg(unix)]

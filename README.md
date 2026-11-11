@@ -2008,7 +2008,7 @@ Every significant event is logged to two independent backends: SQLite for querya
 
 The SQLite logger operates in WAL (Write-Ahead Logging) mode with `synchronous=NORMAL`, trading some crash durability for write throughput. It stores structured rows for pressure changes, artifact deletions, ballast operations, errors, and policy transitions.
 
-The stats engine queries this data for `sbh stats` reports: time-window aggregation, top-N deleted patterns, deletion success rates, and pressure-level distribution over time. The `sbh blame` command uses process attribution data from the SQLite store.
+The stats engine queries this data for `sbh stats` reports: time-window aggregation, top-N deleted patterns, deletion success rates, and pressure-level distribution over time. The `sbh blame` command combines live process observations with recent I/O history from `io_history.bin` beside the daemon's state file. The daemon loads, samples, and saves this optional history on one background worker, so a slow process probe or snapshot write cannot delay pressure handling. A blocked operation retains its worker slot; shutdown stops further probes and prevents a new snapshot from starting.
 
 Automatic retention pruning removes rows older than 30 days, triggered every 3600 events (approximately hourly at typical event rates).
 

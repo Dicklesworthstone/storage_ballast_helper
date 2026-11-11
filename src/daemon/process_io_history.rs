@@ -4,8 +4,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::core::errors::Result;
@@ -25,6 +29,118 @@ const DEFAULT_MAX_PIDS: usize = 4096;
 const DEFAULT_MAX_SAMPLES_PER_PASS: usize = 500;
 const MAX_SAMPLES_PER_PROCESS: usize = 121;
 const SAMPLE_TIME_BUDGET: Duration = Duration::from_millis(250);
+
+type SampleResult = (ProcessIoHistoryReport, Option<String>);
+
+struct SamplerState {
+    history: ProcessIoHistory,
+    loaded: bool,
+}
+
+/// Optional attribution work must never hold up disk-pressure handling.
+///
+/// Only the retained worker touches the history mutex or the filesystem. A
+/// blocked native probe or snapshot write keeps its slot until it returns;
+/// later monitor ticks neither wait for it nor start replacement workers.
+pub(super) struct ProcessIoSampler {
+    state: Arc<Mutex<SamplerState>>,
+    worker: Option<JoinHandle<SampleResult>>,
+    last_started_at: Option<Instant>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl ProcessIoSampler {
+    pub(super) fn new(snapshot_path: PathBuf) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(SamplerState {
+                history: ProcessIoHistory::new(snapshot_path),
+                loaded: false,
+            })),
+            worker: None,
+            last_started_at: None,
+            stopped: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Collect only completed work and schedule at most one due sample.
+    pub(super) fn tick(
+        &mut self,
+        platform: Arc<dyn Platform>,
+        shutdown: Arc<AtomicBool>,
+        now: Instant,
+    ) -> Option<SampleResult> {
+        let completed = self.poll();
+        if self.stopped.load(Ordering::Acquire)
+            || shutdown.load(Ordering::Acquire)
+            || self.worker.is_some()
+            || self
+                .last_started_at
+                .is_some_and(|last| now.saturating_duration_since(last) < DEFAULT_BUCKET_INTERVAL)
+        {
+            return completed;
+        }
+
+        // Rate-limit spawn failures too, instead of retrying at Critical's
+        // 100 ms cadence. State stays owned here if thread creation fails.
+        self.last_started_at = Some(now);
+        let state = Arc::clone(&self.state);
+        let stopped = Arc::clone(&self.stopped);
+        match std::thread::Builder::new()
+            .name("sbh-io-history".into())
+            .spawn(move || {
+                let active =
+                    || !stopped.load(Ordering::Acquire) && !shutdown.load(Ordering::Acquire);
+                if !active() {
+                    return (ProcessIoHistoryReport::skipped(), None);
+                }
+                let mut state = state.lock();
+                if !state.loaded {
+                    state.history.load_snapshot();
+                    state.loaded = true;
+                }
+                state
+                    .history
+                    .maybe_sample_while(platform.as_ref(), now, &active)
+            }) {
+            Ok(worker) => self.worker = Some(worker),
+            Err(error) => {
+                return Some((
+                    ProcessIoHistoryReport::skipped(),
+                    Some(format!(
+                        "failed to start process I/O history worker: {error}"
+                    )),
+                ));
+            }
+        }
+        completed
+    }
+
+    fn poll(&mut self) -> Option<SampleResult> {
+        if !self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            return None;
+        }
+        self.worker.take().map(|worker| {
+            worker.join().unwrap_or_else(|_| {
+                (
+                    ProcessIoHistoryReport::skipped(),
+                    Some("process I/O history worker panicked".into()),
+                )
+            })
+        })
+    }
+
+    pub(super) fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for ProcessIoSampler {
+    fn drop(&mut self) {
+        self.stop();
+        // A native operation cannot be interrupted safely. Detach its retained
+        // handle; cancellation prevents further probes or a new snapshot.
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessIoHistoryReport {
@@ -140,9 +256,19 @@ impl ProcessIoHistory {
         platform: &dyn Platform,
         now: Instant,
     ) -> (ProcessIoHistoryReport, Option<String>) {
-        if self
-            .last_sample_at
-            .is_some_and(|last| now.duration_since(last) < self.bucket_interval)
+        self.maybe_sample_while(platform, now, &|| true)
+    }
+
+    fn maybe_sample_while(
+        &mut self,
+        platform: &dyn Platform,
+        now: Instant,
+        active: &dyn Fn() -> bool,
+    ) -> SampleResult {
+        if !active()
+            || self
+                .last_sample_at
+                .is_some_and(|last| now.saturating_duration_since(last) < self.bucket_interval)
         {
             return (ProcessIoHistoryReport::skipped(), None);
         }
@@ -170,11 +296,17 @@ impl ProcessIoHistory {
             }
         };
 
-        let mut report = self.sample_processes(platform, processes, collected_at_unix_ms, deadline);
+        let mut report = self.sample_processes_while(
+            platform,
+            processes,
+            collected_at_unix_ms,
+            deadline,
+            active,
+        );
         let persist_due = self
             .last_persist_at
             .is_none_or(|last| now.duration_since(last) >= self.persist_interval);
-        if persist_due {
+        if persist_due && active() {
             match self.persist_snapshot() {
                 Ok(()) => {
                     self.last_persist_at = Some(now);
@@ -187,12 +319,26 @@ impl ProcessIoHistory {
         (report, None)
     }
 
+    #[cfg(test)]
     fn sample_processes(
+        &mut self,
+        platform: &dyn Platform,
+        processes: Vec<i32>,
+        collected_at_unix_ms: i64,
+        deadline: Instant,
+    ) -> ProcessIoHistoryReport {
+        self.sample_processes_while(platform, processes, collected_at_unix_ms, deadline, &|| {
+            true
+        })
+    }
+
+    fn sample_processes_while(
         &mut self,
         platform: &dyn Platform,
         mut processes: Vec<i32>,
         collected_at_unix_ms: i64,
         deadline: Instant,
+        active: &dyn Fn() -> bool,
     ) -> ProcessIoHistoryReport {
         processes.retain(|pid| *pid > 0);
         processes.sort_unstable();
@@ -223,7 +369,7 @@ impl ProcessIoHistory {
         // Do not wrap within a pass or sample a small inventory repeatedly.
         // Failed probes advance too; an inaccessible PID cannot hold the sweep.
         for &pid in processes[start..end].iter().take(self.max_samples_per_pass) {
-            if Instant::now() >= deadline {
+            if !active() || Instant::now() >= deadline {
                 break;
             }
             // Publish a new sweep boundary only when a probe actually starts.
@@ -235,7 +381,8 @@ impl ProcessIoHistory {
                     if snapshot.io.pid == pid
                         && snapshot.start_time_unix_ms >= 0
                         && snapshot.start_time_unix_ms <= collected_at_unix_ms
-                        && Instant::now() < deadline =>
+                        && Instant::now() < deadline
+                        && active() =>
                 {
                     let _ = self.record_process_sample_at(
                         snapshot.io,
@@ -532,6 +679,7 @@ mod tests {
     };
     use crate::platform::types::{ProcessInfo, ProcessIoSnapshot};
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     const SAMPLING_TEST_EPOCH_MS: i64 = 3_600_000;
 
@@ -683,8 +831,25 @@ mod tests {
     struct SamplingPlatform {
         inner: MockPlatform,
         selected: Mutex<Vec<i32>>,
+        inventory_calls: AtomicUsize,
+        gate: Option<SamplingGate>,
         exhaust_inventory_budget: bool,
         snapshot_override: Option<ProcessIoSnapshot>,
+    }
+
+    struct SamplingGate {
+        inventory: bool,
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    }
+
+    impl SamplingGate {
+        fn wait(&self, inventory: bool) {
+            if self.inventory == inventory {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        }
     }
 
     impl SamplingPlatform {
@@ -697,6 +862,8 @@ mod tests {
             Self {
                 inner,
                 selected: Mutex::new(Vec::new()),
+                inventory_calls: AtomicUsize::new(0),
+                gate: None,
                 exhaust_inventory_budget: false,
                 snapshot_override: None,
             }
@@ -737,6 +904,10 @@ mod tests {
         }
 
         fn process_ids(&self, deadline: Instant) -> Result<Vec<i32>> {
+            self.inventory_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(gate) = &self.gate {
+                gate.wait(true);
+            }
             let pids = self.inner.process_ids(deadline)?;
             if self.exhaust_inventory_budget {
                 // Simulate a native inventory operation that returns after its
@@ -748,11 +919,171 @@ mod tests {
 
         fn process_io_snapshot(&self, pid: i32, deadline: Instant) -> Result<ProcessIoSnapshot> {
             self.selected.lock().unwrap().push(pid);
+            if let Some(gate) = &self.gate {
+                gate.wait(false);
+            }
             match &self.snapshot_override {
                 Some(snapshot) => Ok(snapshot.clone()),
                 None => self.inner.process_io_snapshot(pid, deadline),
             }
         }
+    }
+
+    fn gated_platform(
+        inventory: bool,
+    ) -> (
+        Arc<SamplingPlatform>,
+        crossbeam_channel::Receiver<()>,
+        crossbeam_channel::Sender<()>,
+    ) {
+        let (entered_tx, entered) = crossbeam_channel::bounded(1);
+        let (release, release_rx) = crossbeam_channel::bounded(1);
+        let mut platform = SamplingPlatform::new(&[10, 20]);
+        platform.gate = Some(SamplingGate {
+            inventory,
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (Arc::new(platform), entered, release)
+    }
+
+    fn await_sample(sampler: &mut ProcessIoSampler) -> SampleResult {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(result) = sampler.poll() {
+                return result;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "attribution worker did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn blocked_attribution_never_blocks_monitor_ticks_or_spawns_replacements() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        let mut sampler = ProcessIoSampler::new(path.clone());
+        let (platform, entered, release) = gated_platform(true);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let now = Instant::now();
+        assert!(
+            sampler
+                .tick(platform.clone(), Arc::clone(&shutdown), now)
+                .is_none()
+        );
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        // The native call remains blocked while the monitor handles many due
+        // ticks. The history mutex is held by that worker throughout.
+        let ticking = Instant::now();
+        for interval in 1..=10 {
+            assert!(
+                sampler
+                    .tick(
+                        platform.clone(),
+                        Arc::clone(&shutdown),
+                        now + DEFAULT_BUCKET_INTERVAL * interval,
+                    )
+                    .is_none()
+            );
+        }
+        assert!(ticking.elapsed() < Duration::from_secs(1));
+        assert_eq!(platform.inventory_calls.load(Ordering::Relaxed), 1);
+        assert!(platform.selected.lock().unwrap().is_empty());
+
+        sampler.stop();
+        release.send(()).unwrap();
+        let (report, _) = await_sample(&mut sampler);
+        assert_eq!(report.pids_recorded, 0);
+        assert!(!report.persisted);
+        assert!(!path.exists());
+        assert!(
+            sampler
+                .tick(platform.clone(), shutdown, now + Duration::from_hours(1))
+                .is_none()
+        );
+        assert_eq!(platform.inventory_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn background_attribution_preserves_history_sweep_and_sampling_cadence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        let mut sampler = ProcessIoSampler::new(path.clone());
+        sampler.state.lock().history.max_samples_per_pass = 1;
+        let platform = Arc::new(SamplingPlatform::new(&[20, 10]));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let now = Instant::now();
+        sampler.tick(platform.clone(), Arc::clone(&shutdown), now);
+        let (first, error) = await_sample(&mut sampler);
+        assert!(error.is_none());
+        assert_eq!(first.pids_recorded, 1);
+        assert!(first.persisted);
+        let saved = ProcessIoHistory::load_or_new(path);
+        assert_eq!(saved.samples_by_process.len(), 1);
+
+        sampler.tick(
+            platform.clone(),
+            Arc::clone(&shutdown),
+            now + DEFAULT_BUCKET_INTERVAL - Duration::from_millis(1),
+        );
+        assert!(sampler.worker.is_none());
+        sampler.tick(platform.clone(), shutdown, now + DEFAULT_BUCKET_INTERVAL);
+        let (second, error) = await_sample(&mut sampler);
+        assert!(error.is_none());
+        assert_eq!(second.pids_recorded, 1);
+        assert!(!second.persisted);
+        assert_eq!(*platform.selected.lock().unwrap(), vec![10, 20]);
+        assert_eq!(sampler.state.lock().history.samples_by_process.len(), 2);
+    }
+
+    #[test]
+    fn shutdown_during_native_sample_preserves_snapshot_and_stops_later_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        ProcessIoHistory::new(path.clone())
+            .persist_snapshot()
+            .unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        let mut sampler = ProcessIoSampler::new(path.clone());
+        let (platform, entered, release) = gated_platform(false);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let now = Instant::now();
+        sampler.tick(platform.clone(), Arc::clone(&shutdown), now);
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        shutdown.store(true, Ordering::Release);
+        release.send(()).unwrap();
+        let (report, error) = await_sample(&mut sampler);
+        assert!(error.is_none());
+        assert_eq!(report.pids_recorded, 0);
+        assert!(!report.persisted);
+        assert_eq!(*platform.selected.lock().unwrap(), vec![10]);
+        assert_eq!(std::fs::read(path).unwrap(), saved);
+        sampler.tick(platform.clone(), shutdown, now + DEFAULT_BUCKET_INTERVAL);
+        assert_eq!(platform.inventory_calls.load(Ordering::Relaxed), 1);
+        assert!(sampler.worker.is_none());
+    }
+
+    #[test]
+    fn dropping_sampler_cancels_without_waiting_for_native_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        let mut sampler = ProcessIoSampler::new(path.clone());
+        let (platform, entered, release) = gated_platform(true);
+        sampler.tick(platform, Arc::new(AtomicBool::new(false)), Instant::now());
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let worker = sampler.worker.take().unwrap();
+        let dropping = Instant::now();
+        drop(sampler);
+        assert!(dropping.elapsed() < Duration::from_secs(1));
+        release.send(()).unwrap();
+        let (report, _) = worker.join().unwrap();
+        assert_eq!(report.pids_recorded, 0);
+        assert!(!report.persisted);
+        assert!(!path.exists());
     }
 
     #[test]
