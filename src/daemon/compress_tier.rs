@@ -11,6 +11,8 @@
 //! checked executor as `sbh compress --discover --apply`. Every file outcome
 //! reaches the activity log, and a summary line names the bytes saved. Nothing
 //! is ever deleted, and a root on another filesystem is never touched.
+//! A running pass keeps its monitored mounts' live pressure authority: recovery
+//! below the configured start level or a missing observation cancels old work.
 //!
 //! On ts2 (2026-10-14..16, `/` at 93-97% and sbh at Red or Critical) the same
 //! method, run by hand, freed several hundred GB from idle scratch while the
@@ -18,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -43,7 +45,8 @@ pub struct RootStatus {
     /// Whether the filesystem holding it is btrfs.
     pub btrfs: bool,
     /// Pressure of the mount holding it. Uses its controller when present,
-    /// otherwise the current free space and configured pressure thresholds.
+    /// or native probe evidence for a compression-only volume. A configured
+    /// or previously monitored mount with no current observation is unknown.
     pub level: Option<PressureLevel>,
     /// Mount whose pressure governs this root, when it could be resolved.
     pub mount_point: Option<PathBuf>,
@@ -62,6 +65,9 @@ struct RootEvidence {
     root: PathBuf,
     stats: Option<FsStats>,
     device_id: Option<u64>,
+    /// The configured monitor covers this mount, even if its first sample
+    /// failed. Only the background probe resolves paths and mount topology.
+    requires_monitor: bool,
     completed_at: Instant,
 }
 
@@ -76,6 +82,7 @@ impl RootEvidence {
         &self,
         mount_levels: &HashMap<PathBuf, PressureLevel>,
         pressure: &PressureConfig,
+        monitored_mounts: &HashSet<PathBuf>,
     ) -> RootStatus {
         RootStatus {
             root: self.root.clone(),
@@ -87,15 +94,17 @@ impl RootEvidence {
                 .stats
                 .as_ref()
                 .filter(|stats| !stats.is_readonly && stats.total_bytes > 0)
-                .map(|stats| {
-                    mount_levels
-                        .get(&stats.mount_point)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            let [green, yellow, orange, red] =
-                                pressure.free_pct_thresholds_for(stats.total_bytes);
-                            classify_level(stats.free_pct(), green, yellow, orange, red)
-                        })
+                .and_then(|stats| {
+                    if self.requires_monitor || monitored_mounts.contains(&stats.mount_point) {
+                        // A failed monitor reading is not an independently
+                        // configured volume. Never replace lost live authority
+                        // with the worker's older native pressure snapshot.
+                        mount_levels.get(&stats.mount_point).copied()
+                    } else {
+                        let [green, yellow, orange, red] =
+                            pressure.free_pct_thresholds_for(stats.total_bytes);
+                        Some(classify_level(stats.free_pct(), green, yellow, orange, red))
+                    }
                 }),
             mount_point: self.stats.as_ref().map(|stats| stats.mount_point.clone()),
             device_id: self.device_id,
@@ -112,12 +121,14 @@ struct RootProbe {
     worker: std::thread::JoinHandle<()>,
 }
 
-/// A pass captures its configuration. Revoke it when consent, work limits or
-/// the executor's protected paths change; unrelated UI/notification settings
-/// do not change its authority to rewrite a file.
-#[derive(Debug, PartialEq, Eq)]
+/// A pass captures its configuration. Revoke it when consent, work limits,
+/// pressure policy, monitor coverage or protected paths change; unrelated
+/// UI/notification settings do not change its authority to rewrite a file.
+#[derive(Debug, PartialEq)]
 struct CompressionScope {
     compress: CompressConfig,
+    pressure: PressureConfig,
+    monitored_roots: Vec<PathBuf>,
     protected_paths: Vec<String>,
     control_paths: [PathBuf; 6],
 }
@@ -126,6 +137,8 @@ impl From<&Config> for CompressionScope {
     fn from(config: &Config) -> Self {
         Self {
             compress: config.compress.clone(),
+            pressure: config.pressure.clone(),
+            monitored_roots: config.scanner.root_paths.clone(),
             protected_paths: config.scanner.protected_paths.clone(),
             // Keep these aligned with compression::linux::check_control_paths.
             // The database sidecars and journal directory derive from them.
@@ -330,6 +343,13 @@ pub struct CompressTier {
     /// re-added, or the same configuration is re-enabled before it returns.
     probes_invalidated: AtomicBool,
     next_probe_root: usize,
+    /// Mounts observed by this configuration's pressure monitor, including
+    /// before a blocked root probe returns. Their missing samples cannot be
+    /// mistaken for compression-only volumes that use native probe pressure.
+    monitored_mounts: HashSet<PathBuf>,
+    /// The mounts admitted to the running pass. Keep their bindings after
+    /// root evidence expires so later monitor ticks can still revoke work.
+    admitted_mounts: HashSet<PathBuf>,
     scope: Option<CompressionScope>,
 }
 
@@ -346,6 +366,17 @@ impl CompressTier {
     /// token when the previous settings are restored.
     pub fn update_config(&mut self, config: &Config) {
         let scope = CompressionScope::from(config);
+        if self
+            .scope
+            .as_ref()
+            .is_some_and(|previous| previous.monitored_roots != scope.monitored_roots)
+        {
+            // A root deliberately removed from scanner coverage can become
+            // compression-only. Changing coverage still cancels the old pass
+            // below; fresh probe evidence must establish coverage under the
+            // new configuration before it can admit any replacement.
+            self.monitored_mounts.clear();
+        }
         if self
             .scope
             .as_ref()
@@ -407,7 +438,12 @@ impl CompressTier {
             .retain(|_, observation| observation.fresh(now));
     }
 
-    fn start_probe(&mut self, roots: &[PathBuf], platform: &Arc<dyn Platform>) {
+    fn start_probe(
+        &mut self,
+        roots: &[PathBuf],
+        monitored_roots: &[PathBuf],
+        platform: &Arc<dyn Platform>,
+    ) {
         if self.probe.is_some() || roots.is_empty() {
             return;
         }
@@ -419,6 +455,7 @@ impl CompressTier {
         let cancelled = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&cancelled);
         let platform = Arc::clone(platform);
+        let monitored_roots = monitored_roots.to_vec();
         match std::thread::Builder::new()
             .name("sbh-compress-roots".into())
             .spawn(move || {
@@ -426,7 +463,7 @@ impl CompressTier {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    let observation = probe_root(root, platform.as_ref());
+                    let observation = probe_root(root, &monitored_roots, platform.as_ref(), &stop);
                     if stop.load(Ordering::Acquire) || send.try_send(observation).is_err() {
                         break;
                     }
@@ -443,6 +480,30 @@ impl CompressTier {
         }
     }
 
+    fn renew_monitored_pressure(
+        &mut self,
+        config: &CompressConfig,
+        mount_levels: &HashMap<PathBuf, PressureLevel>,
+    ) -> bool {
+        self.monitored_mounts.extend(mount_levels.keys().cloned());
+        let start = config.start_pressure_level();
+        if self.running.load(Ordering::Acquire)
+            && self.admitted_mounts.iter().any(|mount| {
+                self.monitored_mounts.contains(mount)
+                    && mount_levels
+                        .get(mount)
+                        .is_none_or(|level| start.is_none_or(|start| *level < start))
+            })
+        {
+            // A different mount remaining Critical cannot retain this pass's
+            // authority on a recovered or unobserved filesystem. Do not probe
+            // or replace its occupied slot while native I/O remains blocked.
+            self.stop_running_pass();
+            return false;
+        }
+        true
+    }
+
     /// Start a pass on its own thread when one is due.
     pub fn tick(
         &mut self,
@@ -455,7 +516,10 @@ impl CompressTier {
         self.update_config(config);
         self.first.update_levels(mount_levels);
         self.poll_probes(&config.compress.roots, now);
-        if config.scanner.dry_run || config.policy.kill_switch {
+        if !self.renew_monitored_pressure(&config.compress, mount_levels)
+            || config.scanner.dry_run
+            || config.policy.kill_switch
+        {
             return;
         }
         let running = self.running.load(Ordering::Acquire);
@@ -467,7 +531,9 @@ impl CompressTier {
             .roots
             .iter()
             .filter_map(|root| self.evidence.get(root))
-            .map(|observation| observation.status(mount_levels, &config.pressure))
+            .map(|observation| {
+                observation.status(mount_levels, &config.pressure, &self.monitored_mounts)
+            })
             .collect();
         let roots = due_roots(&config.compress, &statuses, running, self.last_start, now);
         if roots.is_empty() {
@@ -477,7 +543,7 @@ impl CompressTier {
                 .iter()
                 .any(|root| !self.evidence.contains_key(root))
             {
-                self.start_probe(&config.compress.roots, platform);
+                self.start_probe(&config.compress.roots, &config.scanner.root_paths, platform);
             }
             return;
         }
@@ -492,6 +558,11 @@ impl CompressTier {
             self.next_probe_root = (index + 1) % config.compress.roots.len();
         }
         self.last_start = Some(now);
+        self.admitted_mounts = statuses
+            .iter()
+            .filter(|status| roots.contains(&status.root))
+            .filter_map(|status| status.mount_point.clone())
+            .collect();
         // No pass is running (due_roots checked), so no stop is pending.
         self.stop.store(false, Ordering::Release);
         self.running.store(true, Ordering::Release);
@@ -591,7 +662,12 @@ impl Drop for RunningGuard {
 
 /// The only root admission path which performs filesystem I/O. It runs on
 /// the probe worker, never on the monitor or in cancellation/drop handling.
-fn probe_root(root: PathBuf, platform: &dyn Platform) -> RootEvidence {
+fn probe_root(
+    root: PathBuf,
+    monitored_roots: &[PathBuf],
+    platform: &dyn Platform,
+    cancelled: &AtomicBool,
+) -> RootEvidence {
     let started = Instant::now();
     let mut stats = platform.fs_stats(&root).ok();
     let mut device_id = stats
@@ -599,6 +675,9 @@ fn probe_root(root: PathBuf, platform: &dyn Platform) -> RootEvidence {
         .filter(|stats| stats.fs_type == "btrfs")
         .and_then(|_| identity_for_path(&root, true).ok())
         .map(|identity| identity.device_id);
+    let requires_monitor = stats.as_ref().is_some_and(|stats| {
+        monitor_covers_root(&root, stats, monitored_roots, platform, cancelled)
+    });
     let completed_at = Instant::now();
     if completed_at.saturating_duration_since(started) >= ROOT_PROBE_MAX_AGE {
         // A fresh completion timestamp cannot refresh an old filesystem
@@ -610,8 +689,81 @@ fn probe_root(root: PathBuf, platform: &dyn Platform) -> RootEvidence {
         root,
         stats,
         device_id,
+        requires_monitor,
         completed_at,
     }
+}
+
+/// A failed first controller sample must not turn an explicitly monitored
+/// volume into an independent compression volume. Resolve coverage on the
+/// existing probe worker, including aliases and configured paths which are
+/// temporarily missing. A nested mount can still be genuinely independent.
+fn monitor_covers_root(
+    root: &Path,
+    stats: &FsStats,
+    monitored_roots: &[PathBuf],
+    platform: &dyn Platform,
+    cancelled: &AtomicBool,
+) -> bool {
+    // check_pressure always samples "/", even when it is not a scanner root.
+    if stats.mount_point == Path::new("/") || monitored_roots.iter().any(|path| path == root) {
+        return true;
+    }
+    let mut topology = None;
+    for configured in monitored_roots {
+        if cancelled.load(Ordering::Acquire) {
+            return true;
+        }
+        let Ok(resolved) = resolve_monitored_root(configured) else {
+            // An unreadable or dangling alias is unknown coverage, not proof
+            // that it cannot point at the compressed filesystem.
+            return true;
+        };
+        if !resolved.starts_with(&stats.mount_point) {
+            continue;
+        }
+        let Ok(mounts) = topology.get_or_insert_with(|| platform.mount_points()) else {
+            return true;
+        };
+        let mount = mounts
+            .iter()
+            .filter(|mount| resolved.starts_with(&mount.path))
+            .max_by_key(|mount| mount.path.components().count());
+        if mount.is_none_or(|mount| mount.path == stats.mount_point) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolve aliases through the nearest existing ancestor. Missing ordinary
+/// components preserve intended coverage; unresolved traversal and dangling
+/// symlinks cannot establish that a configured root is on another volume.
+fn resolve_monitored_root(path: &Path) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    for ancestor in absolute.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let tail = absolute.strip_prefix(ancestor).map_err(io::Error::other)?;
+                if tail
+                    .components()
+                    .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unresolved parent traversal in monitored root",
+                    ));
+                }
+                return Ok(std::fs::canonicalize(ancestor)?.join(tail));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "monitored root has no existing ancestor",
+    ))
 }
 
 type RootCursor = Arc<Mutex<Option<PathBuf>>>;
@@ -1412,9 +1564,16 @@ pub(super) mod tests {
         mount_levels: &HashMap<PathBuf, PressureLevel>,
         pressure: &PressureConfig,
     ) -> Vec<RootStatus> {
+        let monitored_mounts = mount_levels.keys().cloned().collect();
         roots
             .iter()
-            .map(|root| probe_root(root.clone(), platform).status(mount_levels, pressure))
+            .map(|root| {
+                probe_root(root.clone(), &[], platform, &AtomicBool::new(false)).status(
+                    mount_levels,
+                    pressure,
+                    &monitored_mounts,
+                )
+            })
             .collect()
     }
 
@@ -1688,6 +1847,24 @@ pub(super) mod tests {
     pub(in crate::daemon) fn assert_monitor_withdraws_pass(
         withdraw: &mut impl FnMut(&mut CompressTier),
     ) {
+        assert_paused_pass_control(true, true, &mut |tier, _, _, _, _| withdraw(tier));
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn assert_paused_pass_control(
+        monitored: bool,
+        cancelled: bool,
+        control: &mut impl FnMut(
+            &mut CompressTier,
+            &Config,
+            &ProbeFixture,
+            &ProbeLogger,
+            &std::path::Path,
+        ),
+    ) {
         let directory = crate::tempdir_outside_git();
         let root = directory.path().canonicalize().unwrap().join("cold-files");
         std::fs::create_dir(&root).unwrap();
@@ -1718,7 +1895,11 @@ pub(super) mod tests {
         config.compress.policy.min_size_bytes = 1;
         config.compress.policy.max_bytes = 64;
         config.paths.state_file = directory.path().join("state.json");
-        let levels = HashMap::from([(root.clone(), PressureLevel::Orange)]);
+        let levels = if monitored {
+            HashMap::from([(root.clone(), PressureLevel::Orange)])
+        } else {
+            HashMap::from([(PathBuf::from("/other-mount"), PressureLevel::Critical)])
+        };
         let mut tier = CompressTier::default();
         let tick = |tier: &mut CompressTier| {
             tier.tick(
@@ -1736,8 +1917,12 @@ pub(super) mod tests {
         tick(&mut tier);
         fixture.requested(&discovery_gate);
         assert!(tier.running.load(Ordering::Acquire));
-        withdraw(&mut tier);
+        control(&mut tier, &config, &fixture, &logger, &root);
+        assert_eq!(tier.stop.load(Ordering::Acquire), cancelled);
+        // Restored pressure must not clear cancellation while a worker is
+        // still inside its old native discovery operation.
         tick(&mut tier);
+        assert_eq!(tier.stop.load(Ordering::Acquire), cancelled);
         assert!(tier.running.load(Ordering::Acquire));
         assert!(
             fixture.requests.try_recv().is_err(),
@@ -1745,12 +1930,21 @@ pub(super) mod tests {
         );
         fixture.gate.release_all();
         wait_for_pass(&tier);
-        assert!(
-            fixture.requests.try_recv().is_err(),
-            "the cancelled pass must not reach file execution"
-        );
+        if cancelled {
+            assert!(
+                fixture.requests.try_recv().is_err(),
+                "the cancelled pass must not reach file execution"
+            );
+        } else {
+            fixture.requested(&file);
+            assert!(fixture.requests.try_recv().is_err());
+        }
         assert_eq!(std::fs::read(&file).unwrap(), b"unchanged cold payload");
         assert!(!directory.path().join("compression-journal").exists());
+
+        if !cancelled {
+            return;
+        }
 
         // Advance only the schedule, without making cached probe timestamps
         // appear fresh. The next pass must obtain new native root evidence.
@@ -1768,6 +1962,66 @@ pub(super) mod tests {
         wait_for_pass(&tier);
         assert_eq!(std::fs::read(&file).unwrap(), b"unchanged cold payload");
         assert!(!directory.path().join("compression-journal").exists());
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn monitored_recovery_or_missing_pressure_revokes_a_paused_real_pass() {
+        for current in [None, Some(PressureLevel::Green)] {
+            assert_paused_pass_control(true, true, &mut |tier, config, fixture, logger, mount| {
+                let mut levels =
+                    HashMap::from([(PathBuf::from("/other-mount"), PressureLevel::Critical)]);
+                if let Some(level) = current {
+                    levels.insert(mount.to_path_buf(), level);
+                }
+                tier.tick(
+                    Instant::now(),
+                    config,
+                    &fixture.platform,
+                    &levels,
+                    &logger.handle,
+                );
+                assert!(
+                    fixture.requests.try_recv().is_err(),
+                    "revocation must not issue another native probe"
+                );
+            });
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn eligible_monitored_pressure_and_compression_only_roots_keep_real_work_running() {
+        for current in [
+            PressureLevel::Yellow,
+            PressureLevel::Orange,
+            PressureLevel::Critical,
+        ] {
+            assert_paused_pass_control(true, false, &mut |tier, config, fixture, logger, mount| {
+                tier.tick(
+                    Instant::now(),
+                    config,
+                    &fixture.platform,
+                    &HashMap::from([(mount.to_path_buf(), current)]),
+                    &logger.handle,
+                );
+            });
+        }
+        assert_paused_pass_control(false, false, &mut |tier, config, fixture, logger, _| {
+            tier.tick(
+                Instant::now(),
+                config,
+                &fixture.platform,
+                &HashMap::from([(PathBuf::from("/other-mount"), PressureLevel::Green)]),
+                &logger.handle,
+            );
+        });
     }
 
     #[test]
@@ -1838,7 +2092,7 @@ pub(super) mod tests {
     #[test]
     fn scope_reload_cancels_old_work_and_discards_its_late_continuation() {
         type ScopeChange = (&'static str, fn(&mut Config));
-        let cases: [ScopeChange; 11] = [
+        let cases: [ScopeChange; 13] = [
             ("roots", |config| {
                 config.compress.roots = vec![PathBuf::from("/sbh-test-new-scope/scratch")];
             }),
@@ -1848,6 +2102,12 @@ pub(super) mod tests {
             }),
             ("work policy", |config| {
                 config.compress.policy.min_age_secs *= 2;
+            }),
+            ("pressure policy", |config| {
+                config.pressure.green_min_free_pct += 1.0;
+            }),
+            ("monitored roots", |config| {
+                config.scanner.root_paths = vec![PathBuf::from("/sbh-test-new-monitor/scratch")];
             }),
             ("protected paths", |config| {
                 config
@@ -2167,6 +2427,244 @@ pub(super) mod tests {
         );
         assert!(tier.last_start.is_some());
         tier.stop_running_pass();
+    }
+
+    #[test]
+    fn a_delayed_probe_cannot_replace_missing_monitor_pressure_with_its_snapshot() {
+        let root = PathBuf::from("/sbh-test-missing-controller/scratch");
+        let mount = PathBuf::from("/sbh-test-missing-controller");
+        let fixture = ProbeFixture::new(vec![volume(
+            "/sbh-test-missing-controller",
+            "btrfs",
+            1000,
+            1,
+        )]);
+        let logger = ProbeLogger::new();
+        let config = probe_config(&["/sbh-test-missing-controller/scratch"]);
+        let mut tier = CompressTier::default();
+        let critical = HashMap::from([(mount.clone(), PressureLevel::Critical)]);
+        tier.tick(
+            Instant::now(),
+            &config,
+            &fixture.platform,
+            &critical,
+            &logger.handle,
+        );
+        fixture.requested(&root);
+        fixture.gate.release_all();
+        drain_finished_probe(&mut tier, &config.compress.roots);
+        let unrelated = HashMap::from([(PathBuf::from("/other-mount"), PressureLevel::Critical)]);
+        for _ in 0..2 {
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &unrelated,
+                &logger.handle,
+            );
+            assert!(
+                tier.last_start.is_none(),
+                "a missing monitor observation cannot reuse a native Critical snapshot"
+            );
+            assert!(fixture.requests.try_recv().is_err());
+        }
+
+        tier.tick(
+            Instant::now(),
+            &config,
+            &fixture.platform,
+            &critical,
+            &logger.handle,
+        );
+        assert!(
+            tier.last_start.is_some(),
+            "fresh monitor authority permits a newly admitted pass"
+        );
+        tier.stop_running_pass();
+        wait_for_pass(&tier);
+    }
+
+    #[test]
+    fn a_failed_first_configured_monitor_sample_cannot_admit_native_pressure() {
+        let mount = PathBuf::from("/sbh-test-first-controller");
+        let root = mount.join("scratch");
+        let fixture =
+            ProbeFixture::new(vec![volume("/sbh-test-first-controller", "btrfs", 1000, 1)]);
+        let logger = ProbeLogger::new();
+        let mut config = probe_config(&["/sbh-test-first-controller/scratch"]);
+        // The monitor cannot read this configured sibling, even though the
+        // compression root's independent native query succeeds.
+        config.scanner.root_paths = vec![mount.join("work"), PathBuf::from("/other-mount")];
+        let unrelated = HashMap::from([(PathBuf::from("/other-mount"), PressureLevel::Critical)]);
+        let monitor_config = config.clone();
+        let monitor_platform = Arc::clone(&fixture.platform);
+        let monitor_levels = unrelated.clone();
+        let monitor_logger = logger.handle.clone();
+        let mut tier = fixture.monitor(CompressTier::default(), move |tier| {
+            tier.tick(
+                Instant::now(),
+                &monitor_config,
+                &monitor_platform,
+                &monitor_levels,
+                &monitor_logger,
+            );
+        });
+        fixture.requested(&root);
+        fixture.gate.release_all();
+        drain_finished_probe(&mut tier, &config.compress.roots);
+        for _ in 0..2 {
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &unrelated,
+                &logger.handle,
+            );
+            assert!(tier.last_start.is_none(), "first missing sample is unknown");
+            assert!(fixture.requests.try_recv().is_err());
+        }
+        tier.tick(
+            Instant::now(),
+            &config,
+            &fixture.platform,
+            &HashMap::from([(mount, PressureLevel::Critical)]),
+            &logger.handle,
+        );
+        assert!(
+            tier.last_start.is_some(),
+            "live pressure restores admission"
+        );
+        tier.stop_running_pass();
+        wait_for_pass(&tier);
+    }
+
+    #[test]
+    fn unrelated_scanner_edits_cannot_turn_missing_pressure_into_compression_only() {
+        for add_unrelated_root in [false, true] {
+            let mount = PathBuf::from("/sbh-test-retained-controller");
+            let root = mount.join("scratch");
+            let monitored = mount.join("work");
+            let unrelated_root = PathBuf::from("/unrelated-scanner-root");
+            let fixture = ProbeFixture::new(vec![volume(
+                "/sbh-test-retained-controller",
+                "btrfs",
+                1000,
+                1,
+            )]);
+            let logger = ProbeLogger::new();
+            let mut config = probe_config(&["/sbh-test-retained-controller/scratch"]);
+            config.scanner.root_paths = vec![monitored.clone()];
+            if !add_unrelated_root {
+                config.scanner.root_paths.push(unrelated_root.clone());
+            }
+            let mut tier = CompressTier::default();
+            let green = HashMap::from([(mount, PressureLevel::Green)]);
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &green,
+                &logger.handle,
+            );
+            fixture.requested(&root);
+            fixture.gate.release_all();
+            drain_finished_probe(&mut tier, &config.compress.roots);
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &green,
+                &logger.handle,
+            );
+            assert!(tier.last_start.is_none());
+
+            if add_unrelated_root {
+                config.scanner.root_paths.push(unrelated_root);
+            } else {
+                config.scanner.root_paths.retain(|path| path == &monitored);
+            }
+            let unrelated =
+                HashMap::from([(PathBuf::from("/other-mount"), PressureLevel::Critical)]);
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &unrelated,
+                &logger.handle,
+            );
+            fixture.requested(&root);
+            drain_finished_probe(&mut tier, &config.compress.roots);
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &unrelated,
+                &logger.handle,
+            );
+            assert!(
+                tier.last_start.is_none(),
+                "the retained root still requires its own current controller"
+            );
+            assert!(fixture.requests.try_recv().is_err());
+
+            // Deliberately removing this volume from scanner coverage really
+            // does make it compression-only, after a new background probe.
+            config.scanner.root_paths.retain(|path| path != &monitored);
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &unrelated,
+                &logger.handle,
+            );
+            fixture.requested(&root);
+            drain_finished_probe(&mut tier, &config.compress.roots);
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &unrelated,
+                &logger.handle,
+            );
+            assert!(tier.last_start.is_some(), "independent volume can proceed");
+            tier.stop_running_pass();
+            wait_for_pass(&tier);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_coverage_resolves_aliases_missing_paths_and_nested_mounts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mount = std::fs::canonicalize(directory.path())
+            .unwrap()
+            .join("volume");
+        let nested = mount.join("nested");
+        let work = mount.join("work");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&work, &alias).unwrap();
+        let platform = mounted_platform(vec![
+            volume(mount.to_str().unwrap(), "btrfs", 1000, 1),
+            volume(nested.to_str().unwrap(), "ext4", 1000, 1),
+        ]);
+        let root = mount.join("scratch");
+        let stop = AtomicBool::new(false);
+        for (configured, expected) in [
+            (alias.join("missing/deep"), None),
+            (nested.join("missing/deep"), Some(PressureLevel::Critical)),
+        ] {
+            let evidence = probe_root(root.clone(), &[configured], &platform, &stop);
+            let status =
+                evidence.status(&HashMap::new(), &PressureConfig::default(), &HashSet::new());
+            assert_eq!(status.level, expected);
+            assert_eq!(
+                due_roots(&enabled(), &[status], false, None, Instant::now()).is_empty(),
+                expected.is_none(),
+                "aliases require their own controller; a separate nested mount does not"
+            );
+        }
     }
 
     #[test]

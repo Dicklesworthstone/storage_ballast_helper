@@ -253,9 +253,22 @@ in observe or fallback-safe mode, under the kill switch, or with
 `scanner.dry_run`. When the daemon enters one of these during a pass, the pass
 stops before its next file, or before the next raw range of the file it is
 rewriting. Reloading compression settings, protected paths or control-file
-locations revokes old work before ballast rediscovery can perform filesystem
-I/O. Dry-run and kill-switch reloads do so at the same boundary. Restoring the
-previous settings cannot revive a worker that already received cancellation.
+locations, pressure policy or scanner coverage revokes old work before ballast
+rediscovery can perform filesystem I/O. Dry-run and kill-switch reloads do so at
+the same boundary. Restoring the previous settings cannot revive a worker that
+already received cancellation.
+
+For mounts covered by pressure monitoring, a running pass also stops when any
+of its admitted mounts falls below `start_level` or loses its current pressure
+observation. Pressure on another mount cannot keep that work authorized, and a
+blocked probe's older reading cannot turn a monitored mount into an independent
+compression-only volume. The background probe resolves configured scanner roots
+and mount topology, including aliases and missing paths, so a failed first sample
+or an unrelated scanner-root edit also requires current controller evidence.
+Cancellation retains the occupied worker slot until it exits; it neither waits
+for native I/O nor starts replacement workers. Roots on
+independently configured compression-only volumes retain their native-probe
+admission and do not borrow another mount's pressure.
 
 A file is started only while the pass has time left, and once started it is
 finished on its own allowance (a minute plus 4 MiB/s, at most an hour): a file
