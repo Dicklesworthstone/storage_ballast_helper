@@ -227,6 +227,57 @@ fn reservation_survives_pacing_and_admission_is_bounded_and_atomic() {
 }
 
 #[test]
+fn pressure_loss_pauses_pending_and_deferred_scans_until_fresh_observation() {
+    for claimed_before_failure in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = scanner(temp.path());
+        let queue = Arc::new(Mutex::new(ScanNowQueue::default()));
+        queue_policy(&queue.lock(), BehaviorPreset::V0_6);
+        queue
+            .lock()
+            .enqueue(scopes(&[], true, &config, temp.path()), 1)
+            .unwrap();
+        queue.lock().refresh(
+            &config,
+            &[response(temp.path(), PressureLevel::Critical)],
+            |_| Some(temp.path().to_path_buf()),
+        );
+        let claim =
+            claimed_before_failure.then(|| ScanNowClaim::take(&queue, Instant::now()).unwrap());
+        queue.lock().withdraw_pressure();
+        // Recovery while a paced claim is still outside the queue must not
+        // let its eventual deferral restore the old Critical observation.
+        if let Some(mut claim) = claim {
+            queue.lock().refresh(
+                &config,
+                &[response(temp.path(), PressureLevel::Green)],
+                |_| Some(temp.path().to_path_buf()),
+            );
+            claim.defer(Duration::ZERO);
+            drop(claim);
+        }
+        assert!(ScanNowClaim::take(&queue, Instant::now()).is_none());
+        assert_eq!(queue.lock().paths(), vec![temp.path().to_path_buf()]);
+        assert!(
+            queue
+                .lock()
+                .enqueue(scopes(&[], true, &config, temp.path()), 1)
+                .is_err(),
+            "the accepted request still owns its bounded queue slot",
+        );
+
+        queue.lock().refresh(
+            &config,
+            &[response(temp.path(), PressureLevel::Green)],
+            |_| Some(temp.path().to_path_buf()),
+        );
+        let refreshed = ScanNowClaim::take(&queue, Instant::now()).unwrap();
+        assert_eq!(refreshed.request().pressure_level, PressureLevel::Green);
+        assert!(refreshed.request().scan_now.unwrap().authorized(&config));
+    }
+}
+
+#[test]
 fn forced_requests_can_run_while_an_earlier_selection_waits_for_pacing() {
     let temp = tempfile::tempdir().unwrap();
     let config = scanner(temp.path());

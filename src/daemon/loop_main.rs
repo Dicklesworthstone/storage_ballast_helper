@@ -6006,13 +6006,12 @@ impl MonitoringDaemon {
             let response = match self.check_pressure() {
                 Ok(r) => r,
                 Err(e) => {
-                    self.ballast_replenisher.cancel();
                     self.logger_handle.send(ActivityEvent::Error {
                         code: "SBH-2001".to_string(),
                         message: format!("pressure check failed: {e}"),
                     });
-                    // On error, sleep and retry.
-                    self.refresh_operator_scans(&[]);
+                    // check_pressure has already withdrawn the old tick's
+                    // authority before any diagnostic or retry can block.
                     self.sleep_with_memory_pressure_events(
                         &memory_pressure_rx,
                         self.last_pressure_level,
@@ -6438,6 +6437,24 @@ impl MonitoringDaemon {
 
     // ──────────────────── pressure monitoring ────────────────────
 
+    /// Lost pressure observations cannot leave background workers using the
+    /// previous tick's permission. These cancellations perform no filesystem
+    /// work and retain occupied worker slots until the old workers exit.
+    /// A later successful sample must admit fresh work; it cannot revive a
+    /// cancelled staging pass, compression probe or target-only batch.
+    fn withdraw_pressure_authority(&mut self) {
+        self.ballast_replenisher.cancel();
+        self.rch_staging.stop_running_pass();
+        self.target_tier.withdraw_pressure();
+        self.scan_now_queue.lock().withdraw_pressure();
+        self.mount_responses.clear();
+        self.last_predictive_action = PredictiveAction::Clear;
+        *self.shared_guard_diagnostics.write() = None;
+        // Compression emits a best-effort diagnostic after setting its stop
+        // flag. Revoke every other worker before that stderr write can block.
+        self.compress_tier.stop_running_pass();
+    }
+
     #[allow(clippy::too_many_lines)]
     fn check_pressure(&mut self) -> Result<crate::monitor::pid::PressureResponse> {
         self.special_rates.begin_tick();
@@ -6465,6 +6482,10 @@ impl MonitoringDaemon {
         }
 
         if stats_by_mount.is_empty() {
+            // The normal pressure handler renews and revokes tier permission,
+            // but the error path skips it. Revoke here as part of sampling so
+            // callers cannot accidentally retain an earlier successful tick.
+            self.withdraw_pressure_authority();
             return Err(crate::core::errors::SbhError::FsStats {
                 path: paths.first().cloned().unwrap_or_else(|| PathBuf::from("/")),
                 details: "no filesystem stats available for any root path".to_string(),
@@ -14072,6 +14093,123 @@ mod tests {
                 let _ = logger.join();
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn unavailable_pressure_collector() -> FsStatsCollector {
+        FsStatsCollector::new(
+            Arc::new(MockPlatform::new(
+                Vec::new(),
+                HashMap::new(),
+                MockPlatform::healthy().memory_info().unwrap(),
+                crate::platform::pal::PlatformPaths::default(),
+            )),
+            Duration::ZERO,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_pressure_sampling_clears_tick_evidence_and_pauses_operator_work() {
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        let response = daemon.check_pressure().unwrap();
+        assert!(!daemon.mount_responses.is_empty());
+        assert!(daemon.shared_guard_diagnostics.read().is_some());
+        daemon.last_predictive_action = PredictiveAction::ImminentDanger {
+            mount: response.causing_mount.clone(),
+            minutes_remaining: 1.0,
+            critical: true,
+        };
+        let scopes = ScanNowScope::capture(&[], true, &daemon.config.scanner)
+            .unwrap()
+            .partition(|_| Some(response.causing_mount.clone()))
+            .unwrap();
+        daemon.scan_now_queue.lock().enqueue(scopes, 1).unwrap();
+        daemon.refresh_operator_scans(&[response]);
+        let mut admitted = ScanNowClaim::take(&daemon.scan_now_queue, Instant::now()).unwrap();
+        admitted.defer(Duration::ZERO);
+        drop(admitted);
+
+        daemon.fs_collector = unavailable_pressure_collector();
+        assert!(matches!(
+            daemon.check_pressure(),
+            Err(SbhError::FsStats { .. })
+        ));
+        assert!(daemon.mount_responses.is_empty());
+        assert!(daemon.worst_filesystem_response().is_none());
+        assert!(matches!(
+            daemon.last_predictive_action,
+            PredictiveAction::Clear
+        ));
+        assert!(daemon.shared_guard_diagnostics.read().is_none());
+        assert!(ScanNowClaim::take(&daemon.scan_now_queue, Instant::now()).is_none());
+        assert_eq!(
+            daemon.scan_now_queue.lock().paths(),
+            daemon.config.scanner.root_paths
+        );
+
+        // The request remains accepted and resumes only with a new observation.
+        daemon.fs_collector = FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::ZERO);
+        let recovered = daemon.check_pressure().unwrap();
+        daemon.refresh_operator_scans(std::slice::from_ref(&recovered));
+        let resumed = ScanNowClaim::take(&daemon.scan_now_queue, Instant::now()).unwrap();
+        assert_eq!(resumed.request().pressure_level, recovered.level);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_pressure_sampling_revokes_target_workers_and_queued_consent() {
+        let mut fixture = RegretDaemonFixture::new();
+        fixture.daemon.fs_collector = unavailable_pressure_collector();
+        crate::daemon::target_tier::tests::scheduling::assert_monitor_withdraws_pressure(
+            &mut |tier| {
+                std::mem::swap(&mut fixture.daemon.target_tier, tier);
+                assert!(fixture.daemon.check_pressure().is_err());
+                std::mem::swap(&mut fixture.daemon.target_tier, tier);
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_pressure_sampling_revokes_staging_probes_and_running_commands() {
+        let mut fixture = RegretDaemonFixture::new();
+        fixture.daemon.fs_collector = unavailable_pressure_collector();
+        let mut withdraw = |tier: &mut crate::daemon::rch_staging::RchStagingTier| {
+            std::mem::swap(&mut fixture.daemon.rch_staging, tier);
+            assert!(fixture.daemon.check_pressure().is_err());
+            std::mem::swap(&mut fixture.daemon.rch_staging, tier);
+        };
+        crate::daemon::rch_staging::tests::assert_monitor_withdraws_probe(&mut withdraw);
+        crate::daemon::rch_staging::tests::assert_monitor_withdraws_pass(&mut withdraw);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_pressure_sampling_revokes_compression_probes() {
+        let mut fixture = RegretDaemonFixture::new();
+        fixture.daemon.fs_collector = unavailable_pressure_collector();
+        crate::daemon::compress_tier::tests::assert_monitor_withdraws_probe(&mut |tier| {
+            std::mem::swap(&mut fixture.daemon.compress_tier, tier);
+            assert!(fixture.daemon.check_pressure().is_err());
+            std::mem::swap(&mut fixture.daemon.compress_tier, tier);
+        });
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn failed_pressure_sampling_revokes_running_compression_discovery() {
+        let mut fixture = RegretDaemonFixture::new();
+        fixture.daemon.fs_collector = unavailable_pressure_collector();
+        crate::daemon::compress_tier::tests::assert_monitor_withdraws_pass(&mut |tier| {
+            std::mem::swap(&mut fixture.daemon.compress_tier, tier);
+            assert!(fixture.daemon.check_pressure().is_err());
+            std::mem::swap(&mut fixture.daemon.compress_tier, tier);
+        });
     }
 
     #[cfg(unix)]

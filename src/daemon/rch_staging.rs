@@ -1018,7 +1018,7 @@ impl Drop for RunningGuard {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(super) mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -1471,6 +1471,98 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
             tier.tick(now, config, platform, mounts, mode, logger);
         }
+    }
+
+    /// Exercise a monitor's failure handler against an actual blocked native
+    /// admission. The callback owns the daemon integration; this harness owns
+    /// the worker, its filesystem gate and the subsequent healthy admission.
+    pub(in crate::daemon) fn assert_monitor_withdraws_probe(
+        withdraw: &mut impl FnMut(&mut RchStagingTier),
+    ) {
+        let mut probe = BlockedAdmission::new();
+        withdraw(&mut probe.tier);
+        let original_worker = probe.tier.probe.as_ref().unwrap().worker.thread().id();
+        probe.tick(
+            probe.started + Duration::from_secs(1),
+            &mount_at(PressureLevel::Critical),
+        );
+        assert_eq!(
+            probe.tier.probe.as_ref().unwrap().worker.thread().id(),
+            original_worker,
+            "withdrawal must retain a blocked admission's occupied slot"
+        );
+        assert_eq!(probe.platform.fs_probes.load(Ordering::Relaxed), 1);
+        probe.finish_probe();
+        probe.tick(
+            probe.started + Duration::from_secs(2),
+            &mount_at(PressureLevel::Critical),
+        );
+        assert!(probe.tier.probe.is_none());
+        assert!(
+            probe.tier.last_run.is_empty(),
+            "a result obtained before withdrawal cannot authorize a pass"
+        );
+
+        // The failure does not permanently disable the tier. A new sample
+        // after the normal probe interval can admit fresh work.
+        let retry = probe.started + PROBE_INTERVAL + Duration::from_secs(1);
+        probe.tick(retry, &mount_at(PressureLevel::Red));
+        probe.finish_probe();
+        probe.tick(retry, &mount_at(PressureLevel::Red));
+        assert!(probe.tier.started_since(&probe.base, retry));
+        assert_eq!(probe.platform.fs_probes.load(Ordering::Relaxed), 2);
+    }
+
+    /// Reach the last reference sweep on the real staging worker before the
+    /// monitor withdraws permission. Its stand-in rch records commands, so a
+    /// missing integration call is observed as an unwanted `--execute`.
+    pub(in crate::daemon) fn assert_monitor_withdraws_pass(
+        withdraw: &mut impl FnMut(&mut RchStagingTier),
+    ) {
+        let mut pass = PausedPass::new(PressureLevel::Critical);
+        let config = pass.config.clone();
+        withdraw(&mut pass.tier);
+        pass.tick(
+            &config,
+            &mount_at(PressureLevel::Critical),
+            ActiveMode::Enforce,
+        );
+        assert!(pass.tier.running.load(Ordering::Acquire));
+        assert_eq!(calls(&pass.root).len(), 2, "the blocked slot is retained");
+        pass.release();
+        pass.wait_for_exit();
+        assert!(!pass.tier.running.load(Ordering::Acquire));
+        assert!(
+            calls(&pass.root)
+                .iter()
+                .all(|call| !call.contains("--execute")),
+            "the old pass must stop after its final native observation returns"
+        );
+        assert!(pass.root.join("rch/clean/tree/repo/src/lib.rs").is_file());
+
+        // A separate, freshly admitted worker can still execute. The same
+        // tree and rch result make this a positive control for the refused
+        // pass, without needing a production rch installation in the test.
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        let started = Instant::now();
+        pass.tier.start_pass(
+            started,
+            &config,
+            &platform,
+            vec![DueBase {
+                base: pass.root.join("rch"),
+                mount: PathBuf::from("/"),
+                level: PressureLevel::Critical,
+                min_idle: min_idle_for(PressureLevel::Critical).unwrap(),
+            }],
+            fake_rch(&pass.root),
+            &pass.logger.handle,
+        );
+        pass.wait_for_exit();
+        assert!(!pass.tier.running.load(Ordering::Acquire));
+        let calls = calls(&pass.root);
+        assert_eq!(calls.len(), 5, "{calls:?}");
+        assert!(calls[4].ends_with("--project=clean --execute"), "{calls:?}");
     }
 
     #[test]

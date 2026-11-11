@@ -404,6 +404,7 @@ pub(crate) struct ScanNowQueue {
     pending: VecDeque<PendingScan>,
     claimed: usize,
     policy: Arc<RwLock<ScanNowPolicy>>,
+    pressure_epoch: u64,
 }
 
 impl ScanNowQueue {
@@ -457,6 +458,16 @@ impl ScanNowQueue {
         count
     }
 
+    /// Pending requests wait for a new pressure sample without probing their
+    /// paths. A failed monitor tick must not block in scope revalidation on
+    /// the same unavailable filesystem it has just failed to observe.
+    pub(crate) fn withdraw_pressure(&mut self) {
+        self.pressure_epoch = self.pressure_epoch.wrapping_add(1);
+        for pending in &mut self.pending {
+            pending.response = None;
+        }
+    }
+
     /// Only actual byte-pressure observations can authorize an operator pass.
     /// Missing samples wait; swap/inode promotion is never inherited here.
     pub(crate) fn refresh(
@@ -503,11 +514,12 @@ pub(crate) struct ScanNowClaim {
     queue: Arc<Mutex<ScanNowQueue>>,
     pending: Option<PendingScan>,
     defer_for: Option<Duration>,
+    pressure_epoch: u64,
 }
 
 impl ScanNowClaim {
     pub(crate) fn take(queue: &Arc<Mutex<ScanNowQueue>>, now: Instant) -> Option<Self> {
-        let pending = {
+        let (pending, pressure_epoch) = {
             let mut queue = queue.lock();
             let ready =
                 |pending: &&PendingScan| pending.response.is_some() && pending.retry_after <= now;
@@ -520,13 +532,15 @@ impl ScanNowClaim {
                 .map(|(index, _)| index)?;
             let pending = queue.pending.remove(index)?;
             queue.claimed += 1;
+            let pressure_epoch = queue.pressure_epoch;
             drop(queue);
-            pending
+            (pending, pressure_epoch)
         };
         Some(Self {
             queue: Arc::clone(queue),
             pending: Some(pending),
             defer_for: None,
+            pressure_epoch,
         })
     }
 
@@ -563,6 +577,11 @@ impl Drop for ScanNowClaim {
         let mut queue = self.queue.lock();
         queue.claimed = queue.claimed.saturating_sub(1);
         if let (Some(mut pending), Some(delay)) = (self.pending.take(), self.defer_for) {
+            if self.pressure_epoch != queue.pressure_epoch {
+                // A paced claim must not restore the observation invalidated
+                // while it was outside the queue, even after sampling recovers.
+                pending.response = None;
+            }
             pending.retry_after = Instant::now() + delay;
             queue.pending.push_back(pending);
         }

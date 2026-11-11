@@ -1013,7 +1013,7 @@ fn summarize(report: &CompressionReport) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -1449,6 +1449,7 @@ mod tests {
         inner: crate::platform::pal::MockPlatform,
         requests: mpsc::Sender<PathBuf>,
         gate: Arc<ProbeGate>,
+        discovery_gate: Option<PathBuf>,
     }
 
     impl Platform for ControlledPlatform {
@@ -1479,6 +1480,14 @@ mod tests {
         fn service_manager(&self) -> Box<dyn crate::platform::pal::ServiceManager> {
             self.inner.service_manager()
         }
+
+        fn sacred_paths(&self) -> Vec<crate::platform::types::SacredPath> {
+            if let Some(gate) = &self.discovery_gate {
+                let _ = self.requests.send(gate.clone());
+                self.gate.wait(gate);
+            }
+            self.inner.sacred_paths()
+        }
     }
 
     struct ProbeFixture {
@@ -1495,6 +1504,7 @@ mod tests {
                 inner: mounted_platform(stats),
                 requests: send,
                 gate: Arc::clone(&gate),
+                discovery_gate: None,
             });
             Self {
                 platform,
@@ -1598,6 +1608,166 @@ mod tests {
             assert!(Instant::now() < deadline, "released probe did not finish");
             std::thread::yield_now();
         }
+    }
+
+    /// The monitor owns revocation while this harness retains a real blocked
+    /// native probe. Recovered pressure cannot revive its completed snapshot,
+    /// but a newly obtained snapshot can still start a later pass.
+    pub(in crate::daemon) fn assert_monitor_withdraws_probe(
+        withdraw: &mut impl FnMut(&mut CompressTier),
+    ) {
+        let root = PathBuf::from("/sbh-test-pressure-withdrawal/scratch");
+        let fixture = ProbeFixture::new(vec![volume(
+            "/sbh-test-pressure-withdrawal",
+            "btrfs",
+            1000,
+            1,
+        )]);
+        let logger = ProbeLogger::new();
+        let config = probe_config(&["/sbh-test-pressure-withdrawal/scratch"]);
+        let mut tier = CompressTier::default();
+        let tick = |tier: &mut CompressTier| {
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &HashMap::new(),
+                &logger.handle,
+            );
+        };
+        tick(&mut tier);
+        fixture.requested(&root);
+        let original_worker = tier.probe.as_ref().unwrap().worker.thread().id();
+        withdraw(&mut tier);
+        tick(&mut tier);
+        assert_eq!(
+            tier.probe.as_ref().unwrap().worker.thread().id(),
+            original_worker,
+            "a cancelled native worker retains its slot until it returns"
+        );
+        assert!(fixture.requests.try_recv().is_err());
+        fixture.gate.release_all();
+        drain_finished_probe(&mut tier, &config.compress.roots);
+        assert!(
+            tier.evidence.is_empty(),
+            "old admission evidence stays revoked"
+        );
+        assert!(tier.last_start.is_none());
+
+        tick(&mut tier);
+        fixture.requested(&root);
+        drain_finished_probe(&mut tier, &config.compress.roots);
+        tick(&mut tier);
+        assert!(
+            tier.last_start.is_some(),
+            "fresh evidence can start a new pass"
+        );
+        tier.stop_running_pass();
+        wait_for_pass(&tier);
+    }
+
+    fn wait_for_pass(tier: &CompressTier) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tier.running.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "released compression pass did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Pause the real pass during discovery and let the monitor revoke it.
+    /// An unchanged cold file must never reach the execution PAL after that
+    /// revocation. A fresh pass subsequently reaches harmless non-btrfs file
+    /// admission; this does not claim coverage of native compression ioctls.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(in crate::daemon) fn assert_monitor_withdraws_pass(
+        withdraw: &mut impl FnMut(&mut CompressTier),
+    ) {
+        let directory = crate::tempdir_outside_git();
+        let root = directory.path().canonicalize().unwrap().join("cold-files");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("cold.bin");
+        std::fs::write(&file, b"unchanged cold payload").unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        let discovery_gate = root.join("discovery-observation");
+        let (send, requests) = mpsc::channel();
+        let gate = Arc::new(ProbeGate::default());
+        let platform = Arc::new(ControlledPlatform {
+            inner: mounted_platform(vec![
+                volume(root.to_str().unwrap(), "btrfs", 1000, 1),
+                // Root admission selects the tier; the per-file PAL refuses
+                // native mutation in the positive control on every host.
+                volume(file.to_str().unwrap(), "ext4", 1000, 1),
+            ]),
+            requests: send,
+            gate: Arc::clone(&gate),
+            discovery_gate: Some(discovery_gate.clone()),
+        });
+        let fixture = ProbeFixture {
+            platform,
+            requests,
+            gate,
+        };
+        let logger = ProbeLogger::new();
+        let mut config = probe_config(&[root.to_str().unwrap()]);
+        config.compress.policy.min_size_bytes = 1;
+        config.compress.policy.max_bytes = 64;
+        config.paths.state_file = directory.path().join("state.json");
+        let levels = HashMap::from([(root.clone(), PressureLevel::Orange)]);
+        let mut tier = CompressTier::default();
+        let tick = |tier: &mut CompressTier| {
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &levels,
+                &logger.handle,
+            );
+        };
+        fixture.gate.release(&root);
+        tick(&mut tier);
+        fixture.requested(&root);
+        drain_finished_probe(&mut tier, &config.compress.roots);
+        tick(&mut tier);
+        fixture.requested(&discovery_gate);
+        assert!(tier.running.load(Ordering::Acquire));
+        withdraw(&mut tier);
+        tick(&mut tier);
+        assert!(tier.running.load(Ordering::Acquire));
+        assert!(
+            fixture.requests.try_recv().is_err(),
+            "no replacement worker starts"
+        );
+        fixture.gate.release_all();
+        wait_for_pass(&tier);
+        assert!(
+            fixture.requests.try_recv().is_err(),
+            "the cancelled pass must not reach file execution"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"unchanged cold payload");
+        assert!(!directory.path().join("compression-journal").exists());
+
+        // Advance only the schedule, without making cached probe timestamps
+        // appear fresh. The next pass must obtain new native root evidence.
+        tier.last_start = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(config.compress.interval_minutes * 60))
+                .unwrap(),
+        );
+        tick(&mut tier);
+        fixture.requested(&root);
+        drain_finished_probe(&mut tier, &config.compress.roots);
+        tick(&mut tier);
+        fixture.requested(&discovery_gate);
+        fixture.requested(&file);
+        wait_for_pass(&tier);
+        assert_eq!(std::fs::read(&file).unwrap(), b"unchanged cold payload");
+        assert!(!directory.path().join("compression-journal").exists());
     }
 
     #[test]

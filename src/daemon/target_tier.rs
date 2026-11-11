@@ -1041,6 +1041,22 @@ pub struct TargetTier {
 }
 
 impl TargetTier {
+    /// Withdraw all previously granted target-only authority when the monitor
+    /// cannot establish current pressure. A later healthy sample starts a new
+    /// generation; it cannot revive a blocked worker or an already queued batch.
+    /// Retain the occupied worker slot without waiting for native I/O.
+    pub fn withdraw_pressure(&mut self) {
+        *self.pressure.write() = MountPressure::default();
+        self.revoked.store(true, Ordering::Release);
+        self.revoked = Arc::new(AtomicBool::new(false));
+        self.started = None;
+        self.last_probe = None;
+        self.last_start = None;
+        // The old worker owns its old map and cannot publish late scheduling
+        // hints into the next generation after the pressure evidence returns.
+        self.survey_progress = Arc::default();
+    }
+
     /// Called at reload, even when the target-only roots become empty. No
     /// filesystem I/O or waiting: a blocked old worker keeps its slot but loses
     /// authority to submit or execute work under its previous configuration.
@@ -1269,7 +1285,7 @@ impl Drop for RunningGuard {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
@@ -2269,7 +2285,7 @@ mod tests {
         }
     }
 
-    mod scheduling {
+    pub(in crate::daemon) mod scheduling {
         use super::*;
         use crate::core::errors::Result;
         use crate::platform::pal::{
@@ -2561,6 +2577,96 @@ mod tests {
                 .expect("a fresh generation still nominates the target");
             assert_eq!(batch.candidates.len(), 1);
             assert_eq!(batch.target_only_root, Some(resolve_absolute_path(&root)));
+        }
+
+        #[test]
+        fn withdrawn_pressure_revokes_blocked_and_queued_work_after_recovery() {
+            assert_monitor_withdraws_pressure(&mut TargetTier::withdraw_pressure);
+        }
+
+        pub(in crate::daemon) fn assert_monitor_withdraws_pressure(
+            withdraw: &mut impl FnMut(&mut TargetTier),
+        ) {
+            let (_temp, root) = scratch_root();
+            cargo_target(&root.join("session/target"));
+            let fixture = ProbeFixture::new();
+            let logger = ProbeLogger::new();
+            let config = config(&root);
+            let (del_tx, del_rx) = crossbeam_channel::bounded(2);
+            let first_config = config.clone();
+            let first_platform = Arc::clone(&fixture.platform);
+            let first_logger = logger.handle.clone();
+            let first_tx = del_tx.clone();
+            let mut tier = fixture.monitor(TargetTier::default(), move |tier| {
+                tier.tick(
+                    Instant::now(),
+                    &first_config,
+                    &first_platform,
+                    &red_mounts(),
+                    &first_tx,
+                    &first_logger,
+                );
+            });
+            fixture.requested(&root);
+            let old_token = Arc::clone(&tier.revoked);
+            let bound_root = resolve_absolute_path(&root);
+            let queued =
+                TargetOnlyConsent::new(&bound_root, &config.scanner, Arc::clone(&old_token));
+            let old_progress = Arc::clone(&tier.survey_progress);
+            let withdrawal_started = Instant::now();
+            withdraw(&mut tier);
+            withdraw(&mut tier);
+            assert!(
+                withdrawal_started.elapsed() < Duration::from_secs(1),
+                "pressure withdrawal waited for the blocked worker"
+            );
+            assert!(old_token.load(Ordering::Acquire));
+            assert!(!queued.permits(&bound_root, &config.scanner));
+            assert!(tier.pressure.read().observed_at.is_none());
+            assert!(tier.pressure.read().mounts.is_empty());
+            assert!(tier.running.load(Ordering::Acquire));
+            assert!(!Arc::ptr_eq(&old_progress, &tier.survey_progress));
+
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &red_mounts(),
+                &del_tx,
+                &logger.handle,
+            );
+            assert!(
+                fixture.requests.try_recv().is_err(),
+                "blocked slot is retained"
+            );
+            assert!(!queued.permits(&bound_root, &config.scanner));
+            fixture.release_all();
+            finish(&mut tier);
+            assert!(
+                del_rx.try_recv().is_err(),
+                "old worker cannot publish after recovery"
+            );
+            assert!(tier.last_start.is_none());
+
+            tier.tick(
+                Instant::now(),
+                &config,
+                &fixture.platform,
+                &red_mounts(),
+                &del_tx,
+                &logger.handle,
+            );
+            finish(&mut tier);
+            let batch = del_rx.try_recv().expect("fresh pressure admits new work");
+            assert_eq!(batch.candidates.len(), 1);
+            assert!(
+                batch
+                    .target_only_consent
+                    .as_ref()
+                    .unwrap()
+                    .permits(batch.target_only_root.as_ref().unwrap(), &config.scanner,)
+            );
+            assert!(!queued.permits(&bound_root, &config.scanner));
         }
 
         #[test]
