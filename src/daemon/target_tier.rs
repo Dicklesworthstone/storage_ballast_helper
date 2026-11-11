@@ -84,6 +84,9 @@ const MAX_LISTING_ENTRIES: usize = 65_536;
 const DISCOVERY_MAX_ENTRIES: usize = 65_536;
 /// Candidate names retained while a discovery page receives its survey turns.
 const DISCOVERY_MAX_CANDIDATES: usize = 256;
+/// Roots retaining reader positions or pending names between passes. A root
+/// waiting for a slot still receives one bounded temporary discovery pass.
+const MAX_LIVE_DISCOVERIES: usize = 4;
 /// Wall time of one discovery.
 const DISCOVERY_BUDGET: Duration = Duration::from_secs(30);
 /// Entries one candidate's survey may visit before it fails closed.
@@ -657,6 +660,25 @@ struct DiscoveryFrame {
     listing: fs::ReadDir,
 }
 
+/// Identity witnesses only, never retained purity or idleness evidence. A
+/// pending name cannot be replayed through a replacement ancestor, even when
+/// the new subtree has the same names and also contains pure Cargo output.
+#[derive(Debug, Clone)]
+struct DiscoveryWitness {
+    target: FsIdentity,
+    ancestors: Vec<(PathBuf, FsIdentity)>,
+}
+
+impl DiscoveryWitness {
+    fn is_current(&self, path: &Path) -> bool {
+        current_identity(path) == Some(self.target)
+            && self
+                .ancestors
+                .iter()
+                .all(|(path, identity)| current_identity(path) == Some(*identity))
+    }
+}
+
 /// Bounded-depth DFS avoids a breadth frontier proportional to the tree.
 /// Readers retain their exact position even in listings larger than a slice.
 /// At most MAX_DEPTH readers and one unread name survive; none is evidence
@@ -666,6 +688,9 @@ struct DiscoveryProgress {
     stack: Vec<DiscoveryFrame>,
     next: Option<PathBuf>,
     started: bool,
+    /// At most the current candidate page; the survey takes these witnesses
+    /// with its names and retains only the unfinished tail.
+    page_witnesses: HashMap<PathBuf, DiscoveryWitness>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -716,6 +741,7 @@ impl DiscoveryProgress {
         limits: DiscoveryLimits,
     ) -> bool {
         let deadline = Instant::now() + limits.duration;
+        self.page_witnesses.clear();
         if !self.started {
             self.started = true;
             self.next = Some(root.to_path_buf());
@@ -738,6 +764,17 @@ impl DiscoveryProgress {
                 };
                 directories += 1;
                 if depth > 0 && markers.cargo {
+                    self.page_witnesses.insert(
+                        dir.clone(),
+                        DiscoveryWitness {
+                            target: current,
+                            ancestors: self
+                                .stack
+                                .iter()
+                                .map(|frame| (frame.path.clone(), frame.identity))
+                                .collect(),
+                        },
+                    );
                     found.push(dir);
                 } else if depth < MAX_DEPTH
                     && let Ok(listing) = fs::read_dir(&dir)
@@ -782,9 +819,11 @@ struct SurveyProgress {
     /// Unexamined names from a partial discovery page. A target too large
     /// for one full survey turn yields, allowing discovery to advance.
     pending: Vec<PathBuf>,
+    pending_witnesses: HashMap<PathBuf, DiscoveryWitness>,
     /// A full survey turn failed in this cycle. Finishing a later discovery
     /// page must not advertise complete coverage of that earlier target.
     unsurveyed: bool,
+    last_discovery_completed: Option<Instant>,
 }
 
 impl SurveyProgress {
@@ -808,6 +847,46 @@ impl SurveyProgress {
             found.rotate_left(next);
         }
     }
+
+    fn has_discovery(&self) -> bool {
+        self.discovery.started || !self.pending.is_empty()
+    }
+
+    /// Call only on the retained worker: retiring a reader can perform native
+    /// filesystem work. The lexical survey-order hint remains reusable.
+    fn discard_discovery(&mut self) {
+        self.discovery = DiscoveryProgress::default();
+        self.pending.clear();
+        self.pending_witnesses.clear();
+        self.unsurveyed = false;
+    }
+}
+
+fn discovery_admitted(progress: &HashMap<PathBuf, SurveyProgress>, root: &Path) -> bool {
+    progress
+        .get(root)
+        .is_some_and(SurveyProgress::has_discovery)
+        || progress
+            .values()
+            .filter(|progress| progress.has_discovery())
+            .count()
+            < MAX_LIVE_DISCOVERIES
+}
+
+/// Waiting roots get the next free retained slot before a completed root
+/// starts over. Until then they still receive a bounded fresh opportunity.
+/// Deep tails need a retained slot; infinite growth has no completion bound.
+fn order_discovery_roots(roots: &mut [PathBuf], progress: &HashMap<PathBuf, SurveyProgress>) {
+    roots.sort_by(|left, right| {
+        let completed = |root: &Path| {
+            progress
+                .get(root)
+                .and_then(|progress| progress.last_discovery_completed)
+        };
+        completed(left)
+            .cmp(&completed(right))
+            .then_with(|| left.cmp(right))
+    });
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -984,6 +1063,7 @@ fn survey_page(
     };
     let excluded = exclusions_under(root, &scanner.excluded_paths);
     let mut found = std::mem::take(&mut progress.pending);
+    let mut witnesses = std::mem::take(&mut progress.pending_witnesses);
     let incremental = if found.is_empty() {
         let resuming = progress.discovery.started;
         if !resuming {
@@ -993,6 +1073,7 @@ fn survey_page(
             progress
                 .discovery
                 .discover(root, identity, &excluded, &mut found, limits.discovery);
+        witnesses = std::mem::take(&mut progress.discovery.page_witnesses);
         resuming || !selection.complete
     } else {
         selection.complete = !progress.discovery.started;
@@ -1000,7 +1081,12 @@ fn survey_page(
     };
     // Retained readers and names are never current protection or structure
     // evidence. This also catches changes made during discovery itself.
-    found.retain(|dir| discoverable_target(dir, root, identity, &excluded));
+    found.retain(|dir| {
+        witnesses
+            .get(dir)
+            .is_some_and(|witness| witness.is_current(dir))
+            && discoverable_target(dir, root, identity, &excluded)
+    });
     selection.discovered = found.len();
     progress.order(root, &mut found);
 
@@ -1017,7 +1103,11 @@ fn survey_page(
             }
             break;
         }
-        if !discoverable_target(dir, root, identity, &excluded) {
+        if !witnesses
+            .get(dir)
+            .is_some_and(|witness| witness.is_current(dir))
+            || !discoverable_target(dir, root, identity, &excluded)
+        {
             selection.leave("changed");
             progress.after = Some(dir.clone());
             continue;
@@ -1039,6 +1129,18 @@ fn survey_page(
                 }
             }
         }
+    }
+    progress.pending_witnesses = progress
+        .pending
+        .iter()
+        .filter_map(|path| {
+            witnesses
+                .remove(path)
+                .map(|witness| (path.clone(), witness))
+        })
+        .collect();
+    if !progress.has_discovery() {
+        progress.last_discovery_completed = Some(Instant::now());
     }
     selection.complete &= !progress.unsurveyed;
     checked
@@ -1239,9 +1341,13 @@ pub struct TargetTier {
     /// batches already queued for the executor. Re-enabling cannot revive it.
     revoked: Arc<AtomicBool>,
     scanner: Option<ScannerConfig>,
-    /// Independent fair turns for each root. Locks only move small scheduling
-    /// hints; no filesystem operation runs while this mutex is held.
+    /// Independent fair turns and bounded discovery read-ahead. The worker
+    /// takes the map before traversal or reader retirement; neither native
+    /// operation runs while this mutex is held.
     survey_progress: Arc<Mutex<HashMap<PathBuf, SurveyProgress>>>,
+    /// At most one retired generation waits for the retained worker. Until
+    /// it starts, repeated revocations only replace empty live maps.
+    retired_progress: Option<Arc<Mutex<HashMap<PathBuf, SurveyProgress>>>>,
 }
 
 impl TargetTier {
@@ -1258,7 +1364,8 @@ impl TargetTier {
         self.last_start = None;
         // The old worker owns its old map and cannot publish late scheduling
         // hints into the next generation after the pressure evidence returns.
-        self.survey_progress = Arc::default();
+        self.retire_discovery_progress();
+        self.start_retirement_worker();
     }
 
     /// Called at reload, even when the target-only roots become empty. No
@@ -1275,9 +1382,56 @@ impl TargetTier {
             self.last_start = None;
             // A blocked old worker can finish later. Its hints belong to its
             // old scope and must not overwrite the replacement's progress.
-            self.survey_progress = Arc::default();
+            self.retire_discovery_progress();
+            self.start_retirement_worker();
         }
         self.scanner = Some(scanner.clone());
+    }
+
+    fn retire_discovery_progress(&mut self) {
+        let previous = std::mem::take(&mut self.survey_progress);
+        if self.retired_progress.is_some() {
+            // Worker admission drains retirement first, so no new generation
+            // can acquire readers while an earlier one awaits that slot.
+            debug_assert!(previous.lock().is_empty());
+        } else if !previous.lock().is_empty() {
+            self.retired_progress = Some(previous);
+        }
+    }
+
+    /// A native directory close belongs to the same retained worker as a
+    /// traversal. Disabling the tier still drains its retired readers, and a
+    /// blocked close never permits a replacement worker to accumulate.
+    fn start_retirement_worker(&mut self) {
+        self.poll_worker();
+        if self.running.load(Ordering::Acquire) || self.worker.is_some() {
+            return;
+        }
+        let Some(retired) = self.retired_progress.as_ref().map(Arc::clone) else {
+            return;
+        };
+        self.running.store(true, Ordering::Release);
+        let guard = RunningGuard(Arc::clone(&self.running));
+        let spawned = std::thread::Builder::new()
+            .name("sbh-targets-retire".to_string())
+            .spawn(move || {
+                let _guard = guard;
+                // Leave the shared map empty before closing native handles.
+                // The monitor may retain its Arc until spawn returns.
+                let progress = std::mem::take(&mut *retired.lock());
+                drop(progress);
+            });
+        match spawned {
+            Ok(worker) => {
+                self.worker = Some(worker);
+                self.retired_progress = None;
+            }
+            Err(error) => {
+                // Retaining the parent's Arc prevents a failed spawn from
+                // closing the readers while dropping its closure here.
+                eprintln!("[SBH-TARGETS] reader retirement thread failed to start: {error}");
+            }
+        }
     }
 
     /// Reap only an already-finished worker and consume its one start notice.
@@ -1320,9 +1474,11 @@ impl TargetTier {
             mounts: mounts.clone(),
         };
         self.poll_worker();
+        self.start_retirement_worker();
         if config.scanner.target_only_roots.is_empty()
             || self.running.load(Ordering::Acquire)
             || self.worker.is_some()
+            || self.retired_progress.is_some()
             || self
                 .last_start
                 .is_some_and(|last| now.saturating_duration_since(last) < PASS_INTERVAL)
@@ -1350,26 +1506,30 @@ impl TargetTier {
                 if revoked.load(Ordering::Acquire) {
                     return;
                 }
-                let roots = expand_roots(&config.scanner.target_only_roots);
-                survey_progress
-                    .lock()
-                    .retain(|root, _| roots.binary_search(root).is_ok());
+                let mut roots = expand_roots(&config.scanner.target_only_roots);
+                let mut progress_by_root = std::mem::take(&mut *survey_progress.lock());
+                progress_by_root.retain(|root, _| roots.binary_search(root).is_ok());
+                order_discovery_roots(&mut roots, &progress_by_root);
                 let mut pass_started = false;
                 for root in roots {
                     if revoked.load(Ordering::Acquire) {
                         break;
                     }
                     let Some(due) = probe_root(&root, platform.as_ref(), &pressure) else {
+                        if let Some(progress) = progress_by_root.get_mut(&root) {
+                            progress.discard_discovery();
+                        }
                         continue;
                     };
                     if revoked.load(Ordering::Acquire) {
                         break;
                     }
+                    let retain_discovery = discovery_admitted(&progress_by_root, &root);
                     if !pass_started {
                         let _ = started_tx.try_send(Instant::now());
                         pass_started = true;
                     }
-                    let mut progress = survey_progress.lock().remove(&root).unwrap_or_default();
+                    let progress = progress_by_root.entry(root.clone()).or_default();
                     let message = run_root(
                         &due,
                         &config,
@@ -1378,13 +1538,19 @@ impl TargetTier {
                         SystemTime::now(),
                         &revoked,
                         &pressure,
-                        &mut progress,
+                        progress,
                     );
-                    if !revoked.load(Ordering::Acquire) {
-                        survey_progress.lock().insert(root, progress);
+                    if !retain_discovery {
+                        // A small waiting root keeps its immediate fresh
+                        // opportunity. Only four roots retain readers/pages;
+                        // discarded continuation never claims full coverage.
+                        progress.discard_discovery();
                     }
                     eprintln!("[SBH-TARGETS] {message}");
                     logger.send(ActivityEvent::Info { message });
+                }
+                if !revoked.load(Ordering::Acquire) {
+                    *survey_progress.lock() = progress_by_root;
                 }
             });
         match spawned {
@@ -1402,8 +1568,14 @@ impl TargetTier {
 
 impl Drop for TargetTier {
     fn drop(&mut self) {
-        // Revocation is nonblocking even if the worker cannot leave a syscall.
         self.revoked.store(true, Ordering::Release);
+        // Hand idle readers to the same retained worker during shutdown too.
+        // Never join or replace an occupied worker. A worker still finishing
+        // publication, or an OS refusal to create one at final destruction,
+        // can leave this caller releasing the final handles. Shutdown cannot
+        // promise a nonblocking close as normal live revocation does.
+        self.retire_discovery_progress();
+        self.start_retirement_worker();
     }
 }
 
@@ -2236,7 +2408,15 @@ pub(super) mod tests {
     #[cfg(unix)]
     #[test]
     fn pending_discovery_names_require_live_ancestry_purity_and_idleness() {
-        for change in ["marker", "git", "cargo", "symlink", "impure", "recent"] {
+        for change in [
+            "marker",
+            "git",
+            "cargo",
+            "symlink",
+            "replacement",
+            "impure",
+            "recent",
+        ] {
             let (_temp, root) = scratch_root();
             for session in ["one", "two"] {
                 cargo_target(&root.join(session).join("target"));
@@ -2275,6 +2455,20 @@ pub(super) mod tests {
                     fs::rename(parent, &held).unwrap();
                     std::os::unix::fs::symlink(&held, parent).unwrap();
                 }
+                "replacement" => {
+                    let target_identity = current_identity(&changed).unwrap();
+                    let held = root.with_file_name("held-session");
+                    fs::rename(parent, &held).unwrap();
+                    fs::create_dir(parent).unwrap();
+                    fs::rename(held.join("target"), &changed).unwrap();
+                    assert_eq!(current_identity(&changed), Some(target_identity));
+                    assert!(discoverable_target(
+                        &changed,
+                        &root,
+                        current_identity(&root).unwrap(),
+                        &[],
+                    ));
+                }
                 "impure" => fs::create_dir(changed.join("trace")).unwrap(),
                 "recent" => touch_ahead(&changed.join("debug/deps/libdemo.rlib"), 2),
                 _ => unreachable!(),
@@ -2299,7 +2493,134 @@ pub(super) mod tests {
                 "{change} did not revoke the retained name"
             );
             assert!(progress.pending.is_empty());
+            assert!(progress.pending_witnesses.is_empty());
         }
+    }
+
+    #[test]
+    fn bounded_reader_slots_eventually_reach_every_finite_root() {
+        let (_temp, root) = scratch_root();
+        let roots: Vec<_> = (0..MAX_LIVE_DISCOVERIES + 2)
+            .map(|index| root.join(format!("root-{index}")))
+            .collect();
+        for root in &roots {
+            for index in 0..3 {
+                cargo_target(&root.join(format!("target-{index}")));
+            }
+        }
+        age(&root, 48);
+        let mut progress = HashMap::new();
+        let mut nominated = std::collections::BTreeSet::new();
+        for _ in 0..30 {
+            let mut order = roots.clone();
+            order_discovery_roots(&mut order, &progress);
+            for root in order {
+                let retained = discovery_admitted(&progress, &root);
+                let selection = select_with_limits(
+                    &root,
+                    &Config::default(),
+                    &MockPlatform::healthy(),
+                    0.5,
+                    later(),
+                    progress.entry(root.clone()).or_default(),
+                    SelectionLimits {
+                        discovery: DiscoveryLimits {
+                            directories: 2,
+                            entries: 3,
+                            candidates: 1,
+                            ..DiscoveryLimits::default()
+                        },
+                        ..SelectionLimits::default()
+                    },
+                );
+                if !retained {
+                    progress.get_mut(&root).unwrap().discard_discovery();
+                }
+                nominated.extend(
+                    selection
+                        .candidates
+                        .into_iter()
+                        .map(|candidate| candidate.path),
+                );
+                assert!(
+                    progress
+                        .values()
+                        .filter(|state| state.has_discovery())
+                        .count()
+                        <= MAX_LIVE_DISCOVERIES
+                );
+                assert!(progress.values().all(|state| {
+                    state.discovery.stack.len() <= MAX_DEPTH
+                        && state.pending.len() <= DISCOVERY_MAX_CANDIDATES
+                        && state.pending_witnesses.len() <= state.pending.len()
+                }));
+            }
+            if nominated.len() == roots.len() * 3 {
+                break;
+            }
+        }
+        assert_eq!(nominated.len(), roots.len() * 3, "waiting roots get a slot");
+    }
+
+    #[test]
+    fn a_small_waiting_root_keeps_its_fresh_opportunity_while_four_large_roots_resume() {
+        let (_temp, root) = scratch_root();
+        let mut roots = Vec::new();
+        for index in 0..MAX_LIVE_DISCOVERIES {
+            let broad = root.join(format!("a-broad-{index}"));
+            fs::create_dir(&broad).unwrap();
+            for name in 0..20 {
+                fs::write(broad.join(format!("notes-{name}.txt")), b"user work").unwrap();
+            }
+            roots.push(broad);
+        }
+        let small = root.join("z-small");
+        cargo_target(&small.join("target"));
+        roots.push(small.clone());
+        age(&root, 48);
+        let mut progress = HashMap::new();
+        order_discovery_roots(&mut roots, &progress);
+        let mut small_selected = false;
+        for root in roots {
+            let retained = discovery_admitted(&progress, &root);
+            let selection = select_with_limits(
+                &root,
+                &Config::default(),
+                &MockPlatform::healthy(),
+                0.5,
+                later(),
+                progress.entry(root.clone()).or_default(),
+                SelectionLimits {
+                    discovery: DiscoveryLimits {
+                        directories: 2,
+                        entries: 3,
+                        candidates: 2,
+                        ..DiscoveryLimits::default()
+                    },
+                    ..SelectionLimits::default()
+                },
+            );
+            if root == small {
+                assert!(!retained, "all retained reader slots are occupied");
+                assert_eq!(names(&selection), ["target"]);
+                small_selected = true;
+            } else {
+                assert!(retained);
+                assert!(!selection.complete);
+                assert!(progress[&root].has_discovery());
+            }
+            if !retained {
+                progress.get_mut(&root).unwrap().discard_discovery();
+            }
+        }
+        assert!(small_selected, "the fifth root is examined in this cycle");
+        assert_eq!(
+            progress
+                .values()
+                .filter(|state| state.has_discovery())
+                .count(),
+            MAX_LIVE_DISCOVERIES,
+        );
     }
 
     #[test]
@@ -3208,6 +3529,66 @@ pub(super) mod tests {
         #[test]
         fn withdrawn_pressure_revokes_blocked_and_queued_work_after_recovery() {
             assert_monitor_withdraws_pressure(&mut TargetTier::withdraw_pressure);
+        }
+
+        #[test]
+        fn retired_readers_are_bounded_and_drained_even_after_disabling_the_tier() {
+            let (_temp, root) = scratch_root();
+            let fixture = ProbeFixture::new();
+            let logger = ProbeLogger::new();
+            let config = config(&root);
+            let mut tier = TargetTier::default();
+            tier.update_config(&config.scanner);
+            let mut progress = SurveyProgress::default();
+            progress.prepare(&root);
+            progress.discovery = retained_session_reader(&root);
+            assert_eq!(progress.discovery.stack.len(), 2);
+            tier.survey_progress.lock().insert(root.clone(), progress);
+            let retired = Arc::downgrade(&tier.survey_progress);
+
+            // Hold the existing slot so the ownership handoff can be observed
+            // before its asynchronous retirement finishes. Readers are real
+            // native directory descriptors, not cached permission tokens.
+            tier.running.store(true, Ordering::Release);
+            let guard = RunningGuard(Arc::clone(&tier.running));
+            for _ in 0..4 {
+                tier.withdraw_pressure();
+                let held = retired.upgrade().expect("revocation must retain readers");
+                assert!(Arc::ptr_eq(tier.retired_progress.as_ref().unwrap(), &held));
+                assert!(held.lock()[&root].has_discovery());
+                assert!(tier.survey_progress.lock().is_empty());
+                assert!(tier.worker.is_none(), "occupied slots are never replaced");
+            }
+            let mut disabled = config;
+            disabled.scanner.target_only_roots.clear();
+            tier.update_config(&disabled.scanner);
+            assert!(retired.upgrade().is_some());
+            drop(guard);
+
+            let (del_tx, del_rx) = crossbeam_channel::bounded(1);
+            tier.tick(
+                Instant::now(),
+                &disabled,
+                &fixture.platform,
+                &red_mounts(),
+                &del_tx,
+                &logger.handle,
+            );
+            finish(&mut tier);
+            assert!(tier.retired_progress.is_none());
+            assert!(
+                retired.upgrade().is_none(),
+                "the worker retired the readers"
+            );
+            assert!(
+                fixture.requests.try_recv().is_err(),
+                "disabled roots are not probed"
+            );
+            assert!(del_rx.try_recv().is_err());
+            assert!(
+                root.join("session/target-0/debug/deps/libdemo.rlib")
+                    .is_file()
+            );
         }
 
         pub(in crate::daemon) fn assert_monitor_withdraws_pressure(

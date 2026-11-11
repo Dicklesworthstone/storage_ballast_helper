@@ -4,7 +4,15 @@
 //! cannot hold another mount's emergency cleanup, and an expired/cancelled
 //! worker cannot regain authority after its native I/O eventually returns.
 
-use super::*;
+use super::{
+    ActiveMode, ActivityEvent, ActivityLoggerHandle, Arc, AtomicBool, AtomicU64, CandidacyScore,
+    Config, Duration, HashMap, HashSet, Instant, MonitoringDaemon, MountTickResponse, Mutex,
+    Ordering, Path, PathBuf, Platform, PolicyEngine, PressureLevel, ProtectionRegistry,
+    QUARANTINE_FIRST_CHANCE_SECS, QUARANTINE_PRESSURE_RETRY_SECS, QUARANTINE_SWEEP_INTERVAL,
+    QuarantineRecord, QuarantineStore, QuarantineSweepMode, RwLock, ScannerConfig,
+    SharedExecutorConfig, SharedRegret, SkipReason, SystemTime, VecDeque, bounded,
+    scanner_mutation_scope_matches, thread,
+};
 
 #[derive(Clone)]
 struct SweepLease {
