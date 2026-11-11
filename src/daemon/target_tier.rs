@@ -39,9 +39,12 @@
 //! Surveys share finite time and entry allowances per root. Each root keeps
 //! a position in the target order as a scheduling hint, so an oversized target
 //! cannot repeatedly consume the turns of all targets discovered after it.
-//! Discovery and every safety observation remain fresh on every pass.
+//! Discovery retains bounded directory-reader positions across passes, so a
+//! wide or slow prefix cannot hide every later target forever. Retained paths
+//! are scheduling hints: ancestry, structure and every safety observation are
+//! renewed before a target is surveyed.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -75,9 +78,12 @@ pub const PASS_INTERVAL: Duration = Duration::from_mins(10);
 const MAX_DEPTH: usize = 6;
 /// Directories one discovery may read.
 const MAX_DIRECTORIES: usize = 50_000;
-/// Entries discovery reads from one directory; a larger listing is skipped
-/// and leaves the root uncovered.
+/// Entries a target's top-level purity check may read before failing closed.
 const MAX_LISTING_ENTRIES: usize = 65_536;
+/// Directory entries one discovery slice may read, across all directories.
+const DISCOVERY_MAX_ENTRIES: usize = 65_536;
+/// Candidate names retained while a discovery page receives its survey turns.
+const DISCOVERY_MAX_CANDIDATES: usize = 256;
 /// Wall time of one discovery.
 const DISCOVERY_BUDGET: Duration = Duration::from_secs(30);
 /// Entries one candidate's survey may visit before it fails closed.
@@ -576,107 +582,224 @@ struct Markers {
     cargo: bool,
 }
 
-/// Why a directory's listing gave discovery nothing to go on.
-enum Unlisted {
-    /// Unreadable: skipped, as the walker skips it.
-    Unreadable,
-    /// Over [`MAX_LISTING_ENTRIES`] or past the deadline: skipped, and the
-    /// root counts as not covered.
-    Budget,
+/// Inspect the fixed marker names without reading an entire wide directory.
+/// Any entry at a protection/Git name, including a dangling symlink, keeps
+/// the subtree; an error other than absence cannot establish safe traversal.
+fn markers_in(dir: &Path) -> std::io::Result<Markers> {
+    let present = |name| match fs::symlink_metadata(dir.join(name)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    };
+    Ok(Markers {
+        protect: present(MARKER_FILENAME)?,
+        git: present(".git")?,
+        cargo: present("CACHEDIR.TAG")? || present(".rustc_info.json")?,
+    })
 }
 
-fn markers_in(dir: &Path, deadline: Instant) -> Result<(Markers, Vec<PathBuf>), Unlisted> {
-    let mut markers = Markers::default();
-    let mut children = Vec::new();
-    let listing = fs::read_dir(dir).map_err(|_| Unlisted::Unreadable)?;
-    for (index, entry) in listing.enumerate() {
-        if index >= MAX_LISTING_ENTRIES || Instant::now() >= deadline {
-            return Err(Unlisted::Budget);
-        }
-        let entry = entry.map_err(|_| Unlisted::Unreadable)?;
-        let name = entry.file_name();
-        if name == MARKER_FILENAME {
-            markers.protect = true;
-        } else if name == ".git" {
-            markers.git = true;
-        } else if name == "CACHEDIR.TAG" || name == ".rustc_info.json" {
-            markers.cargo = true;
-        }
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            children.push(entry.path());
-        }
+/// Fresh traversal permission for a directory, never a retained verdict.
+fn discovery_directory(
+    dir: &Path,
+    root: &Path,
+    root_identity: FsIdentity,
+    excluded: &[PathBuf],
+) -> Option<(FsIdentity, Markers)> {
+    if is_excluded(dir, excluded) {
+        return None;
     }
-    children.sort();
-    Ok((markers, children))
+    let identity = current_identity(dir)?;
+    if identity.device_id != root_identity.device_id || (dir == root && identity != root_identity) {
+        return None;
+    }
+    let markers = markers_in(dir).ok()?;
+    (!markers.protect && !markers.git).then_some((identity, markers))
 }
 
-/// Directories under `root` with cargo structure at their top, shallowest
-/// first. Never the root itself, and never at or below a candidate, a marker,
-/// a `.git` entry, an excluded path or its descendants, another device or an
-/// unreadable directory.
-/// Returns whether the walk covered the root.
-fn discover(root: &Path, excluded: &[PathBuf], found: &mut Vec<PathBuf>) -> bool {
-    let deadline = Instant::now() + DISCOVERY_BUDGET;
-    let Ok(root_meta) = fs::symlink_metadata(root) else {
+/// A name from a prior slice is usable only under current, same-device,
+/// nonsymlink ancestry, with no marker/Git/cargo ancestor below the root.
+fn discoverable_target(
+    dir: &Path,
+    root: &Path,
+    root_identity: FsIdentity,
+    excluded: &[PathBuf],
+) -> bool {
+    let Ok(relative) = dir.strip_prefix(root) else {
         return false;
     };
-    let excluded = exclusions_under(root, excluded);
-    if is_excluded(root, &excluded) {
-        return true;
+    let depth = relative.components().count();
+    if depth == 0 || depth > MAX_DEPTH {
+        return false;
     }
-    let device = device_of(&root_meta);
-    let mut covered = true;
-    let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
-    let mut read = 0usize;
-    while let Some((dir, depth)) = queue.pop_front() {
-        read += 1;
-        if read > MAX_DIRECTORIES || Instant::now() >= deadline {
+    let mut path = root.to_path_buf();
+    if discovery_directory(&path, root, root_identity, excluded).is_none() {
+        return false;
+    }
+    for (index, component) in relative.components().enumerate() {
+        if !matches!(component, std::path::Component::Normal(_)) {
             return false;
         }
-        let (markers, children) = match markers_in(&dir, deadline) {
-            Ok(listing) => listing,
-            Err(Unlisted::Unreadable) => continue,
-            Err(Unlisted::Budget) => {
-                covered = false;
+        path.push(component);
+        let Some((_, markers)) = discovery_directory(&path, root, root_identity, excluded) else {
+            return false;
+        };
+        if markers.cargo != (index + 1 == depth) {
+            return false;
+        }
+    }
+    true
+}
+
+#[derive(Debug)]
+struct DiscoveryFrame {
+    path: PathBuf,
+    identity: FsIdentity,
+    listing: fs::ReadDir,
+}
+
+/// Bounded-depth DFS avoids a breadth frontier proportional to the tree.
+/// Readers retain their exact position even in listings larger than a slice.
+/// At most MAX_DEPTH readers and one unread name survive; none is evidence
+/// that a target is still pure, idle, protected or held by a process.
+#[derive(Debug, Default)]
+struct DiscoveryProgress {
+    stack: Vec<DiscoveryFrame>,
+    next: Option<PathBuf>,
+    started: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiscoveryLimits {
+    directories: usize,
+    entries: usize,
+    candidates: usize,
+    duration: Duration,
+}
+
+impl Default for DiscoveryLimits {
+    fn default() -> Self {
+        Self {
+            directories: MAX_DIRECTORIES,
+            entries: DISCOVERY_MAX_ENTRIES,
+            candidates: DISCOVERY_MAX_CANDIDATES,
+            duration: DISCOVERY_BUDGET,
+        }
+    }
+}
+
+impl DiscoveryProgress {
+    /// A replaced, newly protected or newly opaque ancestor invalidates
+    /// every retained reader below it. Do not replay its old names through
+    /// the replacement path, even if the replacement is also a directory.
+    fn renew(&mut self, root: &Path, identity: FsIdentity, excluded: &[PathBuf]) {
+        let invalid = self.stack.iter().position(|frame| {
+            discovery_directory(&frame.path, root, identity, excluded).is_none_or(
+                |(current, markers)| {
+                    current != frame.identity || (frame.path != root && markers.cargo)
+                },
+            )
+        });
+        if let Some(index) = invalid {
+            self.stack.truncate(index);
+            self.next = None;
+        }
+    }
+
+    /// Return whether this discovery cycle reached its end. Budget stops
+    /// retain the next position, not an ever-growing queue or cached facts.
+    fn discover(
+        &mut self,
+        root: &Path,
+        identity: FsIdentity,
+        excluded: &[PathBuf],
+        found: &mut Vec<PathBuf>,
+        limits: DiscoveryLimits,
+    ) -> bool {
+        let deadline = Instant::now() + limits.duration;
+        if !self.started {
+            self.started = true;
+            self.next = Some(root.to_path_buf());
+        }
+        self.renew(root, identity, excluded);
+        let (mut directories, mut entries) = (0usize, 0usize);
+        loop {
+            if Instant::now() >= deadline
+                || directories >= limits.directories
+                || entries >= limits.entries
+                || found.len() >= limits.candidates
+            {
+                return false;
+            }
+            if let Some(dir) = self.next.take() {
+                let depth = self.stack.len();
+                let Some((current, markers)) = discovery_directory(&dir, root, identity, excluded)
+                else {
+                    continue;
+                };
+                directories += 1;
+                if depth > 0 && markers.cargo {
+                    found.push(dir);
+                } else if depth < MAX_DEPTH
+                    && let Ok(listing) = fs::read_dir(&dir)
+                {
+                    self.stack.push(DiscoveryFrame {
+                        path: dir,
+                        identity: current,
+                        listing,
+                    });
+                }
                 continue;
             }
-        };
-        if markers.protect || markers.git {
-            continue;
-        }
-        if depth > 0 && markers.cargo {
-            found.push(dir);
-            continue;
-        }
-        if depth == MAX_DEPTH {
-            continue;
-        }
-        for child in children {
-            if !is_excluded(&child, &excluded)
-                && fs::symlink_metadata(&child).is_ok_and(|meta| device_of(&meta) == device)
-            {
-                queue.push_back((child, depth + 1));
+            let Some(frame) = self.stack.last_mut() else {
+                self.started = false;
+                return true;
+            };
+            match frame.listing.next() {
+                Some(Ok(entry)) => {
+                    entries += 1;
+                    // Keep the consumed name if the native read used the
+                    // remaining wall time. Admission runs on the next turn
+                    // and rechecks metadata; d_type only avoids probing files.
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        self.next = Some(entry.path());
+                    }
+                }
+                Some(Err(_)) | None => {
+                    self.stack.pop();
+                }
             }
         }
     }
-    covered
 }
 
-/// Scheduling hints only. Every pass discovers candidates anew and repeats
-/// their complete safety checks; no survey or nomination survives a pass.
+/// Scheduling hints only. Every target repeats its complete safety checks;
+/// no survey or nomination survives a pass.
 #[derive(Debug, Default)]
 struct SurveyProgress {
     root_identity: Option<FsIdentity>,
     after: Option<PathBuf>,
+    discovery: DiscoveryProgress,
+    /// Unexamined names from a partial discovery page. A target too large
+    /// for one full survey turn yields, allowing discovery to advance.
+    pending: Vec<PathBuf>,
+    /// A full survey turn failed in this cycle. Finishing a later discovery
+    /// page must not advertise complete coverage of that earlier target.
+    unsurveyed: bool,
 }
 
 impl SurveyProgress {
-    fn order(&mut self, root: &Path, found: &mut [PathBuf]) {
+    fn prepare(&mut self, root: &Path) {
         let identity = current_identity(root);
         if self.root_identity != identity {
-            self.root_identity = identity;
-            self.after = None;
+            *self = Self {
+                root_identity: identity,
+                ..Self::default()
+            };
         }
+    }
+
+    fn order(&mut self, root: &Path, found: &mut [PathBuf]) {
+        self.prepare(root);
         found.sort();
         if let Some(after) = &self.after {
             // The last target may have disappeared or become protected.
@@ -700,6 +823,12 @@ impl Default for SurveyLimits {
             duration: SURVEY_BUDGET,
         }
     }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SelectionLimits {
+    discovery: DiscoveryLimits,
+    survey: SurveyLimits,
 }
 
 struct SurveyBudget {
@@ -827,30 +956,105 @@ fn select_with_progress(
     progress: &mut SurveyProgress,
     limits: SurveyLimits,
 ) -> Selection {
-    let mut selection = Selection::default();
-    let mut found = Vec::new();
-    selection.complete = discover(root, &config.scanner.excluded_paths, &mut found);
+    select_with_limits(
+        root,
+        config,
+        platform,
+        urgency,
+        now,
+        progress,
+        SelectionLimits {
+            survey: limits,
+            ..SelectionLimits::default()
+        },
+    )
+}
+
+fn survey_page(
+    root: &Path,
+    scanner: &ScannerConfig,
+    now: SystemTime,
+    progress: &mut SurveyProgress,
+    limits: SelectionLimits,
+    selection: &mut Selection,
+) -> Vec<Checked> {
+    progress.prepare(root);
+    let Some(identity) = progress.root_identity else {
+        return Vec::new();
+    };
+    let excluded = exclusions_under(root, &scanner.excluded_paths);
+    let mut found = std::mem::take(&mut progress.pending);
+    let incremental = if found.is_empty() {
+        let resuming = progress.discovery.started;
+        if !resuming {
+            progress.unsurveyed = false;
+        }
+        selection.complete =
+            progress
+                .discovery
+                .discover(root, identity, &excluded, &mut found, limits.discovery);
+        resuming || !selection.complete
+    } else {
+        selection.complete = !progress.discovery.started;
+        true
+    };
+    // Retained readers and names are never current protection or structure
+    // evidence. This also catches changes made during discovery itself.
+    found.retain(|dir| discoverable_target(dir, root, identity, &excluded));
     selection.discovered = found.len();
     progress.order(root, &mut found);
 
-    let idle = idle_window(&config.scanner);
+    let idle = idle_window(scanner);
     let idle_cutoff = now.checked_sub(idle).unwrap_or(SystemTime::UNIX_EPOCH);
-    let mut budget = SurveyBudget::new(limits);
+    let mut budget = SurveyBudget::new(limits.survey);
     let mut checked = Vec::new();
-    for (index, dir) in found.into_iter().enumerate() {
+    for (index, dir) in found.iter().enumerate() {
         if budget.exhausted() {
             selection.complete = false;
             *selection.left.entry("unsurveyed").or_default() += selection.discovered - index;
+            if incremental {
+                progress.pending.extend_from_slice(&found[index..]);
+            }
             break;
         }
-        match check_with_progress(&dir, idle_cutoff, now, &mut budget, progress, index == 0) {
+        if !discoverable_target(dir, root, identity, &excluded) {
+            selection.leave("changed");
+            progress.after = Some(dir.clone());
+            continue;
+        }
+        match check_with_progress(dir, idle_cutoff, now, &mut budget, progress, index == 0) {
             Ok(candidate) => checked.push(candidate),
             Err(reason) => {
                 selection.complete &= reason != "unsurveyed";
                 selection.leave(reason);
+                let needs_full_turn = reason == "unsurveyed" && budget.exhausted() && index > 0;
+                progress.unsurveyed |= reason == "unsurveyed" && !needs_full_turn;
+                if incremental && needs_full_turn {
+                    // This target used only what earlier surveys left. Give
+                    // it one whole turn before advancing the discovery page.
+                    progress.pending.extend_from_slice(&found[index..]);
+                    *selection.left.entry("unsurveyed").or_default() +=
+                        selection.discovered - index - 1;
+                    break;
+                }
             }
         }
     }
+    selection.complete &= !progress.unsurveyed;
+    checked
+}
+
+fn select_with_limits(
+    root: &Path,
+    config: &Config,
+    platform: &dyn Platform,
+    urgency: f64,
+    now: SystemTime,
+    progress: &mut SurveyProgress,
+    limits: SelectionLimits,
+) -> Selection {
+    let mut selection = Selection::default();
+    let checked = survey_page(root, &config.scanner, now, progress, limits, &mut selection);
     if checked.is_empty() {
         return selection;
     }
@@ -1679,6 +1883,426 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn discovery_resumes_wide_listings_and_deep_frontiers_for_each_root() {
+        let (_temp, root) = scratch_root();
+        let roots = [root.join("first"), root.join("second")];
+        let mut expected = std::collections::BTreeSet::new();
+        for root in &roots {
+            for index in 0..9 {
+                let target = root.join(format!("session-{index}/scratch/target"));
+                cargo_target(&target);
+                expected.insert(resolve_absolute_path(&target));
+                fs::write(root.join(format!("note-{index}")), b"session notes").unwrap();
+            }
+        }
+        age(&root, 48);
+        let mut progress = HashMap::<PathBuf, SurveyProgress>::new();
+        let mut finished = std::collections::BTreeSet::new();
+        let mut nominated = std::collections::BTreeSet::new();
+        let limits = SelectionLimits {
+            discovery: DiscoveryLimits {
+                directories: 2,
+                entries: 3,
+                candidates: 2,
+                ..DiscoveryLimits::default()
+            },
+            ..SelectionLimits::default()
+        };
+        for round in 0..100 {
+            for root in roots.iter().cycle().skip(round % 2).take(2) {
+                if finished.contains(root) {
+                    continue;
+                }
+                let state = progress.entry(root.clone()).or_default();
+                let selection = select_with_limits(
+                    root,
+                    &Config::default(),
+                    &MockPlatform::healthy(),
+                    0.5,
+                    later(),
+                    state,
+                    limits,
+                );
+                assert!(state.discovery.stack.len() <= MAX_DEPTH);
+                assert!(state.pending.len() <= limits.discovery.candidates);
+                for candidate in selection.candidates {
+                    assert!(
+                        nominated.insert(candidate.path),
+                        "a slice repeated its prefix"
+                    );
+                }
+                if selection.complete {
+                    finished.insert(root.clone());
+                }
+            }
+            if finished.len() == roots.len() {
+                assert!(round > 1, "the fixture must require multiple slices");
+                break;
+            }
+        }
+        assert_eq!(finished.len(), roots.len(), "both traversals must finish");
+        assert_eq!(nominated, expected);
+    }
+
+    #[test]
+    fn incomplete_discovery_pages_give_partial_surveys_a_full_turn_then_advance() {
+        let (_temp, root) = scratch_root();
+        let mut expected = std::collections::BTreeSet::new();
+        for index in 0..7 {
+            let target = root.join(format!("target-{index}"));
+            cargo_target(&target);
+            let extras = if index % 3 == 0 { 20 } else { 1 };
+            for extra in 0..extras {
+                fs::write(target.join(format!("debug/deps/extra-{extra}")), b"x").unwrap();
+            }
+            if extras == 1 {
+                expected.insert(resolve_absolute_path(&target));
+            }
+        }
+        age(&root, 48);
+        let mut progress = SurveyProgress::default();
+        let mut nominated = std::collections::BTreeSet::new();
+        let mut complete = false;
+        for _ in 0..30 {
+            let selection = select_with_limits(
+                &root,
+                &Config::default(),
+                &MockPlatform::healthy(),
+                0.5,
+                later(),
+                &mut progress,
+                SelectionLimits {
+                    discovery: DiscoveryLimits {
+                        candidates: 2,
+                        ..DiscoveryLimits::default()
+                    },
+                    survey: SurveyLimits {
+                        entries: 10,
+                        duration: SURVEY_BUDGET,
+                    },
+                },
+            );
+            assert!(progress.pending.len() <= 2);
+            for candidate in selection.candidates {
+                assert!(nominated.insert(candidate.path));
+            }
+            if !progress.discovery.started && progress.pending.is_empty() {
+                complete = true;
+                break;
+            }
+        }
+        assert!(
+            complete,
+            "oversized targets must not pin the discovery page"
+        );
+        assert_eq!(
+            nominated, expected,
+            "partially allotted targets need a full turn"
+        );
+    }
+
+    fn retained_session_reader(root: &Path) -> DiscoveryProgress {
+        let session = root.join("session");
+        for index in 0..4 {
+            cargo_target(&session.join(format!("target-{index}")));
+        }
+        let mut progress = DiscoveryProgress::default();
+        let mut found = Vec::new();
+        assert!(!progress.discover(
+            root,
+            current_identity(root).unwrap(),
+            &[],
+            &mut found,
+            DiscoveryLimits {
+                entries: 2,
+                ..DiscoveryLimits::default()
+            },
+        ));
+        assert_eq!(progress.stack.len(), 2);
+        assert_eq!(progress.stack[1].path, session);
+        assert!(progress.next.is_some());
+        assert!(found.is_empty());
+        progress
+    }
+
+    #[test]
+    fn resumed_readers_reject_new_protection_git_and_cargo_ancestors() {
+        for marker in [MARKER_FILENAME, ".git", ".rustc_info.json"] {
+            let (_temp, root) = scratch_root();
+            let mut progress = retained_session_reader(&root);
+            let session = root.join("session");
+            fs::write(session.join(marker), b"hold this subtree").unwrap();
+            let identity = current_identity(&root).unwrap();
+            progress.renew(&root, identity, &[]);
+            assert_eq!(progress.stack.len(), 1, "{marker}");
+            assert!(progress.next.is_none(), "{marker}");
+            assert!(!discoverable_target(
+                &session.join("target-0"),
+                &root,
+                identity,
+                &[],
+            ));
+            let mut found = Vec::new();
+            assert!(progress.discover(
+                &root,
+                identity,
+                &[],
+                &mut found,
+                DiscoveryLimits::default(),
+            ));
+            assert!(found.is_empty(), "old reader crossed the new {marker}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_readers_and_candidate_names_cannot_cross_replaced_or_symlink_ancestors() {
+        for symlink in [false, true] {
+            let (_temp, root) = scratch_root();
+            let mut progress = retained_session_reader(&root);
+            let session = root.join("session");
+            let previous = root.with_file_name("previous-session");
+            let old_identity = progress.stack[1].identity;
+            fs::rename(&session, &previous).unwrap();
+            if symlink {
+                std::os::unix::fs::symlink(&previous, &session).unwrap();
+            } else {
+                cargo_target(&session.join("target-0"));
+            }
+            let root_identity = current_identity(&root).unwrap();
+            progress.renew(&root, root_identity, &[]);
+            assert_eq!(progress.stack.len(), 1);
+            assert!(progress.next.is_none());
+            assert!(
+                progress
+                    .stack
+                    .iter()
+                    .all(|frame| frame.identity != old_identity)
+            );
+            if symlink {
+                // The actual target inode is unchanged through the alias;
+                // checking the target alone would miss this substitution.
+                assert_eq!(
+                    current_identity(&session.join("target-0")),
+                    current_identity(&previous.join("target-0")),
+                );
+                assert!(!discoverable_target(
+                    &session.join("target-0"),
+                    &root,
+                    root_identity,
+                    &[],
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn expired_discovery_turns_preserve_positions_and_root_replacement_discards_them() {
+        let (_temp, root) = scratch_root();
+        let mut progress = SurveyProgress::default();
+        progress.prepare(&root);
+        progress.discovery = retained_session_reader(&root);
+        progress.pending.push(root.join("session/target-0"));
+        let next = progress.discovery.next.clone();
+        let mut found = Vec::new();
+        assert!(!progress.discovery.discover(
+            &root,
+            current_identity(&root).unwrap(),
+            &[],
+            &mut found,
+            DiscoveryLimits {
+                duration: Duration::ZERO,
+                ..DiscoveryLimits::default()
+            },
+        ));
+        assert!(found.is_empty());
+        assert_eq!(progress.discovery.next, next);
+        assert_eq!(progress.discovery.stack.len(), 2);
+
+        let old_identity = progress.root_identity;
+        fs::rename(&root, root.with_file_name("previous-root")).unwrap();
+        cargo_target(&root.join("new-target"));
+        age(&root, 48);
+        let selection = select_with_progress(
+            &root,
+            &Config::default(),
+            &MockPlatform::healthy(),
+            0.5,
+            later(),
+            &mut progress,
+            SurveyLimits::default(),
+        );
+        assert_ne!(progress.root_identity, old_identity);
+        assert_eq!(names(&selection), ["new-target"]);
+        assert!(progress.pending.is_empty());
+        assert!(progress.discovery.stack.is_empty());
+    }
+
+    #[test]
+    fn discovery_continuation_preserves_depth_device_and_exclusion_rails() {
+        let (_temp, root) = scratch_root();
+        let allowed = root.join("one/two/three/four/five/target");
+        cargo_target(&allowed);
+        cargo_target(&root.join("deep/one/two/three/four/five/target-too-deep"));
+        cargo_target(&root.join("excluded/target-hidden"));
+        age(&root, 48);
+        let mut config = Config::default();
+        config.scanner.excluded_paths.push(root.join("excluded"));
+        let mut progress = SurveyProgress::default();
+        let mut nominated = Vec::new();
+        for _ in 0..50 {
+            let selection = select_with_limits(
+                &root,
+                &config,
+                &MockPlatform::healthy(),
+                0.5,
+                later(),
+                &mut progress,
+                SelectionLimits {
+                    discovery: DiscoveryLimits {
+                        directories: 2,
+                        entries: 2,
+                        ..DiscoveryLimits::default()
+                    },
+                    ..SelectionLimits::default()
+                },
+            );
+            assert!(progress.discovery.stack.len() <= MAX_DEPTH);
+            nominated.extend(
+                selection
+                    .candidates
+                    .into_iter()
+                    .map(|candidate| candidate.path),
+            );
+            if selection.complete {
+                break;
+            }
+        }
+        assert_eq!(nominated, [resolve_absolute_path(&allowed)]);
+        let mut other_device = current_identity(&root).unwrap();
+        other_device.device_id = other_device.device_id.wrapping_add(1);
+        assert!(discovery_directory(&allowed, &root, other_device, &[]).is_none());
+    }
+
+    #[test]
+    fn a_page_ending_at_the_last_name_finishes_and_later_cycles_see_new_entries() {
+        let (_temp, root) = scratch_root();
+        let first = root.join("target-first");
+        cargo_target(&first);
+        let identity = current_identity(&root).unwrap();
+        let mut progress = DiscoveryProgress::default();
+        let mut found = Vec::new();
+        assert!(!progress.discover(
+            &root,
+            identity,
+            &[],
+            &mut found,
+            DiscoveryLimits {
+                candidates: 1,
+                ..DiscoveryLimits::default()
+            },
+        ));
+        assert_eq!(found, [first.clone()]);
+        found.clear();
+        assert!(progress.discover(&root, identity, &[], &mut found, DiscoveryLimits::default(),));
+        assert!(found.is_empty(), "EOF must not replay the final candidate");
+        assert!(progress.stack.is_empty());
+        assert!(!progress.started);
+
+        // Open another partial cycle, then change a directory whose reader
+        // is retained. Native readdir may or may not expose the new entry
+        // in this cycle; the next cycle must rediscover the live contents.
+        assert!(!progress.discover(
+            &root,
+            identity,
+            &[],
+            &mut found,
+            DiscoveryLimits {
+                candidates: 1,
+                ..DiscoveryLimits::default()
+            },
+        ));
+        let late = root.join("target-late");
+        cargo_target(&late);
+        found.clear();
+        assert!(progress.discover(&root, identity, &[], &mut found, DiscoveryLimits::default(),));
+        found.clear();
+        assert!(progress.discover(&root, identity, &[], &mut found, DiscoveryLimits::default(),));
+        found.sort();
+        assert_eq!(found, [first, late]);
+        assert!(progress.stack.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_discovery_names_require_live_ancestry_purity_and_idleness() {
+        for change in ["marker", "git", "cargo", "symlink", "impure", "recent"] {
+            let (_temp, root) = scratch_root();
+            for session in ["one", "two"] {
+                cargo_target(&root.join(session).join("target"));
+            }
+            age(&root, 48);
+            let mut progress = SurveyProgress::default();
+            let first = select_with_limits(
+                &root,
+                &Config::default(),
+                &MockPlatform::healthy(),
+                0.5,
+                later(),
+                &mut progress,
+                SelectionLimits {
+                    discovery: DiscoveryLimits {
+                        candidates: 2,
+                        ..DiscoveryLimits::default()
+                    },
+                    survey: SurveyLimits {
+                        duration: Duration::ZERO,
+                        ..SurveyLimits::default()
+                    },
+                },
+            );
+            assert!(first.candidates.is_empty());
+            assert_eq!(progress.pending.len(), 2);
+            let changed = progress.pending[0].clone();
+            let unaffected = progress.pending[1].clone();
+            let parent = changed.parent().unwrap();
+            match change {
+                "marker" => fs::write(parent.join(MARKER_FILENAME), b"keep").unwrap(),
+                "git" => fs::write(parent.join(".git"), b"gitdir: somewhere").unwrap(),
+                "cargo" => fs::write(parent.join(".rustc_info.json"), b"{}").unwrap(),
+                "symlink" => {
+                    let held = root.with_file_name("held-session");
+                    fs::rename(parent, &held).unwrap();
+                    std::os::unix::fs::symlink(&held, parent).unwrap();
+                }
+                "impure" => fs::create_dir(changed.join("trace")).unwrap(),
+                "recent" => touch_ahead(&changed.join("debug/deps/libdemo.rlib"), 2),
+                _ => unreachable!(),
+            }
+            let selection = select_with_progress(
+                &root,
+                &Config::default(),
+                &MockPlatform::healthy(),
+                0.5,
+                later(),
+                &mut progress,
+                SurveyLimits::default(),
+            );
+            let paths: Vec<_> = selection
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.path)
+                .collect();
+            assert_eq!(
+                paths,
+                [resolve_absolute_path(&unaffected)],
+                "{change} did not revoke the retained name"
+            );
+            assert!(progress.pending.is_empty());
+        }
+    }
+
+    #[test]
     fn an_oversized_first_target_cannot_starve_later_targets_or_other_roots() {
         let (_temp, root) = scratch_root();
         let roots = [root.join("first-root"), root.join("second-root")];
@@ -2034,6 +2658,7 @@ pub(super) mod tests {
                 SurveyProgress {
                     root_identity: None,
                     after: Some(root.join("target-before-reload")),
+                    ..SurveyProgress::default()
                 },
             );
 
@@ -2060,6 +2685,7 @@ pub(super) mod tests {
                 SurveyProgress {
                     root_identity: None,
                     after: Some(root.join("late-old-worker")),
+                    ..SurveyProgress::default()
                 },
             );
             assert!(tier.survey_progress.lock().is_empty(), "{label}");

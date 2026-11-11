@@ -1404,6 +1404,17 @@ the same root requires a fresh selection. The executor renews that permission
 after the purity probe and before mutation, so a long batch cannot keep using
 a protection exception that the operator has withdrawn.
 
+Target-only discovery advances across bounded passes, including through a
+directory listing that is too large to read in one pass. Each root keeps its
+own traversal position and a bounded page of candidate names; unfinished
+surveys receive a full turn before discovery advances. A target too large for
+one full survey yields to later targets. These positions are volatile
+scheduling hints: resumed work renews directory identities, ancestry,
+protection and Cargo structure, and every nomination needs fresh purity,
+idleness and active-reference checks. Replacing a root or changing its
+configured scope discards the old positions. After reaching the end, discovery
+starts a new cycle to find entries added behind an earlier reader.
+
 An in-flight rch staging pass is also revocable. Reloading its scanner,
 pressure, or policy settings cancels the old pass, as does leaving Enforce
 mode or recovering enough space to require an older idle cutoff. The worker
