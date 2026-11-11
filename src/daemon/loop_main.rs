@@ -2377,6 +2377,10 @@ impl Default for DaemonArgs {
 
 struct MountMonitor {
     rate_estimator: DiskRateEstimator,
+    /// Native observation provenance survives cache hits. A monitor tick is
+    /// not independent evidence that the filesystem has been sampled again.
+    last_observation: Option<MountObservation>,
+    forecast_needs_refresh: bool,
     pressure_controller: PidPressureController,
     /// Swap has its own capacity and percentage thresholds. Disk byte floors,
     /// forecasts and filesystem fill-rate observations never apply to it.
@@ -2387,6 +2391,19 @@ struct MountMonitor {
     last_guard_sample: Option<GuardSample>,
     /// Conformal calibration of the time-to-red forecast.
     conformal: ConformalCalibrator,
+}
+
+#[derive(Clone)]
+struct MountObservation {
+    sample: FsStatsSample,
+    rate: RateEstimate,
+    threshold_bytes: u64,
+}
+
+struct MountSampleUpdate {
+    observation: MountObservation,
+    fresh: bool,
+    filesystem_changed: bool,
 }
 
 /// One mount's reading from `check_pressure`, kept so `handle_pressure` can
@@ -2778,6 +2795,8 @@ impl MountMonitor {
 
         Self {
             rate_estimator,
+            last_observation: None,
+            forecast_needs_refresh: false,
             pressure_controller,
             swap_pressure_controller: Self::swap_controller(config),
             inode_pressure_level: PressureLevel::Green,
@@ -2806,7 +2825,9 @@ impl MountMonitor {
     fn update_config(&mut self, config: &Config) {
         if self.conformal.config() != &conformal_config(config) {
             self.conformal = ConformalCalibrator::new(conformal_config(config));
+            self.last_guard_sample = None;
         }
+        self.forecast_needs_refresh = true;
         self.rate_estimator.update_params(
             config.telemetry.ewma_base_alpha,
             config.telemetry.ewma_min_alpha,
@@ -2832,6 +2853,97 @@ impl MountMonitor {
         } else {
             self.pressure_controller.disable_urgency_boost();
         }
+    }
+
+    /// Reuse the last accepted observation on duplicate or delayed cache
+    /// delivery. In particular an older sample from a former device cannot
+    /// reset newer history or mix its free bytes with the newer device's rate.
+    /// Instantaneous pressure still runs on every tick using the accepted
+    /// reading; only genuinely newer native measurements train forecasts.
+    fn observe_filesystem(&mut self, sample: FsStatsSample, config: &Config) -> MountSampleUpdate {
+        let fresh = self
+            .last_observation
+            .as_ref()
+            .is_none_or(|last| sample.collected_at > last.sample.collected_at);
+        let filesystem_changed = fresh
+            && self
+                .last_observation
+                .as_ref()
+                .is_some_and(|last| !sample.same_filesystem_as(&last.sample));
+        if filesystem_changed {
+            *self = Self::new(config);
+        }
+
+        // Apply the current boundary even when collection returns the same
+        // cached sample immediately after reload. This changes a projection,
+        // not the amount of calibration evidence supporting that projection.
+        if let Some(previous) = self.last_observation.as_mut() {
+            let threshold = Self::red_threshold(config, previous.sample.stats.total_bytes);
+            if self.forecast_needs_refresh || previous.threshold_bytes != threshold {
+                if previous.threshold_bytes != threshold {
+                    self.last_guard_sample = None;
+                    self.conformal.discard_pending();
+                }
+                previous.rate = self.rate_estimator.reforecast(&previous.rate, threshold);
+                previous.threshold_bytes = threshold;
+                self.guard.set_material_rate(
+                    crate::monitor::guardrails::material_rate_for_headroom(
+                        previous
+                            .sample
+                            .stats
+                            .available_bytes
+                            .saturating_sub(threshold),
+                    ),
+                );
+                let interval = self
+                    .conformal
+                    .lower_bound(previous.rate.seconds_to_threshold);
+                self.guard
+                    .set_forecast(Some(ForecastSnapshot::from_interval(
+                        &interval,
+                        self.conformal.config().coverage_target,
+                    )));
+            }
+        }
+        self.forecast_needs_refresh = false;
+
+        if fresh {
+            let threshold_bytes = Self::red_threshold(config, sample.stats.total_bytes);
+            let rate = self.rate_estimator.update(
+                sample.stats.available_bytes,
+                sample.collected_at,
+                threshold_bytes,
+            );
+            self.observe_guard(
+                sample.collected_at,
+                sample.stats.available_bytes,
+                threshold_bytes,
+                &rate,
+            );
+            self.last_observation = Some(MountObservation {
+                sample,
+                rate,
+                threshold_bytes,
+            });
+        }
+
+        MountSampleUpdate {
+            // The first observation is always fresh and seeds the history.
+            observation: self
+                .last_observation
+                .as_ref()
+                .expect("observed filesystem")
+                .clone(),
+            fresh,
+            filesystem_changed,
+        }
+    }
+
+    fn red_threshold(config: &Config, total_bytes: u64) -> u64 {
+        let [_, _, _, red_min_free_pct] = config.pressure.free_pct_thresholds_for(total_bytes);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let threshold = (total_bytes as f64 * red_min_free_pct / 100.0) as u64;
+        threshold
     }
 
     fn observe_guard(
@@ -6471,9 +6583,7 @@ impl MonitoringDaemon {
         self.compress_tier.stop_running_pass();
     }
 
-    #[allow(clippy::too_many_lines)]
     fn check_pressure(&mut self) -> Result<crate::monitor::pid::PressureResponse> {
-        self.special_rates.begin_tick();
         // Collect stats for all root paths PLUS "/". Always monitoring "/"
         // is defensive: if a user configures scanner.root_paths to specific
         // subdirs, the root mount may still fill from non-monitored sources
@@ -6490,29 +6600,54 @@ impl MonitoringDaemon {
 
         for path in &paths {
             if let Ok(sample) = self.fs_collector.collect_sample(path) {
-                // If multiple paths share a mount, we just need one valid reading.
+                // Collection can span cache expiry. Keep the newest native
+                // reading if several configured roots share this mount.
                 stats_by_mount
                     .entry(sample.stats.mount_point.clone())
+                    .and_modify(|previous| {
+                        if sample.collected_at > previous.collected_at {
+                            *previous = sample.clone();
+                        }
+                    })
                     .or_insert(sample);
             }
         }
 
+        self.evaluate_pressure_samples(stats_by_mount, Instant::now())
+    }
+
+    /// Observation timestamps describe the filesystem; `now` describes the
+    /// live control tick. Keeping them separate prevents cache hits from
+    /// manufacturing training data while pressure response stays immediate.
+    #[allow(clippy::too_many_lines)]
+    fn evaluate_pressure_samples(
+        &mut self,
+        stats_by_mount: HashMap<PathBuf, FsStatsSample>,
+        now: Instant,
+    ) -> Result<PressureResponse> {
+        self.special_rates.begin_tick();
         if stats_by_mount.is_empty() {
             // The normal pressure handler renews and revokes tier permission,
             // but the error path skips it. Revoke here as part of sampling so
             // callers cannot accidentally retain an earlier successful tick.
             self.withdraw_pressure_authority();
             return Err(crate::core::errors::SbhError::FsStats {
-                path: paths.first().cloned().unwrap_or_else(|| PathBuf::from("/")),
+                path: self
+                    .config
+                    .scanner
+                    .root_paths
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from("/")),
                 details: "no filesystem stats available for any root path".to_string(),
             });
         }
 
-        let now = Instant::now();
         let mut worst_response: Option<crate::monitor::pid::PressureResponse> = None;
         let mut worst_filesystem_level = PressureLevel::Green;
         let mut worst_filesystem_urgency = 0.0;
         let mut worst_guard_diag: Option<GuardDiagnostics> = None;
+        let mut worst_guard_fresh = false;
         // Reset per-tick predictive action so we track the worst across mounts.
         self.last_predictive_action = PredictiveAction::Clear;
         self.mount_responses.clear();
@@ -6533,9 +6668,39 @@ impl MonitoringDaemon {
 
         // Update monitors for each active mount.
         for (mount_path, sample) in stats_by_mount {
+            let monitor = self
+                .mount_monitors
+                .entry(mount_path.clone())
+                .or_insert_with(|| MountMonitor::new(&self.config));
+            let MountSampleUpdate {
+                observation,
+                fresh,
+                filesystem_changed,
+            } = monitor.observe_filesystem(sample, &self.config);
+            let MountObservation {
+                sample,
+                rate: rate_estimate,
+                ..
+            } = observation;
             let stats = &sample.stats;
-            self.release_controller
-                .update_effectiveness(&mount_path, stats.available_bytes, now);
+            if filesystem_changed {
+                // A reused mount path does not inherit a former filesystem's
+                // exhausted-surface backoff, reserve growth or release result.
+                self.mount_controllers.remove(&mount_path);
+                self.pending_recovery.remove(&mount_path);
+                self.catalog_root_cache.remove(&mount_path);
+                self.catalog_epochs.remove(&mount_path);
+                self.release_controller.reset_effectiveness(&mount_path);
+                *self.burst_stats.mount_mut(&mount_path) =
+                    crate::monitor::burst::MountBurstTracker::default();
+            }
+            if fresh {
+                self.release_controller.update_effectiveness(
+                    &mount_path,
+                    stats.available_bytes,
+                    sample.collected_at,
+                );
+            }
 
             let backing_candidate = swap_pressure.and_then(|mut pressure| {
                 if stats.is_readonly
@@ -6558,31 +6723,7 @@ impl MonitoringDaemon {
                 Some((pressure, crate::scanner::walker::device_id(&metadata)))
             });
 
-            let monitor = self
-                .mount_monitors
-                .entry(mount_path.clone())
-                .or_insert_with(|| MountMonitor::new(&self.config));
-
-            // Forecast the same boundary the mount's PID uses. On a large
-            // volume an absolute byte floor can be far below the raw percent;
-            // predicting the latter hides all remaining runway once crossed.
-            let [_, _, _, red_min_free_pct] = self
-                .config
-                .pressure
-                .free_pct_thresholds_for(stats.total_bytes);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let red_threshold_bytes = (stats.total_bytes as f64 * red_min_free_pct / 100.0) as u64;
-
-            let rate_estimate =
-                monitor
-                    .rate_estimator
-                    .update(stats.available_bytes, now, red_threshold_bytes);
-            let guard_diag = monitor.observe_guard(
-                now,
-                stats.available_bytes,
-                red_threshold_bytes,
-                &rate_estimate,
-            );
+            let guard_diag = monitor.guard.diagnostics();
 
             // Predicted time to red threshold: the point estimate, and the
             // conformal lower bound the controllers act on. Zero means the
@@ -6642,6 +6783,7 @@ impl MonitoringDaemon {
                 worst_filesystem_level = response.level;
                 worst_filesystem_urgency = response.urgency;
                 worst_guard_diag = Some(guard_diag);
+                worst_guard_fresh = fresh;
             }
             let filesystem_response = response.clone();
 
@@ -6777,13 +6919,15 @@ impl MonitoringDaemon {
                 .insert(mount_path.clone(), rate_estimate.bytes_per_second);
             self.special_rates
                 .record_mount(&sample, rate_estimate.bytes_per_second);
-            // One used-bytes reading per tick feeds the reserve-sizing
-            // windows (peak growth per reaction window).
-            self.burst_stats.observe(
-                &mount_path,
-                now,
-                stats.total_bytes.saturating_sub(stats.available_bytes),
-            );
+            // Native sample times, not cache-hit ticks, delimit the measured
+            // peak-growth windows used for reserve sizing.
+            if fresh {
+                self.burst_stats.observe(
+                    &mount_path,
+                    sample.collected_at,
+                    stats.total_bytes.saturating_sub(stats.available_bytes),
+                );
+            }
             self.note_logging_mount_level(&mount_path, filesystem_response.level);
             self.mount_responses.push(MountTickResponse {
                 response: response.clone(),
@@ -6864,7 +7008,7 @@ impl MonitoringDaemon {
         // The cleanup_ran flag distinguishes successful interventions (prediction
         // triggered cleanup that prevented the problem) from false alarms (prediction
         // said danger but nothing was happening).
-        if worst_response.is_some() {
+        if worst_guard_fresh {
             let was_actionable = self.last_predictive_action.severity() >= 2;
             let was_realized = worst_filesystem_level >= PressureLevel::Red;
             self.prediction_scorecard.record(
@@ -6872,14 +7016,17 @@ impl MonitoringDaemon {
                 was_realized,
                 self.last_tick_cleanup_ran,
             );
+            // Interventions between native observations belong to the next
+            // outcome, even if several cached ticks occurred in between.
+            self.last_tick_cleanup_ran = false;
         }
-        // Reset cleanup flag for next tick — it gets set below when we dispatch scans/ballast.
-        self.last_tick_cleanup_ran = false;
 
         if let Some(diag) = worst_guard_diag.as_ref() {
             let mut policy = self.policy_engine.lock();
             policy.set_pressure_level(worst_filesystem_level);
-            policy.observe_window(diag);
+            if worst_guard_fresh {
+                policy.observe_window(diag);
+            }
 
             // Emergency escalation: break fallback_safe deadlock when pressure
             // has been at Yellow+ for too long and recovery can't trigger.
@@ -15201,6 +15348,450 @@ mod tests {
         mount
     }
 
+    fn native_pressure_sample(
+        mount: &Path,
+        device: &str,
+        total_bytes: u64,
+        available_bytes: u64,
+        at: Instant,
+    ) -> FsStatsSample {
+        use crate::platform::pal::{FsStats, MountPoint, PlatformPaths};
+
+        let platform = Arc::new(MockPlatform::new(
+            vec![MountPoint {
+                path: mount.to_path_buf(),
+                device: device.into(),
+                fs_type: "ext4".into(),
+                is_ram_backed: false,
+            }],
+            HashMap::from([(
+                mount.to_path_buf(),
+                FsStats {
+                    total_bytes,
+                    free_bytes: available_bytes,
+                    available_bytes,
+                    fs_type: "ext4".into(),
+                    mount_point: mount.to_path_buf(),
+                    is_readonly: false,
+                },
+            )]),
+            MockPlatform::healthy().memory_info().unwrap(),
+            PlatformPaths::default(),
+        ));
+        let collector = FsStatsCollector::new(platform, Duration::ZERO);
+        let mut sample = collector.collect_sample(mount).unwrap();
+        sample.collected_at = at;
+        sample
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pressure_samples_ignore_cached_ticks_and_use_native_elapsed_time() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let config = Config::default();
+        let mut native_only = MountMonitor::new(&config);
+        let mut cache_heavy = MountMonitor::new(&config);
+        let start = Instant::now();
+        let mut sample =
+            native_pressure_sample(Path::new("/sampled"), "disk-a", 100 * GIB, 80 * GIB, start);
+        let mut expected_rate = DiskRateEstimator::with_history_cap(
+            config.telemetry.ewma_base_alpha,
+            config.telemetry.ewma_min_alpha,
+            config.telemetry.ewma_max_alpha,
+            config.telemetry.ewma_min_samples,
+            config.telemetry.ewma_rate_history_size,
+        );
+
+        // The same real trace is observed once per native read or on ten
+        // control ticks per read. Include a burst and recovery after the
+        // robust-rate window has warmed, then return to steady consumption.
+        for step in 0..=40 {
+            sample.collected_at = start + Duration::from_secs(step * 10);
+            if step > 0 {
+                sample.stats.available_bytes = match step {
+                    32 => sample.stats.available_bytes - 640 * MIB,
+                    34 => sample.stats.available_bytes + 128 * MIB,
+                    _ => sample.stats.available_bytes - 64 * MIB,
+                };
+                sample.stats.free_bytes = sample.stats.available_bytes;
+            }
+            let once = native_only.observe_filesystem(sample.clone(), &config);
+            let repeated = cache_heavy.observe_filesystem(sample.clone(), &config);
+            let expected = expected_rate.update(
+                sample.stats.available_bytes,
+                sample.collected_at,
+                MountMonitor::red_threshold(&config, sample.stats.total_bytes),
+            );
+            assert!(once.fresh && repeated.fresh);
+            assert_eq!(
+                repeated.observation.rate.bytes_per_second,
+                expected.bytes_per_second
+            );
+            assert_eq!(repeated.observation.rate.sample_count, step);
+            for _ in 0..9 {
+                let cached = cache_heavy.observe_filesystem(sample.clone(), &config);
+                assert!(!cached.fresh && !cached.filesystem_changed);
+                let left = &once.observation.rate;
+                let right = &cached.observation.rate;
+                assert_eq!(left.sample_count, right.sample_count);
+                assert_eq!(left.fallback_active, right.fallback_active);
+                assert_eq!(left.trend, right.trend);
+                assert_eq!(
+                    [
+                        left.bytes_per_second,
+                        left.acceleration,
+                        left.seconds_to_threshold,
+                        left.seconds_to_exhaustion,
+                        left.confidence,
+                        left.burst_state.burst_probability,
+                        left.burst_state.median_rate,
+                        left.burst_state.mad_rate,
+                        left.burst_state.robust_upper_bound
+                    ],
+                    [
+                        right.bytes_per_second,
+                        right.acceleration,
+                        right.seconds_to_threshold,
+                        right.seconds_to_exhaustion,
+                        right.confidence,
+                        right.burst_state.burst_probability,
+                        right.burst_state.median_rate,
+                        right.burst_state.mad_rate,
+                        right.burst_state.robust_upper_bound
+                    ],
+                );
+                assert_eq!(
+                    native_only.guard.observation_count(),
+                    cache_heavy.guard.observation_count()
+                );
+                assert_eq!(
+                    native_only.guard.diagnostics().e_process_value,
+                    cache_heavy.guard.diagnostics().e_process_value
+                );
+                assert_eq!(native_only.guard.forecast(), cache_heavy.guard.forecast());
+                assert_eq!(
+                    native_only.conformal.pending(),
+                    cache_heavy.conformal.pending()
+                );
+                assert_eq!(
+                    native_only.conformal.resolved_total(),
+                    cache_heavy.conformal.resolved_total()
+                );
+            }
+        }
+        assert!(
+            cache_heavy
+                .last_observation
+                .as_ref()
+                .unwrap()
+                .rate
+                .burst_state
+                .calibrated
+        );
+        assert_eq!(cache_heavy.rate_estimator.sample_count(), 40);
+        assert_eq!(cache_heavy.guard.observation_count(), 40);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pressure_history_restarts_only_for_newer_filesystem_observations() {
+        const GIB: u64 = 1 << 30;
+        let config = Config::default();
+        let start = Instant::now();
+        let original =
+            native_pressure_sample(Path::new("/rebound"), "disk-a", 100 * GIB, 80 * GIB, start);
+        for change in ["device", "capacity", "read-only"] {
+            let mut monitor = MountMonitor::new(&config);
+            monitor.observe_filesystem(original.clone(), &config);
+            let mut current = original.clone();
+            current.collected_at += Duration::from_secs(10);
+            current.stats.available_bytes = GIB;
+            current.stats.free_bytes = GIB;
+            monitor.observe_filesystem(current.clone(), &config);
+            let pressured = monitor.pressure_controller.update(
+                PressureReading {
+                    free_bytes: GIB,
+                    total_bytes: 100 * GIB,
+                    mount: PathBuf::from("/rebound"),
+                },
+                Some(1.0),
+                current.collected_at,
+            );
+            assert_eq!(pressured.level, PressureLevel::Critical);
+            assert_eq!(monitor.rate_estimator.sample_count(), 1);
+
+            let mut replacement = native_pressure_sample(
+                Path::new("/rebound"),
+                if change == "device" {
+                    "disk-b"
+                } else {
+                    "disk-a"
+                },
+                if change == "capacity" {
+                    200 * GIB
+                } else {
+                    100 * GIB
+                },
+                80 * GIB,
+                start + Duration::from_secs(20),
+            );
+            replacement.stats.is_readonly = change == "read-only";
+            let reset = monitor.observe_filesystem(replacement.clone(), &config);
+            assert!(reset.fresh && reset.filesystem_changed, "{change}");
+            assert_eq!(reset.observation.rate.sample_count, 0, "{change}");
+            assert_eq!(reset.observation.rate.bytes_per_second, 0.0, "{change}");
+            assert_eq!(monitor.guard.observation_count(), 0, "{change}");
+            assert_eq!(monitor.conformal.pending(), 0, "{change}");
+            let response = monitor.pressure_controller.update(
+                PressureReading {
+                    free_bytes: 80 * GIB,
+                    total_bytes: replacement.stats.total_bytes,
+                    mount: PathBuf::from("/rebound"),
+                },
+                None,
+                replacement.collected_at,
+            );
+            assert_eq!(
+                response.level,
+                PressureLevel::Green,
+                "old hysteresis must not follow {change}"
+            );
+
+            for at in [current.collected_at, replacement.collected_at] {
+                current.collected_at = at;
+                let ignored = monitor.observe_filesystem(current.clone(), &config);
+                assert!(!ignored.fresh && !ignored.filesystem_changed, "{change}");
+                assert_eq!(ignored.observation.sample.stats.available_bytes, 80 * GIB);
+                assert!(ignored.observation.sample.same_filesystem_as(&replacement));
+            }
+            replacement.collected_at += Duration::from_secs(10);
+            replacement.stats.available_bytes -= GIB;
+            replacement.stats.free_bytes -= GIB;
+            let next = monitor.observe_filesystem(replacement, &config);
+            assert!(next.fresh && !next.filesystem_changed, "{change}");
+            assert_eq!(next.observation.rate.sample_count, 1, "{change}");
+            assert!(next.observation.rate.bytes_per_second > 0.0, "{change}");
+        }
+    }
+
+    #[test]
+    fn cached_pressure_reloads_reforecast_without_new_evidence() {
+        const GIB: u64 = 1 << 30;
+        let mut config = Config::default();
+        config.telemetry.ewma_base_alpha = 1.0;
+        config.telemetry.ewma_min_alpha = 1.0;
+        config.telemetry.ewma_max_alpha = 1.0;
+        config.telemetry.ewma_min_samples = 3;
+        config.pressure.red_min_free_bytes = 0;
+        let mut monitor = MountMonitor::new(&config);
+        let start = Instant::now();
+        let mut sample =
+            native_pressure_sample(Path::new("/reloaded"), "disk-a", 100 * GIB, 15 * GIB, start);
+        for step in 0..=3 {
+            sample.collected_at = start + Duration::from_secs(step * 10);
+            sample.stats.available_bytes = (15 - step) * GIB;
+            sample.stats.free_bytes = sample.stats.available_bytes;
+            monitor.observe_filesystem(sample.clone(), &config);
+        }
+        assert!(monitor.conformal.pending() > 0);
+        let old_confidence = monitor.last_observation.as_ref().unwrap().rate.confidence;
+        let resolved = monitor.conformal.resolved_total();
+        let guard_evidence = monitor.guard.diagnostics().e_process_value;
+        config.pressure.red_min_free_pct = 3.0;
+        config.pressure.prediction.enabled = false;
+        config.telemetry.ewma_min_samples = 100;
+        monitor.update_config(&config);
+        let refresh = monitor.observe_filesystem(sample.clone(), &config);
+        assert!(!refresh.fresh && !refresh.filesystem_changed);
+        assert_eq!(refresh.observation.rate.sample_count, 3);
+        assert_eq!(monitor.guard.observation_count(), 3);
+        assert_eq!(monitor.guard.diagnostics().e_process_value, guard_evidence);
+        assert_eq!(monitor.conformal.pending(), 0);
+        assert_eq!(monitor.conformal.resolved_total(), resolved);
+        assert!((refresh.observation.rate.seconds_to_threshold - 90.0).abs() < 1e-6);
+        assert!(refresh.observation.rate.confidence < old_confidence);
+        assert!(refresh.observation.rate.fallback_active);
+        let response = monitor.pressure_controller.update(
+            PressureReading {
+                free_bytes: sample.stats.available_bytes,
+                total_bytes: sample.stats.total_bytes,
+                mount: sample.stats.mount_point,
+            },
+            Some(refresh.observation.rate.seconds_to_threshold),
+            sample.collected_at,
+        );
+        assert_eq!(response.level, PressureLevel::Orange);
+        assert_eq!(monitor.pressure_controller.last_feedforward(), 0.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cached_pressure_keeps_live_control_without_recycling_statistical_evidence() {
+        const GIB: u64 = 1 << 30;
+        let mut fixture = RegretDaemonFixture::new();
+        let mount = install_disk_pressure_probe(&mut fixture, 100 * GIB, 15 * GIB, false);
+        let healthy_mount = fixture.directory.path().join("healthy-peer");
+        let daemon = &mut fixture.daemon;
+        daemon.config.telemetry.ewma_base_alpha = 1.0;
+        daemon.config.telemetry.ewma_min_alpha = 1.0;
+        daemon.config.telemetry.ewma_max_alpha = 1.0;
+        daemon.config.telemetry.guardrail_min_observations = 1;
+        *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+            observe_min_interval_secs: 0,
+            ..PolicyConfig::default()
+        });
+        daemon.burst_stats.record_cycle(Duration::from_secs(10));
+        let start = Instant::now()
+            .checked_sub(Duration::from_hours(1))
+            .expect("cache-control fixture needs one hour of prior monotonic time");
+        let mut sample = native_pressure_sample(&mount, "disk-a", 100 * GIB, 15 * GIB, start);
+        let mut healthy =
+            native_pressure_sample(&healthy_mount, "disk-b", 100 * GIB, 80 * GIB, start);
+        daemon
+            .evaluate_pressure_samples(HashMap::from([(mount.clone(), sample.clone())]), start)
+            .unwrap();
+        sample.collected_at += Duration::from_secs(1);
+        daemon
+            .evaluate_pressure_samples(
+                HashMap::from([(mount.clone(), sample.clone())]),
+                sample.collected_at,
+            )
+            .unwrap();
+        assert_eq!(
+            daemon.mount_monitors[&mount].guard.status(),
+            GuardStatus::Pass
+        );
+        let outcomes = daemon.prediction_scorecard.outcome_count();
+        let clean_windows = daemon
+            .policy_engine
+            .lock()
+            .diagnostics()
+            .consecutive_clean_windows;
+        assert_eq!(clean_windows, 1);
+        let integral = daemon.mount_monitors[&mount].pressure_controller.integral();
+
+        daemon.release_controller.record_release(
+            &mount,
+            GIB,
+            15 * GIB,
+            start + Duration::from_secs(2),
+        );
+        daemon.last_tick_cleanup_ran = true;
+        for tick in 3..=11 {
+            let now = start + Duration::from_secs(tick);
+            healthy.collected_at = now;
+            let response = daemon
+                .evaluate_pressure_samples(
+                    HashMap::from([
+                        (mount.clone(), sample.clone()),
+                        (healthy_mount.clone(), healthy.clone()),
+                    ]),
+                    now,
+                )
+                .unwrap();
+            assert_eq!(response.causing_mount, mount);
+            assert_eq!(response.level, PressureLevel::Yellow);
+            assert_eq!(
+                daemon.mount_monitors[&mount].rate_estimator.sample_count(),
+                1
+            );
+            assert_eq!(daemon.mount_monitors[&mount].guard.observation_count(), 1);
+            assert_eq!(daemon.prediction_scorecard.outcome_count(), outcomes);
+            assert_eq!(
+                daemon
+                    .policy_engine
+                    .lock()
+                    .diagnostics()
+                    .consecutive_clean_windows,
+                clean_windows
+            );
+            assert!(
+                daemon.last_tick_cleanup_ran,
+                "cached ticks retain intervention evidence"
+            );
+            assert_eq!(
+                daemon.release_controller.release_efficiency(&mount),
+                1.0,
+                "a pre-release cache reading cannot settle the release"
+            );
+            assert_eq!(daemon.burst_stats.mount(&mount).unwrap().windows(), 0);
+        }
+        assert!(
+            daemon.mount_monitors[&mount].pressure_controller.integral() > integral,
+            "live control time still advances on cache hits"
+        );
+
+        sample.collected_at = start + Duration::from_secs(12);
+        sample.stats.available_bytes = 16 * GIB;
+        sample.stats.free_bytes = 16 * GIB;
+        daemon
+            .evaluate_pressure_samples(
+                HashMap::from([(mount.clone(), sample.clone())]),
+                start + Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(daemon.prediction_scorecard.outcome_count(), outcomes + 1);
+        assert!(!daemon.last_tick_cleanup_ran);
+        assert_eq!(daemon.release_controller.release_efficiency(&mount), 1.0);
+        let actual_rate = daemon.mount_monitors[&mount]
+            .last_observation
+            .as_ref()
+            .unwrap()
+            .rate
+            .bytes_per_second;
+        assert!(
+            (actual_rate + GIB as f64 / 11.0).abs() < 1e-6,
+            "measurement interval is 11 seconds, not 59 control seconds: {actual_rate}"
+        );
+        assert_eq!(daemon.burst_stats.mount(&mount).unwrap().windows(), 1);
+
+        // A replacement under the same path must not retain old controller
+        // backoff, reserve windows or a release comparison across devices.
+        daemon.mount_controllers.insert(
+            mount.clone(),
+            MountController::new(mount.clone(), mount_controller_config(&daemon.config)),
+        );
+        daemon.pending_recovery.insert(mount.clone());
+        daemon
+            .catalog_epochs
+            .insert(mount.clone(), (PressureLevel::Red, start));
+        daemon
+            .release_controller
+            .set_release_efficiency(&mount, 0.2);
+        daemon.release_controller.record_release(
+            &mount,
+            GIB,
+            16 * GIB,
+            start + Duration::from_secs(13),
+        );
+        let replacement = native_pressure_sample(
+            &mount,
+            "disk-c",
+            100 * GIB,
+            GIB,
+            start + Duration::from_secs(20),
+        );
+        let response = daemon
+            .evaluate_pressure_samples(
+                HashMap::from([(mount.clone(), replacement)]),
+                start + Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(response.level, PressureLevel::Critical);
+        assert!(!daemon.mount_controllers.contains_key(&mount));
+        assert!(!daemon.pending_recovery.contains(&mount));
+        assert!(!daemon.catalog_epochs.contains_key(&mount));
+        assert_eq!(
+            daemon.mount_monitors[&mount].rate_estimator.sample_count(),
+            0
+        );
+        assert_eq!(daemon.mount_monitors[&mount].guard.observation_count(), 0);
+        assert_eq!(daemon.burst_stats.mount(&mount).unwrap().windows(), 0);
+        assert_eq!(daemon.release_controller.release_efficiency(&mount), 1.0);
+    }
+
     #[cfg(unix)]
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -15264,12 +15855,15 @@ mod tests {
             // A steady GiB/hour history makes the expected runway independent
             // of the host's capacity, workload and sub-second test scheduling.
             monitor.rate_estimator = DiskRateEstimator::new(1.0, 1.0, 1.0, 3);
-            let start = Instant::now() - Duration::from_hours(4);
+            let start = Instant::now()
+                .checked_sub(Duration::from_hours(4))
+                .expect("forecast-boundary fixture needs four hours of prior monotonic time");
+            let mut sample = daemon.fs_collector.collect_sample(&mount).unwrap();
             for step in 0_u64..4 {
-                let at = start + Duration::from_hours(step);
-                let free = available + (4 - step) * GIB;
-                let estimate = monitor.rate_estimator.update(free, at, red_boundary);
-                monitor.observe_guard(at, free, red_boundary, &estimate);
+                sample.collected_at = start + Duration::from_hours(step);
+                sample.stats.available_bytes = available + (4 - step) * GIB;
+                sample.stats.free_bytes = sample.stats.available_bytes;
+                monitor.observe_filesystem(sample.clone(), &daemon.config);
             }
             daemon.mount_monitors.insert(mount.clone(), monitor);
 
@@ -18501,13 +19095,15 @@ mod tests {
         }]);
         daemon.fs_collector.set_ttl(Duration::ZERO);
         let mut monitor = MountMonitor::new(&daemon.config);
-        let start = Instant::now() - Duration::from_secs(30);
+        let start = Instant::now()
+            .checked_sub(Duration::from_secs(30))
+            .expect("special-mount prior fixture needs thirty seconds of prior monotonic time");
+        let mut sample = daemon.fs_collector.collect_sample(Path::new("/")).unwrap();
         for step in 0..=3 {
-            monitor.rate_estimator.update(
-                (900 - step * 100) * 1_000_000_000,
-                start + Duration::from_secs(step * 5),
-                0,
-            );
+            sample.collected_at = start + Duration::from_secs(step * 5);
+            sample.stats.available_bytes = (900 - step * 100) * 1_000_000_000;
+            sample.stats.free_bytes = sample.stats.available_bytes;
+            monitor.observe_filesystem(sample.clone(), &daemon.config);
         }
         daemon.mount_monitors.insert(PathBuf::from("/"), monitor);
         let (scan_tx, scan_rx) = bounded(8);

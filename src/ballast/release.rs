@@ -424,6 +424,16 @@ impl BallastReleaseController {
             .map_or(1.0, |s| s.release_efficiency)
     }
 
+    /// A replaced or resized filesystem invalidates free-space comparisons.
+    /// Keep the independently identity-bound inventory ledger and cooldowns.
+    #[cfg(feature = "daemon")]
+    pub(crate) fn reset_effectiveness(&mut self, mount_path: &Path) {
+        if let Some(state) = self.states.get_mut(mount_path) {
+            state.release_efficiency = 1.0;
+            state.pending_release = None;
+        }
+    }
+
     /// Set release efficiency for `mount_path` (for test setup or persistence restore).
     pub fn set_release_efficiency(&mut self, mount_path: &Path, efficiency: f64) {
         let state = self.states.entry(mount_path.to_path_buf()).or_default();

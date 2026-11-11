@@ -288,6 +288,31 @@ impl DiskRateEstimator {
         self.samples
     }
 
+    /// Recompute a retained observation after a policy change, without
+    /// manufacturing a rate sample, burst observation or confidence reward.
+    /// Rebasing the jitter comparison keeps a changed red boundary from being
+    /// mistaken for an unstable filesystem on the next real observation.
+    #[cfg(feature = "daemon")]
+    pub(crate) fn reforecast(
+        &mut self,
+        previous: &RateEstimate,
+        threshold_free_bytes: u64,
+    ) -> RateEstimate {
+        let mut estimate = previous.clone();
+        estimate.seconds_to_threshold = project_time(
+            self.ewma_rate,
+            self.ewma_accel,
+            previous.free_bytes.saturating_sub(threshold_free_bytes) as f64,
+        );
+        estimate.confidence = self.compute_confidence();
+        estimate.fallback_active = self.samples < self.min_samples || estimate.confidence < 0.2;
+        self.last_predicted_secs = estimate
+            .seconds_to_threshold
+            .is_finite()
+            .then_some(estimate.seconds_to_threshold);
+        estimate
+    }
+
     fn compute_confidence(&self) -> f64 {
         if self.samples == 0 {
             return 0.0;
