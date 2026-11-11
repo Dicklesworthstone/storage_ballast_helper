@@ -1811,6 +1811,20 @@ fn daemon_constants() -> Vec<ConstantDoc> {
         ),
         constant(
             "daemon",
+            "QUARANTINE_FIRST_CHANCE_SECS",
+            daemon::QUARANTINE_FIRST_CHANCE_SECS,
+            "Seconds one automatic quarantine sweep may hold cleanup on its own mount",
+            SOURCE,
+        ),
+        constant(
+            "daemon",
+            "QUARANTINE_PRESSURE_RETRY_SECS",
+            daemon::QUARANTINE_PRESSURE_RETRY_SECS,
+            "Minimum seconds before a pressured mount receives another quarantine sweep",
+            SOURCE,
+        ),
+        constant(
+            "daemon",
             "TARGET_TIER_PASS_MINUTES",
             crate::daemon::target_tier::PASS_INTERVAL.as_secs() / 60,
             "Shortest gap between two target-only passes",

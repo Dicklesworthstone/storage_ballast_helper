@@ -1511,14 +1511,25 @@ Quarantined space is reclaimable on demand:
 
 | Condition | What happens |
 | --- | --- |
-| Green or Yellow | Once a minute, entries older than `scanner.quarantine_ttl_hours` are removed for good and the store is capped at `scanner.quarantine_max_bytes_pct` of the volume (oldest first). |
-| Orange, Red, Critical | The mount's quarantines are drained oldest-first on the tick, ahead of any new deletion: that space was decided already and costs no scoring. New candidates are removed for good (`Unlink`). |
+| Green or Yellow | Background sweeps are due once a minute. They remove entries older than `scanner.quarantine_ttl_hours` and cap the store at `scanner.quarantine_max_bytes_pct` of the volume (oldest first). |
+| Orange, Red, Critical | A bounded background sweep gives existing quarantine the first opportunity to reclaim space on its filesystem. Fresh cleanup resumes when that opportunity ends; new candidates are removed for good (`Unlink`). |
 | `sbh emergency` | Drains every quarantine under the scan roots before it scans anything. |
 
-Daemon quarantine sweeps respect the live policy and dry-run setting. Observe,
-FallbackSafe, and dry-run retain quarantined payloads while still reporting
-their held bytes. Normal TTL/cap and pressure-driven purges resume only when
-the daemon is allowed to delete.
+Daemon quarantine sweeps respect the live policy and dry-run setting. Canary,
+Observe, FallbackSafe, and dry-run retain quarantined payloads while still
+reporting their held bytes. Normal TTL/cap and pressure-driven purges require
+Enforce mode.
+
+Automatic inventory and purge use one retained worker. Only its admitted
+filesystem receives a cleanup hold; queued sweeps cannot hold other disks.
+The hold expires after `QUARANTINE_FIRST_CHANCE_SECS` (see
+`sbh docs --section constants`), revoking the worker before fresh cleanup
+proceeds. Reload, failed pressure sampling, policy revocation, recovery and
+shutdown can cancel it sooner. A blocked native operation keeps its worker
+slot without blocking pressure monitoring or creating replacement threads.
+Completed observations update held inventory; unavailable observations retain
+the last measured value. See [quarantine recovery](docs/quarantine-recovery.md)
+for the cancellation and shared resource-allowance rules.
 
 Queued deletion batches also recheck policy and dry-run before each candidate
 mutation. Enforce-to-Canary transitions defer the remaining candidates for

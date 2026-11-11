@@ -750,6 +750,8 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | daemon | `CATALOG_PROBE_MAX_ENTRIES` | `50000` | Entries a catalog freshness probe may visit | `src/daemon/loop_main.rs` |
 | daemon | `CATALOG_PROBE_MAX_DEPTH` | `5` | Depth of a catalog freshness probe | `src/daemon/loop_main.rs` |
 | daemon | `CANARY_REPROVE_MINUTES` | `30` | Clean minutes an automatic Canary needs to return to the intended mode | `src/daemon/policy.rs` |
+| daemon | `QUARANTINE_FIRST_CHANCE_SECS` | `5` | Seconds one automatic quarantine sweep may hold cleanup on its own mount | `src/daemon/loop_main.rs` |
+| daemon | `QUARANTINE_PRESSURE_RETRY_SECS` | `5` | Minimum seconds before a pressured mount receives another quarantine sweep | `src/daemon/loop_main.rs` |
 | daemon | `TARGET_TIER_PASS_MINUTES` | `10` | Shortest gap between two target-only passes | `src/daemon/target_tier.rs` |
 | daemon | `TARGET_ROOT_PROBE_SECS` | `60` | Seconds target root admission and monitor pressure evidence stay fresh | `src/daemon/target_tier.rs` |
 | daemon | `RCH_STAGING_PASS_MINUTES` | `30` | Shortest gap between two rch staging passes over one base | `src/daemon/rch_staging.rs` |

@@ -70,11 +70,36 @@ authority. A held or partially purged entry retains its recovery metadata and
 remaining contents, receives no failure cooldown, and contributes no completed
 removal credit until its payload and manifest are finalized.
 
+## Bounded background sweeps
+
+Automatic inventory and purging run on one retained worker. The pressure
+monitor schedules work and reads finished results without waiting for a live
+thread or touching a quarantine store. A worker blocked in filesystem I/O
+keeps its slot; repeated ticks, reloads and cancellation do not create more
+workers.
+
+An admitted sweep receives a brief first opportunity on its own filesystem.
+Only that active filesystem can hold new cleanup; queued sweeps do not delay
+other disks. The opportunity expires after `QUARANTINE_FIRST_CHANCE_SECS`
+(reported by `sbh docs --section constants`). Expiry revokes the worker before
+releasing the hold. Configuration reload, failed pressure sampling, shutdown,
+policy revocation or recovery can revoke it sooner, and restoring earlier
+settings cannot revive the old permission. A finished pressure sweep also
+leaves a retry interval so new cleanup can proceed before another sweep
+receives a turn.
+
+Native filesystem operations already in progress cannot be interrupted
+safely. When they return, the worker renews its permission before further
+mutation. A blocked store can therefore defer other quarantine sweeps, but
+cannot indefinitely hold the monitor or unrelated emergency cleanup. Held
+inventory is updated from completed observations; an unavailable observation
+does not replace the previous inventory with a fabricated zero.
+
 ## Relief from inode or swap pressure
 
-At Orange or worse, inode and tmpfs swap relief considers eligible quarantined
-artifacts before scheduling new cleanup on that filesystem. A held artifact
-must retain a recorded definite category, the admitted device identity, and an
+At Orange or worse, inode and tmpfs swap relief gives an admitted quarantine
+sweep the bounded first opportunity before new cleanup on that filesystem.
+A held artifact must retain a recorded definite category, the admitted device identity, and an
 original path under a current configured root. Legacy or uncertain records,
 suspended categories, newly excluded or protected original paths, and changed
 root aliases remain held. Protection is checked in both the original and
@@ -85,6 +110,11 @@ The pressure gate renews the actual inode or swap shortage before removal and
 at bounded checkpoints within large payloads. Completed purges consume the same
 finite allowance as the scan request that follows: an inode pass counts completed
 artifact removals, while a swap pass charges their allocated-byte estimates.
+The successor retains its freshly observed scope and shares the remaining
+allowance only when the captured mount, device and root identities still match.
+Inode relief also requires the same capacity, recovery goal and policy. A
+tighter fresh allowance can reduce the shared balance; replacing a root never
+replaces fresh scope with the completed sweep's old evidence.
 Recovery, unavailable evidence, observe mode, and dry-run keep the remaining
 payloads restorable. Compression holds do not postpone inode relief because
 compression cannot release inodes. Resource-only Yellow pressure reports held

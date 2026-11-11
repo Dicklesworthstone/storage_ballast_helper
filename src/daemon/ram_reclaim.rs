@@ -17,7 +17,7 @@ use crate::scanner::quarantine::QuarantineRecord;
 use crate::scanner::scoring::{ArtifactCertainty, CandidacyScore, DecisionAction};
 use crate::scanner::walker::{FsIdentity, device_id, identity_for_path};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AdmittedRoot {
     original: PathBuf,
     resolved: PathBuf,
@@ -75,6 +75,22 @@ impl RamReclaimRequest {
     #[must_use]
     pub fn remaining_bytes(&self) -> u64 {
         self.remaining.load(Ordering::Acquire)
+    }
+
+    /// Continue a completed quarantine pass only when this fresh observation
+    /// captured the same mount, device and root identities. Compare retained
+    /// evidence without filesystem I/O on the monitor thread, and preserve the
+    /// newer pass's tighter allowance if the backing shortfall has decreased.
+    pub(super) fn share_remaining_allowance(&mut self, previous: &Self) {
+        if self.mount == previous.mount
+            && self.device_id == previous.device_id
+            && self.roots == previous.roots
+        {
+            previous
+                .remaining
+                .fetch_min(self.remaining_bytes(), Ordering::AcqRel);
+            self.remaining = Arc::clone(&previous.remaining);
+        }
     }
 
     /// Renew the admitted root's original alias, canonical directory identity,

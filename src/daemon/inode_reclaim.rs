@@ -16,7 +16,7 @@ use crate::scanner::quarantine::QuarantineRecord;
 use crate::scanner::scoring::{ArtifactCertainty, CandidacyScore, DecisionAction};
 use crate::scanner::walker::{FsEntryKind, FsIdentity, device_id, identity_for_path};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AdmittedRoot {
     original: PathBuf,
     resolved: PathBuf,
@@ -77,6 +77,24 @@ impl InodeReclaimRequest {
     #[must_use]
     pub fn remaining_artifacts(&self) -> usize {
         self.remaining.load(Ordering::Acquire)
+    }
+
+    /// Continue a completed quarantine pass only for the same captured mount,
+    /// device, roots and inode goal. This comparison performs no filesystem
+    /// I/O, and the successor can tighten but never replenish its allowance.
+    pub(super) fn share_remaining_allowance(&mut self, previous: &Self) {
+        if self.mount == previous.mount
+            && self.device_id == previous.device_id
+            && self.total == previous.total
+            && self.target_available == previous.target_available
+            && self.policy == previous.policy
+            && self.roots == previous.roots
+        {
+            previous
+                .remaining
+                .fetch_min(self.remaining_artifacts(), Ordering::AcqRel);
+            self.remaining = Arc::clone(&previous.remaining);
+        }
     }
 
     /// A queued pass cannot retain permission across an inode policy change.
