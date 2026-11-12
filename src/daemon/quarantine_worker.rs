@@ -164,6 +164,14 @@ pub(super) struct QuarantineSweeper {
 }
 
 impl QuarantineSweeper {
+    /// Retained running and completed passes may have changed free space.
+    /// Inventory-only tasks supply no evidence of an intervention.
+    pub(super) fn forecast_intervention(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|running| running.task.allow_mutation)
+    }
+
     pub(super) fn busy(&self) -> bool {
         self.running.is_some()
     }

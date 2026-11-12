@@ -1351,6 +1351,10 @@ pub struct TargetTier {
     /// scoring view only after the candidate surveys and process checks.
     regret: Option<Arc<SharedRegret>>,
     running: Arc<AtomicBool>,
+    /// A submission worker may queue cleanup before another native sample.
+    forecast_intervention_started: bool,
+    /// Cover a native sample collected just before the worker finishes.
+    forecast_intervention_was_running: bool,
     /// Retain even a cancelled, blocked worker until it actually exits. Never
     /// create replacement threads to work around uninterruptible native I/O.
     worker: Option<std::thread::JoinHandle<()>>,
@@ -1374,6 +1378,17 @@ pub struct TargetTier {
 }
 
 impl TargetTier {
+    /// A submission started, or a worker is active or just finished.
+    /// The shared slot also covers read-only reader retirement, conservatively
+    /// censoring learning until it clears without stopping predictive actions.
+    /// This is uncertainty, not proof that a queued deletion succeeded.
+    pub(super) fn take_forecast_intervention(&mut self) -> bool {
+        let started = std::mem::take(&mut self.forecast_intervention_started);
+        let running = self.running.load(Ordering::Acquire);
+        let was_running = std::mem::replace(&mut self.forecast_intervention_was_running, running);
+        started || running || was_running
+    }
+
     pub(super) fn with_regret(regret: Arc<SharedRegret>) -> Self {
         // `TargetTier` implements `Drop`, so struct-update syntax cannot move
         // the remaining fields out of a default value (E0509).
@@ -1520,6 +1535,7 @@ impl TargetTier {
             return;
         }
         self.last_probe = Some(now);
+        self.forecast_intervention_started = true;
         self.running.store(true, Ordering::Release);
         let guard = RunningGuard(Arc::clone(&self.running));
         let config = config.clone();
@@ -3531,7 +3547,9 @@ pub(super) mod tests {
             let platform = Arc::clone(&fixture.platform);
             let handle = logger.handle.clone();
             let mut tier = fixture.monitor(tier, move |tier| {
+                assert!(tier.take_forecast_intervention(), "new worker is retained");
                 for multiplier in 1..=4 {
+                    assert!(tier.take_forecast_intervention(), "worker is still active");
                     tier.tick(
                         Instant::now() + PASS_INTERVAL * multiplier,
                         &config,
@@ -3553,6 +3571,8 @@ pub(super) mod tests {
                 tier.last_start.is_some(),
                 "the released, due root was surveyed"
             );
+            assert!(tier.take_forecast_intervention(), "completion covers one observation");
+            assert!(!tier.take_forecast_intervention());
         }
 
         #[test]
@@ -3601,6 +3621,11 @@ pub(super) mod tests {
                 tier.last_start.is_none(),
                 "old work cannot spend the new cooldown"
             );
+            assert!(
+                tier.take_forecast_intervention(),
+                "completion before observation must retain the start",
+            );
+            assert!(!tier.take_forecast_intervention());
 
             tier.tick(
                 Instant::now(),

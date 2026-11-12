@@ -14,7 +14,9 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   unrelated mounts cannot change its confidence floor. Cleanup, recovery,
   missing observations and changed filesystem/configuration evidence leave
   uncertain windows unscored, while fresh inactive observations let old
-  confidence penalties age out.
+  confidence penalties age out. Compression, target-only submission, staging
+  and mutating quarantine passes retain intervention evidence across samples,
+  including brief passes and the first observation after active work finishes.
 
 - **Cleanup excludes confirmed unwritable surfaces before planning.** The
   scanner no longer lets a sandbox-denied target satisfy the byte goal or

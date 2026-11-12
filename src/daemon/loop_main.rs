@@ -6669,6 +6669,22 @@ impl MonitoringDaemon {
             });
         }
 
+        // Auxiliary reclaim can suppress ordinary scan dispatch, or finish
+        // between native observations. Consume every start latch even when a
+        // different tier is active; while active, each observation remains
+        // censored and cannot enroll a replacement forecast. The first tick
+        // after completion also covers a native sample collected before the
+        // worker's last mutation, but evaluated after its running flag clears.
+        let auxiliary_reclaim = [
+            self.compress_tier.take_forecast_intervention(),
+            self.rch_staging.take_forecast_intervention(),
+            self.target_tier.take_forecast_intervention(),
+            self.quarantine_sweeper.forecast_intervention(),
+        ]
+        .into_iter()
+        .any(|intervention| intervention);
+        self.last_tick_cleanup_ran |= auxiliary_reclaim;
+
         // A missing mount cannot acquire a false-alarm label from a healthy
         // peer. Possible cleanup is censored globally until receipts carry
         // reliable mount provenance, never counted as a successful forecast.
@@ -9318,6 +9334,9 @@ impl MonitoringDaemon {
     }
 
     fn poll_quarantine_worker(&mut self) {
+        // Preserve possible mutation before polling clears a finished handle,
+        // including callers that reap work before the next pressure sample.
+        self.last_tick_cleanup_ran |= self.quarantine_sweeper.forecast_intervention();
         let now = Instant::now();
         if let Some(completed) = self
             .quarantine_sweeper
@@ -14202,7 +14221,10 @@ mod tests {
         let (del_tx, _del_rx) = bounded(4);
         daemon.mount_responses = ticks.clone();
         daemon.handle_pressure(&ticks[0].response, &scan_tx, &scan_rx, &del_tx);
+        // Isolate the completion path from the ordinary scan-dispatch marker.
+        daemon.last_tick_cleanup_ran = false;
         finish_quarantine_worker(daemon);
+        assert!(daemon.last_tick_cleanup_ran, "polling retains possible mutation");
         assert!(!records[0].quarantine_path.exists());
         assert!(records[1].quarantine_path.exists());
         let _ = scan_rx.try_iter().count();
@@ -15912,6 +15934,97 @@ mod tests {
         assert_eq!(daemon.mount_monitors[&mount].guard.observation_count(), 0);
         assert_eq!(daemon.burst_stats.mount(&mount).unwrap().windows(), 0);
         assert_eq!(daemon.release_controller.release_efficiency(&mount), 1.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auxiliary_reclaim_censors_forecasts_even_when_free_bytes_keep_falling() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        for finished_before_observation in [false, true] {
+            let mut fixture = RegretDaemonFixture::new();
+            let mount = install_disk_pressure_probe(&mut fixture, 100 * GIB, 15 * GIB, false);
+            let daemon = &mut fixture.daemon;
+            daemon.config.telemetry.ewma_base_alpha = 1.0;
+            daemon.config.telemetry.ewma_min_alpha = 1.0;
+            daemon.config.telemetry.ewma_max_alpha = 1.0;
+            let start = Instant::now();
+            let mut sample = native_pressure_sample(&mount, "disk-a", 100 * GIB, 15 * GIB, start);
+            daemon
+                .evaluate_pressure_samples(HashMap::from([(mount.clone(), sample.clone())]), start)
+                .unwrap();
+            assert!(
+                daemon.mount_monitors
+                    .get_mut(&mount)
+                    .unwrap()
+                    .prediction_scorecard
+                    .enroll(start, Duration::from_secs(2))
+            );
+            let base_confidence = daemon.config.pressure.prediction.min_confidence;
+            let mut next_second = 1;
+            crate::daemon::rch_staging::tests::with_forecast_pass(
+                finished_before_observation,
+                &mut |tier, finished| {
+                    std::mem::swap(&mut daemon.rch_staging, tier);
+                    let observations = if !finished {
+                        10
+                    } else if finished_before_observation {
+                        2
+                    } else {
+                        1
+                    };
+                    for _ in 0..observations {
+                        let second = next_second;
+                        next_second += 1;
+                        sample.collected_at = start + Duration::from_secs(second);
+                        // Concurrent growth can conceal reclaimed bytes; an
+                        // increase in free space is not required for censoring.
+                        sample.stats.available_bytes = 15 * GIB - second * 64 * MIB;
+                        sample.stats.free_bytes = sample.stats.available_bytes;
+                        daemon
+                            .evaluate_pressure_samples(
+                                HashMap::from([(mount.clone(), sample.clone())]),
+                                sample.collected_at,
+                            )
+                            .unwrap();
+                        let scorecard = &daemon.mount_monitors[&mount].prediction_scorecard;
+                        assert_eq!(scorecard.resolved_forecasts(), 0);
+                        assert_eq!(scorecard.pending(), usize::from(second < 2));
+                        assert!(
+                            (scorecard.dynamic_min_confidence(base_confidence) - base_confidence)
+                                .abs()
+                                < f64::EPSILON,
+                        );
+                    }
+                    if !finished_before_observation {
+                        assert!(daemon.last_predictive_action.should_cleanup());
+                        assert_eq!(
+                            daemon.mount_monitors[&mount].prediction_scorecard.pending(),
+                            0,
+                            "active work and its completion tick cannot enroll a new window",
+                        );
+                    }
+                    std::mem::swap(&mut daemon.rch_staging, tier);
+                },
+            );
+            if !finished_before_observation {
+                // A fresh observation after the completion tail can establish
+                // a new baseline and enroll an uninterrupted future window.
+                sample.collected_at = start + Duration::from_secs(next_second);
+                sample.stats.available_bytes = 15 * GIB - next_second * 64 * MIB;
+                sample.stats.free_bytes = sample.stats.available_bytes;
+                daemon
+                    .evaluate_pressure_samples(
+                        HashMap::from([(mount.clone(), sample.clone())]),
+                        sample.collected_at,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    daemon.mount_monitors[&mount].prediction_scorecard.pending(),
+                    1,
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

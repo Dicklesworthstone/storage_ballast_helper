@@ -721,6 +721,10 @@ fn probe_admission(
 #[derive(Debug, Default)]
 pub struct RchStagingTier {
     running: Arc<AtomicBool>,
+    /// Retain a pass that starts and finishes between native observations.
+    forecast_intervention_started: bool,
+    /// Cover a native sample collected just before the worker finishes.
+    forecast_intervention_was_running: bool,
     /// Set when the tier may no longer run; the pass in flight stops before
     /// its next project.
     stop: Arc<AtomicBool>,
@@ -733,6 +737,15 @@ pub struct RchStagingTier {
 }
 
 impl RchStagingTier {
+    /// A pass started, remains active, or finished since its last observation.
+    /// Read-only admission probes do not interrupt a filesystem forecast.
+    pub(super) fn take_forecast_intervention(&mut self) -> bool {
+        let started = std::mem::take(&mut self.forecast_intervention_started);
+        let running = self.running.load(Ordering::Acquire);
+        let was_running = std::mem::replace(&mut self.forecast_intervention_was_running, running);
+        started || running || was_running
+    }
+
     /// Revoke old authority before publishing a reloaded configuration. No
     /// filesystem work or waiting: a blocked worker keeps its slot until it
     /// exits, and its stop flag is never cleared even if the settings revert.
@@ -948,6 +961,7 @@ impl RchStagingTier {
             self.last_run.insert(entry.base.clone(), now);
         }
         self.stop = Arc::new(AtomicBool::new(false));
+        self.forecast_intervention_started = true;
         self.running.store(true, Ordering::Release);
         let guard = RunningGuard(Arc::clone(&self.running));
         let stop = Arc::clone(&self.stop);
@@ -1563,6 +1577,46 @@ pub(super) mod tests {
         let calls = calls(&pass.root);
         assert_eq!(calls.len(), 5, "{calls:?}");
         assert!(calls[4].ends_with("--project=clean --execute"), "{calls:?}");
+    }
+
+    pub(in crate::daemon) fn with_forecast_pass(
+        finished_before_observation: bool,
+        observe: &mut impl FnMut(&mut RchStagingTier, bool),
+    ) {
+        let mut pass = PausedPass::new(PressureLevel::Red);
+        if finished_before_observation {
+            pass.release();
+            pass.wait_for_exit();
+            assert!(!pass.tier.running.load(Ordering::Acquire));
+        }
+        observe(&mut pass.tier, finished_before_observation);
+        pass.tier.stop_running_pass();
+        pass.release();
+        pass.wait_for_exit();
+        assert!(!pass.tier.running.load(Ordering::Acquire));
+        if !finished_before_observation {
+            observe(&mut pass.tier, true);
+        }
+        assert!(!pass.tier.take_forecast_intervention(), "completion was observed");
+    }
+
+    #[test]
+    fn forecast_intervention_survives_completion_and_tracks_an_active_pass() {
+        for observed_while_running in [false, true] {
+            let mut pass = PausedPass::new(PressureLevel::Red);
+            if observed_while_running {
+                assert!(pass.tier.take_forecast_intervention());
+                assert!(pass.tier.take_forecast_intervention());
+            }
+            pass.release();
+            pass.wait_for_exit();
+            assert!(!pass.tier.running.load(Ordering::Acquire));
+            assert!(
+                pass.tier.take_forecast_intervention(),
+                "an unobserved start or newly observed completion is retained",
+            );
+            assert!(!pass.tier.take_forecast_intervention());
+        }
     }
 
     #[test]

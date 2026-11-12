@@ -328,6 +328,10 @@ fn due_start_level(
 #[derive(Debug, Default)]
 pub struct CompressTier {
     running: Arc<AtomicBool>,
+    /// Retain a pass that starts and finishes between native observations.
+    forecast_intervention_started: bool,
+    /// Cover a native sample collected just before the worker finishes.
+    forecast_intervention_was_running: bool,
     /// Raised by [`CompressTier::stop_running_pass`]; the pass checks it
     /// before each file and before every raw range of a started one.
     stop: Arc<AtomicBool>,
@@ -354,6 +358,15 @@ pub struct CompressTier {
 }
 
 impl CompressTier {
+    /// A pass started, remains active, or finished since its last observation.
+    /// Admission probes alone do not interrupt a filesystem forecast.
+    pub(super) fn take_forecast_intervention(&mut self) -> bool {
+        let started = std::mem::take(&mut self.forecast_intervention_started);
+        let running = self.running.load(Ordering::Acquire);
+        let was_running = std::mem::replace(&mut self.forecast_intervention_was_running, running);
+        started || running || was_running
+    }
+
     pub(super) fn with_first(first: Arc<CompressionFirst>) -> Self {
         Self {
             first,
@@ -565,6 +578,7 @@ impl CompressTier {
             .collect();
         // No pass is running (due_roots checked), so no stop is pending.
         self.stop.store(false, Ordering::Release);
+        self.forecast_intervention_started = true;
         self.running.store(true, Ordering::Release);
         // Only controllers can maintain a cleanup hold across ticks. A root
         // configured solely for compression may start a pass, but must not
@@ -1913,10 +1927,13 @@ pub(super) mod tests {
         fixture.gate.release(&root);
         tick(&mut tier);
         fixture.requested(&root);
+        assert!(!tier.take_forecast_intervention(), "root probe is read-only");
         drain_finished_probe(&mut tier, &config.compress.roots);
         tick(&mut tier);
         fixture.requested(&discovery_gate);
         assert!(tier.running.load(Ordering::Acquire));
+        assert!(tier.take_forecast_intervention(), "new pass is retained");
+        assert!(tier.take_forecast_intervention(), "active pass stays uncertain");
         control(&mut tier, &config, &fixture, &logger, &root);
         assert_eq!(tier.stop.load(Ordering::Acquire), cancelled);
         // Restored pressure must not clear cancellation while a worker is
@@ -1930,6 +1947,8 @@ pub(super) mod tests {
         );
         fixture.gate.release_all();
         wait_for_pass(&tier);
+        assert!(tier.take_forecast_intervention(), "completion covers one observation");
+        assert!(!tier.take_forecast_intervention());
         if cancelled {
             assert!(
                 fixture.requests.try_recv().is_err(),
@@ -2751,6 +2770,11 @@ pub(super) mod tests {
             assert!(Instant::now() < deadline, "empty pass did not finish");
             std::thread::yield_now();
         }
+        assert!(
+            tier.take_forecast_intervention(),
+            "a completed pass still interrupts the next observation",
+        );
+        assert!(!tier.take_forecast_intervention());
         let due = started + Duration::from_mins(config.compress.interval_minutes);
         tier.tick(
             due,
