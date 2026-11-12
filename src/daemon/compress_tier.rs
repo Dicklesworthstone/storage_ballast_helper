@@ -517,6 +517,14 @@ impl CompressTier {
         true
     }
 
+    /// If a later probe blocks, the ready prefix can still start. On the
+    /// next cycle give roots beyond that prefix first access to the worker.
+    fn rotate_probe_start(&mut self, configured: &[PathBuf], started: &[PathBuf]) {
+        if let Some(index) = configured.iter().rposition(|root| started.contains(root)) {
+            self.next_probe_root = (index + 1) % configured.len();
+        }
+    }
+
     /// Start a pass on its own thread when one is due.
     pub fn tick(
         &mut self,
@@ -560,16 +568,7 @@ impl CompressTier {
             }
             return;
         }
-        // If a later probe blocks, the ready prefix can still start. On the
-        // next cycle give roots beyond that prefix first access to the worker.
-        if let Some(index) = config
-            .compress
-            .roots
-            .iter()
-            .rposition(|root| roots.contains(root))
-        {
-            self.next_probe_root = (index + 1) % config.compress.roots.len();
-        }
+        self.rotate_probe_start(&config.compress.roots, &roots);
         self.last_start = Some(now);
         self.admitted_mounts = statuses
             .iter()
@@ -1868,6 +1867,7 @@ pub(super) mod tests {
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
+    #[allow(clippy::too_many_lines)]
     fn assert_paused_pass_control(
         monitored: bool,
         cancelled: bool,
@@ -1927,13 +1927,19 @@ pub(super) mod tests {
         fixture.gate.release(&root);
         tick(&mut tier);
         fixture.requested(&root);
-        assert!(!tier.take_forecast_intervention(), "root probe is read-only");
+        assert!(
+            !tier.take_forecast_intervention(),
+            "root probe is read-only"
+        );
         drain_finished_probe(&mut tier, &config.compress.roots);
         tick(&mut tier);
         fixture.requested(&discovery_gate);
         assert!(tier.running.load(Ordering::Acquire));
         assert!(tier.take_forecast_intervention(), "new pass is retained");
-        assert!(tier.take_forecast_intervention(), "active pass stays uncertain");
+        assert!(
+            tier.take_forecast_intervention(),
+            "active pass stays uncertain"
+        );
         control(&mut tier, &config, &fixture, &logger, &root);
         assert_eq!(tier.stop.load(Ordering::Acquire), cancelled);
         // Restored pressure must not clear cancellation while a worker is
@@ -1947,7 +1953,10 @@ pub(super) mod tests {
         );
         fixture.gate.release_all();
         wait_for_pass(&tier);
-        assert!(tier.take_forecast_intervention(), "completion covers one observation");
+        assert!(
+            tier.take_forecast_intervention(),
+            "completion covers one observation"
+        );
         assert!(!tier.take_forecast_intervention());
         if cancelled {
             assert!(
@@ -2461,7 +2470,7 @@ pub(super) mod tests {
         let logger = ProbeLogger::new();
         let config = probe_config(&["/sbh-test-missing-controller/scratch"]);
         let mut tier = CompressTier::default();
-        let critical = HashMap::from([(mount.clone(), PressureLevel::Critical)]);
+        let critical = HashMap::from([(mount, PressureLevel::Critical)]);
         tier.tick(
             Instant::now(),
             &config,
