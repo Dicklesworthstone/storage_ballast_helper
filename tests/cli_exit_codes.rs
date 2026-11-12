@@ -253,8 +253,10 @@ fn check_honours_the_absolute_free_floors() {
     let dir = disk_tempdir();
     let config = config_in(dir.path());
     let base = fs::read_to_string(&config).unwrap();
-    let percentages = "[pressure]\ngreen_min_free_pct = 99.9\nyellow_min_free_pct = 99.8\n\
-                       orange_min_free_pct = 99.7\nred_min_free_pct = 99.6\n";
+    // Green plus the default controller hysteresis (1.0) must stay <= 100, or
+    // the config is invalid and `check` falls back to the default lines.
+    let percentages = "[pressure]\ngreen_min_free_pct = 98.0\nyellow_min_free_pct = 97.9\n\
+                       orange_min_free_pct = 97.8\nred_min_free_pct = 97.7\n";
     let target = dir.path().display().to_string();
 
     fs::write(&config, format!("{base}{percentages}")).unwrap();

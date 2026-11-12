@@ -68,14 +68,15 @@ fn finite_slices_eventually_reach_beyond_a_large_deep_directory() {
     let mut saw_incomplete = false;
     for _ in 0..10 {
         let (entries, unfinished, stopped) = finite_walk(config(root), 16);
-        if stopped {
-            assert!(
-                !unfinished.is_empty(),
-                "a canceled pass cannot prove coverage"
-            );
-            saw_incomplete = true;
+        let reached_now = entries.iter().any(|entry| entry.path == target);
+        // The budget's last heartbeat can land as the resumed pass finishes,
+        // so the flag alone does not mean the walk was cut short. A pass that
+        // reports nothing unfinished must actually have reached the target.
+        if stopped && unfinished.is_empty() {
+            assert!(reached_now, "a canceled pass cannot prove coverage");
         }
-        reached |= entries.iter().any(|entry| entry.path == target);
+        saw_incomplete |= !unfinished.is_empty();
+        reached |= reached_now;
         if reached {
             break;
         }

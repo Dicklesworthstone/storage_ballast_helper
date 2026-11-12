@@ -19954,7 +19954,10 @@ mod tests {
                     },
                     &ledger,
                 );
-                executor.delete_candidate_checked(&candidate, None).unwrap();
+                // `sbh clean --dry-run` previews through plan + execute; the
+                // per-item mutating entry point refuses a dry-run executor.
+                let plan = executor.plan(vec![candidate]);
+                let _ = executor.execute(&plan, None);
                 assert!(target.exists());
                 store.drain_all().unwrap()
             } else {

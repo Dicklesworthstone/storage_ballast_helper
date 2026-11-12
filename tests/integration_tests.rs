@@ -980,7 +980,7 @@ fn macos_aware_help_text_is_visible() {
     );
     for fragment in [
         "Omit --systemd/--launchd for auto-detection",
-        "launchd user scope",
+        "sbh doctor --pal to verify launchd",
         "Full Disk Access",
     ] {
         assert!(

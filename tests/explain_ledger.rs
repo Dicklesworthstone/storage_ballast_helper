@@ -784,14 +784,15 @@ fn why_not_names_the_first_rail_for_each_fixture_class() {
     let protected = definite_target(&root.join("protected-proj"), Duration::from_hours(48), 4096);
     fs::write(protected.join(".sbh-protect"), b"keep\n").unwrap();
     let report = why_not(&config, &protected, false);
+    // The walker refuses to enter the marked tree ("not visited: protected
+    // by ..."); a scored path would say "protected: ...". Either way the
+    // verdict is the marker's reason, never a score.
+    let protection = report["protection"].as_str().expect("protection reason");
+    let verdict = report["verdict"].as_str().unwrap();
     assert!(
-        report["verdict"]
-            .as_str()
-            .unwrap()
-            .starts_with("protected:"),
+        protection.contains(".sbh-protect") && verdict.ends_with(protection),
         "{report}"
     );
-    assert!(report["protection"].is_string(), "{report}");
 
     // A source tree is refused by scoring or by the preflight, never scored
     // as reclaimable.
