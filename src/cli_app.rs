@@ -4350,13 +4350,15 @@ fn service_scope_sandbox(
                 return true;
             }
             if let Some(header) = line.strip_prefix('[') {
-                section_seen = header.strip_suffix(']').is_some_and(|name| {
-                    !name.trim().is_empty() && !name.contains(['[', ']'])
-                });
+                section_seen = header
+                    .strip_suffix(']')
+                    .is_some_and(|name| !name.trim().is_empty() && !name.contains(['[', ']']));
                 return !section_seen;
             }
             !section_seen
-                || line.split_once('=').is_none_or(|(key, _)| key.trim().is_empty())
+                || line
+                    .split_once('=')
+                    .is_none_or(|(key, _)| key.trim().is_empty())
         })
     });
     if texts.is_empty() || malformed {
@@ -4392,7 +4394,11 @@ fn service_scope_sandbox(
             return Err(format!("custom {key} needs namespace inspection"));
         }
     }
-    for value in directives.get("Service/ReadWritePaths").into_iter().flatten() {
+    for value in directives
+        .get("Service/ReadWritePaths")
+        .into_iter()
+        .flatten()
+    {
         if SystemdConfig::parse_read_write_paths(value).is_empty() {
             return Err("ReadWritePaths has unresolved or invalid syntax".to_string());
         }
@@ -4487,8 +4493,10 @@ fn read_service_scope_texts(
     systemd: &storage_ballast_helper::daemon::service::SystemdConfig,
 ) -> Result<Vec<String>, String> {
     let unit_path = systemd.unit_path();
-    let mut texts = vec![std::fs::read_to_string(&unit_path)
-        .map_err(|error| format!("cannot read {}: {error}", unit_path.display()))?];
+    let mut texts = vec![
+        std::fs::read_to_string(&unit_path)
+            .map_err(|error| format!("cannot read {}: {error}", unit_path.display()))?,
+    ];
     // A read error is unknown evidence, never an absent grant. Apply lists in
     // name order; the control directory has precedence for duplicate names.
     let mut dropins = std::collections::BTreeMap::new();
@@ -4499,8 +4507,8 @@ fn read_service_scope_texts(
             Err(error) => return Err(format!("cannot inspect {}: {error}", dir.display())),
         };
         for entry in entries {
-            let entry = entry
-                .map_err(|error| format!("cannot inspect {}: {error}", dir.display()))?;
+            let entry =
+                entry.map_err(|error| format!("cannot inspect {}: {error}", dir.display()))?;
             if entry.path().extension().is_some_and(|ext| ext == "conf") {
                 dropins.insert(entry.file_name(), entry.path());
             }
@@ -4546,14 +4554,16 @@ fn installed_service_scope_check(
             }
             let other = SystemdConfig::from_env(!preferred).map_err(|error| error.to_string())?;
             let path = other.unit_path();
-            Ok(if path
-                .try_exists()
-                .map_err(|error| format!("{}: {error}", path.display()))?
-            {
-                other
-            } else {
-                candidate
-            })
+            Ok(
+                if path
+                    .try_exists()
+                    .map_err(|error| format!("{}: {error}", path.display()))?
+                {
+                    other
+                } else {
+                    candidate
+                },
+            )
         });
     let systemd = match systemd {
         Ok(systemd) => systemd,
@@ -19001,7 +19011,10 @@ mod tests {
         );
 
         assert_eq!(checks.len(), previous_count + 1);
-        assert_eq!(serde_json::to_value(&checks[..previous_count]).unwrap(), previous);
+        assert_eq!(
+            serde_json::to_value(&checks[..previous_count]).unwrap(),
+            previous
+        );
         assert!(doctor_checks_have_failures(&checks));
         assert_eq!(doctor_check_status_count(&checks, "FAIL"), 1);
         let scope = checks.last().unwrap();
@@ -19033,10 +19046,10 @@ mod tests {
         config.scanner.catalog_roots_on_pressured_device = true;
         config.ballast.file_count = 2;
         config.paths.ballast_dir = PathBuf::from("/var/lib/sbh/ballast");
-        config.ballast.overrides.insert(
-            "/volume".to_string(),
-            BallastVolumeOverride::default(),
-        );
+        config
+            .ballast
+            .overrides
+            .insert("/volume".to_string(), BallastVolumeOverride::default());
         config.ballast.overrides.insert(
             "/disabled".to_string(),
             BallastVolumeOverride {
@@ -19065,7 +19078,12 @@ mod tests {
         );
         config.scanner.catalog_roots_on_pressured_device = false;
         config.ballast.file_count = 0;
-        config.ballast.overrides.get_mut("/volume").unwrap().file_count = Some(1);
+        config
+            .ballast
+            .overrides
+            .get_mut("/volume")
+            .unwrap()
+            .file_count = Some(1);
         let roots = service_scope_roots(&config, &catalog);
         assert!(!roots.contains(&catalog[0]));
         assert!(!roots.contains(&config.paths.ballast_dir));
@@ -19075,8 +19093,14 @@ mod tests {
     #[test]
     fn service_scope_reports_exact_missing_paths_without_prefix_confusion() {
         let mut config = service_scope_fixture_config();
-        config.scanner.root_paths.push(PathBuf::from("/data/artifacts-other"));
-        config.scanner.target_only_roots.push(PathBuf::from("/scratch/targets"));
+        config
+            .scanner
+            .root_paths
+            .push(PathBuf::from("/data/artifacts-other"));
+        config
+            .scanner
+            .target_only_roots
+            .push(PathBuf::from("/scratch/targets"));
         let check = service_scope_check(
             Path::new("/etc/systemd/system/sbh.service"),
             &config,
@@ -19090,9 +19114,15 @@ mod tests {
         assert!(check.message.contains("/etc/systemd/system/sbh.service"));
         assert!(check.message.contains("/fixture/config.toml"));
         assert!(
-            check.message.contains("covering: /data/artifacts-other, /scratch/targets")
+            check
+                .message
+                .contains("covering: /data/artifacts-other, /scratch/targets")
         );
-        assert!(check.message.contains("live filesystem writability are unverified"));
+        assert!(
+            check
+                .message
+                .contains("live filesystem writability are unverified")
+        );
         assert!(!doctor_checks_have_failures(&[check]));
     }
 
@@ -19112,11 +19142,19 @@ mod tests {
         let covered = service_scope_check(
             Path::new("/etc/systemd/system/sbh.service"),
             &config,
-            Ok(vec![unit, narrowed, "[Service]\nReadWritePaths=/data\n".into()]),
+            Ok(vec![
+                unit,
+                narrowed,
+                "[Service]\nReadWritePaths=/data\n".into(),
+            ]),
             &[],
         );
         assert_eq!(covered.status, "PASS");
-        assert!(covered.message.contains("no missing literal ReadWritePaths"));
+        assert!(
+            covered
+                .message
+                .contains("no missing literal ReadWritePaths")
+        );
         assert!(covered.message.contains("loaded unit, aliases, ACLs"));
     }
 
@@ -19127,14 +19165,22 @@ mod tests {
             Err("cannot read a drop-in: Permission denied".to_string()),
             Ok(Vec::new()),
             Ok(vec![String::new()]),
-            Ok(vec!["[Service]\nProtectSystem=strict\nReadWritePaths=%h/cache\n".into()]),
+            Ok(vec![
+                "[Service]\nProtectSystem=strict\nReadWritePaths=%h/cache\n".into(),
+            ]),
             Ok(vec![
                 "[Service]\nProtectSystem=strict\nReadWritePaths=/data \\\n /scratch\n".into(),
             ]),
-            Ok(vec!["[Service]\nProtectSystem=strict\nRootDirectory=/image\n".into()]),
+            Ok(vec![
+                "[Service]\nProtectSystem=strict\nRootDirectory=/image\n".into(),
+            ]),
             Ok(vec!["[Service]\nProtectSystem=unresolved\n".into()]),
-            Ok(vec!["[Service\nProtectSystem=strict\nReadWritePaths=/data\n".into()]),
-            Ok(vec!["[Service]\nProtectSystem=strict\nReadWritePaths /data\n".into()]),
+            Ok(vec![
+                "[Service\nProtectSystem=strict\nReadWritePaths=/data\n".into(),
+            ]),
+            Ok(vec![
+                "[Service]\nProtectSystem=strict\nReadWritePaths /data\n".into(),
+            ]),
         ];
         for texts in fixtures {
             let check = service_scope_check(
@@ -19145,7 +19191,11 @@ mod tests {
             );
             assert_eq!(check.status, "WARN", "{}", check.message);
             assert!(check.message.contains("scope unknown"), "{}", check.message);
-            assert!(!check.message.contains("has no literal ReadWritePaths grant covering"));
+            assert!(
+                !check
+                    .message
+                    .contains("has no literal ReadWritePaths grant covering")
+            );
         }
     }
 
@@ -19169,11 +19219,16 @@ mod tests {
     #[test]
     fn service_scope_patterns_remain_unknown_without_hiding_literal_gaps() {
         let mut config = service_scope_fixture_config();
-        config.scanner.target_only_roots.push(PathBuf::from("/data/tmp/claude-*"));
+        config
+            .scanner
+            .target_only_roots
+            .push(PathBuf::from("/data/tmp/claude-*"));
         let check = service_scope_check(
             Path::new("/etc/systemd/system/sbh.service"),
             &config,
-            Ok(vec!["[Service]\nProtectSystem=strict\nReadWritePaths=/tmp\n".into()]),
+            Ok(vec![
+                "[Service]\nProtectSystem=strict\nReadWritePaths=/tmp\n".into(),
+            ]),
             &[],
         );
         assert_eq!(check.status, "WARN");
@@ -19196,8 +19251,16 @@ mod tests {
             &[],
         );
         assert_eq!(check.status, "PASS");
-        assert!(check.message.contains("installed-grant check not applicable"));
-        assert!(check.message.contains("live filesystem writability are unverified"));
+        assert!(
+            check
+                .message
+                .contains("installed-grant check not applicable")
+        );
+        assert!(
+            check
+                .message
+                .contains("live filesystem writability are unverified")
+        );
     }
 
     #[test]

@@ -1192,12 +1192,17 @@ mod tests {
         let start = Instant::now();
         scheduler.record_partial_scan_result(&path, 1_000_000, 5, start);
         let end = start + MAX_REVISIT_INTERVAL;
-        scheduler.record_partial_scan_result(&path, 20, 1, end - Duration::from_secs(1));
+        scheduler.record_partial_scan_result(
+            &path,
+            20,
+            1,
+            end.checked_sub(Duration::from_secs(1)).unwrap(),
+        );
         let stats = scheduler.path_stats(&path).unwrap();
         assert_eq!(stats.scan_count, 0);
         assert_eq!(stats.last_scanned, None);
         assert_eq!(stats.partial_window_started, Some(start));
-        assert!(stats.has_pending_work(end - Duration::from_nanos(1)));
+        assert!(stats.has_pending_work(end.checked_sub(Duration::from_nanos(1)).unwrap()));
         assert!(!stats.has_pending_work(end));
         assert_eq!(VoiScheduler::expected_reclaim(stats, 1.0, end), 1.0);
 

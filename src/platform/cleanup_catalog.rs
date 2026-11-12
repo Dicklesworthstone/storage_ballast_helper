@@ -710,8 +710,15 @@ mod catalog_root_tests {
             AgeThreshold::from_days(14).minimum_age,
             "catch-all entries need two weeks of idleness"
         );
+        // Only the fixture home is stable: absolute templates such as
+        // `/var/tmp/*` expand over live system directories that other tests
+        // (and other processes) create and delete concurrently, so a child
+        // can vanish between expansion and this check.
         assert!(
-            roots.iter().all(|r| r.path.is_dir()),
+            roots
+                .iter()
+                .filter(|r| r.path.starts_with(home.path()))
+                .all(|r| r.path.is_dir()),
             "only existing directories are roots"
         );
     }

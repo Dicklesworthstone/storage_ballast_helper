@@ -922,10 +922,10 @@ mod tests {
             if let Some(gate) = &self.gate {
                 gate.wait(false);
             }
-            match &self.snapshot_override {
-                Some(snapshot) => Ok(snapshot.clone()),
-                None => self.inner.process_io_snapshot(pid, deadline),
-            }
+            self.snapshot_override.as_ref().map_or_else(
+                || self.inner.process_io_snapshot(pid, deadline),
+                |snapshot| Ok(snapshot.clone()),
+            )
         }
     }
 
@@ -1028,7 +1028,9 @@ mod tests {
         sampler.tick(
             platform.clone(),
             Arc::clone(&shutdown),
-            now + DEFAULT_BUCKET_INTERVAL - Duration::from_millis(1),
+            (now + DEFAULT_BUCKET_INTERVAL)
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
         );
         assert!(sampler.worker.is_none());
         sampler.tick(platform.clone(), shutdown, now + DEFAULT_BUCKET_INTERVAL);

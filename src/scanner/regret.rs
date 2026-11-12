@@ -1473,7 +1473,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("activity.sqlite3");
-        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let now = UNIX_EPOCH + Duration::from_hours(500_000);
         let recent = now - Duration::from_secs(10);
         let db = SqliteLogger::open(&database).unwrap();
         for (path, completed_at) in [
@@ -1511,13 +1511,13 @@ mod tests {
                 "retained",
                 "RustTarget",
                 Outcome::Regret,
-                now - Duration::from_secs(10 * 24 * 60 * 60),
+                now - Duration::from_hours(10 * 24),
             ),
             (
                 "expired",
                 "RustTarget",
                 Outcome::Regret,
-                now - Duration::from_secs(31 * 24 * 60 * 60),
+                now - Duration::from_hours(31 * 24),
             ),
         ] {
             db.log_outcome(&DecisionOutcome {
@@ -1594,7 +1594,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn history_admission_retains_duplicate_rows_without_recounting_copied_sources() {
-        let deleted_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let deleted_at = UNIX_EPOCH + Duration::from_hours(500_000);
         let now = deleted_at + Duration::from_secs(20);
         let path = "/data/tmp/recreated-cache";
         let receipt = history_receipt("0123456789ab", path, deleted_at);
@@ -1622,7 +1622,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn history_admission_enriches_legacy_receipts_without_counting_them_again() {
-        let deleted_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let deleted_at = UNIX_EPOCH + Duration::from_hours(500_000);
         let now = deleted_at + Duration::from_secs(30);
         let path = "/data/tmp/legacy-cache";
         let mut unknown = history_receipt("0123456789ab", path, deleted_at);
@@ -1674,7 +1674,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn history_admission_pairs_receipts_and_labels_independently_of_arrival_order() {
-        let deleted_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let deleted_at = UNIX_EPOCH + Duration::from_hours(500_000);
         let now = deleted_at + Duration::from_secs(30);
         let path = "/data/tmp/reused-inode-cache";
         let first = history_receipt("0123456789ab", path, deleted_at);
@@ -1707,7 +1707,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn history_admission_uses_receipt_completion_at_the_exact_cache_expiry_boundary() {
-        let deleted_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let deleted_at = UNIX_EPOCH + Duration::from_hours(500_000);
         let now = deleted_at + Duration::from_secs(30);
         let path = "/data/tmp/rounded-cache";
         let receipt = history_receipt("0123456789ab", path, deleted_at);
@@ -1753,9 +1753,9 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn history_admission_keeps_independent_windows_and_rejects_unusable_rows() {
-        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let now = UNIX_EPOCH + Duration::from_hours(500_000);
         let mut history = HistoryAdmission::default();
-        let old_deletion = now - Duration::from_secs(8 * 24 * 60 * 60);
+        let old_deletion = now - Duration::from_hours(8 * 24);
         assert!(!history.admit_receipt(
             history_receipt("0123456789ab", "/data/tmp/expired-cache", old_deletion),
             now,
@@ -1820,7 +1820,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn history_admission_recovers_legacy_classification_and_distinct_reuses() {
-        let deleted_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let deleted_at = UNIX_EPOCH + Duration::from_hours(500_000);
         let now = deleted_at + Duration::from_secs(60);
         let path = "/data/tmp/legacy-cache";
         let mut legacy = history_receipt("0123456789ab", path, deleted_at);
@@ -1991,7 +1991,7 @@ mod tests {
 
     #[test]
     fn calibration_evidence_expires_at_its_original_observation_boundary() {
-        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let now = UNIX_EPOCH + Duration::from_hours(500_000);
         let cutoff = now - REGRET_EVIDENCE_WINDOW;
         let observation = |category: &str, outcome, observed_at| RegretObservation {
             category: category.to_string(),
@@ -2029,7 +2029,7 @@ mod tests {
 
     #[test]
     fn expiry_keeps_active_suspensions_and_live_sequential_evidence() {
-        let now_wall = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let now_wall = UNIX_EPOCH + Duration::from_hours(500_000);
         let now = Instant::now();
         let mut calibrator = RegretCalibrator::new(RegretConfig {
             suspend: Duration::from_secs(60),
@@ -2082,7 +2082,7 @@ mod tests {
 
     #[test]
     fn timestamp_buckets_keep_dense_evidence_and_match_a_fresh_replay() {
-        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let now = UNIX_EPOCH + Duration::from_hours(500_000);
         let cutoff = now - REGRET_EVIDENCE_WINDOW;
         let clean = RegretObservation {
             category: "GoCache".to_string(),

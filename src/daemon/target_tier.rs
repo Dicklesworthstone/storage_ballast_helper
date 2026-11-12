@@ -2479,7 +2479,7 @@ pub(super) mod tests {
                 ..DiscoveryLimits::default()
             },
         ));
-        assert_eq!(found, [first.clone()]);
+        assert_eq!(found, std::slice::from_ref(&first));
         found.clear();
         assert!(progress.discover(&root, identity, &[], &mut found, DiscoveryLimits::default(),));
         assert!(found.is_empty(), "EOF must not replay the final candidate");
@@ -3571,7 +3571,10 @@ pub(super) mod tests {
                 tier.last_start.is_some(),
                 "the released, due root was surveyed"
             );
-            assert!(tier.take_forecast_intervention(), "completion covers one observation");
+            assert!(
+                tier.take_forecast_intervention(),
+                "completion covers one observation"
+            );
             assert!(!tier.take_forecast_intervention());
         }
 

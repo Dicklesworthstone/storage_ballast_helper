@@ -13248,8 +13248,7 @@ fn executor_thread_main(
         // In particular, an impossible first candidate must not take a
         // Canary slot from a writable candidate later in this batch.
         if let Some(summary) = retain_planning_write_access(&mut batch.candidates).summary()
-            && last_not_writable_warning
-                .is_none_or(|at| at.elapsed() >= Duration::from_hours(1))
+            && last_not_writable_warning.is_none_or(|at| at.elapsed() >= Duration::from_hours(1))
         {
             last_not_writable_warning = Some(Instant::now());
             eprintln!("[SBH-CONFIG-NOTWRITABLE] {summary}");
@@ -14224,7 +14223,10 @@ mod tests {
         // Isolate the completion path from the ordinary scan-dispatch marker.
         daemon.last_tick_cleanup_ran = false;
         finish_quarantine_worker(daemon);
-        assert!(daemon.last_tick_cleanup_ran, "polling retains possible mutation");
+        assert!(
+            daemon.last_tick_cleanup_ran,
+            "polling retains possible mutation"
+        );
         assert!(!records[0].quarantine_path.exists());
         assert!(records[1].quarantine_path.exists());
         let _ = scan_rx.try_iter().count();
@@ -15835,7 +15837,10 @@ mod tests {
                     .outcome_count(),
                 outcomes,
             );
-            assert_eq!(daemon.mount_monitors[&mount].prediction_scorecard.pending(), 1);
+            assert_eq!(
+                daemon.mount_monitors[&mount].prediction_scorecard.pending(),
+                1
+            );
             assert_eq!(
                 daemon
                     .policy_engine
@@ -15876,7 +15881,10 @@ mod tests {
             outcomes,
             "interrupted or delayed observations cannot invent a prediction label",
         );
-        assert_eq!(daemon.mount_monitors[&mount].prediction_scorecard.pending(), 0);
+        assert_eq!(
+            daemon.mount_monitors[&mount].prediction_scorecard.pending(),
+            0
+        );
         assert!(!daemon.last_tick_cleanup_ran);
         assert_eq!(daemon.release_controller.release_efficiency(&mount), 1.0);
         let actual_rate = daemon.mount_monitors[&mount]
@@ -15954,7 +15962,8 @@ mod tests {
                 .evaluate_pressure_samples(HashMap::from([(mount.clone(), sample.clone())]), start)
                 .unwrap();
             assert!(
-                daemon.mount_monitors
+                daemon
+                    .mount_monitors
                     .get_mut(&mount)
                     .unwrap()
                     .prediction_scorecard
@@ -16060,7 +16069,10 @@ mod tests {
             );
         }
         assert!(daemon.last_predictive_action.should_cleanup());
-        assert_eq!(daemon.mount_monitors[&mount].prediction_scorecard.pending(), 1);
+        assert_eq!(
+            daemon.mount_monitors[&mount].prediction_scorecard.pending(),
+            1
+        );
     }
 
     #[cfg(unix)]
@@ -16116,7 +16128,10 @@ mod tests {
                 .resolved_forecasts(),
             0,
         );
-        assert_eq!(daemon.mount_monitors[&mount].prediction_scorecard.pending(), 1);
+        assert_eq!(
+            daemon.mount_monitors[&mount].prediction_scorecard.pending(),
+            1
+        );
         assert_eq!(
             daemon.mount_monitors[&peer_mount]
                 .prediction_scorecard
@@ -16170,7 +16185,10 @@ mod tests {
                 peer.collected_at,
             )
             .unwrap();
-        assert_eq!(daemon.mount_monitors[&mount].prediction_scorecard.pending(), 0);
+        assert_eq!(
+            daemon.mount_monitors[&mount].prediction_scorecard.pending(),
+            0
+        );
         assert_eq!(
             daemon.mount_monitors[&mount]
                 .prediction_scorecard
@@ -17816,9 +17834,18 @@ mod tests {
                     held,
                     "{change}, cap_only={cap_only}"
                 );
+                // A shutdown cancels the sweep before it visits a root, and a
+                // cancelled sweep publishes no held total (bd-v8kx); the entry
+                // itself stays intact, as checked below.
+                let expected_held = match change {
+                    "shutdown" => None,
+                    "unchanged" => Some(&0),
+                    _ => Some(&11),
+                };
                 assert_eq!(
                     daemon.quarantine_held.get(&mount),
-                    Some(&if held { 11 } else { 0 })
+                    expected_held,
+                    "{change}, cap_only={cap_only}"
                 );
                 if held {
                     assert_eq!(
@@ -17972,6 +17999,7 @@ mod tests {
                             ..PolicyConfig::default()
                         });
                     }
+                    drop(policy);
                     fixture
                         .daemon
                         .shared_executor_config
@@ -18070,24 +18098,30 @@ mod tests {
                     .as_ref()
                     .map_or(8, RamReclaimRequest::remaining_bytes);
                 let store = QuarantineStore::under(&mount);
-                let records: Vec<_> = ["a-legacy", "b-approved", "c-later"]
-                    .into_iter()
-                    .map(|id| {
-                        let source = mount.join(id);
-                        std::fs::write(&source, b"retained").unwrap();
-                        store
-                            .quarantine(
-                                &source,
-                                id,
-                                allowance,
-                                Duration::from_hours(24),
-                                (id != "a-legacy").then(
-                                    || json!({"category": "RustTarget", "certainty": "Definite"}),
-                                ),
-                            )
-                            .unwrap()
-                    })
-                    .collect();
+                // Real-format decision ids (in the same order): a purge receipt
+                // with a malformed id is not trusted back from the log.
+                let records: Vec<_> = [
+                    ("a-legacy", "a00000000001"),
+                    ("b-approved", "b00000000002"),
+                    ("c-later", "c00000000003"),
+                ]
+                .into_iter()
+                .map(|(name, id)| {
+                    let source = mount.join(name);
+                    std::fs::write(&source, b"retained").unwrap();
+                    store
+                        .quarantine(
+                            &source,
+                            id,
+                            allowance,
+                            Duration::from_hours(24),
+                            (name != "a-legacy").then(
+                                || json!({"category": "RustTarget", "certainty": "Definite"}),
+                            ),
+                        )
+                        .unwrap()
+                })
+                .collect();
                 assert!(store.root().join(".sbh-protect").exists());
                 let other_source = other.join("held.o");
                 std::fs::write(&other_source, b"unrelated").unwrap();
@@ -18625,7 +18659,7 @@ mod tests {
                     Some(&if recovered { 16 } else { 8 }),
                 );
                 if let Some(relief) = tick.inode_reclaim {
-                    assert_eq!(relief.remaining_artifacts(), if recovered { 1 } else { 0 });
+                    assert_eq!(relief.remaining_artifacts(), usize::from(recovered));
                 }
                 if let Some(relief) = tick.ram_reclaim {
                     assert_eq!(relief.remaining_bytes(), if recovered { 8 } else { 0 });
@@ -18716,6 +18750,7 @@ mod tests {
                     );
                 }
                 assert!(calibrator.suspended("GoCache", Instant::now()));
+                drop(calibrator);
             }
             let mut tick = quarantine_tick(PressureLevel::Critical, &mount);
             tick.filesystem_response.level = PressureLevel::Green;
@@ -19629,8 +19664,15 @@ mod tests {
                 "fullness alone would not alert"
             );
             assert_eq!(request.pressure_level, PressureLevel::Red);
+            // The alert keeps the long-standing special-location scope: an
+            // independent location plus the configured roots
+            // (special_location_scan_roots). Learning a rate adds nothing.
+            let mut existing_scope = special_location_scan_roots(&special, &configured_roots);
+            for root in &configured_roots {
+                push_unique_path(&mut existing_scope, root.clone());
+            }
             assert_eq!(
-                request.paths, configured_roots,
+                request.paths, existing_scope,
                 "observation adds no cleanup roots"
             );
         }
@@ -19685,6 +19727,21 @@ mod tests {
             .unwrap()
             .mount_point
             .clone();
+        // The mock mount is "/", and stranded-reserve discovery reads the real
+        // legacy locations (/root, /home/*, /Users/*, /var/lib/sbh) on that
+        // device. A host reserve there satisfies the pool, so growth never
+        // reaches the armed probe, and the Orange tick below would release
+        // real files first. Skip on such a host.
+        let foreign = daemon
+            .ballast_coordinator
+            .pool_for_mount(&mount)
+            .map_or(0, crate::ballast::coordinator::BallastPool::available_count);
+        if foreign > 0 {
+            eprintln!(
+                "skipped: {foreign} ballast file(s) from a real reserve on this device are visible to the fixture's pool"
+            );
+            return;
+        }
         daemon
             .release_controller
             .observe_level(&mount, PressureLevel::Green);
@@ -20078,6 +20135,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn live_regret_history_imports_manual_work_and_excludes_its_own_writer() {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("activity.sqlite3");
@@ -20258,8 +20316,12 @@ mod tests {
             let calibrator = regret.calibrator.lock();
             assert_eq!(calibrator.summary("GoCache").unwrap().decisions, 3);
             assert!(!calibrator.suspended("GoCache", first));
-            assert!(calibrator.suspended("ExistingAlarm", alarm_deadline - Duration::from_secs(1)));
+            assert!(calibrator.suspended(
+                "ExistingAlarm",
+                alarm_deadline.checked_sub(Duration::from_secs(1)).unwrap()
+            ));
             assert!(!calibrator.suspended("ExistingAlarm", alarm_deadline));
+            drop(calibrator);
         }
 
         // A rotated/restored copy can reuse every row ID. Its new inode
@@ -20305,8 +20367,12 @@ mod tests {
         let calibrator = regret.calibrator.lock();
         assert_eq!(calibrator.summary("GoCache").unwrap().decisions, 4);
         assert!(!calibrator.suspended("GoCache", reloaded));
-        assert!(calibrator.suspended("ExistingAlarm", alarm_deadline - Duration::from_secs(1)));
+        assert!(calibrator.suspended(
+            "ExistingAlarm",
+            alarm_deadline.checked_sub(Duration::from_secs(1)).unwrap()
+        ));
         assert!(!calibrator.suspended("ExistingAlarm", alarm_deadline));
+        drop(calibrator);
     }
 
     #[cfg(unix)]
@@ -22266,6 +22332,7 @@ mod tests {
             }
             assert!(!calibrator.suspended("RustTarget", Instant::now()));
             assert!(calibrator.calibrations()["RustTarget"] < 0.4);
+            drop(calibrator);
         }
 
         let learned = feedback_batch(&fixture.daemon.target_tier, &root, &config).unwrap();
@@ -22902,9 +22969,12 @@ mod tests {
         };
         let report =
             executor.execute_with_hooks(&plan, None, Some(&authorize), Some(&add_user_data));
+        // first passes the guard and its renewal before the unlink (bd-h7ya);
+        // held passes the guard, then fails the final content inspection,
+        // which runs before the renewal.
         assert_eq!(
             authorizations.get(),
-            2,
+            3,
             "both candidates reached the live guard"
         );
         assert_eq!(report.deleted_paths, vec![first]);
@@ -23213,7 +23283,7 @@ mod tests {
         let mut suspended = valid.clone();
         suspended.decision.category_suspended = true;
         let candidates = vec![
-            valid.clone(),
+            valid,
             zero_file,
             missing_identity,
             other_device,
@@ -23309,7 +23379,7 @@ mod tests {
             .map(|(index, path)| {
                 std::fs::create_dir_all(path).unwrap();
                 let mut candidate =
-                    test_candidate(&path.to_string_lossy(), 1.0 - index as f64 * 0.01);
+                    test_candidate(&path.to_string_lossy(), (index as f64).mul_add(-0.01, 1.0));
                 candidate.size_bytes = 0;
                 candidate.identity = crate::scanner::walker::identity_for_path(path, false).ok();
                 candidate
@@ -23584,7 +23654,9 @@ mod tests {
         };
         let report = executor.execute_with_guard(&plan, None, Some(&authorize));
 
-        assert_eq!(checks.get(), 3);
+        // first and other pass the initial guard and its renewal right before
+        // their unlink (bd-h7ya); held is refused at its first check.
+        assert_eq!(checks.get(), 5);
         assert_eq!(report.items_deleted, 2);
         assert_eq!(report.items_skipped, 1);
         assert_eq!(report.items_failed, 0);
@@ -23704,8 +23776,11 @@ mod tests {
                 .collect();
             let first_completed = Cell::new(None);
             let later_completed = Cell::new(None);
+            // The guard runs again right before each mutation (bd-h7ya);
+            // recreate and resolve only at later's first authorization.
+            let recreated = Cell::new(false);
             let authorize = |candidate: &CandidacyScore| {
-                if candidate.path == later {
+                if candidate.path == later && !recreated.replace(true) {
                     let completed_at = first_completed
                         .get()
                         .expect("first unlink completes before the next authorization");

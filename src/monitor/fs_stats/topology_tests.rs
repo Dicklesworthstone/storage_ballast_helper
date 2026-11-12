@@ -239,6 +239,7 @@ fn inconsistent_capacity_is_not_cached_and_a_recovered_read_is_fresh() {
             } else {
                 reading.free_bytes = reading.total_bytes + 1;
             }
+            drop(readings);
         }
         let error = collector.collect_sample(&path).unwrap_err();
         assert!(

@@ -864,9 +864,9 @@ impl PredictionScorecard {
             || self
                 .last_enrolled_at
                 .is_some_and(|previous| issued_at <= previous)
-            || !self.last_observation.is_some_and(|observation| {
-                observation.at == issued_at && !observation.reached_red
-            })
+            || !self
+                .last_observation
+                .is_some_and(|observation| observation.at == issued_at && !observation.reached_red)
         {
             return false;
         }
@@ -1825,14 +1825,15 @@ mod tests {
             assert!(scorecard.enroll(start, Duration::from_secs(60)));
             scorecard.observe(start + Duration::from_secs(crossed_at), 100, true, gap);
             assert_eq!(scorecard.pending(), 0);
-            assert_eq!(scorecard.resolved_forecasts(), usize::from(crossed_at <= 60));
-            assert!(scorecard.false_alarm_rate().abs() < f64::EPSILON);
-            assert!(
-                !scorecard.enroll(
-                    start + Duration::from_secs(crossed_at),
-                    Duration::from_secs(60),
-                )
+            assert_eq!(
+                scorecard.resolved_forecasts(),
+                usize::from(crossed_at <= 60)
             );
+            assert!(scorecard.false_alarm_rate().abs() < f64::EPSILON);
+            assert!(!scorecard.enroll(
+                start + Duration::from_secs(crossed_at),
+                Duration::from_secs(60),
+            ));
         }
     }
 

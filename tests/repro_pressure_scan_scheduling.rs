@@ -369,7 +369,7 @@ fn canceling_after_one_received_result_rotates_nested_branches_and_leaves() {
     for branch in &branches {
         leaves.extend(child_fixture(branch, 32));
     }
-    let config = slice_config(vec![root.clone()]);
+    let config = slice_config(vec![root]);
     let (_, unfinished) = finite_slice(config.clone(), 8, |_| false);
     assert!(!unfinished.is_empty());
     let mut seen = BTreeSet::new();

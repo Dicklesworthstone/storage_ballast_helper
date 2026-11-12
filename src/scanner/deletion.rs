@@ -1898,8 +1898,7 @@ pub fn mount_write_state_in(mountinfo: &str, path: &Path) -> Option<MountWriteSt
 /// mount entry contains `path`.
 #[must_use]
 pub fn read_only_bind_in(mountinfo: &str, path: &Path) -> Option<bool> {
-    mount_write_state_in(mountinfo, path)
-        .map(|state| state == MountWriteState::NamespaceReadOnly)
+    mount_write_state_in(mountinfo, path).map(|state| state == MountWriteState::NamespaceReadOnly)
 }
 
 /// A positively observed access refusal, not uncertain filesystem evidence.
@@ -3372,6 +3371,7 @@ mod tests {
                     .is_ok()
             );
             assert!(!*quarantined);
+            drop(events);
         }
     }
 
@@ -3445,6 +3445,7 @@ mod tests {
             };
             assert_eq!(decision_id.as_deref(), Some(id.as_str()));
             assert!(*quarantined, "a rename must not be replayed as an unlink");
+            drop(events);
         }
     }
 
@@ -4453,8 +4454,7 @@ mod tests {
                 safe.clone(),
             ];
             let refused = retain_planning_write_access_with(&mut candidates, |path| {
-                (path == denied || path == protected)
-                    .then_some(PlanningWriteDenial::Permissions)
+                (path == denied || path == protected).then_some(PlanningWriteDenial::Permissions)
             });
             assert_eq!(refused.permissions, 1);
             assert!(
@@ -4899,15 +4899,13 @@ mod tests {
         let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(candidates);
 
-        // Pressure check: resolved after first deletion.
-        let call_count = std::sync::atomic::AtomicU32::new(0);
+        // Pressure check: resolved once the first deletion has happened. The
+        // executor consults it before each candidate and again right before
+        // the mutation (bd-h7ya), so key it on state, not on a call count.
+        let first = plan.candidates[0].path.clone();
         let report = executor.execute(
             &plan,
-            Some(&|_path| {
-                let count = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Resolved after first
-                (count >= 1).then_some(SkipReason::TargetFreeReached)
-            }),
+            Some(&|_path| (!first.exists()).then_some(SkipReason::TargetFreeReached)),
         );
 
         // Should delete 1, then stop.

@@ -1597,7 +1597,10 @@ pub(super) mod tests {
         if !finished_before_observation {
             observe(&mut pass.tier, true);
         }
-        assert!(!pass.tier.take_forecast_intervention(), "completion was observed");
+        assert!(
+            !pass.tier.take_forecast_intervention(),
+            "completion was observed"
+        );
     }
 
     #[test]
