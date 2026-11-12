@@ -24,6 +24,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   failures still reach the executor's recovery handling. Protection is resolved
   across the full path/identity graph before access filtering removes evidence.
 
+- **Doctor and status expose missing installed service write grants.**
+  The service scope check compares configured cleanup roots, enabled reserve
+  paths and visible catalog roots with literal `ReadWritePaths` grants. Human
+  and JSON output identify the unit and selected configuration. Unreadable or
+  malformed units, unsupported namespaces and unexpanded root patterns remain
+  unknown; installed-file coverage is never presented as live write access.
+
 - **Saturated scan queues preserve emergency work and fair mount turns.**
   Frequent special-location alerts can no longer discard queued Critical
   recovery, operator scans or configuration updates. Automatic refreshes

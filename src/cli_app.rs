@@ -4310,8 +4310,284 @@ fn run_service(cli: &Cli, args: &ServiceArgs) -> Result<(), CliError> {
     }
 }
 
+/// Paths whose cleanup or reserve configuration needs a literal service grant.
+/// Catalog expansion is supplied by the caller so this comparison stays testable.
+fn service_scope_roots(config: &Config, catalog: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = config.scanner.root_paths.clone();
+    roots.extend(config.scanner.target_only_roots.iter().cloned());
+    if config.scanner.catalog_roots_on_pressured_device {
+        roots.extend_from_slice(catalog);
+    }
+    if config.ballast.file_count > 0 {
+        roots.push(config.paths.ballast_dir.clone());
+    }
+    for (mount, volume) in &config.ballast.overrides {
+        if volume.enabled && volume.file_count.unwrap_or(config.ballast.file_count) > 0 {
+            roots.push(Path::new(mount).join(".sbh"));
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn service_scope_sandbox(
+    texts: &[String],
+) -> Result<storage_ballast_helper::daemon::service::ServiceSandbox, String> {
+    use storage_ballast_helper::daemon::service::{
+        ServiceSandbox, SystemdConfig, parse_unit_directives,
+    };
+    let malformed = texts.iter().any(|text| {
+        // Each file starts outside every section. Joining first would let a
+        // malformed drop-in borrow [Service] from the previous file.
+        let mut section_seen = false;
+        text.lines().any(|raw| {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                return false;
+            }
+            if line.ends_with('\\') {
+                return true;
+            }
+            if let Some(header) = line.strip_prefix('[') {
+                section_seen = header.strip_suffix(']').is_some_and(|name| {
+                    !name.trim().is_empty() && !name.contains(['[', ']'])
+                });
+                return !section_seen;
+            }
+            !section_seen
+                || line.split_once('=').is_none_or(|(key, _)| key.trim().is_empty())
+        })
+    });
+    if texts.is_empty() || malformed {
+        return Err("missing, malformed or unsupported unit-file syntax".to_string());
+    }
+    let directives = parse_unit_directives(&texts.join("\n"));
+    if !directives.keys().any(|key| key.starts_with("Service/"))
+        || directives
+            .get("Service/ProtectSystem")
+            .and_then(|values| values.last())
+            .is_some_and(|value| {
+                !matches!(
+                    value.as_str(),
+                    "strict" | "full" | "true" | "false" | "yes" | "no" | "1" | "0"
+                )
+            })
+    {
+        return Err("missing Service section or unrecognized ProtectSystem value".to_string());
+    }
+    for key in [
+        "RootDirectory",
+        "RootImage",
+        "BindPaths",
+        "BindReadOnlyPaths",
+        "TemporaryFileSystem",
+        "ReadOnlyPaths",
+        "InaccessiblePaths",
+    ] {
+        if directives
+            .get(&format!("Service/{key}"))
+            .is_some_and(|values| !values.is_empty())
+        {
+            return Err(format!("custom {key} needs namespace inspection"));
+        }
+    }
+    for value in directives.get("Service/ReadWritePaths").into_iter().flatten() {
+        if SystemdConfig::parse_read_write_paths(value).is_empty() {
+            return Err("ReadWritePaths has unresolved or invalid syntax".to_string());
+        }
+    }
+    Ok(ServiceSandbox::from_unit_texts(texts))
+}
+
+/// Compare installed file evidence only; this never proves live write access.
+fn service_scope_check(
+    unit_path: &Path,
+    config: &Config,
+    texts: Result<Vec<String>, String>,
+    catalog: &[PathBuf],
+) -> DoctorCheck {
+    let comparison = (|| {
+        let sandbox = service_scope_sandbox(&texts?)?;
+        let roots = service_scope_roots(config, catalog);
+        if roots.iter().chain(&sandbox.writable).any(|path| {
+            !path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+        }) {
+            return Err("relative or parent-traversing paths need resolution".to_string());
+        }
+        let (patterns, literal): (Vec<_>, Vec<_>) = roots
+            .into_iter()
+            .partition(|path| path.to_string_lossy().contains(['*', '?', '[', '{']));
+        let missing: Vec<_> = literal
+            .into_iter()
+            .filter(|path| sandbox.denies_write(path))
+            .collect();
+        Ok((sandbox.strict, missing, patterns))
+    })();
+    let prefix = format!(
+        "evidence=installed_unit; {} compared with config {}",
+        unit_path.display(),
+        config.paths.config_file.display()
+    );
+    let paths_text = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let caveat = "local installed files and caller-visible catalog only; \
+                  loaded unit, aliases, ACLs and live filesystem writability are unverified";
+    let (status, detail) = match comparison {
+        Err(error) => ("WARN", format!("scope unknown: {error}")),
+        Ok((false, _, _)) => (
+            "PASS",
+            "installed-grant check not applicable: ProtectSystem=strict is not set".to_string(),
+        ),
+        Ok((true, missing, patterns)) => {
+            let detail = if missing.is_empty() {
+                "no missing literal ReadWritePaths grants for the compared paths".to_string()
+            } else {
+                format!(
+                    "ProtectSystem=strict has no literal ReadWritePaths grant covering: {}",
+                    paths_text(&missing)
+                )
+            };
+            if patterns.is_empty() {
+                (if missing.is_empty() { "PASS" } else { "WARN" }, detail)
+            } else {
+                (
+                    "WARN",
+                    format!(
+                        "{detail}; scope unknown for unexpanded patterns: {} (not grant paths)",
+                        paths_text(&patterns)
+                    ),
+                )
+            }
+        }
+    };
+    doctor_check(
+        "service-reclaim-scope",
+        "Service cleanup and reserve scope",
+        status,
+        format!("{prefix}; {detail}; {caveat}"),
+        (status == "WARN").then(|| {
+            "Review the named config, sbh.service and its drop-ins, then inspect the loaded \
+             service namespace before choosing exact grants. This check changes no unit or \
+             permissions."
+                .to_string()
+        }),
+    )
+}
+
+fn read_service_scope_texts(
+    systemd: &storage_ballast_helper::daemon::service::SystemdConfig,
+) -> Result<Vec<String>, String> {
+    let unit_path = systemd.unit_path();
+    let mut texts = vec![std::fs::read_to_string(&unit_path)
+        .map_err(|error| format!("cannot read {}: {error}", unit_path.display()))?];
+    // A read error is unknown evidence, never an absent grant. Apply lists in
+    // name order; the control directory has precedence for duplicate names.
+    let mut dropins = std::collections::BTreeMap::new();
+    for dir in systemd.dropin_dirs() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("cannot inspect {}: {error}", dir.display())),
+        };
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| format!("cannot inspect {}: {error}", dir.display()))?;
+            if entry.path().extension().is_some_and(|ext| ext == "conf") {
+                dropins.insert(entry.file_name(), entry.path());
+            }
+        }
+    }
+    for path in dropins.values() {
+        texts.push(
+            std::fs::read_to_string(path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
+        );
+    }
+    Ok(texts)
+}
+
+fn installed_service_scope_check(
+    platform: &dyn Platform,
+    config: &Config,
+    scope: Option<bool>,
+) -> Option<DoctorCheck> {
+    use storage_ballast_helper::daemon::service::SystemdConfig;
+    use storage_ballast_helper::platform::cleanup_catalog;
+    if platform.service_kind() != ServiceKind::Systemd {
+        return None;
+    }
+    // Unit tests must not discover an unrelated host service.
+    if cfg!(test)
+        || (std::env::var_os("SBH_TEST_MODE").is_some()
+            && std::env::var_os("SBH_SYSTEMD_UNIT_DIR").is_none())
+    {
+        return None;
+    }
+    let preferred = scope.unwrap_or_else(|| !running_as_root());
+    let systemd = SystemdConfig::from_env(preferred)
+        .map_err(|error| error.to_string())
+        .and_then(|candidate| {
+            let path = candidate.unit_path();
+            if scope.is_some()
+                || path
+                    .try_exists()
+                    .map_err(|error| format!("{}: {error}", path.display()))?
+            {
+                return Ok(candidate);
+            }
+            let other = SystemdConfig::from_env(!preferred).map_err(|error| error.to_string())?;
+            let path = other.unit_path();
+            Ok(if path
+                .try_exists()
+                .map_err(|error| format!("{}: {error}", path.display()))?
+            {
+                other
+            } else {
+                candidate
+            })
+        });
+    let systemd = match systemd {
+        Ok(systemd) => systemd,
+        Err(error) => {
+            return Some(service_scope_check(
+                Path::new("sbh.service"),
+                config,
+                Err(format!("cannot resolve installed service: {error}")),
+                &[],
+            ));
+        }
+    };
+    let catalog = if config.scanner.catalog_roots_on_pressured_device {
+        let homes = cleanup_catalog::user_homes(&platform.user_home());
+        cleanup_catalog::expand_catalog_roots(cleanup_catalog::CATALOG_ROOTS, &homes)
+            .into_iter()
+            .map(|root| root.path)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(service_scope_check(
+        &systemd.unit_path(),
+        config,
+        read_service_scope_texts(&systemd),
+        &catalog,
+    ))
+}
+
 /// `doctor --service`: the installed unit against what sbh generates.
-fn service_doctor_checks(user_scope_requested: bool) -> Result<Vec<DoctorCheck>, CliError> {
+fn service_doctor_checks(
+    cli: &Cli,
+    user_scope_requested: bool,
+) -> Result<Vec<DoctorCheck>, CliError> {
     use storage_ballast_helper::daemon::service::SystemdServiceManager;
 
     let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -4367,13 +4643,21 @@ fn service_doctor_checks(user_scope_requested: bool) -> Result<Vec<DoctorCheck>,
         }
     };
 
-    Ok(unit_drift_checks(
+    let mut checks = unit_drift_checks(
         &drift,
         &unit_path,
         user_scope,
         &manager.config().binary_path,
         &reinstall,
-    ))
+    );
+    let config = Config::load(cli.config.as_deref())
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    checks.extend(installed_service_scope_check(
+        platform.as_ref(),
+        &config,
+        Some(user_scope),
+    ));
+    Ok(checks)
 }
 
 /// The `doctor --service` checks for a computed drift: unit present,
@@ -8125,7 +8409,7 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
     }
     let env_checks = args.env.then(env_doctor_checks);
     let service_checks = if args.service {
-        Some(service_doctor_checks(args.user)?)
+        Some(service_doctor_checks(cli, args.user)?)
     } else {
         None
     };
@@ -8240,6 +8524,7 @@ fn system_doctor_checks(
     checks.extend(reserve_coverage_doctor_checks(config, bursts, pools));
     checks.push(logging_placement_doctor_check(platform, config, pools));
     checks.extend(reclaim_capability_doctor_checks(config));
+    checks.extend(installed_service_scope_check(platform, config, None));
     checks.extend(scanner_privilege_doctor_check(
         platform.name(),
         reclaimer_is_root(&config.paths.state_file),
@@ -10223,6 +10508,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
     let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
     let version = env!("CARGO_PKG_VERSION");
+    let service_scope = installed_service_scope_check(platform.as_ref(), &config, None);
 
     // Gather filesystem stats for all root paths + standard mounts.
     let mounts = platform
@@ -10323,6 +10609,15 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     "  Daemon: NOT running ({}, {age}) — degraded mode",
                     liveness.reason
                 );
+            }
+
+            if let Some(check) = &service_scope
+                && check.status == "WARN"
+            {
+                println!("\nService scope WARNING: {}", check.message);
+                if let Some(remediation) = &check.remediation {
+                    println!("  {remediation}");
+                }
             }
 
             // Pressure status table.
@@ -10878,6 +11173,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     .and_then(|state| state.get("policy").cloned())
                     .unwrap_or(Value::Null),
             "config_path": config.paths.config_file.to_string_lossy(),
+            "service_scope": service_scope,
             "pressure": {
                 "mounts": mounts_json,
                 "overall": overall_level,
@@ -18651,6 +18947,193 @@ mod tests {
             "tap failure should explain default branch mismatch: {}",
             tap.message
         );
+    }
+
+    fn service_scope_fixture_config() -> Config {
+        let mut config = Config::default();
+        config.paths.config_file = PathBuf::from("/fixture/config.toml");
+        config.scanner.root_paths = vec![PathBuf::from("/data/artifacts")];
+        config.scanner.target_only_roots.clear();
+        config.scanner.catalog_roots_on_pressured_device = false;
+        config.ballast.file_count = 0;
+        config.ballast.overrides.clear();
+        config
+    }
+
+    #[test]
+    fn service_scope_includes_cleanup_catalog_and_enabled_reserves() {
+        use storage_ballast_helper::core::config::BallastVolumeOverride;
+
+        let mut config = service_scope_fixture_config();
+        config.scanner.target_only_roots = vec![PathBuf::from("/scratch/targets")];
+        config.scanner.catalog_roots_on_pressured_device = true;
+        config.ballast.file_count = 2;
+        config.paths.ballast_dir = PathBuf::from("/var/lib/sbh/ballast");
+        config.ballast.overrides.insert(
+            "/volume".to_string(),
+            BallastVolumeOverride::default(),
+        );
+        config.ballast.overrides.insert(
+            "/disabled".to_string(),
+            BallastVolumeOverride {
+                enabled: false,
+                ..BallastVolumeOverride::default()
+            },
+        );
+        config.ballast.overrides.insert(
+            "/zero".to_string(),
+            BallastVolumeOverride {
+                file_count: Some(0),
+                ..BallastVolumeOverride::default()
+            },
+        );
+        let catalog = vec![PathBuf::from("/home/builder/.cache/go-build")];
+        let roots = service_scope_roots(&config, &catalog);
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/data/artifacts"),
+                PathBuf::from("/home/builder/.cache/go-build"),
+                PathBuf::from("/scratch/targets"),
+                PathBuf::from("/var/lib/sbh/ballast"),
+                PathBuf::from("/volume/.sbh"),
+            ]
+        );
+        config.scanner.catalog_roots_on_pressured_device = false;
+        config.ballast.file_count = 0;
+        config.ballast.overrides.get_mut("/volume").unwrap().file_count = Some(1);
+        let roots = service_scope_roots(&config, &catalog);
+        assert!(!roots.contains(&catalog[0]));
+        assert!(!roots.contains(&config.paths.ballast_dir));
+        assert!(roots.contains(&PathBuf::from("/volume/.sbh")));
+    }
+
+    #[test]
+    fn service_scope_reports_exact_missing_paths_without_prefix_confusion() {
+        let mut config = service_scope_fixture_config();
+        config.scanner.root_paths.push(PathBuf::from("/data/artifacts-other"));
+        config.scanner.target_only_roots.push(PathBuf::from("/scratch/targets"));
+        let check = service_scope_check(
+            Path::new("/etc/systemd/system/sbh.service"),
+            &config,
+            Ok(vec![
+                "[Service]\nProtectSystem=strict\nReadWritePaths=-/data/artifacts\n".into(),
+            ]),
+            &[],
+        );
+        assert_eq!(check.status, "WARN");
+        assert!(check.message.contains("evidence=installed_unit"));
+        assert!(check.message.contains("/etc/systemd/system/sbh.service"));
+        assert!(check.message.contains("/fixture/config.toml"));
+        assert!(
+            check.message.contains("covering: /data/artifacts-other, /scratch/targets")
+        );
+        assert!(check.message.contains("live filesystem writability are unverified"));
+        assert!(!doctor_checks_have_failures(&[check]));
+    }
+
+    #[test]
+    fn service_scope_obeys_dropin_reset_and_later_ancestor_grant() {
+        let config = service_scope_fixture_config();
+        let unit = "[Service]\nProtectSystem=strict\nReadWritePaths=/data\n".to_string();
+        let narrowed = "[Service]\nReadWritePaths=\nReadWritePaths=/tmp\n".to_string();
+        let denied = service_scope_check(
+            Path::new("/etc/systemd/system/sbh.service"),
+            &config,
+            Ok(vec![unit.clone(), narrowed.clone()]),
+            &[],
+        );
+        assert_eq!(denied.status, "WARN");
+        assert!(denied.message.contains("covering: /data/artifacts"));
+        let covered = service_scope_check(
+            Path::new("/etc/systemd/system/sbh.service"),
+            &config,
+            Ok(vec![unit, narrowed, "[Service]\nReadWritePaths=/data\n".into()]),
+            &[],
+        );
+        assert_eq!(covered.status, "PASS");
+        assert!(covered.message.contains("no missing literal ReadWritePaths"));
+        assert!(covered.message.contains("loaded unit, aliases, ACLs"));
+    }
+
+    #[test]
+    fn service_scope_keeps_unreadable_or_unresolved_units_unknown() {
+        let config = service_scope_fixture_config();
+        let fixtures = [
+            Err("cannot read a drop-in: Permission denied".to_string()),
+            Ok(Vec::new()),
+            Ok(vec![String::new()]),
+            Ok(vec!["[Service]\nProtectSystem=strict\nReadWritePaths=%h/cache\n".into()]),
+            Ok(vec![
+                "[Service]\nProtectSystem=strict\nReadWritePaths=/data \\\n /scratch\n".into(),
+            ]),
+            Ok(vec!["[Service]\nProtectSystem=strict\nRootDirectory=/image\n".into()]),
+            Ok(vec!["[Service]\nProtectSystem=unresolved\n".into()]),
+            Ok(vec!["[Service\nProtectSystem=strict\nReadWritePaths=/data\n".into()]),
+            Ok(vec!["[Service]\nProtectSystem=strict\nReadWritePaths /data\n".into()]),
+        ];
+        for texts in fixtures {
+            let check = service_scope_check(
+                Path::new("/etc/systemd/system/sbh.service"),
+                &config,
+                texts,
+                &[],
+            );
+            assert_eq!(check.status, "WARN", "{}", check.message);
+            assert!(check.message.contains("scope unknown"), "{}", check.message);
+            assert!(!check.message.contains("has no literal ReadWritePaths grant covering"));
+        }
+    }
+
+    #[test]
+    fn service_scope_dropin_cannot_inherit_previous_files_section() {
+        let config = service_scope_fixture_config();
+        let check = service_scope_check(
+            Path::new("/etc/systemd/system/sbh.service"),
+            &config,
+            Ok(vec![
+                "[Service]\nProtectSystem=strict\nReadWritePaths=/tmp\n".into(),
+                "ReadWritePaths=/data\n".into(),
+            ]),
+            &[],
+        );
+        assert_eq!(check.status, "WARN");
+        assert!(check.message.contains("scope unknown"));
+        assert!(!check.message.contains("no missing literal ReadWritePaths"));
+    }
+
+    #[test]
+    fn service_scope_patterns_remain_unknown_without_hiding_literal_gaps() {
+        let mut config = service_scope_fixture_config();
+        config.scanner.target_only_roots.push(PathBuf::from("/data/tmp/claude-*"));
+        let check = service_scope_check(
+            Path::new("/etc/systemd/system/sbh.service"),
+            &config,
+            Ok(vec!["[Service]\nProtectSystem=strict\nReadWritePaths=/tmp\n".into()]),
+            &[],
+        );
+        assert_eq!(check.status, "WARN");
+        assert!(check.message.contains("covering: /data/artifacts;"));
+        assert!(check.message.contains(
+            "scope unknown for unexpanded patterns: /data/tmp/claude-* (not grant paths)"
+        ));
+    }
+
+    #[test]
+    fn service_scope_not_strict_is_not_a_write_access_claim() {
+        let config = service_scope_fixture_config();
+        let check = service_scope_check(
+            Path::new("/etc/systemd/system/sbh.service"),
+            &config,
+            Ok(vec![
+                "[Service]\nProtectSystem=strict\n".into(),
+                "[Service]\nProtectSystem=false\n".into(),
+            ]),
+            &[],
+        );
+        assert_eq!(check.status, "PASS");
+        assert!(check.message.contains("installed-grant check not applicable"));
+        assert!(check.message.contains("live filesystem writability are unverified"));
     }
 
     #[test]
