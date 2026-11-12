@@ -64,7 +64,11 @@ pub fn partition_batch(
     optimization::partition_batch(admit_candidates(candidates), request)
 }
 
-fn admit_candidates(candidates: Vec<CandidacyScore>) -> Vec<CandidacyScore> {
+/// Enforce all supplied safety vetoes before discarding any observation.
+/// Even an otherwise ineligible observation can connect identity aliases
+/// needed to protect a descendant. Call this on the complete observation
+/// set before filtering by write access, eligibility, or ranking.
+pub(crate) fn admit_candidates(candidates: Vec<CandidacyScore>) -> Vec<CandidacyScore> {
     if !candidates.iter().any(hard_veto) {
         return candidates;
     }

@@ -93,6 +93,7 @@ use crate::platform::types::{
 };
 use crate::scanner::deletion::{
     DeletionConfig, DeletionExecutor, DeletionMode, FreedBasis, SkipReason,
+    retain_planning_write_access,
 };
 use crate::scanner::engine::{ScannerEngine, SelectedScannerEngine};
 use crate::scanner::events::{
@@ -9710,6 +9711,11 @@ fn dispatch_top_candidates(
     let max_items = request
         .max_delete_batch
         .min(executor_config.max_batch_size.load(Ordering::Relaxed));
+    // A sandbox-denied target must not satisfy the byte target and stop
+    // discovery before a writable alternative is reached.
+    if let Some(summary) = retain_planning_write_access(scored).summary() {
+        eprintln!("[SBH-SCANNER] {summary}");
+    }
     // Give the planner every buffered observation before limiting the queue
     // batch. A composite-score prefix can spend the entire batch on tiny
     // artifacts and hide a lower-scored, lower-risk target-covering choice.
@@ -13217,6 +13223,25 @@ fn executor_thread_main(
             Duration::from_secs(shared_config.repeat_base_cooldown_secs()),
             Duration::from_secs(shared_config.repeat_max_cooldown_secs()),
         );
+
+        // Renew write-surface admission on the executor worker before policy
+        // evaluation: queued paths may have lost permission since discovery.
+        // In particular, an impossible first candidate must not take a
+        // Canary slot from a writable candidate later in this batch.
+        if let Some(summary) = retain_planning_write_access(&mut batch.candidates).summary()
+            && last_not_writable_warning
+                .is_none_or(|at| at.elapsed() >= Duration::from_hours(1))
+        {
+            last_not_writable_warning = Some(Instant::now());
+            eprintln!("[SBH-CONFIG-NOTWRITABLE] {summary}");
+            logger.send(ActivityEvent::Warning {
+                code: "SBH-CONFIG-NOTWRITABLE".to_string(),
+                message: summary,
+            });
+        }
+        if batch.candidates.is_empty() {
+            continue;
+        }
 
         // Gate candidates through the policy engine. The lock is held only for
         // the duration of evaluate() (pure computation, no I/O).

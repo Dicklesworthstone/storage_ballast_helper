@@ -1811,6 +1811,84 @@ fn writability(path: &Path) -> Writability {
     }
 }
 
+/// Write flags of the most specific mount in an observed Linux namespace.
+/// This does not establish directory permissions or authorize a mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountWriteState {
+    /// Both the namespace mount and its superblock permit writes.
+    Writable,
+    /// This namespace made a writable filesystem read-only.
+    NamespaceReadOnly,
+    /// The filesystem's superblock is read-only.
+    FilesystemReadOnly,
+}
+
+fn is_resolved_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+}
+
+/// Parsed once per admission group. Ancestor lookups avoid re-parsing and
+/// unescaping a potentially large container namespace for every candidate.
+struct MountTable {
+    mounts: BTreeMap<PathBuf, MountWriteState>,
+}
+
+impl MountTable {
+    fn parse(mountinfo: &str) -> Option<Self> {
+        let read_only = |options: &str| {
+            let ro = options.split(',').any(|option| option == "ro");
+            let rw = options.split(',').any(|option| option == "rw");
+            (ro != rw).then_some(ro)
+        };
+        let mut mounts = BTreeMap::new();
+        for line in mountinfo.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let (mount_fields, super_fields) = line.split_once(" - ")?;
+            let mut fields = mount_fields.split_whitespace();
+            let mount_point = fields.nth(4)?;
+            let mount_options = fields.next()?;
+            let super_options = super_fields.split_whitespace().nth(2)?;
+            let mount_point =
+                PathBuf::from(crate::relocate::survey::unescape_mountinfo(mount_point));
+            if !is_resolved_absolute(&mount_point) {
+                return None;
+            }
+            let mount_ro = read_only(mount_options)?;
+            let super_ro = read_only(super_options)?;
+            let state = if super_ro {
+                MountWriteState::FilesystemReadOnly
+            } else if mount_ro {
+                MountWriteState::NamespaceReadOnly
+            } else {
+                MountWriteState::Writable
+            };
+            // A later mount at the same point covers the earlier one.
+            mounts.insert(mount_point, state);
+        }
+        Some(Self { mounts })
+    }
+
+    fn state_for(&self, path: &Path) -> Option<MountWriteState> {
+        if !is_resolved_absolute(path) {
+            return None;
+        }
+        path.ancestors()
+            .find_map(|ancestor| self.mounts.get(ancestor).copied())
+    }
+}
+
+/// Classify an absolute, resolved path using a complete mountinfo snapshot.
+/// Malformed entries or contradictory flags make the snapshot unknown.
+#[must_use]
+pub fn mount_write_state_in(mountinfo: &str, path: &Path) -> Option<MountWriteState> {
+    MountTable::parse(mountinfo)?.state_for(path)
+}
+
 /// Whether the mount holding `path` is a read-only bind of this namespace.
 ///
 /// Its mount entry is `ro` while the superblock is `rw`: the bind systemd's
@@ -1820,33 +1898,177 @@ fn writability(path: &Path) -> Writability {
 /// mount entry contains `path`.
 #[must_use]
 pub fn read_only_bind_in(mountinfo: &str, path: &Path) -> Option<bool> {
-    let mut best: Option<(usize, bool)> = None;
-    for line in mountinfo.lines() {
-        // Spaces inside fields are escaped, so " - " only separates the
-        // per-mount fields from fstype, source and the superblock options.
-        let Some((mount_fields, super_fields)) = line.split_once(" - ") else {
-            continue;
-        };
-        let fields: Vec<&str> = mount_fields.split(' ').collect();
-        let super_options = super_fields.split(' ').nth(2);
-        let (Some(mount_point), Some(mount_options), Some(super_options)) =
-            (fields.get(4), fields.get(5), super_options)
-        else {
-            continue;
-        };
-        let mount_point = PathBuf::from(crate::relocate::survey::unescape_mountinfo(mount_point));
-        if !path.starts_with(&mount_point) {
-            continue;
+    mount_write_state_in(mountinfo, path)
+        .map(|state| state == MountWriteState::NamespaceReadOnly)
+}
+
+/// A positively observed access refusal, not uncertain filesystem evidence.
+#[cfg(any(feature = "daemon", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanningWriteDenial {
+    Permissions,
+    NamespaceReadOnly,
+}
+
+/// Bounded diagnostic for an admission group; paths are not retained en masse.
+#[cfg(any(feature = "daemon", test))]
+#[derive(Debug, Default)]
+pub(crate) struct PlanningWriteRefusals {
+    permissions: usize,
+    namespace_read_only: usize,
+    first: Option<PathBuf>,
+}
+
+#[cfg(any(feature = "daemon", test))]
+impl PlanningWriteRefusals {
+    pub(crate) fn summary(&self) -> Option<String> {
+        let count = self.permissions.saturating_add(self.namespace_read_only);
+        (count > 0).then(|| {
+            format!(
+                "held {count} candidate(s) before planning: namespace_read_only={}, \
+                 permission_denied={}; first={}. Inspect the daemon's sandbox \
+                 grants and parent-directory permissions",
+                self.namespace_read_only,
+                self.permissions,
+                self.first
+                    .as_deref()
+                    .map_or_else(String::new, |path| path.display().to_string()),
+            )
+        })
+    }
+}
+
+/// Remove positively unwritable paths before risk/byte and Canary admission.
+/// This is read-only and worker-only: native path probes must not run on the
+/// pressure monitor or while holding policy/configuration locks.
+///
+/// Unknown observations and genuine read-only filesystems remain subject to
+/// fresh executor preflight, which owns the mount-Recovery transition. A
+/// retained candidate has NOT been proved writable or safe to remove.
+#[cfg(any(feature = "daemon", test))]
+pub(crate) fn retain_planning_write_access(
+    candidates: &mut Vec<CandidacyScore>,
+) -> PlanningWriteRefusals {
+    let mountinfo = planning_mountinfo();
+    retain_planning_write_access_in(candidates, mountinfo.as_deref())
+}
+
+#[cfg(any(feature = "daemon", test))]
+fn planning_mountinfo() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+
+        // A truncated namespace table could hide a more specific writable
+        // mount. An oversized or unreadable snapshot is unknown, never a
+        // permission to infer denials from its prefix.
+        const MAX_BYTES: usize = 4 * 1024 * 1024;
+        let limit = u64::try_from(MAX_BYTES).ok()?.checked_add(1)?;
+        let mut reader = fs::File::open("/proc/self/mountinfo").ok()?.take(limit);
+        let mut table = String::new();
+        reader.read_to_string(&mut table).ok()?;
+        drop(reader);
+        (table.len() <= MAX_BYTES).then_some(table)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(any(feature = "daemon", test))]
+fn resolved_mount_state(table: Option<&MountTable>, path: &Path) -> Option<MountWriteState> {
+    let table = table?;
+    let resolved = fs::canonicalize(path).ok()?;
+    table.state_for(&resolved)
+}
+
+#[cfg(any(feature = "daemon", test))]
+fn parent_write_denial(parent: &Path, table: Option<&MountTable>) -> Option<PlanningWriteDenial> {
+    match resolved_mount_state(table, parent) {
+        Some(MountWriteState::NamespaceReadOnly) => {
+            return Some(PlanningWriteDenial::NamespaceReadOnly);
         }
-        let read_only = |options: &str| options.split(',').any(|option| option == "ro");
-        let local = read_only(mount_options) && !read_only(super_options);
-        let depth = mount_point.components().count();
-        // Later lines for the same mount point are mounted over earlier ones.
-        if best.is_none_or(|(best_depth, _)| depth >= best_depth) {
-            best = Some((depth, local));
+        Some(MountWriteState::FilesystemReadOnly) => return None,
+        Some(MountWriteState::Writable) | None => {}
+    }
+    #[cfg(unix)]
+    {
+        use nix::errno::Errno;
+        use nix::unistd::{AccessFlags, access};
+
+        // Unlinking requires both write and search permission on the parent.
+        // EROFS, missing paths and observation failures are deliberately not
+        // relabeled as sandbox drift.
+        if matches!(
+            access(parent, AccessFlags::W_OK | AccessFlags::X_OK),
+            Err(Errno::EACCES | Errno::EPERM)
+        ) {
+            return Some(PlanningWriteDenial::Permissions);
         }
     }
-    best.map(|(_, local)| local)
+    None
+}
+
+#[cfg(any(feature = "daemon", test))]
+fn retain_planning_write_access_in(
+    candidates: &mut Vec<CandidacyScore>,
+    mountinfo: Option<&str>,
+) -> PlanningWriteRefusals {
+    const MAX_PARENTS: usize = 256;
+    let table = mountinfo.and_then(MountTable::parse);
+    let mut parents = BTreeMap::new();
+    retain_planning_write_access_with(candidates, |path| {
+        // A read-only bind may start at the candidate itself even though its
+        // parent is writable. Checking only the parent misses that surface.
+        match resolved_mount_state(table.as_ref(), path) {
+            Some(MountWriteState::NamespaceReadOnly) => {
+                return Some(PlanningWriteDenial::NamespaceReadOnly);
+            }
+            Some(MountWriteState::FilesystemReadOnly) => return None,
+            Some(MountWriteState::Writable) | None => {}
+        }
+        let parent = path.parent()?;
+        if let Some(denial) = parents.get(parent) {
+            return *denial;
+        }
+        if parents.len() >= MAX_PARENTS {
+            parents.clear();
+        }
+        let denial = parent_write_denial(parent, table.as_ref());
+        parents.insert(parent.to_path_buf(), denial);
+        denial
+    })
+}
+
+#[cfg(any(feature = "daemon", test))]
+fn retain_planning_write_access_with(
+    candidates: &mut Vec<CandidacyScore>,
+    mut denial_for: impl FnMut(&Path) -> Option<PlanningWriteDenial>,
+) -> PlanningWriteRefusals {
+    // Close safety vetoes over the COMPLETE identity/path graph first. Even
+    // a denied non-veto candidate can be the alias bridge that protects an
+    // otherwise writable observation of the same tree.
+    *candidates = crate::scanner::planner::admit_candidates(std::mem::take(candidates));
+    let mut refused = PlanningWriteRefusals::default();
+    candidates.retain(|candidate| {
+        if !matches!(
+            candidate.decision.action,
+            DecisionAction::Delete | DecisionAction::Review
+        ) {
+            return true;
+        }
+        let Some(denial) = denial_for(&candidate.path) else {
+            return true;
+        };
+        match denial {
+            PlanningWriteDenial::Permissions => refused.permissions += 1,
+            PlanningWriteDenial::NamespaceReadOnly => refused.namespace_read_only += 1,
+        }
+        refused.first.get_or_insert_with(|| candidate.path.clone());
+        false
+    });
+    refused
 }
 
 /// [`read_only_bind_in`] for this process; false when it cannot be decided,
@@ -4071,6 +4293,283 @@ mod tests {
         }
         let dir = scratch_dir();
         assert_eq!(writability(dir.path()), Writability::Writable);
+    }
+
+    #[test]
+    fn parsed_mount_table_uses_the_nearest_latest_mount() {
+        let table = MountTable::parse(
+            "1 0 0:1 / / rw - ext4 /dev/root rw\n\
+2 1 0:1 / /locked ro - ext4 /dev/root rw\n\
+3 2 0:1 / /locked/open ro - ext4 /dev/root rw\n\
+4 3 0:1 / /locked/open rw - ext4 /dev/root rw\n",
+        )
+        .unwrap();
+        assert_eq!(
+            table.state_for(Path::new("/locked/other/target")),
+            Some(MountWriteState::NamespaceReadOnly)
+        );
+        assert_eq!(
+            table.state_for(Path::new("/locked/open/target")),
+            Some(MountWriteState::Writable)
+        );
+        assert_eq!(
+            table.state_for(Path::new("/locked-other/target")),
+            Some(MountWriteState::Writable)
+        );
+    }
+
+    #[test]
+    fn mount_write_state_rejects_incomplete_namespace_evidence() {
+        let root = "1 0 0:1 / / rw,relatime - ext4 /dev/root rw\n";
+        let table = format!(
+            "{root}\
+2 1 0:1 / /locked ro,relatime - ext4 /dev/root rw\n\
+3 2 0:1 / /locked/open rw,relatime - ext4 /dev/root rw\n\
+4 1 0:2 / /broken ro,relatime - ext4 /dev/broken ro\n"
+        );
+        for (path, expected) in [
+            ("/tmp/a", MountWriteState::Writable),
+            ("/locked/a", MountWriteState::NamespaceReadOnly),
+            ("/locked/open/a", MountWriteState::Writable),
+            ("/broken/a", MountWriteState::FilesystemReadOnly),
+        ] {
+            assert_eq!(
+                mount_write_state_in(&table, Path::new(path)),
+                Some(expected),
+                "{path}"
+            );
+        }
+        assert_eq!(mount_write_state_in(&table, Path::new("relative")), None);
+        assert_eq!(
+            mount_write_state_in(&table, Path::new("/locked/../tmp/a")),
+            None
+        );
+        for malformed in [
+            "truncated",
+            "5 1 0:1 / /tmp",
+            "5 1 0:1 / /tmp rw - ext4 /dev/root",
+            "5 1 0:1 / relative rw - ext4 /dev/root rw",
+            "5 1 0:1 / /a/../tmp rw - ext4 /dev/root rw",
+            "5 1 0:1 / /tmp ro,rw - ext4 /dev/root rw",
+            "5 1 0:1 / /tmp rw - ext4 /dev/root relatime",
+        ] {
+            assert_eq!(
+                mount_write_state_in(&format!("{root}{malformed}\n"), Path::new("/tmp/a")),
+                None,
+                "{malformed}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planning_access_excludes_namespace_denials_before_byte_and_canary_admission() {
+        use crate::monitor::pid::PressureLevel;
+        use crate::scanner::planner::{PlanObjective, PlanRequest, plan_batch};
+
+        let temp = scratch_dir();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let blocked = root.join("denied/target");
+        let direct_bind = root.join("direct-bind");
+        let writable = root.join("writable/target");
+        for path in [&blocked, &direct_bind, &writable] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let escaped = |path: &Path| {
+            path.to_string_lossy()
+                .replace('\\', "\\134")
+                .replace(' ', "\\040")
+                .replace('\t', "\\011")
+                .replace('\n', "\\012")
+        };
+        let table = format!(
+            "1 0 0:1 / / rw - ext4 /dev/root rw\n\
+2 1 0:1 / {} ro - ext4 /dev/root rw\n\
+3 1 0:1 / {} ro - ext4 /dev/root rw\n",
+            escaped(blocked.parent().unwrap()),
+            escaped(&direct_bind),
+        );
+        let allowed = make_candidate(&writable, 64, 0.8);
+        let mut candidates = vec![
+            make_candidate(&blocked, 1_000_000, 0.99),
+            make_candidate(&direct_bind, 1_000_000, 0.98),
+            allowed.clone(),
+        ];
+        let refused = retain_planning_write_access_in(&mut candidates, Some(&table));
+        assert_eq!(refused.namespace_read_only, 2);
+        assert_eq!(refused.permissions, 0);
+        assert_eq!(candidates, vec![allowed.clone()]);
+
+        #[cfg(feature = "daemon")]
+        {
+            use crate::daemon::policy::{ActiveMode, PolicyConfig, PolicyEngine};
+
+            let mut policy = PolicyEngine::new(PolicyConfig {
+                initial_mode: ActiveMode::Canary,
+                max_canary_deletes_per_hour: 1,
+                ..Default::default()
+            });
+            let decision = policy.evaluate(&candidates, None);
+            assert_eq!(decision.approved_for_deletion, vec![allowed.clone()]);
+            assert_eq!(decision.records.len(), 1);
+        }
+
+        let (chosen, plan) = plan_batch(
+            candidates,
+            &PlanRequest {
+                level: PressureLevel::Critical,
+                objective: PlanObjective::Bytes,
+                target_bytes: Some(64),
+                max_items: 1,
+                risk_budget: Some(10.0),
+                false_positive_loss: 50.0,
+                include_review: false,
+            },
+        );
+        assert_eq!(chosen, vec![allowed]);
+        assert_eq!(plan.planned_bytes, 64);
+        assert_eq!(plan.chosen.len(), 1);
+        assert!(plan.skipped_for_budget.is_empty());
+        assert!(blocked.is_dir() && direct_bind.is_dir() && writable.is_dir());
+    }
+
+    #[test]
+    fn planning_access_applies_hard_vetoes_before_write_filtering() {
+        use crate::monitor::pid::PressureLevel;
+        use crate::scanner::planner::{PlanObjective, PlanRequest, plan_batch};
+
+        for suspended in [false, true] {
+            let parent = Path::new("/fixture/container");
+            let protected = parent.join("protected");
+            let denied = Path::new("/fixture/permission-denied");
+            let safe = make_candidate(Path::new("/fixture/safe"), 64, 0.8);
+            let mut veto = make_candidate(&protected, 32, 0.95);
+            veto.vetoed = !suspended;
+            veto.decision.category_suspended = suspended;
+            let mut candidates = vec![
+                make_candidate(parent, 1_000_000, 0.99),
+                veto,
+                make_candidate(denied, 1_000_000, 0.99),
+                safe.clone(),
+            ];
+            let refused = retain_planning_write_access_with(&mut candidates, |path| {
+                (path == denied || path == protected)
+                    .then_some(PlanningWriteDenial::Permissions)
+            });
+            assert_eq!(refused.permissions, 1);
+            assert!(
+                candidates
+                    .iter()
+                    .all(|candidate| candidate.path != protected && candidate.path != parent)
+            );
+            let (chosen, plan) = plan_batch(
+                candidates,
+                &PlanRequest {
+                    level: PressureLevel::Critical,
+                    objective: PlanObjective::Bytes,
+                    target_bytes: None,
+                    max_items: 4,
+                    risk_budget: None,
+                    false_positive_loss: 50.0,
+                    include_review: false,
+                },
+            );
+            assert_eq!(chosen, vec![safe], "suspended={suspended}");
+            assert_eq!(plan.planned_bytes, 64, "suspended={suspended}");
+        }
+    }
+
+    #[test]
+    fn planning_access_closes_alias_vetoes_before_removing_a_denied_bridge() {
+        use crate::monitor::pid::PressureLevel;
+        use crate::scanner::planner::{PlanObjective, PlanRequest, plan_batch};
+
+        for action in [DecisionAction::Delete, DecisionAction::Keep] {
+            let left = Path::new("/fixture/a");
+            let right = Path::new("/fixture/b");
+            let identity = walker::FsIdentity {
+                device_id: 1,
+                inode: 42,
+                kind: walker::FsEntryKind::Directory,
+            };
+            let mut denied_alias = make_candidate(left, 1_000_000, 0.99);
+            denied_alias.identity = Some(identity);
+            denied_alias.decision.action = action;
+            let mut writable_alias = make_candidate(right, 1_000_000, 0.99);
+            writable_alias.identity = Some(identity);
+            let mut protected = make_candidate(&left.join("protected"), 32, 0.95);
+            protected.vetoed = true;
+            let safe = make_candidate(Path::new("/fixture/safe"), 64, 0.8);
+            let mut candidates = vec![denied_alias, writable_alias, protected, safe.clone()];
+            let refused = retain_planning_write_access_with(&mut candidates, |path| {
+                (path == left).then_some(PlanningWriteDenial::NamespaceReadOnly)
+            });
+            // Safety admission precedes the write screen, including when the
+            // bridge itself would not be selectable by the optimizer.
+            assert_eq!(candidates, vec![safe.clone()], "bridge action={action:?}");
+            assert!(refused.summary().is_none());
+            let (chosen, plan) = plan_batch(
+                candidates,
+                &PlanRequest {
+                    level: PressureLevel::Critical,
+                    objective: PlanObjective::Bytes,
+                    target_bytes: None,
+                    max_items: 4,
+                    risk_budget: None,
+                    false_positive_loss: 50.0,
+                    include_review: false,
+                },
+            );
+            assert_eq!(chosen, vec![safe], "bridge action={action:?}");
+            assert_eq!(plan.planned_bytes, 64);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planning_access_leaves_filesystem_incidents_and_unknowns_to_fresh_preflight() {
+        let temp = scratch_dir();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let target = root.join("target");
+        fs::create_dir(&target).unwrap();
+        let known = make_candidate(&target, 100, 0.9);
+        let unknown = make_candidate(&root.join("missing-parent/target"), 100, 0.9);
+        // A globally read-only filesystem must still reach the executor's
+        // typed failure reporting, which parks the affected mount in Recovery.
+        let table = "1 0 0:1 / / ro - ext4 /dev/root ro\n";
+        let mut candidates = vec![known.clone(), unknown.clone()];
+        let refused = retain_planning_write_access_in(&mut candidates, Some(table));
+        assert!(refused.summary().is_none());
+        assert_eq!(candidates, vec![known.clone(), unknown.clone()]);
+        let refused = retain_planning_write_access_in(&mut candidates, None);
+        assert!(refused.summary().is_none());
+        assert_eq!(candidates, vec![known, unknown]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planning_permission_denials_refresh_after_access_is_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("SKIP: root bypasses mode-bit permission denial");
+            return;
+        }
+        let temp = scratch_dir();
+        let parent = temp.path().join("parent");
+        let target = parent.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let candidate = make_candidate(&target, 64, 0.9);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        let mut before = vec![candidate.clone()];
+        let refused = retain_planning_write_access(&mut before);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(before.is_empty());
+        assert_eq!(refused.permissions, 1);
+        let mut repaired = vec![candidate.clone()];
+        let refused = retain_planning_write_access(&mut repaired);
+        assert!(refused.summary().is_none());
+        assert_eq!(repaired, vec![candidate]);
     }
 
     /// bd-i9uh: under `ProtectSystem=strict` every path outside

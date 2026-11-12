@@ -16,6 +16,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   uncertain windows unscored, while fresh inactive observations let old
   confidence penalties age out.
 
+- **Cleanup excludes confirmed unwritable surfaces before planning.** The
+  scanner no longer lets a sandbox-denied target satisfy the byte goal or
+  crowd out a writable alternative. Queued batches renew this read-only
+  admission before Canary policy evaluation. Namespace read-only binds and
+  parent permission denials are summarized separately; genuine filesystem
+  failures still reach the executor's recovery handling. Protection is resolved
+  across the full path/identity graph before access filtering removes evidence.
+
 - **Saturated scan queues preserve emergency work and fair mount turns.**
   Frequent special-location alerts can no longer discard queued Critical
   recovery, operator scans or configuration updates. Automatic refreshes
