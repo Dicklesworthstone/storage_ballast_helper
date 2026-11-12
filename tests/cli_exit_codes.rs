@@ -270,6 +270,41 @@ fn check_honours_the_absolute_free_floors() {
     assert_eq!(with_floors.status.code(), Some(0), "{with_floors:?}");
 }
 
+/// An invalid config does not fail `check` (it gates builds), but the
+/// fallback to the default thresholds is named on stderr, not silent.
+#[test]
+fn check_names_an_invalid_config_instead_of_silently_using_defaults() {
+    let dir = disk_tempdir();
+    let config = config_in(dir.path());
+    let base = fs::read_to_string(&config).unwrap();
+    // Green plus the default hysteresis (1.0) above 100 is rejected by load.
+    fs::write(
+        &config,
+        format!("{base}[pressure]\ngreen_min_free_pct = 99.9\n"),
+    )
+    .unwrap();
+    let target = dir.path().display().to_string();
+    let target = target.as_str();
+    for args in [&["check", target][..], &["--json", "check", target][..]] {
+        let output = sbh(&config, args);
+        assert!(
+            matches!(output.status.code(), Some(0 | 1)),
+            "pressure outcome, not an error: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("configuration not loaded") && stderr.contains("default thresholds"),
+            "{output:?}"
+        );
+    }
+    fs::write(&config, &base).unwrap();
+    let valid = sbh(&config, &["check", target]);
+    assert!(
+        !String::from_utf8_lossy(&valid.stderr).contains("configuration not loaded"),
+        "{valid:?}"
+    );
+}
+
 /// A path that cannot be stat'ed is an I/O failure: exit 2.
 #[test]
 fn check_on_a_missing_path_is_exit_two() {

@@ -15311,7 +15311,15 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         .map_err(|e| CliError::Runtime(e.to_string()))?;
 
     let free_pct = capacity_free_pct(&capacity);
-    let config = Config::load(cli.config.as_deref()).unwrap_or_default();
+    // `check` gates builds, so a config it cannot load does not fail it: it
+    // falls back to the default lines, and says so on stderr rather than
+    // passing or failing silently on thresholds nobody configured.
+    let config = Config::load(cli.config.as_deref()).unwrap_or_else(|error| {
+        eprintln!(
+            "sbh: warning: configuration not loaded ({error}); check uses the default thresholds"
+        );
+        Config::default()
+    });
     let inodes = live_inode_status(platform.as_ref(), &check_path, &config);
     // The daemon's Yellow line on this volume: absolute floors (bd-ud9s)
     // lower it on a large disk, so `check` agrees with the daemon's level.
