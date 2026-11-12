@@ -1253,7 +1253,15 @@ impl DeletionExecutor {
                         report.quarantine_unavailable += 1;
                     }
                     consecutive_failures += 1;
-                    match error_recovery_cause(&e) {
+                    let cause = error_recovery_cause(&e);
+                    // EROFS from a read-only bind of this namespace (a systemd
+                    // sandbox) is a unit fix, not a mount incident.
+                    let sandboxed = cause == Some(RecoveryCause::ReadOnly)
+                        && read_only_is_mount_local(&candidate.path);
+                    match cause {
+                        Some(RecoveryCause::ReadOnly) if sandboxed => {
+                            report.not_writable_paths.push(candidate.path.clone());
+                        }
                         Some(RecoveryCause::ReadOnly) => {
                             report.read_only_paths.push(candidate.path.clone());
                         }
@@ -1278,7 +1286,7 @@ impl DeletionExecutor {
 
                     report.errors.push(error);
                     // A mount incident (EROFS/ENOSPC) is not the path's fault.
-                    if error_recovery_cause(&e).is_none() {
+                    if cause.is_none() || sandboxed {
                         report.backoff_candidates.push(candidate.clone());
                     }
                 }
@@ -1793,6 +1801,73 @@ fn classify_access_error(errno: nix::errno::Errno) -> Writability {
 }
 
 fn writability(path: &Path) -> Writability {
+    match fs_writability(path) {
+        // ProtectSystem=strict makes every path outside ReadWritePaths= a
+        // read-only bind, which also answers EROFS: a sandbox refusal.
+        Writability::ReadOnlyFilesystem if read_only_is_mount_local(path) => {
+            Writability::NotWritable
+        }
+        other => other,
+    }
+}
+
+/// Whether the mount holding `path` is a read-only bind of this namespace.
+///
+/// Its mount entry is `ro` while the superblock is `rw`: the bind systemd's
+/// `ProtectSystem=strict` applies to every path outside `ReadWritePaths=`.
+/// A filesystem mounted or remounted read-only, including the error remounts
+/// of ext4 and btrfs, has a read-only superblock instead. `None` when no
+/// mount entry contains `path`.
+#[must_use]
+pub fn read_only_bind_in(mountinfo: &str, path: &Path) -> Option<bool> {
+    let mut best: Option<(usize, bool)> = None;
+    for line in mountinfo.lines() {
+        // Spaces inside fields are escaped, so " - " only separates the
+        // per-mount fields from fstype, source and the superblock options.
+        let Some((mount_fields, super_fields)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fields: Vec<&str> = mount_fields.split(' ').collect();
+        let super_options = super_fields.split(' ').nth(2);
+        let (Some(mount_point), Some(mount_options), Some(super_options)) =
+            (fields.get(4), fields.get(5), super_options)
+        else {
+            continue;
+        };
+        let mount_point = PathBuf::from(crate::relocate::survey::unescape_mountinfo(mount_point));
+        if !path.starts_with(&mount_point) {
+            continue;
+        }
+        let read_only = |options: &str| options.split(',').any(|option| option == "ro");
+        let local = read_only(mount_options) && !read_only(super_options);
+        let depth = mount_point.components().count();
+        // Later lines for the same mount point are mounted over earlier ones.
+        if best.is_none_or(|(best_depth, _)| depth >= best_depth) {
+            best = Some((depth, local));
+        }
+    }
+    best.map(|(_, local)| local)
+}
+
+/// [`read_only_bind_in`] for this process; false when it cannot be decided,
+/// which keeps the read-only filesystem classification.
+fn read_only_is_mount_local(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        fs::read_to_string("/proc/self/mountinfo")
+            .ok()
+            .and_then(|table| read_only_bind_in(&table, &resolved))
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn fs_writability(path: &Path) -> Writability {
     #[cfg(unix)]
     {
         match nix::unistd::access(path, nix::unistd::AccessFlags::W_OK) {
@@ -3996,6 +4071,33 @@ mod tests {
         }
         let dir = scratch_dir();
         assert_eq!(writability(dir.path()), Writability::Writable);
+    }
+
+    /// bd-i9uh: under `ProtectSystem=strict` every path outside
+    /// `ReadWritePaths=` answers EROFS, and trj's daemon parked `/` in
+    /// recovery every hour for it. Only a read-only superblock is a mount
+    /// incident; a read-only bind over a writable superblock is the sandbox.
+    #[test]
+    fn read_only_bind_is_told_apart_from_a_read_only_filesystem() {
+        // The sbh unit's own namespace on trj (2026-11-12), plus a filesystem
+        // that really is read-only and one remounted read-only after errors.
+        let table = "\
+10663 149 0:35 / / ro,nosuid,noatime shared:255 master:1 - btrfs /dev/nvme0n1p6 rw,ssd,discard=async,space_cache=v2,commit=120,subvolid=5,subvol=/
+11614 10663 0:38 / /tmp rw,nosuid,nodev shared:783 master:19 - tmpfs tmpfs rw,size=134217728k,nr_inodes=10485760,inode64
+11615 10663 259:7 / /scratch ro,nosuid,noatime shared:784 master:127 - xfs /dev/nvme0n1p4 rw,inode64,logbufs=8,logbsize=32k,noquota
+11617 10663 0:51 / /data rw,nosuid,noatime shared:792 master:135 - btrfs /dev/nvme3n1 rw,compress=zstd:1,ssd,space_cache=v2
+11620 11617 0:60 / /data/archive ro,relatime shared:800 - ext4 /dev/sdc1 ro,errors=remount-ro
+11621 10663 0:61 / /mnt/cd\\040rom ro,relatime shared:801 - iso9660 /dev/sr0 ro
+";
+        let bind = |path: &str| read_only_bind_in(table, Path::new(path));
+        assert_eq!(bind("/scratch/cargo-targets/debug"), Some(true));
+        assert_eq!(bind("/home/ubuntu/.cache/x"), Some(true));
+        assert_eq!(bind("/tmp/x"), Some(false));
+        assert_eq!(bind("/data/tmp/x"), Some(false));
+        assert_eq!(bind("/data/archive/x"), Some(false));
+        assert_eq!(bind("/mnt/cd rom/x"), Some(false));
+        assert_eq!(read_only_bind_in("", Path::new("/x")), None);
+        assert_eq!(read_only_bind_in("garbage line\n", Path::new("/x")), None);
     }
 
     /// Deletion errors carrying EROFS or ENOSPC name a recovery cause; the

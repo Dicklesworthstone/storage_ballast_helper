@@ -467,7 +467,7 @@ pub fn atime_maintained_in(mountinfo: &str, path: &Path) -> Option<bool> {
 }
 
 /// Undo mountinfo's octal escapes (`\040` for a space, and so on).
-fn unescape_mountinfo(field: &str) -> String {
+pub(crate) fn unescape_mountinfo(field: &str) -> String {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
