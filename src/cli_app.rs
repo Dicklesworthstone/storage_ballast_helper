@@ -4650,14 +4650,39 @@ fn service_doctor_checks(
         &manager.config().binary_path,
         &reinstall,
     );
-    let config = Config::load(cli.config.as_deref())
-        .map_err(|error| CliError::Runtime(error.to_string()))?;
-    checks.extend(installed_service_scope_check(
-        platform.as_ref(),
-        &config,
-        Some(user_scope),
-    ));
+    append_service_scope_diagnostic(
+        &mut checks,
+        &unit_path,
+        Config::load(cli.config.as_deref()).map_err(|error| error.to_string()),
+        |config| installed_service_scope_check(platform.as_ref(), config, Some(user_scope)),
+    );
     Ok(checks)
+}
+
+/// Keep independent unit drift findings available when configuration is invalid.
+fn append_service_scope_diagnostic(
+    checks: &mut Vec<DoctorCheck>,
+    unit_path: &Path,
+    config: Result<Config, String>,
+    inspect: impl FnOnce(&Config) -> Option<DoctorCheck>,
+) {
+    let check = match config {
+        Ok(config) => inspect(&config),
+        Err(error) => Some(doctor_check(
+            "service-reclaim-scope",
+            "Service cleanup and reserve scope",
+            "WARN",
+            format!(
+                "evidence=installed_unit; {}: scope unknown because the selected configuration \
+                 could not be loaded: {error}; no grant comparison was performed",
+                unit_path.display()
+            ),
+            Some(
+                "Repair the selected configuration and rerun this service diagnostic.".to_string(),
+            ),
+        )),
+    };
+    checks.extend(check);
 }
 
 /// The `doctor --service` checks for a computed drift: unit present,
@@ -18947,6 +18972,45 @@ mod tests {
             "tap failure should explain default branch mismatch: {}",
             tap.message
         );
+    }
+
+    #[test]
+    fn service_doctor_preserves_unit_findings_when_config_cannot_load() {
+        use storage_ballast_helper::daemon::service::UnitDrift;
+
+        let unit_path = Path::new("/fixture/sbh.service");
+        let drift = UnitDrift {
+            missing_directives: vec!["Service/ProtectSystem".to_string()],
+            exec_start_matches: true,
+            ..UnitDrift::default()
+        };
+        let mut checks = unit_drift_checks(
+            &drift,
+            unit_path,
+            false,
+            Path::new("/fixture/sbh"),
+            "sudo sbh service --systemd reinstall-unit",
+        );
+        let previous_count = checks.len();
+        let previous = serde_json::to_value(&checks).unwrap();
+        append_service_scope_diagnostic(
+            &mut checks,
+            unit_path,
+            Err("invalid TOML in the selected configuration".to_string()),
+            |_| panic!("must not compare a fallback configuration after a load failure"),
+        );
+
+        assert_eq!(checks.len(), previous_count + 1);
+        assert_eq!(serde_json::to_value(&checks[..previous_count]).unwrap(), previous);
+        assert!(doctor_checks_have_failures(&checks));
+        assert_eq!(doctor_check_status_count(&checks, "FAIL"), 1);
+        let scope = checks.last().unwrap();
+        assert_eq!(scope.id, "service-reclaim-scope");
+        assert_eq!(scope.status, "WARN");
+        assert!(scope.message.contains("/fixture/sbh.service"));
+        assert!(scope.message.contains("scope unknown"));
+        assert!(scope.message.contains("invalid TOML"));
+        assert!(scope.message.contains("no grant comparison was performed"));
     }
 
     fn service_scope_fixture_config() -> Config {

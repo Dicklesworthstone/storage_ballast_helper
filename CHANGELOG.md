@@ -32,6 +32,8 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   and JSON output identify the unit and selected configuration. Unreadable or
   malformed units, unsupported namespaces and unexpanded root patterns remain
   unknown; installed-file coverage is never presented as live write access.
+  A configuration load error preserves the independent installed-unit findings
+  and reports write scope as unknown without comparing fallback defaults.
 
 - **Saturated scan queues preserve emergency work and fair mount turns.**
   Frequent special-location alerts can no longer discard queued Critical
