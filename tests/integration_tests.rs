@@ -271,9 +271,24 @@ mod protect_cli_regressions {
         }
 
         fn run_at(&self, target: &Path, json: bool) -> Output {
-            let mut command = Command::new(&self.binary);
-            self.configure(&mut command, json);
-            command.arg("protect").arg(target).output().unwrap()
+            // As root the fixture copies the binary. Another test thread's
+            // fork can still hold that copy's write descriptor when this one
+            // execs it (ETXTBSY), so retry the spawn briefly.
+            let mut attempts = 0;
+            loop {
+                let mut command = Command::new(&self.binary);
+                self.configure(&mut command, json);
+                match command.arg("protect").arg(target).output() {
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            && attempts < 50 =>
+                    {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    result => return result.unwrap(),
+                }
+            }
         }
 
         fn run(&self, json: bool) -> Output {
