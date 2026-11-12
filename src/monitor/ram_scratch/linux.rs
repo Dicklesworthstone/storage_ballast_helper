@@ -1872,19 +1872,33 @@ mod tests {
     #[test]
     fn native_descriptor_identity_matches_its_mountinfo_record_read_only() {
         let reader = NativeMountReader;
-        let handle = reader.open(Path::new("/")).unwrap();
-        let identity = reader.identity(&handle).unwrap();
         let table = read_mountinfo().unwrap();
-        let record = table
+        // "/" covers the non-tmpfs answer, and the first listed tmpfs (the
+        // kind this monitor inspects) covers the tmpfs answer when there is one.
+        let tmpfs = table
             .iter()
-            .find(|record| record.id == identity.mount_id)
-            .unwrap();
-        assert!(record.has_device(identity.device));
-        assert_eq!(reader.identity(&handle).unwrap(), identity);
-        let stats = reader.stats(&handle).unwrap();
-        assert_eq!(stats.tmpfs, record.fs_type == "tmpfs");
-        // This directly exercises O_PATH + fstatfs without mount manipulation.
-        assert!(stats.block_size > 0);
+            .find(|record| record.fs_type == "tmpfs")
+            .map(|record| record.mount_point.clone());
+        for path in std::iter::once(PathBuf::from("/")).chain(tmpfs) {
+            let handle = reader.open(&path).unwrap();
+            let identity = reader.identity(&handle).unwrap();
+            let record = table
+                .iter()
+                .find(|record| record.id == identity.mount_id)
+                .unwrap();
+            // A btrfs subvolume other than the top level (omarchy mounts
+            // subvol=/@ at /) reports its own anonymous st_dev, not the
+            // superblock device mountinfo lists. Only tmpfs and ramfs mounts
+            // are matched by device here, so that mismatch never reaches one.
+            if record.fs_type != "btrfs" {
+                assert!(record.has_device(identity.device), "{}", path.display());
+            }
+            assert_eq!(reader.identity(&handle).unwrap(), identity);
+            let stats = reader.stats(&handle).unwrap();
+            assert_eq!(stats.tmpfs, record.fs_type == "tmpfs", "{}", path.display());
+            // This directly exercises O_PATH + fstatfs without mount manipulation.
+            assert!(stats.block_size > 0);
+        }
     }
 
     #[test]

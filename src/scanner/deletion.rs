@@ -2727,6 +2727,23 @@ mod tests {
     /// `HardcodedSourceTree` and every deletion test fails for an
     /// environmental reason. Falls through the usual temp roots and fails
     /// loudly rather than asserting something the preflight forbids.
+    /// `len` bytes that a compressing filesystem cannot shrink (omarchy mounts
+    /// btrfs with `compress=zstd:3`, where 64 MiB of one repeated byte takes
+    /// almost no blocks, so removing it frees almost nothing).
+    fn incompressible_bytes(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut bytes = Vec::with_capacity(len + 8);
+        while bytes.len() < len {
+            // xorshift64: cheap, and its output is not compressible.
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bytes.extend_from_slice(&state.to_le_bytes());
+        }
+        bytes.truncate(len);
+        bytes
+    }
+
     fn scratch_dir() -> tempfile::TempDir {
         let bases = [
             std::env::temp_dir(),
@@ -3563,7 +3580,8 @@ mod tests {
         for attempt in 0..5 {
             let blob = dir.path().join(format!("blob-{attempt}.bin"));
             let mut file = fs::File::create(&blob).unwrap();
-            std::io::Write::write_all(&mut file, &vec![0x5a_u8; 64 * 1024 * 1024]).unwrap();
+            std::io::Write::write_all(&mut file, &incompressible_bytes(64 * 1024 * 1024, attempt))
+                .unwrap();
             file.sync_all().unwrap();
             drop(file);
             let report = executor.execute(
@@ -3596,7 +3614,7 @@ mod tests {
         let available = || available_bytes_beside(dir.path()).unwrap_or(0);
         let blob = dir.path().join("deferred.bin");
         let mut file = fs::File::create(&blob).unwrap();
-        std::io::Write::write_all(&mut file, &vec![0x5a_u8; 64 * 1024 * 1024]).unwrap();
+        std::io::Write::write_all(&mut file, &incompressible_bytes(64 * 1024 * 1024, 99)).unwrap();
         file.sync_all().unwrap();
         drop(file);
         let before = available();
