@@ -8,6 +8,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Predictive warnings mature against their own filesystem and deadline.**
+  A future warning no longer becomes a false alarm on the tick that issues it.
+  Each filesystem tracks one fixed forecast window using later native samples;
+  unrelated mounts cannot change its confidence floor. Cleanup, recovery,
+  missing observations and changed filesystem/configuration evidence leave
+  uncertain windows unscored, while fresh inactive observations let old
+  confidence penalties age out.
+
 - **Saturated scan queues preserve emergency work and fair mount turns.**
   Frequent special-location alerts can no longer discard queued Critical
   recovery, operator scans or configuration updates. Automatic refreshes

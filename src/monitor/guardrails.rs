@@ -11,6 +11,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -745,7 +746,7 @@ impl ActionDecision {
 /// Outcome category for a single prediction tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PredictionOutcome {
-    /// Non-actionable prediction — not counted in false alarm rate.
+    /// Native observation without a resolved actionable forecast.
     Inactive,
     /// Actionable prediction that was realized (pressure reached Red+).
     Realized,
@@ -757,22 +758,40 @@ enum PredictionOutcome {
     FalseAlarm,
 }
 
-/// Tracks recent predictions vs. outcomes to compute realized accuracy.
+/// One issued forecast, whose deadline never moves with later predictions.
+#[derive(Debug, Clone, Copy)]
+struct PendingPrediction {
+    deadline: Instant,
+    censored: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PredictionObservation {
+    at: Instant,
+    available_bytes: u64,
+    reached_red: bool,
+}
+
+/// Tracks issued predictions against subsequent observations of one filesystem.
 ///
-/// Solves the "self-defeating prophecy" problem: when an actionable prediction
-/// triggers cleanup that prevents disk exhaustion, the naive approach records
-/// it as a false alarm, gradually suppressing all predictions. Instead, this
-/// scorecard tracks three outcomes:
-/// - **Realized**: pressure actually hit the danger zone — prediction was correct.
-/// - **Intervened**: cleanup ran and pressure dropped — prediction was correct AND
-///   the system successfully prevented the problem.
-/// - **FalseAlarm**: no cleanup ran but pressure never approached danger — prediction
-///   was genuinely wrong.
+/// A future forecast is not a false alarm just because the issuing sample is
+/// still healthy. The daemon observes each native sample, then enrolls its
+/// actionable forecast. At most one window is pending, so repeated ticks
+/// cannot overweight a trajectory or keep moving its deadline.
 ///
-/// Only `FalseAlarm` outcomes count toward the false alarm rate.
+/// Missing observations invalidate pending work. Possible cleanup, an observed
+/// recovery, or a gap longer than the caller's sampling bound censors a window:
+/// neither a successful prediction nor a false alarm is inferred. The window
+/// remains occupied until its deadline or a crossing, preventing the same
+/// interrupted trajectory from being enrolled again immediately.
+///
+/// Only resolved `FalseAlarm` outcomes raise this filesystem's confidence floor.
 pub struct PredictionScorecard {
     outcomes: VecDeque<PredictionOutcome>,
     max_outcomes: usize,
+    pending: Option<PendingPrediction>,
+    last_observation: Option<PredictionObservation>,
+    last_enrolled_at: Option<Instant>,
 }
 
 impl PredictionScorecard {
@@ -782,17 +801,124 @@ impl PredictionScorecard {
         Self {
             outcomes: VecDeque::with_capacity(max_outcomes.min(1024)),
             max_outcomes: max_outcomes.max(1),
+            pending: None,
+            last_observation: None,
+            last_enrolled_at: None,
         }
     }
 
-    /// Record a prediction outcome.
+    /// Observe a genuinely newer native sample from this scorecard's filesystem.
+    ///
+    /// A crossing at or before the issued deadline realizes the forecast. A
+    /// miss is recorded only after the complete horizon with uninterrupted
+    /// observations. A first crossing seen after the deadline is inconclusive.
+    /// Cached and out-of-order samples cannot resolve or renew any evidence.
+    ///
+    /// Other fresh observations age the bounded history with an inactive
+    /// entry. They are neither successes nor misses, but let an old confidence
+    /// penalty expire instead of permanently suppressing new forecasts.
+    pub fn observe(
+        &mut self,
+        at: Instant,
+        available_bytes: u64,
+        reached_red: bool,
+        max_gap: Duration,
+    ) {
+        if let Some(previous) = self.last_observation {
+            let Some(gap) = at.checked_duration_since(previous.at) else {
+                return;
+            };
+            if gap.is_zero() {
+                return;
+            }
+            if gap > max_gap || available_bytes > previous.available_bytes {
+                self.censor_pending();
+            }
+        }
+        self.last_observation = Some(PredictionObservation {
+            at,
+            available_bytes,
+            reached_red,
+        });
+        let mut resolved = None;
+        if let Some(pending) = self.pending {
+            let realized = reached_red && at <= pending.deadline;
+            if realized || at >= pending.deadline {
+                self.pending = None;
+                if !pending.censored && (realized || !reached_red) {
+                    resolved = Some(realized);
+                }
+            }
+        }
+        self.record(resolved.is_some(), resolved.unwrap_or(false), false);
+    }
+
+    /// Enroll an actionable forecast issued from the latest native observation.
+    ///
+    /// The caller supplies the forecast's own horizon, not the next poll time.
+    /// No overlapping window, duplicate issue, nowcast or invalid deadline is
+    /// accepted. Even a rapidly changing forecast occupies at most one slot.
+    pub fn enroll(&mut self, issued_at: Instant, horizon: Duration) -> bool {
+        if self.pending.is_some()
+            || horizon.is_zero()
+            || self
+                .last_enrolled_at
+                .is_some_and(|previous| issued_at <= previous)
+            || !self.last_observation.is_some_and(|observation| {
+                observation.at == issued_at && !observation.reached_red
+            })
+        {
+            return false;
+        }
+        let Some(deadline) = issued_at.checked_add(horizon) else {
+            return false;
+        };
+        self.pending = Some(PendingPrediction {
+            deadline,
+            censored: false,
+        });
+        self.last_enrolled_at = Some(issued_at);
+        true
+    }
+
+    /// An attempted intervention is uncertainty, not a successful prediction.
+    pub fn censor_pending(&mut self) {
+        if let Some(pending) = &mut self.pending {
+            pending.censored = true;
+        }
+    }
+
+    /// Missing coverage or changed prediction semantics cannot label old work.
+    pub fn discard_pending(&mut self) {
+        self.pending = None;
+    }
+
+    /// Number of issued forecasts awaiting their outcome (always zero or one).
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        usize::from(self.pending.is_some())
+    }
+
+    /// Resolved actionable forecasts still present in the observation window.
+    #[must_use]
+    pub fn resolved_forecasts(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|outcome| !matches!(outcome, PredictionOutcome::Inactive))
+            .count()
+    }
+
+    /// Record an independently established prediction outcome.
+    ///
+    /// The daemon uses `observe` and `enroll` to establish these outcomes;
+    /// merely dispatching work cannot establish a successful intervention.
     ///
     /// - `was_actionable`: true if the prediction had severity >= 2
     ///   (PreemptiveCleanup or ImminentDanger).
     /// - `was_realized`: true if the disk actually hit the threshold within
     ///   the predicted time window (pressure >= Red).
-    /// - `cleanup_ran`: true if any cleanup was performed during this tick
-    ///   (deletions dispatched or ballast released).
+    /// - `cleanup_ran`: true only for an independently established intervention
+    ///   on the forecast's filesystem, never merely a scan dispatch.
     pub fn record(&mut self, was_actionable: bool, was_realized: bool, cleanup_ran: bool) {
         let outcome = if !was_actionable {
             PredictionOutcome::Inactive
@@ -1646,6 +1772,129 @@ mod tests {
             count <= 10,
             "e_process should allow recovery within 10 observations, took {count}"
         );
+    }
+
+    #[test]
+    fn scorecard_waits_for_the_issued_horizon_and_does_not_slide_it() {
+        let mut scorecard = PredictionScorecard::new(10);
+        let start = Instant::now();
+        let horizon = Duration::from_mins(10);
+        let gap = Duration::from_secs(2);
+        scorecard.observe(start, 100_000, false, gap);
+        assert!(scorecard.enroll(start, horizon));
+        for second in 1..600 {
+            let at = start + Duration::from_secs(second);
+            scorecard.observe(at, 100_000 - second, false, gap);
+            assert!(!scorecard.enroll(at, horizon));
+            assert_eq!(scorecard.pending(), 1);
+            assert_eq!(scorecard.resolved_forecasts(), 0);
+            assert!((scorecard.dynamic_min_confidence(0.7) - 0.7).abs() < f64::EPSILON);
+        }
+        scorecard.observe(start + horizon, 99_400, false, gap);
+        assert_eq!(scorecard.pending(), 0);
+        assert_eq!(scorecard.resolved_forecasts(), 1);
+        assert!((scorecard.false_alarm_rate() - 1.0).abs() < f64::EPSILON);
+        assert!((scorecard.dynamic_min_confidence(0.7) - 0.9).abs() < 1e-10);
+
+        // Fresh inactive observations age the penalty; duplicates cannot.
+        let retained = scorecard.outcome_count();
+        for _ in 0..100 {
+            scorecard.observe(start + horizon, 1, true, gap);
+        }
+        assert_eq!(scorecard.outcome_count(), retained);
+        assert_eq!(scorecard.resolved_forecasts(), 1);
+        for second in 601..=610 {
+            scorecard.observe(
+                start + Duration::from_secs(second),
+                100_000 - second,
+                false,
+                gap,
+            );
+        }
+        assert_eq!(scorecard.resolved_forecasts(), 0);
+        assert!((scorecard.dynamic_min_confidence(0.7) - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn scorecard_credits_only_a_timely_crossing_of_its_own_issued_window() {
+        for crossed_at in [1, 60, 61] {
+            let mut scorecard = PredictionScorecard::new(10);
+            let start = Instant::now();
+            let gap = Duration::from_secs(90);
+            scorecard.observe(start, 1_000, false, gap);
+            assert!(scorecard.enroll(start, Duration::from_secs(60)));
+            scorecard.observe(start + Duration::from_secs(crossed_at), 100, true, gap);
+            assert_eq!(scorecard.pending(), 0);
+            assert_eq!(scorecard.resolved_forecasts(), usize::from(crossed_at <= 60));
+            assert!(scorecard.false_alarm_rate().abs() < f64::EPSILON);
+            assert!(
+                !scorecard.enroll(
+                    start + Duration::from_secs(crossed_at),
+                    Duration::from_secs(60),
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn scorecard_censors_uncertain_trajectories_without_reward_or_penalty() {
+        for cause in ["cleanup", "recovery", "gap", "missing"] {
+            for reached_red in [false, true] {
+                let mut scorecard = PredictionScorecard::new(10);
+                let start = Instant::now();
+                let gap = Duration::from_secs(10);
+                scorecard.observe(start, 1_000, false, gap);
+                assert!(scorecard.enroll(start, Duration::from_secs(20)));
+                match cause {
+                    "cleanup" => scorecard.censor_pending(),
+                    "missing" => scorecard.discard_pending(),
+                    "recovery" | "gap" => {}
+                    _ => unreachable!(),
+                }
+                if cause != "gap" {
+                    scorecard.observe(
+                        start + Duration::from_secs(10),
+                        if cause == "recovery" { 1_001 } else { 900 },
+                        false,
+                        gap,
+                    );
+                }
+                scorecard.observe(start + Duration::from_secs(20), 800, reached_red, gap);
+                assert_eq!(scorecard.pending(), 0, "{cause}, reached={reached_red}");
+                assert_eq!(
+                    scorecard.resolved_forecasts(),
+                    0,
+                    "{cause}, reached={reached_red}",
+                );
+                assert!(scorecard.false_alarm_rate().abs() < f64::EPSILON);
+            }
+        }
+    }
+
+    #[test]
+    fn scorecard_rejects_cached_delayed_and_duplicate_prediction_evidence() {
+        let mut scorecard = PredictionScorecard::new(2);
+        let start = Instant::now();
+        let gap = Duration::from_secs(60);
+        assert!(!scorecard.enroll(start, gap), "no native observation");
+        scorecard.observe(start, 1_000, false, gap);
+        assert!(!scorecard.enroll(start, Duration::ZERO));
+        assert!(!scorecard.enroll(start, Duration::MAX));
+        assert!(scorecard.enroll(start, gap));
+        scorecard.observe(start + Duration::from_secs(5), 900, false, gap);
+        let observations = scorecard.outcome_count();
+        scorecard.observe(start, 10, true, gap);
+        scorecard.observe(start + Duration::from_secs(5), 10, true, gap);
+        assert_eq!(scorecard.pending(), 1);
+        assert_eq!(scorecard.outcome_count(), observations);
+        assert_eq!(scorecard.resolved_forecasts(), 0);
+        scorecard.discard_pending();
+        assert!(!scorecard.enroll(start, gap));
+        assert!(scorecard.enroll(start + Duration::from_secs(5), gap));
+        scorecard.censor_pending();
+        assert!(!scorecard.enroll(start + Duration::from_secs(5), gap));
+        scorecard.observe(start + Duration::from_secs(65), 800, false, gap);
+        assert_eq!(scorecard.resolved_forecasts(), 0);
     }
 
     #[test]

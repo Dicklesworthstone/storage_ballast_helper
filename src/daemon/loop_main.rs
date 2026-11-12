@@ -2406,6 +2406,9 @@ struct MountMonitor {
     last_guard_sample: Option<GuardSample>,
     /// Conformal calibration of the time-to-red forecast.
     conformal: ConformalCalibrator,
+    /// Completed forecast windows belong to this filesystem, never the
+    /// currently worst mount or an unrelated cleanup.
+    prediction_scorecard: PredictionScorecard,
 }
 
 #[derive(Clone)]
@@ -2818,6 +2821,7 @@ impl MountMonitor {
             guard: AdaptiveGuard::new(guard_config),
             last_guard_sample: None,
             conformal: ConformalCalibrator::new(conformal_config(config)),
+            prediction_scorecard: PredictionScorecard::new(200),
         }
     }
 
@@ -2838,6 +2842,9 @@ impl MountMonitor {
     }
 
     fn update_config(&mut self, config: &Config) {
+        // An issued window describes the predictor and policy at issue time.
+        // A reload cannot turn it into evidence for a different configuration.
+        self.prediction_scorecard.discard_pending();
         if self.conformal.config() != &conformal_config(config) {
             self.conformal = ConformalCalibrator::new(conformal_config(config));
             self.last_guard_sample = None;
@@ -2898,6 +2905,7 @@ impl MountMonitor {
                 if previous.threshold_bytes != threshold {
                     self.last_guard_sample = None;
                     self.conformal.discard_pending();
+                    self.prediction_scorecard.discard_pending();
                 }
                 previous.rate = self.rate_estimator.reforecast(&previous.rate, threshold);
                 previous.threshold_bytes = threshold;
@@ -3188,8 +3196,9 @@ pub struct MonitoringDaemon {
     last_ewma_confidence: f64,
     predictive_policy: PredictiveActionPolicy,
     last_predictive_action: PredictiveAction,
-    /// Whether any cleanup was dispatched in the previous tick (scan or ballast release).
-    /// Used by the prediction scorecard to distinguish interventions from false alarms.
+    /// Cleanup may have interrupted an outstanding forecast (scan dispatch,
+    /// completed removal or ballast release). Without per-mount receipts this
+    /// censors pending windows; it never proves a successful prediction.
     last_tick_cleanup_ran: bool,
     last_swap_thrash_warning: Option<Instant>,
     swap_thrash_active: bool,
@@ -3254,7 +3263,6 @@ pub struct MonitoringDaemon {
     shared_guard_diagnostics: Arc<RwLock<Option<GuardDiagnostics>>>,
     scanner_heartbeat: Arc<ThreadHeartbeat>,
     executor_heartbeat: Arc<ThreadHeartbeat>,
-    prediction_scorecard: PredictionScorecard,
 }
 
 fn bytes_to_pct(value: u64, total: u64) -> f64 {
@@ -5054,7 +5062,6 @@ impl MonitoringDaemon {
             scanner_heartbeat,
             executor_heartbeat,
             shared_guard_diagnostics,
-            prediction_scorecard: PredictionScorecard::new(200),
         })
     }
 
@@ -6328,6 +6335,9 @@ impl MonitoringDaemon {
                             });
                         }
                         if deleted > 0 {
+                            // A completed removal also censors any forecast
+                            // issued while this asynchronous batch was running.
+                            self.last_tick_cleanup_ran = true;
                             // Best effort: we don't have the mount point here easily without tracking
                             // it through the batch. Use "primary" or "various".
                             let items_deleted = usize::try_from(deleted).unwrap_or(usize::MAX);
@@ -6589,6 +6599,9 @@ impl MonitoringDaemon {
         self.scan_now_queue.lock().withdraw_pressure();
         self.mount_responses.clear();
         self.last_predictive_action = PredictiveAction::Clear;
+        for monitor in self.mount_monitors.values_mut() {
+            monitor.prediction_scorecard.discard_pending();
+        }
         *self.shared_guard_diagnostics.write() = None;
         // Compression emits a best-effort diagnostic after setting its stop
         // flag. Revoke every other worker before that stderr write can block.
@@ -6655,6 +6668,26 @@ impl MonitoringDaemon {
             });
         }
 
+        // A missing mount cannot acquire a false-alarm label from a healthy
+        // peer. Possible cleanup is censored globally until receipts carry
+        // reliable mount provenance, never counted as a successful forecast.
+        for (mount, monitor) in &mut self.mount_monitors {
+            if !stats_by_mount.contains_key(mount) {
+                monitor.prediction_scorecard.discard_pending();
+            } else if self.last_tick_cleanup_ran {
+                monitor.prediction_scorecard.censor_pending();
+            }
+        }
+        // Allow a missed regular poll/cache renewal, but do not infer a
+        // continuous trajectory across a stalled or delayed native reading.
+        let prediction_max_gap = Duration::from_millis(
+            self.config
+                .pressure
+                .poll_interval_ms
+                .max(self.config.telemetry.fs_cache_ttl_ms)
+                .max(1),
+        )
+        .saturating_mul(2);
         let mut worst_response: Option<crate::monitor::pid::PressureResponse> = None;
         let mut worst_filesystem_level = PressureLevel::Green;
         let mut worst_filesystem_urgency = 0.0;
@@ -6799,6 +6832,24 @@ impl MonitoringDaemon {
             }
             let filesystem_response = response.clone();
 
+            // Resolve only an earlier forecast of this filesystem, using the
+            // original native observation time rather than this control tick.
+            let observation_recent = now
+                .checked_duration_since(sample.collected_at)
+                .is_some_and(|age| age <= prediction_max_gap);
+            if fresh {
+                if observation_recent {
+                    monitor.prediction_scorecard.observe(
+                        sample.collected_at,
+                        stats.available_bytes,
+                        filesystem_response.level >= PressureLevel::Red,
+                        prediction_max_gap,
+                    );
+                } else {
+                    monitor.prediction_scorecard.discard_pending();
+                }
+            }
+
             let inode_pressure = self
                 .platform
                 .inode_stats(&mount_path)
@@ -6909,10 +6960,10 @@ impl MonitoringDaemon {
 
             // Force low-confidence predictions to Clear so they don't trigger
             // scans or other downstream actions (breaks scan saturation feedback loop).
-            // The effective confidence floor is raised by the prediction scorecard
-            // when false alarm rate is high — this dynamically tightens the gate
-            // based on realized accuracy.
-            let effective_min_conf = self
+            // The confidence floor comes from this filesystem's completed,
+            // uninterrupted forecast windows. Another mount's predictions or
+            // pressure cannot tighten it.
+            let effective_min_conf = monitor
                 .prediction_scorecard
                 .dynamic_min_confidence(self.config.pressure.prediction.min_confidence);
             if !matches!(pred_action, PredictiveAction::Clear)
@@ -6921,6 +6972,28 @@ impl MonitoringDaemon {
                 pred_action = PredictiveAction::Clear;
             }
             let imminent_danger = matches!(pred_action, PredictiveAction::ImminentDanger { .. });
+
+            if fresh && observation_recent && !self.last_tick_cleanup_ran {
+                // The action's calibrated/burst-adjusted runway is time to
+                // full. The existing success criterion is danger reached
+                // (Red or worse) within that runway, not full exhaustion.
+                let minutes_remaining = match &pred_action {
+                    PredictiveAction::PreemptiveCleanup {
+                        minutes_remaining, ..
+                    }
+                    | PredictiveAction::ImminentDanger {
+                        minutes_remaining, ..
+                    } => Some(*minutes_remaining),
+                    _ => None,
+                };
+                if let Some(horizon) = minutes_remaining
+                    .and_then(|minutes| Duration::try_from_secs_f64(minutes * 60.0).ok())
+                {
+                    let _ = monitor
+                        .prediction_scorecard
+                        .enroll(sample.collected_at, horizon);
+                }
+            }
 
             if pred_action.severity() > self.last_predictive_action.severity() {
                 self.last_predictive_action = pred_action;
@@ -7014,22 +7087,10 @@ impl MonitoringDaemon {
         self.shared_executor_config
             .set_ram_reclaim_physical_mode(physical_mode);
 
-        // Record prediction scorecard outcome: was the previous tick's prediction
-        // realized? An actionable prediction (severity >= 2) is "realized" if the
-        // current tick's worst pressure is at Red or above.
-        // The cleanup_ran flag distinguishes successful interventions (prediction
-        // triggered cleanup that prevented the problem) from false alarms (prediction
-        // said danger but nothing was happening).
+        // A possible intervention censors windows instead of awarding a
+        // success. Retain that uncertainty across cache-only worst-mount ticks;
+        // each mount resolves its own windows above from native evidence.
         if worst_guard_fresh {
-            let was_actionable = self.last_predictive_action.severity() >= 2;
-            let was_realized = worst_filesystem_level >= PressureLevel::Red;
-            self.prediction_scorecard.record(
-                was_actionable,
-                was_realized,
-                self.last_tick_cleanup_ran,
-            );
-            // Interventions between native observations belong to the next
-            // outcome, even if several cached ticks occurred in between.
             self.last_tick_cleanup_ran = false;
         }
 
@@ -15676,7 +15737,17 @@ mod tests {
             daemon.mount_monitors[&mount].guard.status(),
             GuardStatus::Pass
         );
-        let outcomes = daemon.prediction_scorecard.outcome_count();
+        assert!(
+            daemon
+                .mount_monitors
+                .get_mut(&mount)
+                .unwrap()
+                .prediction_scorecard
+                .enroll(sample.collected_at, Duration::from_mins(5)),
+        );
+        let outcomes = daemon.mount_monitors[&mount]
+            .prediction_scorecard
+            .outcome_count();
         let clean_windows = daemon
             .policy_engine
             .lock()
@@ -15711,7 +15782,13 @@ mod tests {
                 1
             );
             assert_eq!(daemon.mount_monitors[&mount].guard.observation_count(), 1);
-            assert_eq!(daemon.prediction_scorecard.outcome_count(), outcomes);
+            assert_eq!(
+                daemon.mount_monitors[&mount]
+                    .prediction_scorecard
+                    .outcome_count(),
+                outcomes,
+            );
+            assert_eq!(daemon.mount_monitors[&mount].prediction_scorecard.pending(), 1);
             assert_eq!(
                 daemon
                     .policy_engine
@@ -15745,7 +15822,14 @@ mod tests {
                 start + Duration::from_secs(60),
             )
             .unwrap();
-        assert_eq!(daemon.prediction_scorecard.outcome_count(), outcomes + 1);
+        assert_eq!(
+            daemon.mount_monitors[&mount]
+                .prediction_scorecard
+                .outcome_count(),
+            outcomes,
+            "interrupted or delayed observations cannot invent a prediction label",
+        );
+        assert_eq!(daemon.mount_monitors[&mount].prediction_scorecard.pending(), 0);
         assert!(!daemon.last_tick_cleanup_ran);
         assert_eq!(daemon.release_controller.release_efficiency(&mount), 1.0);
         let actual_rate = daemon.mount_monitors[&mount]
@@ -15803,6 +15887,181 @@ mod tests {
         assert_eq!(daemon.mount_monitors[&mount].guard.observation_count(), 0);
         assert_eq!(daemon.burst_stats.mount(&mount).unwrap().windows(), 0);
         assert_eq!(daemon.release_controller.release_efficiency(&mount), 1.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn predictive_pipeline_enrolls_future_danger_without_immediate_false_alarms() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let mut fixture = RegretDaemonFixture::new();
+        let mount = install_disk_pressure_probe(&mut fixture, 100 * GIB, 15 * GIB, false);
+        let daemon = &mut fixture.daemon;
+        daemon.config.telemetry.ewma_base_alpha = 1.0;
+        daemon.config.telemetry.ewma_min_alpha = 1.0;
+        daemon.config.telemetry.ewma_max_alpha = 1.0;
+        let start = Instant::now();
+        let mut sample = native_pressure_sample(&mount, "disk-a", 100 * GIB, 15 * GIB, start);
+        let base_confidence = daemon.config.pressure.prediction.min_confidence;
+        for step in 0..=10 {
+            sample.collected_at = start + Duration::from_secs(step);
+            sample.stats.available_bytes = 15 * GIB - step * 64 * MIB;
+            sample.stats.free_bytes = sample.stats.available_bytes;
+            let response = daemon
+                .evaluate_pressure_samples(
+                    HashMap::from([(mount.clone(), sample.clone())]),
+                    sample.collected_at,
+                )
+                .unwrap();
+            assert!(response.level < PressureLevel::Red);
+            let scorecard = &daemon.mount_monitors[&mount].prediction_scorecard;
+            assert_eq!(scorecard.resolved_forecasts(), 0);
+            assert!(
+                (scorecard.dynamic_min_confidence(base_confidence) - base_confidence).abs()
+                    < f64::EPSILON,
+            );
+        }
+        assert!(daemon.last_predictive_action.should_cleanup());
+        assert_eq!(daemon.mount_monitors[&mount].prediction_scorecard.pending(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn predictive_outcomes_stay_with_their_mount_and_discard_missing_or_replaced_evidence() {
+        const GIB: u64 = 1 << 30;
+        let mut fixture = RegretDaemonFixture::new();
+        let mount = install_disk_pressure_probe(&mut fixture, 100 * GIB, 15 * GIB, false);
+        let peer_mount = fixture.directory.path().join("forecast-peer");
+        let daemon = &mut fixture.daemon;
+        daemon.config.pressure.poll_interval_ms = 30_000;
+        let start = Instant::now();
+        let mut sample = native_pressure_sample(&mount, "disk-a", 100 * GIB, 15 * GIB, start);
+        let mut peer = native_pressure_sample(&peer_mount, "disk-b", 100 * GIB, 15 * GIB, start);
+        daemon
+            .evaluate_pressure_samples(
+                HashMap::from([
+                    (mount.clone(), sample.clone()),
+                    (peer_mount.clone(), peer.clone()),
+                ]),
+                start,
+            )
+            .unwrap();
+        for selected in [&mount, &peer_mount] {
+            assert!(
+                daemon
+                    .mount_monitors
+                    .get_mut(selected)
+                    .unwrap()
+                    .prediction_scorecard
+                    .enroll(start, Duration::from_secs(60)),
+            );
+        }
+
+        // Only the peer reaches Red. The cached forecast on this mount has
+        // not succeeded, failed, or gained another independent observation.
+        peer.collected_at = start + Duration::from_secs(30);
+        peer.stats.available_bytes = 5 * GIB;
+        peer.stats.free_bytes = peer.stats.available_bytes;
+        daemon
+            .evaluate_pressure_samples(
+                HashMap::from([
+                    (mount.clone(), sample.clone()),
+                    (peer_mount.clone(), peer.clone()),
+                ]),
+                peer.collected_at,
+            )
+            .unwrap();
+        assert_eq!(
+            daemon.mount_monitors[&mount]
+                .prediction_scorecard
+                .resolved_forecasts(),
+            0,
+        );
+        assert_eq!(daemon.mount_monitors[&mount].prediction_scorecard.pending(), 1);
+        assert_eq!(
+            daemon.mount_monitors[&peer_mount]
+                .prediction_scorecard
+                .resolved_forecasts(),
+            1,
+        );
+
+        for second in [59, 60] {
+            sample.collected_at = start + Duration::from_secs(second);
+            sample.stats.available_bytes = 14 * GIB;
+            sample.stats.free_bytes = sample.stats.available_bytes;
+            daemon
+                .evaluate_pressure_samples(
+                    HashMap::from([
+                        (mount.clone(), sample.clone()),
+                        (peer_mount.clone(), peer.clone()),
+                    ]),
+                    sample.collected_at,
+                )
+                .unwrap();
+            assert_eq!(
+                daemon.mount_monitors[&mount]
+                    .prediction_scorecard
+                    .resolved_forecasts(),
+                usize::from(second == 60),
+            );
+        }
+        let scorecard = &daemon.mount_monitors[&mount].prediction_scorecard;
+        let peer_scorecard = &daemon.mount_monitors[&peer_mount].prediction_scorecard;
+        let base_confidence = daemon.config.pressure.prediction.min_confidence;
+        assert!((scorecard.false_alarm_rate() - 1.0).abs() < f64::EPSILON);
+        assert!(peer_scorecard.false_alarm_rate().abs() < f64::EPSILON);
+        assert!(scorecard.dynamic_min_confidence(base_confidence) > base_confidence);
+        assert!(
+            (peer_scorecard.dynamic_min_confidence(base_confidence) - base_confidence).abs()
+                < f64::EPSILON,
+        );
+
+        assert!(
+            daemon
+                .mount_monitors
+                .get_mut(&mount)
+                .unwrap()
+                .prediction_scorecard
+                .enroll(sample.collected_at, Duration::from_secs(60)),
+        );
+        peer.collected_at = start + Duration::from_secs(61);
+        daemon
+            .evaluate_pressure_samples(
+                HashMap::from([(peer_mount.clone(), peer.clone())]),
+                peer.collected_at,
+            )
+            .unwrap();
+        assert_eq!(daemon.mount_monitors[&mount].prediction_scorecard.pending(), 0);
+        assert_eq!(
+            daemon.mount_monitors[&mount]
+                .prediction_scorecard
+                .resolved_forecasts(),
+            1,
+        );
+
+        let replacement = native_pressure_sample(
+            &mount,
+            "replacement-disk",
+            100 * GIB,
+            15 * GIB,
+            start + Duration::from_secs(62),
+        );
+        daemon
+            .evaluate_pressure_samples(
+                HashMap::from([(mount.clone(), replacement.clone()), (peer_mount, peer)]),
+                replacement.collected_at,
+            )
+            .unwrap();
+        let monitor = daemon.mount_monitors.get_mut(&mount).unwrap();
+        assert_eq!(monitor.prediction_scorecard.resolved_forecasts(), 0);
+        assert!(
+            monitor
+                .prediction_scorecard
+                .enroll(replacement.collected_at, Duration::from_secs(60))
+        );
+        monitor.update_config(&daemon.config);
+        assert_eq!(monitor.prediction_scorecard.pending(), 0);
     }
 
     #[cfg(unix)]
