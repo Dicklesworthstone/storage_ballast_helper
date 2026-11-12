@@ -1375,10 +1375,11 @@ pub struct TargetTier {
 
 impl TargetTier {
     pub(super) fn with_regret(regret: Arc<SharedRegret>) -> Self {
-        Self {
-            regret: Some(regret),
-            ..Self::default()
-        }
+        // `TargetTier` implements `Drop`, so struct-update syntax cannot move
+        // the remaining fields out of a default value (E0509).
+        let mut tier = Self::default();
+        tier.regret = Some(regret);
+        tier
     }
 
     /// Withdraw all previously granted target-only authority when the monitor
