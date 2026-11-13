@@ -18,8 +18,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use storage_ballast_helper::ballast::coordinator::{
-    BallastRefillBlocker, BallastReserveSnapshot, BallastReserveState,
-    resolve_configured_pool_alias,
+    BallastReserveSnapshot, BallastReserveState, resolve_configured_pool_alias,
 };
 use storage_ballast_helper::ballast::manager::{
     BallastAvailability, BallastHealth, BallastManager,
@@ -10875,6 +10874,7 @@ fn count_sacred_scan_overlaps(
 struct BallastReserveStatus {
     source: &'static str,
     detail: String,
+    discovery_pending: bool,
     pools: Vec<BallastReserveSnapshot>,
     skipped_pools: Vec<SkippedBallastPoolStatus>,
 }
@@ -10893,7 +10893,7 @@ impl BallastReserveStatus {
         if self.source == "unavailable" {
             return Some(format!("availability unknown: {}", self.detail));
         }
-        let impaired: Vec<_> = self
+        let mut impaired: Vec<_> = self
             .pools
             .iter()
             .filter(|pool| {
@@ -10904,6 +10904,11 @@ impl BallastReserveStatus {
             })
             .map(|pool| format!("{} on {}", pool.state.as_str(), pool.mount_point.display()))
             .collect();
+        if self.discovery_pending {
+            impaired.push(
+                "overall reserve availability unknown while pool discovery is pending".into(),
+            );
+        }
         (!impaired.is_empty()).then(|| impaired.join("; "))
     }
 }
@@ -10926,6 +10931,10 @@ fn daemon_reserve_status(
     }
     let records: Vec<BallastPoolState> =
         serde_json::from_value(state.get("ballast_pools")?.clone()).ok()?;
+    let discovery_pending = state.get("discovery").is_some_and(|discovery| {
+        discovery.get("pending").and_then(Value::as_bool) == Some(true)
+            || discovery.get("reload_pending").and_then(Value::as_bool) == Some(true)
+    });
     let mut pools = Vec::new();
     let mut skipped_pools = Vec::new();
     for record in records {
@@ -10937,59 +10946,19 @@ fn daemon_reserve_status(
             });
             continue;
         }
-        let mut reserve = record.reserve?;
-        if reserve.mount_point.to_string_lossy() != record.mount
-            || reserve.ballast_dir.to_string_lossy() != record.ballast_dir
-        {
-            return None;
-        }
-        // A fresh state file can carry old inventory while its observer is
-        // stalled. Preserve the daemon's namespace and healthy sibling rows;
-        // a host-side read must not turn an unreadable daemon pool into a
-        // healthy claim. Expire this pool's evidence independently instead.
-        let age = chrono::DateTime::parse_from_rfc3339(&reserve.observed_at)
-            .ok()
-            .and_then(|observed| now.signed_duration_since(observed).to_std().ok());
-        let pending = reserve.observed_at.is_empty() && !reserve.inventory_authoritative;
-        if pending
-            || age.is_none_or(|age| age >= Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS))
-        {
-            reserve.inventory_authoritative = false;
-            reserve.state = BallastReserveState::classify(reserve.configured_bytes, 0, false);
-            reserve.files_available = 0;
-            reserve.releasable_bytes = 0;
-            reserve.unreadable_count = 0;
-            reserve.headroom = None;
-            reserve.headroom_error = None;
-            reserve.refill_in_progress = false;
-            // These reasons depend on the expired filesystem observation.
-            // Policy reasons in the fresh daemon state remain useful evidence.
-            reserve.refill_blockers.retain(|blocker| {
-                !matches!(
-                    blocker,
-                    BallastRefillBlocker::SafetyFloor
-                        | BallastRefillBlocker::FilesystemStatsUnavailable
-                        | BallastRefillBlocker::ReadOnlyFilesystem
-                        | BallastRefillBlocker::InventoryUnreadable
-                )
-            });
-            let reason = if pending {
-                BallastRefillBlocker::NotEvaluated
-            } else {
-                reserve.headroom_error = Some("reserve observation is stale".into());
-                BallastRefillBlocker::ObservationStale
-            };
-            if !reserve.refill_blockers.contains(&reason) {
-                reserve.refill_blockers.push(reason);
-            }
-        }
+        let reserve = record.reserve_status_at(now)?;
         pools.push(reserve);
     }
     pools.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
     skipped_pools.sort_by(|left, right| left.mount.cmp(&right.mount));
     Some(BallastReserveStatus {
         source: "daemon_observation",
-        detail: "Daemon reserve evidence; unobserved or expired inventory is unknown; reserve availability is separate from disk pressure".into(),
+        detail: if discovery_pending {
+            "Pool discovery is pending; overall reserve availability and configured totals are unknown. Listed pools retain their latest individual observations."
+        } else {
+            "Daemon reserve evidence; unobserved or expired inventory is unknown; reserve availability is separate from disk pressure"
+        }.into(),
+        discovery_pending,
         pools,
         skipped_pools,
     })
@@ -11012,6 +10981,7 @@ fn observe_reserve_status(config: &Config, platform: &dyn Platform) -> BallastRe
         Ok(pools) => BallastReserveStatus {
             source: "read_only_inventory",
             detail: "Read-only inventory visible to this command; no fresh daemon reserve report, so daemon release access, automatic refill policy and cooldown are unknown".into(),
+            discovery_pending: false,
             pools: pools
                 .iter()
                 .filter(|pool| !pool.skipped)
@@ -11030,6 +11000,7 @@ fn observe_reserve_status(config: &Config, platform: &dyn Platform) -> BallastRe
         Err(error) => BallastReserveStatus {
             source: "unavailable",
             detail: format!("could not inspect reserve inventory: {error}"),
+            discovery_pending: false,
             pools: Vec::new(),
             skipped_pools: Vec::new(),
         },
@@ -18093,6 +18064,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use storage_ballast_helper::ballast::coordinator::BallastRefillBlocker;
     use storage_ballast_helper::core::config::SacredConfig;
     use storage_ballast_helper::platform::pal::{FsStats, MockPlatform, MountPoint, PlatformPaths};
     use storage_ballast_helper::platform::types::{
@@ -24865,8 +24837,6 @@ mod tests {
     }
 
     fn reserve_status_fixture(mount: &str, bytes: u64, authoritative: bool) -> BallastPoolState {
-        use storage_ballast_helper::ballast::coordinator::BallastRefillBlocker;
-
         let reserve = BallastReserveSnapshot {
             observed_at: "2026-11-12T12:05:35Z".into(),
             mount_point: mount.into(),
@@ -25045,17 +25015,17 @@ mod tests {
         assert!(daemon_reserve_status(&state, now, Some(42)).is_some());
         assert!(daemon_reserve_status(&state, now, Some(43)).is_none());
         for observed_at in ["2026-11-12T12:00:00Z", "2026-11-12T13:00:00Z", "", "bad"] {
-            let mut stale = state.clone();
-            stale["ballast_pools"][0]["reserve"]["observed_at"] = json!(observed_at);
-            stale["ballast_pools"][0]["reserve"]["unreadable_count"] = json!(7);
-            stale["ballast_pools"][0]["reserve"]["refill_blockers"] = json!([
+            let mut expired = state.clone();
+            expired["ballast_pools"][0]["reserve"]["observed_at"] = json!(observed_at);
+            expired["ballast_pools"][0]["reserve"]["unreadable_count"] = json!(7);
+            expired["ballast_pools"][0]["reserve"]["refill_blockers"] = json!([
                 BallastRefillBlocker::PressurePolicy,
                 BallastRefillBlocker::SafetyFloor,
                 BallastRefillBlocker::FilesystemStatsUnavailable,
                 BallastRefillBlocker::ReadOnlyFilesystem,
                 BallastRefillBlocker::InventoryUnreadable,
             ]);
-            let report = daemon_reserve_status(&stale, now, Some(42)).unwrap();
+            let report = daemon_reserve_status(&expired, now, Some(42)).unwrap();
             assert_eq!(report.pools[0].state, BallastReserveState::Unknown);
             assert_eq!(report.pools[0].releasable_bytes, 0);
             assert!(!report.pools[0].inventory_authoritative);
@@ -25114,6 +25084,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn status_pending_daemon_inventory_keeps_its_namespace_and_policy_reason() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:06:00Z")
             .unwrap()
@@ -25139,5 +25110,45 @@ mod tests {
                 .summary()
                 .contains("no ballast reserve remains")
         );
+
+        for (pending, reload_pending) in [(true, false), (false, true)] {
+            let mut state = json!({
+                "pid": 42,
+                "discovery": { "pending": pending, "reload_pending": reload_pending },
+                "ballast": { "available": 0, "total": 0 },
+                "ballast_pools": [],
+            });
+            let report = daemon_reserve_status(&state, now, Some(42)).unwrap();
+            assert_eq!(report.source, "daemon_observation");
+            assert!(report.discovery_pending);
+            assert_eq!(
+                report.warning_summary().as_deref(),
+                Some("overall reserve availability unknown while pool discovery is pending")
+            );
+            assert!(report.detail.contains("configured totals are unknown"));
+            assert!(report.pools.is_empty());
+            assert_eq!(
+                serde_json::to_value(&report).unwrap()["discovery_pending"],
+                true
+            );
+
+            state["ballast_pools"] = json!([
+                reserve_status_fixture("/healthy", 1000, true),
+                reserve_status_fixture("/empty", 0, true),
+            ]);
+            let report = daemon_reserve_status(&state, now, Some(42)).unwrap();
+            assert_eq!(report.pools[0].state, BallastReserveState::Exhausted);
+            assert_eq!(report.pools[1].state, BallastReserveState::Healthy);
+            assert!(report.pools.iter().all(|pool| pool.inventory_authoritative));
+            let warning = report.warning_summary().unwrap();
+            assert!(warning.contains("exhausted on /empty"));
+            assert!(warning.contains("discovery is pending"));
+
+            state["discovery"] = json!({ "pending": false, "reload_pending": false });
+            state["ballast_pools"] = json!([reserve_status_fixture("/healthy", 1000, true)]);
+            let report = daemon_reserve_status(&state, now, Some(42)).unwrap();
+            assert!(!report.discovery_pending);
+            assert!(report.warning_summary().is_none());
+        }
     }
 }

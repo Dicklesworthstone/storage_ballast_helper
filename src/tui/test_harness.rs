@@ -25,9 +25,11 @@ use sha2::{Digest, Sha256};
 use super::model::{DashboardCmd, DashboardError, DashboardModel, DashboardMsg, Overlay, Screen};
 use super::render;
 use super::update;
+use crate::ballast::coordinator::{BallastReserveSnapshot, BallastReserveState};
 use crate::core::hex_lower;
 use crate::daemon::self_monitor::{
-    BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
+    BallastPoolState, BallastState, Counters, DaemonState, LastScanState, MountPressure,
+    PressureState,
 };
 
 // ──────────────────── frame snapshot ────────────────────
@@ -376,14 +378,58 @@ fn make_key_ctrl(code: KeyCode) -> KeyEvent {
 
 // ──────────────────── test fixtures ────────────────────
 
+/// Explicit inventory evidence for rendering and operator workflow fixtures.
+/// The caller supplies the observation clock; timestamp freshness is tested
+/// separately with fixed clocks in the reader tests.
+pub fn sample_observed_pool(
+    mount: &str,
+    available: usize,
+    total: usize,
+    observed_at: &str,
+) -> BallastPoolState {
+    let mount_point = PathBuf::from(mount);
+    let ballast_dir = mount_point.join(".sbh/ballast");
+    let releasable_bytes = available as u64 * 1_073_741_824;
+    let configured_bytes = total as u64 * 1_073_741_824;
+    BallastPoolState {
+        mount: mount.into(),
+        ballast_dir: ballast_dir.to_string_lossy().into_owned(),
+        fs_type: "ext4".into(),
+        strategy: "fallocate".into(),
+        available,
+        total,
+        releasable_bytes,
+        reserve: Some(BallastReserveSnapshot {
+            observed_at: observed_at.into(),
+            mount_point,
+            ballast_dir,
+            files_available: available,
+            files_total: total,
+            releasable_bytes,
+            configured_bytes,
+            state: BallastReserveState::classify(configured_bytes, releasable_bytes, true),
+            inventory_authoritative: true,
+            unreadable_count: 0,
+            headroom: None,
+            headroom_error: None,
+            refill_blockers: vec![],
+            refill_in_progress: false,
+        }),
+        ..BallastPoolState::default()
+    }
+}
+
 /// A healthy daemon state for test scenarios.
 pub fn sample_healthy_state() -> DaemonState {
+    // Publication/observation timestamps are not rendered; all visible data
+    // remains stable while the live reducer receives current evidence.
+    let observed_at = chrono::Utc::now().to_rfc3339();
     DaemonState {
         version: "0.1.0".into(),
         pid: 1234,
         started_at: "2026-02-16T00:00:00Z".into(),
         uptime_seconds: 3600,
-        last_updated: "2026-02-16T01:00:00Z".into(),
+        last_updated: observed_at.clone(),
         pressure: PressureState {
             overall: "green".into(),
             mounts: vec![MountPressure {
@@ -398,6 +444,7 @@ pub fn sample_healthy_state() -> DaemonState {
             total: 10,
             released: 0,
         },
+        ballast_pools: vec![sample_observed_pool("/data", 10, 10, &observed_at)],
         last_scan: LastScanState {
             at: Some("2026-02-16T00:59:00Z".into()),
             candidates: 5,
@@ -420,12 +467,13 @@ pub fn sample_healthy_state() -> DaemonState {
 
 /// A pressured daemon state for test scenarios.
 pub fn sample_pressured_state() -> DaemonState {
+    let observed_at = chrono::Utc::now().to_rfc3339();
     DaemonState {
         version: "0.1.0".into(),
         pid: 1234,
         started_at: "2026-02-16T00:00:00Z".into(),
         uptime_seconds: 7200,
-        last_updated: "2026-02-16T02:00:00Z".into(),
+        last_updated: observed_at.clone(),
         pressure: PressureState {
             overall: "red".into(),
             mounts: vec![MountPressure {
@@ -440,6 +488,7 @@ pub fn sample_pressured_state() -> DaemonState {
             total: 10,
             released: 8,
         },
+        ballast_pools: vec![sample_observed_pool("/data", 2, 10, &observed_at)],
         last_scan: LastScanState {
             at: Some("2026-02-16T01:59:00Z".into()),
             candidates: 47,

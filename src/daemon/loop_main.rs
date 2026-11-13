@@ -17959,8 +17959,11 @@ mod tests {
         );
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let expired = Instant::now()
-            - MonitoringDaemon::filesystem_observation_max_age(&fixture.daemon.config)
-            - Duration::from_secs(1);
+            .checked_sub(
+                MonitoringDaemon::filesystem_observation_max_age(&fixture.daemon.config)
+                    + Duration::from_secs(1),
+            )
+            .expect("the expired observation timestamp is representable");
         for monitor in fixture.daemon.mount_monitors.values_mut() {
             if let Some(observation) = &mut monitor.last_observation {
                 observation.sample.collected_at = expired;
@@ -31480,8 +31483,11 @@ mod tests {
 
         // Age the consumed receipt without waiting ten minutes. The second
         // probe also has a genuinely elapsed, short delivery deadline.
-        fixture.daemon.last_full_disk_access_check =
-            Some(Instant::now() - FULL_DISK_ACCESS_MAX_AGE - Duration::from_secs(1));
+        fixture.daemon.last_full_disk_access_check = Some(
+            Instant::now()
+                .checked_sub(FULL_DISK_ACCESS_MAX_AGE + Duration::from_secs(1))
+                .expect("the expired probe timestamp is representable"),
+        );
         fixture
             .daemon
             .full_disk_access_observer

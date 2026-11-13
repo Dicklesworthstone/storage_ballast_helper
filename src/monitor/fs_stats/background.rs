@@ -474,6 +474,7 @@ mod tests {
         {
             let state = observer.state.lock().unwrap();
             assert!(state.entries["mount"].observation.is_none());
+            drop(state);
         }
         let fresh = await_value(&observer, "mount", false);
         assert!(fresh.collected_at > first.collected_at);
@@ -511,6 +512,7 @@ mod tests {
             let state = observer.state.lock().unwrap();
             assert_eq!(state.entries.len(), 2);
             assert!(state.entries["stalled"].pending.is_some());
+            drop(state);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         resume_tx.send(()).unwrap();

@@ -289,8 +289,9 @@ mod background_tests {
             let key = u64::from(reason == "scope");
             match reason {
                 "expired" => {
-                    probes.pending.get_mut(mount).unwrap().started_at =
-                        Instant::now() - Duration::from_secs(120);
+                    probes.pending.get_mut(mount).unwrap().started_at = Instant::now()
+                        .checked_sub(Duration::from_secs(120))
+                        .expect("the expired recovery timestamp is representable");
                 }
                 "missing" => current_deadline = Instant::now(),
                 "shutdown" => shutdown.store(true, Ordering::Release),
@@ -324,14 +325,14 @@ mod background_tests {
         );
         entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         let (dropped_tx, dropped_rx) = channel();
-        let dropper = std::thread::spawn(move || {
+        let join_handle = std::thread::spawn(move || {
             drop(probes);
             dropped_tx.send(()).unwrap();
         });
         let dropped = dropped_rx.recv_timeout(Duration::from_secs(3));
         resume_tx.send(()).unwrap();
         dropped.expect("dropping probes must not join a blocked worker");
-        dropper.join().unwrap();
+        join_handle.join().unwrap();
         assert!(!permitted_rx.recv_timeout(Duration::from_secs(3)).unwrap());
     }
 }

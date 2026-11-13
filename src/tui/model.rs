@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use ftui::{KeyEvent, MouseEvent};
 
+use crate::ballast::coordinator::{BallastRefillBlocker, BallastReserveState};
 use crate::daemon::self_monitor::DaemonState;
 use crate::tui::layout::OverviewPane;
 use crate::tui::preferences::{DensityMode, HintVerbosity, StartScreen};
@@ -317,6 +318,12 @@ pub struct BallastVolume {
     pub files_total: usize,
     /// Bytes reclaimable by releasing available files.
     pub releasable_bytes: u64,
+    /// Observed reserve condition, independent of filesystem pressure.
+    pub reserve_state: BallastReserveState,
+    /// Whether the displayed quantities are confirmed inventory.
+    pub inventory_authoritative: bool,
+    /// Existing policy and observation reasons preventing automatic refill.
+    pub refill_blockers: Vec<BallastRefillBlocker>,
     /// Whether this volume was skipped during provisioning.
     pub skipped: bool,
     /// Reason the volume was skipped, if applicable.
@@ -326,15 +333,36 @@ pub struct BallastVolume {
 impl BallastVolume {
     /// The dashboard's view of one pool record from the daemon state.
     #[must_use]
-    pub fn from_pool_state(pool: &crate::daemon::self_monitor::BallastPoolState) -> Self {
+    pub fn from_pool_state_at(
+        pool: &crate::daemon::self_monitor::BallastPoolState,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let reserve = pool.reserve_status_at(now);
+        let authoritative = reserve
+            .as_ref()
+            .is_some_and(|reserve| reserve.inventory_authoritative);
         Self {
             mount_point: pool.mount.clone(),
             ballast_dir: pool.ballast_dir.clone(),
             fs_type: pool.fs_type.clone(),
             strategy: pool.strategy.clone(),
-            files_available: pool.available,
-            files_total: pool.total,
-            releasable_bytes: pool.releasable_bytes,
+            files_available: reserve
+                .as_ref()
+                .filter(|_| authoritative)
+                .map_or(0, |r| r.files_available),
+            files_total: reserve.as_ref().map_or(pool.total, |r| r.files_total),
+            releasable_bytes: reserve
+                .as_ref()
+                .filter(|_| authoritative)
+                .map_or(0, |r| r.releasable_bytes),
+            reserve_state: reserve
+                .as_ref()
+                .map_or(BallastReserveState::Unknown, |r| r.state),
+            inventory_authoritative: authoritative,
+            refill_blockers: reserve.map_or_else(
+                || vec![BallastRefillBlocker::NotEvaluated],
+                |r| r.refill_blockers,
+            ),
             skipped: pool.skipped,
             skip_reason: pool.skip_reason.clone(),
         }
@@ -345,14 +373,66 @@ impl BallastVolume {
     pub fn status_level(&self) -> &'static str {
         if self.skipped {
             "SKIPPED"
-        } else if self.files_total == 0 {
-            "UNCONFIGURED"
-        } else if self.files_available == 0 {
-            "CRITICAL"
-        } else if self.files_available.saturating_mul(2) < self.files_total {
-            "LOW"
         } else {
-            "OK"
+            reserve_status_label(self.reserve_state)
+        }
+    }
+
+    /// Unknown availability is never displayed as an observed empty pool.
+    pub fn files_label(&self) -> String {
+        if self.inventory_authoritative {
+            format!("{}/{}", self.files_available, self.files_total)
+        } else {
+            format!("unknown/{}", self.files_total)
+        }
+    }
+
+    /// Confirmed releasable allocation, or an explicit unavailable reading.
+    pub fn bytes_label(&self) -> String {
+        if self.inventory_authoritative {
+            crate::tui::widgets::human_bytes(self.releasable_bytes)
+        } else {
+            "unknown".into()
+        }
+    }
+}
+
+fn reserve_status_label(state: BallastReserveState) -> &'static str {
+    match state {
+        BallastReserveState::Unconfigured => "UNCONFIGURED",
+        BallastReserveState::Healthy => "OK",
+        BallastReserveState::Depleted => "LOW",
+        BallastReserveState::Critical => "CRITICAL",
+        BallastReserveState::Exhausted => "EXHAUSTED",
+        BallastReserveState::Unknown => "UNKNOWN",
+    }
+}
+
+/// Aggregate evidence for the overview; an unknown pool makes totals unknown,
+/// while a confirmed exhausted sibling still raises the overall warning.
+pub struct BallastSummary {
+    /// Most urgent observed pool condition.
+    pub state: BallastReserveState,
+    /// Confirmed available files, absent if any managed pool is unknown.
+    pub available: Option<usize>,
+    /// Configured files across managed pools, absent while discovery is pending.
+    pub total: Option<usize>,
+    /// Confirmed releasable bytes, absent if any managed pool is unknown.
+    pub releasable_bytes: Option<u64>,
+}
+
+impl BallastSummary {
+    /// Human-readable condition shared with the per-volume badges.
+    pub fn status_level(&self) -> &'static str {
+        reserve_status_label(self.state)
+    }
+
+    /// Aggregate file count that preserves uncertainty.
+    pub fn files_label(&self) -> String {
+        match (self.available, self.total) {
+            (Some(available), Some(total)) => format!("{available}/{total}"),
+            (None, Some(total)) => format!("unknown/{total}"),
+            (_, None) => "unknown".into(),
         }
     }
 }
@@ -1070,6 +1150,70 @@ impl DashboardModel {
     #[must_use]
     pub fn ballast_selected_volume(&self) -> Option<&BallastVolume> {
         self.ballast_volumes.get(self.ballast_selected)
+    }
+
+    /// Summarize observed pools rather than the daemon's cached actuator counts.
+    pub fn ballast_summary(&self) -> BallastSummary {
+        let discovery_pending = self
+            .daemon_state
+            .as_ref()
+            .and_then(|state| state.discovery.as_ref())
+            .is_some_and(|discovery| discovery.pending || discovery.reload_pending);
+        let managed: Vec<_> = self
+            .ballast_volumes
+            .iter()
+            .filter(|pool| !pool.skipped)
+            .collect();
+        if managed.is_empty() {
+            let total = self
+                .daemon_state
+                .as_ref()
+                .filter(|_| !discovery_pending)
+                .map(|state| state.ballast.total);
+            let unconfigured = total == Some(0);
+            return BallastSummary {
+                state: if unconfigured {
+                    BallastReserveState::Unconfigured
+                } else {
+                    BallastReserveState::Unknown
+                },
+                available: unconfigured.then_some(0),
+                total,
+                releasable_bytes: unconfigured.then_some(0),
+            };
+        }
+        let state = [
+            BallastReserveState::Exhausted,
+            BallastReserveState::Critical,
+            BallastReserveState::Unknown,
+            BallastReserveState::Depleted,
+            BallastReserveState::Healthy,
+            BallastReserveState::Unconfigured,
+        ]
+        .into_iter()
+        .find(|state| {
+            (*state == BallastReserveState::Unknown && discovery_pending)
+                || managed.iter().any(|pool| pool.reserve_state == *state)
+        })
+        .unwrap_or(BallastReserveState::Unknown);
+        let authoritative =
+            !discovery_pending && managed.iter().all(|pool| pool.inventory_authoritative);
+        let (available, total, bytes) = managed.iter().fold(
+            (0_usize, 0_usize, 0_u64),
+            |(available, total, bytes), pool| {
+                (
+                    available.saturating_add(pool.files_available),
+                    total.saturating_add(pool.files_total),
+                    bytes.saturating_add(pool.releasable_bytes),
+                )
+            },
+        );
+        BallastSummary {
+            state,
+            available: authoritative.then_some(available),
+            total: (!discovery_pending).then_some(total),
+            releasable_bytes: authoritative.then_some(bytes),
+        }
     }
 
     // ── Command palette methods ──
@@ -1918,6 +2062,13 @@ mod tests {
             files_available: available,
             files_total: total,
             releasable_bytes: available as u64 * 1_073_741_824,
+            reserve_state: BallastReserveState::classify(
+                total as u64 * 1_073_741_824,
+                available as u64 * 1_073_741_824,
+                true,
+            ),
+            inventory_authoritative: true,
+            refill_blockers: vec![],
             skipped: false,
             skip_reason: None,
         }
@@ -2024,7 +2175,7 @@ mod tests {
 
     #[test]
     fn ballast_volume_status_levels() {
-        let ok = sample_volume("/", 4, 5);
+        let ok = sample_volume("/", 5, 5);
         assert_eq!(ok.status_level(), "OK");
 
         let low = sample_volume("/data", 2, 5);
@@ -2034,7 +2185,7 @@ mod tests {
             files_available: 0,
             ..sample_volume("/tmp", 0, 5)
         };
-        assert_eq!(critical.status_level(), "CRITICAL");
+        assert_eq!(critical.status_level(), "EXHAUSTED");
 
         let skipped = BallastVolume {
             skipped: true,
@@ -2048,6 +2199,137 @@ mod tests {
             ..sample_volume("/mnt", 0, 0)
         };
         assert_eq!(unconfigured.status_level(), "UNCONFIGURED");
+    }
+
+    #[test]
+    fn ballast_summary_preserves_unknown_legacy_and_per_volume_risk() {
+        let mut model = test_model();
+        model.daemon_state = Some(DaemonState {
+            ballast: crate::daemon::self_monitor::BallastState {
+                available: 10,
+                total: 10,
+                released: 0,
+            },
+            ..DaemonState::default()
+        });
+        let legacy = model.ballast_summary();
+        assert_eq!(legacy.status_level(), "UNKNOWN");
+        assert_eq!(legacy.files_label(), "unknown/10");
+        assert_eq!(legacy.releasable_bytes, None);
+
+        model.ballast_volumes = vec![sample_volume("/", 0, 10), sample_volume("/data", 10, 10)];
+        let exhausted = model.ballast_summary();
+        assert_eq!(exhausted.status_level(), "EXHAUSTED");
+        assert_eq!(exhausted.available, Some(10));
+        assert_eq!(exhausted.total, Some(20));
+
+        model.ballast_volumes[1].inventory_authoritative = false;
+        model.ballast_volumes[1].reserve_state = BallastReserveState::Unknown;
+        let uncertain = model.ballast_summary();
+        assert_eq!(uncertain.status_level(), "EXHAUSTED");
+        assert_eq!(uncertain.available, None);
+        assert_eq!(uncertain.releasable_bytes, None);
+        assert_eq!(model.ballast_volumes[1].files_label(), "unknown/10");
+        assert_eq!(model.ballast_volumes[1].bytes_label(), "unknown");
+
+        model.ballast_volumes = vec![sample_volume("/", 10, 10), sample_volume("/data", 10, 10)];
+        assert_eq!(model.ballast_summary().status_level(), "OK");
+        assert_eq!(model.ballast_summary().available, Some(20));
+
+        for (pending, reload_pending) in [(true, false), (false, true)] {
+            let state = model.daemon_state.as_mut().unwrap();
+            state.ballast.total = 0;
+            state.discovery = Some(crate::daemon::self_monitor::DiscoveryState {
+                pending,
+                reload_pending,
+                ..Default::default()
+            });
+            model.ballast_volumes.clear();
+            let pending = model.ballast_summary();
+            assert_eq!(pending.status_level(), "UNKNOWN");
+            assert_eq!(pending.available, None);
+            assert_eq!(pending.total, None);
+            assert_eq!(pending.files_label(), "unknown");
+
+            model.ballast_volumes = vec![sample_volume("/data", 10, 10)];
+            assert_eq!(model.ballast_summary().status_level(), "UNKNOWN");
+            assert_eq!(model.ballast_summary().files_label(), "unknown");
+            assert_eq!(model.ballast_volumes[0].status_level(), "OK");
+            assert_eq!(model.ballast_volumes[0].files_label(), "10/10");
+            model.ballast_volumes.push(sample_volume("/empty", 0, 10));
+            assert_eq!(model.ballast_summary().status_level(), "EXHAUSTED");
+            assert_eq!(model.ballast_summary().available, None);
+        }
+        model.daemon_state.as_mut().unwrap().discovery = None;
+        model.ballast_volumes.clear();
+        assert_eq!(model.ballast_summary().status_level(), "UNCONFIGURED");
+        assert_eq!(model.ballast_summary().files_label(), "0/0");
+    }
+
+    #[test]
+    fn ballast_projection_uses_observation_and_expires_without_cached_fallback() {
+        use crate::ballast::coordinator::BallastReserveSnapshot;
+        use crate::daemon::self_monitor::BallastPoolState;
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-13T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut pool = BallastPoolState {
+            mount: "/data".into(),
+            ballast_dir: "/data/ballast".into(),
+            available: 10,
+            total: 10,
+            releasable_bytes: 10_000,
+            reserve: Some(BallastReserveSnapshot {
+                observed_at: now.to_rfc3339(),
+                mount_point: "/data".into(),
+                ballast_dir: "/data/ballast".into(),
+                files_available: 0,
+                files_total: 10,
+                releasable_bytes: 0,
+                configured_bytes: 10_000,
+                state: BallastReserveState::Exhausted,
+                inventory_authoritative: true,
+                unreadable_count: 0,
+                headroom: None,
+                headroom_error: None,
+                refill_blockers: vec![BallastRefillBlocker::SafetyFloor],
+                refill_in_progress: false,
+            }),
+            ..BallastPoolState::default()
+        };
+        let empty = BallastVolume::from_pool_state_at(&pool, now);
+        assert_eq!(empty.status_level(), "EXHAUSTED");
+        assert_eq!(empty.files_label(), "0/10");
+        assert_eq!(empty.releasable_bytes, 0);
+        assert_eq!(
+            empty.refill_blockers,
+            vec![BallastRefillBlocker::SafetyFloor]
+        );
+
+        let stale = BallastVolume::from_pool_state_at(&pool, now + chrono::Duration::seconds(90));
+        assert_eq!(stale.status_level(), "UNKNOWN");
+        assert_eq!(stale.files_label(), "unknown/10");
+        assert_eq!(stale.bytes_label(), "unknown");
+        assert!(
+            !stale
+                .refill_blockers
+                .contains(&BallastRefillBlocker::SafetyFloor)
+        );
+        assert!(
+            stale
+                .refill_blockers
+                .contains(&BallastRefillBlocker::ObservationStale)
+        );
+
+        pool.reserve = None;
+        let pending = BallastVolume::from_pool_state_at(&pool, now);
+        assert_eq!(pending.status_level(), "UNKNOWN");
+        assert_eq!(pending.files_available, 0);
+        assert_eq!(
+            pool.available, 10,
+            "observation must not mutate actuator bookkeeping"
+        );
     }
 
     // ── Diagnostics state tests ──
@@ -2267,25 +2549,22 @@ mod tests {
     // ── BallastVolume boundary conditions ──
 
     #[test]
-    fn ballast_volume_exact_low_ok_boundary() {
-        // The condition is: files_available * 2 < files_total → LOW, otherwise OK
-        // At exact boundary: 5 * 2 = 10, not < 10, so "OK"
-        let exact_boundary = sample_volume("/test", 5, 10);
-        assert_eq!(exact_boundary.status_level(), "OK");
-
-        // Just below boundary: 4 * 2 = 8 < 10, so "LOW"
-        let below_boundary = sample_volume("/test", 4, 10);
-        assert_eq!(below_boundary.status_level(), "LOW");
+    fn ballast_volume_exact_critical_boundary() {
+        let exact_boundary = sample_volume("/test", 1, 4);
+        assert_eq!(exact_boundary.status_level(), "CRITICAL");
+        let above_boundary = sample_volume("/test", 2, 4);
+        assert_eq!(above_boundary.status_level(), "LOW");
+        assert_eq!(sample_volume("/test", 4, 4).status_level(), "OK");
     }
 
     #[test]
     fn ballast_volume_single_file_critical_vs_ok() {
-        // 0 of 1 → CRITICAL
+        // 0 of 1 is confirmed exhaustion.
         let critical = BallastVolume {
             files_available: 0,
             ..sample_volume("/x", 0, 1)
         };
-        assert_eq!(critical.status_level(), "CRITICAL");
+        assert_eq!(critical.status_level(), "EXHAUSTED");
 
         // 1 of 1 → files_available*2=2 >= files_total=1 → OK
         let ok = sample_volume("/x", 1, 1);

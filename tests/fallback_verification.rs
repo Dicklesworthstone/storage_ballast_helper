@@ -42,7 +42,7 @@ fn sample_daemon_state() -> DaemonState {
         pid: 42,
         started_at: "2026-02-16T00:00:00Z".to_string(),
         uptime_seconds: 3600,
-        last_updated: "2026-02-16T01:00:00Z".to_string(),
+        last_updated: chrono::Utc::now().to_rfc3339(),
         pressure: PressureState {
             overall: "yellow".to_string(),
             mounts: vec![MountPressure {

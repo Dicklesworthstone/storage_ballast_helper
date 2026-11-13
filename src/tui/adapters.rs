@@ -31,7 +31,7 @@ impl Default for AdapterHealth {
 
 /// Shared state-source contract. Implementations are added in `bd-xzt.2.3`.
 pub trait StateAdapter {
-    /// Returns `None` when data is unavailable or malformed.
+    /// Returns `None` when data is unavailable, malformed, stopped, or stale.
     fn read_state(&self, state_file: &Path) -> Option<DaemonState>;
 
     /// Provides a coarse health signal for diagnostics.
@@ -63,6 +63,7 @@ impl StateAdapter for NullStateAdapter {
 pub enum StateFreshness {
     Fresh,
     Stale { age: Duration },
+    Stopped,
     Missing,
     Malformed,
     ReadError(String),
@@ -155,7 +156,8 @@ impl DashboardStateAdapter {
     /// filesystem fallback.
     #[must_use]
     pub fn load_snapshot(&self, state_file: &Path, monitor_paths: &[PathBuf]) -> DashboardSnapshot {
-        let outcome = self.read_state_outcome(state_file);
+        let outcome =
+            Self::read_state_outcome_at(state_file, self.stale_threshold, SystemTime::now());
         match outcome {
             StateReadOutcome::Fresh { state, warnings } => DashboardSnapshot {
                 mounts: mounts_from_state(&state),
@@ -179,6 +181,17 @@ impl DashboardStateAdapter {
                     warnings,
                 }
             }
+            StateReadOutcome::Stopped { state, warnings } => {
+                let fallback_mounts = self.collect_fallback_mounts(monitor_paths);
+                let source = fallback_source(&fallback_mounts);
+                DashboardSnapshot {
+                    daemon_state: Some(state),
+                    mounts: fallback_mounts,
+                    freshness: StateFreshness::Stopped,
+                    source,
+                    warnings,
+                }
+            }
             StateReadOutcome::Missing => {
                 let fallback_mounts = self.collect_fallback_mounts(monitor_paths);
                 let source = fallback_source(&fallback_mounts);
@@ -190,7 +203,7 @@ impl DashboardStateAdapter {
                     warnings: SchemaWarnings::default(),
                 }
             }
-            StateReadOutcome::Malformed => {
+            StateReadOutcome::Malformed { warnings } => {
                 let fallback_mounts = self.collect_fallback_mounts(monitor_paths);
                 let source = fallback_source(&fallback_mounts);
                 DashboardSnapshot {
@@ -198,7 +211,7 @@ impl DashboardStateAdapter {
                     mounts: fallback_mounts,
                     freshness: StateFreshness::Malformed,
                     source,
-                    warnings: SchemaWarnings::default(),
+                    warnings,
                 }
             }
             StateReadOutcome::ReadError(details) => {
@@ -215,7 +228,23 @@ impl DashboardStateAdapter {
         }
     }
 
-    fn read_state_outcome(&self, state_file: &Path) -> StateReadOutcome {
+    /// Read only current live-daemon evidence, without probing filesystems or
+    /// requiring a detected platform. The runtime and typed adapter share this
+    /// reader; replay feeds captured state through its own history driver.
+    pub(super) fn read_live_state_at(state_file: &Path, now: SystemTime) -> Option<DaemonState> {
+        Self::read_state_outcome_at(
+            state_file,
+            Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS),
+            now,
+        )
+        .into_live_state()
+    }
+
+    fn read_state_outcome_at(
+        state_file: &Path,
+        stale_threshold: Duration,
+        now: SystemTime,
+    ) -> StateReadOutcome {
         let metadata = match std::fs::metadata(state_file) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -231,7 +260,9 @@ impl DashboardStateAdapter {
             }
             // Binary garbage / invalid UTF-8 is malformed content, not a read error.
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                return StateReadOutcome::Malformed;
+                return StateReadOutcome::Malformed {
+                    warnings: SchemaWarnings::default(),
+                };
             }
             Err(error) => return StateReadOutcome::ReadError(error.to_string()),
         };
@@ -242,18 +273,38 @@ impl DashboardStateAdapter {
         // `DaemonState` uses `#[serde(default)]` so that missing fields
         // get zero-values rather than hard-failing deserialization.
         let Ok(state) = serde_json::from_str::<DaemonState>(&raw) else {
-            return StateReadOutcome::Malformed;
+            return StateReadOutcome::Malformed { warnings };
+        };
+
+        if state.stopped_at.is_some() {
+            return StateReadOutcome::Stopped { state, warnings };
+        }
+
+        // Copying or touching an old state file cannot renew the daemon's
+        // evidence. Require its recorded update time as well as the file's
+        // own age, and reject missing, malformed, or future timestamps.
+        let Some(document_age) = chrono::DateTime::parse_from_rfc3339(&state.last_updated)
+            .ok()
+            .and_then(|updated| {
+                chrono::DateTime::<chrono::Utc>::from(now)
+                    .signed_duration_since(updated)
+                    .to_std()
+                    .ok()
+            })
+        else {
+            return StateReadOutcome::Malformed { warnings };
         };
 
         let modified = match metadata.modified() {
             Ok(modified) => modified,
             Err(error) => return StateReadOutcome::ReadError(error.to_string()),
         };
-        let age = SystemTime::now()
-            .duration_since(modified)
-            .unwrap_or_default();
+        let Ok(file_age) = now.duration_since(modified) else {
+            return StateReadOutcome::Malformed { warnings };
+        };
+        let age = document_age.max(file_age);
 
-        if age > self.stale_threshold {
+        if age >= stale_threshold {
             StateReadOutcome::Stale {
                 state,
                 age,
@@ -290,17 +341,25 @@ impl DashboardStateAdapter {
 
 impl StateAdapter for DashboardStateAdapter {
     fn read_state(&self, state_file: &Path) -> Option<DaemonState> {
-        match self.read_state_outcome(state_file) {
-            StateReadOutcome::Fresh { state, .. } => Some(state),
-            StateReadOutcome::Stale { .. }
-            | StateReadOutcome::Missing
-            | StateReadOutcome::Malformed
-            | StateReadOutcome::ReadError(_) => None,
-        }
+        Self::read_state_outcome_at(state_file, self.stale_threshold, SystemTime::now())
+            .into_live_state()
     }
 
     fn health(&self) -> AdapterHealth {
         AdapterHealth::default()
+    }
+}
+
+impl StateReadOutcome {
+    fn into_live_state(self) -> Option<DaemonState> {
+        match self {
+            Self::Fresh { state, .. } => Some(state),
+            Self::Stale { .. }
+            | Self::Stopped { .. }
+            | Self::Missing
+            | Self::Malformed { .. }
+            | Self::ReadError(_) => None,
+        }
     }
 }
 
@@ -315,15 +374,21 @@ enum StateReadOutcome {
         age: Duration,
         warnings: SchemaWarnings,
     },
+    Stopped {
+        state: DaemonState,
+        warnings: SchemaWarnings,
+    },
     Missing,
-    Malformed,
+    Malformed {
+        warnings: SchemaWarnings,
+    },
     ReadError(String),
 }
 
 /// Expected top-level keys in `DaemonState`. Used for drift detection.
 /// `DaemonState` fields that serialize only when set, so a default value
 /// does not show them and they must be listed by hand.
-const OPTIONAL_STATE_KEYS: &[&str] = &["idle_reason"];
+const OPTIONAL_STATE_KEYS: &[&str] = &["idle_reason", "discovery"];
 
 /// The keys a current `DaemonState` writes: derived from the type itself,
 /// so a new state-file field is never reported as schema drift. A
@@ -415,7 +480,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::daemon::self_monitor::{
-        BallastState, Counters, LastScanState, MountPressure, PressureState,
+        BallastState, Counters, DiscoveryState, LastScanState, MountPressure, PressureState,
     };
     use crate::platform::pal::{FsStats, MemoryInfo, MockPlatform, MountPoint, PlatformPaths};
 
@@ -640,6 +705,124 @@ mod tests {
     }
 
     #[test]
+    fn live_reader_requires_fresh_document_and_file_at_the_exact_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let threshold = Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS);
+
+        for (document_age, file_age, fresh) in [
+            (Duration::ZERO, Duration::ZERO, true),
+            (
+                threshold.checked_sub(Duration::from_millis(1)).unwrap(),
+                Duration::ZERO,
+                true,
+            ),
+            (threshold, Duration::ZERO, false),
+            (Duration::ZERO, threshold, false),
+            (Duration::from_hours(12), Duration::ZERO, false),
+            (Duration::ZERO, Duration::from_hours(12), false),
+        ] {
+            let mut state = sample_daemon_state();
+            state.last_updated =
+                chrono::DateTime::<chrono::Utc>::from(now - document_age).to_rfc3339();
+            write_state_file(&path, &state).unwrap();
+            set_file_mtime(&path, FileTime::from_system_time(now - file_age)).unwrap();
+
+            let outcome = DashboardStateAdapter::read_state_outcome_at(&path, threshold, now);
+            if fresh {
+                assert!(matches!(outcome, StateReadOutcome::Fresh { .. }));
+                assert_eq!(
+                    DashboardStateAdapter::read_live_state_at(&path, now),
+                    Some(state),
+                );
+            } else {
+                assert!(matches!(
+                    outcome,
+                    StateReadOutcome::Stale { age, .. } if age == document_age.max(file_age)
+                ));
+                assert!(DashboardStateAdapter::read_live_state_at(&path, now).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn live_reader_refuses_unverifiable_times_stopped_and_missing_state() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let threshold = Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS);
+        assert!(DashboardStateAdapter::read_live_state_at(&path, now).is_none());
+
+        for updated in [
+            String::new(),
+            "not a timestamp".to_string(),
+            chrono::DateTime::<chrono::Utc>::from(now + Duration::from_millis(1)).to_rfc3339(),
+        ] {
+            let mut state = sample_daemon_state();
+            state.last_updated = updated;
+            write_state_file(&path, &state).unwrap();
+            set_file_mtime(&path, FileTime::from_system_time(now)).unwrap();
+            assert!(matches!(
+                DashboardStateAdapter::read_state_outcome_at(&path, threshold, now),
+                StateReadOutcome::Malformed { .. }
+            ));
+            assert!(DashboardStateAdapter::read_live_state_at(&path, now).is_none());
+        }
+
+        let mut state = sample_daemon_state();
+        state.last_updated = chrono::DateTime::<chrono::Utc>::from(now).to_rfc3339();
+        write_state_file(&path, &state).unwrap();
+        set_file_mtime(
+            &path,
+            FileTime::from_system_time(now + Duration::from_secs(1)),
+        )
+        .unwrap();
+        assert!(DashboardStateAdapter::read_live_state_at(&path, now).is_none());
+
+        state.stopped_at = Some(state.last_updated.clone());
+        write_state_file(&path, &state).unwrap();
+        set_file_mtime(&path, FileTime::from_system_time(now)).unwrap();
+        assert!(matches!(
+            DashboardStateAdapter::read_state_outcome_at(&path, threshold, now),
+            StateReadOutcome::Stopped { .. }
+        ));
+        assert!(DashboardStateAdapter::read_live_state_at(&path, now).is_none());
+
+        std::fs::write(&path, "not json").unwrap();
+        set_file_mtime(&path, FileTime::from_system_time(now)).unwrap();
+        assert!(DashboardStateAdapter::read_live_state_at(&path, now).is_none());
+
+        state.stopped_at = None;
+        write_state_file(&path, &state).unwrap();
+        set_file_mtime(&path, FileTime::from_system_time(now)).unwrap();
+        assert_eq!(
+            DashboardStateAdapter::read_live_state_at(&path, now),
+            Some(state)
+        );
+    }
+
+    #[test]
+    fn stopped_snapshot_uses_fallback_without_claiming_live_daemon_data() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        let mut state = sample_daemon_state();
+        state.stopped_at = Some(state.last_updated.clone());
+        write_state_file(&path, &state).unwrap();
+        let adapter = DashboardStateAdapter::new(
+            mock_platform(),
+            Duration::from_secs(90),
+            Duration::from_secs(1),
+        );
+
+        let snapshot = adapter.load_snapshot(&path, &[PathBuf::from("/tmp/work")]);
+        assert_eq!(snapshot.freshness, StateFreshness::Stopped);
+        assert_eq!(snapshot.source, SnapshotSource::FilesystemFallback);
+        assert_eq!(snapshot.daemon_state, Some(state));
+        assert!(adapter.read_state(&path).is_none());
+    }
+
+    #[test]
     fn fallback_mounts_are_deduplicated_by_mount_path() {
         let tmp = TempDir::new().expect("tempdir");
         let state_path = tmp.path().join("missing-state.json");
@@ -670,7 +853,7 @@ mod tests {
             pid: 42,
             started_at: "2026-02-16T00:00:00Z".to_string(),
             uptime_seconds: 60,
-            last_updated: "2026-02-16T00:01:00Z".to_string(),
+            last_updated: chrono::Utc::now().to_rfc3339(),
             pressure: PressureState {
                 overall: "yellow".to_string(),
                 mounts: vec![MountPressure {
@@ -739,18 +922,43 @@ mod tests {
     fn fresh_state_has_no_schema_warnings() {
         let tmp = TempDir::new().expect("tempdir");
         let state_path = tmp.path().join("state.json");
-        write_state_file(&state_path, &sample_daemon_state()).expect("write");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
 
-        let adapter = DashboardStateAdapter::new(
-            mock_platform(),
-            Duration::from_secs(90),
-            Duration::from_secs(1),
-        );
-        let snapshot = adapter.load_snapshot(&state_path, &[]);
+        for discovery in [
+            None,
+            Some(DiscoveryState {
+                pending: true,
+                generation: 3,
+                reload_pending: true,
+                last_error: Some("optional volume is unavailable".into()),
+            }),
+        ] {
+            let mut state = sample_daemon_state();
+            state.last_updated = chrono::DateTime::<chrono::Utc>::from(now).to_rfc3339();
+            state.discovery = discovery.clone();
+            write_state_file(&state_path, &state).expect("write");
+            set_file_mtime(&state_path, FileTime::from_system_time(now)).expect("mtime");
 
-        assert!(!snapshot.warnings.has_drift());
-        assert!(snapshot.warnings.unknown_fields.is_empty());
-        assert!(snapshot.warnings.missing_fields.is_empty());
+            let StateReadOutcome::Fresh { state, warnings } =
+                DashboardStateAdapter::read_state_outcome_at(
+                    &state_path,
+                    Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS),
+                    now,
+                )
+            else {
+                panic!("pending discovery must not invalidate a fresh daemon state");
+            };
+            assert!(!warnings.has_drift());
+            assert!(warnings.unknown_fields.is_empty());
+            assert!(warnings.missing_fields.is_empty());
+            assert_eq!(state.discovery, discovery);
+            assert_eq!(
+                DashboardStateAdapter::read_live_state_at(&state_path, now)
+                    .expect("live daemon")
+                    .discovery,
+                discovery
+            );
+        }
     }
 
     #[test]
@@ -810,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn minimal_json_object_parses_with_all_defaults() {
+    fn missing_update_time_keeps_schema_warnings_but_cannot_be_live() {
         let tmp = TempDir::new().expect("tempdir");
         let state_path = tmp.path().join("state.json");
 
@@ -824,13 +1032,12 @@ mod tests {
         );
         let snapshot = adapter.load_snapshot(&state_path, &[PathBuf::from("/tmp/work")]);
 
-        // Should parse as Fresh (file was just written, so not stale).
-        assert!(snapshot.daemon_state.is_some());
-        let state = snapshot.daemon_state.unwrap();
-        assert_eq!(state.version, "");
-        assert_eq!(state.pid, 0);
-        assert_eq!(state.pressure.mounts.len(), 0);
-        assert_eq!(state.counters.scans, 0);
+        // Serde defaults do not establish live evidence. A new file with no
+        // update timestamp cannot claim a healthy, empty default daemon.
+        assert_eq!(snapshot.freshness, StateFreshness::Malformed);
+        assert!(snapshot.daemon_state.is_none());
+        assert_eq!(snapshot.source, SnapshotSource::FilesystemFallback);
+        assert!(adapter.read_state(&state_path).is_none());
 
         // Every required field is missing (optional ones are never reported).
         assert!(snapshot.warnings.has_drift());

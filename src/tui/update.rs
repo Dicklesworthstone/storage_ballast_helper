@@ -126,21 +126,27 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
 
             model.daemon_state = state.map(|s| *s);
 
-            // The Ballast screen lists the daemon's own per-mount inventory.
-            // A daemon older than that field gives only the aggregate, so
-            // one volume is synthesized on the first monitored mount (it
-            // has no pool directory, so a release on it can only go
-            // through the daemon).
+            // The Ballast screen uses observed per-pool evidence. Actuator
+            // bookkeeping and historical aggregate counts cannot establish
+            // live reserve availability. Replay uses the captured clock.
             if let Some(ref ds) = model.daemon_state {
+                let now = if model.replay.is_some() {
+                    chrono::DateTime::parse_from_rfc3339(&ds.last_updated)
+                        .map_or(chrono::DateTime::<chrono::Utc>::MAX_UTC, |time| {
+                            time.with_timezone(&chrono::Utc)
+                        })
+                } else {
+                    chrono::Utc::now()
+                };
                 if !ds.ballast_pools.is_empty() {
                     let volumes = ds
                         .ballast_pools
                         .iter()
-                        .map(BallastVolume::from_pool_state)
+                        .map(|pool| BallastVolume::from_pool_state_at(pool, now))
                         .collect();
                     model.set_ballast_volumes(volumes);
                     model.ballast_source = crate::tui::telemetry::DataSource::None;
-                } else if ds.ballast.total > 0 && model.ballast_volumes.is_empty() {
+                } else if ds.ballast.total > 0 {
                     let mount = ds
                         .pressure
                         .mounts
@@ -151,14 +157,25 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
                         ballast_dir: String::new(),
                         fs_type: String::new(),
                         strategy: String::new(),
-                        files_available: ds.ballast.available,
+                        files_available: 0,
                         files_total: ds.ballast.total,
                         releasable_bytes: 0,
+                        reserve_state: crate::ballast::coordinator::BallastReserveState::Unknown,
+                        inventory_authoritative: false,
+                        refill_blockers: vec![
+                            crate::ballast::coordinator::BallastRefillBlocker::NotEvaluated,
+                        ],
                         skipped: false,
                         skip_reason: None,
                     }]);
                     model.ballast_source = crate::tui::telemetry::DataSource::None;
+                } else {
+                    model.set_ballast_volumes(Vec::new());
                 }
+            } else {
+                // A missing, stopped or expired daemon state must not leave
+                // the last healthy inventory visible or available to actions.
+                model.set_ballast_volumes(Vec::new());
             }
 
             DashboardCmd::None
@@ -2946,6 +2963,13 @@ mod tests {
             files_available: available,
             files_total: total,
             releasable_bytes: available as u64 * 1_073_741_824,
+            reserve_state: crate::ballast::coordinator::BallastReserveState::classify(
+                total as u64 * 1_073_741_824,
+                available as u64 * 1_073_741_824,
+                true,
+            ),
+            inventory_authoritative: true,
+            refill_blockers: vec![],
             skipped: false,
             skip_reason: None,
         }
@@ -3098,7 +3122,26 @@ mod tests {
             skip_reason: None,
             release_efficiency: None,
             release_history: None,
-            reserve: None,
+            reserve: Some(crate::ballast::coordinator::BallastReserveSnapshot {
+                observed_at: chrono::Utc::now().to_rfc3339(),
+                mount_point: mount.into(),
+                ballast_dir: dir.into(),
+                files_available: available,
+                files_total: total,
+                releasable_bytes: available as u64 * 1_048_576,
+                configured_bytes: total as u64 * 1_048_576,
+                state: crate::ballast::coordinator::BallastReserveState::classify(
+                    total as u64 * 1_048_576,
+                    available as u64 * 1_048_576,
+                    true,
+                ),
+                inventory_authoritative: true,
+                unreadable_count: 0,
+                headroom: None,
+                headroom_error: None,
+                refill_blockers: vec![],
+                refill_in_progress: false,
+            }),
         };
         let mut model = test_model();
         // Written in one order by the daemon, listed sorted by mount.
@@ -3168,8 +3211,19 @@ mod tests {
             DashboardMsg::DataUpdate(Some(Box::new(old_daemon))),
         );
         assert_eq!(legacy.ballast_volumes.len(), 1);
-        assert_eq!(legacy.ballast_volumes[0].files_available, 3);
+        assert_eq!(legacy.ballast_volumes[0].files_available, 0);
+        assert!(!legacy.ballast_volumes[0].inventory_authoritative);
+        assert_eq!(legacy.ballast_volumes[0].status_level(), "UNKNOWN");
+        assert_eq!(legacy.ballast_summary().files_label(), "unknown/4");
         assert!(legacy.ballast_volumes[0].ballast_dir.is_empty());
+
+        // Removed pools and a lost live state do not inherit the old list.
+        update(&mut model, DashboardMsg::DataUpdate(Some(Box::default())));
+        assert!(model.ballast_volumes.is_empty());
+        model.ballast_volumes = vec![sample_volume("/data", 4, 4)];
+        update(&mut model, DashboardMsg::DataUpdate(None));
+        assert!(model.degraded);
+        assert!(model.ballast_volumes.is_empty());
 
         // Quick-release with nothing to give explains itself instead of
         // opening a confirmation that could only fail.

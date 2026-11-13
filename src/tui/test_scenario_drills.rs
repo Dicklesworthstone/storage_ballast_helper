@@ -23,7 +23,8 @@ use super::model::{BallastVolume, DashboardMsg, Overlay, Screen};
 use super::telemetry::{
     DataSource, DecisionEvidence, FactorBreakdown, TelemetryResult, TimelineEvent,
 };
-use super::test_harness::{DashboardHarness, sample_healthy_state};
+use super::test_harness::{DashboardHarness, sample_healthy_state, sample_observed_pool};
+use crate::ballast::coordinator::BallastReserveState;
 use crate::daemon::self_monitor::{
     BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
 };
@@ -32,12 +33,13 @@ use crate::daemon::self_monitor::{
 
 /// Yellow pressure — disk filling, partial ballast release.
 fn yellow_state() -> DaemonState {
+    let observed_at = chrono::Utc::now().to_rfc3339();
     DaemonState {
         version: "0.1.0".into(),
         pid: 1234,
         started_at: "2026-02-16T00:00:00Z".into(),
         uptime_seconds: 5400,
-        last_updated: "2026-02-16T01:30:00Z".into(),
+        last_updated: observed_at.clone(),
         pressure: PressureState {
             overall: "yellow".into(),
             mounts: vec![MountPressure {
@@ -52,6 +54,7 @@ fn yellow_state() -> DaemonState {
             total: 10,
             released: 2,
         },
+        ballast_pools: vec![sample_observed_pool("/data", 8, 10, &observed_at)],
         last_scan: LastScanState {
             at: Some("2026-02-16T01:29:00Z".into()),
             candidates: 20,
@@ -74,12 +77,13 @@ fn yellow_state() -> DaemonState {
 
 /// Red critical — almost out of space.
 fn red_state() -> DaemonState {
+    let observed_at = chrono::Utc::now().to_rfc3339();
     DaemonState {
         version: "0.1.0".into(),
         pid: 1234,
         started_at: "2026-02-16T00:00:00Z".into(),
         uptime_seconds: 7200,
-        last_updated: "2026-02-16T02:00:00Z".into(),
+        last_updated: observed_at.clone(),
         pressure: PressureState {
             overall: "red".into(),
             mounts: vec![MountPressure {
@@ -94,6 +98,7 @@ fn red_state() -> DaemonState {
             total: 10,
             released: 9,
         },
+        ballast_pools: vec![sample_observed_pool("/data", 1, 10, &observed_at)],
         last_scan: LastScanState {
             at: Some("2026-02-16T01:59:00Z".into()),
             candidates: 50,
@@ -116,12 +121,13 @@ fn red_state() -> DaemonState {
 
 /// Recovery — green again, ballast replenished.
 fn recovery_state() -> DaemonState {
+    let observed_at = chrono::Utc::now().to_rfc3339();
     DaemonState {
         version: "0.1.0".into(),
         pid: 1234,
         started_at: "2026-02-16T00:00:00Z".into(),
         uptime_seconds: 9000,
-        last_updated: "2026-02-16T02:30:00Z".into(),
+        last_updated: observed_at.clone(),
         pressure: PressureState {
             overall: "green".into(),
             mounts: vec![MountPressure {
@@ -136,6 +142,7 @@ fn recovery_state() -> DaemonState {
             total: 10,
             released: 0,
         },
+        ballast_pools: vec![sample_observed_pool("/data", 10, 10, &observed_at)],
         last_scan: LastScanState {
             at: Some("2026-02-16T02:29:00Z".into()),
             candidates: 2,
@@ -158,12 +165,13 @@ fn recovery_state() -> DaemonState {
 
 /// Ballast fully depleted — emergency territory.
 fn depleted_state() -> DaemonState {
+    let observed_at = chrono::Utc::now().to_rfc3339();
     DaemonState {
         version: "0.1.0".into(),
         pid: 1234,
         started_at: "2026-02-16T00:00:00Z".into(),
         uptime_seconds: 6000,
-        last_updated: "2026-02-16T01:40:00Z".into(),
+        last_updated: observed_at.clone(),
         pressure: PressureState {
             overall: "red".into(),
             mounts: vec![MountPressure {
@@ -178,6 +186,7 @@ fn depleted_state() -> DaemonState {
             total: 10,
             released: 10,
         },
+        ballast_pools: vec![sample_observed_pool("/data", 0, 10, &observed_at)],
         last_scan: LastScanState {
             at: Some("2026-02-16T01:39:00Z".into()),
             candidates: 60,
@@ -453,6 +462,9 @@ fn multi_mount_volumes() -> Vec<BallastVolume> {
             files_available: 5,
             files_total: 5,
             releasable_bytes: 5_368_709_120,
+            reserve_state: BallastReserveState::classify(5_368_709_120, 5_368_709_120, true),
+            inventory_authoritative: true,
+            refill_blockers: vec![],
             skipped: false,
             skip_reason: None,
         },
@@ -464,6 +476,9 @@ fn multi_mount_volumes() -> Vec<BallastVolume> {
             files_available: 1,
             files_total: 5,
             releasable_bytes: 1_073_741_824,
+            reserve_state: BallastReserveState::classify(5_368_709_120, 1_073_741_824, true),
+            inventory_authoritative: true,
+            refill_blockers: vec![],
             skipped: false,
             skip_reason: None,
         },
@@ -480,6 +495,9 @@ fn depleted_volumes() -> Vec<BallastVolume> {
         files_available: 0,
         files_total: 10,
         releasable_bytes: 0,
+        reserve_state: BallastReserveState::classify(10_737_418_240, 0, true),
+        inventory_authoritative: true,
+        refill_blockers: vec![],
         skipped: false,
         skip_reason: None,
     }]
@@ -759,6 +777,9 @@ fn drill_ballast_operations_under_pressure() {
             files_available: 10,
             files_total: 10,
             releasable_bytes: 10_737_418_240,
+            reserve_state: BallastReserveState::classify(10_737_418_240, 10_737_418_240, true),
+            inventory_authoritative: true,
+            refill_blockers: vec![],
             skipped: false,
             skip_reason: None,
         },
@@ -793,6 +814,9 @@ fn drill_ballast_operations_under_pressure() {
             files_available: 3,
             files_total: 10,
             releasable_bytes: 3_221_225_472,
+            reserve_state: BallastReserveState::classify(10_737_418_240, 3_221_225_472, true),
+            inventory_authoritative: true,
+            refill_blockers: vec![],
             skipped: false,
             skip_reason: None,
         },
@@ -822,17 +846,17 @@ fn drill_ballast_operations_under_pressure() {
     let model = h.model_mut();
     let status = model.ballast_volumes[0].status_level();
     let files_avail = model.ballast_volumes[0].files_available;
-    assert_eq!(status, "CRITICAL");
+    assert_eq!(status, "EXHAUSTED");
 
     collector
-        .start_case("phase3_ballast_critical")
+        .start_case("phase3_ballast_exhausted")
         .section("ballast_operations")
-        .tags(["ballast", "critical", "depleted"])
+        .tags(["ballast", "exhausted", "depleted"])
         .frame(fc)
         .assertion(
-            "status is CRITICAL",
-            status == "CRITICAL",
-            "CRITICAL",
+            "status is EXHAUSTED",
+            status == "EXHAUSTED",
+            "EXHAUSTED",
             s(&status),
         )
         .assertion("0 files available", files_avail == 0, "0", s(&files_avail))
@@ -889,6 +913,9 @@ fn drill_ballast_operations_under_pressure() {
             files_available: 10,
             files_total: 10,
             releasable_bytes: 10_737_418_240,
+            reserve_state: BallastReserveState::classify(10_737_418_240, 10_737_418_240, true),
+            inventory_authoritative: true,
+            refill_blockers: vec![],
             skipped: false,
             skip_reason: None,
         },
@@ -921,6 +948,9 @@ fn drill_ballast_operations_under_pressure() {
             files_available: 3,
             files_total: 10,
             releasable_bytes: 3_221_225_472,
+            reserve_state: BallastReserveState::classify(10_737_418_240, 3_221_225_472, true),
+            inventory_authoritative: true,
+            refill_blockers: vec![],
             skipped: false,
             skip_reason: None,
         },
@@ -1510,7 +1540,7 @@ fn drill_multi_mount_incident_response() {
     let vol_count = model.ballast_volumes.len();
     assert_eq!(vol_count, 2);
 
-    // / should be OK (5/5), /data should be LOW (1/5).
+    // / should be OK (5/5), /data should be CRITICAL (1/5).
     let root_vol = model.ballast_volumes.iter().find(|v| v.mount_point == "/");
     let data_vol = model
         .ballast_volumes
@@ -1521,7 +1551,7 @@ fn drill_multi_mount_incident_response() {
     let root_status = root_vol.unwrap().status_level();
     let data_status = data_vol.unwrap().status_level();
     assert_eq!(root_status, "OK");
-    assert_eq!(data_status, "LOW");
+    assert_eq!(data_status, "CRITICAL");
 
     collector
         .start_case("phase3_per_mount_ballast")
@@ -1530,7 +1560,12 @@ fn drill_multi_mount_incident_response() {
         .frame(capture_frame(&h))
         .assertion("2 volumes", vol_count == 2, "2", s(&vol_count))
         .assertion("/ is OK", root_status == "OK", "OK", s(&root_status))
-        .assertion("/data is LOW", data_status == "LOW", "LOW", s(&data_status))
+        .assertion(
+            "/data is CRITICAL",
+            data_status == "CRITICAL",
+            "CRITICAL",
+            s(&data_status),
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -1681,6 +1716,11 @@ fn drill_full_incident_to_resolution() {
     let overlay = h.overlay();
     let on_ballast = screen == Screen::Ballast;
     let has_confirm = matches!(overlay, Some(Overlay::Confirmation(_)));
+    assert!(on_ballast);
+    assert!(
+        has_confirm,
+        "observed reserve should allow release confirmation"
+    );
 
     collector
         .start_case("step5_quick_release")

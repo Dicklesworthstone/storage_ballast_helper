@@ -885,48 +885,38 @@ fn styled_candidate_hotlist<'a>(
 #[allow(clippy::option_if_let_else)]
 fn styled_ballast_quick<'a>(model: &'a DashboardModel, theme: &'a Theme) -> Vec<Line<'a>> {
     if let Some(ref state) = model.daemon_state {
-        let (badge_label, badge_color) = if state.ballast.total > 0 && state.ballast.available == 0
-        {
-            ("CRITICAL", theme.palette.critical_color())
-        } else if state.ballast.available.saturating_mul(2) < state.ballast.total {
-            ("LOW", theme.palette.warning_color())
-        } else {
-            ("OK", theme.palette.success_color())
-        };
-
-        let ratio = if state.ballast.total > 0 {
-            #[allow(clippy::cast_precision_loss)]
-            let pct = (state.ballast.available as f64 / state.ballast.total as f64) * 100.0;
-            pct
-        } else {
-            0.0
-        };
-
-        vec![
-            Line::from_spans([
-                Span::styled(
-                    "ballast ",
-                    Style::default().fg(theme.palette.text_secondary()),
-                ),
-                styled_badge(badge_label, badge_color),
-            ]),
-            Line::from_spans([Span::styled(
+        let summary = model.ballast_summary();
+        let badge_label = summary.status_level();
+        let badge_color = ballast_status_color(badge_label, &theme.palette);
+        // Compact overview cards may have only one content row. Keep the
+        // observed count beside the condition so it cannot be clipped away.
+        let mut lines = vec![Line::from_spans([
+            Span::styled(
+                "ballast ",
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+            styled_badge(badge_label, badge_color),
+            Span::styled(
                 format!(
-                    "  available={}/{} released={}",
-                    state.ballast.available, state.ballast.total, state.ballast.released,
+                    " available={} released={}",
+                    summary.files_label(),
+                    state.ballast.released,
                 ),
                 Style::default().fg(theme.palette.text_secondary()),
-            )]),
-            {
-                let gauge_w = 20;
-                let mut row = vec![Span::styled(
-                    "  ",
-                    Style::default().fg(theme.palette.text_secondary()),
-                )];
-                row.extend(segmented_gauge(100.0 - ratio, gauge_w, &theme.palette));
-                Line::from_spans(row)
-            },
-        ]
+            ),
+        ])];
+        if let Some((available, total)) = summary
+            .available
+            .zip(summary.total)
+            .filter(|(_, total)| *total > 0)
+        {
+            #[allow(clippy::cast_precision_loss)]
+            let ratio = available as f64 / total as f64 * 100.0;
+            let mut row = vec![Span::raw("  ")];
+            row.extend(segmented_gauge(100.0 - ratio, 20, &theme.palette));
+            lines.push(Line::from_spans(row));
+        }
+        lines
     } else {
         vec![Line::from_spans([
             Span::styled(
@@ -2467,20 +2457,14 @@ fn frame_ballast_list_text(model: &DashboardModel, theme: &Theme, rows: usize) -
             " "
         };
         let status = vol.status_level();
-        let status_color = match status {
-            "OK" => theme.palette.success,
-            "LOW" => theme.palette.warning,
-            "CRITICAL" => theme.palette.critical,
-            _ => theme.palette.muted,
-        };
+        let status_color = ballast_status_palette(status, &theme.palette);
         let _ = writeln!(
             out,
-            "{cursor} {} {:<18} files={}/{} releasable={}",
+            "{cursor} {} {:<18} files={} releasable={}",
             status_badge(status, status_color, theme.accessibility),
             truncate_path(&vol.mount_point, 18),
-            vol.files_available,
-            vol.files_total,
-            human_bytes(vol.releasable_bytes),
+            vol.files_label(),
+            vol.bytes_label(),
         );
     }
     out
@@ -2494,12 +2478,11 @@ fn frame_ballast_detail_text(model: &DashboardModel, theme: &Theme) -> String {
             render_volume_detail(vol, theme, &mut out);
         } else {
             out = format!(
-                "mount={}\nstatus={}\nfiles={}/{}\nreleasable={}\nEnter/Space for full detail",
+                "mount={}\nstatus={}\nfiles={}\nreleasable={}\nEnter/Space for full detail",
                 vol.mount_point,
                 vol.status_level(),
-                vol.files_available,
-                vol.files_total,
-                human_bytes(vol.releasable_bytes),
+                vol.files_label(),
+                vol.bytes_label(),
             );
         }
     } else {
@@ -2537,22 +2520,7 @@ fn frame_ballast_list_styled<'a>(
             Span::styled("  ", Style::default().bg(bg))
         };
         let status = vol.status_level();
-        let status_color = match status {
-            "OK" => theme.palette.success_color(),
-            "LOW" => theme.palette.warning_color(),
-            "CRITICAL" => theme.palette.critical_color(),
-            _ => theme.palette.muted_color(),
-        };
-        #[allow(clippy::cast_precision_loss)]
-        let file_color = if vol.files_total == 0 {
-            theme.palette.muted_color()
-        } else if vol.files_available == 0 {
-            theme.palette.danger_color()
-        } else if (vol.files_available as f64 / vol.files_total as f64) < 0.5 {
-            theme.palette.warning_color()
-        } else {
-            theme.palette.success_color()
-        };
+        let status_color = ballast_status_color(status, &theme.palette);
         let row = vec![
             cursor_span,
             styled_badge(status, status_color),
@@ -2561,11 +2529,11 @@ fn frame_ballast_list_styled<'a>(
                 Style::default().fg(theme.palette.text_secondary()).bg(bg),
             ),
             Span::styled(
-                format!(" {}/{}", vol.files_available, vol.files_total),
-                Style::default().fg(file_color).bg(bg),
+                format!(" {}", vol.files_label()),
+                Style::default().fg(status_color).bg(bg),
             ),
             Span::styled(
-                format!(" {}", human_bytes(vol.releasable_bytes)),
+                format!(" {}", vol.bytes_label()),
                 Style::default().fg(accent).bg(bg),
             ),
         ];
@@ -2584,12 +2552,7 @@ fn frame_ballast_detail_styled<'a>(model: &'a DashboardModel, theme: &'a Theme) 
             styled_volume_detail(vol, theme)
         } else {
             let status = vol.status_level();
-            let status_color = match status {
-                "OK" => theme.palette.success_color(),
-                "LOW" => theme.palette.warning_color(),
-                "CRITICAL" => theme.palette.critical_color(),
-                _ => muted,
-            };
+            let status_color = ballast_status_color(status, &theme.palette);
             let lines = vec![
                 Line::from_spans([
                     Span::styled("  mount       ", Style::default().fg(muted)),
@@ -2601,15 +2564,12 @@ fn frame_ballast_detail_styled<'a>(model: &'a DashboardModel, theme: &'a Theme) 
                 ]),
                 Line::from_spans([
                     Span::styled("  files       ", Style::default().fg(muted)),
-                    Span::styled(
-                        format!("{}/{}", vol.files_available, vol.files_total),
-                        Style::default().fg(secondary),
-                    ),
+                    Span::styled(vol.files_label(), Style::default().fg(secondary)),
                 ]),
                 Line::from_spans([
                     Span::styled("  releasable  ", Style::default().fg(muted)),
                     Span::styled(
-                        human_bytes(vol.releasable_bytes),
+                        vol.bytes_label(),
                         Style::default().fg(theme.palette.accent_color()),
                     ),
                 ]),
@@ -2634,12 +2594,7 @@ fn styled_volume_detail<'a>(vol: &'a BallastVolume, theme: &'a Theme) -> Text<'a
     let primary = theme.palette.text_primary();
     let secondary = theme.palette.text_secondary();
     let status = vol.status_level();
-    let status_color = match status {
-        "OK" => theme.palette.success_color(),
-        "LOW" => theme.palette.warning_color(),
-        "CRITICAL" => theme.palette.critical_color(),
-        _ => muted,
-    };
+    let status_color = ballast_status_color(status, &theme.palette);
 
     let mut lines = vec![
         Line::from_spans([
@@ -2660,19 +2615,12 @@ fn styled_volume_detail<'a>(vol: &'a BallastVolume, theme: &'a Theme) -> Text<'a
         ]),
         Line::from_spans([
             Span::styled("  files       ", Style::default().fg(muted)),
-            Span::styled(
-                format!("{}/{}", vol.files_available, vol.files_total),
-                Style::default().fg(secondary),
-            ),
+            Span::styled(vol.files_label(), Style::default().fg(secondary)),
         ]),
         Line::from_spans([
             Span::styled("  releasable  ", Style::default().fg(muted)),
             Span::styled(
-                format!(
-                    "{} ({} bytes)",
-                    human_bytes(vol.releasable_bytes),
-                    vol.releasable_bytes
-                ),
+                vol.bytes_label(),
                 Style::default().fg(theme.palette.accent_color()),
             ),
         ]),
@@ -2692,8 +2640,17 @@ fn styled_volume_detail<'a>(vol: &'a BallastVolume, theme: &'a Theme) -> Text<'a
             ),
         ]));
     }
+    for reason in &vol.refill_blockers {
+        lines.push(Line::from_spans([
+            Span::styled("  refill      ", Style::default().fg(muted)),
+            Span::styled(
+                reason.explanation(),
+                Style::default().fg(theme.palette.warning_color()),
+            ),
+        ]));
+    }
     // File fill gauge.
-    if vol.files_total > 0 {
+    if vol.inventory_authoritative && vol.files_total > 0 {
         let fill_pct = (vol.files_available as f64 / vol.files_total as f64) * 100.0;
         let mut row = vec![Span::styled("  fill        ", Style::default().fg(muted))];
         row.extend(segmented_gauge(fill_pct, 20, &theme.palette));
@@ -4460,17 +4417,14 @@ fn render_recent_activity(model: &DashboardModel) -> String {
 #[allow(clippy::option_if_let_else)]
 fn render_ballast_quick(model: &DashboardModel, theme: &Theme) -> String {
     if let Some(ref state) = model.daemon_state {
-        let (palette, label) = if state.ballast.total > 0 && state.ballast.available == 0 {
-            (theme.palette.critical, "CRITICAL")
-        } else if state.ballast.available.saturating_mul(2) < state.ballast.total {
-            (theme.palette.warning, "LOW")
-        } else {
-            (theme.palette.success, "OK")
-        };
+        let summary = model.ballast_summary();
+        let label = summary.status_level();
+        let palette = ballast_status_palette(label, &theme.palette);
         let badge = status_badge(label, palette, theme.accessibility);
         format!(
-            "ballast {badge} available={}/{} released={}",
-            state.ballast.available, state.ballast.total, state.ballast.released,
+            "ballast {badge} available={} released={}",
+            summary.files_label(),
+            state.ballast.released,
         )
     } else {
         let badge = status_badge("UNKNOWN", theme.palette.muted, theme.accessibility);
@@ -5599,21 +5553,18 @@ fn render_ballast(model: &DashboardModel, theme: &Theme, out: &mut String) {
 
     // ── Aggregate ballast state from daemon ──
     if let Some(ref state) = model.daemon_state {
-        let avail = state.ballast.available;
-        let total = state.ballast.total;
+        let summary = model.ballast_summary();
         let released = state.ballast.released;
-        let aggregate_badge = if total == 0 {
-            status_badge("UNCONFIGURED", theme.palette.muted, theme.accessibility)
-        } else if avail == 0 {
-            status_badge("CRITICAL", theme.palette.critical, theme.accessibility)
-        } else if avail.saturating_mul(2) < total {
-            status_badge("LOW", theme.palette.warning, theme.accessibility)
-        } else {
-            status_badge("OK", theme.palette.success, theme.accessibility)
-        };
+        let label = summary.status_level();
+        let aggregate_badge = status_badge(
+            label,
+            ballast_status_palette(label, &theme.palette),
+            theme.accessibility,
+        );
         let _ = writeln!(
             out,
-            "ballast: {avail}/{total} available, {released} released {aggregate_badge}",
+            "ballast: {} available, {released} released {aggregate_badge}",
+            summary.files_label(),
         );
     }
 
@@ -5656,16 +5607,11 @@ fn render_ballast(model: &DashboardModel, theme: &Theme, out: &mut String) {
             " "
         };
         let status = vol.status_level();
-        let status_color = match status {
-            "OK" => theme.palette.success,
-            "LOW" => theme.palette.warning,
-            "CRITICAL" => theme.palette.critical,
-            _ => theme.palette.muted,
-        };
+        let status_color = ballast_status_palette(status, &theme.palette);
         let badge = status_badge(status, status_color, theme.accessibility);
-        let files = format!("{}/{}", vol.files_available, vol.files_total);
+        let files = vol.files_label();
         let mount_short = truncate_path(&vol.mount_point, 20);
-        let releasable = human_bytes(vol.releasable_bytes);
+        let releasable = vol.bytes_label();
         let _ = writeln!(
             out,
             "{cursor} {:<4} {badge} {:<20} {:<8} {:<8} {:<10} {}",
@@ -5679,14 +5625,10 @@ fn render_ballast(model: &DashboardModel, theme: &Theme, out: &mut String) {
     }
 
     // ── Total releasable ──
-    let total_releasable: u64 = model
-        .ballast_volumes
-        .iter()
-        .filter(|v| !v.skipped)
-        .map(|v| v.releasable_bytes)
-        .sum();
-    if total_releasable > 0 {
+    if let Some(total_releasable) = model.ballast_summary().releasable_bytes {
         let _ = writeln!(out, "total releasable: {}", human_bytes(total_releasable));
+    } else {
+        let _ = writeln!(out, "total releasable: unknown");
     }
 
     // ── Skipped summary ──
@@ -5726,26 +5668,12 @@ fn render_volume_detail(vol: &BallastVolume, theme: &Theme, out: &mut String) {
     let _ = writeln!(out, "  ballast:    {}", vol.ballast_dir);
     let _ = writeln!(out, "  fs-type:    {}", vol.fs_type);
     let _ = writeln!(out, "  strategy:   {}", vol.strategy);
-    let _ = writeln!(
-        out,
-        "  files:      {}/{}",
-        vol.files_available, vol.files_total
-    );
-    let _ = writeln!(
-        out,
-        "  releasable: {} ({} bytes)",
-        human_bytes(vol.releasable_bytes),
-        vol.releasable_bytes
-    );
+    let _ = writeln!(out, "  files:      {}", vol.files_label());
+    let _ = writeln!(out, "  releasable: {}", vol.bytes_label());
 
     // Status badge.
     let status = vol.status_level();
-    let status_color = match status {
-        "OK" => theme.palette.success,
-        "LOW" => theme.palette.warning,
-        "CRITICAL" => theme.palette.critical,
-        _ => theme.palette.muted,
-    };
+    let status_color = ballast_status_palette(status, &theme.palette);
     let badge = status_badge(status, status_color, theme.accessibility);
     let _ = writeln!(out, "  status:     {badge}");
 
@@ -5755,12 +5683,34 @@ fn render_volume_detail(vol: &BallastVolume, theme: &Theme, out: &mut String) {
         let _ = writeln!(out, "  skip-reason: {reason}");
     }
 
+    for reason in &vol.refill_blockers {
+        let _ = writeln!(out, "  refill:     {}", reason.explanation());
+    }
+
     // File fill gauge.
-    if vol.files_total > 0 {
+    if vol.inventory_authoritative && vol.files_total > 0 {
         #[allow(clippy::cast_precision_loss)]
         let fill_pct = (vol.files_available as f64 / vol.files_total as f64) * 100.0;
         let bar = gauge(fill_pct, 20);
         let _ = writeln!(out, "  fill: {bar}");
+    }
+}
+
+fn ballast_status_palette(status: &str, palette: &ThemePalette) -> PaletteEntry {
+    match status {
+        "OK" => palette.success,
+        "LOW" | "UNKNOWN" => palette.warning,
+        "CRITICAL" | "EXHAUSTED" => palette.critical,
+        _ => palette.muted,
+    }
+}
+
+fn ballast_status_color(status: &str, palette: &ThemePalette) -> PackedRgba {
+    match status {
+        "OK" => palette.success_color(),
+        "LOW" | "UNKNOWN" => palette.warning_color(),
+        "CRITICAL" | "EXHAUSTED" => palette.critical_color(),
+        _ => palette.muted_color(),
     }
 }
 
@@ -7261,6 +7211,13 @@ mod tests {
             files_available: available,
             files_total: total,
             releasable_bytes: releasable,
+            reserve_state: crate::ballast::coordinator::BallastReserveState::classify(
+                total as u64 * 1_073_741_824,
+                releasable,
+                !skipped,
+            ),
+            inventory_authoritative: !skipped,
+            refill_blockers: vec![],
             skipped,
             skip_reason: if skipped {
                 Some(String::from("unsupported filesystem"))
@@ -7320,8 +7277,8 @@ mod tests {
         );
         model.screen = Screen::Ballast;
         model.ballast_volumes = vec![
-            sample_ballast_volume("/", 4, 5, 4_294_967_296, false),
-            sample_ballast_volume("/data", 1, 5, 1_073_741_824, false),
+            sample_ballast_volume("/", 5, 5, 5_368_709_120, false),
+            sample_ballast_volume("/data", 2, 5, 2_147_483_648, false),
             sample_ballast_volume("/mnt/nfs", 0, 0, 0, true),
         ];
 
@@ -7329,6 +7286,86 @@ mod tests {
         assert!(frame.contains("OK"));
         assert!(frame.contains("LOW"));
         assert!(frame.contains("SKIPPED"));
+    }
+
+    #[test]
+    fn ballast_renderers_do_not_present_unknown_inventory_as_available() {
+        use crate::ballast::coordinator::{BallastRefillBlocker, BallastReserveState};
+
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (160, 45),
+        );
+        let mut state = sample_state("yellow", 15.1);
+        state.ballast.available = 10;
+        state.ballast.total = 10;
+        model.daemon_state = Some(state);
+        let mut volume = sample_ballast_volume("/data", 10, 10, 10_737_418_240, false);
+        volume.reserve_state = BallastReserveState::Unknown;
+        volume.inventory_authoritative = false;
+        volume.refill_blockers = vec![BallastRefillBlocker::ObservationStale];
+        model.ballast_volumes = vec![volume];
+        let theme = Theme::for_terminal(160, AccessibilityProfile::default());
+        let overview = render_ballast_quick(&model, &theme);
+        let styled_overview =
+            Text::from_lines(styled_ballast_quick(&model, &theme)).to_plain_text();
+        for text in [overview, styled_overview] {
+            assert!(text.contains("UNKNOWN"), "{text}");
+            assert!(text.contains("unknown/10"), "{text}");
+            assert!(!text.contains("available=10/10"), "{text}");
+        }
+        model.screen = Screen::Ballast;
+        model.ballast_detail = true;
+        let headless = render(&model);
+        let styled_list = frame_ballast_list_styled(&model, &theme, 10).to_plain_text();
+        let styled_detail = frame_ballast_detail_styled(&model, &theme).to_plain_text();
+        for text in [headless, styled_list, styled_detail] {
+            assert!(text.contains("UNKNOWN"), "{text}");
+            assert!(text.contains("unknown/10"), "{text}");
+            assert!(!text.contains("10.0 GB"), "{text}");
+        }
+        assert!(
+            styled_volume_detail(&model.ballast_volumes[0], &theme)
+                .to_plain_text()
+                .contains("observation is stale")
+        );
+    }
+
+    #[test]
+    fn ballast_renderers_show_exhaustion_and_actual_refill_blockers() {
+        use crate::ballast::coordinator::BallastRefillBlocker;
+
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (160, 45),
+        );
+        model.daemon_state = Some(sample_state("yellow", 15.1));
+        let mut volume = sample_ballast_volume("/data", 0, 10, 0, false);
+        volume.refill_blockers = vec![
+            BallastRefillBlocker::PressurePolicy,
+            BallastRefillBlocker::SafetyFloor,
+        ];
+        model.ballast_volumes = vec![volume];
+        model.screen = Screen::Ballast;
+        model.ballast_detail = true;
+        let theme = Theme::for_terminal(160, AccessibilityProfile::default());
+        for text in [
+            render(&model),
+            frame_ballast_detail_styled(&model, &theme).to_plain_text(),
+        ] {
+            assert!(text.contains("EXHAUSTED"), "{text}");
+            assert!(text.contains("0/10"), "{text}");
+            assert!(text.contains("pressure policy suppresses refill"), "{text}");
+            assert!(
+                text.contains("another configured file would cross the safety floor"),
+                "{text}"
+            );
+        }
+        assert_eq!(model.ballast_summary().available, Some(0));
     }
 
     #[test]

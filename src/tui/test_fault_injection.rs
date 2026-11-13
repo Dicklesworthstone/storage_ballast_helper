@@ -83,7 +83,7 @@ fn sample_state() -> DaemonState {
         pid: 42,
         started_at: "2026-02-16T00:00:00Z".to_string(),
         uptime_seconds: 60,
-        last_updated: "2026-02-16T00:01:00Z".to_string(),
+        last_updated: chrono::Utc::now().to_rfc3339(),
         pressure: PressureState {
             overall: "yellow".to_string(),
             mounts: vec![MountPressure {
@@ -303,7 +303,7 @@ fn state_future_schema_fields_detected_but_load_succeeds() {
 }
 
 #[test]
-fn state_minimal_empty_object_parses_with_all_defaults() {
+fn state_minimal_empty_object_cannot_claim_current_daemon_evidence() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("state.json");
     std::fs::write(&path, "{}").unwrap();
@@ -311,11 +311,8 @@ fn state_minimal_empty_object_parses_with_all_defaults() {
     let adapter = make_adapter(90);
     let snap = adapter.load_snapshot(&path, &[]);
 
-    assert!(snap.daemon_state.is_some());
-    let state = snap.daemon_state.unwrap();
-    assert_eq!(state.version, "");
-    assert_eq!(state.pid, 0);
-    assert_eq!(state.pressure.mounts.len(), 0);
+    assert_eq!(snap.freshness, StateFreshness::Malformed);
+    assert!(snap.daemon_state.is_none());
     assert!(snap.warnings.has_drift());
     // All expected keys should be missing.
     assert!(!snap.warnings.missing_fields.is_empty());

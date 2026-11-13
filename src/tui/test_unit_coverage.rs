@@ -17,6 +17,7 @@ use super::model::{
 use super::telemetry::{DataSource, TelemetryResult};
 use super::update;
 use super::widgets;
+use crate::ballast::coordinator::BallastReserveState;
 
 // ──────────────────── helpers ────────────────────
 
@@ -54,6 +55,13 @@ fn sample_volume(mount: &str, available: usize, total: usize) -> BallastVolume {
         files_available: available,
         files_total: total,
         releasable_bytes: (available as u64) * 1_073_741_824,
+        reserve_state: BallastReserveState::classify(
+            (total as u64) * 1_073_741_824,
+            (available as u64) * 1_073_741_824,
+            true,
+        ),
+        inventory_authoritative: true,
+        refill_blockers: vec![],
         skipped: false,
         skip_reason: None,
     }
@@ -68,6 +76,9 @@ fn skipped_volume(mount: &str, reason: &str) -> BallastVolume {
         files_available: 0,
         files_total: 0,
         releasable_bytes: 0,
+        reserve_state: BallastReserveState::Unconfigured,
+        inventory_authoritative: false,
+        refill_blockers: vec![],
         skipped: true,
         skip_reason: Some(reason.into()),
     }
@@ -1057,16 +1068,13 @@ fn ballast_detail_toggle_idempotent() {
 
 #[test]
 fn ballast_volume_status_levels_comprehensive() {
-    let critical = BallastVolume {
-        files_available: 0,
-        files_total: 5,
-        skipped: false,
-        ..sample_volume("/", 0, 5)
-    };
+    let exhausted = sample_volume("/", 0, 5);
+    let critical = sample_volume("/critical", 1, 5);
     let healthy = sample_volume("/data", 5, 5);
     let partial = sample_volume("/home", 2, 5);
     let skipped = skipped_volume("/tmp", "tmpfs unsupported");
 
+    assert_eq!(exhausted.status_level(), "EXHAUSTED");
     assert_eq!(critical.status_level(), "CRITICAL");
     assert_eq!(healthy.status_level(), "OK");
     assert_eq!(partial.status_level(), "LOW");
@@ -1183,6 +1191,9 @@ fn ballast_volume_unconfigured_status() {
         files_available: 0,
         files_total: 0,
         releasable_bytes: 0,
+        reserve_state: BallastReserveState::classify(0, 0, true),
+        inventory_authoritative: true,
+        refill_blockers: vec![],
         skipped: false,
         skip_reason: None,
     };
@@ -1191,12 +1202,19 @@ fn ballast_volume_unconfigured_status() {
 
 #[test]
 fn ballast_volume_low_status_boundary() {
-    // files_available * 2 < files_total → LOW
+    // Above one quarter but below the configured target is LOW.
     let vol = sample_volume("/", 2, 5);
     assert_eq!(vol.status_level(), "LOW");
 
-    // Exactly half → not LOW (2*3 = 6 > 5)
+    // More than half remains LOW until the configured target is restored.
     let vol = sample_volume("/", 3, 5);
+    assert_eq!(vol.status_level(), "LOW");
+
+    // A positive reserve at exactly one quarter is CRITICAL.
+    let vol = sample_volume("/", 1, 4);
+    assert_eq!(vol.status_level(), "CRITICAL");
+
+    let vol = sample_volume("/", 4, 4);
     assert_eq!(vol.status_level(), "OK");
 }
 

@@ -9,7 +9,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ftui::{Buffer, BufferDiff, Event, Frame, GraphemePool, KeyEventKind};
 use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
@@ -17,6 +17,7 @@ use ftui_tty::TtySessionOptions;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use super::adapters::DashboardStateAdapter;
 use super::model::{
     DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, Overlay, PreferenceAction,
     PreferenceProfileMode, Screen,
@@ -443,7 +444,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
         );
         notification_timers.push((id, Instant::now() + Duration::from_secs(12)));
     } else {
-        let initial = read_state_file(&config.state_file);
+        let initial = read_state_file(&config.state_file, SystemTime::now());
         update::update(&mut model, DashboardMsg::DataUpdate(initial));
     }
 
@@ -788,7 +789,7 @@ fn fetch_state(model: &mut DashboardModel, state_file: &Path) -> DashboardCmd {
     if model.replay.is_some() {
         return DashboardCmd::None;
     }
-    let state = read_state_file(state_file);
+    let state = read_state_file(state_file, SystemTime::now());
     update::update(model, DashboardMsg::DataUpdate(state))
 }
 
@@ -1007,11 +1008,10 @@ fn release_ballast_at(
     ))
 }
 
-/// Read and parse the daemon state file. Returns `None` on any error.
-fn read_state_file(path: &Path) -> Option<Box<DaemonState>> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let state: DaemonState = serde_json::from_str(&content).ok()?;
-    Some(Box::new(state))
+/// Live state must pass the adapter's document and file freshness checks.
+/// Replay bypasses this reader and preserves its historical observations.
+fn read_state_file(path: &Path, now: SystemTime) -> Option<Box<DaemonState>> {
+    DashboardStateAdapter::read_live_state_at(path, now).map(Box::new)
 }
 
 #[cfg(feature = "legacy-crossterm-dashboard")]
@@ -1103,6 +1103,91 @@ mod tests {
         assert!(model.screen_history.is_empty());
     }
 
+    #[test]
+    fn live_runtime_reader_refuses_stale_stopped_and_unverifiable_state() {
+        use filetime::{FileTime, set_file_mtime};
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("state.json");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let timestamp = |time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339();
+        assert!(read_state_file(&path, now).is_none());
+
+        for (name, updated, mtime, stopped, accepted) in [
+            ("fresh", timestamp(now), now, false, true),
+            (
+                "just inside boundary",
+                timestamp(now - Duration::from_millis(89_999)),
+                now,
+                false,
+                true,
+            ),
+            (
+                "exact document boundary",
+                timestamp(now - Duration::from_secs(90)),
+                now,
+                false,
+                false,
+            ),
+            (
+                "old copied document",
+                timestamp(now - Duration::from_hours(12)),
+                now,
+                false,
+                false,
+            ),
+            (
+                "exact file boundary",
+                timestamp(now),
+                now - Duration::from_secs(90),
+                false,
+                false,
+            ),
+            (
+                "future document",
+                timestamp(now + Duration::from_millis(1)),
+                now,
+                false,
+                false,
+            ),
+            (
+                "future file",
+                timestamp(now),
+                now + Duration::from_secs(1),
+                false,
+                false,
+            ),
+            (
+                "invalid timestamp",
+                "invalid".to_string(),
+                now,
+                false,
+                false,
+            ),
+            ("stopped", timestamp(now), now, true, false),
+        ] {
+            let state = DaemonState {
+                pid: 42,
+                last_updated: updated,
+                stopped_at: stopped.then(|| timestamp(now)),
+                ..Default::default()
+            };
+            std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+            set_file_mtime(&path, FileTime::from_system_time(mtime)).unwrap();
+            let read = read_state_file(&path, now);
+            assert_eq!(read.is_some(), accepted, "{name}");
+            if let Some(read) = read {
+                assert_eq!(*read, state, "{name}");
+            }
+        }
+
+        for malformed in ["not json", "{}"] {
+            std::fs::write(&path, malformed).unwrap();
+            set_file_mtime(&path, FileTime::from_system_time(now)).unwrap();
+            assert!(read_state_file(&path, now).is_none());
+        }
+    }
+
     /// bd-rc-master-ajg1.4.13: in replay `FetchData` leaves the reconstructed
     /// state alone and ballast actions are refused before touching anything.
     #[test]
@@ -1111,8 +1196,13 @@ mod tests {
         let mut model = test_model();
         let temp = TempDir::new().unwrap();
         let state = temp.path().join("state.json");
-        std::fs::write(&state, "{}").unwrap();
-        model.daemon_state = Some(DaemonState::default());
+        let history = DaemonState {
+            last_updated: "2000-01-01T00:00:00Z".into(),
+            stopped_at: Some("2000-01-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        std::fs::write(&state, serde_json::to_vec(&history).unwrap()).unwrap();
+        model.daemon_state = Some(history.clone());
         model.replay = Some(ReplayStatus {
             file: "activity.jsonl".to_string(),
             cursor_ts: None,
@@ -1126,9 +1216,10 @@ mod tests {
             fetch_state(&mut model, &state),
             DashboardCmd::None
         ));
-        assert!(
-            model.daemon_state.is_some(),
-            "the replay state survives FetchData"
+        assert_eq!(
+            model.daemon_state,
+            Some(history),
+            "replay keeps old captured state"
         );
 
         let refused = unless_replay(&model, || Ok("would have released".to_string()));
@@ -1136,6 +1227,9 @@ mod tests {
         model.replay = None;
         let allowed = unless_replay(&model, || Ok("released".to_string()));
         assert_eq!(allowed.unwrap(), "released");
+        // The same captured record cannot pose as a current live daemon.
+        let _ = fetch_state(&mut model, &state);
+        assert!(model.daemon_state.is_none());
         // Outside replay the state file is read: an unparseable one clears
         // the state, which is what the daemon-unavailable path shows.
         std::fs::write(&state, "not json").unwrap();

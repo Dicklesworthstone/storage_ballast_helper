@@ -17,6 +17,7 @@ use super::model::{
     Screen,
 };
 use super::update;
+use crate::ballast::coordinator::BallastReserveState;
 use crate::daemon::self_monitor::{
     BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
 };
@@ -188,6 +189,13 @@ fn arb_ballast_volume() -> impl Strategy<Value = BallastVolume> {
             files_available: avail,
             files_total: total,
             releasable_bytes: (avail as u64) * 1_073_741_824,
+            reserve_state: BallastReserveState::classify(
+                (total as u64) * 1_073_741_824,
+                (avail as u64) * 1_073_741_824,
+                true,
+            ),
+            inventory_authoritative: true,
+            refill_blockers: vec![],
             skipped: false,
             skip_reason: None,
         }
@@ -1010,6 +1018,9 @@ fn sample_ballast_volume() -> BallastVolume {
         files_available: 5,
         files_total: 10,
         releasable_bytes: 5_368_709_120,
+        reserve_state: BallastReserveState::classify(10_737_418_240, 5_368_709_120, true),
+        inventory_authoritative: true,
+        refill_blockers: vec![],
         skipped: false,
         skip_reason: None,
     }

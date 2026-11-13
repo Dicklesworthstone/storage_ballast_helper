@@ -25,6 +25,7 @@ use super::model::{BallastVolume, DashboardMsg, Screen};
 use super::test_harness::{
     DashboardHarness, HarnessStep, sample_healthy_state, sample_pressured_state,
 };
+use crate::ballast::coordinator::BallastReserveState;
 use crate::tui::telemetry::{
     DataSource, DecisionEvidence, FactorBreakdown, TelemetryResult, TimelineEvent,
 };
@@ -107,6 +108,13 @@ fn make_ballast_volumes(count: usize) -> Vec<BallastVolume> {
             files_available: 5 + i,
             files_total: 10 + i,
             releasable_bytes: ((5 + i) as u64) * 1_073_741_824,
+            reserve_state: BallastReserveState::classify(
+                ((10 + i) as u64) * 1_073_741_824,
+                ((5 + i) as u64) * 1_073_741_824,
+                true,
+            ),
+            inventory_authoritative: true,
+            refill_blockers: vec![],
             skipped: false,
             skip_reason: None,
         })

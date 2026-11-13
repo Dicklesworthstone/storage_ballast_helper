@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ballast::coordinator::{
+    BallastRefillBlocker, BallastReserveSnapshot, BallastReserveState,
+};
 use crate::core::config::TelemetryConfig;
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::cpu_budget::CpuBudgetState;
@@ -670,6 +673,70 @@ impl BallastPoolState {
             refill_in_progress: false,
         });
         pending
+    }
+
+    /// Project this pool's read-only observation at the reader's time.
+    ///
+    /// Missing evidence, a skipped alias, or a different physical pool cannot
+    /// borrow the actuator's cached counts. Pending, expired, future-dated and
+    /// malformed observations retain pool identity and current policy reasons,
+    /// but do not establish either available reserve or confirmed exhaustion.
+    /// The caller separately checks the enclosing daemon run's liveness.
+    #[must_use]
+    pub fn reserve_status_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<BallastReserveSnapshot> {
+        if self.skipped {
+            return None;
+        }
+        let mut reserve = self.reserve.clone()?;
+        if reserve.mount_point.to_string_lossy() != self.mount
+            || reserve.ballast_dir.to_string_lossy() != self.ballast_dir
+        {
+            return None;
+        }
+        let age = chrono::DateTime::parse_from_rfc3339(&reserve.observed_at)
+            .ok()
+            .and_then(|observed| now.signed_duration_since(observed).to_std().ok());
+        let pending = reserve.observed_at.is_empty() && !reserve.inventory_authoritative;
+        if pending
+            || age.is_none_or(|age| age >= Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS))
+        {
+            reserve.inventory_authoritative = false;
+            reserve.files_available = 0;
+            reserve.releasable_bytes = 0;
+            reserve.unreadable_count = 0;
+            reserve.headroom = None;
+            reserve.headroom_error = None;
+            reserve.refill_in_progress = false;
+            // These reasons depend on the expired filesystem observation.
+            // Policy reasons in a fresh enclosing state remain useful evidence.
+            reserve.refill_blockers.retain(|blocker| {
+                !matches!(
+                    blocker,
+                    BallastRefillBlocker::SafetyFloor
+                        | BallastRefillBlocker::FilesystemStatsUnavailable
+                        | BallastRefillBlocker::ReadOnlyFilesystem
+                        | BallastRefillBlocker::InventoryUnreadable
+                )
+            });
+            let reason = if pending {
+                BallastRefillBlocker::NotEvaluated
+            } else {
+                reserve.headroom_error = Some("reserve observation is stale".into());
+                BallastRefillBlocker::ObservationStale
+            };
+            if !reserve.refill_blockers.contains(&reason) {
+                reserve.refill_blockers.push(reason);
+            }
+        }
+        reserve.state = BallastReserveState::classify(
+            reserve.configured_bytes,
+            reserve.releasable_bytes,
+            reserve.inventory_authoritative,
+        );
+        Some(reserve)
     }
 }
 
@@ -1980,7 +2047,7 @@ mod tests {
             "files_available": 0,
             "files_total": 10,
             "releasable_bytes": 0,
-            "configured_bytes": 10737418240_u64,
+            "configured_bytes": 10_737_418_240_u64,
             "state": "exhausted",
             "inventory_authoritative": true,
             "unreadable_count": 0,
@@ -1992,6 +2059,207 @@ mod tests {
         let decoded: BallastPoolState = serde_json::from_value(pool.clone()).unwrap();
         let encoded = serde_json::to_value(decoded).unwrap();
         assert_eq!(encoded["reserve"], pool["reserve"]);
+    }
+
+    fn reserve_view_pool() -> BallastPoolState {
+        BallastPoolState {
+            mount: "/data".into(),
+            ballast_dir: "/data/.sbh/ballast".into(),
+            available: 4,
+            total: 4,
+            releasable_bytes: 16_384,
+            reserve: Some(BallastReserveSnapshot {
+                observed_at: "2026-11-13T12:00:00Z".into(),
+                mount_point: PathBuf::from("/data"),
+                ballast_dir: PathBuf::from("/data/.sbh/ballast"),
+                files_available: 1,
+                files_total: 4,
+                releasable_bytes: 4096,
+                configured_bytes: 16_384,
+                state: BallastReserveState::Critical,
+                inventory_authoritative: true,
+                unreadable_count: 0,
+                headroom: Some(crate::ballast::manager::BallastHeadroom {
+                    total_bytes: 100_000,
+                    available_bytes: 40_000,
+                    file_size_bytes: 4096,
+                    floor_pct: 40.0,
+                    free_pct_after: 35.904,
+                    can_allocate: false,
+                }),
+                headroom_error: None,
+                refill_blockers: vec![
+                    BallastRefillBlocker::PressurePolicy,
+                    BallastRefillBlocker::SafetyFloor,
+                ],
+                refill_in_progress: true,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reserve_status_reader_expires_evidence_without_reusing_actuator_counts() {
+        let pool = reserve_view_pool();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-13T12:01:29.999Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let fresh = pool.reserve_status_at(now).unwrap();
+        assert!(fresh.inventory_authoritative);
+        assert_eq!(fresh.state, BallastReserveState::Critical);
+        assert_eq!(fresh.files_available, 1);
+        assert_eq!(fresh.releasable_bytes, 4096);
+        assert!(fresh.headroom.is_some());
+
+        for observed_at in [
+            "2026-11-12T00:00:00Z",
+            "2026-11-13T12:00:00Z",     // Exactly 90 seconds is expired.
+            "2026-11-13T12:01:30.001Z", // Future evidence is not fresh.
+            "not-a-timestamp",
+            "",
+        ] {
+            let mut candidate = pool.clone();
+            let observation = candidate.reserve.as_mut().unwrap();
+            observation.observed_at = observed_at.into();
+            observation.inventory_authoritative = !observed_at.is_empty();
+            observation.unreadable_count = 2;
+            observation.headroom_error = Some("previous capacity error".into());
+            observation.refill_blockers.extend([
+                BallastRefillBlocker::DryRun,
+                BallastRefillBlocker::FilesystemStatsUnavailable,
+                BallastRefillBlocker::ReadOnlyFilesystem,
+                BallastRefillBlocker::InventoryUnreadable,
+            ]);
+            let before = candidate.clone();
+            let view = candidate
+                .reserve_status_at(now + chrono::Duration::milliseconds(1))
+                .unwrap();
+            assert!(!view.inventory_authoritative, "{observed_at}");
+            assert_eq!(view.state, BallastReserveState::Unknown, "{observed_at}");
+            assert_eq!(view.files_available, 0);
+            assert_eq!(view.releasable_bytes, 0);
+            assert_eq!(view.unreadable_count, 0);
+            assert!(view.headroom.is_none());
+            assert!(!view.refill_in_progress);
+            let reason = if observed_at.is_empty() {
+                assert!(view.headroom_error.is_none());
+                BallastRefillBlocker::NotEvaluated
+            } else {
+                assert_eq!(
+                    view.headroom_error.as_deref(),
+                    Some("reserve observation is stale")
+                );
+                BallastRefillBlocker::ObservationStale
+            };
+            assert_eq!(
+                view.refill_blockers,
+                vec![
+                    BallastRefillBlocker::PressurePolicy,
+                    BallastRefillBlocker::DryRun,
+                    reason
+                ]
+            );
+            assert_eq!(
+                candidate, before,
+                "a reader must not mutate allocator state"
+            );
+        }
+    }
+
+    #[test]
+    fn reserve_status_reader_distinguishes_unknown_zero_and_unconfigured() {
+        let mut pool = reserve_view_pool();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-13T12:00:01Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let config = crate::core::config::BallastConfig {
+            file_count: 4,
+            file_size_bytes: 4096,
+            ..Default::default()
+        };
+        let pending = pool.pending_history(&config);
+        let pending_view = pending.reserve_status_at(now).unwrap();
+        assert_eq!(pending_view.state, BallastReserveState::Unknown);
+        assert!(!pending_view.inventory_authoritative);
+        assert_eq!(pending_view.files_total, 4);
+        assert_eq!(pending_view.files_available, 0);
+        assert_eq!(
+            pending_view.refill_blockers,
+            vec![BallastRefillBlocker::NotEvaluated]
+        );
+        {
+            let reserve = pool.reserve.as_mut().unwrap();
+            reserve.inventory_authoritative = false;
+            reserve.state = BallastReserveState::Healthy;
+        }
+        let unknown = pool.reserve_status_at(now).unwrap();
+        assert_eq!(unknown.state, BallastReserveState::Unknown);
+        assert_eq!(
+            unknown.releasable_bytes, 4096,
+            "observed bytes are not verified reserve"
+        );
+        {
+            let reserve = pool.reserve.as_mut().unwrap();
+            reserve.inventory_authoritative = true;
+            reserve.files_available = 0;
+            reserve.releasable_bytes = 0;
+        }
+        let exhausted = pool.reserve_status_at(now).unwrap();
+        assert!(exhausted.inventory_authoritative);
+        assert_eq!(exhausted.state, BallastReserveState::Exhausted);
+        {
+            let reserve = pool.reserve.as_mut().unwrap();
+            reserve.configured_bytes = 0;
+            reserve.inventory_authoritative = false;
+        }
+        assert_eq!(
+            pool.reserve_status_at(now).unwrap().state,
+            BallastReserveState::Unconfigured
+        );
+    }
+
+    #[test]
+    fn reserve_status_reader_rejects_missing_replaced_and_skipped_pools() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-13T12:00:01Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut pool = reserve_view_pool();
+        pool.reserve = None;
+        assert!(pool.reserve_status_at(now).is_none());
+        let mut pool = reserve_view_pool();
+        pool.mount = "/replacement".into();
+        assert!(pool.reserve_status_at(now).is_none());
+        let mut pool = reserve_view_pool();
+        pool.ballast_dir = "/data/new-pool".into();
+        assert!(pool.reserve_status_at(now).is_none());
+        let mut pool = reserve_view_pool();
+        pool.skipped = true;
+        assert!(pool.reserve_status_at(now).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reserve_status_reader_preserves_native_pool_identity() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut pool = reserve_view_pool();
+        let mount = PathBuf::from(OsString::from_vec(b"/data-\xff".to_vec()));
+        let directory = mount.join("ballast");
+        pool.mount = mount.to_string_lossy().into_owned();
+        pool.ballast_dir = directory.to_string_lossy().into_owned();
+        let reserve = pool.reserve.as_mut().unwrap();
+        reserve.mount_point = mount.clone();
+        reserve.ballast_dir = directory.clone();
+        let restored: BallastPoolState =
+            serde_json::from_slice(&serde_json::to_vec(&pool).unwrap()).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-13T12:00:01Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let view = restored.reserve_status_at(now).unwrap();
+        assert_eq!(view.mount_point, mount);
+        assert_eq!(view.ballast_dir, directory);
+        assert!(view.inventory_authoritative);
     }
 
     /// bd-rc-master-ajg1.7.4: the daemon's files against the reclaimed

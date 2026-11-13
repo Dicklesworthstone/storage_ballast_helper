@@ -649,6 +649,21 @@ mod tests {
     fn prolonged_yellow_is_quiet_and_a_restart_reobserves_the_empty_reserve() {
         let mut fixture = Fixture::new();
         fixture.release_files(10);
+        let pool_dir = fixture
+            .coordinator
+            .pool_for_mount(fixture.mount())
+            .unwrap()
+            .ballast_dir
+            .clone();
+        let inventory_names = || {
+            let mut names: Vec<_> = std::fs::read_dir(&pool_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort_unstable();
+            names
+        };
+        let original_names = inventory_names();
         let mut monitor = BallastReserveMonitor::default();
         let start = Instant::now();
         fixture.observe(&mut monitor, start);
@@ -669,13 +684,11 @@ mod tests {
         }
         let pool = fixture.coordinator.pool_for_mount(fixture.mount()).unwrap();
         assert_eq!(pool.available_count(), 0, "observation must not allocate");
-        assert!(std::fs::read_dir(&pool.ballast_dir).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with("SBH_BALLAST_")
-        }));
+        assert_eq!(
+            inventory_names(),
+            original_names,
+            "read-only observation must not create or remove any pool entry"
+        );
 
         let mut restarted = BallastReserveMonitor::default();
         assert!(restarted.snapshot(fixture.mount()).is_none());
@@ -824,7 +837,7 @@ mod tests {
         let worker = monitor.worker.take().unwrap();
         let result = worker.handle.join().unwrap();
         assert!(monitor.accept_observation(&fixture.coordinator, result, worker.started_at));
-        assert!(monitor.expire_observations(start + Duration::from_secs(42_120)));
+        assert!(monitor.expire_observations(start + Duration::from_mins(702)));
         assert_eq!(
             monitor.snapshot(fixture.mount()).unwrap().state,
             BallastReserveState::Unknown,

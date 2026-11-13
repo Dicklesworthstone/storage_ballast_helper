@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 
 use super::model::{DashboardModel, DashboardMsg, Screen};
 use super::render;
+use super::test_harness::sample_observed_pool;
 use super::update;
 use crate::core::hex_lower;
 use crate::daemon::self_monitor::{
@@ -149,14 +150,17 @@ fn navigate_to(model: &mut DashboardModel, screen: Screen) {
 
 // ──────────────────── fixture data ────────────────────
 
-/// Deterministic healthy daemon state — identical across all test runs.
+/// Healthy daemon state with deterministic visible data. Freshness timestamps
+/// are current so the live reducer can use its explicit inventory evidence;
+/// neither timestamp is part of the rendered frame.
 fn healthy_state() -> DaemonState {
+    let observed_at = chrono::Utc::now().to_rfc3339();
     DaemonState {
         version: "0.1.0".into(),
         pid: 1234,
         started_at: "2026-02-16T00:00:00Z".into(),
         uptime_seconds: 3600,
-        last_updated: "2026-02-16T01:00:00Z".into(),
+        last_updated: observed_at.clone(),
         pressure: PressureState {
             overall: "green".into(),
             mounts: vec![MountPressure {
@@ -171,6 +175,7 @@ fn healthy_state() -> DaemonState {
             total: 10,
             released: 0,
         },
+        ballast_pools: vec![sample_observed_pool("/data", 10, 10, &observed_at)],
         last_scan: LastScanState {
             at: Some("2026-02-16T00:59:00Z".into()),
             candidates: 5,
@@ -191,14 +196,15 @@ fn healthy_state() -> DaemonState {
     }
 }
 
-/// Deterministic pressured daemon state.
+/// Pressured daemon state with deterministic visible data.
 fn pressured_state() -> DaemonState {
+    let observed_at = chrono::Utc::now().to_rfc3339();
     DaemonState {
         version: "0.1.0".into(),
         pid: 1234,
         started_at: "2026-02-16T00:00:00Z".into(),
         uptime_seconds: 7200,
-        last_updated: "2026-02-16T02:00:00Z".into(),
+        last_updated: observed_at.clone(),
         pressure: PressureState {
             overall: "red".into(),
             mounts: vec![
@@ -221,6 +227,7 @@ fn pressured_state() -> DaemonState {
             total: 10,
             released: 8,
         },
+        ballast_pools: vec![sample_observed_pool("/data", 2, 10, &observed_at)],
         last_scan: LastScanState {
             at: Some("2026-02-16T01:59:00Z".into()),
             candidates: 47,
@@ -265,7 +272,7 @@ fn overview_healthy_wide_structure() {
             "ewma",
             "activity",
             "actions",
-            "ok:OK",
+            "ballast [OK] available=10/10",
             "pid=1234",
             "1h 00m",
         ],
@@ -472,7 +479,7 @@ fn ballast_pressured_wide_structure() {
     assert_contains_all(
         &frame,
         "ballast/pressured/wide",
-        &["S5 Ballast", "2/10 available", "8 released", "LOW"],
+        &["S5 Ballast", "2/10 available", "8 released", "CRITICAL"],
     );
 }
 
@@ -706,7 +713,7 @@ fn pressure_transition_green_to_red_overview() {
     assert!(!red_frame.contains("GREEN"));
 }
 
-/// Verify ballast screen reflects pressure-appropriate badges.
+/// Verify ballast screen reflects observed reserve coverage under pressure.
 #[test]
 fn ballast_badges_change_with_pressure() {
     let healthy_model = model_healthy_at(120, 40);
@@ -722,10 +729,12 @@ fn ballast_badges_change_with_pressure() {
 
     // Healthy: all 10 ballast files available.
     assert!(healthy_frame.contains("10/10 available"));
+    assert!(healthy_frame.contains("OK"));
 
     // Pressured: only 2 of 10 available, 8 released.
     assert!(pressured_frame.contains("2/10 available"));
     assert!(pressured_frame.contains("8 released"));
+    assert!(pressured_frame.contains("CRITICAL"));
 }
 
 // ══════════════════════════════════════════════════════════════

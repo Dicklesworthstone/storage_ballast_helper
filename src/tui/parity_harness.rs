@@ -14,9 +14,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::model::DashboardModel;
+use super::model::{DashboardModel, DashboardMsg};
 use super::render;
-use super::test_harness::{DashboardHarness, sample_healthy_state, sample_pressured_state};
+use super::test_harness::{
+    DashboardHarness, sample_healthy_state, sample_observed_pool, sample_pressured_state,
+};
 use crate::daemon::self_monitor::{
     BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
 };
@@ -218,12 +220,13 @@ pub fn run_parity_matrix() -> ParityReport {
 
 /// Multi-mount state with rate data for comprehensive parity testing.
 fn multi_mount_state() -> DaemonState {
+    let observed_at = chrono::Utc::now().to_rfc3339();
     DaemonState {
         version: "0.1.0".into(),
         pid: 4567,
         started_at: "2026-02-16T00:00:00Z".into(),
         uptime_seconds: 7200,
-        last_updated: "2026-02-16T02:00:00Z".into(),
+        last_updated: observed_at.clone(),
         pressure: PressureState {
             overall: "yellow".into(),
             mounts: vec![
@@ -246,6 +249,7 @@ fn multi_mount_state() -> DaemonState {
             total: 4,
             released: 3,
         },
+        ballast_pools: vec![sample_observed_pool("/data", 1, 4, &observed_at)],
         last_scan: LastScanState {
             at: Some("2026-02-16T01:45:30.123Z".into()),
             candidates: 42,
@@ -378,8 +382,7 @@ fn render_with_state(state: Option<DaemonState>, terminal_size: (u16, u16)) -> S
         terminal_size,
     );
     if let Some(s) = state {
-        model.daemon_state = Some(s);
-        model.degraded = false;
+        super::update::update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(s))));
     }
     render::render(&model)
 }

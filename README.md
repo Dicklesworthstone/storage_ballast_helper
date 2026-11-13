@@ -1131,8 +1131,8 @@ planning.
 Startup and reload discovery run as a separate, read-only background job.
 Readiness waits for a healthy pressure observation and the control workers,
 without waiting for optional mount inventories or ballast scans. A complete
-plan is adopted only for the current configuration, within 60 seconds of its
-start, and only if no intervening release or refill changed the active pool
+plan is adopted only for the current configuration, within its freshness
+deadline, and only if no intervening release or refill changed the active pool
 inventory. An unavailable volume can keep the whole optional plan pending;
 it cannot stall monitoring of healthy roots. `state.json.discovery` reports
 pending discovery, reload progress and errors. Saved release history survives
@@ -1949,6 +1949,20 @@ daemon report, status uses read-only inventory and explicitly marks daemon
 release access and automatic refill eligibility as unknown. Releasable bytes
 are allocation estimates; filesystem snapshots may retain blocks after unlink.
 
+The cockpit's overview and Ballast screen use the same reserve observations.
+They show `EXHAUSTED` for confirmed zero and `UNKNOWN` for missing, unreadable or
+expired evidence; unknown quantities are displayed as `unknown`, never as zero
+or cached positive counts. The overview retains the most urgent per-volume
+condition, so a full pool on another filesystem cannot hide an exhausted pool.
+While discovery or a configuration reload is pending, aggregate quantities are
+unknown; independently verified pools still show their observed condition.
+The detail view lists the current refill blockers. Live cockpit reads reject a
+state document marked stopped or at least <!-- claim:constants.daemon.DAEMON_STATE_STALE_THRESHOLD_SECS -->90<!-- /claim --> seconds old, using both its
+recorded update time and file modification time. Copying or touching an old
+document cannot make it live. An unmarked crash can remain visible within that
+freshness window. Incident replay keeps its historical clock and continues to
+disable ballast actions.
+
 Reserve-band changes produce `ballast_reserve_changed` notification records,
 including the remaining reserve and refill explanation. Exhaustion has Red
 notification severity, critical depletion Orange, partial depletion or unknown
@@ -2437,7 +2451,33 @@ The self-monitor tracks daemon health from within, providing introspection data 
 
 With every `state.json` write (every <!-- claim:constants.daemon.DAEMON_STATE_WRITE_INTERVAL_SECS -->30<!-- /claim --> seconds, or on request from `sbh status`) the daemon also renders `metrics.prom` beside it, atomically and world-readable, in the Prometheus text exposition format. Point node_exporter's textfile collector at the data directory (`--collector.textfile.directory=/var/lib/sbh` for a system install) and the `sbh_*` families appear with no network surface and no new dependency; `sbh metrics` prints the same text for hosts without a collector.
 
-The families are a view of the state document, so they never disagree with `sbh status`: `sbh_up`, `sbh_info{version,git_sha,policy_mode,run_id}`, `sbh_daemon_uptime_seconds`, `sbh_daemon_cpu_seconds_total`, `sbh_daemon_rss_bytes`, `sbh_daemon_cpu_budget_used_ratio`, `sbh_daemon_cpu_budget_deficit_seconds`; per mount `sbh_mount_free_ratio`, `sbh_mount_pressure_level{level}` (one-hot), `sbh_mount_fill_rate_bytes_per_second`, `sbh_mount_seconds_to_red`, `sbh_mount_reclaim_capability{capability}`, `sbh_mount_controller_state{state}`, `sbh_ballast_present_bytes`, `sbh_ballast_target_bytes`, `sbh_quarantine_bytes`; `sbh_ballast_files{state}`, `sbh_ballast_releases_total`, `sbh_scans_total`, `sbh_deletions_total`, `sbh_bytes_freed_total`, `sbh_bytes_freed_basis{basis}` (one-hot: `observed`, or `estimated_allocated` / `estimated_upper_bound` where ext4 or btrfs frees blocks only at commit), `sbh_errors_total`, `sbh_log_events_dropped_total`, `sbh_last_scan_candidates`, `sbh_policy_mode{mode}` (one-hot), `sbh_policy_mode_seconds`, `sbh_thread_up{thread}`. Scan CPU seconds, per-engine scan counts and guard e-values are not exported yet because the state document does not carry them. `[telemetry] metrics_enabled = false` turns the export off and removes a stale file at startup.
+The families describe the published state document: `sbh_up`, `sbh_info{version,git_sha,policy_mode,run_id}`, `sbh_daemon_uptime_seconds`, `sbh_daemon_cpu_seconds_total`, `sbh_daemon_rss_bytes`, `sbh_daemon_cpu_budget_used_ratio`, `sbh_daemon_cpu_budget_deficit_seconds`; per mount `sbh_mount_free_ratio`, `sbh_mount_pressure_level{level}` (one-hot), `sbh_mount_fill_rate_bytes_per_second`, `sbh_mount_seconds_to_red`, `sbh_mount_reclaim_capability{capability}`, `sbh_mount_controller_state{state}`, `sbh_ballast_present_bytes`, `sbh_ballast_target_bytes`, `sbh_quarantine_bytes`; `sbh_ballast_files{state}`, `sbh_ballast_releases_total`, `sbh_scans_total`, `sbh_deletions_total`, `sbh_bytes_freed_total`, `sbh_bytes_freed_basis{basis}` (one-hot: `observed`, or `estimated_allocated` / `estimated_upper_bound` where ext4 or btrfs frees blocks only at commit), `sbh_errors_total`, `sbh_log_events_dropped_total`, `sbh_last_scan_candidates`, `sbh_policy_mode{mode}` (one-hot), `sbh_policy_mode_seconds`, `sbh_thread_up{thread}`. Scan CPU seconds, per-engine scan counts and guard e-values are not exported yet because the state document does not carry them. `[telemetry] metrics_enabled = false` turns the export off and removes a stale file at startup.
+
+Reserve metrics use observed inventory, independently of disk pressure and the
+allocator's cached bookkeeping. Per-pool families carry `mount` and
+`ballast_dir`; paths containing non-UTF-8 bytes also receive native hexadecimal
+identity labels so distinct pools cannot collapse to the same series.
+
+| Metric | Meaning |
+| --- | --- |
+| `sbh_ballast_reserve_state{state}` | One-hot reserve condition: healthy, depleted, critical, exhausted, unknown or unconfigured. |
+| `sbh_ballast_inventory_authoritative` | Whether this pool's availability is confirmed. |
+| `sbh_ballast_inventory_complete` | Whether authoritative observations cover every managed pool; zero while discovery or reload is pending, observations are absent, or any pool is unknown. |
+| `sbh_ballast_present_bytes` | Confirmed releasable bytes; a real empty pool emits zero, while unknown availability omits the sample. |
+| `sbh_ballast_target_bytes` | Reserve target independent of observed availability. |
+| `sbh_ballast_files{state="available"}` | Aggregate available files, omitted if any managed pool is unknown. The `total` sample retains the configured count. Both samples are omitted while discovery or reload is pending. |
+| `sbh_ballast_refill_blocked{reason}` | Binary indicators for the current policy, safety-floor and observation blockers; several blockers can apply together. |
+| `sbh_ballast_refill_in_progress` | Whether an authorized refill worker is reported for this pool. |
+| `sbh_ballast_reserve_observed_timestamp_seconds` | Timestamp of the pool's last valid observation. |
+| `sbh_state_last_updated_timestamp_seconds` | Timestamp of the state publication that produced the export. |
+
+Textfiles remain on disk if a daemon crashes. Alerting must check publication
+and observation ages as well as the reserve condition: treat missing timestamps,
+negative ages, and ages of <!-- claim:constants.daemon.DAEMON_STATE_STALE_THRESHOLD_SECS -->90<!-- /claim --> seconds or more as unavailable evidence. A fresh
+state publication alone cannot renew an older inventory observation. Use the
+configured total to distinguish intentionally unconfigured ballast from missing
+observations; do not replace an absent availability sample with zero or a saved
+positive value.
 
 Inode metrics remain independent: `sbh_mount_inode_accounting_known` distinguishes
 available evidence from unavailable or disabled accounting;
