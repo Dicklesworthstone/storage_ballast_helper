@@ -744,6 +744,14 @@ pub struct ScoringConfig {
     /// caches). The floor changes only the prior fed into the expected-loss
     /// decision; every veto still runs first. Default 0.85.
     pub posterior_floor_definite: f64,
+    /// Hours a `Definite` candidate must have been idle before
+    /// `posterior_floor_definite` applies in a Green or Yellow daemon pass
+    /// (bd-i9uh). Without it a definite cargo target 30 minutes idle was
+    /// deleted on a disk with room to spare and rebuilt the same day. Orange
+    /// and above, and an operator's own `sbh scan` or `sbh clean`, apply the
+    /// floor at any age past `scanner.min_file_age_minutes`. 0 turns the
+    /// requirement off. Default 12, rch's own idle floor for a per-job target.
+    pub definite_floor_maintenance_idle_hours: u64,
     /// Regret labels (Q4): a deletion recreated within this many minutes
     /// while a process uses the parent directory is a regret.
     pub regret_window_minutes: u64,
@@ -1582,6 +1590,7 @@ impl Default for ScoringConfig {
             false_negative_loss: 30.0,
             calibration_floor: 0.40,
             posterior_floor_definite: 0.85,
+            definite_floor_maintenance_idle_hours: 12,
             regret_window_minutes: 30,
             regret_alpha_definite: 0.02,
             regret_alpha_likely: 0.005,
@@ -2529,6 +2538,10 @@ impl Config {
         set_env_f64(
             "SBH_SCORING_POSTERIOR_FLOOR_DEFINITE",
             &mut self.scoring.posterior_floor_definite,
+        )?;
+        set_env_u64(
+            "SBH_SCORING_DEFINITE_FLOOR_MAINTENANCE_IDLE_HOURS",
+            &mut self.scoring.definite_floor_maintenance_idle_hours,
         )?;
 
         // telemetry
@@ -3926,6 +3939,16 @@ mod tests {
         assert!((rule.pct_on(100_000_000_000) - pct_floor).abs() < 1e-12);
         // Unknown capacity falls back to the percentage floor.
         assert!((rule.pct_on(0) - pct_floor).abs() < 1e-12);
+    }
+
+    #[test]
+    fn scoring_definite_floor_maintenance_idle_defaults_and_parses() {
+        let cfg = Config::default();
+        assert_eq!(cfg.scoring.definite_floor_maintenance_idle_hours, 12);
+        let parsed: Config =
+            toml::from_str("[scoring]\ndefinite_floor_maintenance_idle_hours = 0\n").unwrap();
+        assert_eq!(parsed.scoring.definite_floor_maintenance_idle_hours, 0);
+        parsed.validate().unwrap();
     }
 
     #[test]

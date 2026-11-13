@@ -1022,6 +1022,7 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_SCORING_MIN_SCORE` | config override | `scoring.min_score` |
 | `SBH_SCORING_CALIBRATION_FLOOR` | config override | `scoring.calibration_floor` |
 | `SBH_SCORING_POSTERIOR_FLOOR_DEFINITE` | config override | `scoring.posterior_floor_definite` |
+| `SBH_SCORING_DEFINITE_FLOOR_MAINTENANCE_IDLE_HOURS` | config override | `scoring.definite_floor_maintenance_idle_hours` |
 | `SBH_SCORING_FALSE_POSITIVE_LOSS` | config override | `scoring.false_positive_loss` |
 | `SBH_SCORING_FALSE_NEGATIVE_LOSS` | config override | `scoring.false_negative_loss` |
 | `SBH_SYSTEM_TUNING_WRITEBACK_ENABLED` | config override | `system_tuning.writeback.enabled` |

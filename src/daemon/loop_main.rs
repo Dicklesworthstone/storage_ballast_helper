@@ -12296,6 +12296,11 @@ fn scanner_thread_main(
         engine.set_regret(regret_view.0.clone(), regret_view.1.clone());
         let cache_redeletions = regret.cache_redeletions(SystemTime::now());
         engine.set_cache_redeletions(cache_redeletions.clone());
+        // A Green or Yellow pass waits for half-day-idle definite candidates
+        // (bd-i9uh), on all three engines, like the regret view.
+        let maintenance_pass =
+            matches!(request_level, PressureLevel::Green | PressureLevel::Yellow);
+        engine.set_maintenance_pass(maintenance_pass);
 
         // If no paths to scan, skip.
         if request.paths.is_empty() {
@@ -12525,6 +12530,7 @@ fn scanner_thread_main(
                 );
                 replay_engine.set_regret(regret_view.0.clone(), regret_view.1.clone());
                 replay_engine.set_cache_redeletions(cache_redeletions.clone());
+                replay_engine.set_maintenance_pass(maintenance_pass);
                 for record in &records {
                     heartbeat.beat();
                     if shutdown.load(Ordering::Relaxed) {
@@ -12738,6 +12744,7 @@ fn scanner_thread_main(
             );
             prescan_engine.set_regret(regret_view.0.clone(), regret_view.1.clone());
             prescan_engine.set_cache_redeletions(cache_redeletions.clone());
+            prescan_engine.set_maintenance_pass(maintenance_pass);
             let prescan_root_order: Vec<PathBuf> = cursor
                 .root_order(&active_scan_paths)
                 .into_iter()

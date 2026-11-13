@@ -414,6 +414,12 @@ pub struct ScoringEngine {
     false_negative_loss: f64,
     calibration_floor: f64,
     posterior_floor_definite: f64,
+    /// Idle time a `Definite` candidate needs for the posterior floor in a
+    /// Green or Yellow daemon pass (`scoring.definite_floor_maintenance_idle_hours`).
+    definite_floor_maintenance_idle: Duration,
+    /// Whether this engine scores a Green or Yellow daemon pass; see
+    /// [`Self::set_maintenance_pass`]. Off for every other caller.
+    maintenance_pass: bool,
     /// Regret calibration factor per category key (`{:?}` of the
     /// category); absent means 1.
     category_calibration: HashMap<String, f64>,
@@ -425,6 +431,20 @@ pub struct ScoringEngine {
 }
 
 impl ScoringEngine {
+    /// Mark the pass this engine scores as a Green or Yellow daemon pass
+    /// (bd-i9uh). There the definite fast lane waits until a candidate has
+    /// been idle for `scoring.definite_floor_maintenance_idle_hours`: nothing
+    /// is worth a cold rebuild of a target in use today on a disk with room
+    /// to spare. trj decided DELETE at Green on a 76 GB shared cargo target
+    /// written 45 minutes earlier; csd deleted a shared `cargo-target` at 35
+    /// minutes idle on two days running, rebuilt each time. Orange and above,
+    /// and an operator's own `sbh scan` or `sbh clean`, keep the floor at any
+    /// age past `scanner.min_file_age_minutes`. The level decides, not the
+    /// urgency: a freshly pressured mount's controller urgency starts low.
+    pub fn set_maintenance_pass(&mut self, maintenance: bool) {
+        self.maintenance_pass = maintenance;
+    }
+
     /// Apply sbh's own deletion history of warm caches (see
     /// [`cache_redeletion_counts`]): each earlier deletion of a path doubles
     /// its idle floor, including under Red/Critical pressure.
@@ -466,6 +486,10 @@ impl ScoringEngine {
             false_negative_loss: scoring.false_negative_loss,
             calibration_floor: scoring.calibration_floor,
             posterior_floor_definite: scoring.posterior_floor_definite.clamp(0.0, 1.0),
+            definite_floor_maintenance_idle: Duration::from_hours(
+                scoring.definite_floor_maintenance_idle_hours,
+            ),
+            maintenance_pass: false,
             category_calibration: HashMap::new(),
             suspended_categories: HashSet::new(),
             cache_redeletions: HashMap::new(),
@@ -539,12 +563,11 @@ impl ScoringEngine {
         // changes the prior fed into the expected-loss decision, never a veto.
         let certainty = classify_certainty(&input.classification, input.signals, factors.location);
         let raw_posterior = posterior_from_score(total, input.classification.combined_confidence);
-        // Below Orange nothing is worth a cold rebuild of a target in use
-        // today: the fast lane waits until the candidate has been idle as long
-        // as an rch per-job dir must be (bd-i9uh).
+        // In a Green or Yellow daemon pass the fast lane waits for a
+        // half-day-idle candidate (bd-i9uh; see `set_maintenance_pass`).
         let posterior_floor_withheld = certainty == ArtifactCertainty::Definite
-            && urgency < DEFINITE_FLOOR_PRESSURE_URGENCY
-            && input.age < DEFINITE_FLOOR_MAINTENANCE_IDLE
+            && self.maintenance_pass
+            && input.age < self.definite_floor_maintenance_idle
             && raw_posterior < self.posterior_floor_definite;
         let posterior_floor_applied = certainty == ArtifactCertainty::Definite
             && !posterior_floor_withheld
@@ -619,11 +642,12 @@ impl ScoringEngine {
             posterior_floor_applied.then_some(self.posterior_floor_definite),
         );
         if posterior_floor_withheld {
-            ledger.summary.push_str(&format!(
-                "; posterior_floor_withheld=idle {}m below {}h at urgency {urgency:.2}",
+            let _ = write!(
+                ledger.summary,
+                "; posterior_floor_withheld=idle {}m below {}h in a Green/Yellow pass",
                 input.age.as_secs() / 60,
-                DEFINITE_FLOOR_MAINTENANCE_IDLE.as_secs() / 3600
-            ));
+                self.definite_floor_maintenance_idle.as_secs() / 3600
+            );
         }
 
         CandidacyScore {
@@ -909,24 +933,6 @@ pub(crate) const RCH_PRESSURE_URGENCY: f64 = 0.7;
 
 /// rch's own idle floor for a per-job target dir.
 pub(crate) const RCH_PER_JOB_IDLE_HOURS: u64 = 12;
-
-/// Urgency below which a `Definite` candidate needs
-/// [`DEFINITE_FLOOR_MAINTENANCE_IDLE`] before its posterior floor applies:
-/// Green (0.0) and Yellow (0.25) in the daemon's level-to-urgency map, under
-/// Orange (0.5).
-pub(crate) const DEFINITE_FLOOR_PRESSURE_URGENCY: f64 = 0.5;
-
-/// Idle time a `Definite` candidate needs for the posterior floor below
-/// [`DEFINITE_FLOOR_PRESSURE_URGENCY`] (bd-i9uh): rch's per-job floor, so a
-/// plain cargo target waits as long as an rch per-job one already does.
-///
-/// Without it the floor made anything past `min_file_age_minutes` (30)
-/// deletable on a disk with room to spare. trj decided DELETE at Green on a
-/// 76 GB shared cargo target written 45 minutes earlier, and csd deleted a
-/// shared `cargo-target` at 35 minutes idle on two days running, rebuilt each
-/// time. Under pressure the floor still applies at any age past the minimum.
-pub(crate) const DEFINITE_FLOOR_MAINTENANCE_IDLE: Duration =
-    Duration::from_hours(RCH_PER_JOB_IDLE_HOURS);
 
 /// rch's own idle floor for a pooled (warm-cache) target dir.
 pub(crate) const RCH_POOLED_IDLE_HOURS: u64 = 168;
@@ -3260,16 +3266,17 @@ mod tests {
     /// cargo target (`/scratch/cargo-targets/inatd-receipts`) last written 45
     /// minutes earlier, with `/scratch` 70% full; only the unit's sandbox
     /// stopped it. csd deleted a shared `cargo-target` at 35 minutes idle on
-    /// two days running and it was rebuilt each time. Below Orange the fast
-    /// lane now waits for the same half day an rch per-job target needs.
+    /// two days running and it was rebuilt each time. In a Green or Yellow
+    /// daemon pass the fast lane now waits for a half-day-idle candidate.
     #[test]
-    fn definite_floor_waits_for_a_half_day_idle_target_below_orange() {
-        let engine = default_engine();
+    fn definite_floor_waits_for_a_half_day_idle_target_in_a_maintenance_pass() {
+        let mut maintenance = default_engine();
+        maintenance.set_maintenance_pass(true);
         let mut young = stale_definite_target("/scratch/cargo-targets/inatd-receipts");
         young.age = Duration::from_secs(2677);
         young.size_bytes = 76 * 1_073_741_824;
         for urgency in [0.0, 0.05, 0.25] {
-            let score = engine.score_candidate(&young, urgency);
+            let score = maintenance.score_candidate(&young, urgency);
             assert!(!score.vetoed, "urgency={urgency}: {:?}", score.veto_reason);
             assert_eq!(score.decision.certainty, ArtifactCertainty::Definite);
             assert!(
@@ -3284,15 +3291,20 @@ mod tests {
                 score.ledger.summary
             );
             assert!(
-                score.ledger.summary.contains("posterior_floor_withheld"),
+                score
+                    .ledger
+                    .summary
+                    .contains("posterior_floor_withheld=idle 44m below 12h"),
                 "urgency={urgency}: {}",
                 score.ledger.summary
             );
         }
 
-        // Under pressure the same young target is still reclaimed.
-        for urgency in [0.5, 0.75, 0.93] {
-            let score = engine.score_candidate(&young, urgency);
+        // Not a maintenance pass (Orange and above, an operator's scan or
+        // clean): the same young target is still reclaimed at any urgency.
+        let pressured = default_engine();
+        for urgency in [0.0, 0.3, 0.75, 0.93] {
+            let score = pressured.score_candidate(&young, urgency);
             assert_eq!(
                 score.decision.action,
                 DecisionAction::Delete,
@@ -3302,10 +3314,10 @@ mod tests {
             assert!(!score.ledger.summary.contains("posterior_floor_withheld"));
         }
 
-        // The boundary: half a day idle qualifies at Green, a minute less does not.
-        let mut idle = young.clone();
+        // The boundary: half a day idle qualifies, a minute less does not.
+        let mut idle = young;
         idle.age = Duration::from_hours(12);
-        let score = engine.score_candidate(&idle, 0.0);
+        let score = maintenance.score_candidate(&idle, 0.0);
         assert!(
             score.decision.posterior_floor_applied,
             "{}",
@@ -3318,13 +3330,30 @@ mod tests {
             score.ledger.summary
         );
         idle.age = Duration::from_hours(12) - Duration::from_mins(1);
-        let score = engine.score_candidate(&idle, 0.0);
+        let score = maintenance.score_candidate(&idle, 0.0);
         assert!(
             !score.decision.posterior_floor_applied,
             "{}",
             score.ledger.summary
         );
         assert_ne!(
+            score.decision.action,
+            DecisionAction::Delete,
+            "{}",
+            score.ledger.summary
+        );
+
+        // 0 hours turns the requirement off.
+        let mut disabled = ScoringEngine::from_config(
+            &ScoringConfig {
+                definite_floor_maintenance_idle_hours: 0,
+                ..ScoringConfig::default()
+            },
+            30,
+        );
+        disabled.set_maintenance_pass(true);
+        let score = disabled.score_candidate(&idle, 0.0);
+        assert_eq!(
             score.decision.action,
             DecisionAction::Delete,
             "{}",

@@ -265,6 +265,10 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
         "`scoring.posterior_floor_definite`",
     ),
     cfg(
+        "SBH_SCORING_DEFINITE_FLOOR_MAINTENANCE_IDLE_HOURS",
+        "`scoring.definite_floor_maintenance_idle_hours`",
+    ),
+    cfg(
         "SBH_SCORING_FALSE_POSITIVE_LOSS",
         "`scoring.false_positive_loss`",
     ),
@@ -1366,6 +1370,13 @@ pub fn constants() -> Vec<ConstantDoc> {
             "posterior_floor_definite",
             scoring.posterior_floor_definite,
             "Posterior needed for a definite label",
+            CONFIG,
+        ),
+        constant(
+            "scoring",
+            "definite_floor_maintenance_idle_hours",
+            scoring.definite_floor_maintenance_idle_hours,
+            "Idle hours before that floor applies at Green or Yellow",
             CONFIG,
         ),
         constant(

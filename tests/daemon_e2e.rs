@@ -133,6 +133,10 @@ pub struct ScenarioConfig {
     pub root_paths: Vec<PathBuf>,
     pub poll_interval_ms: u64,
     pub min_file_age_minutes: u64,
+    /// `scoring.definite_floor_maintenance_idle_hours`. 0 by default: every
+    /// fixture's birth time is now, so a Green or Yellow pass would otherwise
+    /// wait 12 h before the definite fast lane applies (bd-i9uh).
+    pub definite_floor_maintenance_idle_hours: u64,
     pub maintenance_interval_secs: u64,
     pub min_rescan_interval_secs: u64,
     pub cross_devices: bool,
@@ -169,6 +173,7 @@ impl Default for ScenarioConfig {
             root_paths: Vec::new(),
             poll_interval_ms: 500,
             min_file_age_minutes: 30,
+            definite_floor_maintenance_idle_hours: 0,
             maintenance_interval_secs: 1800,
             min_rescan_interval_secs: 90,
             cross_devices: false,
@@ -240,7 +245,9 @@ min_rescan_interval_secs = {rescan}
 max_scan_duty_cycle_pct = {duty}
 max_depth = 6
 parallelism = 2
-{scanner_extra}[telemetry]
+{scanner_extra}[scoring]
+definite_floor_maintenance_idle_hours = {definite_idle}
+[telemetry]
 cpu_budget_pct = {budget}
 metrics_enabled = {metrics}
 {telemetry_extra}{notifications}{extra}",
@@ -261,6 +268,7 @@ metrics_enabled = {metrics}
         catalog = scenario.catalog_roots,
         roots = roots,
         min_age = scenario.min_file_age_minutes,
+        definite_idle = scenario.definite_floor_maintenance_idle_hours,
         rescan = scenario.min_rescan_interval_secs,
         duty = scenario.duty_cycle_pct,
         budget = scenario.cpu_budget_pct,
