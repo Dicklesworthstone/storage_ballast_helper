@@ -615,6 +615,9 @@ pub enum SkipReason {
     /// Lossless compression has a bounded first chance on this filesystem.
     /// This live scheduling hold must not create a per-path refusal backoff.
     CompressionFirst,
+    /// A target-driven cleanup cannot confirm the candidate filesystem's
+    /// current capacity. Missing evidence must not authorize more removals.
+    PressureUnavailable,
 }
 
 impl SkipReason {
@@ -624,7 +627,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -648,6 +651,7 @@ impl SkipReason {
         Self::ShuttingDown,
         Self::PolicyChanged,
         Self::CompressionFirst,
+        Self::PressureUnavailable,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -685,6 +689,7 @@ impl SkipReason {
             Self::ShuttingDown => "shutting_down",
             Self::PolicyChanged => "policy_changed",
             Self::CompressionFirst => "compression_first",
+            Self::PressureUnavailable => "pressure_unavailable",
         }
     }
 
@@ -734,6 +739,9 @@ impl SkipReason {
             Self::ShuttingDown => "the daemon was shutting down — left for the next run",
             Self::PolicyChanged => "live policy or dry-run settings no longer permit changes",
             Self::CompressionFirst => "lossless compression is running before permanent cleanup",
+            Self::PressureUnavailable => {
+                "current filesystem capacity is unavailable — target-driven cleanup paused"
+            }
         }
     }
 }
@@ -782,6 +790,7 @@ fn should_backoff_skip(reason: SkipReason) -> bool {
             | SkipReason::ShuttingDown
             | SkipReason::PolicyChanged
             | SkipReason::CompressionFirst
+            | SkipReason::PressureUnavailable
     )
 }
 
@@ -3033,6 +3042,7 @@ mod tests {
         assert!(!should_backoff_skip(SkipReason::CategorySuspended));
         assert!(!should_backoff_skip(SkipReason::PolicyChanged));
         assert!(!should_backoff_skip(SkipReason::CompressionFirst));
+        assert!(!should_backoff_skip(SkipReason::PressureUnavailable));
         assert!(!should_backoff_skip(SkipReason::SourceRootDenied));
         assert!(should_backoff_skip(SkipReason::Symlink));
         assert!(!should_backoff_skip(SkipReason::PathGone));
@@ -3069,6 +3079,7 @@ mod tests {
                 SkipReason::ShuttingDown => 20,
                 SkipReason::PolicyChanged => 21,
                 SkipReason::CompressionFirst => 22,
+                SkipReason::PressureUnavailable => 23,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];

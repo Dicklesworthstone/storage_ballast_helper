@@ -338,6 +338,126 @@ fn clean_and_emergency_with_nothing_to_reclaim_are_exit_zero() {
     assert_eq!(payload["candidates_count"], 0);
 }
 
+#[cfg(unix)]
+fn emergency_fixture_command(directory: &Path, root: &Path, yes: bool) -> Output {
+    let mut command = Command::new(common::sbh_bin_path());
+    command
+        .args(["--json", "emergency", "--target-free", "100"])
+        .arg(root)
+        .env("HOME", directory.join("home"))
+        .env("XDG_CONFIG_HOME", directory.join("config"))
+        .env("XDG_DATA_HOME", directory.join("data"))
+        .env("XDG_CACHE_HOME", directory.join("cache"))
+        .env("SBH_USE_XDG_PATHS", "1")
+        .env_remove("SBH_TEST_MODE")
+        .env_remove("SBH_TEST_FS_STATS");
+    if yes {
+        command.arg("--yes");
+    }
+    command.output().expect("run fixture emergency recovery")
+}
+
+#[cfg(unix)]
+fn quarantined_emergency_fixture(
+    directory: &Path,
+    size: u64,
+) -> (
+    PathBuf,
+    storage_ballast_helper::scanner::quarantine::QuarantineRecord,
+) {
+    use storage_ballast_helper::scanner::quarantine::QuarantineStore;
+    let root = directory.join("scan");
+    let source = root.join("held-artifact");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.o"), b"obj").unwrap();
+    let record = QuarantineStore::under(&root)
+        .quarantine(
+            &source,
+            "emergency-held",
+            size,
+            std::time::Duration::from_hours(24),
+            None,
+        )
+        .unwrap();
+    (root, record)
+}
+
+/// Merely asking for emergency recovery must not discard an undo copy before
+/// the same --yes rule that protects ordinary candidate deletion is checked.
+#[cfg(unix)]
+#[test]
+fn emergency_quarantine_without_yes_is_untouched_and_writes_no_ledger() {
+    use storage_ballast_helper::scanner::quarantine::QuarantineStore;
+    let directory = tempfile::tempdir().unwrap();
+    let (root, record) = quarantined_emergency_fixture(directory.path(), 3);
+    let output = emergency_fixture_command(directory.path(), &root, false);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr(&output).contains("--yes"), "{output:?}");
+    assert_eq!(
+        fs::read(record.quarantine_path.join("a.o")).unwrap(),
+        b"obj"
+    );
+    assert_eq!(
+        QuarantineStore::under(&root)
+            .record("emergency-held")
+            .unwrap()
+            .unwrap(),
+        record,
+    );
+    assert!(!directory.path().join("data").exists());
+    assert!(!directory.path().join("config").exists());
+}
+
+/// A quarantine-only recovery has real removal credit even though the scanner
+/// finds no new candidates. Zero-size manifests still represent actual removals.
+#[cfg(unix)]
+#[test]
+fn emergency_quarantine_only_recovery_reports_completed_items_and_estimates() {
+    for size in [0, 3] {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, record) = quarantined_emergency_fixture(directory.path(), size);
+        let output = emergency_fixture_command(directory.path(), &root, true);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["candidates_count"], 0);
+        assert_eq!(payload["items_deleted"], 1);
+        assert_eq!(payload["items_failed"], 0);
+        assert_eq!(payload["bytes_freed"], size);
+        assert_eq!(payload["quarantine_drain"]["items_deleted"], 1);
+        assert_eq!(payload["quarantine_drain"]["bytes_freed"], size);
+        assert_eq!(
+            payload["quarantine_drain"]["bytes_basis"],
+            "decision_estimate"
+        );
+        assert_eq!(
+            payload["quarantine_drain"]["removals"][0]["decision_id"],
+            "emergency-held"
+        );
+        assert_eq!(payload["stalled"], false);
+        assert!(!record.quarantine_path.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn emergency_quarantine_store_failure_reports_partial_instead_of_empty_success() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("scan");
+    fs::create_dir_all(root.join(".sbh")).unwrap();
+    let refused = root.join(".sbh/quarantine");
+    fs::write(&refused, b"not a directory").unwrap();
+    let output = emergency_fixture_command(directory.path(), &root, true);
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["items_deleted"], 0);
+    assert_eq!(payload["bytes_freed"], 0);
+    assert_eq!(payload["items_failed"], 1);
+    assert_eq!(payload["quarantine_drain"]["items_failed"], 1);
+    assert_eq!(payload["errors"][0]["path"], refused.display().to_string());
+    assert_eq!(fs::read(refused).unwrap(), b"not a directory");
+    assert!(!directory.path().join("data").exists());
+}
+
 /// Bad arguments are user errors: exit 1 (clap's own usage errors keep
 /// clap's exit 2, which is the runtime class and out of this contract).
 #[test]

@@ -1,6 +1,6 @@
 //! Top-level CLI definition and dispatch.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -61,7 +61,7 @@ use storage_ballast_helper::monitor::inode_pressure::{
 };
 use storage_ballast_helper::monitor::pid::{PressureLevel, classify_level};
 use storage_ballast_helper::platform::pal::{
-    BlockDeviceInfo, InodeStats, MemoryInfo, Platform, ServiceManager, detect_platform,
+    BlockDeviceInfo, FsStats, InodeStats, MemoryInfo, Platform, ServiceManager, detect_platform,
 };
 use storage_ballast_helper::platform::types::{
     Capacity, FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
@@ -72,17 +72,20 @@ use storage_ballast_helper::scanner::active_lease::{
     self, ACTIVE_LEASE_TARGET_ENV, ACTIVE_LEASE_TOKEN_ENV, ActiveLease, LeasePolicy,
 };
 use storage_ballast_helper::scanner::deletion::{
-    DeletionConfig, DeletionExecutor, DeletionMode, DeletionPlan, SkipCheck, SkipReason,
+    DeletionConfig, DeletionError, DeletionExecutor, DeletionMode, DeletionPlan, DeletionReport,
+    SkipCheck, SkipReason,
 };
 use storage_ballast_helper::scanner::engine::{ScannerEngine, SelectedScannerEngine};
 use storage_ballast_helper::scanner::patterns::{
     ArtifactCategory, ArtifactPatternRegistry, OpaqueTreeDisposition,
 };
-use storage_ballast_helper::scanner::planner::{BatchPlan, PlanObjective, PlanRequest, plan_batch};
+use storage_ballast_helper::scanner::planner::{
+    BatchPlan, PlanObjective, PlanRequest, admit_candidates, plan_batch,
+};
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
 use storage_ballast_helper::scanner::quarantine::{
     QuarantineCompletion, QuarantineRecord, QuarantineStore, RecoveryState, RestoreOutcome,
-    StuckEntry,
+    StuckEntry, SweepMode,
 };
 use storage_ballast_helper::scanner::scoring::{
     ActiveReferenceSummary, CandidacyScore, CandidateInput, ScoringEngine,
@@ -1676,37 +1679,261 @@ fn planner_explanation(line: &str, decision_id: &str) -> Option<String> {
         })
 }
 
-/// The pressure level of the mount under the first root and, for a
-/// `--target-free` percentage, the bytes that reach it (`None` when the
-/// mount already has them).
+/// One physical filesystem's independent cleanup objective and risk budget.
+#[derive(Serialize)]
+struct CliFilesystemPlan {
+    device_id: u64,
+    mounts: BTreeSet<PathBuf>,
+    free_pct: f64,
+    plan: BatchPlan,
+}
+
+/// The aggregate is reporting only; admission always uses the individual
+/// filesystem plans. A healthy filesystem cannot pay another one's byte goal
+/// or donate its unused risk allowance.
+struct CliCleanupPlan {
+    summary: BatchPlan,
+    filesystems: Vec<CliFilesystemPlan>,
+}
+
+struct CliFilesystemCandidates {
+    device_id: u64,
+    stats: FsStats,
+    mounts: BTreeSet<PathBuf>,
+    candidates: Vec<CandidacyScore>,
+}
+
+/// Preserve a zero byte target: a satisfied filesystem plans no new removals.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-fn clean_plan_target(
+fn cli_filesystem_target(
     config: &Config,
-    root_paths: &[PathBuf],
+    stats: &FsStats,
     target_free: Option<f64>,
 ) -> (PressureLevel, Option<u64>) {
-    let Some(root) = root_paths.first() else {
-        return (PressureLevel::Green, None);
-    };
-    let Ok(platform) = detect_platform() else {
-        return (PressureLevel::Green, None);
-    };
-    let collector = FsStatsCollector::new(platform, Duration::from_millis(500));
-    let Ok(stats) = collector.collect(root) else {
-        return (PressureLevel::Green, None);
-    };
     let [green, yellow, orange, red] = config.pressure.free_pct_thresholds_for(stats.total_bytes);
     let level = classify_level(stats.free_pct(), green, yellow, orange, red);
-    let target = target_free
-        .map(|pct| {
-            ((stats.total_bytes as f64 * pct / 100.0) as u64).saturating_sub(stats.available_bytes)
-        })
-        .filter(|bytes| *bytes > 0);
+    let target = target_free.map(|pct| {
+        ((stats.total_bytes as f64 * pct / 100.0) as u64).saturating_sub(stats.available_bytes)
+    });
     (level, target)
+}
+
+/// Resolve every root and candidate in one mount-table generation. Unknown
+/// ownership or a replaced candidate refuses the plan before any deletion.
+fn plan_cli_cleanup(
+    config: &Config,
+    roots: &[PathBuf],
+    candidates: Vec<CandidacyScore>,
+    target_free: Option<f64>,
+    max_items: usize,
+) -> Result<(Vec<CandidacyScore>, CliCleanupPlan), CliError> {
+    let platform = detect_platform().map_err(|error| CliError::Runtime(error.to_string()))?;
+    let collector = FsStatsCollector::new(platform, Duration::from_millis(500));
+    let paths: Vec<_> = roots
+        .iter()
+        .cloned()
+        .chain(candidates.iter().map(|candidate| candidate.path.clone()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let observations = collector.collect_many(&paths).map_err(|error| {
+        CliError::Runtime(format!("cannot determine cleanup filesystems: {error}"))
+    })?;
+    plan_cli_cleanup_with(config, roots, candidates, target_free, max_items, |path| {
+        use storage_ballast_helper::scanner::walker::identity_for_path;
+
+        let stats = observations.get(path).ok_or_else(|| {
+            CliError::Runtime(format!(
+                "missing filesystem observation for {}",
+                path.display()
+            ))
+        })?;
+        let identity = identity_for_path(path, false)?;
+        let owner = identity_for_path(&stats.mount_point, false)?;
+        if identity.device_id != owner.device_id {
+            return Err(CliError::Runtime(format!(
+                "filesystem ownership changed while planning {}",
+                path.display()
+            )));
+        }
+        Ok((identity, stats.clone()))
+    })
+}
+
+fn cli_filesystem_key(device_id: u64, stats: &FsStats) -> (u64, Option<PathBuf>) {
+    // APFS volumes may share st_dev. Their native mount owners must remain
+    // distinct even when their container totals match. Firmlink spellings
+    // already resolve to the same native owner in FsStatsCollector.
+    (
+        device_id,
+        (stats.fs_type == "apfs").then(|| stats.mount_point.clone()),
+    )
+}
+
+fn add_cli_filesystem(
+    groups: &mut BTreeMap<(u64, Option<PathBuf>), CliFilesystemCandidates>,
+    device_id: u64,
+    stats: FsStats,
+) -> Result<(), CliError> {
+    if stats.total_bytes == 0 {
+        return Err(CliError::Runtime(format!(
+            "filesystem capacity is unavailable while planning {}",
+            stats.mount_point.display()
+        )));
+    }
+    let key = cli_filesystem_key(device_id, &stats);
+    if let Some(group) = groups.get_mut(&key) {
+        if group.stats.total_bytes != stats.total_bytes || group.stats.fs_type != stats.fs_type {
+            return Err(CliError::Runtime(format!(
+                "filesystem capacity changed while planning {}",
+                stats.mount_point.display()
+            )));
+        }
+        // Bind aliases share one budget and one target. Use the least free
+        // observation when capacity changed between their native samples.
+        group.stats.available_bytes = group.stats.available_bytes.min(stats.available_bytes);
+        group.mounts.insert(stats.mount_point);
+    } else {
+        groups.insert(
+            key,
+            CliFilesystemCandidates {
+                device_id,
+                mounts: BTreeSet::from([stats.mount_point.clone()]),
+                stats,
+                candidates: Vec::new(),
+            },
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn plan_cli_cleanup_with(
+    config: &Config,
+    roots: &[PathBuf],
+    candidates: Vec<CandidacyScore>,
+    target_free: Option<f64>,
+    max_items: usize,
+    mut observe: impl FnMut(&Path) -> Result<(FsIdentity, FsStats), CliError>,
+) -> Result<(Vec<CandidacyScore>, CliCleanupPlan), CliError> {
+    let mut groups = BTreeMap::new();
+    // Include empty roots: no candidates on a full filesystem is an unmet
+    // goal, even when a different requested filesystem is already healthy.
+    for root in roots {
+        let (identity, stats) = observe(root)?;
+        add_cli_filesystem(&mut groups, identity.device_id, stats)?;
+    }
+    for candidate in admit_candidates(candidates) {
+        let (identity, stats) = observe(&candidate.path)?;
+        if candidate
+            .identity
+            .is_some_and(|expected| expected != identity)
+        {
+            return Err(CliError::Runtime(format!(
+                "candidate identity changed while planning {}",
+                candidate.path.display()
+            )));
+        }
+        let key = cli_filesystem_key(identity.device_id, &stats);
+        add_cli_filesystem(&mut groups, identity.device_id, stats)?;
+        if let Some(group) = groups.get_mut(&key) {
+            group.candidates.push(candidate);
+        }
+    }
+    let mut groups: Vec<_> = groups.into_values().collect();
+    // The command-wide item cap goes to pressured filesystems first, not to
+    // whichever root happened to be first on the command line.
+    groups.sort_by(|a, b| {
+        let (a_level, _) = cli_filesystem_target(config, &a.stats, target_free);
+        let (b_level, _) = cli_filesystem_target(config, &b.stats, target_free);
+        b_level
+            .cmp(&a_level)
+            .then_with(|| a.stats.free_pct().total_cmp(&b.stats.free_pct()))
+            .then_with(|| a.device_id.cmp(&b.device_id))
+    });
+    let mut chosen = Vec::new();
+    let mut selected_paths = BTreeSet::<PathBuf>::new();
+    let mut filesystems = Vec::with_capacity(groups.len());
+    for mut group in groups {
+        let (level, target) = cli_filesystem_target(config, &group.stats, target_free);
+        // Preserve disjoint deletion scopes even when a parent and a nested
+        // mount were both observed. Same-device aliases are handled together
+        // by the ordinary planner's identity admission.
+        group.candidates.retain(|candidate| {
+            !candidate
+                .path
+                .ancestors()
+                .any(|path| selected_paths.contains(path))
+                && !selected_paths
+                    .range(candidate.path.clone()..)
+                    .next()
+                    .is_some_and(|path| path.starts_with(&candidate.path))
+        });
+        let request = cli_plan_request(
+            config,
+            level,
+            target,
+            max_items.saturating_sub(chosen.len()),
+        );
+        let (selected, plan) = plan_batch(group.candidates, &request);
+        selected_paths.extend(selected.iter().map(|candidate| candidate.path.clone()));
+        chosen.extend(selected);
+        filesystems.push(CliFilesystemPlan {
+            device_id: group.device_id,
+            mounts: group.mounts,
+            free_pct: group.stats.free_pct(),
+            plan,
+        });
+    }
+    let mut summary = plan_batch(
+        Vec::new(),
+        &cli_plan_request(config, PressureLevel::Green, target_free.map(|_| 0), 0),
+    )
+    .1;
+    summary.risk_budget = Some(0.0);
+    summary.target_met = target_free.is_some();
+    for filesystem in &filesystems {
+        let plan = &filesystem.plan;
+        summary.planned_bytes = summary.planned_bytes.saturating_add(plan.planned_bytes);
+        summary.target_bytes = summary
+            .target_bytes
+            .zip(plan.target_bytes)
+            .map(|(a, b)| a.saturating_add(b));
+        summary.risk_budget = summary
+            .risk_budget
+            .zip(plan.risk_budget)
+            .map(|(a, b)| (a + b).min(f64::MAX));
+        summary.risk_used = (summary.risk_used + plan.risk_used).min(f64::MAX);
+        summary.top_n_risk = (summary.top_n_risk + plan.top_n_risk).min(f64::MAX);
+        summary.top_n_bytes = summary.top_n_bytes.saturating_add(plan.top_n_bytes);
+        summary.target_met &= plan.target_met;
+        summary.chosen.extend(plan.chosen.iter().cloned());
+        summary
+            .skipped_for_budget
+            .extend(plan.skipped_for_budget.iter().cloned());
+        summary
+            .skipped_for_overlap
+            .extend(plan.skipped_for_overlap.iter().cloned());
+    }
+    summary.level = if filesystems.len() == 1 {
+        filesystems[0].plan.level.clone()
+    } else {
+        "per_filesystem".to_string()
+    };
+    for (index, item) in summary.chosen.iter_mut().enumerate() {
+        item.rank = index + 1;
+    }
+    Ok((
+        chosen,
+        CliCleanupPlan {
+            summary,
+            filesystems,
+        },
+    ))
 }
 
 /// A manual clean's plan request: the mount's level sets the risk budget.
@@ -14079,16 +14306,18 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 .map(|entry| scan_entry_json(entry, args.explain))
                 .collect();
 
-            // W1 planner: the batch the daemon would execute from these
-            // candidates at the mount's current level.
-            let (scan_level, _) = clean_plan_target(&config, &root_paths, None);
-            let (_, scan_plan) = plan_batch(
+            // W1 planner: each filesystem owns its pressure/risk budget.
+            let (_, scan_plan) = plan_cli_cleanup(
+                &config,
+                &root_paths,
                 candidates.iter().map(|entry| entry.score.clone()).collect(),
-                &cli_plan_request(&config, scan_level, None, config.scanner.max_delete_batch),
-            );
+                None,
+                config.scanner.max_delete_batch,
+            )?;
             let mut payload = json!({
                 "command": "scan",
-                "plan": scan_plan,
+                "plan": scan_plan.summary,
+                "plans_by_mount": scan_plan.filesystems,
                 "scanner_engine": scanner_engine_mode.to_string(),
                 "scanner_dispatch": scanner_dispatch.to_string(),
                 "opaque_pruning": scanner_opaque_pruning,
@@ -15006,59 +15235,64 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     let mut open_paths = None;
     let mut active_reference_index = None;
 
-    let scored: Vec<CandidacyScore> = entries
-        .iter()
-        .filter_map(|entry| {
-            // As `sbh scan` and the daemon walk classify (bd-10yj).
-            let classification = entry.walk_classification(&registry)?;
-            let age = now
-                .duration_since(
-                    entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
-                )
-                .unwrap_or_default();
-            let mut candidate = CandidateInput {
-                path: entry.path.clone(),
-                size_bytes: entry.metadata.content_size_bytes,
-                age,
-                classification,
-                signals: entry.structural_signals,
-                active_references: ActiveReferenceSummary::default(),
-                is_open: false,
-                excluded: false,
-            };
-            let cheap_score = engine.score_candidate(&candidate, 0.0);
-            if !cheap_score.vetoed && cheap_score.total_score >= args.min_score {
-                candidate.is_open = open_status_for_candidate(
-                    &mut open_paths,
-                    &root_paths,
-                    active_reference_scan,
-                    &entry.path,
-                    entry.metadata.content_size_bytes,
-                    candidate.classification.category,
+    let scored: Vec<CandidacyScore> = admit_candidates(
+        entries
+            .iter()
+            .filter_map(|entry| {
+                // As `sbh scan` and the daemon walk classify (bd-10yj).
+                let classification = entry.walk_classification(&registry)?;
+                let age = now
+                    .duration_since(
+                        entry
+                            .effective_age_timestamp(classification.category.is_regenerable_tree()),
+                    )
+                    .unwrap_or_default();
+                let mut candidate = CandidateInput {
+                    path: entry.path.clone(),
+                    size_bytes: entry.metadata.content_size_bytes,
+                    age,
+                    classification,
+                    signals: entry.structural_signals,
+                    active_references: ActiveReferenceSummary::default(),
+                    is_open: false,
+                    excluded: false,
+                };
+                let cheap_score = engine.score_candidate(&candidate, 0.0);
+                if !cheap_score.vetoed && cheap_score.total_score >= args.min_score {
+                    candidate.is_open = open_status_for_candidate(
+                        &mut open_paths,
+                        &root_paths,
+                        active_reference_scan,
+                        &entry.path,
+                        entry.metadata.content_size_bytes,
+                        candidate.classification.category,
+                    );
+                    let (active_references, _) = active_references_for_candidate(
+                        &mut active_reference_index,
+                        &root_paths,
+                        active_reference_scan,
+                        &entry.path,
+                        Some(entry.metadata.identity()),
+                        entry.metadata.content_size_bytes,
+                        candidate.classification.category,
+                    );
+                    candidate.active_references = active_references;
+                }
+                let (mut score, _) = score_candidate_with_deferred_sacred_check(
+                    &engine,
+                    &candidate,
+                    0.0,
+                    &sacred_paths,
+                    |base_score| !base_score.vetoed && base_score.total_score >= args.min_score,
                 );
-                let (active_references, _) = active_references_for_candidate(
-                    &mut active_reference_index,
-                    &root_paths,
-                    active_reference_scan,
-                    &entry.path,
-                    Some(entry.metadata.identity()),
-                    entry.metadata.content_size_bytes,
-                    candidate.classification.category,
-                );
-                candidate.active_references = active_references;
-            }
-            let (mut score, _) = score_candidate_with_deferred_sacred_check(
-                &engine,
-                &candidate,
-                0.0,
-                &sacred_paths,
-                |base_score| !base_score.vetoed && base_score.total_score >= args.min_score,
-            );
-            score.identity = Some(entry.metadata.identity());
-            Some(score)
-        })
-        .filter(|score| !score.vetoed && score.total_score >= args.min_score)
-        .collect();
+                score.identity = Some(entry.metadata.identity());
+                Some(score)
+            })
+            .collect(),
+    )
+    .into_iter()
+    .filter(|score| !score.vetoed && score.total_score >= args.min_score)
+    .collect();
 
     let scan_elapsed = start.elapsed();
 
@@ -15089,20 +15323,23 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     let recorded_decisions = record_cli_decisions(cli, &config, &scored, args.dry_run);
     // W1 planner: the set that reaches --target-free with the least expected
     // loss inside the mount's risk budget, in that order.
-    let (level, target_bytes) = clean_plan_target(&config, &root_paths, args.target_free);
-    let (chosen, batch_plan) = plan_batch(
+    let (chosen, batch_plan) = plan_cli_cleanup(
+        &config,
+        &root_paths,
         scored,
-        &cli_plan_request(
-            &config,
-            level,
-            target_bytes,
-            args.max_items.unwrap_or(config.scanner.max_delete_batch),
-        ),
-    );
-    eprintln!("[SBH-PLANNER] {}", batch_plan.summary_line());
-    record_cli_plan(cli, &config, &batch_plan);
+        args.target_free,
+        args.max_items.unwrap_or(config.scanner.max_delete_batch),
+    )?;
+    for filesystem in &batch_plan.filesystems {
+        eprintln!(
+            "[SBH-PLANNER] {} mounts={:?}",
+            filesystem.plan.summary_line(),
+            filesystem.mounts
+        );
+        record_cli_plan(cli, &config, &filesystem.plan);
+    }
     let mut plan = executor.plan(chosen);
-    order_by_plan(&mut plan, &batch_plan);
+    order_by_plan(&mut plan, &batch_plan.summary);
     if cli.verbose && recorded_decisions > 0 {
         eprintln!(
             "[SBH-CLEAN] recorded {recorded_decisions} decision(s) in {} (see `sbh explain --last {recorded_decisions}`)",
@@ -15138,6 +15375,8 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                     "items_failed": 0,
                     "bytes_freed": 0,
                     "bytes_would_free": 0,
+                    "plan": batch_plan.summary,
+                    "plans_by_mount": batch_plan.filesystems,
                     "dry_run": args.dry_run,
                     "protected_count": protected_count,
                     "skipped_by_reason": json!({}),
@@ -15179,14 +15418,13 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                 );
             }
             OutputMode::Json => {
-                emit_clean_report_json(
+                emit_filesystem_clean_report_json(
                     &plan,
                     &report,
                     dir_count,
                     scan_elapsed,
                     protected_count,
-                    "clean",
-                    Some(&batch_plan),
+                    &batch_plan,
                 )?;
             }
         }
@@ -15223,14 +15461,13 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                 print_clean_summary(&report);
             }
             OutputMode::Json => {
-                emit_clean_report_json(
+                emit_filesystem_clean_report_json(
                     &plan,
                     &report,
                     dir_count,
                     scan_elapsed,
                     protected_count,
-                    "clean",
-                    Some(&batch_plan),
+                    &batch_plan,
                 )?;
             }
         }
@@ -15507,11 +15744,17 @@ fn build_pressure_check(
 ) -> Option<Box<dyn Fn(&Path) -> Option<SkipReason>>> {
     let target = target_free?;
     Some(Box::new(move |path: &Path| {
-        collector
-            .collect(path)
-            .is_ok_and(|stats| stats.free_pct() >= target)
-            .then_some(SkipReason::TargetFreeReached)
+        target_free_skip(&collector, path, target)
     }))
+}
+
+fn target_free_skip(collector: &FsStatsCollector, path: &Path, target: f64) -> Option<SkipReason> {
+    match collector.collect(path) {
+        Ok(stats) if stats.total_bytes > 0 => {
+            (stats.free_pct() >= target).then_some(SkipReason::TargetFreeReached)
+        }
+        Ok(_) | Err(_) => Some(SkipReason::PressureUnavailable),
+    }
 }
 
 fn active_reference_scan_config(config: &Config) -> ActiveReferenceScanConfig {
@@ -15639,14 +15882,14 @@ fn run_interactive_clean(
     for (i, candidate) in plan.candidates.iter().enumerate() {
         // Check target_free skip condition.
         if let Some(target) = args.target_free
-            && let Ok(stats) = collector.collect(&candidate.path)
-            && stats.free_pct() >= target
+            && let Some(reason) = target_free_skip(&collector, &candidate.path, target)
         {
             println!(
-                "  Target free space ({target:.1}%) achieved on {}. Skipping.",
-                stats.mount_point.display()
+                "  Skipping {}: {}.",
+                candidate.path.display(),
+                reason.explanation()
             );
-            skips.record(storage_ballast_helper::scanner::deletion::SkipReason::TargetFreeReached);
+            skips.record(reason);
             continue;
         }
 
@@ -15911,7 +16154,28 @@ fn print_clean_summary(report: &storage_ballast_helper::scanner::deletion::Delet
 }
 
 /// Emit the clean report in JSON format.
-fn emit_clean_report_json(
+fn emit_filesystem_clean_report_json(
+    plan: &DeletionPlan,
+    report: &storage_ballast_helper::scanner::deletion::DeletionReport,
+    dir_count: usize,
+    scan_elapsed: std::time::Duration,
+    protected_count: usize,
+    batch_plan: &CliCleanupPlan,
+) -> Result<(), CliError> {
+    let mut payload = clean_report_payload(
+        plan,
+        report,
+        dir_count,
+        scan_elapsed,
+        protected_count,
+        "clean",
+        Some(&batch_plan.summary),
+    );
+    payload["plans_by_mount"] = json!(&batch_plan.filesystems);
+    write_json_line(&payload)
+}
+
+fn clean_report_payload(
     plan: &DeletionPlan,
     report: &storage_ballast_helper::scanner::deletion::DeletionReport,
     dir_count: usize,
@@ -15919,7 +16183,7 @@ fn emit_clean_report_json(
     protected_count: usize,
     command: &str,
     batch_plan: Option<&BatchPlan>,
-) -> Result<(), CliError> {
+) -> Value {
     let errors: Vec<Value> = report
         .errors
         .iter()
@@ -15949,7 +16213,7 @@ fn emit_clean_report_json(
         })
         .collect();
 
-    let payload = json!({
+    json!({
         "command": command,
         "scanned_directories": dir_count,
         "elapsed_seconds": scan_elapsed.as_secs_f64(),
@@ -15975,8 +16239,7 @@ fn emit_clean_report_json(
         // reads as "sbh is broken" and previously carried no explanation.
         "stalled": report.stalled(),
         "errors": errors,
-    });
-    write_json_line(&payload)
+    })
 }
 
 #[allow(
@@ -16956,8 +17219,283 @@ fn parse_decimal_byte_count(number: &str, multiplier: u64) -> std::result::Resul
     u64::try_from(total).map_err(|_| "byte count is too large".to_string())
 }
 
+#[derive(Default)]
+struct EmergencyQuarantineReport {
+    candidates_count: usize,
+    removals: Vec<Value>,
+    bytes_freed: u64,
+    metadata_only_entries: usize,
+    skips: InteractiveSkips,
+    errors: Vec<DeletionError>,
+    deferred_entries: usize,
+    budget_exhausted: bool,
+    unfinished: bool,
+    duration: Duration,
+}
+
+impl EmergencyQuarantineReport {
+    fn merge_into(&self, report: &mut DeletionReport) {
+        report.items_deleted = report.items_deleted.saturating_add(self.removals.len());
+        report.bytes_freed = report.bytes_freed.saturating_add(self.bytes_freed);
+        // Quarantine manifests supply estimates, never an observed capacity gain.
+        if !self.removals.is_empty() {
+            report.bytes_freed_observed = None;
+        }
+        report.items_skipped = report.items_skipped.saturating_add(self.skips.total);
+        for (&reason, &count) in &self.skips.by_reason {
+            let total = report.skipped_by_reason.entry(reason).or_default();
+            *total = total.saturating_add(count);
+        }
+        report.items_failed = report.items_failed.saturating_add(self.errors.len());
+        report.errors.extend(self.errors.iter().cloned());
+        report.duration = report.duration.saturating_add(self.duration);
+    }
+
+    fn payload(&self) -> Value {
+        json!({
+            "candidates_count": self.candidates_count,
+            "items_deleted": self.removals.len(),
+            "bytes_freed": self.bytes_freed,
+            "bytes_basis": "decision_estimate",
+            "removals": self.removals,
+            "metadata_only_entries": self.metadata_only_entries,
+            "items_skipped": self.skips.total,
+            "items_failed": self.errors.len(),
+            "deferred_entries": self.deferred_entries,
+            "budget_exhausted": self.budget_exhausted,
+            "unfinished": self.unfinished,
+        })
+    }
+}
+
+fn require_emergency_authorization(yes: bool, interactive: bool) -> Result<(), CliError> {
+    if !yes && !interactive {
+        return Err(CliError::User(
+            "emergency mode in non-interactive context requires --yes flag".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn confirm_emergency_quarantine(
+    root: &Path,
+    records: &[QuarantineRecord],
+    input: &mut impl io::BufRead,
+    output: &mut impl Write,
+) -> Result<bool, CliError> {
+    let bytes = records
+        .iter()
+        .map(|record| record.size_bytes)
+        .fold(0u64, u64::saturating_add);
+    writeln!(
+        output,
+        "Permanently remove {} quarantined item(s), estimated {}, under {}? These undo copies cannot be restored afterward. [y/N]",
+        records.len(),
+        format_bytes(bytes),
+        root.display(),
+    )?;
+    output.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// A prompt authorizes only the identities it described. Our own purge may
+/// advance recovery_state, but a newly quarantined or replaced entry is not
+/// covered by the previous answer.
+fn confirmed_quarantine_record(reviewed: &QuarantineRecord, fresh: &QuarantineRecord) -> bool {
+    reviewed.decision_id == fresh.decision_id
+        && reviewed.original_path == fresh.original_path
+        && reviewed.quarantine_path == fresh.quarantine_path
+        && reviewed.device_id == fresh.device_id
+        && reviewed.inode == fresh.inode
+        && reviewed.size_bytes == fresh.size_bytes
+        && reviewed.quarantined_at == fresh.quarantined_at
+        && reviewed.expires_at == fresh.expires_at
+        && reviewed.decision == fresh.decision
+}
+
+#[allow(clippy::too_many_lines)]
+fn drain_emergency_quarantine(
+    roots: &[PathBuf],
+    args: &EmergencyArgs,
+    ledger: &Path,
+    collector: &FsStatsCollector,
+    mut confirm: impl FnMut(&Path, &[QuarantineRecord]) -> Result<bool, CliError>,
+) -> Result<EmergencyQuarantineReport, CliError> {
+    let started = std::time::Instant::now();
+    let mut report = EmergencyQuarantineReport::default();
+    let mut seen = HashSet::new();
+    for root in roots.iter().filter(|root| seen.insert((*root).clone())) {
+        let store = QuarantineStore::under(root);
+        let records = match store.records() {
+            Ok(records) => records,
+            Err(error) => {
+                report.errors.push(DeletionError {
+                    path: store.root().to_path_buf(),
+                    error: error.to_string(),
+                    error_code: error.code().to_string(),
+                    recoverable: error.is_retryable(),
+                });
+                continue;
+            }
+        };
+        report.candidates_count = report.candidates_count.saturating_add(records.len());
+        if records.is_empty() {
+            continue;
+        }
+        if let Some(reason) = target_free_skip(collector, root, args.target_free) {
+            for _ in &records {
+                report.skips.record(reason);
+            }
+            report.unfinished |= reason != SkipReason::TargetFreeReached;
+            continue;
+        }
+        if !args.yes && !confirm(root, &records)? {
+            for _ in &records {
+                report.skips.record(SkipReason::UserDeclined);
+            }
+            continue;
+        }
+        let approved: std::collections::HashMap<_, _> = records
+            .into_iter()
+            .map(|record| (record.decision_id.clone(), record))
+            .collect();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut pressure_hold = None;
+        let outcome = store.sweep_with_pressure_filter(
+            now,
+            SweepMode::Pressure,
+            |fresh| {
+                approved
+                    .get(&fresh.decision_id)
+                    .is_some_and(|reviewed| confirmed_quarantine_record(reviewed, fresh))
+            },
+            |_| {
+                pressure_hold = target_free_skip(collector, root, args.target_free);
+                pressure_hold.is_none()
+            },
+        );
+        match outcome {
+            Ok(outcome) => {
+                let drained = outcome.drained;
+                report.metadata_only_entries = report
+                    .metadata_only_entries
+                    .saturating_add(drained.entries.saturating_sub(drained.completed.len()));
+                for completion in &drained.completed {
+                    report.bytes_freed = report
+                        .bytes_freed
+                        .saturating_add(completion.record.size_bytes);
+                    report.removals.push(json!({
+                        "decision_id": completion.record.decision_id,
+                        "path": completion.record.original_path.to_string_lossy(),
+                        "size_bytes": completion.record.size_bytes,
+                    }));
+                }
+                report.deferred_entries = report
+                    .deferred_entries
+                    .saturating_add(drained.deferred_entries);
+                report.budget_exhausted |= drained.budget_exhausted;
+                report.unfinished |= drained.budget_exhausted
+                    || (drained.deferred_entries > 0
+                        && pressure_hold != Some(SkipReason::TargetFreeReached));
+                report
+                    .errors
+                    .extend(drained.failures.into_iter().map(|failure| DeletionError {
+                        path: failure.path,
+                        error: failure.error,
+                        error_code: failure.code,
+                        recoverable: true,
+                    }));
+                // Preserve the emergency contract: no ledger is opened until
+                // a payload was actually removed, and receipt failure is advisory.
+                record_quarantine_completions(ledger, drained.completed);
+            }
+            Err(error) => report.errors.push(DeletionError {
+                path: store.root().to_path_buf(),
+                error: error.to_string(),
+                error_code: error.code().to_string(),
+                recoverable: error.is_retryable(),
+            }),
+        }
+    }
+    report.duration = started.elapsed();
+    Ok(report)
+}
+
+/// Obtain the executor's report defaults without a process sweep or mutation.
+fn empty_emergency_report() -> DeletionReport {
+    let executor = DeletionExecutor::new(
+        DeletionConfig {
+            check_open_files: false,
+            ..DeletionConfig::default()
+        },
+        None,
+    );
+    executor.execute(&executor.plan(Vec::new()), None)
+}
+
+fn finish_emergency_report(
+    cli: &Cli,
+    plan: &DeletionPlan,
+    mut report: DeletionReport,
+    quarantine: &EmergencyQuarantineReport,
+    dir_count: usize,
+    scan_elapsed: Duration,
+) -> Result<(), CliError> {
+    quarantine.merge_into(&mut report);
+    match output_mode(cli) {
+        OutputMode::Human => {
+            print_clean_summary(&report);
+            if !quarantine.removals.is_empty() {
+                println!(
+                    "  Includes {} permanently removed quarantine item(s), estimated {}.",
+                    quarantine.removals.len(),
+                    format_bytes(quarantine.bytes_freed),
+                );
+            }
+            if quarantine.unfinished {
+                println!(
+                    "  Quarantine work remains; rerun emergency recovery to continue the bounded drain."
+                );
+            }
+        }
+        OutputMode::Json => {
+            let mut payload =
+                clean_report_payload(plan, &report, dir_count, scan_elapsed, 0, "emergency", None);
+            payload["quarantine_drain"] = quarantine.payload();
+            write_json_line(&payload)?;
+        }
+    }
+    if report.items_failed > 0 {
+        return Err(CliError::Partial(format!(
+            "{} emergency removal(s) failed; {} completed",
+            report.items_failed, report.items_deleted,
+        )));
+    }
+    if quarantine.unfinished {
+        return Err(CliError::Partial(
+            "quarantine recovery is incomplete; rerun to continue".to_string(),
+        ));
+    }
+    if report.items_deleted == 0 && report.skipped_by_reason.contains_key("user_declined") {
+        return Err(CliError::User(
+            "user cancelled — no items deleted".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
+    // This must precede every mutation, including permanent quarantine purge.
+    require_emergency_authorization(args.yes, io::stdout().is_terminal())?;
     let start = std::time::Instant::now();
 
     // Use defaults only — no config file or pre-cleanup ledger writes.
@@ -16989,38 +17527,24 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         return Err(CliError::User("no valid scan paths found".to_string()));
     }
 
-    // Layer 7: the quarantine is already-decided space. On a critically
-    // full disk it goes first, before anything is scanned or scored.
-    for root in &root_paths {
-        match QuarantineStore::under(root).drain_all() {
-            Ok(drained) => {
-                if drained.entries > 0 {
-                    eprintln!(
-                        "[SBH-EMERGENCY] drained {} quarantined entr{} ({}) under {}",
-                        drained.entries,
-                        if drained.entries == 1 { "y" } else { "ies" },
-                        format_bytes(drained.bytes),
-                        root.display()
-                    );
-                }
-                // In emergency the entries that would not go are exactly the
-                // ones worth naming: the operator is standing at a full disk.
-                for failure in &drained.failures {
-                    eprintln!(
-                        "[SBH-EMERGENCY] quarantine entry {} will not unlink: {} ({})",
-                        failure.decision_id,
-                        failure.error,
-                        failure.path.display()
-                    );
-                }
-                record_quarantine_completions(&config.paths.sqlite_db, drained.completed);
-            }
-            Err(e) => eprintln!(
-                "[SBH-EMERGENCY] quarantine under {} not drained: {e}",
-                root.display()
-            ),
-        }
-    }
+    // Quarantine goes first, but a reversible cleanup decision is not consent
+    // to discard its undo copy. Authorize the reviewed entries before purging.
+    let platform = detect_platform().map_err(|error| CliError::Runtime(error.to_string()))?;
+    let collector = std::sync::Arc::new(FsStatsCollector::new(platform, Duration::ZERO));
+    let quarantine = drain_emergency_quarantine(
+        &root_paths,
+        args,
+        &config.paths.sqlite_db,
+        &collector,
+        |root, records| {
+            confirm_emergency_quarantine(
+                root,
+                records,
+                &mut io::stdin().lock(),
+                &mut io::stderr().lock(),
+            )
+        },
+    )?;
 
     // Marker-only protection: honors .sbh-protect files on disk, no config patterns.
     let protection = ProtectionRegistry::marker_only();
@@ -17139,38 +17663,23 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     let plan = executor.plan(scored);
 
     if plan.candidates.is_empty() {
-        match output_mode(cli) {
-            OutputMode::Human => {
-                println!(
-                    "Emergency scan: scanned {} directories in {:.1}s — no cleanup candidates found.",
-                    dir_count,
-                    scan_elapsed.as_secs_f64(),
-                );
-                eprintln!(
-                    "Config-level protections are not active in emergency mode. Only .sbh-protect marker files are honored."
-                );
-            }
-            OutputMode::Json => {
-                // Same key set as every other clean/emergency payload so a
-                // parser never has to special-case the no-candidate path.
-                let payload = json!({
-                    "command": "emergency",
-                    "scanned_directories": dir_count,
-                    "elapsed_seconds": scan_elapsed.as_secs_f64(),
-                    "candidates_count": 0,
-                    "items_deleted": 0,
-                    "items_skipped": 0,
-                    "items_failed": 0,
-                    "bytes_freed": 0,
-                    "dry_run": false,
-                    "skipped_by_reason": json!({}),
-                    "stalled": false,
-                });
-                write_json_line(&payload)?;
-            }
+        if output_mode(cli) == OutputMode::Human {
+            println!(
+                "Emergency scan: scanned {dir_count} directories in {:.1}s — no cleanup candidates found.",
+                scan_elapsed.as_secs_f64(),
+            );
+            eprintln!(
+                "Config-level protections are not active in emergency mode. Only .sbh-protect marker files are honored."
+            );
         }
-        // C-EXIT: nothing to reclaim is a successful outcome, as for `clean`.
-        return Ok(());
+        return finish_emergency_report(
+            cli,
+            &plan,
+            empty_emergency_report(),
+            &quarantine,
+            dir_count,
+            scan_elapsed,
+        );
     }
 
     // Display candidates: the report goes to stdout, the mode banner and
@@ -17198,64 +17707,19 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         println!();
     }
 
-    // Execute based on flags.
-    // Non-interactive (piped/cron) MUST pass --yes explicitly to avoid silent mass-deletion.
-    if !args.yes && !io::stdout().is_terminal() {
-        return Err(CliError::User(
-            "emergency mode in non-interactive context requires --yes flag".to_string(),
-        ));
-    }
-    if args.yes {
-        let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
-        let collector = std::sync::Arc::new(FsStatsCollector::new(
-            platform,
-            std::time::Duration::from_millis(500),
-        ));
+    let report = if args.yes {
         let pressure_check = build_pressure_check(Some(args.target_free), collector);
-        let report = executor.execute(&plan, pressure_check.as_ref().map(|f| f as SkipCheck));
-
-        match output_mode(cli) {
-            OutputMode::Human => {
-                print_clean_summary(&report);
-                eprintln!(
-                    "\nConsider installing sbh for ongoing protection: {}",
-                    ongoing_protection_install_hint()
-                );
-            }
-            OutputMode::Json => {
-                emit_clean_report_json(
-                    &plan,
-                    &report,
-                    dir_count,
-                    scan_elapsed,
-                    0,
-                    "emergency",
-                    None,
-                )?;
-            }
-        }
-        // C-EXIT: failed deletions are a partial success (4).
-        if report.items_failed > 0 {
-            return Err(CliError::Partial(format!(
-                "{} of {} deletion(s) failed",
-                report.items_failed,
-                report.items_failed + report.items_deleted
-            )));
-        }
+        executor.execute(&plan, pressure_check.as_ref().map(|f| f as SkipCheck))
     } else {
-        // Interactive emergency cleanup.
-        run_interactive_emergency(
-            cli,
-            &executor,
-            &plan,
-            args,
-            &root_paths,
-            dir_count,
-            scan_elapsed,
-        )?;
+        run_interactive_emergency(&executor, &plan, args, &collector, &mut io::stdin().lock())?
+    };
+    if output_mode(cli) == OutputMode::Human {
+        eprintln!(
+            "\nConsider installing sbh for ongoing protection: {}",
+            ongoing_protection_install_hint()
+        );
     }
-
-    Ok(())
+    finish_emergency_report(cli, &plan, report, &quarantine, dir_count, scan_elapsed)
 }
 
 fn ongoing_protection_install_hint() -> &'static str {
@@ -17265,37 +17729,30 @@ fn ongoing_protection_install_hint() -> &'static str {
 /// Interactive emergency cleanup — like interactive clean but with emergency messaging.
 #[allow(clippy::too_many_lines)]
 fn run_interactive_emergency(
-    cli: &Cli,
     executor: &DeletionExecutor,
     plan: &DeletionPlan,
     args: &EmergencyArgs,
-    _root_paths: &[PathBuf],
-    dir_count: usize,
-    scan_elapsed: std::time::Duration,
-) -> Result<(), CliError> {
-    let stdin = io::stdin();
-    let mut input = String::new();
-    let mut items_deleted: usize = 0;
+    collector: &FsStatsCollector,
+    input: &mut impl io::BufRead,
+) -> Result<DeletionReport, CliError> {
+    let mut answer = String::new();
+    let mut report = empty_emergency_report();
     let mut skips = InteractiveSkips::default();
-    let mut bytes_freed: u64 = 0;
-    let mut bytes_quarantined: u64 = 0;
     let mut delete_all = false;
-
-    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
-    let collector = FsStatsCollector::new(platform, std::time::Duration::from_millis(500));
+    let started = std::time::Instant::now();
 
     eprintln!("Proceed with deletion? [y/N/a(ll)/s(kip)/q(uit)]");
 
     for (i, candidate) in plan.candidates.iter().enumerate() {
-        // Check target_free stop condition using the candidate's actual mount point.
-        if let Ok(stats) = collector.collect(&candidate.path)
-            && stats.free_pct() >= args.target_free
-        {
+        // One satisfied filesystem must not suppress later pressured mounts.
+        if let Some(reason) = target_free_skip(collector, &candidate.path, args.target_free) {
             eprintln!(
-                "  Target free space ({:.1}%) achieved. Stopping.",
-                args.target_free,
+                "  Skipping {}: {}.",
+                candidate.path.display(),
+                reason.explanation(),
             );
-            break;
+            skips.record(reason);
+            continue;
         }
 
         let action = if delete_all {
@@ -17313,11 +17770,11 @@ fn run_interactive_emergency(
             );
             io::stderr().flush()?;
 
-            input.clear();
-            stdin
-                .read_line(&mut input)
+            answer.clear();
+            input
+                .read_line(&mut answer)
                 .map_err(|e| CliError::Runtime(e.to_string()))?;
-            match input.trim().to_lowercase().as_str() {
+            match answer.trim().to_lowercase().as_str() {
                 "y" | "yes" => 'y',
                 "a" | "all" => {
                     delete_all = true;
@@ -17325,10 +17782,16 @@ fn run_interactive_emergency(
                 }
                 "s" | "skip" => {
                     eprintln!("  Skipping all remaining items.");
+                    for _ in i..plan.candidates.len() {
+                        skips.record(SkipReason::UserDeclined);
+                    }
                     break;
                 }
                 "q" | "quit" => {
                     eprintln!("  Quitting.");
+                    for _ in i..plan.candidates.len() {
+                        skips.record(SkipReason::UserDeclined);
+                    }
                     break;
                 }
                 _ => 'n',
@@ -17361,15 +17824,20 @@ fn run_interactive_emergency(
             } else {
                 match executor.delete_candidate_checked(candidate, Some(&fresh_open_paths)) {
                     Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Deleted) => {
-                        items_deleted += 1;
-                        bytes_freed += candidate.size_bytes;
+                        report.items_deleted += 1;
+                        report.bytes_freed =
+                            report.bytes_freed.saturating_add(candidate.size_bytes);
+                        report.bytes_freed_observed = None;
                         if !delete_all {
                             eprintln!("    Deleted.");
                         }
                     }
                     Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Quarantined) => {
-                        items_deleted += 1;
-                        bytes_quarantined += candidate.size_bytes;
+                        report.items_deleted += 1;
+                        report.items_quarantined += 1;
+                        report.bytes_quarantined = report
+                            .bytes_quarantined
+                            .saturating_add(candidate.size_bytes);
                         if !delete_all {
                             eprintln!("    Quarantined (restore with `sbh undo`).");
                         }
@@ -17386,6 +17854,13 @@ fn run_interactive_emergency(
                     }
                     Err(e) => {
                         eprintln!("    Failed: {e}");
+                        report.items_failed += 1;
+                        report.errors.push(DeletionError {
+                            path: candidate.path.clone(),
+                            error: e.to_string(),
+                            error_code: e.code().to_string(),
+                            recoverable: e.is_retryable(),
+                        });
                     }
                 }
             }
@@ -17394,46 +17869,10 @@ fn run_interactive_emergency(
         }
     }
 
-    match output_mode(cli) {
-        OutputMode::Human => {
-            eprintln!("\nEmergency cleanup complete:");
-            eprintln!(
-                "  Deleted: {items_deleted} items, {} freed",
-                format_bytes(bytes_freed),
-            );
-            if skips.total > 0 {
-                eprintln!("  Skipped: {} items", skips.total);
-            }
-            eprintln!(
-                "\nConsider installing sbh for ongoing protection: {}",
-                ongoing_protection_install_hint()
-            );
-        }
-        OutputMode::Json => {
-            let payload = json!({
-                "command": "emergency",
-                "scanned_directories": dir_count,
-                "elapsed_seconds": scan_elapsed.as_secs_f64(),
-                "candidates_count": plan.estimated_items,
-                "items_deleted": items_deleted,
-                "bytes_quarantined": bytes_quarantined,
-                "items_skipped": skips.total,
-                "skipped_by_reason": skips_json(&skips.by_reason),
-                // Mirrors DeletionReport::stalled(): work was queued, nothing freed.
-                "stalled": items_deleted == 0 && bytes_freed == 0 && skips.total > 0,
-                "bytes_freed": bytes_freed,
-            });
-            write_json_line(&payload)?;
-        }
-    }
-
-    if items_deleted == 0 {
-        return Err(CliError::User(
-            "user cancelled — no items deleted".to_string(),
-        ));
-    }
-
-    Ok(())
+    report.items_skipped = skips.total;
+    report.skipped_by_reason = skips.by_reason;
+    report.duration = started.elapsed();
+    Ok(report)
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -20433,6 +20872,321 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cli_filesystem_plan_keeps_targets_on_the_filesystem_that_needs_space() {
+        let config = Config::default();
+        let roots = vec![PathBuf::from("/healthy"), PathBuf::from("/full")];
+        let candidates = vec![
+            cli_filesystem_candidate("/healthy/large", 1, 1, 1000),
+            cli_filesystem_candidate("/full/a", 2, 1, 70),
+            cli_filesystem_candidate("/full/b", 2, 2, 70),
+        ];
+        let capacities = [("/healthy", 1, 800), ("/full", 2, 100)];
+        let run = |roots: &[PathBuf]| {
+            plan_cli_cleanup_with(&config, roots, candidates.clone(), Some(20.0), 2, |path| {
+                cli_filesystem_observation(path, &candidates, &capacities)
+            })
+            .unwrap()
+        };
+        let (chosen, plan) = run(&roots);
+        assert_eq!(chosen.len(), 2);
+        assert!(
+            chosen
+                .iter()
+                .all(|candidate| candidate.path.starts_with("/full"))
+        );
+        assert_eq!(plan.summary.target_bytes, Some(100));
+        assert_eq!(plan.summary.planned_bytes, 140);
+        assert!(plan.summary.target_met);
+        assert_eq!(
+            plan.filesystems
+                .iter()
+                .find(|entry| entry.device_id == 1)
+                .unwrap()
+                .plan
+                .target_bytes,
+            Some(0)
+        );
+        let reversed: Vec<_> = roots.into_iter().rev().collect();
+        let (reordered, _) = run(&reversed);
+        assert_eq!(
+            chosen
+                .iter()
+                .map(|candidate| &candidate.path)
+                .collect::<Vec<_>>(),
+            reordered
+                .iter()
+                .map(|candidate| &candidate.path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_filesystem_plan_reports_unmet_target_when_full_mount_has_no_candidates() {
+        let config = Config::default();
+        let candidates = vec![cli_filesystem_candidate("/healthy/large", 1, 1, 1000)];
+        let (chosen, plan) = plan_cli_cleanup_with(
+            &config,
+            &[PathBuf::from("/healthy"), PathBuf::from("/full")],
+            candidates.clone(),
+            Some(20.0),
+            10,
+            |path| {
+                cli_filesystem_observation(
+                    path,
+                    &candidates,
+                    &[("/healthy", 1, 800), ("/full", 2, 10)],
+                )
+            },
+        )
+        .unwrap();
+        assert!(chosen.is_empty());
+        assert_eq!(plan.summary.target_bytes, Some(190));
+        assert_eq!(plan.summary.planned_bytes, 0);
+        assert!(!plan.summary.target_met);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_filesystem_plan_aliases_share_one_target_and_risk_budget() {
+        let config = Config::default();
+        let candidates = vec![
+            cli_filesystem_candidate("/data/a", 7, 1, 110),
+            cli_filesystem_candidate("/bind/a", 7, 1, 110),
+            cli_filesystem_candidate("/bind/b", 7, 2, 110),
+        ];
+        let (chosen, plan) = plan_cli_cleanup_with(
+            &config,
+            &[PathBuf::from("/data"), PathBuf::from("/bind")],
+            candidates.clone(),
+            Some(20.0),
+            10,
+            |path| {
+                cli_filesystem_observation(
+                    path,
+                    &candidates,
+                    &[("/data", 7, 100), ("/bind", 7, 100)],
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(plan.filesystems.len(), 1);
+        assert_eq!(plan.filesystems[0].mounts.len(), 2);
+        assert_eq!(plan.summary.target_bytes, Some(100));
+        assert_eq!(plan.summary.planned_bytes, 110);
+        assert!(plan.summary.target_met);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_filesystem_plan_separates_apfs_volumes_with_shared_device_numbers() {
+        let config = Config::default();
+        let candidates = vec![
+            cli_filesystem_candidate("/Volumes/Healthy/large", 7, 1, 1000),
+            cli_filesystem_candidate("/Volumes/Full/a", 7, 2, 70),
+            cli_filesystem_candidate("/Volumes/Full/b", 7, 3, 70),
+        ];
+        let (chosen, plan) = plan_cli_cleanup_with(
+            &config,
+            &[
+                PathBuf::from("/Volumes/Healthy"),
+                PathBuf::from("/Volumes/Full"),
+            ],
+            candidates.clone(),
+            Some(20.0),
+            2,
+            |path| {
+                let (identity, mut stats) = cli_filesystem_observation(
+                    path,
+                    &candidates,
+                    &[("/Volumes/Healthy", 7, 800), ("/Volumes/Full", 7, 100)],
+                )?;
+                stats.fs_type = "apfs".to_string();
+                Ok((identity, stats))
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.filesystems.len(), 2);
+        assert_eq!(chosen.len(), 2);
+        assert!(
+            chosen
+                .iter()
+                .all(|candidate| candidate.path.starts_with("/Volumes/Full"))
+        );
+        assert_eq!(plan.summary.target_bytes, Some(100));
+        assert_eq!(plan.summary.planned_bytes, 140);
+        assert!(plan.summary.target_met);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_filesystem_plan_uses_local_risk_and_one_command_item_limit() {
+        let mut config = Config::default();
+        config.scoring.batch_risk_budget_by_level.green = 0.01;
+        let candidates = vec![
+            cli_filesystem_candidate("/healthy/huge", 1, 1, 1000),
+            cli_filesystem_candidate("/full/a", 2, 1, 10),
+            cli_filesystem_candidate("/full/b", 2, 2, 10),
+        ];
+        let (chosen, plan) = plan_cli_cleanup_with(
+            &config,
+            &[PathBuf::from("/healthy"), PathBuf::from("/full")],
+            candidates.clone(),
+            None,
+            1,
+            |path| {
+                cli_filesystem_observation(
+                    path,
+                    &candidates,
+                    &[("/healthy", 1, 800), ("/full", 2, 1)],
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(chosen.len(), 1);
+        assert!(chosen[0].path.starts_with("/full"));
+        let healthy = &plan
+            .filesystems
+            .iter()
+            .find(|entry| entry.device_id == 1)
+            .unwrap()
+            .plan;
+        assert_eq!(healthy.level, "green");
+        assert_eq!(healthy.risk_budget, Some(0.5));
+        assert!(healthy.chosen.is_empty());
+        assert_eq!(plan.summary.chosen.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_filesystem_plan_refuses_unknown_or_replaced_ownership() {
+        let config = Config::default();
+        let candidates = vec![cli_filesystem_candidate("/full/a", 2, 1, 100)];
+        let result = plan_cli_cleanup_with(
+            &config,
+            &[PathBuf::from("/full")],
+            candidates.clone(),
+            Some(20.0),
+            1,
+            |path| {
+                let (mut identity, stats) =
+                    cli_filesystem_observation(path, &candidates, &[("/full", 2, 1)])?;
+                if path.ends_with("a") {
+                    identity.inode += 1;
+                }
+                Ok((identity, stats))
+            },
+        );
+        assert!(
+            matches!(result, Err(CliError::Runtime(message)) if message.contains("identity changed"))
+        );
+        for target in [None, Some(20.0)] {
+            let unavailable = plan_cli_cleanup_with(
+                &config,
+                &[PathBuf::from("/full")],
+                candidates.clone(),
+                target,
+                1,
+                |path| {
+                    let (identity, mut stats) =
+                        cli_filesystem_observation(path, &candidates, &[("/full", 2, 0)])?;
+                    stats.total_bytes = 0;
+                    Ok((identity, stats))
+                },
+            );
+            assert!(
+                matches!(unavailable, Err(CliError::Runtime(message)) if message.contains("capacity is unavailable"))
+            );
+        }
+        let missing = plan_cli_cleanup_with(
+            &config,
+            &[PathBuf::from("/full")],
+            candidates,
+            Some(20.0),
+            1,
+            |_| Err(CliError::Runtime("capacity unavailable".to_string())),
+        );
+        assert!(matches!(missing, Err(CliError::Runtime(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_filesystem_plan_preserves_vetoes_and_cross_mount_disjointness() {
+        let config = Config::default();
+        let mut protected = cli_filesystem_candidate("/data/protected/held", 1, 4, 100);
+        protected.vetoed = true;
+        let candidates = vec![
+            cli_filesystem_candidate("/data/parent", 1, 1, 1000),
+            cli_filesystem_candidate("/data/parent/nested/cache", 2, 2, 1000),
+            cli_filesystem_candidate("/data/protected", 1, 3, 1000),
+            protected,
+        ];
+        let (chosen, _) = plan_cli_cleanup_with(
+            &config,
+            &[PathBuf::from("/data")],
+            candidates.clone(),
+            None,
+            10,
+            |path| {
+                cli_filesystem_observation(
+                    path,
+                    &candidates,
+                    &[("/data", 1, 100), ("/data/parent/nested", 2, 1)],
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].path, Path::new("/data/parent/nested/cache"));
+    }
+
+    #[cfg(unix)]
+    fn cli_filesystem_candidate(path: &str, device: u64, inode: u64, bytes: u64) -> CandidacyScore {
+        let directory = tempfile::tempdir().unwrap();
+        let mut score = clean_receipt_candidate(directory.path());
+        score.path = PathBuf::from(path);
+        score.identity.as_mut().unwrap().device_id = device;
+        score.identity.as_mut().unwrap().inode = inode;
+        score.size_bytes = bytes;
+        score
+    }
+
+    #[cfg(unix)]
+    fn cli_filesystem_observation(
+        path: &Path,
+        candidates: &[CandidacyScore],
+        capacities: &[(&str, u64, u64)],
+    ) -> Result<(FsIdentity, FsStats), CliError> {
+        let (mount, device, available) = capacities
+            .iter()
+            .filter(|(mount, _, _)| path.starts_with(mount))
+            .max_by_key(|(mount, _, _)| mount.len())
+            .ok_or_else(|| CliError::Runtime("missing fixture filesystem".to_string()))?;
+        let identity = candidates
+            .iter()
+            .find(|candidate| candidate.path == path)
+            .and_then(|candidate| candidate.identity)
+            .unwrap_or(FsIdentity {
+                device_id: *device,
+                inode: 0,
+                kind: storage_ballast_helper::scanner::walker::FsEntryKind::Directory,
+            });
+        Ok((
+            identity,
+            FsStats {
+                total_bytes: 1000,
+                available_bytes: *available,
+                free_bytes: *available,
+                fs_type: "ext4".to_string(),
+                mount_point: PathBuf::from(mount),
+                is_readonly: false,
+            },
+        ))
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn clean_receipts_persist_batch_and_checked_mutations_with_their_reversibility() {
         use storage_ballast_helper::scanner::deletion::CheckedDeletion;
 
@@ -20584,6 +21338,271 @@ mod tests {
         assert_eq!(report.items_failed, 0);
         assert!(!target.exists());
         assert!(report.backoff_candidates.is_empty());
+    }
+
+    #[cfg(unix)]
+    fn emergency_test_collector(mounts: &[(&Path, u64)]) -> FsStatsCollector {
+        let inventory = mounts
+            .iter()
+            .map(|(path, _)| MountPoint {
+                path: (*path).to_path_buf(),
+                device: path.display().to_string(),
+                fs_type: "ext4".into(),
+                is_ram_backed: false,
+            })
+            .collect();
+        let stats = mounts
+            .iter()
+            .map(|(path, free)| {
+                (
+                    (*path).to_path_buf(),
+                    FsStats {
+                        total_bytes: 1000,
+                        free_bytes: *free,
+                        available_bytes: *free,
+                        fs_type: "ext4".into(),
+                        mount_point: (*path).to_path_buf(),
+                        is_readonly: false,
+                    },
+                )
+            })
+            .collect();
+        FsStatsCollector::new(
+            std::sync::Arc::new(MockPlatform::new(
+                inventory,
+                stats,
+                MockPlatform::healthy().memory_info().unwrap(),
+                PlatformPaths::default(),
+            )),
+            Duration::ZERO,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emergency_quarantine_requires_consent_and_preserves_declined_undo_copies() {
+        assert!(require_emergency_authorization(false, false).is_err());
+        for answer in ["", "\n", "no\n", "quit\n"] {
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let (store, _) = undo_fixture(&root, "held", RecoveryState::Intact);
+            let record = store.record("held").unwrap().unwrap();
+            let ledger = root.join("activity.sqlite3");
+            let collector = emergency_test_collector(&[(&root, 50)]);
+            let mut input = io::Cursor::new(answer);
+            let mut prompt = Vec::new();
+            let report = drain_emergency_quarantine(
+                std::slice::from_ref(&root),
+                &EmergencyArgs::default(),
+                &ledger,
+                &collector,
+                |root, records| {
+                    confirm_emergency_quarantine(root, records, &mut input, &mut prompt)
+                },
+            )
+            .unwrap();
+            assert!(report.removals.is_empty());
+            assert_eq!(report.skips.by_reason.get("user_declined"), Some(&1));
+            assert_eq!(store.record("held").unwrap().unwrap(), record);
+            assert_eq!(
+                std::fs::read(record.quarantine_path.join("a.o")).unwrap(),
+                b"obj"
+            );
+            assert!(
+                !ledger.exists(),
+                "declining must not open the receipt ledger"
+            );
+            let prompt = String::from_utf8(prompt).unwrap();
+            assert!(prompt.contains("1 quarantined item(s)"));
+            assert!(prompt.contains("cannot be restored"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emergency_quarantine_unknown_capacity_cannot_authorize_removal() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (store, _) = undo_fixture(&root, "held", RecoveryState::Intact);
+        let record = store.record("held").unwrap().unwrap();
+        let ledger = root.join("activity.sqlite3");
+        let collector = emergency_test_collector(&[]);
+        let args = EmergencyArgs {
+            yes: true,
+            ..EmergencyArgs::default()
+        };
+        let quarantine = drain_emergency_quarantine(
+            std::slice::from_ref(&root),
+            &args,
+            &ledger,
+            &collector,
+            |_, _| panic!("unavailable pressure must be held before prompting"),
+        )
+        .unwrap();
+        assert!(quarantine.removals.is_empty());
+        assert!(quarantine.unfinished);
+        assert_eq!(
+            quarantine.skips.by_reason.get("pressure_unavailable"),
+            Some(&1)
+        );
+        assert_eq!(store.record("held").unwrap().unwrap(), record);
+        assert_eq!(
+            std::fs::read(record.quarantine_path.join("a.o")).unwrap(),
+            b"obj"
+        );
+        assert!(!ledger.exists());
+
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let plan = executor.plan(vec![clean_receipt_candidate(&root)]);
+        assert_eq!(plan.candidates.len(), 1);
+        let mut input = io::Cursor::new("y\n");
+        let report =
+            run_interactive_emergency(&executor, &plan, &args, &collector, &mut input).unwrap();
+        assert_eq!(
+            report.skipped_by_reason.get("pressure_unavailable"),
+            Some(&1)
+        );
+        assert_eq!(input.position(), 0);
+        assert_eq!(report.items_deleted, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emergency_quarantine_confirmation_does_not_cover_later_entries() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (store, _) = undo_fixture(&root, "reviewed", RecoveryState::Intact);
+        let collector = emergency_test_collector(&[(&root, 50)]);
+        let report = drain_emergency_quarantine(
+            std::slice::from_ref(&root),
+            &EmergencyArgs::default(),
+            &root.join("activity.sqlite3"),
+            &collector,
+            |root, records| {
+                assert_eq!(records.len(), 1);
+                undo_fixture(root, "arrived-after-prompt", RecoveryState::Intact);
+                confirm_emergency_quarantine(
+                    root,
+                    records,
+                    &mut io::Cursor::new("yes\n"),
+                    &mut Vec::new(),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(report.removals.len(), 1);
+        assert_eq!(report.bytes_freed, 3);
+        assert!(store.record("reviewed").unwrap().is_none());
+        let remaining = store.record("arrived-after-prompt").unwrap().unwrap();
+        assert_eq!(remaining.recovery_state, RecoveryState::Intact);
+        assert_eq!(
+            std::fs::read(remaining.quarantine_path.join("a.o")).unwrap(),
+            b"obj"
+        );
+        assert!(report.unfinished);
+        assert_eq!(report.deferred_entries, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emergency_quarantine_counts_only_completed_removals_and_reports_failures() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (store, _) = undo_fixture(&root, "good", RecoveryState::Intact);
+        undo_fixture(&root, "absent", RecoveryState::Intact);
+        undo_fixture(&root, "replaced", RecoveryState::Intact);
+        let absent = store.record("absent").unwrap().unwrap();
+        std::fs::rename(&absent.quarantine_path, root.join("retained-absent")).unwrap();
+        let replaced = store.record("replaced").unwrap().unwrap();
+        let retained = root.join("retained-replaced");
+        std::fs::rename(&replaced.quarantine_path, &retained).unwrap();
+        symlink(&retained, &replaced.quarantine_path).unwrap();
+        let collector = emergency_test_collector(&[(&root, 50)]);
+        let report = drain_emergency_quarantine(
+            std::slice::from_ref(&root),
+            &EmergencyArgs {
+                yes: true,
+                ..EmergencyArgs::default()
+            },
+            &root.join("activity.sqlite3"),
+            &collector,
+            |_, _| panic!("--yes must not prompt"),
+        )
+        .unwrap();
+        assert_eq!(report.removals.len(), 1);
+        assert_eq!(report.bytes_freed, 3);
+        assert_eq!(report.metadata_only_entries, 1);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(std::fs::read(retained.join("a.o")).unwrap(), b"obj");
+        let mut total = empty_emergency_report();
+        report.merge_into(&mut total);
+        assert_eq!(total.items_deleted, 1);
+        assert_eq!(total.items_failed, 1);
+        assert_eq!(total.bytes_freed, 3);
+        assert_eq!(total.bytes_freed_observed, None);
+        assert!(!total.stalled());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emergency_quarantine_and_interactive_scan_continue_after_a_satisfied_mount() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let healthy = root.join("healthy");
+        let pressured = root.join("pressured");
+        std::fs::create_dir(&healthy).unwrap();
+        std::fs::create_dir(&pressured).unwrap();
+        let (healthy_store, _) = undo_fixture(&healthy, "keep", RecoveryState::Intact);
+        let (pressured_store, _) = undo_fixture(&pressured, "reclaim", RecoveryState::Intact);
+        let collector = emergency_test_collector(&[(&healthy, 500), (&pressured, 50)]);
+        let quarantine = drain_emergency_quarantine(
+            &[healthy.clone(), pressured.clone()],
+            &EmergencyArgs {
+                yes: true,
+                ..EmergencyArgs::default()
+            },
+            &root.join("activity.sqlite3"),
+            &collector,
+            |_, _| panic!("--yes must not prompt"),
+        )
+        .unwrap();
+        assert_eq!(quarantine.removals.len(), 1);
+        assert_eq!(
+            quarantine.skips.by_reason.get("target_free_reached"),
+            Some(&1)
+        );
+        assert!(healthy_store.record("keep").unwrap().is_some());
+        assert!(pressured_store.record("reclaim").unwrap().is_none());
+
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let mut plan = executor.plan(vec![
+            clean_receipt_candidate(&healthy),
+            clean_receipt_candidate(&pressured),
+        ]);
+        plan.candidates
+            .sort_by_key(|candidate| candidate.path != healthy);
+        assert_eq!(plan.candidates.len(), 2);
+        let mut input = io::Cursor::new("n\n");
+        let report = run_interactive_emergency(
+            &executor,
+            &plan,
+            &EmergencyArgs::default(),
+            &collector,
+            &mut input,
+        )
+        .unwrap();
+        assert_eq!(
+            input.position(),
+            2,
+            "the pressured mount must still reach its prompt"
+        );
+        assert_eq!(
+            report.skipped_by_reason.get("target_free_reached"),
+            Some(&1)
+        );
+        assert_eq!(report.skipped_by_reason.get("user_declined"), Some(&1));
+        assert_eq!(report.items_deleted, 0);
     }
 
     #[cfg(unix)]

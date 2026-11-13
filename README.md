@@ -1335,6 +1335,16 @@ When uncertainty is too high to decide, the artifact is placed in a **Review** c
 
 When a byte target is known (`sbh clean --target-free N`, or the bytes a pressured mount needs to return to Green), the executor no longer takes the top-N candidates by composite score. The batch planner (`src/scanner/planner.rs`) orders the approved candidates by expected reclaim per unit of expected loss (`(1 - posterior) * false_positive_loss`) and takes them while the level's batch size, the risk budget and the target allow, stopping as soon as the target is met: a 40 GiB candidate at posterior 0.85 comes before a 200 MiB one at 0.95. The risk budget is `scoring.batch_risk_budget_by_level` times one false-positive loss (Green 1x, Yellow 2x, Orange 5x, Red 10x, Critical unbounded). Review candidates are never planned outside `sbh emergency`, ties break on bytes then path so identical inputs plan identically, and every batch logs `[SBH-PLANNER] level=.. target_bytes=.. planned_bytes=.. risk_budget=.. risk_used=.. chosen=n skipped_for_budget=m top_n_risk=..` plus a `planner` activity event carrying the plan. `sbh clean --json` and `sbh scan --json` carry the plan as a `plan` block, and `sbh explain --id` quotes it: "chosen 1st: 40.0 GiB at posterior 0.85 (loss 7.5 of budget 250.0) because it reaches the target with 50% of the risk the top-scored set would use".
 
+Manual cleanup plans each physical filesystem independently. Free space on a
+healthy filesystem cannot satisfy another filesystem's target or consume its
+risk budget. Mount aliases share a target and budget, and `--max-items` remains
+a limit for the whole command, with pressured filesystems considered first.
+The JSON `plans_by_mount` array provides these individual plans beside the
+aggregate `plan`. Unknown or changed filesystem ownership refuses planning;
+if capacity becomes unavailable during target-driven execution, the affected
+candidate is held with `pressure_unavailable` until a later invocation can
+confirm its headroom.
+
 #### macOS Xcode DerivedData
 
 On macOS, `sbh` recognizes immediate children of `~/Library/Developer/Xcode/DerivedData/` as `xcode-derived-data` cleanup candidates. The DerivedData root itself is not deleted as one broad target; per-project subdirectories are ranked independently and still pass through age, active-file, parent, and sacred-overlap checks.
@@ -2251,6 +2261,16 @@ After a quarantine drain physically removes payloads and finalizes their recover
 The emergency command scans the specified paths, scores candidates using the standard multi-factor engine, and presents them for immediate deletion. With `--yes`, it executes deletions immediately without interactive confirmation, prioritizing the highest-scoring candidates until the target free space is reached or all candidates are exhausted. Because no config is read, `--min-age <MINUTES>` (default 5) is the only age floor: artifacts modified more recently are left alone, and `--min-age 0` reclaims fresh builds too. Every candidate is printed with its decision id (`id <hex>` in the plan, `candidates[].decision_id` in `--json`), the same id `sbh scan` and `sbh clean` would record, so a later `sbh explain --id` can be matched against what emergency acted on.
 
 **Emergency escalation:** unlike `sbh clean`, emergency mode also acts on candidates whose decision-theoretic outcome is `Review` (score cleared the threshold and nothing vetoed them, but the keep-vs-delete loss margin was too ambiguous for unattended deletion). `Review` means "a human should look" — in emergency mode the human *is* looking, via the interactive confirmation or an explicit `--yes`. Without this escalation, a candidate corpus that is 100% `Review` would make the last line of defence a silent no-op on a critically full disk. Unambiguous `Delete` decisions are still executed first; every hard safety rail (vetoes, sacred paths, `.sbh-protect` markers, and the `.git`/Cargo-manifest/source-tree/open-file/active-lease pre-flight checks) applies unchanged.
+
+Emergency confirmation also covers permanent removal of quarantined undo
+copies. Noninteractive use requires `--yes` before any drain; interactive use
+asks separately before removing the reviewed quarantine entries. Refusing
+that prompt preserves them. Draining honors the target on each filesystem and
+stops on missing capacity evidence. Completed removals contribute to the
+command's totals even when the later scan finds no candidates; JSON also
+reports the separate `quarantine_drain` outcome. Failed or unfinished drains
+produce a partial-success result, while a satisfied filesystem does not stop
+cleanup on other requested filesystems.
 
 Emergency recovery does not require a successful ledger write, so unavailable logging cannot prevent reclamation on a full disk.
 
