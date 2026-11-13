@@ -6,7 +6,35 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.7.13 **[release]**
+
+Compare: [`v0.7.12...v0.7.13`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.12...v0.7.13)
+
+Fixes from the v0.7.12 fleet rollout. Automatic cleanup, quarantine purges,
+compression and log truncation re-check live pressure and permission at each
+irreversible step instead of trusting an older scan. Slow discovery,
+quarantine, staging and notification I/O no longer stalls the pressure monitor.
+Inode and swap pressure are tracked as resources of their own and can start
+bounded reclaim. The daemon learns from cleanup done by other processes.
+`sbh doctor` and `sbh status` report missing service write grants and name the
+directory tree that is growing.
+
+Upgrade note: configuration validation is stricter. A config whose thresholds
+leave no reachable Green recovery boundary (for example `green_min_free_pct`
+of 99 or more with the default 1.0 hysteresis), or whose enabled prediction
+horizons are not finite, is now rejected when it loads, and the daemon will
+not start on it. After installing, run the new binary's `sbh config validate`
+on any host with a hand-edited config.
+
 ### Fixed
+
+- **`sbh check` says when it could not load the configuration.** `check`
+  gates builds, so a config it cannot load still does not fail the check. It
+  used to fall back to the default thresholds silently, so a rejected file
+  looked the same as no file at all. It now prints `sbh: warning: configuration
+  not loaded (<error>); check uses the default thresholds` on stderr. The exit
+  code still reflects pressure only, and a path that cannot be stat'ed is still
+  exit 2.
 
 - **Predictive warnings mature against their own filesystem and deadline.**
   A future warning no longer becomes a false alarm on the tick that issues it.
@@ -221,6 +249,18 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   ([#40](https://github.com/Dicklesworthstone/storage_ballast_helper/issues/40))
 
 ### Added
+
+- **`sbh status` names the directory tree that is growing.** A mount that
+  stays at Red or Critical while reclaim falls behind gets an hourly SBH-2007
+  report of its largest directories. On build hosts that report named a home
+  directory or a project root, which says where to look but not what to move,
+  and it reached only the journal and the activity log. The report now descends
+  into the largest directory and names the five largest entries inside it,
+  going down at most two levels while one entry holds at least half of its
+  parent. Each level is a bounded probe on the mount's own device. `sbh status`
+  shows the latest report per mount from the last 3 hours in a "Space
+  Attribution" section (`space_reports` in `--json`). The sizes say where the
+  bytes are; they never authorize a deletion (bd-6qw4).
 
 - **Running daemons learn from cleanup performed by other processes.** The
   scanner polls persisted receipts and outcomes while idle and at bounded
