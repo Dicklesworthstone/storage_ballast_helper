@@ -1113,6 +1113,9 @@ reloading cannot create an unbounded succession of replacement threads.
 RAM log-fallback eligibility also runs on a bounded worker. Pending or expired
 guard evidence keeps mirroring disabled, and the logger retains its separate
 safety checks before writing.
+macOS Full Disk Access diagnostics use one retained background worker at startup
+and on five-minute refreshes. A stalled home or Mail directory cannot delay
+pressure checks; diagnostic results older than ten minutes are discarded.
 
 Missing or expired observations provide no authority for automatic maintenance,
 predictive scans, or cross-device fallback roots. Healthy observed roots can
@@ -1123,9 +1126,8 @@ pending samples before their freshness window expires. On macOS, pressure
 sampling uses native `statfs` and memory-cached APFS geometry; optional metadata
 refresh cannot hold up the sample, and cached free space cannot exceed current
 native headroom. These bounds cover pressure observations and automatic scan
-planning. Startup discovery, configuration-reload discovery, periodic macOS
-Full Disk Access diagnostics, and filesystem mutations still include synchronous
-operations.
+planning. Startup discovery, configuration-reload discovery, and filesystem
+mutations still include synchronous operations.
 
 An `ENOSPC` state-write failure gets a separate bounded inode diagnostic started
 after the failure. Only fresh evidence from the actual destination can preserve

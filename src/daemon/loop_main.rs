@@ -188,6 +188,8 @@ const SWAP_THRASH_MIN_AVAILABLE_RAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const TEMP_FAST_TRACK_MIN_OBSERVED_AGE: Duration = Duration::from_mins(2);
 /// Recheck macOS Full Disk Access grants without adding pressure-loop noise.
 const FULL_DISK_ACCESS_RECHECK_INTERVAL: Duration = Duration::from_mins(5);
+/// A blocked refresh cannot leave an old grant recorded as current forever.
+const FULL_DISK_ACCESS_MAX_AGE: Duration = Duration::from_mins(10);
 /// Memory pressure callbacks wake the monitor loop instead of waiting for the
 /// next disk-pressure poll.
 pub const MEMORY_PRESSURE_CHANNEL_CAP: usize = 16;
@@ -3386,6 +3388,8 @@ pub struct MonitoringDaemon {
     /// How `summary_bytes_freed` is known, and what was measured beside it.
     summary_freed_basis: FreedBasis,
     summary_bytes_freed_observed: Option<u64>,
+    full_disk_access_observer: Option<FullDiskAccessObserver>,
+    /// Start time of the last completed diagnostic consumed by the monitor.
     last_full_disk_access_check: Option<Instant>,
     last_full_disk_access_state: Option<FullDiskAccessState>,
     full_disk_access_granted_logged: bool,
@@ -4579,6 +4583,39 @@ fn enqueue_scan_request(
     }
 }
 
+#[derive(Clone)]
+struct FullDiskAccessFailure {
+    code: String,
+    message: String,
+}
+
+type FullDiskAccessObserver =
+    BoundedObserver<(), std::result::Result<FullDiskAccessStatus, FullDiskAccessFailure>>;
+
+fn new_full_disk_access_observer(platform: Arc<dyn Platform>) -> FullDiskAccessObserver {
+    BoundedObserver::new(
+        Arc::new(move |()| {
+            // Keep native errors as completed observations, so the monitor can
+            // log each failed check once without mistaking a pending worker for
+            // a failure. Resolving the user's home and probing Mail both stay
+            // on this worker, including the first check before READY=1.
+            Ok(platform
+                .full_disk_access_status()
+                .map_err(|error| FullDiskAccessFailure {
+                    code: daemon_activity_error_code(&error),
+                    message: format!("Full Disk Access recheck failed: {error}"),
+                }))
+        }),
+        FULL_DISK_ACCESS_RECHECK_INTERVAL,
+        FULL_DISK_ACCESS_MAX_AGE,
+        // The coordinator reserves one priority slot. This fixed nonpriority
+        // key uses exactly one worker; expiry and invalidation retain it until
+        // native I/O and worker teardown actually finish.
+        2,
+        2,
+    )
+}
+
 fn full_disk_access_status_log_message(
     status: &FullDiskAccessStatus,
     previous_state: Option<FullDiskAccessState>,
@@ -5446,6 +5483,7 @@ impl MonitoringDaemon {
             summary_bytes_freed: 0,
             summary_freed_basis: FreedBasis::Observed,
             summary_bytes_freed_observed: Some(0),
+            full_disk_access_observer: None,
             last_full_disk_access_check: None,
             last_full_disk_access_state: None,
             full_disk_access_granted_logged: false,
@@ -5468,16 +5506,36 @@ impl MonitoringDaemon {
     }
 
     fn maybe_log_full_disk_access_status(&mut self, force: bool) {
-        if !force
-            && self
+        let observer = self
+            .full_disk_access_observer
+            .get_or_insert_with(|| new_full_disk_access_observer(Arc::clone(&self.platform)));
+        if force {
+            observer.invalidate();
+            self.last_full_disk_access_check = None;
+            self.last_full_disk_access_state = None;
+            self.full_disk_access_granted_logged = false;
+        }
+
+        // Poll every tick, even while the five-minute refresh interval has
+        // not elapsed. Otherwise a check queued at startup is not consumed
+        // until the next interval, and completed evidence can expire unseen.
+        let Ok(observation) = observer.observe((), false) else {
+            if self
                 .last_full_disk_access_check
-                .is_some_and(|checked_at| checked_at.elapsed() < FULL_DISK_ACCESS_RECHECK_INTERVAL)
-        {
+                .is_some_and(|checked_at| checked_at.elapsed() > FULL_DISK_ACCESS_MAX_AGE)
+            {
+                self.last_full_disk_access_check = None;
+                self.last_full_disk_access_state = None;
+                self.full_disk_access_granted_logged = false;
+            }
+            return;
+        };
+        if self.last_full_disk_access_check == Some(observation.collected_at) {
             return;
         }
 
-        self.last_full_disk_access_check = Some(Instant::now());
-        match self.platform.full_disk_access_status() {
+        self.last_full_disk_access_check = Some(observation.collected_at);
+        match observation.value {
             Ok(status) => {
                 if let Some(message) = full_disk_access_status_log_message(
                     &status,
@@ -5495,9 +5553,11 @@ impl MonitoringDaemon {
                 self.last_full_disk_access_state = Some(status.state);
             }
             Err(error) => {
+                self.last_full_disk_access_state = Some(FullDiskAccessState::Unknown);
+                self.full_disk_access_granted_logged = false;
                 self.logger_handle.send(ActivityEvent::Error {
-                    code: daemon_activity_error_code(&error),
-                    message: format!("Full Disk Access recheck failed: {error}"),
+                    code: error.code,
+                    message: error.message,
                 });
             }
         }
@@ -29766,6 +29826,258 @@ mod tests {
         assert!(health.record_panic());
         assert!(health.record_panic());
         assert!(!health.record_panic()); // 4th panic exceeds limit
+    }
+
+    #[cfg(unix)]
+    struct FullDiskAccessProbePlatform {
+        inner: Arc<dyn Platform>,
+        probe: Box<dyn Fn() -> Result<FullDiskAccessStatus> + Send + Sync>,
+    }
+
+    #[cfg(unix)]
+    impl Platform for FullDiskAccessProbePlatform {
+        fn fs_stats(&self, path: &Path) -> Result<crate::platform::pal::FsStats> {
+            self.inner.fs_stats(path)
+        }
+
+        fn mount_points(&self) -> Result<Vec<crate::platform::pal::MountPoint>> {
+            self.inner.mount_points()
+        }
+
+        fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+            self.inner.is_ram_backed(path)
+        }
+
+        fn default_paths(&self) -> crate::platform::pal::PlatformPaths {
+            self.inner.default_paths()
+        }
+
+        fn memory_info(&self) -> Result<MemoryInfo> {
+            self.inner.memory_info()
+        }
+
+        fn service_manager(&self) -> Box<dyn crate::platform::pal::ServiceManager> {
+            self.inner.service_manager()
+        }
+
+        fn full_disk_access_status(&self) -> Result<FullDiskAccessStatus> {
+            (self.probe)()
+        }
+    }
+
+    #[cfg(unix)]
+    fn await_full_disk_access_check(daemon: &mut MonitoringDaemon, previous: Option<Instant>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            daemon.maybe_log_full_disk_access_status(false);
+            if daemon.last_full_disk_access_check.is_some()
+                && daemon.last_full_disk_access_check != previous
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "FDA diagnostic did not complete");
+            thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    fn fixture_full_disk_access_status(state: FullDiskAccessState) -> FullDiskAccessStatus {
+        FullDiskAccessStatus {
+            state,
+            probe_path: None,
+            detail: "temporary diagnostic fixture".to_string(),
+            cache_ttl_seconds: 60,
+            cached: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_disk_access_probe_keeps_startup_and_pressure_live_with_one_worker() {
+        let mut fixture = RegretDaemonFixture::new();
+        let mail_index = fixture.directory.path().join("mail-index");
+        std::fs::write(&mail_index, b"temporary Mail index").unwrap();
+        let control_thread = thread::current().id();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        fixture.daemon.platform = Arc::new(FullDiskAccessProbePlatform {
+            inner: Arc::clone(&fixture.daemon.platform),
+            probe: Box::new(move || {
+                assert_ne!(thread::current().id(), control_thread);
+                let first = worker_calls.fetch_add(1, Ordering::AcqRel) == 0;
+                if first {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                std::fs::File::open(&mail_index).unwrap();
+                Ok(fixture_full_disk_access_status(if first {
+                    FullDiskAccessState::Granted
+                } else {
+                    FullDiskAccessState::Missing
+                }))
+            }),
+        });
+
+        let before = Instant::now();
+        fixture.daemon.maybe_log_full_disk_access_status(true);
+        assert!(before.elapsed() < Duration::from_millis(500));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before = Instant::now();
+        for _ in 0..20 {
+            // Even forced refreshes retain the occupied worker and reject its
+            // old result; ordinary ticks must still run pressure collection.
+            fixture.daemon.maybe_log_full_disk_access_status(true);
+            fixture.daemon.maybe_log_full_disk_access_status(false);
+            fixture.daemon.check_pressure().unwrap();
+        }
+        assert!(before.elapsed() < Duration::from_secs(1));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(fixture.daemon.last_full_disk_access_check.is_none());
+
+        release_tx.send(()).unwrap();
+        await_full_disk_access_check(&mut fixture.daemon, None);
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert_eq!(
+            fixture.daemon.last_full_disk_access_state,
+            Some(FullDiskAccessState::Missing)
+        );
+        fixture.flush_logger();
+        let log = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
+        assert_eq!(log.matches("Full Disk Access missing").count(), 1);
+        assert!(!log.contains("Full Disk Access granted"));
+        assert!(!log.contains("Full Disk Access recheck failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_disk_access_probe_rejects_expired_delivery_and_forgets_old_grants() {
+        let mut fixture = RegretDaemonFixture::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        fixture.daemon.platform = Arc::new(FullDiskAccessProbePlatform {
+            inner: Arc::clone(&fixture.daemon.platform),
+            probe: Box::new(move || {
+                if worker_calls.fetch_add(1, Ordering::AcqRel) > 0 {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                Ok(fixture_full_disk_access_status(
+                    FullDiskAccessState::Granted,
+                ))
+            }),
+        });
+        await_full_disk_access_check(&mut fixture.daemon, None);
+        assert!(fixture.daemon.full_disk_access_granted_logged);
+
+        // Age the consumed receipt without waiting ten minutes. The second
+        // probe also has a genuinely elapsed, short delivery deadline.
+        fixture.daemon.last_full_disk_access_check =
+            Some(Instant::now() - FULL_DISK_ACCESS_MAX_AGE - Duration::from_secs(1));
+        fixture
+            .daemon
+            .full_disk_access_observer
+            .as_ref()
+            .unwrap()
+            .set_max_age(Duration::from_millis(20));
+        fixture.daemon.maybe_log_full_disk_access_status(false);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(fixture.daemon.last_full_disk_access_check.is_none());
+        assert!(fixture.daemon.last_full_disk_access_state.is_none());
+        assert!(!fixture.daemon.full_disk_access_granted_logged);
+        thread::sleep(Duration::from_millis(30));
+        release_tx.send(()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let observer = fixture.daemon.full_disk_access_observer.as_ref().unwrap();
+            if observer
+                .observe((), false)
+                .is_err_and(|error| error.contains("expired before delivery"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expired result was not discarded"
+            );
+            thread::yield_now();
+        }
+        for _ in 0..100 {
+            fixture.daemon.maybe_log_full_disk_access_status(false);
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert!(fixture.daemon.last_full_disk_access_state.is_none());
+        fixture.flush_logger();
+        let log = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
+        assert_eq!(log.matches("Full Disk Access granted").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_disk_access_probe_logs_failures_once_and_recovers_grants() {
+        let mut fixture = RegretDaemonFixture::new();
+        let mode = Arc::new(AtomicU8::new(0));
+        let worker_mode = Arc::clone(&mode);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        fixture.daemon.platform = Arc::new(FullDiskAccessProbePlatform {
+            inner: Arc::clone(&fixture.daemon.platform),
+            probe: Box::new(move || {
+                worker_calls.fetch_add(1, Ordering::AcqRel);
+                match worker_mode.load(Ordering::Acquire) {
+                    1 => Err(SbhError::from(PalError::method_failed(
+                        "macos",
+                        "full_disk_access_status",
+                        "injected diagnostic failure",
+                    ))),
+                    2 => Ok(fixture_full_disk_access_status(
+                        FullDiskAccessState::Missing,
+                    )),
+                    _ => Ok(fixture_full_disk_access_status(
+                        FullDiskAccessState::Granted,
+                    )),
+                }
+            }),
+        });
+        await_full_disk_access_check(&mut fixture.daemon, None);
+        for expected_mode in 0..=3 {
+            if expected_mode > 0 {
+                mode.store(expected_mode, Ordering::Release);
+                let previous = fixture.daemon.last_full_disk_access_check;
+                fixture
+                    .daemon
+                    .full_disk_access_observer
+                    .as_ref()
+                    .unwrap()
+                    .invalidate();
+                await_full_disk_access_check(&mut fixture.daemon, previous);
+            }
+            for _ in 0..100 {
+                fixture.daemon.maybe_log_full_disk_access_status(false);
+            }
+            assert_eq!(
+                calls.load(Ordering::Acquire),
+                usize::from(expected_mode) + 1
+            );
+            if expected_mode == 1 {
+                assert_eq!(
+                    fixture.daemon.last_full_disk_access_state,
+                    Some(FullDiskAccessState::Unknown)
+                );
+                assert!(!fixture.daemon.full_disk_access_granted_logged);
+            }
+        }
+        assert!(fixture.daemon.full_disk_access_granted_logged);
+        fixture.flush_logger();
+        let log = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
+        assert_eq!(log.matches("Full Disk Access granted").count(), 2);
+        assert_eq!(log.matches("Full Disk Access missing").count(), 1);
+        assert_eq!(log.matches("Full Disk Access recheck failed").count(), 1);
+        assert!(log.contains("SBH-1102"));
     }
 
     #[test]
