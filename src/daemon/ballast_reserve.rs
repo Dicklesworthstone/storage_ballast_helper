@@ -42,6 +42,7 @@ pub(super) struct BallastReserveMonitor {
     worker: Option<ObservationWorker>,
     last_started: Option<Instant>,
     refresh_requested: bool,
+    reload_pending: bool,
     observations: HashMap<PathBuf, ObservedReserve>,
     reported: HashMap<(PathBuf, PathBuf), BallastReserveState>,
     latest_notifications: HashMap<(PathBuf, PathBuf), NotificationEvent>,
@@ -74,12 +75,25 @@ impl BallastReserveMonitor {
         self.refresh_requested = true;
     }
 
-    /// A reload can replace both pool identity and the floor rule. Retain the
-    /// worker slot until it exits, but discard every old observation. Keep
-    /// transition history for pools that survive the reload so recovery is
-    /// delivered to the notification manager before a later exhaustion.
+    /// A reload can replace both pool identity and the floor rule. Invalidate
+    /// evidence while retaining uncertainty deadlines until the current pool
+    /// seeds confirm which identities survived. Transition history for those
+    /// pools also survives, so recovery reaches the notification manager.
     pub(super) fn invalidate_all(&mut self) {
-        self.observations.clear();
+        self.invalidate_all_at(Instant::now());
+    }
+
+    fn invalidate_all_at(&mut self, now: Instant) {
+        let mounts: Vec<_> = self.observations.keys().cloned().collect();
+        for mount in mounts {
+            self.invalidate_at(&mount, now);
+        }
+        // Even an expired row waits for identity reconciliation before its
+        // retained notification can be delivered after a reload.
+        for observation in self.observations.values_mut() {
+            observation.pending = true;
+        }
+        self.reload_pending = true;
         self.refresh_requested = true;
     }
 
@@ -151,17 +165,42 @@ impl BallastReserveMonitor {
         self.reported.retain(|key, _| active_pools.contains(key));
         self.latest_notifications
             .retain(|key, _| active_pools.contains(key));
-        let mut changed = false;
+        let previous_count = self.observations.len();
+        self.observations.retain(|mount, observation| {
+            active_pools.contains(&(mount.clone(), observation.snapshot.ballast_dir.clone()))
+        });
+        let mut changed =
+            std::mem::take(&mut self.reload_pending) || self.observations.len() != previous_count;
         for snapshot in seeds {
-            if let std::collections::hash_map::Entry::Vacant(entry) =
-                self.observations.entry(snapshot.mount_point.clone())
-            {
-                entry.insert(ObservedReserve {
-                    snapshot,
-                    started_at: now,
-                    pending: true,
-                });
-                changed = true;
+            match self.observations.entry(snapshot.mount_point.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(ObservedReserve {
+                        snapshot,
+                        started_at: now,
+                        pending: true,
+                    });
+                    changed = true;
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let observation = entry.get_mut();
+                    let stale = observation
+                        .snapshot
+                        .refill_blockers
+                        .contains(&BallastRefillBlocker::ObservationStale);
+                    if observation.pending || stale {
+                        changed |= observation.snapshot.files_total != snapshot.files_total
+                            || observation.snapshot.configured_bytes != snapshot.configured_bytes
+                            || (stale && observation.pending);
+                        // Reloaded targets are configuration, not inventory
+                        // evidence. Keep the original uncertainty deadline.
+                        observation.snapshot.files_total = snapshot.files_total;
+                        observation.snapshot.configured_bytes = snapshot.configured_bytes;
+                        observation.snapshot.state = snapshot.state;
+                        if stale {
+                            observation.pending = false;
+                        }
+                    }
+                }
             }
         }
         changed
@@ -822,9 +861,7 @@ mod tests {
         for seconds in [30, 60, 89, 90, 120, 600, 42_120] {
             let now = invalidated_at + Duration::from_secs(seconds);
             monitor.invalidate_at(fixture.mount(), now);
-            monitor
-                .tick(&fixture.coordinator, &platform, now)
-                .unwrap();
+            monitor.tick(&fixture.coordinator, &platform, now).unwrap();
             let (events, _) = monitor.report(&fixture.blocked(), None);
             assert_eq!(events.len(), usize::from(seconds == 90));
             if seconds == 90 {
@@ -877,6 +914,135 @@ mod tests {
             vec![BallastReserveState::Unknown],
         );
         assert!(monitor.report(&fixture.blocked(), None).0.is_empty());
+    }
+
+    #[test]
+    fn repeated_reload_keeps_uncertainty_deadline_and_refreshes_configuration() {
+        let mut fixture = Fixture::new();
+        let platform: Arc<dyn Platform> = fixture.platform.clone();
+        let mut monitor = BallastReserveMonitor::default();
+        let start = Instant::now();
+        fixture.observe(&mut monitor, start);
+        assert!(monitor.report(&fixture.blocked(), None).0.is_empty());
+
+        fixture.platform.block_next.store(true, Ordering::Release);
+        let before = fixture.platform.probes.load(Ordering::Relaxed);
+        monitor.invalidate_all_at(start);
+        monitor
+            .tick(&fixture.coordinator, &platform, start)
+            .unwrap();
+        fixture
+            .entered
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let worker_id = monitor.worker.as_ref().unwrap().handle.thread().id();
+        fixture.coordinator.update_config(&BallastConfig {
+            file_count: 20,
+            file_size_bytes: 8192,
+            replenish_cooldown_minutes: 0,
+            ..BallastConfig::default()
+        });
+        fixture.coordinator.set_provision_floor(20.0);
+
+        for seconds in [30, 60, 89, 90, 120, 600, 42_120] {
+            let now = start + Duration::from_secs(seconds);
+            monitor.invalidate_all_at(now);
+            assert!(monitor.delivery_events().is_empty());
+            monitor.tick(&fixture.coordinator, &platform, now).unwrap();
+            let (events, _) = monitor.report(&fixture.blocked(), None);
+            assert_eq!(events.len(), usize::from(seconds == 90));
+            if seconds == 90 {
+                assert_eq!(states(&events), vec![BallastReserveState::Unknown]);
+            }
+            let snapshot = monitor.snapshot(fixture.mount()).unwrap();
+            assert_eq!(snapshot.files_total, 20);
+            assert_eq!(snapshot.configured_bytes, 20 * 8192);
+            assert_eq!(snapshot.releasable_bytes, 0);
+            assert!(snapshot.headroom.is_none());
+            assert!(!snapshot.inventory_authoritative);
+            assert_eq!(
+                snapshot
+                    .refill_blockers
+                    .contains(&BallastRefillBlocker::ObservationStale),
+                seconds >= 90,
+            );
+            assert_eq!(monitor.delivery_events().len(), usize::from(seconds >= 90),);
+            assert_eq!(
+                monitor.worker.as_ref().unwrap().handle.thread().id(),
+                worker_id,
+            );
+            assert_eq!(fixture.platform.probes.load(Ordering::Relaxed), before + 1);
+        }
+
+        fixture.release.send(()).unwrap();
+        let worker = monitor.worker.take().unwrap();
+        let result = worker.handle.join().unwrap();
+        assert!(!monitor.accept_observation(&fixture.coordinator, result, worker.started_at));
+        let recovered_at = start + Duration::from_secs(42_121);
+        fixture.observe(&mut monitor, recovered_at);
+        assert_eq!(
+            states(&monitor.report(&fixture.blocked(), None).0),
+            vec![BallastReserveState::Depleted],
+        );
+        let headroom = monitor.snapshot(fixture.mount()).unwrap().headroom.unwrap();
+        assert!((headroom.floor_pct - 20.0).abs() < f64::EPSILON);
+
+        let next_reload = recovered_at + Duration::from_secs(1);
+        monitor.invalidate_all_at(next_reload);
+        assert!(monitor.seed_observations(&fixture.coordinator, next_reload));
+        assert!(!monitor.expire_observations(next_reload + Duration::from_secs(89)));
+        assert!(monitor.report(&fixture.blocked(), None).0.is_empty());
+        assert!(monitor.expire_observations(next_reload + MAX_OBSERVATION_AGE));
+        assert_eq!(
+            states(&monitor.report(&fixture.blocked(), None).0),
+            vec![BallastReserveState::Unknown],
+        );
+    }
+
+    #[test]
+    fn reload_replacement_directory_gets_a_new_uncertainty_episode() {
+        let mut fixture = Fixture::new();
+        let mut monitor = BallastReserveMonitor::default();
+        let start = Instant::now();
+        fixture.observe(&mut monitor, start);
+        assert!(monitor.report(&fixture.blocked(), None).0.is_empty());
+        assert!(monitor.expire_observations(start + MAX_OBSERVATION_AGE));
+        assert_eq!(
+            states(&monitor.report(&fixture.blocked(), None).0),
+            vec![BallastReserveState::Unknown],
+        );
+
+        let replacement_dir = fixture.mount().join("replacement-ballast");
+        let platform: Arc<dyn Platform> = fixture.platform.clone();
+        fixture.coordinator = BallastPoolCoordinator::discover_inner(
+            &BallastConfig {
+                file_count: 3,
+                file_size_bytes: 8192,
+                ..BallastConfig::default()
+            },
+            &[fixture.mount().to_path_buf()],
+            fixture.platform.as_ref(),
+            &platform,
+            Some(&replacement_dir),
+        )
+        .unwrap();
+        let reloaded_at = start + Duration::from_secs(120);
+        monitor.invalidate_all_at(reloaded_at);
+        assert!(monitor.delivery_events().is_empty());
+        assert!(monitor.seed_observations(&fixture.coordinator, reloaded_at));
+        assert!(monitor.reported.is_empty());
+        assert!(monitor.latest_notifications.is_empty());
+        let snapshot = monitor.snapshot(fixture.mount()).unwrap();
+        assert_eq!(snapshot.ballast_dir, replacement_dir);
+        assert_eq!(snapshot.files_total, 3);
+        assert!(snapshot.observed_at.is_empty());
+        assert!(!monitor.expire_observations(reloaded_at + Duration::from_secs(89)));
+        assert!(monitor.report(&fixture.blocked(), None).0.is_empty());
+        assert!(monitor.expire_observations(reloaded_at + MAX_OBSERVATION_AGE));
+        assert_eq!(
+            states(&monitor.report(&fixture.blocked(), None).0),
+            vec![BallastReserveState::Unknown],
+        );
     }
 
     #[test]
@@ -938,6 +1104,7 @@ mod tests {
         let replacement = Fixture::new();
         monitor.invalidate_all();
         assert!(monitor.seed_observations(&replacement.coordinator, now));
+        assert!(monitor.snapshot(fixture.mount()).is_none());
         assert!(monitor.reported.is_empty());
         assert!(monitor.latest_notifications.is_empty());
         assert!(monitor.delivery_events().is_empty());
