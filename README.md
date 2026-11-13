@@ -1832,6 +1832,66 @@ The daemon manages one pool per eligible mount, not just the configured `ballast
 
 Pools are planned per filesystem, not per mount entry. The mount holding a path is the one the kernel reports (`statfs`), so a macOS ballast dir under `/Users` lands on `/System/Volumes/Data` rather than the sealed, read-only `/`, and mount entries with the same source device (the bind mounts a `ProtectSystem=strict` unit sees for each `ReadWritePaths=` entry) fold into one pool on a writable entry, listed as "same filesystem as ..." and served by that pool. sbh ballast files left in a default `<mount>/.sbh/ballast` the daemon no longer manages (the pool moved to a configured `ballast_dir`, or its mount was folded) count as that filesystem's reserve and are released after the pool's own files; only files with the sbh ballast header are ever touched, and they are not replenished.
 
+#### Reserve availability in status and notifications
+
+A successful release can leave a volume at Yellow with no ballast left for the
+next pressure spike. `sbh status` reports reserve availability separately from
+disk pressure, with a prominent warning and one record per physical pool. The
+pressure level, release strategy, hysteresis and refill safety floor keep their
+existing meaning.
+
+| Reserve state | Meaning |
+| --- | --- |
+| `healthy` | Observed releasable bytes meet or exceed the configured pool size. |
+| `depleted` | More than 25% of the configured reserve remains, but the pool is below its configured size. |
+| `critical` | Some reserve remains, at most 25% of configured bytes, including exactly 25%. |
+| `exhausted` | A reserve is configured and authoritative inventory found zero releasable bytes. |
+| `unknown` | Inventory has not completed, could not be inspected reliably, or is too old to establish current protection. |
+| `unconfigured` | No reserve bytes are configured for this pool. Existing surplus files can still be reported. |
+
+The report includes file counts, releasable and configured bytes, observation
+time, and the current reasons automatic refill cannot proceed. These can include
+pressure policy, the refill cooldown, dry-run mode, an occupied worker, unreadable
+inventory, or the safety floor. Floor evidence describes free space **after
+allocating another whole configured file**. For example:
+
+| Free before allocation | Free after the next whole file | Safety floor | Admission |
+| --- | --- | --- | --- |
+| 15.1% | 14.9% | 15.0% | Refused |
+
+Existing policy can permit refill on a Yellow mount that is idle with nothing
+left to reclaim; this report describes that decision without authorizing any
+additional writes. Improved pressure alone does not mean the reserve has recovered.
+
+`sbh status --json` exposes this view under `ballast.reserves`, and each daemon
+`state.json` pool record carries it as `ballast_pools[].reserve`. Skipped mounts
+retain their exact discovery reasons in `ballast.reserves.skipped_pools` and
+ordinary status; aliases and deliberately unmanaged filesystems do not add
+reserve depletion warnings. Fresh evidence
+from the running daemon takes precedence over what a less restricted status
+process can see. A stalled observation becomes `unknown` after <!-- claim:constants.daemon.DAEMON_STATE_STALE_THRESHOLD_SECS -->90<!-- /claim --> seconds;
+it never leaves a saved positive reserve claim indefinitely. Without a current
+daemon report, status uses read-only inventory and explicitly marks daemon
+release access and automatic refill eligibility as unknown. Releasable bytes
+are allocation estimates; filesystem snapshots may retain blocks after unlink.
+
+Reserve-band changes produce `ballast_reserve_changed` notification records,
+including the remaining reserve and refill explanation. Exhaustion has Red
+notification severity, critical depletion Orange, partial depletion or unknown
+inventory Warning, and recovery to healthy Info, subject to each channel's
+configured level filter. Unchanged evaluations do not produce periodic repeats,
+even after the ordinary notification cooldown expires. Recovery and a new
+depletion episode remain visible within that cooldown, and different volumes
+cannot suppress one another. On restart, the daemon inspects its pools again
+and announces an unhealthy initial observation once; it never restores reserve
+availability from a saved healthy state. Re-enabling notifications or changing
+their destination makes the current condition eligible for delivery again.
+If every accepting notification queue is full, the latest transition remains
+eligible and retries at most once every five seconds while its reserve band
+stays unchanged. A changed band can attempt delivery immediately. This paces
+queue-loss notices as well as retries; actual channel delivery remains best
+effort.
+
 ### VOI Scan Scheduling
 
 Fixed-interval full scans waste IO bandwidth when most directories haven't changed. For v1, the Value-of-Information (VOI) scheduler allocates a limited scan budget (default: <!-- claim:constants.voi.scan_budget_per_interval -->5<!-- /claim --> paths per cycle) to the paths most likely to yield reclaimable space. For v2, the same pressure signal decides when to use the persistent candidate index, event-dirty roots, or bounded reconciliation instead of recursively walking every configured root.

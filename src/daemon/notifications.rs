@@ -8,11 +8,11 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Sender, bounded};
 use serde::{Deserialize, Serialize};
 
+use crate::ballast::coordinator::{BallastReserveSnapshot, BallastReserveState};
 use crate::monitor::pid::PressureLevel;
 use crate::scanner::deletion::FreedBasis;
 
@@ -28,6 +29,8 @@ mod journal;
 
 const DEFAULT_NOTIFY_INTERVAL_SECS: u64 = 60;
 const DEFAULT_URGENT_NOTIFY_INTERVAL_SECS: u64 = 300;
+/// Pace unchanged reserve retries when every accepting channel is backlogged.
+const RESERVE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// Pending notifications per channel; an occupied worker is never replaced.
 const CHANNEL_QUEUE_CAPACITY: usize = 64;
 /// Desktop/webhook children get one bounded attempt on their channel's worker.
@@ -106,6 +109,13 @@ pub enum NotificationEvent {
     BallastReplenished {
         mount: String,
         files_replenished: usize,
+    },
+    /// Reserve availability changed materially on this physical pool. This
+    /// describes remaining protection independently of filesystem pressure.
+    BallastReserveChanged {
+        mount: String,
+        previous: Option<BallastReserveState>,
+        reserve: BallastReserveSnapshot,
     },
     BehaviorEmergency {
         source: String,
@@ -222,6 +232,17 @@ impl NotificationEvent {
 
             Self::BallastReleased { .. } => NotificationLevel::Orange,
 
+            Self::BallastReserveChanged { reserve, .. } => match reserve.state {
+                BallastReserveState::Unconfigured | BallastReserveState::Healthy => {
+                    NotificationLevel::Info
+                }
+                BallastReserveState::Depleted | BallastReserveState::Unknown => {
+                    NotificationLevel::Warning
+                }
+                BallastReserveState::Critical => NotificationLevel::Orange,
+                BallastReserveState::Exhausted => NotificationLevel::Red,
+            },
+
             Self::BehaviorEmergency { .. } => NotificationLevel::Critical,
 
             Self::Error { .. } => NotificationLevel::Red,
@@ -250,6 +271,14 @@ impl NotificationEvent {
             Self::CleanupCompleted { .. } => "cleanup_completed",
             Self::BallastReleased { .. } => "ballast_released",
             Self::BallastReplenished { .. } => "ballast_replenished",
+            Self::BallastReserveChanged { reserve, .. } => match reserve.state {
+                BallastReserveState::Unconfigured => "ballast_reserve_unconfigured",
+                BallastReserveState::Healthy => "ballast_reserve_healthy",
+                BallastReserveState::Depleted => "ballast_reserve_depleted",
+                BallastReserveState::Critical => "ballast_reserve_critical",
+                BallastReserveState::Exhausted => "ballast_reserve_exhausted",
+                BallastReserveState::Unknown => "ballast_reserve_unknown",
+            },
             Self::BehaviorEmergency { .. } => "behavior_emergency",
             Self::DaemonStarted { .. } => "daemon_started",
             Self::DaemonStopped { .. } => "daemon_stopped",
@@ -269,6 +298,7 @@ impl NotificationEvent {
             | Self::CleanupCompleted { mount, .. }
             | Self::BallastReleased { mount, .. }
             | Self::BallastReplenished { mount, .. }
+            | Self::BallastReserveChanged { mount, .. }
             | Self::ReclaimUnavailable { mount, .. } => mount,
             Self::Error { code, .. } => code,
             Self::BehaviorEmergency { .. }
@@ -320,6 +350,7 @@ impl NotificationEvent {
                 mount,
                 files_replenished,
             } => format!("Replenished {files_replenished} ballast files on {mount}"),
+            Self::BallastReserveChanged { reserve, .. } => reserve.summary(),
             Self::BehaviorEmergency {
                 source,
                 memory_level,
@@ -800,6 +831,23 @@ impl WebhookChannel {
             NotificationEvent::PressureChanged {
                 mount, free_pct, ..
             } => (mount.clone(), format!("{free_pct:.1}")),
+            NotificationEvent::BallastReserveChanged { mount, reserve, .. } => (
+                mount.clone(),
+                reserve.headroom.as_ref().map_or_else(
+                    || "N/A".to_string(),
+                    |headroom| {
+                        if headroom.total_bytes == 0 {
+                            "N/A".to_string()
+                        } else {
+                            format!(
+                                "{:.1}",
+                                headroom.available_bytes as f64 / headroom.total_bytes as f64
+                                    * 100.0
+                            )
+                        }
+                    },
+                ),
+            ),
             NotificationEvent::PredictiveWarning { mount, .. }
             | NotificationEvent::CleanupCompleted { mount, .. }
             | NotificationEvent::BallastReleased { mount, .. }
@@ -1035,6 +1083,13 @@ pub struct NotificationManager {
     /// Dispatch history by category, affected scope and severity. Lower-level
     /// events cannot hide an escalation or reset a previous urgent cooldown.
     last_send_by_scope: HashMap<(&'static str, String), BTreeMap<NotificationLevel, Instant>>,
+    /// Reserve transitions are episode events: a confirmed recovery or a new
+    /// exhaustion must be visible even within the previous alert's cooldown.
+    /// Retain the last state so duplicate observations never become reminders.
+    reserve_states: HashMap<(String, PathBuf), BallastReserveState>,
+    /// Last failed enqueue attempt per pool and reserve band. The daemon can
+    /// retry each tick without producing a matching stream of drop notices.
+    reserve_retries: HashMap<(String, PathBuf), (BallastReserveState, Instant)>,
     min_interval: Duration,
     urgent_min_interval: Duration,
 }
@@ -1055,6 +1110,28 @@ impl NotificationManager {
     /// executing native operation may still complete under its old settings.
     pub fn update_config(&mut self, config: &NotificationConfig) {
         let configured = ChannelSettings::configured(config);
+        let destinations_changed = self.enabled != config.enabled
+            || self
+                .channels
+                .iter()
+                .filter(|worker| worker.target.is_some())
+                .count()
+                != configured.len()
+            || configured.iter().any(|setting| {
+                !self.channels.iter().any(|worker| {
+                    worker
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| &target.settings == setting)
+                })
+            });
+        if destinations_changed {
+            // The daemon retries its latest reserve transition. A newly
+            // enabled or replaced destination needs that current condition,
+            // even if an older destination already accepted the same state.
+            self.reserve_states.clear();
+            self.reserve_retries.clear();
+        }
         for worker in &mut self.channels {
             worker.update(
                 configured
@@ -1084,9 +1161,31 @@ impl NotificationManager {
             enabled: false,
             dropped: AtomicU64::new(0),
             last_send_by_scope: HashMap::new(),
+            reserve_states: HashMap::new(),
+            reserve_retries: HashMap::new(),
             min_interval: Duration::ZERO,
             urgent_min_interval: Duration::ZERO,
         }
+    }
+
+    /// Forget reserve cursors when their physical pools leave monitoring.
+    /// A later pool at the same path starts a new notification episode.
+    pub(super) fn retain_reserve_pools<'a>(
+        &mut self,
+        pools: impl Iterator<Item = (&'a Path, &'a Path)>,
+    ) {
+        let retained: HashSet<_> = pools
+            .map(|(mount, directory)| {
+                (
+                    mount.to_string_lossy().into_owned(),
+                    directory.to_path_buf(),
+                )
+            })
+            .collect();
+        self.reserve_states
+            .retain(|scope, _| retained.contains(scope));
+        self.reserve_retries
+            .retain(|scope, _| retained.contains(scope));
     }
 
     /// Dispatch a notification event to all enabled channels.
@@ -1096,6 +1195,8 @@ impl NotificationManager {
     /// history that throttles repeated urgent alerts. Orange-and-below use
     /// `min_notify_interval_secs`; Red and Critical events use
     /// `urgent_notify_interval_secs` (default five minutes).
+    /// Reserve availability uses state transitions instead: unchanged states
+    /// are silent indefinitely, and a recovery or renewed depletion is immediate.
     pub fn notify(&mut self, event: &NotificationEvent) {
         self.notify_at(event, Instant::now());
     }
@@ -1118,34 +1219,69 @@ impl NotificationManager {
         } else {
             self.min_interval
         };
-        let key = (event.type_key(), event.throttle_scope().to_owned());
-        let history = self.last_send_by_scope.entry(key).or_default();
-        if !interval.is_zero()
-            && history
-                .range(level..)
-                .any(|(_, sent)| now.saturating_duration_since(*sent) < interval)
-        {
-            return;
-        }
+        let reserve_transition =
+            if let NotificationEvent::BallastReserveChanged { mount, reserve, .. } = event {
+                let key = (mount.clone(), reserve.ballast_dir.clone());
+                if self.reserve_states.get(&key) == Some(&reserve.state) {
+                    return;
+                }
+                if self
+                    .reserve_retries
+                    .get(&key)
+                    .is_some_and(|(state, attempted)| {
+                        *state == reserve.state
+                            && now.saturating_duration_since(*attempted) < RESERVE_RETRY_INTERVAL
+                    })
+                {
+                    return;
+                }
+                Some((key, reserve.state))
+            } else {
+                let key = (event.type_key(), event.throttle_scope().to_owned());
+                let history = self.last_send_by_scope.entry(key).or_default();
+                if !interval.is_zero()
+                    && history
+                        .range(level..)
+                        .any(|(_, sent)| now.saturating_duration_since(*sent) < interval)
+                {
+                    return;
+                }
 
-        history.insert(level, now);
+                history.insert(level, now);
+                None
+            };
 
         let event = Arc::new(event.clone());
+        let mut accepted = false;
+        let mut eligible = false;
         for worker in &self.channels {
             let Some(target) = &worker.target else {
                 continue;
             };
-            if target.settings.accepts(level)
-                && worker
-                    .send
-                    .try_send(Dispatch::Event(Delivery {
-                        event: Arc::clone(&event),
-                        channel: Arc::clone(&target.channel),
-                        revoked: Arc::clone(&target.revoked),
-                    }))
-                    .is_err()
-            {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
+            if target.settings.accepts(level) {
+                eligible = true;
+                match worker.send.try_send(Dispatch::Event(Delivery {
+                    event: Arc::clone(&event),
+                    channel: Arc::clone(&target.channel),
+                    revoked: Arc::clone(&target.revoked),
+                })) {
+                    Ok(()) => accepted = true,
+                    Err(_) => {
+                        self.dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        if let Some((key, state)) = reserve_transition {
+            if accepted || !eligible {
+                // A deliberately filtered recovery advances semantic state,
+                // so a later exhaustion is a new alert rather than a duplicate.
+                self.reserve_retries.remove(&key);
+                self.reserve_states.insert(key, state);
+            } else {
+                // Full queues do not consume the transition. Pace its retries
+                // to avoid turning each monitor tick into another drop notice.
+                self.reserve_retries.insert(key, (state, now));
             }
         }
     }
@@ -1987,6 +2123,31 @@ mod tests {
         }
     }
 
+    fn reserve_event(mount: &str, bytes: u64, authoritative: bool) -> NotificationEvent {
+        use crate::ballast::coordinator::BallastRefillBlocker;
+
+        NotificationEvent::BallastReserveChanged {
+            mount: mount.into(),
+            previous: None,
+            reserve: BallastReserveSnapshot {
+                observed_at: "2026-11-12T12:05:35Z".into(),
+                mount_point: mount.into(),
+                ballast_dir: PathBuf::from(mount).join(".sbh/ballast"),
+                files_available: usize::try_from(bytes / 100).unwrap(),
+                files_total: 10,
+                releasable_bytes: bytes,
+                configured_bytes: 1000,
+                state: BallastReserveState::classify(1000, bytes, authoritative),
+                inventory_authoritative: authoritative,
+                unreadable_count: usize::from(!authoritative),
+                headroom: None,
+                headroom_error: None,
+                refill_blockers: vec![BallastRefillBlocker::PressurePolicy],
+                refill_in_progress: false,
+            },
+        }
+    }
+
     fn recorded_notifications(
         config: &NotificationConfig,
         manager: &NotificationManager,
@@ -2020,6 +2181,245 @@ mod tests {
             .map(|record| record["level"].as_str().unwrap())
             .collect();
         assert_eq!(levels, ["warning", "red", "critical"]);
+    }
+
+    #[test]
+    fn reserve_notifications_deduplicate_prolonged_exhaustion_and_reload() {
+        let (_directory, config, mut manager) = notification_fixture();
+        let now = Instant::now();
+        let event = reserve_event("/data", 0, true);
+        manager.notify_at(&event, now);
+        manager.update_config(&config);
+        for seconds in [1, 60, 300, 3600, 42_120] {
+            manager.notify_at(&event, now + Duration::from_secs(seconds));
+        }
+        let records = recorded_notifications(&config, &manager);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["type"], "ballast_reserve_changed");
+        assert_eq!(records[0]["level"], "red");
+        assert_eq!(records[0]["reserve"]["state"], "exhausted");
+        assert_eq!(records[0]["reserve"]["releasable_bytes"], 0);
+        assert!(
+            event
+                .summary()
+                .contains("no ballast reserve remains to release")
+        );
+    }
+
+    #[test]
+    fn reserve_recovery_and_new_exhaustion_bypass_previous_cooldown() {
+        let (_directory, config, mut manager) = notification_fixture();
+        let now = Instant::now();
+        for (seconds, mount, bytes) in [
+            (0, "/data", 0),
+            (0, "/backup", 0),
+            (1, "/data", 100),
+            (2, "/data", 200), // Same critical band: no notification.
+            (3, "/data", 1000),
+            (4, "/data", 0),
+        ] {
+            manager.notify_at(
+                &reserve_event(mount, bytes, true),
+                now + Duration::from_secs(seconds),
+            );
+        }
+        let records = recorded_notifications(&config, &manager);
+        let observed: Vec<_> = records
+            .iter()
+            .map(|record| {
+                (
+                    record["mount"].as_str().unwrap(),
+                    record["reserve"]["state"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                ("/data", "exhausted"),
+                ("/backup", "exhausted"),
+                ("/data", "critical"),
+                ("/data", "healthy"),
+                ("/data", "exhausted"),
+            ]
+        );
+    }
+
+    #[test]
+    fn reserve_condition_is_delivered_after_reenable_and_destination_change() {
+        let (_directory, mut config, mut manager) = notification_fixture();
+        let event = reserve_event("/data", 0, true);
+        manager.notify(&event);
+        assert_eq!(recorded_notifications(&config, &manager).len(), 1);
+        config.enabled = false;
+        manager.update_config(&config);
+        manager.notify(&event);
+        config.enabled = true;
+        manager.update_config(&config);
+        manager.notify(&event);
+        manager.update_config(&config); // A no-op reload does not rearm it.
+        manager.notify(&event);
+        assert_eq!(recorded_notifications(&config, &manager).len(), 2);
+
+        config.file.path = config.file.path.with_file_name("new-notifications.jsonl");
+        manager.update_config(&config);
+        manager.notify(&event);
+        assert_eq!(recorded_notifications(&config, &manager).len(), 1);
+    }
+
+    #[test]
+    fn removed_reserve_pool_can_alert_again_without_repeating_other_pools() {
+        let (_directory, config, mut manager) = notification_fixture();
+        let data = reserve_event("/data", 0, true);
+        let backup = reserve_event("/backup", 100, true);
+        manager.notify(&data);
+        manager.notify(&backup);
+        assert_eq!(recorded_notifications(&config, &manager).len(), 2);
+
+        manager.retain_reserve_pools(std::iter::once((
+            Path::new("/backup"),
+            Path::new("/backup/.sbh/ballast"),
+        )));
+        manager.notify(&backup);
+        assert_eq!(recorded_notifications(&config, &manager).len(), 2);
+
+        // A re-added healthy pool has no initial notification. Its next
+        // exhaustion must not inherit the removed pool's old cursor.
+        manager.retain_reserve_pools(
+            [
+                (Path::new("/data"), Path::new("/data/.sbh/ballast")),
+                (Path::new("/backup"), Path::new("/backup/.sbh/ballast")),
+            ]
+            .into_iter(),
+        );
+        manager.notify(&data);
+        manager.notify(&data);
+        manager.notify(&backup);
+        let records = recorded_notifications(&config, &manager);
+        let observed: Vec<_> = records
+            .iter()
+            .map(|record| {
+                (
+                    record["mount"].as_str().unwrap(),
+                    record["reserve"]["state"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                ("/data", "exhausted"),
+                ("/backup", "critical"),
+                ("/data", "exhausted"),
+            ]
+        );
+    }
+
+    #[test]
+    fn filtered_reserve_recovery_does_not_hide_next_exhaustion() {
+        let config = NotificationConfig {
+            channels: vec!["journal".into()],
+            ..Default::default()
+        };
+        assert_eq!(config.journal.min_level, NotificationLevel::Warning);
+        let mut manager = NotificationManager::from_config(&config);
+        let delivered = install_probe(&mut manager, "journal", None);
+        let now = Instant::now();
+        for (seconds, bytes) in [(0, 0), (1, 1000), (2, 0), (3, 0)] {
+            manager.notify_at(
+                &reserve_event("/data", bytes, true),
+                now + Duration::from_secs(seconds),
+            );
+        }
+        assert!(manager.drain(Duration::from_secs(5)));
+        assert_eq!(delivered.try_iter().collect::<Vec<_>>(), ["/data", "/data"]);
+    }
+
+    #[test]
+    fn full_notification_queue_does_not_consume_reserve_transition() {
+        let (_directory, config, mut manager) = notification_fixture();
+        let (release, wait) = bounded(1);
+        let delivered = install_probe(&mut manager, "file", Some(wait));
+        manager.notify(&pressure_event("/first", NotificationLevel::Critical));
+        assert_eq!(
+            delivered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "/first"
+        );
+        for index in 0..CHANNEL_QUEUE_CAPACITY {
+            manager.notify(&pressure_event(
+                &format!("/queued-{index}"),
+                NotificationLevel::Critical,
+            ));
+        }
+        let event = reserve_event("/reserve", 0, true);
+        let now = Instant::now();
+        manager.notify_at(&event, now);
+        manager.update_config(&config); // An unchanged destination keeps pacing.
+        for millis in [1, 100, 1000, 4999] {
+            manager.notify_at(&event, now + Duration::from_millis(millis));
+        }
+        assert_eq!(manager.dropped_count(), 1);
+        assert!(manager.reserve_states.is_empty());
+
+        // A different reserve band attempts immediately, before five seconds.
+        let changed = reserve_event("/reserve", 100, true);
+        let changed_at = now + Duration::from_millis(4999);
+        manager.notify_at(&changed, changed_at);
+        assert_eq!(manager.dropped_count(), 2);
+        drop(release);
+        assert!(manager.drain(Duration::from_secs(5)));
+        manager.notify_at(&changed, changed_at + Duration::from_millis(4999));
+        assert!(delivered.try_iter().all(|mount| mount != "/reserve"));
+        manager.notify_at(&changed, changed_at + RESERVE_RETRY_INTERVAL);
+        manager.notify_at(&changed, changed_at + RESERVE_RETRY_INTERVAL);
+        assert!(manager.drain(Duration::from_secs(5)));
+        assert_eq!(manager.dropped_count(), 2);
+        assert!(manager.reserve_retries.is_empty());
+        assert_eq!(
+            delivered
+                .try_iter()
+                .filter(|mount| mount == "/reserve")
+                .count(),
+            1,
+        );
+        assert!(
+            !config.file.path.exists(),
+            "the in-memory probe handled delivery"
+        );
+    }
+
+    #[test]
+    fn reserve_webhook_reports_actual_headroom_and_unknown_inventory_honestly() {
+        use crate::ballast::coordinator::BallastRefillBlocker;
+        use crate::ballast::manager::BallastHeadroom;
+
+        let mut event = reserve_event("/data", 0, true);
+        if let NotificationEvent::BallastReserveChanged { reserve, .. } = &mut event {
+            reserve.headroom = Some(BallastHeadroom {
+                total_bytes: 1_000_000,
+                available_bytes: 151_000,
+                file_size_bytes: 2000,
+                floor_pct: 15.0,
+                free_pct_after: 14.9,
+                can_allocate: false,
+            });
+            reserve.refill_blockers = vec![BallastRefillBlocker::SafetyFloor];
+        }
+        let channel = WebhookChannel {
+            url: "https://example.com".into(),
+            min_level: NotificationLevel::Info,
+            template: r#"{"mount":"${MOUNT}","free":"${FREE_PCT}","summary":"${SUMMARY}"}"#.into(),
+        };
+        let body: serde_json::Value = serde_json::from_str(&channel.render_body(&event)).unwrap();
+        assert_eq!(body["mount"], "/data");
+        assert_eq!(body["free"], "15.1");
+        assert!(body["summary"].as_str().unwrap().contains("14.900%"));
+        assert!(body["summary"].as_str().unwrap().contains("15.000%"));
+
+        let unknown = reserve_event("/data", 0, false);
+        assert_eq!(unknown.level(), NotificationLevel::Warning);
+        assert!(unknown.summary().contains("unknown"));
+        assert!(!unknown.summary().contains("no ballast reserve remains"));
     }
 
     #[test]

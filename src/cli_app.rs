@@ -17,7 +17,10 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use storage_ballast_helper::ballast::coordinator::resolve_configured_pool_alias;
+use storage_ballast_helper::ballast::coordinator::{
+    BallastRefillBlocker, BallastReserveSnapshot, BallastReserveState,
+    resolve_configured_pool_alias,
+};
 use storage_ballast_helper::ballast::manager::{
     BallastAvailability, BallastHealth, BallastManager,
 };
@@ -33,7 +36,8 @@ use storage_ballast_helper::daemon::loop_main::{
 use storage_ballast_helper::daemon::mount_controller::{MountStateRecord, unprotected_pressure};
 use storage_ballast_helper::daemon::process_io_history::ProcessIoHistory;
 use storage_ballast_helper::daemon::self_monitor::{
-    DAEMON_STATE_STALE_THRESHOLD_SECS, assess_logging_placement, detect_daemon_liveness,
+    BallastPoolState, DAEMON_STATE_STALE_THRESHOLD_SECS, assess_logging_placement,
+    detect_daemon_liveness,
 };
 use storage_ballast_helper::daemon::service::{
     LAUNCHD_LABEL_ENV, LaunchdConfig, LaunchdServiceManager, LaunchdStatusReport,
@@ -10695,6 +10699,174 @@ fn count_sacred_scan_overlaps(
     Ok((candidate_count, overlap_count))
 }
 
+/// Reserve protection is independent of pressure. Prefer the running daemon's
+/// observed physical pools; without that evidence inspect all pools read-only
+/// and leave automatic refill eligibility explicitly unknown.
+#[derive(Debug, Serialize)]
+struct BallastReserveStatus {
+    source: &'static str,
+    detail: String,
+    pools: Vec<BallastReserveSnapshot>,
+    skipped_pools: Vec<SkippedBallastPoolStatus>,
+}
+
+/// Discovery decisions stay visible without classifying aliases or deliberately
+/// unmanaged volumes as depleted reserves.
+#[derive(Debug, Serialize)]
+struct SkippedBallastPoolStatus {
+    mount: String,
+    ballast_dir: String,
+    skip_reason: Option<String>,
+}
+
+impl BallastReserveStatus {
+    fn warning_summary(&self) -> Option<String> {
+        if self.source == "unavailable" {
+            return Some(format!("availability unknown: {}", self.detail));
+        }
+        let impaired: Vec<_> = self
+            .pools
+            .iter()
+            .filter(|pool| {
+                !matches!(
+                    pool.state,
+                    BallastReserveState::Healthy | BallastReserveState::Unconfigured
+                )
+            })
+            .map(|pool| format!("{} on {}", pool.state.as_str(), pool.mount_point.display()))
+            .collect();
+        (!impaired.is_empty()).then(|| impaired.join("; "))
+    }
+}
+
+fn daemon_reserve_status(
+    state: &Value,
+    now: chrono::DateTime<chrono::Utc>,
+    current_pid: Option<u32>,
+) -> Option<BallastReserveStatus> {
+    if state
+        .get("stopped_at")
+        .is_some_and(|value| !value.is_null())
+    {
+        return None;
+    }
+    if current_pid
+        .is_some_and(|pid| state.get("pid").and_then(Value::as_u64) != Some(u64::from(pid)))
+    {
+        return None;
+    }
+    let records: Vec<BallastPoolState> =
+        serde_json::from_value(state.get("ballast_pools")?.clone()).ok()?;
+    let mut pools = Vec::new();
+    let mut skipped_pools = Vec::new();
+    for record in records {
+        if record.skipped {
+            skipped_pools.push(SkippedBallastPoolStatus {
+                mount: record.mount,
+                ballast_dir: record.ballast_dir,
+                skip_reason: record.skip_reason,
+            });
+            continue;
+        }
+        let mut reserve = record.reserve?;
+        if reserve.mount_point.to_string_lossy() != record.mount
+            || reserve.ballast_dir.to_string_lossy() != record.ballast_dir
+        {
+            return None;
+        }
+        // A fresh state file can carry old inventory while its observer is
+        // stalled. Preserve the daemon's namespace and healthy sibling rows;
+        // a host-side read must not turn an unreadable daemon pool into a
+        // healthy claim. Expire this pool's evidence independently instead.
+        let age = chrono::DateTime::parse_from_rfc3339(&reserve.observed_at)
+            .ok()
+            .and_then(|observed| now.signed_duration_since(observed).to_std().ok());
+        let pending = reserve.observed_at.is_empty() && !reserve.inventory_authoritative;
+        if pending
+            || age.is_none_or(|age| age >= Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS))
+        {
+            reserve.inventory_authoritative = false;
+            reserve.state = BallastReserveState::classify(reserve.configured_bytes, 0, false);
+            reserve.files_available = 0;
+            reserve.releasable_bytes = 0;
+            reserve.unreadable_count = 0;
+            reserve.headroom = None;
+            reserve.headroom_error = None;
+            reserve.refill_in_progress = false;
+            // These reasons depend on the expired filesystem observation.
+            // Policy reasons in the fresh daemon state remain useful evidence.
+            reserve.refill_blockers.retain(|blocker| {
+                !matches!(
+                    blocker,
+                    BallastRefillBlocker::SafetyFloor
+                        | BallastRefillBlocker::FilesystemStatsUnavailable
+                        | BallastRefillBlocker::ReadOnlyFilesystem
+                        | BallastRefillBlocker::InventoryUnreadable
+                )
+            });
+            let reason = if pending {
+                BallastRefillBlocker::NotEvaluated
+            } else {
+                reserve.headroom_error = Some("reserve observation is stale".into());
+                BallastRefillBlocker::ObservationStale
+            };
+            if !reserve.refill_blockers.contains(&reason) {
+                reserve.refill_blockers.push(reason);
+            }
+        }
+        pools.push(reserve);
+    }
+    pools.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
+    skipped_pools.sort_by(|left, right| left.mount.cmp(&right.mount));
+    Some(BallastReserveStatus {
+        source: "daemon_observation",
+        detail: "Daemon reserve evidence; unobserved or expired inventory is unknown; reserve availability is separate from disk pressure".into(),
+        pools,
+        skipped_pools,
+    })
+}
+
+fn observe_reserve_status(config: &Config, platform: &dyn Platform) -> BallastReserveStatus {
+    use storage_ballast_helper::ballast::coordinator::BallastPoolCoordinator;
+    use storage_ballast_helper::daemon::loop_main::ballast_discovery_paths;
+    use storage_ballast_helper::monitor::special_locations::SpecialLocationRegistry;
+
+    let observed = SpecialLocationRegistry::discover(platform, &[]).and_then(|special| {
+        BallastPoolCoordinator::inventory_for_config(
+            &config.ballast,
+            &ballast_discovery_paths(config, &special),
+            platform,
+            Some(&config.paths.ballast_dir),
+        )
+    });
+    match observed {
+        Ok(pools) => BallastReserveStatus {
+            source: "read_only_inventory",
+            detail: "Read-only inventory visible to this command; no fresh daemon reserve report, so daemon release access, automatic refill policy and cooldown are unknown".into(),
+            pools: pools
+                .iter()
+                .filter(|pool| !pool.skipped)
+                .map(BallastReserveSnapshot::from_observed_inventory)
+                .collect(),
+            skipped_pools: pools
+                .iter()
+                .filter(|pool| pool.skipped)
+                .map(|pool| SkippedBallastPoolStatus {
+                    mount: pool.mount_point.to_string_lossy().into_owned(),
+                    ballast_dir: pool.ballast_dir.to_string_lossy().into_owned(),
+                    skip_reason: pool.skip_reason.clone(),
+                })
+                .collect(),
+        },
+        Err(error) => BallastReserveStatus {
+            source: "unavailable",
+            detail: format!("could not inspect reserve inventory: {error}"),
+            pools: Vec::new(),
+            skipped_pools: Vec::new(),
+        },
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_status(cli: &Cli) -> Result<(), CliError> {
     let config =
@@ -10707,11 +10879,6 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     let mounts = platform
         .mount_points()
         .map_err(|e| CliError::Runtime(e.to_string()))?;
-
-    // Read daemon state.json for EWMA predictions (optional).
-    let daemon_state = std::fs::read_to_string(&config.paths.state_file)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
 
     // Liveness: the daemon's exclusive lock next to state.json is
     // authoritative; state-file age and the service manager's view of the
@@ -10740,6 +10907,23 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             });
         if refreshed { "socket" } else { "state_file" }
     };
+    // Read after the socket's refresh has completed. Reading before it gave
+    // source="socket" to a snapshot that predated the requested update.
+    let daemon_state = std::fs::read_to_string(&config.paths.state_file)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let reserve_status = daemon_running
+        .then(|| read_fresh_daemon_state(&config.paths.state_file))
+        .flatten()
+        .as_ref()
+        .and_then(|state| {
+            daemon_reserve_status(
+                state,
+                chrono::Utc::now(),
+                liveness.lock.as_ref().map(|lock| lock.pid),
+            )
+        })
+        .unwrap_or_else(|| observe_reserve_status(&config, platform.as_ref()));
 
     // Open SQLite database for recent activity (optional, read-only).
     let db_stats = if config.paths.sqlite_db.exists() {
@@ -10801,6 +10985,26 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 println!(
                     "  Daemon: NOT running ({}, {age}) — degraded mode",
                     liveness.reason
+                );
+            }
+
+            if let Some(warning) = reserve_status.warning_summary() {
+                println!("  Reserve WARNING: {warning}");
+            }
+            println!("\nReserve Availability ({}):", reserve_status.source);
+            println!("  {}", reserve_status.detail);
+            for reserve in &reserve_status.pools {
+                println!("  {}", reserve.summary());
+            }
+            for skipped in &reserve_status.skipped_pools {
+                println!(
+                    "  Skipped {} ({}): {}",
+                    skipped.mount,
+                    skipped.ballast_dir,
+                    skipped
+                        .skip_reason
+                        .as_deref()
+                        .unwrap_or("reason not reported"),
                 );
             }
 
@@ -11205,7 +11409,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 &resolve_configured_pool_alias(&config.paths.ballast_dir),
                 &config.ballast,
             );
-            println!("\nBallast:");
+            println!("\nBallast (configured directory only):");
             println!(
                 "  Configured: {} files x {}",
                 config.ballast.file_count,
@@ -11240,8 +11444,8 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             println!("  Health: {}", ballast.health);
             if ballast.health == BallastHealth::Empty {
                 println!(
-                    "  WARNING: a {} reserve is configured but 0 bytes are releasable — \
-                     the emergency reserve does not exist. Run: sbh ballast provision",
+                    "  This directory has 0 bytes releasable of {} configured. See Reserve \
+                     Availability above for per-volume protection and refill conditions.",
                     format_bytes(ballast.configured_pool_bytes),
                 );
             }
@@ -11380,6 +11584,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     .unwrap_or_else(|| json!([])),
             },
                 "ballast": {
+                    "inventory_scope": "configured_directory",
                     "file_count": config.ballast.file_count,
                     "file_size_bytes": config.ballast.file_size_bytes,
                     "total_pool_bytes": ballast_total_pool_bytes(
@@ -11398,6 +11603,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     "unreadable_count": ballast_availability.unreadable_count,
                     "authoritative": ballast_availability.is_authoritative(),
                     "health": ballast_availability.health.as_str(),
+                    "reserves": reserve_status,
                 },
                 "memory": memory_info.as_ref().map(|memory| {
                     let swap_used_bytes = memory.swap_total_bytes.saturating_sub(memory.swap_free_bytes);
@@ -22536,6 +22742,8 @@ mod tests {
         for path in ["debug/deps/libx.rlib", "debug/deps", "debug", ""] {
             filetime::set_file_mtime(pool.join(path), stamp).unwrap();
         }
+        // The idle window includes activity at the cache root itself.
+        filetime::set_file_mtime(&pool, stamp).unwrap();
         let signals = StructuralSignals {
             has_incremental: true,
             has_deps: true,
@@ -24194,5 +24402,282 @@ mod tests {
         assert_eq!(scan_ab_cpu_ratio(Some(1), Some(0)), None);
         assert!((scan_ab_entries_ratio(200, 100) - 2.0).abs() < 1e-9);
         assert!((scan_ab_entries_ratio(0, 0) - 0.0).abs() < 1e-9);
+    }
+
+    fn reserve_status_fixture(mount: &str, bytes: u64, authoritative: bool) -> BallastPoolState {
+        use storage_ballast_helper::ballast::coordinator::BallastRefillBlocker;
+
+        let reserve = BallastReserveSnapshot {
+            observed_at: "2026-11-12T12:05:35Z".into(),
+            mount_point: mount.into(),
+            ballast_dir: PathBuf::from(mount).join(".sbh/ballast"),
+            files_available: usize::try_from(bytes / 100).unwrap(),
+            files_total: 10,
+            releasable_bytes: bytes,
+            configured_bytes: 1000,
+            state: BallastReserveState::classify(1000, bytes, authoritative),
+            inventory_authoritative: authoritative,
+            unreadable_count: usize::from(!authoritative),
+            headroom: None,
+            headroom_error: None,
+            refill_blockers: vec![BallastRefillBlocker::PressurePolicy],
+            refill_in_progress: false,
+        };
+        BallastPoolState {
+            mount: mount.into(),
+            ballast_dir: reserve.ballast_dir.display().to_string(),
+            available: reserve.files_available,
+            total: reserve.files_total,
+            releasable_bytes: reserve.releasable_bytes,
+            reserve: Some(reserve),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn status_reserve_report_keeps_pool_risk_separate_from_yellow_pressure() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:06:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let state = json!({
+            "pid": 42,
+            "pressure": {"level": "yellow"},
+            "ballast_pools": [
+                reserve_status_fixture("/healthy", 1000, true),
+                reserve_status_fixture("/empty", 0, true),
+                reserve_status_fixture("/small", 200, true),
+                BallastPoolState { mount: "/alias".into(), skipped: true, ..Default::default() },
+            ],
+        });
+        let report = daemon_reserve_status(&state, now, Some(42)).unwrap();
+        assert_eq!(report.source, "daemon_observation");
+        assert_eq!(report.pools.len(), 3);
+        assert_eq!(
+            report.warning_summary().as_deref(),
+            Some("exhausted on /empty; critical on /small")
+        );
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["pools"][0]["state"], "exhausted");
+        assert_eq!(encoded["pools"][0]["refill_blockers"][0], "pressure_policy");
+        assert!(
+            report.pools[0]
+                .summary()
+                .contains("no ballast reserve remains")
+        );
+    }
+
+    #[test]
+    fn status_keeps_skipped_pool_reasons_without_inventing_reserve_warnings() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:06:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let skipped: Vec<_> = [
+            (
+                "/alias",
+                "same filesystem as /healthy (its pool serves this mount)",
+            ),
+            ("/readonly", "read-only filesystem"),
+            (
+                "/unreadable",
+                "failed to stat filesystem: permission denied",
+            ),
+        ]
+        .into_iter()
+        .map(|(mount, reason)| BallastPoolState {
+            mount: mount.into(),
+            ballast_dir: format!("{mount}/.sbh/ballast"),
+            skipped: true,
+            skip_reason: Some(reason.into()),
+            ..Default::default()
+        })
+        .collect();
+        let mut records = skipped.clone();
+        records.push(reserve_status_fixture("/healthy", 1000, true));
+        let state = json!({ "pid": 42, "ballast_pools": records });
+        let report = daemon_reserve_status(&state, now, Some(42)).unwrap();
+        assert_eq!(report.pools.len(), 1);
+        assert!(report.warning_summary().is_none());
+        assert_eq!(report.skipped_pools.len(), skipped.len());
+        let encoded = serde_json::to_value(&report).unwrap();
+        for (index, expected) in skipped.iter().enumerate() {
+            assert_eq!(encoded["skipped_pools"][index]["mount"], expected.mount);
+            assert_eq!(
+                encoded["skipped_pools"][index]["ballast_dir"],
+                expected.ballast_dir
+            );
+            assert_eq!(
+                encoded["skipped_pools"][index]["skip_reason"],
+                json!(expected.skip_reason)
+            );
+            assert!(encoded["skipped_pools"][index].get("state").is_none());
+        }
+    }
+
+    #[test]
+    fn status_read_only_inventory_retains_readonly_and_stat_failure_reasons() {
+        let directory = TempDir::new().unwrap();
+        let mount = directory.path().to_path_buf();
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![mount.clone()];
+        config.paths.ballast_dir = mount.join("ballast");
+        config.paths.state_file = mount.join("state.json");
+        for readonly in [true, false] {
+            let stats = if readonly {
+                HashMap::from([(
+                    mount.clone(),
+                    FsStats {
+                        total_bytes: 100_000_000,
+                        free_bytes: 50_000_000,
+                        available_bytes: 50_000_000,
+                        fs_type: "ext4".into(),
+                        mount_point: mount.clone(),
+                        is_readonly: true,
+                    },
+                )])
+            } else {
+                HashMap::new()
+            };
+            let platform = MockPlatform::new(
+                vec![MountPoint {
+                    path: mount.clone(),
+                    device: "mock-reserve-device".into(),
+                    fs_type: "ext4".into(),
+                    is_ram_backed: false,
+                }],
+                stats,
+                MockPlatform::healthy().memory_info().unwrap(),
+                PlatformPaths::default(),
+            );
+            let expected_reason = if readonly {
+                "read-only filesystem".to_owned()
+            } else {
+                format!(
+                    "failed to stat filesystem: {}",
+                    platform.fs_stats(&mount).unwrap_err()
+                )
+            };
+            let report = observe_reserve_status(&config, &platform);
+            assert_eq!(report.source, "read_only_inventory");
+            assert!(report.pools.is_empty());
+            assert!(report.warning_summary().is_none());
+            assert_eq!(report.skipped_pools.len(), 1);
+            assert_eq!(report.skipped_pools[0].mount, mount.to_string_lossy());
+            assert_eq!(
+                report.skipped_pools[0].skip_reason.as_deref(),
+                Some(expected_reason.as_str())
+            );
+            assert!(!config.paths.ballast_dir.exists(), "status created a pool");
+        }
+    }
+
+    #[test]
+    fn status_reserve_expires_stale_rows_and_rejects_stopped_or_replaced_runs() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:06:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let state = json!({
+            "pid": 42,
+            "ballast_pools": [
+                reserve_status_fixture("/data", 1000, true),
+                reserve_status_fixture("/healthy", 1000, true),
+            ],
+        });
+        assert!(daemon_reserve_status(&state, now, Some(42)).is_some());
+        assert!(daemon_reserve_status(&state, now, Some(43)).is_none());
+        for observed_at in ["2026-11-12T12:00:00Z", "2026-11-12T13:00:00Z", "", "bad"] {
+            let mut stale = state.clone();
+            stale["ballast_pools"][0]["reserve"]["observed_at"] = json!(observed_at);
+            stale["ballast_pools"][0]["reserve"]["unreadable_count"] = json!(7);
+            stale["ballast_pools"][0]["reserve"]["refill_blockers"] = json!([
+                BallastRefillBlocker::PressurePolicy,
+                BallastRefillBlocker::SafetyFloor,
+                BallastRefillBlocker::FilesystemStatsUnavailable,
+                BallastRefillBlocker::ReadOnlyFilesystem,
+                BallastRefillBlocker::InventoryUnreadable,
+            ]);
+            let report = daemon_reserve_status(&stale, now, Some(42)).unwrap();
+            assert_eq!(report.pools[0].state, BallastReserveState::Unknown);
+            assert_eq!(report.pools[0].releasable_bytes, 0);
+            assert!(!report.pools[0].inventory_authoritative);
+            assert_eq!(report.pools[0].unreadable_count, 0);
+            assert!(report.pools[0].headroom.is_none());
+            assert_eq!(
+                report.pools[0].refill_blockers,
+                vec![
+                    BallastRefillBlocker::PressurePolicy,
+                    BallastRefillBlocker::ObservationStale,
+                ]
+            );
+            assert!(
+                report.pools[0]
+                    .refill_blockers
+                    .contains(&BallastRefillBlocker::ObservationStale)
+            );
+            assert_eq!(report.pools[1].state, BallastReserveState::Healthy);
+            assert_eq!(report.source, "daemon_observation");
+        }
+        let mut stopped = state.clone();
+        stopped["stopped_at"] = json!("2026-11-12T12:05:40Z");
+        assert!(daemon_reserve_status(&stopped, now, Some(42)).is_none());
+
+        let mut changed = state.clone();
+        changed["ballast_pools"][0]["ballast_dir"] = json!("/new/pool");
+        assert!(daemon_reserve_status(&changed, now, Some(42)).is_none());
+
+        let mut unobserved = state;
+        unobserved["ballast_pools"][0]["reserve"] = Value::Null;
+        assert!(daemon_reserve_status(&unobserved, now, Some(42)).is_none());
+    }
+
+    #[test]
+    fn status_unreadable_reserve_is_unknown_in_summary_and_json() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:06:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let state = json!({
+            "pid": 42,
+            "ballast_pools": [reserve_status_fixture("/data", 0, false)],
+        });
+        let report = daemon_reserve_status(&state, now, Some(42)).unwrap();
+        assert_eq!(
+            report.warning_summary().as_deref(),
+            Some("unknown on /data")
+        );
+        assert!(
+            !report.pools[0]
+                .summary()
+                .contains("no ballast reserve remains")
+        );
+        let encoded = serde_json::to_value(report).unwrap();
+        assert_eq!(encoded["pools"][0]["state"], "unknown");
+        assert_eq!(encoded["pools"][0]["inventory_authoritative"], false);
+    }
+
+    #[test]
+    fn status_pending_daemon_inventory_keeps_its_namespace_and_policy_reason() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:06:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut record = reserve_status_fixture("/data", 0, false);
+        record.reserve.as_mut().unwrap().observed_at.clear();
+        let state = json!({ "pid": 42, "ballast_pools": [record] });
+        let report = daemon_reserve_status(&state, now, Some(42)).unwrap();
+        assert_eq!(report.source, "daemon_observation");
+        assert_eq!(report.pools[0].state, BallastReserveState::Unknown);
+        assert!(
+            report.pools[0]
+                .refill_blockers
+                .contains(&BallastRefillBlocker::PressurePolicy)
+        );
+        assert!(
+            report.pools[0]
+                .refill_blockers
+                .contains(&BallastRefillBlocker::NotEvaluated)
+        );
+        assert!(
+            !report.pools[0]
+                .summary()
+                .contains("no ballast reserve remains")
+        );
     }
 }

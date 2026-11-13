@@ -42,7 +42,7 @@ pub(super) fn check_remaining(
     })
 }
 
-fn evaluate(
+pub(super) fn evaluate(
     stats: &FsStats,
     file_bytes: u64,
     floor_pct: f64,
@@ -594,5 +594,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn reserve_headroom_reports_the_after_file_floor_not_the_current_percentage() {
+        use crate::ballast::manager::{BallastHeadroom, ProvisionFloor};
+
+        let gib = 1_u64 << 30;
+        let total = 698 * gib;
+        let floor = ProvisionFloor::Fixed(15.0);
+        for (available, expected) in [(total * 151 / 1000, false), (total * 152 / 1000, true)] {
+            let reading = stats(total, available);
+            let headroom = BallastHeadroom::evaluate(&reading, gib, floor).unwrap();
+            assert!(reading.free_pct() > 15.0);
+            assert_eq!(headroom.can_allocate, expected);
+            assert_eq!(headroom.free_pct_after >= headroom.floor_pct, expected);
+            assert_eq!(headroom.available_bytes, available);
+        }
+    }
+
+    #[test]
+    fn reserve_headroom_preserves_exact_admission_and_capacity_errors() {
+        use crate::ballast::manager::{BallastHeadroom, ProvisionFloor};
+
+        for total in [1_u64, 997, 1_u64 << 54, u64::MAX] {
+            for floor in [0_u8, 15, 100] {
+                for available in [0, total / 2, total] {
+                    for file in [1, 8192, u64::MAX] {
+                        let minimum = (u128::from(total) * u128::from(floor)).div_ceil(100);
+                        let expected = u128::from(available) >= minimum + u128::from(file);
+                        let headroom = BallastHeadroom::evaluate(
+                            &stats(total, available),
+                            file,
+                            ProvisionFloor::Fixed(f64::from(floor)),
+                        )
+                        .unwrap();
+                        assert_eq!(headroom.can_allocate, expected);
+                    }
+                }
+            }
+        }
+        let floor = ProvisionFloor::Fixed(15.0);
+        assert!(BallastHeadroom::evaluate(&stats(0, 0), 1, floor).is_err());
+        assert!(BallastHeadroom::evaluate(&stats(100, 101), 1, floor).is_err());
+        let mut readonly = stats(100, 99);
+        readonly.is_readonly = true;
+        assert_eq!(
+            BallastHeadroom::evaluate(&readonly, 1, floor).unwrap_err(),
+            "filesystem is read-only",
+        );
     }
 }

@@ -11,9 +11,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::ballast::manager::{
-    BallastAvailability, BallastHealth, BallastManager, ProvisionFloor, ProvisionReport,
-    ReleaseReport, VerifyReport, orphan_ballast_files,
+    BallastAvailability, BallastHeadroom, BallastHealth, BallastManager, ProvisionFloor,
+    ProvisionReport, ReleaseReport, VerifyReport, orphan_ballast_files,
 };
 use crate::core::config::BallastConfig;
 use crate::core::errors::Result;
@@ -136,6 +138,288 @@ pub struct PoolInventory {
     pub skip_reason: Option<String>,
 }
 
+/// Availability of the instant-release ballast reserve, independent of disk
+/// pressure. A Yellow filesystem can have a healthy or exhausted reserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BallastReserveState {
+    /// No reserve bytes are configured for this pool.
+    Unconfigured,
+    /// Confirmed reserve meets or exceeds the configured byte target.
+    Healthy,
+    /// Confirmed reserve exceeds one quarter but is below the byte target.
+    Depleted,
+    /// A positive confirmed reserve of at most one quarter of the byte target.
+    Critical,
+    /// Current authoritative inventory confirms no releasable reserve bytes.
+    Exhausted,
+    /// Current reserve availability cannot be confirmed.
+    Unknown,
+}
+
+impl BallastReserveState {
+    /// Critically depleted means a positive reserve of at most one quarter
+    /// of configured bytes. Integer arithmetic makes the boundary exact,
+    /// including pools above the range of exactly representable f64 values.
+    pub fn classify(configured_bytes: u64, releasable_bytes: u64, authoritative: bool) -> Self {
+        if configured_bytes == 0 {
+            Self::Unconfigured
+        } else if !authoritative {
+            Self::Unknown
+        } else if releasable_bytes == 0 {
+            Self::Exhausted
+        } else if u128::from(releasable_bytes) * 4 <= u128::from(configured_bytes) {
+            Self::Critical
+        } else if releasable_bytes < configured_bytes {
+            Self::Depleted
+        } else {
+            Self::Healthy
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unconfigured => "unconfigured",
+            Self::Healthy => "healthy",
+            Self::Depleted => "depleted",
+            Self::Critical => "critical",
+            Self::Exhausted => "exhausted",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// A current reason automatic refill cannot proceed. These reasons describe
+/// existing safety and scheduling decisions; none grants allocation authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BallastRefillBlocker {
+    NotEvaluated,
+    PressurePolicy,
+    Forecast,
+    RamPressure,
+    InodePressure,
+    MountRecovery,
+    MountInactive,
+    DryRun,
+    KillSwitch,
+    Shutdown,
+    Cooldown,
+    WorkerBusy,
+    InventoryUnreadable,
+    FilesystemStatsUnavailable,
+    ReadOnlyFilesystem,
+    ObservationStale,
+    SafetyFloor,
+}
+
+impl BallastRefillBlocker {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotEvaluated => "not_evaluated",
+            Self::PressurePolicy => "pressure_policy",
+            Self::Forecast => "forecast",
+            Self::RamPressure => "ram_pressure",
+            Self::InodePressure => "inode_pressure",
+            Self::MountRecovery => "mount_recovery",
+            Self::MountInactive => "mount_inactive",
+            Self::DryRun => "dry_run",
+            Self::KillSwitch => "kill_switch",
+            Self::Shutdown => "shutdown",
+            Self::Cooldown => "cooldown",
+            Self::WorkerBusy => "worker_busy",
+            Self::InventoryUnreadable => "inventory_unreadable",
+            Self::FilesystemStatsUnavailable => "filesystem_stats_unavailable",
+            Self::ReadOnlyFilesystem => "read_only_filesystem",
+            Self::ObservationStale => "observation_stale",
+            Self::SafetyFloor => "safety_floor",
+        }
+    }
+
+    pub const fn explanation(self) -> &'static str {
+        match self {
+            Self::NotEvaluated => "automatic refill eligibility has not been evaluated",
+            Self::PressurePolicy => "the current pressure policy suppresses refill",
+            Self::Forecast => "the pressure forecast indicates imminent danger",
+            Self::RamPressure => "RAM-backed pressure is being relieved",
+            Self::InodePressure => "inode pressure is being relieved",
+            Self::MountRecovery => "the filesystem is in recovery",
+            Self::MountInactive => "the mount is not eligible for reserve maintenance",
+            Self::DryRun => "scanner dry-run is enabled",
+            Self::KillSwitch => "the policy kill switch is enabled",
+            Self::Shutdown => "the daemon is shutting down",
+            Self::Cooldown => "the refill cooldown or attempt interval has not elapsed",
+            Self::WorkerBusy => "a refill worker is still occupied",
+            Self::InventoryUnreadable => "reserve inventory could not be read reliably",
+            Self::FilesystemStatsUnavailable => "filesystem headroom could not be established",
+            Self::ReadOnlyFilesystem => "the filesystem is read-only",
+            Self::ObservationStale => "the reserve observation is stale",
+            Self::SafetyFloor => "another configured file would cross the safety floor",
+        }
+    }
+}
+
+/// A read-only, per-physical-pool reserve observation for status and alerts.
+///
+/// The byte count estimates allocation; filesystem snapshots can retain
+/// extents after unlink. Without authoritative inventory, observed quantities
+/// do not establish a usable reserve.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BallastReserveSnapshot {
+    /// Completion time of the read-only observation, in RFC3339 UTC. Empty
+    /// for an explicitly unobserved or pending pool.
+    #[serde(default)]
+    pub observed_at: String,
+    /// Canonical mount whose physical pool this observation describes.
+    #[serde(with = "crate::core::path_serde")]
+    pub mount_point: PathBuf,
+    /// Active pool directory; retained with mount identity across reporting.
+    #[serde(with = "crate::core::path_serde")]
+    pub ballast_dir: PathBuf,
+    /// Observed valid files, including validated stranded reserve.
+    pub files_available: usize,
+    /// Number of files requested by the per-volume configuration.
+    pub files_total: usize,
+    /// Observed allocation estimate, usable only when inventory is authoritative.
+    pub releasable_bytes: u64,
+    /// Per-volume configured file count multiplied by configured file size.
+    pub configured_bytes: u64,
+    /// Reserve coverage band, separate from the filesystem pressure level.
+    pub state: BallastReserveState,
+    /// Whether current releasable availability is confirmed. Unreadable
+    /// inventory or a read-only filesystem cannot establish usable reserve.
+    pub inventory_authoritative: bool,
+    /// Entries whose readability could not be established during observation.
+    pub unreadable_count: usize,
+    /// Exact existing per-file floor decision, explained without allocating.
+    pub headroom: Option<BallastHeadroom>,
+    /// Failure to obtain a usable headroom observation, when applicable.
+    pub headroom_error: Option<String>,
+    /// Current policy, scheduling, and observation reasons preventing refill.
+    #[serde(default)]
+    pub refill_blockers: Vec<BallastRefillBlocker>,
+    /// An existing replenishment worker is currently processing this pool.
+    #[serde(default)]
+    pub refill_in_progress: bool,
+}
+
+impl BallastReserveSnapshot {
+    /// Describe a configured pool whose current inventory has not been
+    /// observed. Cached actuator counts are never presented as proof that a
+    /// reserve is present or exhausted.
+    pub fn from_inventory(pool: &PoolInventory) -> Self {
+        let mut snapshot = Self::from_observed_inventory(pool);
+        snapshot.observed_at.clear();
+        snapshot.inventory_authoritative = false;
+        snapshot.state = BallastReserveState::classify(pool.configured_bytes, 0, false);
+        snapshot.files_available = 0;
+        snapshot.releasable_bytes = 0;
+        snapshot.unreadable_count = 0;
+        snapshot
+    }
+
+    /// Build from fresh `inventory_for_config` evidence for read-only CLI
+    /// output. Do not pass the daemon's cached `inventory()` to this method.
+    pub fn from_observed_inventory(pool: &PoolInventory) -> Self {
+        let authoritative = pool.health != BallastHealth::Indeterminate;
+        Self {
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            mount_point: pool.mount_point.clone(),
+            ballast_dir: pool.ballast_dir.clone(),
+            files_available: pool.files_available,
+            files_total: pool.files_total,
+            releasable_bytes: pool.releasable_bytes,
+            configured_bytes: pool.configured_bytes,
+            state: BallastReserveState::classify(
+                pool.configured_bytes,
+                pool.releasable_bytes,
+                authoritative,
+            ),
+            inventory_authoritative: authoritative,
+            unreadable_count: usize::from(!authoritative),
+            headroom: None,
+            headroom_error: None,
+            refill_blockers: vec![BallastRefillBlocker::NotEvaluated],
+            refill_in_progress: false,
+        }
+    }
+
+    /// Shared operator explanation for the ordinary status and notification
+    /// stream. Pressure is deliberately not raised or rewritten by this view.
+    pub fn summary(&self) -> String {
+        let state = match self.state {
+            BallastReserveState::Critical => "critically depleted (at most 25% remains)",
+            state => state.as_str(),
+        };
+        let quantity = if self.inventory_authoritative {
+            "bytes releasable"
+        } else {
+            "bytes observed"
+        };
+        let mut message = format!(
+            "Ballast reserve {state} on {}: {}/{} files, {}/{} {quantity}",
+            self.mount_point.display(),
+            self.files_available,
+            self.files_total,
+            self.releasable_bytes,
+            self.configured_bytes,
+        );
+        if self.state == BallastReserveState::Exhausted {
+            message.push_str("; no ballast reserve remains to release");
+        } else if self.state == BallastReserveState::Unknown {
+            message.push_str(
+                "; availability could not be confirmed; observed quantities are not a confirmed reserve",
+            );
+        }
+        if matches!(
+            self.state,
+            BallastReserveState::Unconfigured | BallastReserveState::Healthy
+        ) {
+            return message;
+        }
+        if self.refill_in_progress {
+            message.push_str("; refill is in progress");
+        } else if !self.refill_blockers.is_empty() {
+            message.push_str("; refill: ");
+            message.push_str(
+                &self
+                    .refill_blockers
+                    .iter()
+                    .map(|reason| reason.explanation())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        } else if self.state == BallastReserveState::Unknown {
+            message.push_str("; refill eligibility is unknown");
+        } else if self.state != BallastReserveState::Healthy {
+            message.push_str("; refill is eligible under the current policy");
+        }
+        if let Some(headroom) = self.headroom {
+            use std::fmt::Write;
+
+            // Percentages are display-only. `can_allocate` comes from the
+            // exact integer admission predicate, not these rounded values.
+            let _ = write!(
+                message,
+                "; now {:.3}% free; another {}-byte file would leave {:.3}% free (safety floor {:.3}%; {})",
+                headroom.available_bytes as f64 / headroom.total_bytes as f64 * 100.0,
+                headroom.file_size_bytes,
+                headroom.free_pct_after,
+                headroom.floor_pct,
+                if headroom.can_allocate {
+                    "fits"
+                } else {
+                    "does not fit"
+                },
+            );
+        } else if let Some(error) = &self.headroom_error {
+            message.push_str("; headroom unavailable: ");
+            message.push_str(error);
+        }
+        message
+    }
+}
+
 /// A pool the coordinator would manage, before any manager is opened.
 #[derive(Debug, Clone)]
 struct PlannedPool {
@@ -223,6 +507,123 @@ impl BallastReplenishment {
     pub(crate) fn run(&mut self, still_allowed: &dyn Fn() -> bool) -> Result<ProvisionReport> {
         provision::replenish_one_guarded(&mut self.pool, still_allowed)
     }
+}
+
+/// Owned, memory-only capture to hand to a bounded background observer. Its
+/// read-only I/O must not run on the daemon's pressure-monitoring thread.
+pub(crate) struct BallastReserveObservation {
+    origin: Arc<()>,
+    pools: Vec<ReserveProbePool>,
+}
+
+struct ReserveProbePool {
+    mount_point: PathBuf,
+    ballast_dir: PathBuf,
+    config: BallastConfig,
+    floor: ProvisionFloor,
+    stranded: StrandedReserve,
+    revision: u64,
+}
+
+/// Completed observations retain their mutation epochs until accepted by the
+/// coordinator. A slow observer can never resurrect a reserve after a release.
+pub(crate) struct BallastReserveObservationResult {
+    origin: Arc<()>,
+    snapshots: Vec<(u64, BallastReserveSnapshot)>,
+}
+
+impl BallastReserveObservation {
+    pub(crate) fn run(self, platform: &dyn Platform) -> BallastReserveObservationResult {
+        let snapshots = self
+            .pools
+            .into_iter()
+            .map(|pool| {
+                let observed = BallastAvailability::observe(&pool.ballast_dir, &pool.config);
+                let (stranded_count, stranded_bytes, stranded_unreadable) = pool.stranded.observe();
+                let unreadable_count = observed
+                    .unreadable_count
+                    .saturating_add(stranded_unreadable);
+                let releasable_bytes = observed.releasable_bytes.saturating_add(stranded_bytes);
+                let mut refill_blockers = vec![BallastRefillBlocker::NotEvaluated];
+                if unreadable_count > 0 {
+                    refill_blockers.push(BallastRefillBlocker::InventoryUnreadable);
+                }
+                let headroom = observe_headroom(&pool, platform);
+                let (headroom, headroom_error) = match headroom {
+                    Ok(headroom) => {
+                        if !headroom.can_allocate {
+                            refill_blockers.push(BallastRefillBlocker::SafetyFloor);
+                        }
+                        (Some(headroom), None)
+                    }
+                    Err((blocker, error)) => {
+                        refill_blockers.push(blocker);
+                        (None, Some(error))
+                    }
+                };
+                let inventory_authoritative = unreadable_count == 0
+                    && !refill_blockers.contains(&BallastRefillBlocker::ReadOnlyFilesystem);
+                let snapshot = BallastReserveSnapshot {
+                    observed_at: chrono::Utc::now().to_rfc3339(),
+                    mount_point: pool.mount_point,
+                    ballast_dir: pool.ballast_dir,
+                    files_available: observed.available_count.saturating_add(stranded_count),
+                    files_total: observed.configured_count,
+                    releasable_bytes,
+                    configured_bytes: observed.configured_pool_bytes,
+                    state: BallastReserveState::classify(
+                        observed.configured_pool_bytes,
+                        releasable_bytes,
+                        inventory_authoritative,
+                    ),
+                    inventory_authoritative,
+                    unreadable_count,
+                    headroom,
+                    headroom_error,
+                    refill_blockers,
+                    refill_in_progress: false,
+                };
+                (pool.revision, snapshot)
+            })
+            .collect();
+        BallastReserveObservationResult {
+            origin: self.origin,
+            snapshots,
+        }
+    }
+}
+
+fn observe_headroom(
+    pool: &ReserveProbePool,
+    platform: &dyn Platform,
+) -> std::result::Result<BallastHeadroom, (BallastRefillBlocker, String)> {
+    let unavailable = |error: String| (BallastRefillBlocker::FilesystemStatsUnavailable, error);
+    // A reserve may never have been provisioned. Inspect its nearest existing
+    // ancestor without creating the missing directory. Do not skip a denied or
+    // otherwise unreadable ancestor in search of a more optimistic reading.
+    let mut path = pool.ballast_dir.as_path();
+    loop {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                path = path.parent().ok_or_else(|| {
+                    unavailable("no existing parent for ballast pool".to_string())
+                })?;
+            }
+            Err(error) => return Err(unavailable(error.to_string())),
+        }
+    }
+    let stats = platform
+        .fs_stats(path)
+        .map_err(|error| unavailable(error.to_string()))?;
+    BallastHeadroom::evaluate(&stats, pool.config.file_size_bytes, pool.floor).map_err(|error| {
+        let blocker = if stats.is_readonly {
+            BallastRefillBlocker::ReadOnlyFilesystem
+        } else {
+            BallastRefillBlocker::FilesystemStatsUnavailable
+        };
+        (blocker, error.to_string())
+    })
 }
 
 /// The mount planning decided on: pools to build, mounts skipped with a
@@ -839,6 +1240,89 @@ impl BallastPoolCoordinator {
 
         inventory.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
         inventory
+    }
+
+    /// Describe every managed physical pool without any filesystem access.
+    /// Pending or stalled observers must remain visible as unknown instead of
+    /// disappearing from status or borrowing the actuator's cached bytes.
+    pub(crate) fn reserve_observation_seeds(&self) -> Vec<BallastReserveSnapshot> {
+        let mut snapshots: Vec<_> = self
+            .pools
+            .values()
+            .map(|pool| {
+                let configured_bytes = pool.manager.configured_pool_bytes();
+                BallastReserveSnapshot {
+                    observed_at: String::new(),
+                    mount_point: pool.mount_point.clone(),
+                    ballast_dir: pool.ballast_dir.clone(),
+                    files_available: 0,
+                    files_total: pool.expected_count(),
+                    releasable_bytes: 0,
+                    configured_bytes,
+                    state: BallastReserveState::classify(configured_bytes, 0, false),
+                    inventory_authoritative: false,
+                    unreadable_count: 0,
+                    headroom: None,
+                    headroom_error: None,
+                    refill_blockers: vec![BallastRefillBlocker::NotEvaluated],
+                    refill_in_progress: false,
+                }
+            })
+            .collect();
+        snapshots.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
+        snapshots
+    }
+
+    /// Capture each physical pool exactly once, including its per-volume
+    /// target and current mutation epoch. This method performs no I/O.
+    pub(crate) fn prepare_reserve_observation(&self) -> BallastReserveObservation {
+        let mut pools: Vec<_> = self
+            .pools
+            .values()
+            .map(|pool| ReserveProbePool {
+                mount_point: pool.mount_point.clone(),
+                ballast_dir: pool.ballast_dir.clone(),
+                config: pool.manager.config().clone(),
+                floor: pool.manager.provision_floor(),
+                stranded: pool.stranded.clone(),
+                revision: self
+                    .pool_revisions
+                    .get(&pool.mount_point)
+                    .copied()
+                    .unwrap_or(0),
+            })
+            .collect();
+        pools.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
+        BallastReserveObservation {
+            origin: Arc::clone(&self.worker_origin),
+            pools,
+        }
+    }
+
+    /// Publish only observations still belonging to the same pool, config
+    /// generation and release/refill revision. Does not update actuator state.
+    pub(crate) fn accept_reserve_observation(
+        &self,
+        result: BallastReserveObservationResult,
+    ) -> Vec<BallastReserveSnapshot> {
+        if !Arc::ptr_eq(&self.worker_origin, &result.origin) {
+            return Vec::new();
+        }
+        result
+            .snapshots
+            .into_iter()
+            .filter_map(|(revision, snapshot)| {
+                let pool = self.pools.get(&snapshot.mount_point)?;
+                (pool.ballast_dir == snapshot.ballast_dir
+                    && self
+                        .pool_revisions
+                        .get(&snapshot.mount_point)
+                        .copied()
+                        .unwrap_or(0)
+                        == revision)
+                    .then_some(snapshot)
+            })
+            .collect()
     }
 
     /// Total releasable bytes across all pools.
@@ -2997,5 +3481,303 @@ mod tests {
             &platform,
             &mounts
         ));
+    }
+
+    #[test]
+    fn reserve_bands_use_authoritative_bytes_and_an_exact_quarter_boundary() {
+        use BallastReserveState::{Critical, Depleted, Exhausted, Healthy, Unconfigured, Unknown};
+
+        for (configured, present, authoritative, expected) in [
+            (0, 0, true, Unconfigured),
+            (0, 100, false, Unconfigured),
+            (100, 0, false, Unknown),
+            (100, 100, false, Unknown),
+            (100, 0, true, Exhausted),
+            (100, 1, true, Critical),
+            (100, 25, true, Critical),
+            (100, 26, true, Depleted),
+            (100, 99, true, Depleted),
+            (100, 100, true, Healthy),
+            (100, 101, true, Healthy),
+            (u64::MAX, u64::MAX / 4, true, Critical),
+            (u64::MAX, u64::MAX / 4 + 1, true, Depleted),
+            (u64::MAX, u64::MAX, true, Healthy),
+        ] {
+            assert_eq!(
+                BallastReserveState::classify(configured, present, authoritative),
+                expected,
+                "configured={configured} present={present} authoritative={authoritative}",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reserve_snapshot_round_trips_native_paths_without_breaking_state_writes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mount_point = PathBuf::from(OsString::from_vec(b"/volume-\xff".to_vec()));
+        let snapshot = BallastReserveSnapshot {
+            observed_at: "2026-11-12T12:00:00Z".into(),
+            ballast_dir: mount_point.join(".sbh/ballast"),
+            mount_point,
+            files_available: 0,
+            files_total: 10,
+            releasable_bytes: 0,
+            configured_bytes: 10 * 8192,
+            state: BallastReserveState::Unknown,
+            inventory_authoritative: false,
+            unreadable_count: 1,
+            headroom: None,
+            headroom_error: None,
+            refill_blockers: vec![BallastRefillBlocker::InventoryUnreadable],
+            refill_in_progress: false,
+        };
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert!(encoded["mount_point"]["unix_bytes"].is_array());
+        assert!(encoded["ballast_dir"]["unix_bytes"].is_array());
+        let decoded: BallastReserveSnapshot = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn reserve_observation_tracks_releases_recovery_and_restart_on_each_volume() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let platform = mock_platform_two_volumes(first.path(), second.path());
+        let watched = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+        let config = BallastConfig {
+            file_count: 4,
+            ..tiny_ballast_config()
+        };
+        let mut coordinator =
+            BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        coordinator.set_provision_floor(0.0);
+        assert_eq!(
+            coordinator
+                .provision_all(&platform)
+                .unwrap()
+                .total_files_created(),
+            8,
+        );
+        let observe = |coordinator: &BallastPoolCoordinator| {
+            coordinator.accept_reserve_observation(
+                coordinator.prepare_reserve_observation().run(&platform),
+            )
+        };
+        let snapshots = observe(&coordinator);
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots.iter().all(|snapshot| {
+            snapshot.state == BallastReserveState::Healthy
+                && snapshot.inventory_authoritative
+                && snapshot.files_available == 4
+        }));
+
+        coordinator.release_for_mount(first.path(), 2).unwrap();
+        let snapshots = observe(&coordinator);
+        let first_snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.mount_point == first.path())
+            .unwrap();
+        assert_eq!(first_snapshot.state, BallastReserveState::Depleted);
+        coordinator.release_for_mount(first.path(), 1).unwrap();
+        let snapshots = observe(&coordinator);
+        assert_eq!(
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.mount_point == first.path())
+                .unwrap()
+                .state,
+            BallastReserveState::Critical,
+        );
+        coordinator.release_for_mount(first.path(), 1).unwrap();
+
+        // Read-only restart discovery has no release history, yet establishes
+        // that the first pool is empty and the second still protects its mount.
+        let mut restarted = BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        restarted.set_provision_floor(0.0);
+        for _ in 0..3 {
+            for snapshot in observe(&restarted) {
+                let expected = if snapshot.mount_point == first.path() {
+                    BallastReserveState::Exhausted
+                } else {
+                    BallastReserveState::Healthy
+                };
+                assert_eq!(snapshot.state, expected);
+                assert!(snapshot.headroom.unwrap().can_allocate);
+            }
+        }
+        for _ in 0..4 {
+            assert_eq!(
+                restarted
+                    .replenish_for_mount(first.path(), None)
+                    .unwrap()
+                    .unwrap()
+                    .files_created,
+                1,
+            );
+        }
+        assert!(
+            observe(&restarted)
+                .iter()
+                .all(|snapshot| snapshot.state == BallastReserveState::Healthy)
+        );
+    }
+
+    #[test]
+    fn reserve_observation_is_read_only_unknown_for_unreadable_and_deduplicates_aliases() {
+        let mount = tempfile::tempdir().unwrap();
+        let platform = MockPlatform::new(
+            vec![mock_mount(mount.path(), "/dev/sda1")],
+            HashMap::from([(mount.path().to_path_buf(), mock_stats(mount.path(), false))]),
+            mock_memory(),
+            PlatformPaths::default(),
+        );
+        let mut coordinator = BallastPoolCoordinator::discover(
+            &tiny_ballast_config(),
+            &[mount.path().to_path_buf()],
+            &platform,
+        )
+        .unwrap();
+        let pool_dir = coordinator
+            .pool_for_mount(mount.path())
+            .unwrap()
+            .ballast_dir
+            .clone();
+        coordinator
+            .aliases
+            .insert(mount.path().join("alias"), mount.path().to_path_buf());
+        let snapshots = coordinator
+            .accept_reserve_observation(coordinator.prepare_reserve_observation().run(&platform));
+        assert_eq!(snapshots.len(), 1, "one observation per physical pool");
+        assert_eq!(snapshots[0].state, BallastReserveState::Exhausted);
+        assert!(
+            !pool_dir.exists(),
+            "observation does not create a missing pool"
+        );
+        std::fs::create_dir_all(pool_dir.parent().unwrap()).unwrap();
+        // A regular file at the directory path deterministically makes the
+        // inventory unreadable, including when the test runner is root.
+        std::fs::write(&pool_dir, b"not a ballast directory").unwrap();
+        let snapshots = coordinator
+            .accept_reserve_observation(coordinator.prepare_reserve_observation().run(&platform));
+        assert_eq!(snapshots[0].state, BallastReserveState::Unknown);
+        assert!(!snapshots[0].inventory_authoritative);
+        assert!(snapshots[0].unreadable_count > 0);
+        assert_eq!(std::fs::read(pool_dir).unwrap(), b"not a ballast directory");
+        assert!(
+            !snapshots[0]
+                .summary()
+                .contains("no ballast reserve remains")
+        );
+    }
+
+    #[test]
+    fn reserve_on_a_newly_readonly_filesystem_is_observed_but_not_claimed_releasable() {
+        let mount = tempfile::tempdir().unwrap();
+        let platform = |readonly| {
+            MockPlatform::new(
+                vec![mock_mount(mount.path(), "/dev/sda1")],
+                HashMap::from([(
+                    mount.path().to_path_buf(),
+                    mock_stats(mount.path(), readonly),
+                )]),
+                mock_memory(),
+                PlatformPaths::default(),
+            )
+        };
+        let writable = platform(false);
+        let mut coordinator = BallastPoolCoordinator::discover(
+            &tiny_ballast_config(),
+            &[mount.path().to_path_buf()],
+            &writable,
+        )
+        .unwrap();
+        coordinator.set_provision_floor(0.0);
+        coordinator.provision_all(&writable).unwrap();
+        let snapshots = coordinator.accept_reserve_observation(
+            coordinator
+                .prepare_reserve_observation()
+                .run(&platform(true)),
+        );
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.state, BallastReserveState::Unknown);
+        assert!(!snapshot.inventory_authoritative);
+        assert_eq!(
+            snapshot.unreadable_count, 0,
+            "inventory itself was readable"
+        );
+        assert!(snapshot.releasable_bytes > 0);
+        assert!(snapshot.headroom.is_none());
+        assert!(
+            snapshot
+                .refill_blockers
+                .contains(&BallastRefillBlocker::ReadOnlyFilesystem)
+        );
+        let summary = snapshot.summary();
+        assert!(summary.contains("bytes observed"));
+        assert!(summary.contains("filesystem is read-only"));
+        assert!(!summary.contains("bytes releasable"));
+        assert!(!summary.contains("no ballast reserve remains"));
+
+        // A zero target is Unconfigured even when surplus files remain, but
+        // absent authority must still qualify those bytes as only observed.
+        let mut unconfigured = snapshot.clone();
+        unconfigured.configured_bytes = 0;
+        unconfigured.files_total = 0;
+        unconfigured.state = BallastReserveState::classify(0, unconfigured.releasable_bytes, false);
+        assert_eq!(unconfigured.state, BallastReserveState::Unconfigured);
+        assert!(unconfigured.summary().contains("bytes observed"));
+        assert!(!unconfigured.summary().contains("bytes releasable"));
+    }
+
+    #[test]
+    fn stale_reserve_observation_cannot_survive_release_or_configuration_change() {
+        let mount = tempfile::tempdir().unwrap();
+        let platform = MockPlatform::new(
+            vec![mock_mount(mount.path(), "/dev/sda1")],
+            HashMap::from([(mount.path().to_path_buf(), mock_stats(mount.path(), false))]),
+            mock_memory(),
+            PlatformPaths::default(),
+        );
+        let config = tiny_ballast_config();
+        let mut coordinator =
+            BallastPoolCoordinator::discover(&config, &[mount.path().to_path_buf()], &platform)
+                .unwrap();
+        coordinator.set_provision_floor(0.0);
+        coordinator.provision_all(&platform).unwrap();
+        let seeds = coordinator.reserve_observation_seeds();
+        assert_eq!(seeds.len(), 1);
+        assert!(
+            coordinator
+                .pool_for_mount(mount.path())
+                .unwrap()
+                .available_count()
+                > 0
+        );
+        assert_eq!(seeds[0].state, BallastReserveState::Unknown);
+        assert!(!seeds[0].inventory_authoritative);
+        assert!(seeds[0].observed_at.is_empty());
+        assert_eq!(seeds[0].releasable_bytes, 0);
+        assert_eq!(seeds[0].files_available, 0);
+        let prior = coordinator.prepare_reserve_observation().run(&platform);
+        coordinator
+            .release_for_mount(mount.path(), usize::MAX)
+            .unwrap();
+        assert!(coordinator.accept_reserve_observation(prior).is_empty());
+        let prior = coordinator.prepare_reserve_observation().run(&platform);
+        coordinator.set_provision_floor(15.0);
+        assert!(coordinator.accept_reserve_observation(prior).is_empty());
+        let prior = coordinator.prepare_reserve_observation().run(&platform);
+        coordinator.update_config(&config);
+        assert!(coordinator.accept_reserve_observation(prior).is_empty());
+        let inventory = coordinator.inventory();
+        assert_eq!(
+            BallastReserveSnapshot::from_inventory(&inventory[0]).state,
+            BallastReserveState::Unknown,
+            "cached actuator inventory cannot establish current reserve availability",
+        );
     }
 }

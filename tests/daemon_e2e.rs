@@ -1551,6 +1551,7 @@ fn engine_v1_reclaims_the_same_set_as_v2_at_orange() {
 #[allow(clippy::too_many_lines)]
 fn red_pressure_releases_the_whole_pool_before_scanning() {
     let dir = scratch();
+    let notify = dir.path().join("notify.jsonl");
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 4096);
     let fixture_mount = dir.path().to_path_buf();
     let (root, root_total, root_free, root_ro) = quiet_root_mount();
@@ -1569,6 +1570,7 @@ fn red_pressure_releases_the_whole_pool_before_scanning() {
     let scenario = ScenarioConfig {
         root_paths: vec![fixtures.root],
         ballast_files: 2,
+        notify_file: Some(notify.clone()),
         ..ScenarioConfig::default()
     };
     let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
@@ -1634,6 +1636,29 @@ fn red_pressure_releases_the_whole_pool_before_scanning() {
     let record = run.mount_record(&fixture_mount).unwrap();
     assert_eq!(record["level"], "red", "{record}");
 
+    let observed = wait_for_exhausted_reserve(&mut run, &fixture_mount, None);
+    let reserve = reserve_for_mount(&observed, &fixture_mount).unwrap();
+    assert_eq!(reserve["files_available"], 0, "{reserve}");
+    assert_eq!(reserve["files_total"], 2, "{reserve}");
+    run.wait_until(
+        "exhausted reserve notification",
+        Duration::from_secs(10),
+        |_| {
+            reserve_notifications(&notify, &fixture_mount)
+                .last()
+                .is_some_and(|event| event["reserve"]["state"] == "exhausted")
+        },
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let notifications_at_exhaustion = reserve_notifications(&notify, &fixture_mount).len();
+    // A completed follow-up observation proves the daemon kept evaluating
+    // the empty pool; it must not repeat the exhausted-reserve notification.
+    wait_for_exhausted_reserve(
+        &mut run,
+        &fixture_mount,
+        Some(reserve["observed_at"].as_str().unwrap()),
+    );
+
     // `sbh stats` counts the releases from the rows the daemon logged, and
     // the inventory table knows both files are gone.
     let stats_output = Command::new(common::sbh_bin_path())
@@ -1660,7 +1685,56 @@ fn red_pressure_releases_the_whole_pool_before_scanning() {
 
     let status = run.stop();
     assert!(status.success(), "{status}");
+    assert_eq!(
+        reserve_notifications(&notify, &fixture_mount).len(),
+        notifications_at_exhaustion,
+        "unchanged exhaustion must not generate repeated notifications"
+    );
     assert_log_conforms(&dir.path().join("data"));
+}
+
+fn reserve_for_mount<'a>(state: &'a Value, mount: &Path) -> Option<&'a Value> {
+    let wanted = mount.to_string_lossy();
+    state["ballast_pools"]
+        .as_array()?
+        .iter()
+        .find(|pool| pool["mount"] == wanted.as_ref())?
+        .get("reserve")
+}
+
+fn reserve_notifications(path: &Path, mount: &Path) -> Vec<Value> {
+    let wanted = mount.to_string_lossy();
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| {
+            event["type"] == "ballast_reserve_changed" && event["mount"] == wanted.as_ref()
+        })
+        .collect()
+}
+
+/// Require fresh evidence from this process, and optionally a later completed
+/// observation. Waiting for a new observed_at prevents a quiet/stalled daemon
+/// from satisfying the notification-deduplication assertion vacuously.
+fn wait_for_exhausted_reserve(run: &mut DaemonRun, mount: &Path, after: Option<&str>) -> Value {
+    let pid = u64::from(run.child.id());
+    run.wait_for_state(
+        "this daemon's authoritative exhausted reserve observation",
+        Duration::from_secs(65),
+        |state| {
+            state["pid"].as_u64() == Some(pid)
+                && reserve_for_mount(state, mount).is_some_and(|reserve| {
+                    reserve["state"] == "exhausted"
+                        && reserve["inventory_authoritative"] == true
+                        && reserve["releasable_bytes"] == 0
+                        && reserve["observed_at"].as_str().is_some_and(|observed| {
+                            !observed.is_empty() && after.is_none_or(|prior| observed != prior)
+                        })
+                })
+        },
+    )
+    .unwrap_or_else(|error| panic!("{error}"))
 }
 
 /// Wait for this process's physical pool snapshot, not its predecessor's file.
@@ -1829,6 +1903,209 @@ fn alias_mount_release_credit_survives_state_writes_and_restart() {
     assert_eq!(restarted.events_of("ballast_release").len(), 3);
     assert_eq!(ballast_files_in(&restarted.data_dir.join("ballast")), 2);
     assert!(restarted.stop().success());
+}
+
+/// GitHub #41: Yellow pressure can coexist with an exhausted reserve, and
+/// headroom above the floor need not be enough to allocate the next file.
+/// Status and notifications must explain both facts without changing policy.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn yellow_exhausted_reserve_reports_floor_and_dry_run_through_status_and_restart() {
+    let dir = scratch();
+    let scan_root = dir.path().join("scan-root");
+    fs::create_dir(&scan_root).unwrap();
+    let mount = dir.path();
+    let mount_key = mount.to_string_lossy().into_owned();
+    // 15.1% is above the 15% floor, but another 1 MiB file would leave
+    // 14.051424%. The observer must report the projected refusal accurately.
+    let table = injected_table(&[(mount, 100_000_000, 15_100_000, false), quiet_root_mount()]);
+    let notify = dir.path().join("notify.jsonl");
+    let scenario = ScenarioConfig {
+        root_paths: vec![scan_root],
+        ballast_files: 10,
+        ballast_file_bytes: 1_048_576,
+        ballast_toml: "auto_provision = false\nreplenish_cooldown_minutes = 0\n".into(),
+        dry_run: true,
+        notify_file: Some(notify.clone()),
+        extra_toml: "[pressure.prediction]\nenabled = false\n".into(),
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    let state = wait_for_exhausted_reserve(&mut run, mount, None);
+    let reserve = reserve_for_mount(&state, mount).unwrap();
+    assert_eq!(reserve["files_available"], 0, "{reserve}");
+    assert_eq!(reserve["files_total"], 10, "{reserve}");
+    assert_eq!(reserve["configured_bytes"], 10 * 1_048_576, "{reserve}");
+    let headroom = &reserve["headroom"];
+    assert_eq!(headroom["total_bytes"], 100_000_000, "{headroom}");
+    assert_eq!(headroom["available_bytes"], 15_100_000, "{headroom}");
+    assert_eq!(headroom["file_size_bytes"], 1_048_576, "{headroom}");
+    assert_eq!(headroom["floor_pct"], 15.0, "{headroom}");
+    assert_eq!(headroom["can_allocate"], false, "{headroom}");
+    assert!(
+        (headroom["free_pct_after"].as_f64().unwrap() - 14.051_424).abs() < 1e-9,
+        "{headroom}"
+    );
+    let blockers = reserve["refill_blockers"].as_array().unwrap();
+    for reason in ["safety_floor", "dry_run"] {
+        assert!(blockers.iter().any(|value| value == reason), "{reserve}");
+    }
+    let record = run.mount_record(mount).unwrap();
+    assert_eq!(record["level"], "yellow", "{record}");
+
+    let status = |args: &[&str]| {
+        Command::new(common::sbh_bin_path())
+            .arg("--config")
+            .arg(&run.config_path)
+            .arg("--no-color")
+            .args(args)
+            .env("SBH_TEST_MODE", "1")
+            .env("SBH_TEST_FS_STATS", &table)
+            .env("SBH_OUTPUT_FORMAT", "human")
+            .env_remove("XPC_SERVICE_NAME")
+            .env_remove("INVOCATION_ID")
+            .env_remove("NOTIFY_SOCKET")
+            .output()
+            .expect("run ordinary sbh status")
+    };
+    let json_output = status(&["--json", "status"]);
+    assert!(
+        json_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(payload["daemon_running"], true, "{payload}");
+    assert_eq!(
+        payload["daemon_pid"].as_u64(),
+        Some(u64::from(run.child.id()))
+    );
+    assert_eq!(payload["pressure"]["overall"], "yellow", "{payload}");
+    let reserves = &payload["ballast"]["reserves"];
+    assert_eq!(reserves["source"], "daemon_observation", "{payload}");
+    let reported = reserves["pools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pool| pool["mount_point"] == mount_key)
+        .unwrap();
+    assert_eq!(reported["state"], "exhausted", "{reported}");
+    assert_eq!(reported["inventory_authoritative"], true, "{reported}");
+    assert_eq!(reported["releasable_bytes"], 0, "{reported}");
+    assert_eq!(reported["headroom"]["can_allocate"], false, "{reported}");
+    for reason in ["safety_floor", "dry_run"] {
+        assert!(
+            reported["refill_blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == reason),
+            "{reported}"
+        );
+    }
+    let human_output = status(&["status"]);
+    assert!(human_output.status.success());
+    let human = String::from_utf8_lossy(&human_output.stdout);
+    assert!(human.contains("Reserve WARNING: exhausted on"), "{human}");
+    assert!(
+        human.contains("Reserve Availability (daemon_observation):"),
+        "{human}"
+    );
+    assert!(
+        human.contains("no ballast reserve remains to release"),
+        "{human}"
+    );
+    assert!(human.contains("safety floor 15.000%"), "{human}");
+    assert!(human.contains("scanner dry-run is enabled"), "{human}");
+    assert!(
+        human.lines().any(|line| {
+            line.contains(&mount_key) && line.contains("15.1%") && line.contains("YELLOW")
+        }),
+        "{human}"
+    );
+
+    run.wait_until(
+        "one exhausted reserve notification",
+        Duration::from_secs(10),
+        |_| !reserve_notifications(&notify, mount).is_empty(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    wait_for_exhausted_reserve(
+        &mut run,
+        mount,
+        Some(reserve["observed_at"].as_str().unwrap()),
+    );
+    assert_eq!(ballast_files_in(&run.data_dir.join("ballast")), 0);
+    assert!(run.events_of("ballast_provision").is_empty());
+    assert!(run.events_of("ballast_release").is_empty());
+    assert!(run.stop().success());
+    let events = reserve_notifications(&notify, mount);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["reserve"]["state"], "exhausted", "{events:?}");
+
+    // Leave the preceding state file in place, but remove the dry-run veto.
+    // The real refill path must now attempt maintenance and be stopped by
+    // the safety floor, while reporting a fresh current-condition snapshot.
+    let restart_scenario = ScenarioConfig {
+        dry_run: false,
+        ..scenario
+    };
+    let mut restarted = DaemonRun::spawn(dir.path(), &restart_scenario, Some(&table));
+    let fresh = wait_for_exhausted_reserve(&mut restarted, mount, None);
+    assert_ne!(fresh["run_id"], state["run_id"]);
+    let current = reserve_for_mount(&fresh, mount).unwrap();
+    assert_ne!(current["observed_at"], reserve["observed_at"]);
+    assert_eq!(current["headroom"]["can_allocate"], false, "{current}");
+    let floor_limited = restarted
+        .wait_for_state(
+            "an idle Yellow refill attempt stopped by the safety floor",
+            Duration::from_secs(90),
+            |state| {
+                state["mount_controllers"]
+                    .as_array()
+                    .is_some_and(|records| {
+                        records.iter().any(|record| {
+                            record["mount"] == mount_key
+                                && record["level"] == "yellow"
+                                && record["state"] == "idle"
+                                && record["idle_reason"] == "nothing_to_reclaim"
+                                && record["reserve_state"]["floor_limited"] == true
+                        })
+                    })
+            },
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    let previous_observation = reserve_for_mount(&floor_limited, mount)
+        .and_then(|snapshot| snapshot["observed_at"].as_str())
+        .unwrap_or_else(|| current["observed_at"].as_str().unwrap());
+    let after_attempt =
+        wait_for_exhausted_reserve(&mut restarted, mount, Some(previous_observation));
+    let verified = reserve_for_mount(&after_attempt, mount).unwrap();
+    let blockers = verified["refill_blockers"].as_array().unwrap();
+    assert!(
+        blockers.iter().any(|reason| reason == "safety_floor"),
+        "{verified}"
+    );
+    for absent in ["dry_run", "pressure_policy"] {
+        assert!(blockers.iter().all(|reason| reason != absent), "{verified}");
+    }
+    let record = restarted.mount_record(mount).unwrap();
+    assert_eq!(record["level"], "yellow", "{record}");
+    assert_eq!(record["state"], "idle", "{record}");
+    assert_eq!(record["idle_reason"], "nothing_to_reclaim", "{record}");
+    assert_eq!(record["reserve_state"]["floor_limited"], true, "{record}");
+    restarted
+        .wait_until(
+            "the restarted reserve notification",
+            Duration::from_secs(10),
+            |_| reserve_notifications(&notify, mount).len() >= 2,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(ballast_files_in(&restarted.data_dir.join("ballast")), 0);
+    assert!(restarted.events_of("ballast_provision").is_empty());
+    assert!(restarted.events_of("ballast_release").is_empty());
+    assert!(restarted.stop().success());
+    assert_eq!(reserve_notifications(&notify, mount).len(), 2);
 }
 
 /// bd-7spb: after a release a large volume can sit at Yellow for days with

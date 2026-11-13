@@ -27,11 +27,12 @@ use crossbeam_channel::{
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
-use crate::ballast::coordinator::BallastPoolCoordinator;
+use crate::ballast::coordinator::{BallastPoolCoordinator, BallastRefillBlocker};
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::{Config, InodePressureConfig, ScannerConfig, ScannerEngineMode};
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::ballast_replenish::BallastReplenisher;
+use crate::daemon::ballast_reserve::BallastReserveMonitor;
 use crate::daemon::compress_tier::{CompressTier, CompressionFirst};
 use crate::daemon::control::{
     BallastAction as ControlBallastAction, ControlBackend, ControlCommand, ControlResponse,
@@ -3178,6 +3179,10 @@ pub struct MonitoringDaemon {
     ballast_coordinator: BallastPoolCoordinator,
     /// One retained worker keeps reserve allocation off the pressure monitor.
     ballast_replenisher: BallastReplenisher,
+    /// Read-only availability is independent of the actuator's cached inventory.
+    ballast_reserve_monitor: BallastReserveMonitor,
+    /// Reasons from the existing per-pool admission path on the latest tick.
+    ballast_refill_blockers: HashMap<PathBuf, Vec<BallastRefillBlocker>>,
     release_controller: BallastReleaseController,
     notification_manager: NotificationManager,
     /// Last notification loss total submitted to best-effort activity logging.
@@ -5013,6 +5018,8 @@ impl MonitoringDaemon {
             special_locations,
             ballast_coordinator,
             ballast_replenisher: BallastReplenisher::default(),
+            ballast_reserve_monitor: BallastReserveMonitor::default(),
+            ballast_refill_blockers: HashMap::new(),
             release_controller,
             notification_manager,
             notification_drops_logged: 0,
@@ -5597,6 +5604,7 @@ impl MonitoringDaemon {
         let mut pools = Vec::new();
         for mount in mounts {
             let pool_mount = self.pool_mount(&mount);
+            self.ballast_reserve_monitor.invalidate(&pool_mount);
             if let Some(pool) = self.ballast_coordinator.pool_for_mount(&mount) {
                 self.release_controller
                     .bind_pool(&pool_mount, &pool.ballast_dir);
@@ -5870,6 +5878,10 @@ impl MonitoringDaemon {
                             .release_efficiency(&pool.mount_point),
                     ),
                     release_history,
+                    reserve: self
+                        .ballast_reserve_monitor
+                        .snapshot(&pool.mount_point)
+                        .cloned(),
                 }
             })
             .collect();
@@ -6172,6 +6184,7 @@ impl MonitoringDaemon {
                     });
                     // check_pressure has already withdrawn the old tick's
                     // authority before any diagnostic or retry can block.
+                    self.report_ballast_reserves_without_pressure(Instant::now());
                     self.sleep_with_memory_pressure_events(
                         &memory_pressure_rx,
                         self.last_pressure_level,
@@ -6607,6 +6620,7 @@ impl MonitoringDaemon {
     /// cancelled staging pass, compression probe or target-only batch.
     fn withdraw_pressure_authority(&mut self) {
         self.ballast_replenisher.cancel();
+        self.ballast_refill_blockers.clear();
         self.quarantine_sweeper.cancel();
         self.rch_staging.stop_running_pass();
         self.target_tier.withdraw_pressure();
@@ -7260,6 +7274,7 @@ impl MonitoringDaemon {
         let mut replenish_mounts = HashMap::new();
         let mut refill_refused = HashSet::new();
         let mut refill_levels = HashMap::new();
+        self.ballast_refill_blockers.clear();
         let mut pressured_without_surface: Option<(PathBuf, PressureLevel)> = None;
         // Every pressured mount sbh can do nothing about, for the
         // once-per-epoch ReclaimUnavailable alert.
@@ -7399,6 +7414,42 @@ impl MonitoringDaemon {
                 tick.response.level
             };
             let refill_mount = self.pool_mount(&mount);
+            let blockers = self
+                .ballast_refill_blockers
+                .entry(refill_mount.clone())
+                .or_default();
+            // Record the existing predicates; reporting never changes which
+            // pool is admitted or consumes a cooldown/attempt slot.
+            for (blocked, reason) in [
+                (
+                    replenish_level != PressureLevel::Green,
+                    BallastRefillBlocker::PressurePolicy,
+                ),
+                (tick.imminent_danger, BallastRefillBlocker::Forecast),
+                (
+                    tick.ram_reclaim.is_some(),
+                    BallastRefillBlocker::RamPressure,
+                ),
+                (
+                    tick.inode_reclaim.is_some(),
+                    BallastRefillBlocker::InodePressure,
+                ),
+                (
+                    decision.state == MountState::Recovery,
+                    BallastRefillBlocker::MountRecovery,
+                ),
+                (
+                    !matches!(
+                        decision.state,
+                        MountState::Maintain | MountState::Idle | MountState::Recovery
+                    ),
+                    BallastRefillBlocker::MountInactive,
+                ),
+            ] {
+                if blocked && !blockers.contains(&reason) {
+                    blockers.push(reason);
+                }
+            }
             refill_levels
                 .entry(refill_mount.clone())
                 .and_modify(|level: &mut PressureLevel| *level = (*level).max(replenish_level))
@@ -7529,6 +7580,23 @@ impl MonitoringDaemon {
             self.release_controller.observe_level(&pool, level);
         }
         replenish_mounts.retain(|pool, _| !refill_refused.contains(pool));
+        for blockers in self.ballast_refill_blockers.values_mut() {
+            for (blocked, reason) in [
+                (
+                    self.config.policy.kill_switch,
+                    BallastRefillBlocker::KillSwitch,
+                ),
+                (self.config.scanner.dry_run, BallastRefillBlocker::DryRun),
+                (
+                    self.signal_handler.should_shutdown(),
+                    BallastRefillBlocker::Shutdown,
+                ),
+            ] {
+                if blocked {
+                    blockers.push(reason);
+                }
+            }
+        }
         if self.config.policy.kill_switch
             || self.config.scanner.dry_run
             || self.signal_handler.should_shutdown()
@@ -7546,6 +7614,14 @@ impl MonitoringDaemon {
                 || self.maybe_replenish_pool(&mount, PressureLevel::Green, now)
             {
                 break;
+            }
+        }
+        if self.ballast_replenisher.busy() {
+            let active = self.ballast_replenisher.active_mount();
+            for (mount, blockers) in &mut self.ballast_refill_blockers {
+                if blockers.is_empty() && active != Some(mount.as_path()) {
+                    blockers.push(BallastRefillBlocker::WorkerBusy);
+                }
             }
         }
 
@@ -7821,6 +7897,8 @@ impl MonitoringDaemon {
             mode,
             &self.logger_handle,
         );
+
+        self.report_ballast_reserves(Instant::now());
 
         global_tick(cadence, base_poll)
     }
@@ -8108,6 +8186,7 @@ impl MonitoringDaemon {
             0,
             super::super::ballast::coordinator::BallastPool::available_count,
         );
+        self.ballast_reserve_monitor.invalidate(&pool_mount);
         let mut released = 0;
         if available > 0
             && let Ok(Some(report)) = self.ballast_coordinator.release_for_mount(mount, available)
@@ -8235,6 +8314,10 @@ impl MonitoringDaemon {
             pool.available_count(),
             pool.expected_count(),
         ) {
+            self.ballast_refill_blockers
+                .entry(pool_mount.clone())
+                .or_default()
+                .push(BallastRefillBlocker::Cooldown);
             return false;
         }
         let Some(task) = self.ballast_coordinator.prepare_replenishment(&pool_mount) else {
@@ -8248,6 +8331,10 @@ impl MonitoringDaemon {
             Ok(started) => started,
             Err(error) => {
                 eprintln!("[SBH-BALLAST] refill worker could not start: {error}");
+                self.ballast_refill_blockers
+                    .entry(pool_mount)
+                    .or_default()
+                    .push(BallastRefillBlocker::NotEvaluated);
                 false
             }
         }
@@ -8266,6 +8353,9 @@ impl MonitoringDaemon {
         };
         let pool_mount = task.mount().to_path_buf();
         let current = self.ballast_coordinator.finish_replenishment(task);
+        if current {
+            self.ballast_reserve_monitor.invalidate(&pool_mount);
+        }
         let report = match result {
             Ok(report) => report,
             Err(error) => {
@@ -8334,6 +8424,7 @@ impl MonitoringDaemon {
 
         let mut released = 0;
         if count > 0 {
+            self.ballast_reserve_monitor.invalidate(&pool_mount);
             let free_before = self
                 .fs_collector
                 .collect(mount)
@@ -8970,6 +9061,69 @@ impl MonitoringDaemon {
 
     // ──────────────────── ballast ────────────────────
 
+    fn poll_ballast_reserve_observation(&mut self, now: Instant) {
+        match self
+            .ballast_reserve_monitor
+            .tick(&self.ballast_coordinator, &self.platform, now)
+        {
+            Ok(true) => self.self_monitor.force_next_write(),
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("[SBH-BALLAST] reserve observation could not start: {error}");
+            }
+        }
+    }
+
+    /// Keep read-only reserve evidence and expiry moving when pressure
+    /// collection fails. Eligibility is unknown; known global vetoes remain
+    /// visible, while headroom errors come only from each pool's own probe.
+    fn report_ballast_reserves_without_pressure(&mut self, now: Instant) {
+        let mut blockers = vec![BallastRefillBlocker::NotEvaluated];
+        for (blocked, reason) in [
+            (
+                self.config.policy.kill_switch,
+                BallastRefillBlocker::KillSwitch,
+            ),
+            (self.config.scanner.dry_run, BallastRefillBlocker::DryRun),
+            (
+                self.signal_handler.should_shutdown(),
+                BallastRefillBlocker::Shutdown,
+            ),
+        ] {
+            if blocked {
+                blockers.push(reason);
+            }
+        }
+        self.ballast_refill_blockers = self
+            .ballast_coordinator
+            .reserve_observation_seeds()
+            .into_iter()
+            .map(|snapshot| (snapshot.mount_point, blockers.clone()))
+            .collect();
+        self.report_ballast_reserves(now);
+    }
+
+    fn report_ballast_reserves(&mut self, now: Instant) {
+        self.poll_ballast_reserve_observation(now);
+        self.notification_manager
+            .retain_reserve_pools(self.ballast_reserve_monitor.pool_scopes());
+        let (events, changed) = self.ballast_reserve_monitor.report(
+            &self.ballast_refill_blockers,
+            self.ballast_replenisher.active_mount(),
+        );
+        if changed || !events.is_empty() {
+            self.self_monitor.force_next_write();
+        }
+        for event in events {
+            self.logger_handle.send(ActivityEvent::Info {
+                message: event.summary(),
+            });
+        }
+        for event in self.ballast_reserve_monitor.delivery_events() {
+            self.notification_manager.notify(&event);
+        }
+    }
+
     fn provision_ballast(&mut self) -> Result<()> {
         if !self.config.ballast.auto_provision {
             eprintln!(
@@ -9180,6 +9334,8 @@ impl MonitoringDaemon {
                         details: format!("config hash: {old_hash} -> {new_hash}"),
                     });
                     self.config = new_config;
+                    self.ballast_reserve_monitor.invalidate_all();
+                    self.ballast_refill_blockers.clear();
                     let revoked_scans = self.scan_now_queue.lock().revoke();
                     if revoked_scans > 0 {
                         self.logger_handle.send(ActivityEvent::Info {
@@ -14532,6 +14688,51 @@ mod tests {
             daemon.scan_now_queue.lock().paths(),
             daemon.config.scanner.root_paths
         );
+
+        // The failed collector does not imply that the separate read-only
+        // pool probe failed. Keep observing without fabricating pressure or
+        // admitting refill, and retain the known global policy vetoes.
+        let saved_kill_switch = daemon.config.policy.kill_switch;
+        let saved_dry_run = daemon.config.scanner.dry_run;
+        daemon.config.policy.kill_switch = true;
+        daemon.config.scanner.dry_run = true;
+        let pool_mount = daemon.ballast_coordinator.reserve_observation_seeds()[0]
+            .mount_point
+            .clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            daemon.report_ballast_reserves_without_pressure(Instant::now());
+            if daemon
+                .ballast_reserve_monitor
+                .snapshot(&pool_mount)
+                .is_some_and(|snapshot| snapshot.headroom.is_some())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reserve observer did not finish");
+            thread::yield_now();
+        }
+        let reserve = daemon
+            .ballast_reserve_monitor
+            .snapshot(&pool_mount)
+            .unwrap();
+        for reason in [
+            BallastRefillBlocker::NotEvaluated,
+            BallastRefillBlocker::KillSwitch,
+            BallastRefillBlocker::DryRun,
+        ] {
+            assert!(reserve.refill_blockers.contains(&reason), "{reason:?}");
+        }
+        assert!(
+            !reserve
+                .refill_blockers
+                .contains(&BallastRefillBlocker::FilesystemStatsUnavailable)
+        );
+        assert!(!reserve.refill_in_progress);
+        assert!(daemon.ballast_replenisher.active_mount().is_none());
+        assert!(daemon.mount_responses.is_empty());
+        daemon.config.policy.kill_switch = saved_kill_switch;
+        daemon.config.scanner.dry_run = saved_dry_run;
 
         // The request remains accepted and resumes only with a new observation.
         daemon.fs_collector = FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::ZERO);

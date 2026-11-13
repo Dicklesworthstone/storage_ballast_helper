@@ -25,7 +25,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use crate::core::config::BallastConfig;
 use crate::core::errors::{Result, SbhError};
 use crate::monitor::pid::PressureLevel;
-use crate::platform::pal::Platform;
+use crate::platform::pal::{FsStats, Platform};
 
 mod admission;
 mod creation;
@@ -134,6 +134,55 @@ impl ProvisionFloor {
         } else {
             100.0
         }
+    }
+}
+
+/// Read-only explanation of whether one configured file fits above the floor.
+///
+/// This is observation, never allocation authority. The provisioner always
+/// takes another live capacity reading before it writes a file or a chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BallastHeadroom {
+    /// Capacity of the filesystem used to derive its pressure floor.
+    pub total_bytes: u64,
+    /// Space available to this process at the time of observation.
+    pub available_bytes: u64,
+    /// Allocation cost of one configured ballast file.
+    pub file_size_bytes: u64,
+    /// Free percentage which must remain after the allocation.
+    pub floor_pct: f64,
+    /// Free percentage after subtracting one file, saturating at zero.
+    pub free_pct_after: f64,
+    /// Whether the exact per-file admission arithmetic permits this file.
+    pub can_allocate: bool,
+}
+
+impl BallastHeadroom {
+    /// Explain headroom using the same integer-rounded predicate as allocation.
+    /// Unknown/invalid capacity and a read-only filesystem are errors, not a
+    /// measured floor refusal. In particular, being above `floor_pct` before
+    /// the write does not prove that another whole file fits.
+    pub fn evaluate(
+        stats: &FsStats,
+        file_size_bytes: u64,
+        floor: ProvisionFloor,
+    ) -> std::result::Result<Self, &'static str> {
+        let floor_pct = floor.pct_on(stats.total_bytes);
+        let outcome = admission::evaluate(stats, file_size_bytes, floor_pct, None)?;
+        let (can_allocate, free_pct_after) = match outcome {
+            Admission::Admit { free_pct_after, .. } => {
+                (true, free_pct_after.unwrap_or_else(|| stats.free_pct()))
+            }
+            Admission::Refuse { free_pct_after, .. } => (false, free_pct_after),
+        };
+        Ok(Self {
+            total_bytes: stats.total_bytes,
+            available_bytes: stats.available_bytes,
+            file_size_bytes,
+            floor_pct,
+            free_pct_after,
+            can_allocate,
+        })
     }
 }
 

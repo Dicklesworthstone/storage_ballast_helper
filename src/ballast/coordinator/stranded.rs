@@ -280,6 +280,34 @@ mod unix {
                 .fold(0, u64::saturating_add)
         }
 
+        /// Observe only reserve still releasable under these adopted identities.
+        /// Never turn an unreadable/busy directory into either confirmed empty
+        /// reserve or credited cached bytes. Existing locks are nonblocking and
+        /// this read creates no file or directory.
+        pub(in super::super) fn observe(&self) -> (usize, u64, usize) {
+            let mut count = 0usize;
+            let mut bytes = 0u64;
+            let mut unreadable = 0usize;
+            for (path, size) in &self.files {
+                let Some(snapshot) = self.snapshots.get(path) else {
+                    continue;
+                };
+                match with_validated_candidate(path, snapshot, |_, _| Ok(())) {
+                    Ok(()) => {
+                        count = count.saturating_add(1);
+                        bytes = bytes.saturating_add(*size);
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+                        ) => {}
+                    Err(_) => unreadable = unreadable.saturating_add(1),
+                }
+            }
+            (count, bytes, unreadable)
+        }
+
         /// Revalidate before crediting reserve against new allocation. Known
         /// losses revoke stale inventory; unreadable or busy entries defer
         /// growth instead of silently treating an unknown reserve as empty.
@@ -533,6 +561,9 @@ impl StrandedReserve {
     }
     pub(super) fn bytes(&self) -> u64 {
         0
+    }
+    pub(super) fn observe(&self) -> (usize, u64, usize) {
+        (0, 0, 0)
     }
     pub(super) fn refresh(&mut self) -> Vec<String> {
         Vec::new()

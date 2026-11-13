@@ -3098,6 +3098,7 @@ mod tests {
             skip_reason: None,
             release_efficiency: None,
             release_history: None,
+            reserve: None,
         };
         let mut model = test_model();
         // Written in one order by the daemon, listed sorted by mount.

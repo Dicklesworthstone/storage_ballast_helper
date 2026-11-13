@@ -625,6 +625,10 @@ pub struct BallastPoolState {
     /// Physical inventory observation used to retain release credit on restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_history: Option<crate::ballast::release::BallastReleaseHistory>,
+    /// Last completed read-only reserve observation and refill eligibility.
+    /// Absent until this daemon has observed the pool, or in older state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve: Option<crate::ballast::coordinator::BallastReserveSnapshot>,
 }
 
 /// One path in the last VOI scan plan, as the dashboard's overlay lists it.
@@ -1877,6 +1881,7 @@ mod tests {
                 skip_reason: None,
                 release_efficiency: None,
                 release_history: None,
+                reserve: None,
             }],
             ..Default::default()
         };
@@ -1893,6 +1898,38 @@ mod tests {
         older.remove("ballast_pools");
         let parsed: DaemonState = serde_json::from_value(serde_json::Value::Object(older)).unwrap();
         assert!(parsed.ballast_pools.is_empty());
+    }
+
+    #[test]
+    fn reserve_observation_survives_state_round_trip_without_old_state_inventing_it() {
+        let mut pool = serde_json::json!({
+            "mount": "/data",
+            "ballast_dir": "/data/.sbh/ballast",
+            "available": 0,
+            "total": 10,
+            "releasable_bytes": 0,
+        });
+        let old: BallastPoolState = serde_json::from_value(pool.clone()).unwrap();
+        assert!(old.reserve.is_none());
+        pool["reserve"] = serde_json::json!({
+            "observed_at": "2026-11-12T12:05:35Z",
+            "mount_point": "/data",
+            "ballast_dir": "/data/.sbh/ballast",
+            "files_available": 0,
+            "files_total": 10,
+            "releasable_bytes": 0,
+            "configured_bytes": 10737418240_u64,
+            "state": "exhausted",
+            "inventory_authoritative": true,
+            "unreadable_count": 0,
+            "headroom": null,
+            "headroom_error": null,
+            "refill_blockers": ["pressure_policy"],
+            "refill_in_progress": false,
+        });
+        let decoded: BallastPoolState = serde_json::from_value(pool.clone()).unwrap();
+        let encoded = serde_json::to_value(decoded).unwrap();
+        assert_eq!(encoded["reserve"], pool["reserve"]);
     }
 
     /// bd-rc-master-ajg1.7.4: the daemon's files against the reclaimed
