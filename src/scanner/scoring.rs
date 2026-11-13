@@ -1025,6 +1025,19 @@ fn rch_tree_activity(root: &Path, window: Duration, max_entries: usize) -> TreeA
     let Some(cutoff) = std::time::SystemTime::now().checked_sub(window) else {
         return TreeActivity::Unknown;
     };
+    let Ok(root_metadata) = std::fs::symlink_metadata(root) else {
+        return TreeActivity::Unknown;
+    };
+    if !root_metadata.is_dir() {
+        return TreeActivity::Unknown;
+    }
+    // Creating, removing or renaming a direct child can leave the root
+    // as the only recent write in an otherwise old cache tree.
+    match root_metadata.modified() {
+        Ok(modified) if modified > cutoff => return TreeActivity::Active,
+        Ok(_) => {}
+        Err(_) => return TreeActivity::Unknown,
+    }
     let mut stack = vec![root.to_path_buf()];
     let mut seen = 0usize;
     while let Some(dir) = stack.pop() {
@@ -1048,10 +1061,10 @@ fn rch_tree_activity(root: &Path, window: Duration, max_entries: usize) -> TreeA
             if meta.is_symlink() {
                 continue;
             }
-            if let Ok(modified) = meta.modified()
-                && modified > cutoff
-            {
-                return TreeActivity::Active;
+            match meta.modified() {
+                Ok(modified) if modified > cutoff => return TreeActivity::Active,
+                Ok(_) => {}
+                Err(_) => return TreeActivity::Unknown,
             }
             if meta.is_dir() {
                 stack.push(entry.path());
@@ -1942,6 +1955,7 @@ mod tests {
                 .path()
                 .join(".rch-target-hz1-pool-e8298f7544a4b8493a8270f7ccf03bb3");
             std::fs::create_dir_all(pool.join("debug/deps")).unwrap();
+            age_tree(&pool, Duration::from_hours(200));
             // A fresh artifact deep in the tree — exactly what cargo leaves
             // behind mid-build, and what a top-level mtime/birth-time check misses.
             std::fs::write(pool.join("debug/deps/libfoo.rlib"), b"x").unwrap();
@@ -1999,6 +2013,7 @@ mod tests {
             let ft = filetime::FileTime::from_system_time(long_ago);
             filetime::set_file_mtime(&stale, ft).unwrap();
             filetime::set_file_mtime(pool.join("debug"), ft).unwrap();
+            filetime::set_file_mtime(&pool, ft).unwrap();
 
             assert!(
                 rch_target_veto_reason(&pool, 0.0, 0).is_none(),
@@ -2018,6 +2033,7 @@ mod tests {
                     filetime::FileTime::from_system_time(std::time::SystemTime::now() - age);
                 filetime::set_file_mtime(pool.join("debug/old.rlib"), stamp).unwrap();
                 filetime::set_file_mtime(pool.join("debug"), stamp).unwrap();
+                filetime::set_file_mtime(pool, stamp).unwrap();
             };
             let make = |name: &str, age: Duration| {
                 let pool = tmp.path().join(name);
@@ -2068,6 +2084,7 @@ mod tests {
                     filetime::FileTime::from_system_time(std::time::SystemTime::now() - age);
                 filetime::set_file_mtime(pool.join("debug/old.rlib"), stamp).unwrap();
                 filetime::set_file_mtime(pool.join("debug"), stamp).unwrap();
+                filetime::set_file_mtime(&pool, stamp).unwrap();
                 pool
             };
 
@@ -2196,6 +2213,7 @@ mod tests {
                 );
                 filetime::set_file_mtime(pool.join("debug/old.rlib"), stamp).unwrap();
                 filetime::set_file_mtime(pool.join("debug"), stamp).unwrap();
+                filetime::set_file_mtime(&pool, stamp).unwrap();
                 pool
             };
             let redeleted = make(".rch-target-hz3-pool-again");
@@ -2255,6 +2273,126 @@ mod tests {
             set(
                 root,
                 filetime::FileTime::from_system_time(std::time::SystemTime::now() - age),
+            );
+        }
+
+        #[test]
+        fn root_activity_obeys_normal_and_learned_rch_idle_floors() {
+            let tmp = tempfile::tempdir().unwrap();
+            for (name, root_age) in [
+                (
+                    ".rch-target-hz3-pool-root-activity",
+                    Duration::from_mins(90),
+                ),
+                (
+                    ".rch-target-hz3-job-root-activity",
+                    Duration::from_mins(45),
+                ),
+            ] {
+                let target = tmp.path().join(name);
+                std::fs::create_dir_all(target.join("debug")).unwrap();
+                std::fs::write(target.join("debug/old.rlib"), b"old output").unwrap();
+                age_tree(&target, Duration::from_hours(200));
+
+                assert!(
+                    rch_target_veto_reason(&target, 0.0, 0).is_none(),
+                    "a fully idle tree remains reclaimable"
+                );
+
+                let stamp = filetime::FileTime::from_system_time(
+                    std::time::SystemTime::now() - root_age,
+                );
+                filetime::set_file_mtime(&target, stamp).unwrap();
+
+                assert!(
+                    rch_target_veto_reason(&target, 0.0, 0).is_some(),
+                    "root activity inside the normal floor must hold {name}"
+                );
+                assert!(
+                    rch_target_veto_reason(&target, 1.0, 0).is_none(),
+                    "root activity older than the pressure floor must not freeze {name}"
+                );
+                assert!(
+                    rch_target_veto_reason(&target, 1.0, 1).is_some(),
+                    "root activity inside the learned floor must hold {name}"
+                );
+            }
+        }
+
+        #[test]
+        fn rch_go_root_activity_holds_its_old_cache_children() {
+            use super::super::rch_go_veto_reason;
+
+            let tmp = tempfile::tempdir().unwrap();
+            let project = rch_go_project(tmp.path(), "root-activity", Duration::from_hours(200));
+            let root = project.join(".rch-go");
+            let stamp = filetime::FileTime::from_system_time(
+                std::time::SystemTime::now() - Duration::from_mins(90),
+            );
+            filetime::set_file_mtime(&root, stamp).unwrap();
+
+            for path in [&root, &root.join("cache"), &root.join("mod")] {
+                assert!(
+                    rch_go_veto_reason(path, 0.0, 0).is_some(),
+                    "project root activity must protect {}",
+                    path.display()
+                );
+                assert!(
+                    rch_go_veto_reason(path, 1.0, 0).is_none(),
+                    "activity older than the pressure floor remains reclaimable"
+                );
+                assert!(
+                    rch_go_veto_reason(path, 1.0, 1).is_some(),
+                    "project root activity must respect the learned floor"
+                );
+            }
+        }
+
+        #[test]
+        fn idle_probe_requires_a_real_directory_root() {
+            use super::super::{TreeActivity, rch_tree_activity};
+
+            let tmp = tempfile::tempdir().unwrap();
+            let directory = tmp.path().join("cache");
+            let file = tmp.path().join("file");
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::write(&file, b"old output").unwrap();
+            age_tree(&directory, Duration::from_hours(200));
+
+            let window = Duration::from_hours(168);
+            assert_eq!(
+                rch_tree_activity(&directory, window, 10),
+                TreeActivity::IdleThroughout
+            );
+            assert_eq!(
+                rch_tree_activity(&file, window, 10),
+                TreeActivity::Unknown
+            );
+            assert_eq!(
+                rch_tree_activity(&tmp.path().join("missing"), window, 10),
+                TreeActivity::Unknown
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn idle_probe_does_not_follow_a_symlink_root() {
+            use super::super::{TreeActivity, rch_tree_activity};
+
+            let tmp = tempfile::tempdir().unwrap();
+            let directory = tmp.path().join("cache");
+            let alias = tmp.path().join("alias");
+            std::fs::create_dir(&directory).unwrap();
+            age_tree(&directory, Duration::from_hours(200));
+            std::os::unix::fs::symlink(&directory, &alias).unwrap();
+
+            assert_eq!(
+                rch_tree_activity(&alias, Duration::from_hours(168), 10),
+                TreeActivity::Unknown
+            );
+            assert_eq!(
+                rch_tree_activity(&directory, Duration::from_hours(168), 10),
+                TreeActivity::IdleThroughout
             );
         }
 
@@ -2539,7 +2677,13 @@ mod tests {
                     std::fs::write(dir.join(format!("f{i}.o")), b"x").unwrap();
                 }
             }
-            // Everything is fresh, so this must be a definite Active, reached
+            // Keep the root old so this exercises descendant activity rather
+            // than returning on the new root-activity check.
+            let stamp = filetime::FileTime::from_system_time(
+                std::time::SystemTime::now() - Duration::from_hours(200),
+            );
+            filetime::set_file_mtime(&pool, stamp).unwrap();
+            // Descendants are fresh, so this must be a definite Active, reached
             // via early exit rather than by exhausting the guard.
             assert_eq!(
                 rch_tree_activity(&pool, Duration::from_hours(168), RCH_IDLE_PROBE_MAX_ENTRIES),
