@@ -285,6 +285,21 @@ impl Platform for TestOverlayPlatform {
         )
     }
 
+    fn observe_fs_stats(&self, path: &Path) -> Result<FsStats> {
+        self.table.owner(path).map_or_else(
+            || self.inner.observe_fs_stats(path),
+            |mount| Ok(mount.stats_at(self.elapsed_secs())),
+        )
+    }
+
+    fn has_capacity_metadata(&self) -> bool {
+        self.inner.has_capacity_metadata()
+    }
+
+    fn refresh_capacity_metadata(&self) -> Result<()> {
+        self.inner.refresh_capacity_metadata()
+    }
+
     fn inode_stats(&self, path: &Path) -> Result<Option<InodeStats>> {
         self.table.owner(path).map_or_else(
             || self.inner.inode_stats(path),
@@ -311,10 +326,29 @@ impl Platform for TestOverlayPlatform {
         Ok(mounts)
     }
 
+    fn mount_identity(&self, path: &Path) -> Result<MountPoint> {
+        self.table.owner(path).map_or_else(
+            || self.inner.mount_identity(path),
+            |mount| Ok(mount.mount_point()),
+        )
+    }
+
     fn mount_lookup_path(&self, path: &Path) -> Result<PathBuf> {
         self.table.owner(path).map_or_else(
             || self.inner.mount_lookup_path(path),
             |_| Ok(crate::core::paths::resolve_absolute_path(path)),
+        )
+    }
+
+    fn observe_mount_lookup_path(&self, path: &Path) -> Result<PathBuf> {
+        self.table.owner(path).map_or_else(
+            || self.inner.observe_mount_lookup_path(path),
+            |_| {
+                std::fs::canonicalize(path).map_err(|error| SbhError::FsStats {
+                    path: path.to_path_buf(),
+                    details: format!("could not resolve observed mount query: {error}"),
+                })
+            },
         )
     }
 

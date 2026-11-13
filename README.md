@@ -1092,7 +1092,7 @@ What follows covers the algorithms, control theory, safety mechanisms, and desig
 
 ### The Daemon Loop
 
-The daemon runs four threads connected by bounded channels:
+The daemon runs four primary threads connected by bounded channels:
 
 1. **Monitor thread** polls filesystem stats at a configurable interval, feeds them to the EWMA forecaster and PID controller, and emits a `ScanRequest` when pressure warrants action.
 2. **Scanner thread** receives scan requests, selects `scanner.engine = "v2"` (the default since v0.4.32) or `"v1"`, scores discovered artifacts, and produces a ranked `DeletionBatch`. v2 adds opaque-tree pruning, a persistent candidate index, filesystem event invalidation where available, and pressure-gated reconciliation; v1 is the legacy full-descent directory walker kept as an opt-out.
@@ -1100,6 +1100,37 @@ The daemon runs four threads connected by bounded channels:
 4. **Logger thread** receives activity events and writes them to both SQLite and JSONL backends.
 
 Channels use bounded capacities (scanner: <!-- claim:constants.daemon.SCANNER_CHANNEL_CAP -->2<!-- /claim -->, executor: <!-- claim:constants.daemon.EXECUTOR_CHANNEL_CAP -->64<!-- /claim -->, logger: <!-- claim:constants.logger.CHANNEL_CAPACITY -->1024<!-- /claim -->) to provide natural backpressure.
+
+Filesystem pressure observations run on bounded background workers. Capacity, inode
+availability, mount ownership, and RAM-backed classification arrive together,
+with the original probe-start time and mount identity. The monitor reads fresh
+completed observations without waiting for native filesystem calls. The
+16-worker budget reserves one slot for `/`; mount inventory and optional APFS
+metadata refresh use independent jobs. Catalog discovery has a separate
+four-worker budget, so reading user homes or cache directories cannot block
+pressure-response dispatch. A blocked worker keeps its slot across reloads;
+reloading cannot create an unbounded succession of replacement threads.
+RAM log-fallback eligibility also runs on a bounded worker. Pending or expired
+guard evidence keeps mirroring disabled, and the logger retains its separate
+safety checks before writing.
+
+Missing or expired observations provide no authority for automatic maintenance,
+predictive scans, or cross-device fallback roots. Healthy observed roots can
+still be dispatched while a peer is unavailable. An explicit `SIGUSR1` scan
+keeps its complete configured scope pending until every root is observed.
+Uncovered-volume alerts retry
+pending samples before their freshness window expires. On macOS, pressure
+sampling uses native `statfs` and memory-cached APFS geometry; optional metadata
+refresh cannot hold up the sample, and cached free space cannot exceed current
+native headroom. These bounds cover pressure observations and automatic scan
+planning. Startup discovery, configuration-reload discovery, periodic macOS
+Full Disk Access diagnostics, and filesystem mutations still include synchronous
+operations.
+
+An `ENOSPC` state-write failure gets a separate bounded inode diagnostic started
+after the failure. Only fresh evidence from the actual destination can preserve
+inode-relief policy; a stalled diagnostic records an unknown result by its
+deadline, and reloads cannot reuse a late result from the previous policy.
 
 When the scanner queue fills, automatic observations can refresh a matching
 scope or replace weaker automatic work. Accepted operator and configuration

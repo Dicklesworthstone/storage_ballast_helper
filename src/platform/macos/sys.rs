@@ -761,6 +761,23 @@ fn write_cache_file_atomically(path: &Path, data: &[u8]) {
     }
 }
 
+/// Optional APFS capacity metadata already held in memory. Never reads a
+/// plist, starts diskutil, waits for a refresh, or renews an expired timestamp.
+pub fn cached_apfs_inventory() -> Option<ApfsInventory> {
+    apfs_inventory_from_memory(APFS_INVENTORY_CACHE.get()?, Instant::now())
+}
+
+fn apfs_inventory_from_memory(
+    cache: &RwLock<Option<(Instant, ApfsInventory)>>,
+    now: Instant,
+) -> Option<ApfsInventory> {
+    let cached = cache.try_read()?;
+    let (collected_at, inventory) = cached.as_ref()?;
+    now.checked_duration_since(*collected_at)
+        .filter(|age| *age < APFS_CACHE_TTL)
+        .map(|_| inventory.clone())
+}
+
 pub fn apfs_inventory() -> io::Result<ApfsInventory> {
     let cache = APFS_INVENTORY_CACHE.get_or_init(|| RwLock::new(None));
     {
@@ -1740,13 +1757,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ApfsVolumeRole, FirmlinkSource, FirmlinkStamp, LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES,
-        LOCAL_SNAPSHOT_THIN_URGENCY, SwapUsage, SwapUsageInfo, command_output_with_timeout,
-        command_output_with_timeout_inner, firmlink_map, firmlink_map_from_paths,
-        important_usage_available_bytes, mounted_filesystems, parent_apfs_volume_device,
-        parse_apfs_inventory, parse_firmlink_map, parse_tmutil_local_snapshots, parse_vm_stat,
-        parse_vm_swapusage, read_vm_stats, resolve_firmlinked_path, statfs, sysctl,
-        tmutil_thinlocalsnapshots_args, vm_swapusage,
+        ApfsInventory, ApfsVolumeRole, FirmlinkSource, FirmlinkStamp,
+        LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES, LOCAL_SNAPSHOT_THIN_URGENCY, SwapUsage, SwapUsageInfo,
+        command_output_with_timeout, command_output_with_timeout_inner, firmlink_map,
+        firmlink_map_from_paths, important_usage_available_bytes, mounted_filesystems,
+        parent_apfs_volume_device, parse_apfs_inventory, parse_firmlink_map,
+        parse_tmutil_local_snapshots, parse_vm_stat, parse_vm_swapusage, read_vm_stats,
+        resolve_firmlinked_path, statfs, sysctl, tmutil_thinlocalsnapshots_args, vm_swapusage,
     };
 
     const fn mib(value: u64) -> u64 {
@@ -2293,6 +2310,51 @@ Pages occupied by compressor:           1221199.
             parse_vm_swapusage("total = nope used = 1.00M free = 2.00M"),
             SwapUsage::Unknown
         );
+    }
+
+    #[test]
+    fn memory_only_apfs_inventory_never_renews_expired_evidence() {
+        let collected_at = Instant::now();
+        let inventory = ApfsInventory {
+            containers: Vec::new(),
+            volumes: Vec::new(),
+        };
+        let cache = parking_lot::RwLock::new(None);
+        assert!(super::apfs_inventory_from_memory(&cache, collected_at).is_none());
+        *cache.write() = Some((collected_at, inventory.clone()));
+        assert_eq!(
+            super::apfs_inventory_from_memory(&cache, collected_at),
+            Some(inventory)
+        );
+        assert!(
+            super::apfs_inventory_from_memory(&cache, collected_at + super::APFS_CACHE_TTL)
+                .is_none()
+        );
+        assert_eq!(cache.read().as_ref().unwrap().0, collected_at);
+    }
+
+    #[test]
+    fn memory_only_apfs_inventory_does_not_wait_for_a_busy_cache() {
+        let cache = std::sync::Arc::new(parking_lot::RwLock::new(None));
+        let held = cache.write();
+        let reader_cache = std::sync::Arc::clone(&cache);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            sender
+                .send(super::apfs_inventory_from_memory(
+                    &reader_cache,
+                    Instant::now(),
+                ))
+                .unwrap();
+        });
+        assert!(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("memory lookup must not wait for refresh")
+                .is_none()
+        );
+        drop(held);
+        reader.join().unwrap();
     }
 
     #[test]

@@ -10,7 +10,11 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 
 use crate::core::errors::{Result, SbhError};
-use crate::platform::pal::{FsStats, MountPoint, Platform};
+use crate::platform::pal::{FsStats, InodeStats, MountPoint, Platform};
+
+pub(crate) mod background;
+
+use background::BoundedObserver;
 
 /// A capacity observation with its original time and discovered filesystem
 /// binding. Reading it from the cache does not make it a new rate sample.
@@ -20,6 +24,7 @@ pub(crate) struct FsStatsSample {
     binding: MountBinding,
     pub stats: FsStats,
     pub collected_at: Instant,
+    auxiliary: Option<AuxiliaryEvidence>,
 }
 
 impl FsStatsSample {
@@ -29,7 +34,76 @@ impl FsStatsSample {
         self.binding == other.binding
             && self.stats.total_bytes == other.stats.total_bytes
             && self.stats.is_readonly == other.stats.is_readonly
+            && self
+                .auxiliary
+                .as_ref()
+                .map(|evidence| evidence.directory_identity)
+                == other
+                    .auxiliary
+                    .as_ref()
+                    .map(|evidence| evidence.directory_identity)
     }
+
+    pub(crate) fn inode_stats(&self) -> Option<InodeStats> {
+        self.auxiliary
+            .as_ref()
+            .and_then(|evidence| evidence.inode_stats)
+    }
+
+    pub(crate) fn is_ram_backed(&self) -> Option<bool> {
+        self.auxiliary
+            .as_ref()
+            .map(|evidence| evidence.is_ram_backed)
+    }
+
+    pub(crate) fn mount_device_id(&self) -> Option<u64> {
+        self.mount_directory_identity().map(|(device, _)| device)
+    }
+
+    pub(crate) fn mount_directory_identity(&self) -> Option<(u64, u64)> {
+        self.auxiliary
+            .as_ref()
+            .and_then(|evidence| evidence.directory_identity)
+    }
+
+    pub(crate) fn mount_owner(&self) -> MountPoint {
+        MountPoint {
+            path: self.binding.path.clone(),
+            device: self.binding.device.clone(),
+            fs_type: self.binding.fs_type.clone(),
+            is_ram_backed: self.binding.is_ram_backed,
+        }
+    }
+
+    pub(crate) fn resolved_query(&self) -> Option<&Path> {
+        self.auxiliary
+            .as_ref()
+            .map(|evidence| evidence.resolved_query.as_path())
+    }
+}
+
+/// Background probes collect every native input needed by the pressure path.
+/// Synchronous callers retain their existing cost and have no auxiliary frame.
+#[derive(Debug, Clone)]
+struct AuxiliaryEvidence {
+    inode_stats: Option<InodeStats>,
+    is_ram_backed: bool,
+    directory_identity: Option<(u64, u64)>,
+    resolved_query: PathBuf,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ProbeRequest {
+    Filesystem(PathBuf),
+    MountInventory,
+    CapacityMetadata,
+}
+
+#[derive(Clone)]
+enum ProbeValue {
+    Filesystem(Box<FsStatsSample>),
+    MountInventory(Vec<MountPoint>),
+    CapacityMetadata,
 }
 
 /// The PAL's ownership evidence, including the resolved mount spelling.
@@ -85,6 +159,7 @@ pub struct FsStatsCollector {
     platform: Arc<dyn Platform>,
     cache_ttl: Duration,
     state: RwLock<CollectorState>,
+    background: Option<BoundedObserver<ProbeRequest, ProbeValue>>,
 }
 
 impl FsStatsCollector {
@@ -94,6 +169,93 @@ impl FsStatsCollector {
             platform,
             cache_ttl,
             state: RwLock::new(CollectorState::default()),
+            background: None,
+        }
+    }
+
+    /// Start observations lazily on bounded workers. Every lookup returns
+    /// immediately with still-current evidence or an unknown/pending error.
+    /// The root filesystem has a reserved worker even if other roots stall.
+    #[must_use]
+    pub fn new_background(
+        platform: Arc<dyn Platform>,
+        cache_ttl: Duration,
+        max_sample_age: Duration,
+    ) -> Self {
+        let worker_platform = Arc::clone(&platform);
+        let probe = Arc::new(move |request: &ProbeRequest| {
+            match request {
+                ProbeRequest::Filesystem(path) => {
+                    collect_background_sample(worker_platform.as_ref(), path)
+                        .map(|sample| ProbeValue::Filesystem(Box::new(sample)))
+                }
+                ProbeRequest::MountInventory => worker_platform
+                    .mount_points()
+                    .map(ProbeValue::MountInventory),
+                ProbeRequest::CapacityMetadata => worker_platform
+                    .refresh_capacity_metadata()
+                    .map(|()| ProbeValue::CapacityMetadata),
+            }
+            .map_err(|error| error.to_string())
+        });
+        Self {
+            platform,
+            cache_ttl,
+            state: RwLock::new(CollectorState::default()),
+            background: Some(BoundedObserver::new(
+                probe,
+                cache_ttl,
+                max_sample_age,
+                16,
+                512,
+            )),
+        }
+    }
+
+    #[must_use]
+    pub fn is_background(&self) -> bool {
+        self.background.is_some()
+    }
+
+    /// Inventory discovery has its own bounded job; targeted native probes
+    /// never wait for this result or canonicalize every unrelated mount.
+    pub fn mount_points(&self) -> Result<Vec<MountPoint>> {
+        let Some(background) = &self.background else {
+            return self.platform.mount_points();
+        };
+        if self.platform.has_capacity_metadata() {
+            // Optional metadata may read global disk caches or invoke native
+            // tools. Keep it separate from both targeted capacity and mount
+            // inventory, with its own accounted-for bounded worker slot.
+            let _ = background.observe(ProbeRequest::CapacityMetadata, false);
+        }
+        let observation = background
+            .observe(ProbeRequest::MountInventory, false)
+            .map_err(|details| SbhError::FsStats {
+                path: PathBuf::from("/"),
+                details,
+            })?;
+        match observation.value {
+            ProbeValue::MountInventory(mounts) => Ok(mounts),
+            ProbeValue::Filesystem(_) | ProbeValue::CapacityMetadata => {
+                unreachable!("inventory request has inventory result")
+            }
+        }
+    }
+
+    /// Revoke old evidence without freeing slots held by blocked workers.
+    pub fn invalidate_observations(&self) {
+        if let Some(background) = &self.background {
+            background.invalidate();
+        }
+        let mut state = self.state.write();
+        state.cache.clear();
+        state.mounts = None;
+    }
+
+    pub fn set_max_sample_age(&mut self, max_sample_age: Duration) {
+        if let Some(background) = &self.background {
+            background.set_max_age(max_sample_age);
         }
     }
 
@@ -103,6 +265,33 @@ impl FsStatsCollector {
 
     /// Retain provenance for consumers that derive rates between readings.
     pub(crate) fn collect_sample(&self, path: &Path) -> Result<FsStatsSample> {
+        if let Some(background) = &self.background {
+            let observation = background.observe(
+                ProbeRequest::Filesystem(path.to_path_buf()),
+                path == Path::new("/"),
+            );
+            if self.platform.has_capacity_metadata() {
+                // Sampling must keep optional metadata refreshing even on
+                // platforms without the uncovered-mount inventory sweep.
+                // The same key deduplicates this with inventory requests.
+                let _ = background.observe(ProbeRequest::CapacityMetadata, false);
+            }
+            let observation = observation.map_err(|details| SbhError::FsStats {
+                path: path.to_path_buf(),
+                details,
+            })?;
+            return match observation.value {
+                ProbeValue::Filesystem(mut sample) => {
+                    // Keep the original scheduling time: a slow worker or a
+                    // delayed receiver cannot manufacture fresh rate evidence.
+                    sample.collected_at = observation.collected_at;
+                    Ok(*sample)
+                }
+                ProbeValue::MountInventory(_) | ProbeValue::CapacityMetadata => {
+                    unreachable!("filesystem request has filesystem result")
+                }
+            };
+        }
         let mounts = self.cached_mounts()?;
         let lookup_path = self.platform.mount_lookup_path(path)?;
         let mount =
@@ -116,6 +305,23 @@ impl FsStatsCollector {
     pub fn collect_many(&self, paths: &[PathBuf]) -> Result<HashMap<PathBuf, FsStats>> {
         if paths.is_empty() {
             return Ok(HashMap::new());
+        }
+        if self.is_background() {
+            let mut readings = HashMap::with_capacity(paths.len());
+            let mut first_error = None;
+            for path in paths {
+                match self.collect(path) {
+                    Ok(stats) => {
+                        readings.insert(path.clone(), stats);
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            // Schedule every requested root, including those following a
+            // stalled peer, before reporting an incomplete batch.
+            return first_error.map_or(Ok(readings), Err);
         }
         let mounts = self.cached_mounts()?;
         let resolved_paths: Vec<PathBuf> = paths
@@ -160,6 +366,10 @@ impl FsStatsCollector {
     }
 
     pub fn prune_expired_cache(&self) {
+        if let Some(background) = &self.background {
+            background.prune();
+            return;
+        }
         let now = Instant::now();
         let ttl = self.cache_ttl;
         let mut state = self.state.write();
@@ -181,6 +391,9 @@ impl FsStatsCollector {
             return;
         }
         self.cache_ttl = ttl;
+        if let Some(background) = &self.background {
+            background.set_refresh_after(ttl);
+        }
         // Increasing a TTL must not resurrect evidence that already expired.
         let state = self.state.get_mut();
         state.cache.clear();
@@ -299,6 +512,7 @@ impl FsStatsCollector {
             binding: mount.clone(),
             stats: fresh,
             collected_at,
+            auxiliary: None,
         };
         state.cache.insert(mount.path.clone(), sample.clone());
         drop(state);
@@ -323,6 +537,83 @@ impl FsStatsCollector {
             state.cache.remove(&mount.path);
             state.mounts = None;
         }
+    }
+}
+
+/// Collect a coherent native frame without walking or resolving unrelated
+/// mount points. Every potentially blocking operation stays on this worker.
+fn collect_background_sample(platform: &dyn Platform, path: &Path) -> Result<FsStatsSample> {
+    let collected_at = Instant::now();
+    let resolved_query = platform.observe_mount_lookup_path(path)?;
+    let owner = platform.mount_identity(path)?;
+    let resolved_owner = platform.observe_mount_lookup_path(&owner.path)?;
+    if !resolved_query.starts_with(&resolved_owner) {
+        return Err(changed_mount(path));
+    }
+    let directory_identity = mount_directory_identity(&owner.path)?;
+    let stats = platform.observe_fs_stats(&owner.path)?;
+    if stats.free_bytes > stats.total_bytes || stats.available_bytes > stats.free_bytes {
+        return Err(SbhError::FsStats {
+            path: path.to_path_buf(),
+            details: "inconsistent filesystem capacity counters".to_string(),
+        });
+    }
+    if stats.fs_type != owner.fs_type
+        || platform.observe_mount_lookup_path(&stats.mount_point)? != resolved_owner
+    {
+        return Err(changed_mount(path));
+    }
+    let inode_stats = match platform.inode_stats(&owner.path)? {
+        Some(stats) => Some(stats.validated().ok_or_else(|| SbhError::FsStats {
+            path: path.to_path_buf(),
+            details: "inconsistent filesystem inode counters".to_string(),
+        })?),
+        None => None,
+    };
+    let is_ram_backed = platform.is_ram_backed(&owner.path)?;
+    // Bracket all native inputs, including inode and RAM classification, by
+    // equal ownership and real-directory identity. A renamed or replaced
+    // mount cannot keep authority merely because its pathname was reused.
+    if is_ram_backed != owner.is_ram_backed
+        || platform.observe_mount_lookup_path(path)? != resolved_query
+        || platform.mount_identity(path)? != owner
+        || platform.observe_mount_lookup_path(&owner.path)? != resolved_owner
+        || mount_directory_identity(&owner.path)? != directory_identity
+    {
+        return Err(changed_mount(path));
+    }
+    Ok(FsStatsSample {
+        binding: MountBinding::of(&owner, resolved_owner),
+        stats,
+        collected_at,
+        auxiliary: Some(AuxiliaryEvidence {
+            inode_stats,
+            is_ram_backed,
+            directory_identity,
+            resolved_query,
+        }),
+    })
+}
+
+fn mount_directory_identity(path: &Path) -> Result<Option<(u64, u64)>> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| SbhError::FsStats {
+        path: path.to_path_buf(),
+        details: format!("could not verify mount directory: {error}"),
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(SbhError::FsStats {
+            path: path.to_path_buf(),
+            details: "mount owner is not a real directory".to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(Some((metadata.dev(), metadata.ino())))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(None)
     }
 }
 
@@ -355,6 +646,9 @@ fn find_mount<'a>(path: &Path, mounts: &'a [MountBinding]) -> Option<&'a MountBi
 
 #[cfg(test)]
 mod topology_tests;
+
+#[cfg(test)]
+mod background_tests;
 
 #[cfg(test)]
 mod tests {

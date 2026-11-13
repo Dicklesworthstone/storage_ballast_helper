@@ -421,16 +421,56 @@ pub trait Platform: Send + Sync {
     }
 
     fn fs_stats(&self, path: &Path) -> Result<FsStats>;
+    /// Latency-sensitive native capacity observation. Optional metadata must
+    /// come from memory here; platforms refresh it independently so a remote
+    /// cache directory cannot stall every filesystem's pressure observation.
+    fn observe_fs_stats(&self, path: &Path) -> Result<FsStats> {
+        self.fs_stats(path)
+    }
+
+    /// Whether capacity observations use independently refreshed metadata.
+    fn has_capacity_metadata(&self) -> bool {
+        false
+    }
+
+    /// Refresh optional capacity metadata. The daemon runs this on its own
+    /// bounded worker, never as a dependency of an individual mount probe.
+    fn refresh_capacity_metadata(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Fresh inode accounting, when the filesystem has a finite inode limit.
     /// Unsupported platforms must not substitute byte capacity or host data.
     fn inode_stats(&self, _path: &Path) -> Result<Option<InodeStats>> {
         Ok(None)
     }
     fn mount_points(&self) -> Result<Vec<MountPoint>>;
+    /// Identify only the filesystem owning this path. Native implementations
+    /// must not probe or resolve unrelated mounts: one unavailable volume must
+    /// not delay observations of every healthy filesystem.
+    fn mount_identity(&self, path: &Path) -> Result<MountPoint> {
+        let FsStats {
+            mount_point,
+            fs_type,
+            ..
+        } = self.fs_stats(path)?;
+        self.mount_points()?
+            .into_iter()
+            .find(|mount| mount.path == mount_point && mount.fs_type == fs_type)
+            .ok_or_else(|| SbhError::FsStats {
+                path: path.to_path_buf(),
+                details: "could not verify filesystem owner".to_string(),
+            })
+    }
     /// Resolve a path in the namespace used by this platform's mount table.
     /// Native platforms may need more than symlink resolution (APFS firmlinks).
     fn mount_lookup_path(&self, path: &Path) -> Result<PathBuf> {
         Ok(crate::core::paths::resolve_absolute_path(path))
+    }
+    /// Fresh query spelling for background observations that also authorize
+    /// path scope. Native implementations must bypass ancestor alias caches.
+    fn observe_mount_lookup_path(&self, path: &Path) -> Result<PathBuf> {
+        self.mount_lookup_path(path)
     }
     fn is_ram_backed(&self, path: &Path) -> Result<bool>;
     fn default_paths(&self) -> PlatformPaths;

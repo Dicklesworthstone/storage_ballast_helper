@@ -130,6 +130,23 @@ impl Platform for LinuxPal {
         self.get_cached_mounts()
     }
 
+    fn mount_identity(&self, path: &Path) -> Result<MountPoint> {
+        let resolved = resolve_mount_path(path)?;
+        // /proc mount inventory is lexical. Do not canonicalize other mount
+        // paths here: an unrelated disconnected filesystem may block forever.
+        let mounts = self.get_cached_mounts()?;
+        disk::find_mount(&resolved, &mounts)
+            .cloned()
+            .ok_or_else(|| SbhError::FsStats {
+                path: path.to_path_buf(),
+                details: "could not map resolved path to mount point".to_string(),
+            })
+    }
+
+    fn observe_mount_lookup_path(&self, path: &Path) -> Result<PathBuf> {
+        resolve_mount_path(path)
+    }
+
     fn inode_stats(&self, path: &Path) -> Result<Option<InodeStats>> {
         let resolved = resolve_mount_path(path)?;
         let stat = nix::sys::statvfs::statvfs(&resolved).map_err(|error| SbhError::FsStats {

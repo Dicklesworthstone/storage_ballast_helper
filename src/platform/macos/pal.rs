@@ -78,16 +78,48 @@ impl Platform for MacOsPal {
         )))
     }
 
+    fn observe_fs_stats(&self, path: &Path) -> Result<FsStats> {
+        let stats =
+            sys::statfs(path).map_err(|error| macos_method_error("observe_fs_stats", &error))?;
+        let inventory = sys::cached_apfs_inventory();
+        Ok(statfs_to_observed_fs_stats(stats, inventory.as_ref()))
+    }
+
+    fn has_capacity_metadata(&self) -> bool {
+        true
+    }
+
+    fn refresh_capacity_metadata(&self) -> Result<()> {
+        sys::apfs_inventory()
+            .map(|_| ())
+            .map_err(|error| macos_method_error("refresh_capacity_metadata", &error))
+    }
+
     fn mount_points(&self) -> Result<Vec<MountPoint>> {
         sys::mounted_filesystems()
             .map(|mounts| mounts.into_iter().map(statfs_to_mount_point).collect())
             .map_err(|error| macos_method_error("mount_points", &error))
     }
 
+    fn mount_identity(&self, path: &Path) -> Result<MountPoint> {
+        // statfs carries this volume's native mount source, including APFS
+        // identity. A global mount inventory can probe unrelated volumes.
+        sys::statfs(path)
+            .map(statfs_to_mount_point)
+            .map_err(|error| macos_method_error("mount_identity", &error))
+    }
+
     fn mount_lookup_path(&self, path: &Path) -> Result<PathBuf> {
         let resolved = crate::core::paths::resolve_absolute_path(path);
         sys::resolve_firmlinked_path(&resolved)
             .map_err(|error| macos_method_error("mount_lookup_path", &error))
+    }
+
+    fn observe_mount_lookup_path(&self, path: &Path) -> Result<PathBuf> {
+        let resolved = std::fs::canonicalize(path)
+            .map_err(|error| macos_method_error("observe_mount_lookup_path", &error))?;
+        sys::resolve_firmlinked_path(&resolved)
+            .map_err(|error| macos_method_error("observe_mount_lookup_path", &error))
     }
 
     fn is_ram_backed(&self, path: &Path) -> Result<bool> {
@@ -878,6 +910,21 @@ fn statfs_to_capacity(stats: StatfsSnapshot, inventory: Option<&ApfsInventory>) 
         local_snapshot_bytes: None,
         estimated_reclaimable_by_snapshot_thinning: None,
     }
+}
+
+/// Keep APFS container geometry without allowing optional cached counters to
+/// inflate current native headroom. A cold or expired metadata cache uses the
+/// existing native statfs fallback; it never delays this pressure reading.
+fn statfs_to_observed_fs_stats(
+    stats: StatfsSnapshot,
+    inventory: Option<&ApfsInventory>,
+) -> FsStats {
+    let native_free_bytes = stats.free_bytes();
+    let native_available_bytes = stats.available_bytes();
+    let mut capacity = statfs_to_capacity(stats, inventory);
+    capacity.free_bytes = capacity.free_bytes.min(native_free_bytes);
+    capacity.available_bytes = capacity.available_bytes.min(native_available_bytes);
+    capacity_to_fs_stats(capacity)
 }
 
 fn local_snapshot_bytes_for_capacity(
@@ -1866,6 +1913,67 @@ mod tests {
         assert_eq!(stats.available_bytes, 250);
         assert!((stats.free_pct() - 25.0).abs() < f64::EPSILON);
         assert_eq!(stats.mount_point, PathBuf::from("/System/Volumes/Data"));
+    }
+
+    #[test]
+    fn cold_optional_apfs_metadata_falls_back_to_native_capacity() {
+        let native = StatfsSnapshot {
+            mount_point: PathBuf::from("/System/Volumes/Data"),
+            device: "/dev/disk3s5".to_string(),
+            fs_type: "apfs".to_string(),
+            block_size: 1,
+            blocks: 400,
+            blocks_free: 30,
+            blocks_available: 20,
+            is_readonly: false,
+        };
+        let stats = super::statfs_to_observed_fs_stats(native, None);
+        assert_eq!(stats.total_bytes, 400);
+        assert_eq!(stats.free_bytes, 30);
+        assert_eq!(stats.available_bytes, 20);
+        assert_eq!(stats.mount_point, PathBuf::from("/System/Volumes/Data"));
+    }
+
+    #[test]
+    fn warm_apfs_geometry_cannot_inflate_fresh_native_headroom() {
+        for (native_free, native_available, cached_available, expected_free, expected_available) in [
+            (30, 20, 250, 30, 20),
+            (80, 60, 10, 10, 10),
+            (80, 60, 70, 70, 60),
+            (30, 0, 250, 30, 0),
+        ] {
+            let native = StatfsSnapshot {
+                mount_point: PathBuf::from("/System/Volumes/Data"),
+                device: "/dev/disk3s5".to_string(),
+                fs_type: "apfs".to_string(),
+                block_size: 1,
+                blocks: 400,
+                blocks_free: native_free,
+                blocks_available: native_available,
+                is_readonly: false,
+            };
+            let inventory = ApfsInventory {
+                containers: Vec::new(),
+                volumes: vec![ApfsVolume {
+                    device_id: "/dev/disk3s5".to_string(),
+                    container_id: "/dev/disk3".to_string(),
+                    name: Some("Data".to_string()),
+                    roles: vec![ApfsVolumeRole::Data],
+                    capacity_in_use_bytes: None,
+                    container_total_bytes: Some(1000),
+                    container_available_bytes: Some(cached_available),
+                }],
+            };
+            // The full discovery path retains its existing projection.
+            let full = super::statfs_to_capacity(native.clone(), Some(&inventory));
+            assert_eq!(full.available_bytes, cached_available);
+            let observed = super::statfs_to_observed_fs_stats(native, Some(&inventory));
+            assert_eq!(observed.total_bytes, 1000);
+            assert_eq!(observed.free_bytes, expected_free);
+            assert_eq!(observed.available_bytes, expected_available);
+            assert!(observed.available_bytes <= native_available);
+            assert!(observed.available_bytes <= observed.free_bytes);
+        }
     }
 
     #[test]

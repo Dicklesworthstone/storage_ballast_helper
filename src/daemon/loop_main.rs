@@ -69,6 +69,7 @@ use crate::logger::sqlite::{HistoryPage, HistoryWatermark, SqliteLogger};
 use crate::monitor::burst::BurstStats;
 use crate::monitor::conformal::{ConformalCalibrator, ConformalConfig, TteInterval};
 use crate::monitor::ewma::{DiskRateEstimator, RateEstimate};
+use crate::monitor::fs_stats::background::BoundedObserver;
 use crate::monitor::fs_stats::{FsStatsCollector, FsStatsSample};
 use crate::monitor::guardrails::ForecastSnapshot;
 use crate::monitor::guardrails::{
@@ -2552,6 +2553,126 @@ pub const CATALOG_PROBE_MAX_ENTRIES: usize = 50_000;
 /// Depth budget for the catalog root probe.
 pub const CATALOG_PROBE_MAX_DEPTH: usize = 5;
 
+/// Catalog results belong to the observed mount incarnation, not just a path.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CatalogObservationKey {
+    mount: PathBuf,
+    directory_identity: (u64, u64),
+    owner_device: String,
+    owner_fs_type: String,
+    owner_is_ram_backed: bool,
+}
+
+impl CatalogObservationKey {
+    fn from_sample(mount: &Path, sample: &FsStatsSample) -> Option<Self> {
+        let directory_identity = sample.mount_directory_identity()?;
+        let owner = sample.mount_owner();
+        (owner.path == mount).then(|| Self {
+            mount: mount.to_path_buf(),
+            directory_identity,
+            owner_device: owner.device,
+            owner_fs_type: owner.fs_type,
+            owner_is_ram_backed: owner.is_ram_backed,
+        })
+    }
+}
+
+type CatalogObserver = BoundedObserver<CatalogObservationKey, Vec<ExpandedCatalogRoot>>;
+
+#[derive(Clone)]
+struct RamLogMirrorObservation {
+    start_refusal: Option<String>,
+    keep_refusal: Option<String>,
+}
+
+impl RamLogMirrorObservation {
+    fn collect(
+        mut check: impl FnMut(crate::monitor::ram_scratch::RamLogHeadroom) -> Option<String>,
+    ) -> Self {
+        use crate::monitor::ram_scratch::RamLogHeadroom;
+        let start_refusal = check(RamLogHeadroom::Start);
+        let keep_refusal = check(RamLogHeadroom::Keep);
+        Self {
+            // Resources can deteriorate between the two native checks. The
+            // later refusal must also prevent starting a new RAM writer.
+            start_refusal: start_refusal.or_else(|| keep_refusal.clone()),
+            keep_refusal,
+        }
+    }
+
+    fn refusal(&self, mirroring: bool) -> Option<String> {
+        if mirroring {
+            self.keep_refusal.clone()
+        } else {
+            self.start_refusal.clone()
+        }
+    }
+}
+
+type RamLogMirrorObserver = BoundedObserver<(), RamLogMirrorObservation>;
+
+fn ram_log_mirror_observer(
+    platform: Arc<dyn Platform>,
+    path: Option<PathBuf>,
+) -> RamLogMirrorObserver {
+    BoundedObserver::new(
+        Arc::new(move |&()| {
+            Ok(RamLogMirrorObservation::collect(|headroom| {
+                path.as_ref().map_or_else(
+                    || Some("log fallback destination is disabled".to_string()),
+                    |path| {
+                        crate::monitor::ram_scratch::ram_log_mirror_refusal_for(
+                            platform.as_ref(),
+                            path,
+                            headroom,
+                        )
+                    },
+                )
+            }))
+        }),
+        LOGGING_RAM_RECHECK / 2,
+        LOGGING_RAM_RECHECK,
+        2,
+        2,
+    )
+}
+
+fn catalog_mount_matches(key: &CatalogObservationKey, platform: &dyn Platform) -> bool {
+    let Ok(owner) = platform.mount_identity(&key.mount) else {
+        return false;
+    };
+    if owner.path != key.mount
+        || owner.device != key.owner_device
+        || owner.fs_type != key.owner_fs_type
+        || owner.is_ram_backed != key.owner_is_ram_backed
+    {
+        return false;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(&key.mount) else {
+        return false;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let identity = crate::scanner::walker::entry_metadata(&metadata).identity();
+    (identity.device_id, identity.inode) == key.directory_identity
+}
+
+fn collect_catalog_observation(
+    key: &CatalogObservationKey,
+    platform: &dyn Platform,
+    discover: impl FnOnce(u64) -> Vec<ExpandedCatalogRoot>,
+) -> std::result::Result<Vec<ExpandedCatalogRoot>, String> {
+    if !catalog_mount_matches(key, platform) {
+        return Err("catalog mount no longer matches its pressure observation".to_string());
+    }
+    let roots = discover(key.directory_identity.0);
+    if !catalog_mount_matches(key, platform) {
+        return Err("catalog mount changed during discovery".to_string());
+    }
+    Ok(roots)
+}
+
 /// Turn derived catalog roots into opaque candidate units for the scanner
 /// loop. Each root is probed once (allocated size, newest mtime, structural
 /// markers); roots used more recently than their rule's minimum idle age are
@@ -3139,6 +3260,12 @@ pub struct MonitoringDaemon {
     /// Derived catalog roots per mount (W1 catalog roots), refreshed every
     /// `scanner.catalog_rescan_interval_secs`.
     catalog_root_cache: HashMap<PathBuf, (Instant, Vec<ExpandedCatalogRoot>)>,
+    /// Native home/catalog discovery shares the bounded observation lifecycle.
+    /// Retain this coordinator across reloads so blocked workers keep their slots.
+    catalog_observer: Option<CatalogObserver>,
+    /// One post-failure inode diagnostic and its deadline waiter. Finished
+    /// decisions retain occupied native worker slots until both threads exit.
+    pending_state_write_diagnosis: Option<PendingStateWriteDiagnosis>,
     /// Last catalog scan per mount: the level it was dispatched at and when.
     /// One catalog scan per pressure epoch; a rising level re-arms it.
     catalog_epochs: HashMap<PathBuf, (PressureLevel, Instant)>,
@@ -3158,6 +3285,11 @@ pub struct MonitoringDaemon {
     /// When the RAM fallback's headroom was last checked while the logging
     /// mount was pressured (bd-ffjj).
     logging_ram_checked_at: Option<Instant>,
+    /// The logger's actual startup destination; resolving a fallback path can
+    /// itself touch a filesystem and must not recur on the monitor thread.
+    logging_ram_path: Option<PathBuf>,
+    /// One complete Start/Keep frame, with one occupied native worker maximum.
+    logging_ram_observer: Option<RamLogMirrorObserver>,
     /// Per-location alert throttle for the special-location horizon rule.
     special_alerts: AlertThrottle,
     /// Independent capacity trends for special mounts outside scanner roots.
@@ -3617,6 +3749,41 @@ fn special_location_scan_roots(location: &Path, configured_roots: &[PathBuf]) ->
         push_unique_path(&mut roots, location.to_path_buf());
     }
 
+    roots
+}
+
+/// Cached worker resolutions preserve configured subtree boundaries across
+/// aliases without doing path I/O on the control thread. An unresolved root
+/// may be an alias into the special location, so it cannot justify widening
+/// the special scope to its whole parent. Known configured roots remain usable.
+fn observed_special_location_scan_roots(
+    location: &Path,
+    resolved_location: Option<&Path>,
+    configured_roots: &[(PathBuf, Option<PathBuf>)],
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for (root, resolved) in configured_roots {
+        if resolved
+            .as_deref()
+            .zip(resolved_location)
+            .is_some_and(|(root, location)| root.starts_with(location))
+        {
+            push_unique_path(&mut roots, root.clone());
+        }
+    }
+    if roots.is_empty()
+        && resolved_location.is_some()
+        && configured_roots
+            .iter()
+            .all(|(_, resolved)| resolved.is_some())
+    {
+        push_unique_path(&mut roots, location.to_path_buf());
+    }
+    for (root, resolved) in configured_roots {
+        if resolved.is_some() {
+            push_unique_path(&mut roots, root.clone());
+        }
+    }
     roots
 }
 
@@ -4718,10 +4885,219 @@ fn build_status_dump_payload(input: &StatusDumpPayloadInput<'_>) -> Value {
     })
 }
 
+/// Background samples carry this evidence from their worker. The synchronous
+/// platform-injected harness retains its existing native observation seam.
+fn pressure_observation_device_id(sample: &FsStatsSample, background: bool) -> Option<u64> {
+    if background {
+        return sample.mount_device_id();
+    }
+    let metadata = std::fs::symlink_metadata(&sample.stats.mount_point).ok()?;
+    (metadata.is_dir() && !metadata.file_type().is_symlink())
+        .then(|| crate::scanner::walker::device_id(&metadata))
+}
+
+struct StateWriteFailureVerdict {
+    recorded: AtomicBool,
+    policy: Arc<Mutex<PolicyEngine>>,
+}
+
+impl StateWriteFailureVerdict {
+    fn record(&self, inode_pressure: bool) {
+        // Serialize the once decision with policy mutation so a reload cannot
+        // overtake a claimed-but-not-yet-recorded old diagnostic result.
+        let mut policy = self.policy.lock();
+        if !self.recorded.swap(true, Ordering::AcqRel) {
+            policy.note_serialization_failure(inode_pressure);
+        }
+    }
+}
+
+struct PendingStateWriteDiagnosis {
+    probe: thread::JoinHandle<()>,
+    decision: Option<thread::JoinHandle<()>>,
+    verdict: Arc<StateWriteFailureVerdict>,
+}
+
+impl PendingStateWriteDiagnosis {
+    fn start(
+        probe: impl FnOnce() -> bool + Send + 'static,
+        policy: Arc<Mutex<PolicyEngine>>,
+        timeout: Duration,
+    ) -> std::io::Result<Self> {
+        let deadline = Instant::now() + timeout;
+        let verdict = Arc::new(StateWriteFailureVerdict {
+            recorded: AtomicBool::new(false),
+            policy,
+        });
+        let (sender, receiver) = bounded(1);
+        let worker = thread::Builder::new()
+            .name("sbh-state-inodes".to_string())
+            .spawn(move || {
+                let _ = sender.try_send(probe());
+            })?;
+        let decision_verdict = Arc::clone(&verdict);
+        let decision = thread::Builder::new()
+            .name("sbh-state-verdict".to_string())
+            .spawn(move || {
+                let pressure = receiver
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or(false);
+                decision_verdict.record(pressure && Instant::now() <= deadline);
+            });
+        let decision = decision.map_or_else(
+            |_| {
+                verdict.record(false);
+                None
+            },
+            Some,
+        );
+        Ok(Self {
+            probe: worker,
+            decision,
+            verdict,
+        })
+    }
+
+    fn is_finished(&self) -> bool {
+        self.probe.is_finished()
+            && self
+                .decision
+                .as_ref()
+                .is_none_or(thread::JoinHandle::is_finished)
+    }
+}
+
+/// Fresh native evidence for the atomic state-write destination. In background
+/// mode this is called only by the diagnostic worker, after the failed write.
+fn diagnose_state_volume_inodes(
+    platform: &dyn Platform,
+    parent: &Path,
+    thresholds: &InodePressureConfig,
+) -> bool {
+    let Ok(resolved) = std::fs::canonicalize(parent) else {
+        return false;
+    };
+    if !resolved.is_dir() {
+        return false;
+    }
+    let Ok(identity) = crate::scanner::walker::identity_for_path(&resolved, false) else {
+        return false;
+    };
+    let Ok(stats) = platform.fs_stats(&resolved) else {
+        return false;
+    };
+    if stats.is_readonly
+        || !std::fs::metadata(&stats.mount_point).is_ok_and(|metadata| {
+            crate::scanner::walker::device_id(&metadata) == identity.device_id
+        })
+    {
+        return false;
+    }
+    let Some(evidence) = platform
+        .inode_stats(&resolved)
+        .ok()
+        .flatten()
+        .and_then(|sample| classify_inode_pressure(sample, thresholds, PressureLevel::Green))
+    else {
+        return false;
+    };
+    evidence.pressure_level() >= PressureLevel::Red
+        && std::fs::canonicalize(parent).ok().as_ref() == Some(&resolved)
+        && crate::scanner::walker::identity_for_path(&resolved, false).ok() == Some(identity)
+}
+
 impl MonitoringDaemon {
     /// Build and initialize the daemon from configuration.
     pub fn init(config: Config, args: &DaemonArgs) -> Result<Self> {
-        Self::init_with_platform(config, args, detect_platform()?)
+        let mut daemon = Self::init_with_platform(config, args, detect_platform()?)?;
+        daemon.enable_background_filesystem_observations();
+        Ok(daemon)
+    }
+
+    /// Collect capacity and pressure evidence off the control thread. Startup
+    /// discovery and filesystem mutations retain their existing lifecycle;
+    /// the synchronous constructor remains the platform-injected test seam.
+    fn enable_background_filesystem_observations(&mut self) {
+        self.fs_collector = FsStatsCollector::new_background(
+            Arc::clone(&self.platform),
+            Duration::from_millis(self.config.telemetry.fs_cache_ttl_ms),
+            Self::filesystem_observation_max_age(&self.config),
+        );
+        let platform = Arc::clone(&self.platform);
+        let ttl = Duration::from_secs(self.config.scanner.catalog_rescan_interval_secs.max(1));
+        self.catalog_observer = Some(BoundedObserver::new(
+            Arc::new(move |key: &CatalogObservationKey| {
+                collect_catalog_observation(key, platform.as_ref(), |device| {
+                    let homes = cleanup_catalog::user_homes(&platform.user_home());
+                    cleanup_catalog::catalog_roots_for_mount(
+                        cleanup_catalog::CATALOG_ROOTS,
+                        &homes,
+                        device,
+                    )
+                })
+            }),
+            ttl,
+            ttl,
+            4,
+            128,
+        ));
+        self.catalog_root_cache.clear();
+        self.logging_ram_observer = Some(ram_log_mirror_observer(
+            Arc::clone(&self.platform),
+            self.logging_ram_path.clone(),
+        ));
+        self.prime_filesystem_observations();
+    }
+
+    fn filesystem_observation_max_age(config: &Config) -> Duration {
+        Duration::from_millis(
+            config
+                .pressure
+                .poll_interval_ms
+                .max(config.telemetry.fs_cache_ttl_ms)
+                .max(1),
+        )
+        .saturating_mul(2)
+    }
+
+    fn prime_filesystem_observations(&self) {
+        for path in std::iter::once(Path::new("/"))
+            .chain(self.config.scanner.root_paths.iter().map(PathBuf::as_path))
+            .chain(
+                self.special_locations
+                    .all()
+                    .iter()
+                    .map(|location| location.path.as_path()),
+            )
+        {
+            let _ = self.fs_collector.collect_sample(path);
+        }
+        let _ = self.fs_collector.mount_points();
+    }
+
+    /// A new background collector needs a first observation, but a stalled
+    /// mount must not make startup wait indefinitely. Any healthy root can
+    /// establish the first response; unavailable peers retain no authority.
+    fn initial_pressure_check(&mut self) -> Result<PressureResponse> {
+        if !self.fs_collector.is_background() {
+            return self.check_pressure();
+        }
+        // Allow healthy native observations to finish during a bounded startup
+        // grace without waiting indefinitely for any unavailable peer.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match self.check_pressure() {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    if Instant::now() >= deadline || self.signal_handler.should_shutdown() {
+                        return Err(error);
+                    }
+                }
+            }
+            self.watchdog
+                .maybe_notify("waiting for filesystem observations");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4757,6 +5133,7 @@ impl MonitoringDaemon {
             channel_capacity: 1024,
             run_id: Some(run_id.clone()),
         };
+        let logging_ram_path = logger_config.jsonl_config.fallback_path.clone();
         let (logger_handle, logger_join) = spawn_logger(logger_config)?;
 
         // 2. Signal handler.
@@ -5002,12 +5379,16 @@ impl MonitoringDaemon {
             uncovered_levels: HashMap::new(),
             uncovered_checked_at: None,
             catalog_root_cache: HashMap::new(),
+            catalog_observer: None,
+            pending_state_write_diagnosis: None,
             catalog_epochs: HashMap::new(),
             emergency_mounts: HashSet::new(),
             mount_rates: HashMap::new(),
             logging_placement,
             logging_level_logged: None,
             logging_ram_checked_at: None,
+            logging_ram_path,
+            logging_ram_observer: None,
             special_alerts: AlertThrottle::default(),
             special_rates: SpecialLocationRates::default(),
             last_maintenance_scan: None,
@@ -5141,26 +5522,53 @@ impl MonitoringDaemon {
         );
         let level_changed = self.logging_level_logged != Some(level);
         let now = Instant::now();
-        if !level_changed && !logging_ram_recheck_due(pressured, self.logging_ram_checked_at, now) {
+        if !level_changed
+            && self.logging_ram_observer.is_none()
+            && !logging_ram_recheck_due(pressured, self.logging_ram_checked_at, now)
+        {
             return;
         }
         self.logging_level_logged = Some(level);
         let refusal = if pressured {
-            self.logging_ram_checked_at = Some(now);
             // A margin to start, the plain floors to keep: no flapping at a
             // threshold (bd-sz85).
-            let headroom = if self.logging_placement.mirroring {
-                crate::monitor::ram_scratch::RamLogHeadroom::Keep
+            if let Some(observer) = &self.logging_ram_observer {
+                // Poll pending work each tick, including the first result.
+                // A pending request must not start the old 30-second throttle
+                // and let its evidence expire before it can be consumed.
+                match observer.observe((), false) {
+                    Ok(observation) => {
+                        self.logging_ram_checked_at = Some(observation.collected_at);
+                        observation.value.refusal(self.logging_placement.mirroring)
+                    }
+                    Err(error) => {
+                        self.logging_ram_checked_at = None;
+                        Some(format!("RAM log headroom is unavailable: {error}"))
+                    }
+                }
             } else {
-                crate::monitor::ram_scratch::RamLogHeadroom::Start
-            };
-            crate::monitor::ram_scratch::ram_log_mirror_refusal_for(
-                self.platform.as_ref(),
-                &crate::logger::jsonl::ram_fallback_path(),
-                headroom,
-            )
+                self.logging_ram_checked_at = Some(now);
+                let headroom = if self.logging_placement.mirroring {
+                    crate::monitor::ram_scratch::RamLogHeadroom::Keep
+                } else {
+                    crate::monitor::ram_scratch::RamLogHeadroom::Start
+                };
+                self.logging_ram_path.as_ref().map_or_else(
+                    || Some("log fallback destination is disabled".to_string()),
+                    |path| {
+                        crate::monitor::ram_scratch::ram_log_mirror_refusal_for(
+                            self.platform.as_ref(),
+                            path,
+                            headroom,
+                        )
+                    },
+                )
+            }
         } else {
             self.logging_ram_checked_at = None;
+            if level_changed && let Some(observer) = &self.logging_ram_observer {
+                observer.invalidate();
+            }
             None
         };
         let mirror = pressured && refusal.is_none();
@@ -5180,6 +5588,21 @@ impl MonitoringDaemon {
             self.logging_placement.mirroring,
             refusal.map_or_else(String::new, |reason| format!(" (not mirroring: {reason})"))
         );
+        self.self_monitor
+            .set_logging_snapshot(self.logging_placement.clone());
+    }
+
+    fn invalidate_logging_ram_observations(&mut self) {
+        if let Some(observer) = &self.logging_ram_observer {
+            observer.invalidate();
+        }
+        self.logging_ram_checked_at = None;
+        self.logging_level_logged = None;
+        self.logging_placement.level = None;
+        if self.logging_placement.mirroring {
+            self.logging_placement.mirroring = false;
+            self.logger_handle.mirror_jsonl(false);
+        }
         self.self_monitor
             .set_logging_snapshot(self.logging_placement.clone());
     }
@@ -5760,50 +6183,63 @@ impl MonitoringDaemon {
         if !tick.state_write_failed || tick.state_write_errno != Some(libc::ENOSPC) {
             return false;
         }
+        // A cached sample predating the failed write cannot grant this special
+        // exception. Background callers use the bounded post-failure worker.
+        if self.fs_collector.is_background() {
+            return false;
+        }
         let Some(parent) = self.self_monitor.state_file_path().parent() else {
             return false;
         };
-        let Ok(resolved) = std::fs::canonicalize(parent) else {
-            return false;
-        };
-        if !resolved.is_dir() {
-            return false;
-        }
-        let Ok(identity) = crate::scanner::walker::identity_for_path(&resolved, false) else {
-            return false;
-        };
-        let Ok(stats) = self.platform.fs_stats(&resolved) else {
-            return false;
-        };
-        if stats.is_readonly
-            || !std::fs::metadata(&stats.mount_point).is_ok_and(|metadata| {
-                crate::scanner::walker::device_id(&metadata) == identity.device_id
-            })
-        {
-            return false;
-        }
-        let Some(evidence) = self
-            .platform
-            .inode_stats(&resolved)
-            .ok()
-            .flatten()
-            .and_then(|sample| {
-                classify_inode_pressure(sample, &self.config.pressure.inodes, PressureLevel::Green)
-            })
-        else {
-            return false;
-        };
-        evidence.pressure_level() >= PressureLevel::Red
-            && std::fs::canonicalize(parent).ok().as_ref() == Some(&resolved)
-            && crate::scanner::walker::identity_for_path(&resolved, false).ok() == Some(identity)
+        diagnose_state_volume_inodes(self.platform.as_ref(), parent, &self.config.pressure.inodes)
     }
 
-    fn note_state_write_failure(&self, tick: SelfMonitorTick) {
-        if tick.state_write_failed {
+    fn note_state_write_failure(&mut self, tick: SelfMonitorTick) {
+        if !tick.state_write_failed {
+            return;
+        }
+        if !self.fs_collector.is_background() || tick.state_write_errno != Some(libc::ENOSPC) {
             let inode_pressure = self.state_write_has_inode_pressure(tick);
             self.policy_engine
                 .lock()
                 .note_serialization_failure(inode_pressure);
+            return;
+        }
+        if self
+            .pending_state_write_diagnosis
+            .as_ref()
+            .is_some_and(PendingStateWriteDiagnosis::is_finished)
+        {
+            self.pending_state_write_diagnosis = None;
+        }
+        if self.pending_state_write_diagnosis.is_some() {
+            self.policy_engine.lock().note_serialization_failure(false);
+            return;
+        }
+        let Some(parent) = self
+            .self_monitor
+            .state_file_path()
+            .parent()
+            .map(Path::to_path_buf)
+        else {
+            self.policy_engine.lock().note_serialization_failure(false);
+            return;
+        };
+        let platform = Arc::clone(&self.platform);
+        let thresholds = self.config.pressure.inodes.clone();
+        match PendingStateWriteDiagnosis::start(
+            move || diagnose_state_volume_inodes(platform.as_ref(), &parent, &thresholds),
+            Arc::clone(&self.policy_engine),
+            Duration::from_secs(2),
+        ) {
+            Ok(pending) => self.pending_state_write_diagnosis = Some(pending),
+            Err(_) => self.policy_engine.lock().note_serialization_failure(false),
+        }
+    }
+
+    fn flush_pending_state_write_failure(&self) {
+        if let Some(pending) = &self.pending_state_write_diagnosis {
+            pending.verdict.record(false);
         }
     }
 
@@ -6092,8 +6528,8 @@ impl MonitoringDaemon {
             || self.provision_ballast(),
         )?;
 
-        // Initial pressure check.
-        let initial_response = self.check_pressure()?;
+        // Wait only a bounded time for the first background observation.
+        let initial_response = self.initial_pressure_check()?;
         if initial_response.level != PressureLevel::Green {
             eprintln!(
                 "[SBH-DAEMON] starting under pressure: {:?} (urgency={:.2})",
@@ -6196,7 +6632,7 @@ impl MonitoringDaemon {
             // handle_pressure consumes the per-mount ticks. Keep this tick's
             // actual filesystem response for all-root forced scans and their
             // retries; swap relief has its own narrower request authority.
-            let forced_scan_response = self.worst_filesystem_response();
+            let forced_scan_response = self.forced_filesystem_response();
             let operator_scan_responses: Vec<PressureResponse> = self
                 .mount_responses
                 .iter()
@@ -6619,6 +7055,7 @@ impl MonitoringDaemon {
     /// A later successful sample must admit fresh work; it cannot revive a
     /// cancelled staging pass, compression probe or target-only batch.
     fn withdraw_pressure_authority(&mut self) {
+        self.invalidate_logging_ram_observations();
         self.ballast_replenisher.cancel();
         self.ballast_refill_blockers.clear();
         self.quarantine_sweeper.cancel();
@@ -6643,10 +7080,15 @@ impl MonitoringDaemon {
         // (logs, packages, agent worktrees) and we'd miss the pressure
         // entirely. Per-mount dedup below means this is essentially free
         // when "/" is already implied by the configured paths.
-        let mut paths: Vec<PathBuf> = self.config.scanner.root_paths.clone();
-        if !paths.iter().any(|p| p == Path::new("/")) {
-            paths.push(PathBuf::from("/"));
-        }
+        let mut paths = vec![PathBuf::from("/")];
+        paths.extend(
+            self.config
+                .scanner
+                .root_paths
+                .iter()
+                .filter(|path| path.as_path() != Path::new("/"))
+                .cloned(),
+        );
 
         // Group paths by mount point to avoid redundant updates.
         let mut stats_by_mount: HashMap<PathBuf, FsStatsSample> = HashMap::new();
@@ -6679,6 +7121,14 @@ impl MonitoringDaemon {
         now: Instant,
     ) -> Result<PressureResponse> {
         self.special_rates.begin_tick();
+        if self.logging_ram_observer.is_some()
+            && self.logging_placement.on_monitored_fs
+            && !stats_by_mount
+                .keys()
+                .any(|mount| mount.to_string_lossy() == self.logging_placement.device)
+        {
+            self.invalidate_logging_ram_observations();
+        }
         if stats_by_mount.is_empty() {
             // The normal pressure handler renews and revokes tier permission,
             // but the error path skips it. Revoke here as part of sampling so
@@ -6724,14 +7174,7 @@ impl MonitoringDaemon {
         }
         // Allow a missed regular poll/cache renewal, but do not infer a
         // continuous trajectory across a stalled or delayed native reading.
-        let prediction_max_gap = Duration::from_millis(
-            self.config
-                .pressure
-                .poll_interval_ms
-                .max(self.config.telemetry.fs_cache_ttl_ms)
-                .max(1),
-        )
-        .saturating_mul(2);
+        let prediction_max_gap = Self::filesystem_observation_max_age(&self.config);
         let mut worst_response: Option<crate::monitor::pid::PressureResponse> = None;
         let mut worst_filesystem_level = PressureLevel::Green;
         let mut worst_filesystem_urgency = 0.0;
@@ -6754,6 +7197,7 @@ impl MonitoringDaemon {
         } else {
             None
         };
+        let background_observations = self.fs_collector.is_background();
 
         // Update monitors for each active mount.
         for (mount_path, sample) in stats_by_mount {
@@ -6798,18 +7242,22 @@ impl MonitoringDaemon {
                     || stats.free_bytes > stats.total_bytes
                     || stats.available_bytes > stats.free_bytes
                     || stats.free_bytes == stats.total_bytes
-                    || !self.platform.is_ram_backed(&mount_path).unwrap_or(false)
                 {
                     return None;
                 }
-                let metadata = std::fs::symlink_metadata(&mount_path).ok()?;
-                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                let ram_backed = if background_observations {
+                    sample.is_ram_backed().unwrap_or(false)
+                } else {
+                    self.platform.is_ram_backed(&mount_path).unwrap_or(false)
+                };
+                if !ram_backed {
                     return None;
                 }
+                let device_id = pressure_observation_device_id(&sample, background_observations)?;
                 pressure.target_bytes = pressure
                     .target_bytes
                     .min(stats.total_bytes - stats.free_bytes);
-                Some((pressure, crate::scanner::walker::device_id(&metadata)))
+                Some((pressure, device_id))
             });
 
             let guard_diag = monitor.guard.diagnostics();
@@ -6894,18 +7342,18 @@ impl MonitoringDaemon {
                 }
             }
 
-            let inode_pressure = self
-                .platform
-                .inode_stats(&mount_path)
-                .ok()
-                .flatten()
-                .and_then(|sample| {
-                    classify_inode_pressure(
-                        sample,
-                        &self.config.pressure.inodes,
-                        monitor.inode_pressure_level,
-                    )
-                });
+            let inode_sample = if background_observations {
+                sample.inode_stats()
+            } else {
+                self.platform.inode_stats(&mount_path).ok().flatten()
+            };
+            let inode_pressure = inode_sample.and_then(|sample| {
+                classify_inode_pressure(
+                    sample,
+                    &self.config.pressure.inodes,
+                    monitor.inode_pressure_level,
+                )
+            });
             monitor.inode_pressure_level = inode_pressure
                 .as_ref()
                 .map_or(PressureLevel::Green, InodePressureEvidence::pressure_level);
@@ -6953,9 +7401,8 @@ impl MonitoringDaemon {
                 && pressure.pressure_level() > response.level
                 && pressure.available < pressure.target_available
                 && !stats.is_readonly
-                && let Ok(metadata) = std::fs::symlink_metadata(&mount_path)
-                && metadata.is_dir()
-                && !metadata.file_type().is_symlink()
+                && let Some(device_id) =
+                    pressure_observation_device_id(&sample, background_observations)
             {
                 let level = pressure.pressure_level();
                 let row = crate::monitor::pid::level_response(level);
@@ -6985,7 +7432,7 @@ impl MonitoringDaemon {
                 backing_pressure = None;
                 inode_reclaim = Some(InodeReclaimRequest::new(
                     mount_path.clone(),
-                    crate::scanner::walker::device_id(&metadata),
+                    device_id,
                     pressure.total,
                     pressure.target_available,
                     response
@@ -7256,7 +7703,16 @@ impl MonitoringDaemon {
                 (root.clone(), mount)
             })
             .collect();
-        let cross_device_fallback = self.config.scanner.cross_devices && !root_paths.is_empty();
+        // Unknown roots cannot grant scan authority. In particular, predictive
+        // and fallback scans must not occupy the sole scanner with a root
+        // whose observation is still blocked or has expired.
+        let observed_root_paths: Vec<PathBuf> = root_mounts
+            .iter()
+            .filter(|(_, mount)| mount.is_some())
+            .map(|(root, _)| root.clone())
+            .collect();
+        let cross_device_fallback =
+            self.config.scanner.cross_devices && !observed_root_paths.is_empty();
 
         let mut responses = std::mem::take(&mut self.mount_responses);
         let policy_transitions = self.policy_engine.lock().transitions_total();
@@ -7513,7 +7969,7 @@ impl MonitoringDaemon {
                             // via cross_devices, where any configured root may
                             // help.
                             let paths = if roots_here.is_empty() {
-                                root_paths.clone()
+                                observed_root_paths.clone()
                             } else {
                                 roots_here
                             };
@@ -7842,8 +8298,8 @@ impl MonitoringDaemon {
             // pressure so that guard windows can update and recovery can
             // trigger. Without this, FallbackSafe at green is permanent.
             let in_fallback = self.policy_engine.lock().mode() == ActiveMode::FallbackSafe;
-            if scan_allowed && (needs_scan || in_fallback) {
-                self.send_scan_request(scan_tx, scan_rx, response, root_paths, None, None);
+            if scan_allowed && !observed_root_paths.is_empty() && (needs_scan || in_fallback) {
+                self.send_scan_request(scan_tx, scan_rx, response, observed_root_paths, None, None);
                 if needs_scan {
                     self.last_tick_cleanup_ran = true;
                 }
@@ -7916,6 +8372,22 @@ impl MonitoringDaemon {
                     .then_with(|| left.urgency.total_cmp(&right.urgency))
             })
             .cloned()
+    }
+
+    /// SIGUSR1 requests the complete configured scope. Preserve that request
+    /// for retry until every root is observed, rather than either losing part
+    /// of the operator's scope or handing a stalled root to the sole scanner.
+    fn forced_filesystem_response(&self) -> Option<PressureResponse> {
+        if !self
+            .config
+            .scanner
+            .root_paths
+            .iter()
+            .all(|root| self.fs_collector.collect(root).is_ok())
+        {
+            return None;
+        }
+        self.worst_filesystem_response()
     }
 
     /// Dedicated cleanup tiers do not carry RAM relief's finite allowance or
@@ -8031,15 +8503,14 @@ impl MonitoringDaemon {
         if !cfg!(target_os = "linux") {
             return;
         }
-        let first = self.uncovered_checked_at.is_none();
+        let first = self.uncovered_checked_at.is_none() && self.uncovered_levels.is_empty();
         if self
             .uncovered_checked_at
             .is_some_and(|at| now.duration_since(at) < UNCOVERED_REFRESH_INTERVAL)
         {
             return;
         }
-        self.uncovered_checked_at = Some(now);
-        let Ok(mounts) = self.platform.mount_points() else {
+        let Ok(mounts) = self.fs_collector.mount_points() else {
             return;
         };
         let monitored: HashSet<PathBuf> = self
@@ -8048,12 +8519,28 @@ impl MonitoringDaemon {
             .chain(self.mount_monitors.keys())
             .cloned()
             .collect();
+        let unavailable = std::cell::Cell::new(false);
         let levels = uncovered_mount_levels(
             &mounts,
             &monitored,
-            |path| self.fs_collector.collect(path).ok(),
+            |path| {
+                self.fs_collector.collect(path).map_or_else(
+                    |_| {
+                        unavailable.set(true);
+                        None
+                    },
+                    Some,
+                )
+            },
             &self.config.pressure,
         );
+        // The first background pass only schedules probes. Do not postpone
+        // consuming them until the minute-long refresh interval: their
+        // pressure evidence may expire well before then. Healthy peers can
+        // still publish alerts while an unavailable volume keeps retrying.
+        if !self.fs_collector.is_background() || !unavailable.get() {
+            self.uncovered_checked_at = Some(now);
+        }
         self.uncovered_levels = levels;
         if first && !self.uncovered_levels.is_empty() {
             let mut listed: Vec<String> = self
@@ -8144,7 +8631,7 @@ impl MonitoringDaemon {
     /// (true for a mount that has no controller yet).
     fn root_mount_in_maintain(&self, root: &Path) -> bool {
         let Ok(stats) = self.fs_collector.collect(root) else {
-            return true;
+            return false;
         };
         self.mount_controllers
             .get(&stats.mount_point)
@@ -8540,15 +9027,48 @@ impl MonitoringDaemon {
     /// set once per refresh.
     fn catalog_roots_for(&mut self, mount: &Path, now: Instant) -> Vec<ExpandedCatalogRoot> {
         let ttl = Duration::from_secs(self.config.scanner.catalog_rescan_interval_secs.max(1));
-        if let Some((derived_at, roots)) = self.catalog_root_cache.get(mount)
-            && now.saturating_duration_since(*derived_at) < ttl
-        {
-            return roots.clone();
-        }
-        let roots = cleanup_catalog::device_of(mount).map_or_else(Vec::new, |device| {
-            let homes = cleanup_catalog::user_homes(&self.platform.user_home());
-            cleanup_catalog::catalog_roots_for_mount(cleanup_catalog::CATALOG_ROOTS, &homes, device)
-        });
+        let (derived_at, roots) = if let Some(observer) = &self.catalog_observer {
+            let Some(key) = self
+                .mount_monitors
+                .get(mount)
+                .and_then(|monitor| monitor.last_observation.as_ref())
+                .and_then(|observation| {
+                    CatalogObservationKey::from_sample(mount, &observation.sample)
+                })
+            else {
+                return Vec::new();
+            };
+            // Catalog keys include the mount incarnation, so let obsolete
+            // roots age out normally instead of permanently protecting them.
+            let Ok(observation) = observer.observe(key, false) else {
+                self.catalog_root_cache.remove(mount);
+                return Vec::new();
+            };
+            if self
+                .catalog_root_cache
+                .get(mount)
+                .is_some_and(|(at, _)| *at == observation.collected_at)
+            {
+                return observation.value;
+            }
+            (observation.collected_at, observation.value)
+        } else {
+            // The platform-injected constructor retains the synchronous test seam.
+            if let Some((derived_at, roots)) = self.catalog_root_cache.get(mount)
+                && now.saturating_duration_since(*derived_at) < ttl
+            {
+                return roots.clone();
+            }
+            let roots = cleanup_catalog::device_of(mount).map_or_else(Vec::new, |device| {
+                let homes = cleanup_catalog::user_homes(&self.platform.user_home());
+                cleanup_catalog::catalog_roots_for_mount(
+                    cleanup_catalog::CATALOG_ROOTS,
+                    &homes,
+                    device,
+                )
+            });
+            (now, roots)
+        };
         let message = format!(
             "catalog roots for {}: {} derived ({})",
             mount.display(),
@@ -8562,8 +9082,18 @@ impl MonitoringDaemon {
         eprintln!("[SBH-DAEMON] {message}");
         self.logger_handle.send(ActivityEvent::Info { message });
         self.catalog_root_cache
-            .insert(mount.to_path_buf(), (now, roots.clone()));
+            .insert(mount.to_path_buf(), (derived_at, roots.clone()));
         roots
+    }
+
+    fn invalidate_catalog_observations(&mut self, config: &Config) {
+        self.catalog_root_cache.clear();
+        if let Some(observer) = &self.catalog_observer {
+            observer.invalidate();
+            let ttl = Duration::from_secs(config.scanner.catalog_rescan_interval_secs.max(1));
+            observer.set_refresh_after(ttl);
+            observer.set_max_age(ttl);
+        }
     }
 
     /// Dispatch a catalog-only scan: the derived roots are the request's
@@ -8930,15 +9460,17 @@ impl MonitoringDaemon {
             // learn their own rate instead of remaining permanently at zero.
             // Only sample-bound evidence from this tick can seed the prior;
             // pressure dispatch already consumed the mount_responses vector.
-            let ram_backed = self
-                .platform
-                .is_ram_backed(&location.path)
-                .unwrap_or(matches!(
-                    location.kind,
-                    crate::monitor::special_locations::SpecialKind::Tmpfs
-                        | crate::monitor::special_locations::SpecialKind::DevShm
-                        | crate::monitor::special_locations::SpecialKind::Ramfs
-                ));
+            let observed_ram_backed = if self.fs_collector.is_background() {
+                sample.is_ram_backed()
+            } else {
+                self.platform.is_ram_backed(&location.path).ok()
+            };
+            let ram_backed = observed_ram_backed.unwrap_or(matches!(
+                location.kind,
+                crate::monitor::special_locations::SpecialKind::Tmpfs
+                    | crate::monitor::special_locations::SpecialKind::DevShm
+                    | crate::monitor::special_locations::SpecialKind::Ramfs
+            ));
             let Some(rate) = self.special_rates.observe(
                 location,
                 &sample,
@@ -9020,10 +9552,37 @@ impl MonitoringDaemon {
                     _ => 40,
                 };
 
-                let mut scan_paths =
-                    special_location_scan_roots(&location.path, &self.config.scanner.root_paths);
-                for root in &self.config.scanner.root_paths {
-                    push_unique_path(&mut scan_paths, root.clone());
+                let scan_paths = if self.fs_collector.is_background() {
+                    let configured: Vec<_> =
+                        self.config
+                            .scanner
+                            .root_paths
+                            .iter()
+                            .map(|root| {
+                                let resolved =
+                                    self.fs_collector.collect_sample(root).ok().and_then(
+                                        |sample| sample.resolved_query().map(Path::to_path_buf),
+                                    );
+                                (root.clone(), resolved)
+                            })
+                            .collect();
+                    observed_special_location_scan_roots(
+                        &location.path,
+                        sample.resolved_query(),
+                        &configured,
+                    )
+                } else {
+                    let mut paths = special_location_scan_roots(
+                        &location.path,
+                        &self.config.scanner.root_paths,
+                    );
+                    for root in &self.config.scanner.root_paths {
+                        push_unique_path(&mut paths, root.clone());
+                    }
+                    paths
+                };
+                if scan_paths.is_empty() {
+                    continue;
                 }
 
                 let request = ScanRequest {
@@ -9209,6 +9768,13 @@ impl MonitoringDaemon {
                 } else {
                     // A rewritten root or new protection takes effect before
                     // ballast rediscovery can block in native filesystem I/O.
+                    // Keep occupied observation workers accounted for, while
+                    // rejecting any result started under the old config.
+                    self.fs_collector.invalidate_observations();
+                    self.invalidate_logging_ram_observations();
+                    self.invalidate_catalog_observations(&new_config);
+                    self.flush_pending_state_write_failure();
+                    self.uncovered_checked_at = None;
                     self.ballast_replenisher.cancel();
                     self.quarantine_sweeper.cancel();
                     self.compress_tier.update_config(&new_config);
@@ -9264,6 +9830,8 @@ impl MonitoringDaemon {
                     // Update FS collector TTL.
                     self.fs_collector
                         .set_ttl(Duration::from_millis(new_config.telemetry.fs_cache_ttl_ms));
+                    self.fs_collector
+                        .set_max_sample_age(Self::filesystem_observation_max_age(&new_config));
 
                     // Update VOI scheduler.
                     self.voi_scheduler
@@ -9336,6 +9904,9 @@ impl MonitoringDaemon {
                     self.config = new_config;
                     self.ballast_reserve_monitor.invalidate_all();
                     self.ballast_refill_blockers.clear();
+                    if self.fs_collector.is_background() {
+                        self.prime_filesystem_observations();
+                    }
                     let revoked_scans = self.scan_now_queue.lock().revoke();
                     if revoked_scans > 0 {
                         self.logger_handle.send(ActivityEvent::Info {
@@ -14343,6 +14914,849 @@ mod tests {
                 let _ = logger.join();
             }
         }
+    }
+
+    #[cfg(unix)]
+    struct BackgroundOnlyFilesystemPlatform {
+        inner: MockPlatform,
+        control_thread: std::thread::ThreadId,
+        blocked: PathBuf,
+        started: Sender<()>,
+        release: Receiver<()>,
+    }
+
+    #[cfg(unix)]
+    impl BackgroundOnlyFilesystemPlatform {
+        fn require_worker(&self) {
+            assert_ne!(
+                std::thread::current().id(),
+                self.control_thread,
+                "native filesystem observations must not run on the control thread"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    impl Platform for BackgroundOnlyFilesystemPlatform {
+        fn fs_stats(&self, path: &Path) -> Result<crate::platform::pal::FsStats> {
+            self.require_worker();
+            if path == self.blocked {
+                let _ = self.started.try_send(());
+                let _ = self.release.recv();
+            }
+            self.inner.fs_stats(path)
+        }
+
+        fn inode_stats(&self, path: &Path) -> Result<Option<crate::platform::pal::InodeStats>> {
+            self.require_worker();
+            self.inner.inode_stats(path)
+        }
+
+        fn mount_identity(&self, path: &Path) -> Result<crate::platform::pal::MountPoint> {
+            self.require_worker();
+            self.inner.mount_identity(path)
+        }
+
+        fn mount_points(&self) -> Result<Vec<crate::platform::pal::MountPoint>> {
+            self.require_worker();
+            self.inner.mount_points()
+        }
+
+        fn mount_lookup_path(&self, path: &Path) -> Result<PathBuf> {
+            self.require_worker();
+            self.inner.mount_lookup_path(path)
+        }
+
+        fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+            self.require_worker();
+            self.inner.is_ram_backed(path)
+        }
+
+        fn default_paths(&self) -> crate::platform::pal::PlatformPaths {
+            self.inner.default_paths()
+        }
+
+        fn user_home(&self) -> PathBuf {
+            self.require_worker();
+            self.inner.user_home()
+        }
+
+        fn memory_info(&self) -> Result<crate::platform::pal::MemoryInfo> {
+            self.inner.memory_info()
+        }
+
+        fn service_manager(&self) -> Box<dyn crate::platform::pal::ServiceManager> {
+            self.inner.service_manager()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_pressure_reaches_healthy_scan_dispatch_while_another_mount_is_stalled() {
+        let mut fixture = RegretDaemonFixture::new();
+        let healthy = fixture.directory.path().join("healthy-mount");
+        let blocked = fixture.directory.path().join("stalled-mount");
+        std::fs::create_dir(&healthy).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        let platform = disk_pressure_platform(vec![
+            disk_pressure_sample("/", 1_000_000, 500_000),
+            disk_pressure_sample(&healthy.to_string_lossy(), 1_000_000, 1_000),
+            disk_pressure_sample(&blocked.to_string_lossy(), 1_000_000, 1_000),
+        ])
+        .with_home(fixture.directory.path());
+        let (started_tx, started_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let daemon = &mut fixture.daemon;
+        daemon.platform = Arc::new(BackgroundOnlyFilesystemPlatform {
+            inner: platform,
+            control_thread: std::thread::current().id(),
+            blocked: blocked.clone(),
+            started: started_tx,
+            release: release_rx,
+        });
+        daemon.config.scanner.root_paths = vec![blocked.clone(), healthy.clone()];
+        *daemon.shared_scanner_config.write() = daemon.config.scanner.clone();
+        daemon.behavior_state.mode = mock_behavior_mode(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::None,
+            NotificationPriority::Low,
+        );
+        daemon.enable_background_filesystem_observations();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let response = loop {
+            if let Ok(response) = daemon.check_pressure()
+                && response.causing_mount == healthy
+                && response.level == PressureLevel::Critical
+            {
+                break response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "healthy pressure was stalled by its peer"
+            );
+            thread::yield_now();
+        };
+        assert!(!daemon.root_mount_in_maintain(&blocked));
+        assert!(
+            !daemon
+                .mount_responses
+                .iter()
+                .any(|tick| tick.response.causing_mount == blocked)
+        );
+
+        // The response path used to perform fresh native probes for logging,
+        // root ownership and state output after check_pressure had succeeded.
+        daemon.log_pressure_change(&response);
+        let (scan_tx, scan_rx) = bounded(4);
+        let (del_tx, _del_rx) = bounded(4);
+        assert!(!MonitoringDaemon::trigger_forced_scan(
+            &daemon.config.scanner.root_paths,
+            &scan_tx,
+            daemon.forced_filesystem_response().as_ref(),
+        ));
+        assert!(scan_rx.is_empty());
+        daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+        let scans: Vec<_> = scan_rx.try_iter().collect();
+        assert!(scans.iter().any(|scan| scan.paths.contains(&healthy)));
+        assert!(scans.iter().all(|scan| !scan.paths.contains(&blocked)));
+        daemon.maybe_write_self_monitor_state(&response);
+        // A cached frame cannot grant the post-failure inode exception, and
+        // this query cannot start a native probe on the control thread.
+        assert!(!daemon.state_write_has_inode_pressure(SelfMonitorTick {
+            rss_bytes: 0,
+            rss_warning_bytes: 0,
+            rss_hard_limit_bytes: 0,
+            rss_hard_limit_exceeded: false,
+            state_write_failed: true,
+            state_write_errno: Some(libc::ENOSPC),
+        }));
+        assert!(
+            Instant::now() < deadline,
+            "pressure response repeated a blocking probe"
+        );
+
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let forced = loop {
+            let _ = daemon.check_pressure();
+            if let Some(response) = daemon.forced_filesystem_response() {
+                break response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "recovered forced scope stayed unavailable"
+            );
+            thread::yield_now();
+        };
+        assert!(MonitoringDaemon::trigger_forced_scan(
+            &daemon.config.scanner.root_paths,
+            &scan_tx,
+            Some(&forced),
+        ));
+        let request = scan_rx.try_recv().unwrap();
+        assert!(request.force_full_scan);
+        assert_eq!(request.paths, daemon.config.scanner.root_paths);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_filesystem_observation_cannot_authorize_maintenance() {
+        let mut fixture = RegretDaemonFixture::new();
+        fixture.daemon.fs_collector = unavailable_pressure_collector();
+        assert!(
+            !fixture
+                .daemon
+                .root_mount_in_maintain(Path::new("/unobserved"))
+        );
+    }
+
+    #[test]
+    fn ram_log_frame_keeps_start_margin_and_rejects_later_deterioration() {
+        use crate::monitor::ram_scratch::RamLogHeadroom;
+        let margin = RamLogMirrorObservation::collect(|headroom| match headroom {
+            RamLogHeadroom::Start => Some("short of the start margin".to_string()),
+            RamLogHeadroom::Keep => None,
+        });
+        assert!(margin.refusal(false).is_some());
+        assert!(margin.refusal(true).is_none());
+        let deteriorated = RamLogMirrorObservation::collect(|headroom| match headroom {
+            RamLogHeadroom::Start => None,
+            RamLogHeadroom::Keep => Some("process memory became unavailable".to_string()),
+        });
+        assert!(deteriorated.refusal(false).is_some());
+        assert!(deteriorated.refusal(true).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn background_ram_log_guard_preserves_native_memory_checks_and_mirror_lifecycle() {
+        struct GuardPlatform {
+            inner: MockPlatform,
+            control: thread::ThreadId,
+            pause_once: AtomicBool,
+            entered: Sender<()>,
+            resume: Receiver<()>,
+            refuse: AtomicBool,
+            minima: Mutex<Vec<u8>>,
+        }
+        impl GuardPlatform {
+            fn worker(&self) {
+                assert_ne!(
+                    thread::current().id(),
+                    self.control,
+                    "RAM log evidence must stay off the control thread"
+                );
+            }
+        }
+        impl Platform for GuardPlatform {
+            fn fs_stats(&self, path: &Path) -> Result<crate::platform::pal::FsStats> {
+                self.worker();
+                self.inner.fs_stats(path)
+            }
+            fn mount_points(&self) -> Result<Vec<crate::platform::pal::MountPoint>> {
+                self.worker();
+                self.inner.mount_points()
+            }
+            fn is_ram_backed(&self, _path: &Path) -> Result<bool> {
+                self.worker();
+                Ok(true)
+            }
+            fn memory_info(&self) -> Result<crate::platform::pal::MemoryInfo> {
+                self.worker();
+                self.inner.memory_info()
+            }
+            fn ram_write_memory_refusal(&self, minimum: u8) -> Result<Option<String>> {
+                self.worker();
+                self.minima.lock().push(minimum);
+                if self.pause_once.swap(false, Ordering::AcqRel) {
+                    self.entered.send(()).unwrap();
+                    self.resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                Ok(self
+                    .refuse
+                    .load(Ordering::Acquire)
+                    .then(|| "service memory headroom refused".to_string()))
+            }
+            fn default_paths(&self) -> crate::platform::pal::PlatformPaths {
+                self.inner.default_paths()
+            }
+            fn service_manager(&self) -> Box<dyn crate::platform::pal::ServiceManager> {
+                self.inner.service_manager()
+            }
+        }
+        let mut fixture = RegretDaemonFixture::new();
+        let (entered, waiting) = bounded(1);
+        let (resume, release) = bounded(1);
+        let platform = Arc::new(GuardPlatform {
+            inner: disk_pressure_platform(vec![disk_pressure_sample("/", 1_000_000, 900_000)]),
+            control: thread::current().id(),
+            pause_once: AtomicBool::new(true),
+            entered,
+            resume: release,
+            refuse: AtomicBool::new(false),
+            minima: Mutex::new(Vec::new()),
+        });
+        let daemon = &mut fixture.daemon;
+        daemon.logging_ram_observer = Some(ram_log_mirror_observer(
+            platform.clone(),
+            Some(fixture.directory.path().join("mirror.jsonl")),
+        ));
+        daemon.logging_placement.on_monitored_fs = true;
+        daemon.logging_placement.device = "/".to_string();
+        daemon.note_logging_mount_level(Path::new("/"), PressureLevel::Orange);
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..20 {
+            daemon.note_logging_mount_level(Path::new("/"), PressureLevel::Orange);
+            assert!(!daemon.logging_placement.mirroring);
+            assert!(daemon.logging_ram_checked_at.is_none());
+        }
+        assert_eq!(*platform.minima.lock(), vec![15]);
+        resume.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !daemon.logging_placement.mirroring {
+            daemon.note_logging_mount_level(Path::new("/"), PressureLevel::Orange);
+            assert!(
+                Instant::now() < deadline,
+                "completed Start result was throttled or lost"
+            );
+            thread::yield_now();
+        }
+        for _ in 0..20 {
+            daemon.note_logging_mount_level(Path::new("/"), PressureLevel::Orange);
+            assert!(
+                daemon.logging_placement.mirroring,
+                "Start-to-Keep handoff must not flap"
+            );
+        }
+        assert_eq!(*platform.minima.lock(), vec![15, 10]);
+        // Reload/lost evidence revokes requested mirroring immediately. A
+        // healthy host cannot bypass a later service/container limit refusal.
+        platform.refuse.store(true, Ordering::Release);
+        daemon.invalidate_logging_ram_observations();
+        assert!(!daemon.logging_placement.mirroring);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while daemon.logging_ram_checked_at.is_none() {
+            daemon.note_logging_mount_level(Path::new("/"), PressureLevel::Orange);
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(!daemon.logging_placement.mirroring);
+        assert_eq!(*platform.minima.lock(), vec![15, 10, 15, 10]);
+
+        // A missing logging mount cannot retain old mirror authority merely
+        // because a different filesystem continues to provide observations.
+        daemon.logging_placement.mirroring = true;
+        daemon.logging_placement.device = "/missing-logging-mount".to_string();
+        let sample = daemon.fs_collector.collect_sample(Path::new("/")).unwrap();
+        daemon
+            .evaluate_pressure_samples(
+                HashMap::from([(PathBuf::from("/"), sample)]),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(!daemon.logging_placement.mirroring);
+        daemon.logging_placement.mirroring = true;
+        daemon.withdraw_pressure_authority();
+        assert!(!daemon.logging_placement.mirroring);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_special_scan_keeps_known_subtree_and_defers_stalled_peer() {
+        let mut fixture = RegretDaemonFixture::new();
+        let special = fixture.directory.path().join("special");
+        let healthy = special.join("healthy-subtree");
+        let blocked = special.join("blocked-subtree");
+        std::fs::create_dir_all(&healthy).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        let platform = disk_pressure_platform(vec![
+            disk_pressure_sample("/", 1_000_000, 500_000),
+            disk_pressure_sample(&special.to_string_lossy(), 1_000_000, 1_000),
+            disk_pressure_sample(&blocked.to_string_lossy(), 1_000_000, 500_000),
+        ])
+        .with_home(fixture.directory.path());
+        let (started_tx, started_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let daemon = &mut fixture.daemon;
+        daemon.platform = Arc::new(BackgroundOnlyFilesystemPlatform {
+            inner: platform,
+            control_thread: thread::current().id(),
+            blocked: blocked.clone(),
+            started: started_tx,
+            release: release_rx,
+        });
+        daemon.config.scanner.root_paths = vec![blocked.clone(), healthy.clone()];
+        daemon.config.notifications.enabled = false;
+        daemon
+            .notification_manager
+            .update_config(&daemon.config.notifications);
+        daemon.special_locations = SpecialLocationRegistry::new(vec![SpecialLocation {
+            path: special.clone(),
+            kind: SpecialKind::DevShm,
+            buffer_pct: 20,
+            scan_interval: Duration::ZERO,
+            priority: 255,
+        }]);
+        daemon.enable_background_filesystem_observations();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while daemon.fs_collector.collect(&healthy).is_err()
+            || daemon.fs_collector.collect(&special).is_err()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "healthy special scope was stalled by its peer"
+            );
+            thread::yield_now();
+        }
+        let (scan_tx, scan_rx) = bounded(4);
+        daemon.check_special_locations(&scan_tx, &scan_rx);
+        let request = scan_rx
+            .try_recv()
+            .expect("critical special location must dispatch known scope");
+        assert_eq!(request.paths, vec![healthy]);
+        assert!(
+            !request.paths.contains(&special),
+            "pending subtree must not widen to its special parent"
+        );
+        assert!(!request.paths.contains(&blocked));
+        release_tx.send(()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_predictive_and_cross_device_scans_exclude_unobserved_roots() {
+        for cross_device in [false, true] {
+            let mut fixture = RegretDaemonFixture::new();
+            let healthy = fixture.directory.path().join("healthy");
+            let blocked = fixture.directory.path().join("blocked");
+            std::fs::create_dir(&healthy).unwrap();
+            std::fs::create_dir(&blocked).unwrap();
+            let root_free = if cross_device { 1_000 } else { 500_000 };
+            let platform = disk_pressure_platform(vec![
+                disk_pressure_sample("/", 1_000_000, root_free),
+                disk_pressure_sample(&healthy.to_string_lossy(), 1_000_000, 500_000),
+                disk_pressure_sample(&blocked.to_string_lossy(), 1_000_000, 500_000),
+            ])
+            .with_home(fixture.directory.path());
+            let (started_tx, started_rx) = bounded(1);
+            let (release_tx, release_rx) = bounded(1);
+            let daemon = &mut fixture.daemon;
+            daemon.platform = Arc::new(BackgroundOnlyFilesystemPlatform {
+                inner: platform,
+                control_thread: std::thread::current().id(),
+                blocked: blocked.clone(),
+                started: started_tx,
+                release: release_rx,
+            });
+            daemon.config.scanner.root_paths = vec![blocked.clone(), healthy.clone()];
+            daemon.config.scanner.cross_devices = cross_device;
+            *daemon.shared_scanner_config.write() = daemon.config.scanner.clone();
+            daemon.behavior_state.mode = mock_behavior_mode(
+                ScanAggressiveness::Aggressive,
+                CleanupAction::AnyDefiniteCandidate,
+                BallastAction::None,
+                NotificationPriority::Low,
+            );
+            daemon.enable_background_filesystem_observations();
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let response = loop {
+                if let Ok(response) = daemon.check_pressure()
+                    && daemon.fs_collector.collect(&healthy).is_ok()
+                    && daemon.fs_collector.collect(Path::new("/")).is_ok()
+                {
+                    break response;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "healthy observations unavailable"
+                );
+                thread::yield_now();
+            };
+            if !cross_device {
+                assert_eq!(response.level, PressureLevel::Green);
+                daemon.last_predictive_action = PredictiveAction::PreemptiveCleanup {
+                    mount: healthy.clone(),
+                    minutes_remaining: 10.0,
+                    confidence: 0.9,
+                    rate_bytes_per_second: 1_000.0,
+                    recommended_min_score: 0.5,
+                    recommended_free_target_pct: 20.0,
+                };
+            }
+            let (scan_tx, scan_rx) = bounded(4);
+            let (del_tx, _del_rx) = bounded(4);
+            daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+            let scans: Vec<_> = scan_rx.try_iter().collect();
+            assert!(
+                scans.iter().any(|scan| scan.paths.contains(&healthy)),
+                "cross_device={cross_device}"
+            );
+            assert!(
+                scans.iter().all(|scan| !scan.paths.contains(&blocked)),
+                "cross_device={cross_device}"
+            );
+            release_tx.send(()).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn background_uncovered_alerts_consume_pending_samples_before_refresh_interval() {
+        let mut fixture = RegretDaemonFixture::new();
+        let uncovered = fixture.directory.path().join("uncovered");
+        std::fs::create_dir(&uncovered).unwrap();
+        let total = 20 * (1_u64 << 30);
+        let platform = disk_pressure_platform(vec![
+            disk_pressure_sample("/", total, total / 2),
+            disk_pressure_sample(&uncovered.to_string_lossy(), total, 0),
+        ])
+        .with_home(fixture.directory.path());
+        let daemon = &mut fixture.daemon;
+        daemon.platform = Arc::new(platform);
+        // No scanner root covers this volume. Its alert must remain separate
+        // from pressure policy, and must arrive before the next minute tick.
+        daemon.fs_collector = FsStatsCollector::new_background(
+            Arc::clone(&daemon.platform),
+            Duration::from_millis(100),
+            Duration::from_secs(2),
+        );
+        let now = Instant::now();
+        daemon.refresh_uncovered_levels(now);
+        assert!(daemon.uncovered_checked_at.is_none());
+        let deadline = now + Duration::from_secs(2);
+        while daemon.uncovered_levels.get(&uncovered) != Some(&PressureLevel::Critical)
+            || daemon.uncovered_checked_at.is_none()
+        {
+            daemon.refresh_uncovered_levels(Instant::now());
+            assert!(
+                Instant::now() < deadline,
+                "pending observations were deferred for a minute"
+            );
+            thread::yield_now();
+        }
+        assert!(daemon.uncovered_checked_at.is_some());
+        assert!(!daemon.mount_controllers.contains_key(&uncovered));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_catalog_keeps_blocked_workers_across_reload_and_reuses_fresh_results() {
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        daemon.enable_background_filesystem_observations();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while daemon.check_pressure().is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "initial filesystem observation timed out"
+            );
+            thread::yield_now();
+        }
+
+        let control_thread = thread::current().id();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let catalog_base = fixture.directory.path().to_path_buf();
+        daemon.catalog_observer = Some(BoundedObserver::new(
+            Arc::new(move |_key: &CatalogObservationKey| {
+                assert_ne!(thread::current().id(), control_thread);
+                let call = worker_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                let rule = if call == 0 { "stale" } else { "fresh" };
+                Ok(vec![ExpandedCatalogRoot {
+                    path: catalog_base.join(rule),
+                    rule,
+                    confidence: cleanup_catalog::CleanupConfidence::Definite,
+                    min_age: Duration::ZERO,
+                }])
+            }),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            2,
+            4,
+        ));
+        assert!(
+            daemon
+                .catalog_roots_for(Path::new("/"), Instant::now())
+                .is_empty()
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let config = daemon.config.clone();
+        for _ in 0..20 {
+            daemon.invalidate_catalog_observations(&config);
+            assert!(
+                daemon
+                    .catalog_roots_for(Path::new("/"), Instant::now())
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "reload must retain the occupied slot"
+        );
+        release_tx.send(()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let roots = loop {
+            let roots = daemon.catalog_roots_for(Path::new("/"), Instant::now());
+            if !roots.is_empty() {
+                break roots;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fresh catalog observation timed out"
+            );
+            thread::yield_now();
+        };
+        assert_eq!(
+            roots[0].rule, "fresh",
+            "old-epoch roots must never gain authority"
+        );
+        let collected_at = daemon.catalog_root_cache.get(Path::new("/")).unwrap().0;
+        assert_eq!(
+            daemon.catalog_roots_for(Path::new("/"), Instant::now())[0].rule,
+            "fresh"
+        );
+        assert_eq!(
+            daemon.catalog_root_cache.get(Path::new("/")).unwrap().0,
+            collected_at
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a warm result needs no native discovery"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_discovery_rejects_replaced_directories_and_native_mount_owners() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().join("mount");
+        std::fs::create_dir(&mount).unwrap();
+        let metadata = std::fs::symlink_metadata(&mount).unwrap();
+        let platform = disk_pressure_platform(vec![disk_pressure_sample(
+            mount.to_str().unwrap(),
+            1_000_000,
+            500_000,
+        )]);
+        let key = CatalogObservationKey {
+            mount: mount.clone(),
+            directory_identity: (metadata.dev(), metadata.ino()),
+            owner_device: mount.display().to_string(),
+            owner_fs_type: "mockfs".to_string(),
+            owner_is_ram_backed: false,
+        };
+        let wrong_owner = CatalogObservationKey {
+            owner_device: "replaced-native-volume".to_string(),
+            ..key.clone()
+        };
+        assert!(
+            collect_catalog_observation(&wrong_owner, &platform, |_| {
+                panic!("an old native volume must be rejected before catalog discovery")
+            })
+            .is_err()
+        );
+        assert!(
+            collect_catalog_observation(&key, &platform, |device| {
+                assert_eq!(device, metadata.dev());
+                Vec::new()
+            })
+            .is_ok()
+        );
+
+        let error = collect_catalog_observation(&key, &platform, |_| {
+            std::fs::rename(&mount, temp.path().join("old-mount")).unwrap();
+            std::fs::create_dir(&mount).unwrap();
+            Vec::new()
+        })
+        .unwrap_err();
+        assert!(error.contains("changed during discovery"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn background_state_write_failure_preserves_timely_native_inode_relief() {
+        use crate::platform::pal::InodeStats;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let (mount, _) = install_inode_pressure_probe(&mut fixture, InodeStats::new(10_000, 0, 0));
+        let daemon = &mut fixture.daemon;
+        daemon.self_monitor = SelfMonitor::from_telemetry_config(
+            mount.join("state.json"),
+            Arc::clone(&daemon.platform),
+            &daemon.config.telemetry,
+        );
+        daemon.config.pressure.inodes.enabled = true;
+        *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+            initial_mode: ActiveMode::Enforce,
+            ..PolicyConfig::default()
+        });
+        daemon.enable_background_filesystem_observations();
+        let tick = SelfMonitorTick {
+            state_write_failed: true,
+            state_write_errno: Some(libc::ENOSPC),
+            ..test_self_monitor_tick(0, u64::MAX)
+        };
+        assert!(
+            !daemon.state_write_has_inode_pressure(tick),
+            "cached evidence cannot grant the exception"
+        );
+        daemon.note_state_write_failure(tick);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while daemon.policy_engine.lock().serialization_failures() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "post-failure diagnostic did not finish"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(daemon.policy_engine.lock().mode(), ActiveMode::Enforce);
+        assert_eq!(daemon.policy_engine.lock().serialization_failures(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_state_write_diagnosis_times_out_once_and_keeps_its_worker_slot() {
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        daemon.enable_background_filesystem_observations();
+        *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+            initial_mode: ActiveMode::Enforce,
+            ..PolicyConfig::default()
+        });
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        daemon.pending_state_write_diagnosis = Some(
+            PendingStateWriteDiagnosis::start(
+                move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    true
+                },
+                Arc::clone(&daemon.policy_engine),
+                Duration::from_millis(500),
+            )
+            .unwrap(),
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let tick = SelfMonitorTick {
+            state_write_failed: true,
+            state_write_errno: Some(libc::ENOSPC),
+            ..test_self_monitor_tick(0, u64::MAX)
+        };
+        daemon.note_state_write_failure(tick);
+        assert_eq!(
+            daemon.policy_engine.lock().serialization_failures(),
+            1,
+            "a busy failure is immediately unknown"
+        );
+
+        // Do not poll the monitor: the separate decision waiter must record
+        // the first failure by its deadline while the native probe is blocked.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while daemon.policy_engine.lock().serialization_failures() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "deadline did not record the blocked failure"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(daemon.policy_engine.lock().mode(), ActiveMode::FallbackSafe);
+        assert!(
+            !daemon
+                .pending_state_write_diagnosis
+                .as_ref()
+                .unwrap()
+                .is_finished()
+        );
+        daemon.note_state_write_failure(tick);
+        assert_eq!(daemon.policy_engine.lock().serialization_failures(), 3);
+        release_tx.send(()).unwrap();
+        while !daemon
+            .pending_state_write_diagnosis
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            assert!(Instant::now() < deadline, "diagnostic worker did not exit");
+            thread::yield_now();
+        }
+        assert_eq!(
+            daemon.policy_engine.lock().serialization_failures(),
+            3,
+            "late success cannot double-count a failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reload_records_pending_state_write_failure_before_discarding_late_success() {
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+            initial_mode: ActiveMode::Enforce,
+            ..PolicyConfig::default()
+        });
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        daemon.pending_state_write_diagnosis = Some(
+            PendingStateWriteDiagnosis::start(
+                move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    true
+                },
+                Arc::clone(&daemon.policy_engine),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        daemon.flush_pending_state_write_failure();
+        assert_eq!(daemon.policy_engine.lock().mode(), ActiveMode::FallbackSafe);
+        assert_eq!(daemon.policy_engine.lock().serialization_failures(), 1);
+        assert!(
+            !daemon
+                .pending_state_write_diagnosis
+                .as_ref()
+                .unwrap()
+                .is_finished()
+        );
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !daemon
+            .pending_state_write_diagnosis
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "flushed diagnostic worker did not exit"
+            );
+            thread::yield_now();
+        }
+        daemon.flush_pending_state_write_failure();
+        assert_eq!(daemon.policy_engine.lock().mode(), ActiveMode::FallbackSafe);
+        assert_eq!(daemon.policy_engine.lock().serialization_failures(), 1);
     }
 
     #[cfg(unix)]
@@ -28778,6 +30192,45 @@ mod tests {
         let roots = special_location_scan_roots(Path::new("/dev/shm"), &configured);
 
         assert_eq!(roots, vec![PathBuf::from("/dev/shm")]);
+    }
+
+    #[test]
+    fn observed_special_scope_respects_aliases_and_unknown_subtrees() {
+        let location = Path::new("/tmp/special");
+        let physical = Path::new("/physical/special");
+        let aliased_child = PathBuf::from("/work/special-alias");
+        let independent = PathBuf::from("/work/independent");
+        let blocked = PathBuf::from("/unknown/possible-alias");
+        let configured = vec![
+            (
+                aliased_child.clone(),
+                Some(physical.join("configured-child")),
+            ),
+            (blocked.clone(), None),
+            (independent.clone(), Some(independent.clone())),
+        ];
+        assert_eq!(
+            observed_special_location_scan_roots(location, Some(physical), &configured),
+            vec![aliased_child, independent.clone()]
+        );
+        assert_eq!(
+            observed_special_location_scan_roots(location, Some(physical), &configured[1..]),
+            vec![independent.clone()],
+            "an unresolved alias could restrict the special location to a subtree"
+        );
+        assert!(
+            observed_special_location_scan_roots(location, Some(physical), &[(blocked, None)])
+                .is_empty()
+        );
+        assert_eq!(
+            observed_special_location_scan_roots(
+                location,
+                Some(physical),
+                &[(independent.clone(), Some(independent.clone()))]
+            ),
+            vec![location.to_path_buf(), independent],
+            "known independent roots preserve the existing special-location scope"
+        );
     }
 
     #[test]
