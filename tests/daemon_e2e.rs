@@ -1371,12 +1371,28 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
     // the JSONL is mirrored to the RAM fallback while it stays pressured,
     // and the mirror carries this run's lines. A test host whose own RAM is
     // short (swap nearly full, or /dev/shm under a fifth free) keeps the
-    // mirror off and says why instead (bd-ffjj).
+    // mirror off and says why instead (bd-ffjj). The latest logging line
+    // decides: the RAM headroom check runs off the pressure loop (181e46b6),
+    // so a pressured tick can report "RAM log headroom is unavailable" while
+    // the observation is pending and mirror on a later tick.
+    fn latest_logging_line(run: &DaemonRun) -> String {
+        run.stderr()
+            .lines()
+            .filter(|line| line.contains("logging.on_monitored_fs=true"))
+            .last()
+            .unwrap_or_default()
+            .to_string()
+    }
+    fn mirror_settled(line: &str) -> bool {
+        line.contains("mirror_to_ram=true")
+            || (line.contains("(not mirroring:")
+                && !line.contains("RAM log headroom is unavailable"))
+    }
     run.wait_until(
-        "the logging placement in state.json",
+        "a settled logging placement in state.json",
         Duration::from_secs(40),
         |run| {
-            run.stderr_count("(not mirroring:") > 0
+            mirror_settled(&latest_logging_line(run))
                 || run
                     .state()
                     .and_then(|state| state.get("logging").cloned())
@@ -1384,7 +1400,7 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
         },
     )
     .unwrap_or_else(|e| panic!("[{engine}] {e}"));
-    let ram_short = run.stderr_count("(not mirroring:") > 0;
+    let ram_short = latest_logging_line(&run).contains("(not mirroring:");
     let state = run.state().unwrap();
     let logging = &state["logging"];
     assert_eq!(

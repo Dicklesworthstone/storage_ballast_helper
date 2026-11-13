@@ -272,7 +272,8 @@ fn overview_healthy_wide_structure() {
             "ewma",
             "activity",
             "actions",
-            "ballast [OK] available=10/10",
+            // "[ok:OK]" in color mode, "[OK]" under NO_COLOR.
+            "OK] available=10/10",
             "pid=1234",
             "1h 00m",
         ],

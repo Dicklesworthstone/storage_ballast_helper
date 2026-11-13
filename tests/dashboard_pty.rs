@@ -377,9 +377,22 @@ fn pty_session_walks_the_screens_and_releases_one_ballast_file() {
     let dir = scratch();
     let config = write_config(dir.path());
     let mut daemon = SandboxDaemon::spawn(dir.path(), &config);
-    daemon.wait_for("a provisioned pool", Duration::from_secs(40), |state| {
-        state["ballast"]["available"].as_u64() == Some(2)
-    });
+    // The cockpit counts only an observed, authoritative reserve as
+    // releasable (1ce92b47): allocator bookkeeping alone shows the pool as
+    // unknown/2 and quick-release refuses with "No ballast file available".
+    daemon.wait_for(
+        "a provisioned pool with an observed reserve",
+        Duration::from_secs(40),
+        |state| {
+            state["ballast"]["available"].as_u64() == Some(2)
+                && state["ballast_pools"].as_array().is_some_and(|pools| {
+                    pools.iter().any(|pool| {
+                        pool["reserve"]["inventory_authoritative"].as_bool() == Some(true)
+                            && pool["reserve"]["files_available"].as_u64() == Some(2)
+                    })
+                })
+        },
+    );
     assert!(
         daemon.events_of("ballast_release").is_empty(),
         "no release before the operator asks"
