@@ -349,6 +349,10 @@ native_scratch() {
 # rustup's own cargo, not an rch shim earlier on PATH: the root-only step runs
 # a test binary this host must have built itself. It still honors
 # rust-toolchain.toml and installs that toolchain on demand.
+# Native stages build on the host itself, so each one exports
+# RCH_CARGO_WRAPPER_BYPASS=1 together with RCH_REQUIRE_REMOTE=0. rch's cargo
+# shim (2.1.36) reads an unset RCH_REQUIRE_REMOTE as "remote required" and
+# refuses a caller-set bypass, which failed every native stage in 0 s.
 native_cargo() {
   local cargo="${HOME}/.cargo/bin/cargo"
   [[ -x "${cargo}" ]] || cargo="$(command -v cargo)"
@@ -384,7 +388,7 @@ stage_native_btrfs() {
       rm -r "${work}"
     }
     trap cleanup EXIT
-    export CARGO_TARGET_DIR="${work}/target" RCH_CARGO_WRAPPER_BYPASS=1
+    export CARGO_TARGET_DIR="${work}/target" RCH_CARGO_WRAPPER_BYPASS=1 RCH_REQUIRE_REMOTE=0
     echo "== syscall ABI and pure tests"
     cc -std=c11 -Wall -Wextra -Werror crates/sbh_btrfs/tests/uapi_abi.c -o "${work}/sbh-uapi"
     "${work}/sbh-uapi"
@@ -409,7 +413,7 @@ stage_native_systemd() {
     cd "${ROOT_DIR}"
     work="$(native_scratch)"
     trap 'rm -r "${work}"' EXIT
-    export CARGO_TARGET_DIR="${work}/target" RCH_CARGO_WRAPPER_BYPASS=1
+    export CARGO_TARGET_DIR="${work}/target" RCH_CARGO_WRAPPER_BYPASS=1 RCH_REQUIRE_REMOTE=0
     systemctl --version
     echo "== service contracts"
     native_cargo test --locked --no-default-features --features cli,daemon,sqlite --lib daemon::service::systemd
@@ -437,7 +441,7 @@ stage_native_ram_scratch() {
     fi
     work="$(native_scratch)" || exit 1
     trap 'echo "native-ram-scratch: artifacts retained at ${work}"' EXIT
-    export CARGO_TARGET_DIR="${work}/target" RCH_CARGO_WRAPPER_BYPASS=1
+    export CARGO_TARGET_DIR="${work}/target" RCH_CARGO_WRAPPER_BYPASS=1 RCH_REQUIRE_REMOTE=0
     echo "== visible, covered, stacked, replaced and denied tmpfs; library and CLI"
     if ! bin="$(native_test_executable ram_scratch_native --locked --no-default-features --features cli,daemon,sqlite --test ram_scratch_native)"; then
       exit 1
