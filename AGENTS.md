@@ -469,7 +469,7 @@ One mapping for every command (`CliError::exit_code`, C-EXIT); generated from `c
 | `[pressure.controller]` | per-mount PID: `kp`, `ki`, `kd`, `kf` (forecast feedforward), `integral_cap`, `hysteresis_pct`, `reference_total_bytes`, `kp_scale_min`, `kp_scale_max` |
 | `[scanner]` | `engine` (`"v2"` default, `"v1"` rollback), `root_paths`, `excluded_paths`, `protected_paths`, `min_file_age_minutes`, `max_depth`, `parallelism`, `dry_run`, `cross_devices`, `quarantine_enabled`, `quarantine_ttl_hours`, `quarantine_max_bytes_pct`, `target_only_roots` + `target_only_idle_hours` (pure idle cargo targets inside otherwise protected roots, `src/daemon/target_tier.rs`) |
 | `[scoring]` | `min_score`, `location_weight`, `name_weight`, `age_weight`, `size_weight`, `structure_weight` |
-| `[scoring]` (decision-theoretic) | `false_positive_loss`, `false_negative_loss`, `calibration_floor`, `posterior_floor_definite` |
+| `[scoring]` (decision-theoretic) | `false_positive_loss`, `false_negative_loss`, `calibration_floor`, `posterior_floor_definite`, `definite_floor_maintenance_idle_hours` |
 | `[scoring]` (batch planner) | `batch_risk_budget_by_level` (`green`, `yellow`, `orange`, `red`, `critical`): expected loss per batch as multiples of `false_positive_loss`; `[SBH-PLANNER]` line per batch, `plan` block in `clean`/`scan --json` |
 | `[scoring]` (regret labels) | `regret_window_minutes`, `regret_alpha_definite`, `regret_alpha_likely`, `regret_suspend_minutes` (Layer 8: outcomes in SQLite `decision_outcome`, shown by `sbh explain`) |
 | `[ballast]` | `file_count`, `file_size_bytes`, `replenish_cooldown_minutes` |
@@ -690,6 +690,7 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | scoring | `false_negative_loss` | `30` | Loss of keeping an artifact | `src/core/config.rs` |
 | scoring | `calibration_floor` | `0.4` | Calibration needed for adaptive actions | `src/core/config.rs` |
 | scoring | `posterior_floor_definite` | `0.85` | Posterior needed for a definite label | `src/core/config.rs` |
+| scoring | `definite_floor_maintenance_idle_hours` | `12` | Idle hours before that floor applies at Green or Yellow | `src/core/config.rs` |
 | scoring | `regret_window_minutes` | `30` | Window in which a recreated path counts as regret | `src/core/config.rs` |
 | scoring | `regret_alpha_definite` | `0.02` | Regret rate tolerated for definite deletions | `src/core/config.rs` |
 | scoring | `regret_alpha_likely` | `0.005` | Regret rate tolerated for likely deletions | `src/core/config.rs` |
