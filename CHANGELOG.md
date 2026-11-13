@@ -110,6 +110,16 @@ host runs a version that has it.
   ancestors or a root alias. Existing configs and interactive choices are
   kept, and automatic setup is refused when no safe root exists.
 
+- **`sbh status` and `sbh doctor` say when the installed service runs another
+  config (bd-bx6j).** On nine fleet workers the system unit starts the daemon
+  with `--config /root/.config/sbh/config.toml`, while a non-root `sbh status`
+  loads `/etc/sbh/config.toml`. It reported the running daemon as stopped and
+  its ballast as empty, and its service-scope check passed. That check now
+  reads the `--config` of the unit's effective `ExecStart=`; when it names a
+  different file, the check warns with both paths and the command that shows
+  the service's own view (`sudo sbh --config <path> status`). A specifier,
+  variable or quoted value is not compared.
+
 ## v0.7.13 **[release]**
 
 Compare: [`v0.7.12...v0.7.13`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.12...v0.7.13)

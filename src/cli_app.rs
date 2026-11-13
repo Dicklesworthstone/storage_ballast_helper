@@ -4966,6 +4966,41 @@ fn service_scope_sandbox(
     Ok(ServiceSandbox::from_unit_texts(texts))
 }
 
+/// The `--config` that the installed unit's effective `ExecStart=` passes
+/// the daemon. `None` when it passes none (the daemon then resolves its own
+/// default) or when the value is not a plain word: a systemd specifier
+/// (`%h`), an environment reference or quoting cannot be compared literally,
+/// so no claim is made about it.
+fn service_exec_config(texts: &[String]) -> Option<PathBuf> {
+    use storage_ballast_helper::daemon::service::parse_unit_directives;
+    let directives = parse_unit_directives(&texts.join("\n"));
+    let exec = directives.get("Service/ExecStart")?.last()?;
+    let mut words = exec.split_whitespace();
+    let value = loop {
+        let word = words.next()?;
+        if word == "--config" {
+            break words.next()?;
+        }
+        if let Some(value) = word.strip_prefix("--config=") {
+            break value;
+        }
+    };
+    (!value.is_empty() && !value.contains(['%', '$', '"', '\'', '\\']))
+        .then(|| PathBuf::from(value))
+}
+
+/// Whether the daemon config named by the unit is not the config this
+/// command loaded. Equal spellings match; different spellings match only
+/// when both resolve to one file. A path this user cannot resolve (another
+/// user's home) counts as different, which is what the caller then sees.
+fn service_config_differs(service_config: &Path, view_config: &Path) -> bool {
+    service_config != view_config
+        && !matches!(
+            (service_config.canonicalize(), view_config.canonicalize()),
+            (Ok(service), Ok(view)) if service == view
+        )
+}
+
 /// Compare installed file evidence only; this never proves live write access.
 fn service_scope_check(
     unit_path: &Path,
@@ -4973,6 +5008,15 @@ fn service_scope_check(
     texts: Result<Vec<String>, String>,
     catalog: &[PathBuf],
 ) -> DoctorCheck {
+    // A daemon started with another config keeps its lock, state, ballast and
+    // activity under that config's paths, so a view built from this config
+    // reports it as not running (fleet sweeps were misled by this on 14 of
+    // 20 hosts). Name the service's config so the operator can read it.
+    let service_config = texts
+        .as_ref()
+        .ok()
+        .and_then(|texts| service_exec_config(texts))
+        .filter(|path| service_config_differs(path, &config.paths.config_file));
     let comparison = (|| {
         let sandbox = service_scope_sandbox(&texts?)?;
         let roots = service_scope_roots(config, catalog);
@@ -5035,6 +5079,25 @@ fn service_scope_check(
             }
         }
     };
+    if let Some(service_config) = service_config {
+        let service_config = service_config.display();
+        return doctor_check(
+            "service-reclaim-scope",
+            "Service cleanup and reserve scope",
+            "WARN",
+            format!(
+                "{prefix}; the installed service runs the daemon with --config {service_config}, \
+                 not {}: this view does not read that daemon's lock, state, ballast or activity, \
+                 so it can report a running daemon as stopped; scope against this config: \
+                 {detail}; {caveat}",
+                config.paths.config_file.display()
+            ),
+            Some(format!(
+                "Read the service's own view: `sudo sbh --config {service_config} status` (or \
+                 doctor). This check changes no unit, config or permissions."
+            )),
+        );
+    }
     doctor_check(
         "service-reclaim-scope",
         "Service cleanup and reserve scope",
@@ -20326,6 +20389,106 @@ mod tests {
                 .contains("live filesystem writability are unverified")
         );
         assert!(!doctor_checks_have_failures(&[check]));
+    }
+
+    #[test]
+    fn service_exec_config_reads_the_effective_execstart_config() {
+        let unit = |exec: &str| {
+            vec![format!(
+                "[Unit]\nDescription=x\n\n[Service]\nExecStart={exec}\n"
+            )]
+        };
+        assert_eq!(
+            service_exec_config(&unit(
+                "/usr/local/bin/sbh daemon --config /root/.config/sbh/config.toml"
+            )),
+            Some(PathBuf::from("/root/.config/sbh/config.toml"))
+        );
+        assert_eq!(
+            service_exec_config(&unit("-/usr/local/bin/sbh daemon --config=/srv/sbh.toml")),
+            Some(PathBuf::from("/srv/sbh.toml"))
+        );
+        // No claim without a plain word to compare.
+        for exec in [
+            "/usr/local/bin/sbh daemon",
+            "/usr/local/bin/sbh daemon --config",
+            "/usr/local/bin/sbh daemon --config=",
+            "/usr/local/bin/sbh daemon --config %h/.config/sbh/config.toml",
+            "/usr/local/bin/sbh daemon --config ${SBH_CONFIG}",
+            "/usr/local/bin/sbh daemon --config \"/a b/config.toml\"",
+        ] {
+            assert_eq!(service_exec_config(&unit(exec)), None, "{exec}");
+        }
+        // A drop-in that resets ExecStart decides, as systemd applies it.
+        let mut texts = unit("/usr/local/bin/sbh daemon --config /etc/sbh/config.toml");
+        texts.push(
+            "[Service]\nExecStart=\nExecStart=/usr/local/bin/sbh daemon --config /srv/sbh.toml\n"
+                .into(),
+        );
+        assert_eq!(
+            service_exec_config(&texts),
+            Some(PathBuf::from("/srv/sbh.toml"))
+        );
+        assert_eq!(service_exec_config(&[]), None);
+    }
+
+    #[test]
+    fn service_scope_names_a_service_config_this_view_does_not_read() {
+        // hz4 2026-11-13: the unit runs `--config /root/.config/sbh/config.toml`, a
+        // non-root `sbh status` loads /etc/sbh/config.toml and reported the
+        // running daemon as stopped, with this check passing.
+        let config = service_scope_fixture_config();
+        let unit_path = Path::new("/etc/systemd/system/sbh.service");
+        let unit = |exec: &str| vec![format!("[Service]\nExecStart={exec}\n")];
+        let check = service_scope_check(
+            unit_path,
+            &config,
+            Ok(unit(
+                "/usr/local/bin/sbh daemon --config /root/.config/sbh/config.toml",
+            )),
+            &[],
+        );
+        assert_eq!(check.status, "WARN");
+        assert!(
+            check.message.contains(
+                "runs the daemon with --config /root/.config/sbh/config.toml, not /fixture/config.toml"
+            ),
+            "{}",
+            check.message
+        );
+        assert!(
+            check
+                .message
+                .contains("can report a running daemon as stopped")
+        );
+        // The scope comparison against this config is still reported.
+        assert!(check.message.contains("ProtectSystem=strict is not set"));
+        assert!(check.message.contains("evidence=installed_unit"));
+        assert!(check.remediation.as_deref().is_some_and(|text| {
+            text.contains("`sudo sbh --config /root/.config/sbh/config.toml status`")
+        }));
+        assert!(!doctor_checks_have_failures(&[check]));
+
+        // The same config, a unit without --config, and an unreadable unit are
+        // judged as before.
+        for (texts, status) in [
+            (
+                unit("/usr/local/bin/sbh daemon --config /fixture/config.toml"),
+                "PASS",
+            ),
+            (unit("/usr/local/bin/sbh daemon"), "PASS"),
+            (
+                unit("/usr/local/bin/sbh daemon --config %h/sbh.toml"),
+                "PASS",
+            ),
+        ] {
+            let check = service_scope_check(unit_path, &config, Ok(texts), &[]);
+            assert_eq!(check.status, status, "{}", check.message);
+            assert!(!check.message.contains("runs the daemon with"));
+        }
+        let unreadable =
+            service_scope_check(unit_path, &config, Err("cannot read unit".into()), &[]);
+        assert!(!unreadable.message.contains("runs the daemon with"));
     }
 
     #[test]
