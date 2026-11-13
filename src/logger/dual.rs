@@ -173,6 +173,10 @@ pub enum ActivityEvent {
     /// A cleanup decision (keep, delete, review, veto) for the evidence
     /// ledger: SQLite `decision_log` plus a JSONL `decision` line.
     DecisionRecorded(Box<DecisionRecord>),
+    /// The Delete verdict the executor just carried out. Written like
+    /// `DecisionRecorded`, but never skipped as a repeat (bd-jl92): only when
+    /// this very record is already in the ledger.
+    DecisionExecuted(Box<DecisionRecord>),
     /// A compression outcome is an audit event, not a throttled diagnostic.
     /// Its structured info envelope never contributes deletion/ballast bytes.
     CompressionRecorded(Box<crate::logger::compression::CompressionActivity>),
@@ -589,8 +593,13 @@ fn logger_thread_main(
         // JSONL-only traffic must still reach the periodic SQLite recovery path.
         #[cfg(feature = "sqlite")]
         if sqlite.is_some()
-            && let ActivityEvent::DecisionRecorded(record) = &event
-            && !decisions.should_record(record, now)
+            && match &event {
+                ActivityEvent::DecisionRecorded(record) => !decisions.should_record(record, now),
+                ActivityEvent::DecisionExecuted(record) => {
+                    !decisions.should_record_executed(record)
+                }
+                _ => false,
+            }
         {
             // Duplicate traffic can prevent both ordinary writes and the
             // receive timeout from servicing the JSONL durability timer.
@@ -620,7 +629,8 @@ fn logger_thread_main(
                     .as_ref()
                     .map(|row| db.log_pressure(row).is_ok());
                 let decision_ok = match &event {
-                    ActivityEvent::DecisionRecorded(record) => {
+                    ActivityEvent::DecisionRecorded(record)
+                    | ActivityEvent::DecisionExecuted(record) => {
                         let ok = db.log_decision(record).is_ok();
                         if ok {
                             decisions.acknowledge(record, Instant::now());
@@ -902,7 +912,7 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
             ));
             e
         }
-        ActivityEvent::DecisionRecorded(record) => {
+        ActivityEvent::DecisionRecorded(record) | ActivityEvent::DecisionExecuted(record) => {
             let mut e = LogEntry::new(EventType::Decision, Severity::Info);
             e.path = Some(record.path.to_string_lossy().to_string());
             e.size = Some(record.size_bytes);
@@ -1602,10 +1612,11 @@ mod tests {
         blocker.join(leaf)
     }
 
-    /// bd-jl92 through the real logger: a kept artifact re-evaluated on every
-    /// pass is one `decision_log` row and one JSONL `decision` line, a changed
-    /// verdict and every delete add one each, and `sbh explain --id` (the
-    /// latest row for the stable id) still answers with the latest verdict.
+    /// bd-jl92 through the real logger: an artifact re-evaluated on every pass
+    /// with an unchanged verdict (keep or delete) is one `decision_log` row and
+    /// one JSONL `decision` line, a changed verdict adds one, and `sbh explain
+    /// --id` (the latest row for the stable id) still answers with the latest
+    /// verdict.
     #[cfg(feature = "sqlite")]
     #[test]
     fn repeated_kept_verdicts_are_one_ledger_row() {
@@ -1633,8 +1644,8 @@ mod tests {
         let db = SqliteLogger::open(&dir.path().join("test.db")).unwrap();
         let (latest, rows) = db.decision_by_id("a1b2c3d4e5f6").unwrap().unwrap();
         assert_eq!(
-            rows, 6,
-            "3 keeps + 1 review + 2 deletes, including the return to KEEP"
+            rows, 5,
+            "3 keeps + 1 review + 1 delete, including the return to KEEP"
         );
         assert_eq!(latest.effective_action, Some(ActionRecord::Keep));
         let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
@@ -1642,7 +1653,54 @@ mod tests {
             .lines()
             .filter(|line| line.contains("a1b2c3d4e5f6"))
             .count();
-        assert_eq!(lines, 6);
+        assert_eq!(lines, 5);
+    }
+
+    /// bd-jl92: a Delete held back for passes is one row until it executes,
+    /// then the executed record is written; executed on the pass that first
+    /// recorded it, it stays one row.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn an_executed_verdict_is_written_at_execution_once() {
+        use crate::scanner::decision_record::{PolicyMode, sample_record_for_tests};
+        use crate::scanner::scoring::DecisionAction;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join) = spawn_logger(test_config(dir.path())).unwrap();
+        let delete = |id: &str, pass: u64| {
+            let mut record =
+                sample_record_for_tests(PolicyMode::Live, Some(DecisionAction::Delete));
+            record.id = id.to_string();
+            record.decision_id = pass;
+            record.timestamp = format!("2026-11-13T07:{pass:02}:00.000Z");
+            Box::new(record)
+        };
+        for pass in 1..=5 {
+            handle.send(ActivityEvent::DecisionRecorded(delete(
+                "0123456789ab",
+                pass,
+            )));
+        }
+        handle.send(ActivityEvent::DecisionExecuted(delete("0123456789ab", 5)));
+        handle.send(ActivityEvent::DecisionRecorded(delete("ba9876543210", 6)));
+        handle.send(ActivityEvent::DecisionExecuted(delete("ba9876543210", 6)));
+        handle.shutdown();
+        join.join().unwrap();
+
+        let db = SqliteLogger::open(&dir.path().join("test.db")).unwrap();
+        let (latest, rows) = db.decision_by_id("0123456789ab").unwrap().unwrap();
+        assert_eq!(rows, 2, "pass 1 and the executed pass 5");
+        assert_eq!(latest.timestamp, "2026-11-13T07:05:00.000Z");
+        let (_, rows) = db.decision_by_id("ba9876543210").unwrap().unwrap();
+        assert_eq!(rows, 1, "recorded and executed on the same pass");
+        let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        assert_eq!(
+            jsonl
+                .lines()
+                .filter(|line| line.contains("\"event\":\"decision\""))
+                .count(),
+            3
+        );
     }
 
     #[cfg(feature = "sqlite")]

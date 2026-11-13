@@ -13681,6 +13681,21 @@ fn executor_thread_main(
             Some(&on_unlinked),
         );
 
+        // The ledger skips repeats of an unchanged verdict (bd-jl92), so a
+        // Delete held back for passes would otherwise be explained by its
+        // first record. Hand the logger this pass's record for each deletion.
+        if !report.dry_run && !report.deleted_paths.is_empty() {
+            let deleted: HashSet<&Path> =
+                report.deleted_paths.iter().map(PathBuf::as_path).collect();
+            for record in decision
+                .records
+                .iter()
+                .filter(|record| deleted.contains(record.path.as_path()))
+            {
+                logger.send(ActivityEvent::DecisionExecuted(Box::new(record.clone())));
+            }
+        }
+
         if scanner_config.engine == ScannerEngineMode::V2 {
             for candidate in &report.backoff_candidates {
                 let Some(identity) = candidate.identity else {
