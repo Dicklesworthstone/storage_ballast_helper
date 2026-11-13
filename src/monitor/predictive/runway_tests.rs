@@ -34,30 +34,44 @@ fn forecast(acceleration: f64, burst_probability: f64, median_rate: f64) -> Rate
 }
 
 #[test]
-fn accelerating_burst_does_not_fabricate_a_dangerous_baseline() {
-    let estimate = forecast(200.0, 0.6, 100.0);
-    // 60s at v=1000, a=200 implies 420000 free bytes. At the historical
-    // 100 bytes/s this is 70 minutes, NOT the old linear rescaling's 10.
-    assert!((median_runway_minutes(&estimate) - 70.0).abs() < 1e-9);
+fn burst_path_projects_the_baseline_runway_without_acceleration() {
+    // 60 s at the burst-inflated 1000 B/s is 60000 bytes free. At the
+    // historical 100 B/s that is 10 minutes whatever the acceleration says.
+    for acceleration in [-10.0, 0.0, 200.0] {
+        let estimate = forecast(acceleration, 0.6, 100.0);
+        assert!((median_runway_minutes(&estimate) - 10.0).abs() < 1e-9);
+        match policy().evaluate(&estimate, 10.0, PathBuf::from("/data")) {
+            PredictiveAction::PreemptiveCleanup {
+                minutes_remaining, ..
+            } => assert!((minutes_remaining - 10.0).abs() < 1e-9),
+            other => panic!("baseline 10 min from full: {other:?}"),
+        }
+    }
+    // A safe baseline (100 minutes at 10 B/s) clears the burst.
     assert_eq!(
-        policy().evaluate(&estimate, 10.0, PathBuf::from("/data")),
+        policy().evaluate(&forecast(200.0, 0.6, 10.0), 10.0, PathBuf::from("/data")),
         PredictiveAction::Clear
     );
 }
 
 #[test]
-fn normal_path_median_crosscheck_also_removes_burst_acceleration() {
-    let estimate = forecast(200.0, 0.3, 100.0);
+fn normal_path_median_crosscheck_projects_the_baseline_runway() {
     // Below the detected-burst threshold; high confidence passes the
-    // implied-rate gate, so the separate median cross-check must catch it.
+    // implied-rate gate, so the separate median cross-check decides.
+    match policy().evaluate(&forecast(200.0, 0.3, 100.0), 30.0, PathBuf::from("/data")) {
+        PredictiveAction::PreemptiveCleanup {
+            minutes_remaining, ..
+        } => assert!((minutes_remaining - 10.0).abs() < 1e-9),
+        other => panic!("baseline 10 min from full: {other:?}"),
+    }
     assert_eq!(
-        policy().evaluate(&estimate, 30.0, PathBuf::from("/data")),
+        policy().evaluate(&forecast(200.0, 0.3, 10.0), 30.0, PathBuf::from("/data")),
         PredictiveAction::Clear
     );
 }
 
 #[test]
-fn dangerous_accelerating_baseline_still_releases_ballast() {
+fn dangerous_baseline_still_releases_ballast() {
     let estimate = forecast(2.0, 0.6, 800.0);
     let action = policy().evaluate(&estimate, 10.0, PathBuf::from("/data"));
     assert!(action.should_release_ballast());
@@ -67,8 +81,8 @@ fn dangerous_accelerating_baseline_still_releases_ballast() {
             critical,
             ..
         } => {
-            // (1000*60 + 2*60*60/2) / 800 / 60 = 1.325 minutes.
-            assert!((minutes_remaining - 1.325).abs() < 1e-9);
+            // 1000 B/s * 60 s / 800 B/s / 60 = 1.25 minutes.
+            assert!((minutes_remaining - 1.25).abs() < 1e-9);
             assert!(critical);
         }
         other => panic!("expected critical rescue, got {other:?}"),
@@ -76,23 +90,9 @@ fn dangerous_accelerating_baseline_still_releases_ballast() {
 }
 
 #[test]
-fn median_runway_never_shortens_the_constant_rate_bound() {
-    for (acceleration, expected) in [(-10.0, 10.0), (0.0, 10.0), (200.0, 70.0)] {
-        let estimate = forecast(acceleration, 0.6, 100.0);
-        assert!((median_runway_minutes(&estimate) - expected).abs() < 1e-9);
-    }
-}
-
-#[test]
 fn unverifiable_median_arithmetic_cannot_authorize_cleanup() {
     for probability in [0.3, 0.6] {
-        let mut estimate = forecast(f64::MAX, probability, 100.0);
-        assert!(median_runway_minutes(&estimate).is_infinite());
-        assert_eq!(
-            policy().evaluate(&estimate, 30.0, PathBuf::from("/data")),
-            PredictiveAction::Clear
-        );
-        estimate = forecast(200.0, probability, f64::MIN_POSITIVE);
+        let estimate = forecast(200.0, probability, f64::MIN_POSITIVE);
         assert!(median_runway_minutes(&estimate).is_infinite());
         assert_eq!(
             policy().evaluate(&estimate, 30.0, PathBuf::from("/data")),
@@ -105,6 +105,8 @@ fn unverifiable_median_arithmetic_cannot_authorize_cleanup() {
         policy().evaluate(&estimate, 10.0, PathBuf::from("/data")),
         PredictiveAction::Clear
     );
+    // An absurd acceleration cannot move the baseline runway either way.
+    assert!((median_runway_minutes(&forecast(f64::MAX, 0.6, 100.0)) - 10.0).abs() < 1e-9);
 }
 
 #[test]
@@ -133,7 +135,7 @@ fn sustained_write_burst_is_actionable_before_the_burst_flag_clears() {
             confidence,
             ..
         } => {
-            // The acceleration-aware baseline is 400 MB / 1 MB/s.
+            // The baseline is 400 MB at the 1 MB/s median.
             assert!((minutes_remaining - 400.0 / 60.0).abs() < 0.01);
             assert!(confidence >= PredictiveConfig::default().min_confidence);
         }
@@ -169,17 +171,20 @@ fn slowing_write_trace_that_still_fills_disk_triggers_cleanup() {
     ));
 }
 
+/// One slower sample is not a writer stopping: extrapolating that single
+/// deceleration used to report "never fills" for a disk still filling.
 #[test]
-fn slowing_write_trace_that_stops_in_time_does_not_trigger_cleanup() {
+fn one_slower_sample_does_not_cancel_a_filling_forecast() {
     let (mut estimator, next, free) = warmed_estimator();
     let estimate = estimator.update(free - 900_000, next, 30_000_000);
     assert_eq!(estimate.trend, Trend::Decelerating);
     assert!(estimate.bytes_per_second > 0.0);
-    assert!(estimate.seconds_to_exhaustion.is_infinite());
-    assert_eq!(
+    // 399.1 MB free at 0.9 MB/s.
+    assert!((estimate.seconds_to_exhaustion - 399_100_000.0 / 900_000.0).abs() < 1e-6);
+    assert!(matches!(
         policy().evaluate(&estimate, 20.0, PathBuf::from("/data")),
-        PredictiveAction::Clear
-    );
+        PredictiveAction::PreemptiveCleanup { .. }
+    ));
 }
 
 #[test]

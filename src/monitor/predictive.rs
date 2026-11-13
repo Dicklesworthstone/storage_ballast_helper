@@ -270,8 +270,8 @@ impl PredictiveActionPolicy {
         // trigger "disk full in 1m" because the median rate shows it's transient.
         let bs = &estimate.burst_state;
         if bs.calibrated && bs.burst_probability > 0.5 {
-            // Remove burst acceleration as well as the burst-inflated rate
-            // when projecting the historical baseline's runway.
+            // Project the historical baseline's runway at the median rate,
+            // not the burst-inflated EWMA rate.
             let median_minutes = median_runway_minutes(estimate);
 
             // If median-rate projection shows no danger, return Clear.
@@ -555,21 +555,16 @@ fn consumption_runway_minutes(estimate: &RateEstimate) -> f64 {
 
 /// Project the forecast's implied free space at the historical median rate.
 ///
-/// EWMA exhaustion time includes acceleration: distance = v*t + a*t*t/2.
-/// Scaling time by v/median alone discards the acceleration contribution and
-/// can turn a safe historical baseline into a false cleanup recommendation.
-/// For deceleration, retain the longer constant-rate bound rather than making
-/// an existing median cross-check more aggressive. Callers validate inputs;
+/// The EWMA exhaustion time is linear (distance = v*t), so the runway at the
+/// median rate is that distance over the median. Callers validate inputs;
 /// arithmetic overflow still fails closed instead of authorizing cleanup.
 fn median_runway_minutes(estimate: &RateEstimate) -> f64 {
     let median_rate = estimate.burst_state.median_rate;
     if median_rate <= 0.0 {
         return f64::INFINITY;
     }
-    let seconds = estimate.seconds_to_exhaustion;
-    let mean_rate =
-        (0.5 * estimate.acceleration.max(0.0)).mul_add(seconds, estimate.bytes_per_second);
-    let minutes = mean_rate * seconds / median_rate / 60.0;
+    let distance = estimate.bytes_per_second * estimate.seconds_to_exhaustion;
+    let minutes = distance / median_rate / 60.0;
     if minutes.is_finite() && minutes >= 0.0 {
         minutes
     } else {

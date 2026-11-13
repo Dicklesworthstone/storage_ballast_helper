@@ -239,11 +239,9 @@ impl DiskRateEstimator {
         let burst_state = self.compute_burst_state(inst_rate);
 
         let trend = classify_trend(self.ewma_rate, self.ewma_accel);
-        let seconds_to_exhaustion =
-            project_time(self.ewma_rate, self.ewma_accel, free_bytes as f64);
+        let seconds_to_exhaustion = project_time(self.ewma_rate, free_bytes as f64);
         let threshold_distance = free_bytes.saturating_sub(threshold_free_bytes);
-        let seconds_to_threshold =
-            project_time(self.ewma_rate, self.ewma_accel, threshold_distance as f64);
+        let seconds_to_threshold = project_time(self.ewma_rate, threshold_distance as f64);
 
         // Track prediction jitter: how much seconds_to_threshold changes between
         // ticks, normalized by the prediction magnitude. Swings like 47m → 2m
@@ -301,7 +299,6 @@ impl DiskRateEstimator {
         let mut estimate = previous.clone();
         estimate.seconds_to_threshold = project_time(
             self.ewma_rate,
-            self.ewma_accel,
             previous.free_bytes.saturating_sub(threshold_free_bytes) as f64,
         );
         estimate.confidence = self.compute_confidence();
@@ -465,54 +462,25 @@ fn classify_trend(rate: f64, accel: f64) -> Trend {
     }
 }
 
-fn project_time(rate: f64, accel: f64, distance_bytes: f64) -> f64 {
+/// Time to consume `distance_bytes` at the smoothed rate.
+///
+/// Linear on purpose. The acceleration estimate changes sign between 5 s
+/// samples under build traffic, and extrapolating it as `v*t + a*t*t/2` over
+/// a horizon of minutes turned that noise into the forecast: on 2026-11-13,
+/// hz4 filled at a realized 24 MB/s (72 min to full) while the quadratic
+/// said "full within 30 min" in 45 of 111 samples (as low as 5.7 min) and
+/// "never fills" in 64; vmi1264463, 21 h from full at 1.4 MB/s, was told
+/// 8 min after one burst. The smoothed rate itself follows a real
+/// sustained change within a few samples, and acceleration still sets
+/// [`Trend`].
+fn project_time(rate: f64, distance_bytes: f64) -> f64 {
     if distance_bytes <= 0.0 {
         return 0.0;
     }
     if rate <= 0.0 {
         return f64::INFINITY;
     }
-    if accel.abs() < 1e-9 {
-        return distance_bytes / rate;
-    }
-
-    let discriminant = rate.mul_add(rate, 2.0 * accel * distance_bytes);
-    if discriminant < 0.0 {
-        // Deceleration is strong enough that the rate will reach zero before
-        // covering `distance_bytes`. The disk will never fill at this trend.
-        return f64::INFINITY;
-    }
-    let root = discriminant.sqrt();
-
-    // Use the numerically stable form to avoid catastrophic cancellation.
-    // When accel is small and negative, `(-rate + root)` suffers precision loss
-    // because root ≈ rate. Instead, multiply both sides by the conjugate:
-    //   t = (-rate + root) / accel = 2*distance / (rate + root)
-    // The latter avoids subtracting nearly-equal quantities.
-    let t = if accel < 0.0 {
-        let denom = rate + root;
-        if denom.abs() < f64::EPSILON {
-            return f64::INFINITY;
-        }
-        2.0 * distance_bytes / denom
-    } else {
-        (-rate + root) / accel
-    };
-
-    // Reject results where the rate would have reached zero before t
-    // (unphysical: rate can't go negative).
-    if accel < 0.0 {
-        let t_zero = -rate / accel; // time when rate reaches zero
-        if t > t_zero {
-            return f64::INFINITY;
-        }
-    }
-
-    if t.is_finite() && t > 0.0 {
-        t
-    } else {
-        distance_bytes / rate
-    }
+    distance_bytes / rate
 }
 
 #[cfg(test)]
