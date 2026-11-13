@@ -22532,7 +22532,8 @@ mod tests {
         let three_hours = std::time::Duration::from_hours(3);
         let stamp =
             filetime::FileTime::from_system_time(std::time::SystemTime::now() - three_hours);
-        for path in ["debug/deps/libx.rlib", "debug/deps", "debug"] {
+        // The pool root too: its mtime counts as activity (1aa31bf1).
+        for path in ["debug/deps/libx.rlib", "debug/deps", "debug", ""] {
             filetime::set_file_mtime(pool.join(path), stamp).unwrap();
         }
         let signals = StructuralSignals {

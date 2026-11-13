@@ -1939,9 +1939,12 @@ fn prescan_timeouts_on_a_busy_root_are_paced_by_the_rescan_interval() {
             .filter(|line| line.contains("scan complete:") && line.contains("(timed out"))
             .count()
     };
+    // Generous: only the pacing after the first pass is under test, and the
+    // fixture walk is slow under a parallel e2e run (60 s timed out on a
+    // 10-core worker while 23 other daemons ran).
     run.wait_until(
         "the first budget-cut pass",
-        Duration::from_secs(60),
+        Duration::from_secs(180),
         |run| budget_cut_passes(run) >= 1,
     )
     .unwrap_or_else(|e| panic!("{e}"));
