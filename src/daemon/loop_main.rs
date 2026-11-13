@@ -2641,6 +2641,19 @@ fn daemon_idle_reason(controllers: &[MountStateRecord]) -> Option<String> {
         .map(|(reason, _)| reason.to_string())
 }
 
+/// Whether the priority pre-scan may classify or enter `path` as a directory.
+/// Without `follow_symlinks` only a real directory qualifies, as in the
+/// walker. `Path::is_dir` follows a symlink: on trj (2026-11-13) a symlink in
+/// `/data/tmp/rch` to a source checkout outside every root got its
+/// `.rch-target` nominated, and only the unit's sandbox stopped the deletion.
+fn prescan_is_dir(path: &Path, follow_symlinks: bool) -> bool {
+    if follow_symlinks {
+        path.is_dir()
+    } else {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+    }
+}
+
 /// A pre-scan candidate's age by the walker's rule: files by mtime;
 /// directories by the newest of their mtime, birth time and a bounded probe
 /// of the tree, so a tree created a moment ago with old mtimes (a copy, an
@@ -11473,7 +11486,9 @@ fn scanner_thread_main(
                     // `cursor_before_entry` so the entry is retried whole.
                     let cursor_before_entry = cursor.clone();
                     cursor.advance(root, &path);
-                    if !path.is_dir() || !request.permits_reclaim_path(&path) {
+                    if !prescan_is_dir(&path, current_scanner_config.follow_symlinks)
+                        || !request.permits_reclaim_path(&path)
+                    {
                         continue;
                     }
                     let _ = protection.discover_ancestor_markers(&path);
@@ -11524,7 +11539,7 @@ fn scanner_thread_main(
                             if !request.permits_reclaim_path(&sub_path) {
                                 continue;
                             }
-                            if sub_path.is_dir() {
+                            if prescan_is_dir(&sub_path, current_scanner_config.follow_symlinks) {
                                 let _ = protection.discover_ancestor_markers(&sub_path);
                                 if protection.is_protected(&sub_path) {
                                     continue;
@@ -11559,7 +11574,10 @@ fn scanner_thread_main(
                                             if !request.permits_reclaim_path(&d3_path) {
                                                 continue;
                                             }
-                                            if d3_path.is_dir() {
+                                            if prescan_is_dir(
+                                                &d3_path,
+                                                current_scanner_config.follow_symlinks,
+                                            ) {
                                                 let _ =
                                                     protection.discover_ancestor_markers(&d3_path);
                                                 if protection.is_protected(&d3_path) {
@@ -24456,6 +24474,122 @@ mod tests {
 
         logger.shutdown();
         logger_join.join().unwrap();
+    }
+
+    /// trj 2026-11-13: `/data/tmp/rch/ft-dsr-qualification-1031-c91` was a
+    /// symlink to a source checkout outside every scan root, and the priority
+    /// pre-scan nominated `<link>/.rch-target` through it (only the unit's
+    /// `ProtectSystem=strict` sandbox kept it from the executor). With
+    /// `follow_symlinks = false` the pre-scan, like the walker, must not enter
+    /// a symlinked directory at depth 1, 2 or 3.
+    #[cfg(unix)]
+    #[test]
+    fn scanner_prescan_never_follows_a_symlinked_directory_out_of_its_root() {
+        fn cargo_project(project: &Path) -> PathBuf {
+            let target = project.join("target");
+            for child in ["debug/deps", "debug/incremental", "debug/.fingerprint"] {
+                std::fs::create_dir_all(target.join(child)).unwrap();
+            }
+            std::fs::write(
+                project.join("Cargo.toml"),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+            write_cargo_cachedir_tag(&target);
+            std::fs::write(target.join("debug/deps/libfixture.rlib"), [0xA5_u8; 8192]).unwrap();
+            target
+        }
+
+        let temp = temp_root_scratch_dir();
+        let root = temp.path().join("scan-root");
+        let outside = temp.path().join("outside-checkout");
+        // Positive control at the trj depth: root/pool/<project>/target.
+        let real_target = cargo_project(&root.join("pool").join("real"));
+        let outside_target = cargo_project(&outside);
+        // The trj shape (a depth-2 link) and a depth-1 link to the same tree.
+        std::os::unix::fs::symlink(&outside, root.join("pool").join("linked")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked-top")).unwrap();
+
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![root.clone()];
+        config.scanner.follow_symlinks = false;
+        config.scanner.parallelism = 1;
+        config.scanner.min_file_age_minutes = 0;
+        config.scanner.active_reference_min_size_bytes = u64::MAX;
+        config.scanner.min_rescan_interval_secs = 0;
+        config.scanner.max_scan_duty_cycle_pct = 100;
+        config.scanner.scan_time_budget_secs = 30;
+        config.scanner.log_truncation.enabled = false;
+        config.scoring.min_score = 0.0;
+
+        let executor_config = Arc::new(SharedExecutorConfig::new(
+            false, 10, 0.0, 60, 3600, false, 0,
+        ));
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: temp.path().join("activity.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 64,
+            run_id: None,
+        })
+        .unwrap();
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(16);
+        let (report_tx, _report_rx) = bounded::<WorkerReport>(2);
+        let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        let (index_path, cursor_path) = scanner_state_paths(temp.path());
+        let mut request = event_test_request(vec![root.clone()]);
+        request.pressure_level = PressureLevel::Critical;
+        request.free_pct = Some(1.0);
+        request.urgency = 1.0;
+        scan_tx.send(request).unwrap();
+        drop(scan_tx);
+        scanner_thread_main(
+            &scan_rx,
+            &del_tx,
+            &logger,
+            &Arc::new(RwLock::new(config.scoring.clone())),
+            &Arc::new(RwLock::new(config.scanner.clone())),
+            &platform,
+            &ThreadHeartbeat::new("prescan-symlink-test"),
+            &report_tx,
+            &Arc::new(AtomicBool::new(false)),
+            &index_path,
+            &cursor_path,
+            &feedback_rx,
+            &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+            &executor_config,
+            &Arc::new(SharedRegret::new(&config)),
+            None,
+            &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
+        );
+        logger.shutdown();
+        logger_join.join().unwrap();
+
+        let dispatched: Vec<PathBuf> = del_rx
+            .try_iter()
+            .flat_map(|batch| batch.candidates.into_iter().map(|candidate| candidate.path))
+            .collect();
+        assert!(
+            dispatched.contains(&real_target),
+            "positive control: the real target at the same depth is dispatched: {dispatched:?}"
+        );
+        let through_a_link = |path: &PathBuf| {
+            path.starts_with(root.join("pool").join("linked"))
+                || path.starts_with(root.join("linked-top"))
+                || path.starts_with(&outside)
+        };
+        assert!(
+            !dispatched.iter().any(through_a_link),
+            "nothing may be nominated through a symlinked directory: {dispatched:?}"
+        );
+        assert!(outside_target.join("debug/deps/libfixture.rlib").exists());
     }
 
     /// A pre-scan phase that runs out of *its own* wall budget must hand the
