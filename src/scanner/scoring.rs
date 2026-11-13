@@ -539,7 +539,15 @@ impl ScoringEngine {
         // changes the prior fed into the expected-loss decision, never a veto.
         let certainty = classify_certainty(&input.classification, input.signals, factors.location);
         let raw_posterior = posterior_from_score(total, input.classification.combined_confidence);
+        // Below Orange nothing is worth a cold rebuild of a target in use
+        // today: the fast lane waits until the candidate has been idle as long
+        // as an rch per-job dir must be (bd-i9uh).
+        let posterior_floor_withheld = certainty == ArtifactCertainty::Definite
+            && urgency < DEFINITE_FLOOR_PRESSURE_URGENCY
+            && input.age < DEFINITE_FLOOR_MAINTENANCE_IDLE
+            && raw_posterior < self.posterior_floor_definite;
         let posterior_floor_applied = certainty == ArtifactCertainty::Definite
+            && !posterior_floor_withheld
             && raw_posterior < self.posterior_floor_definite;
         let posterior_abandoned = if posterior_floor_applied {
             self.posterior_floor_definite
@@ -596,7 +604,7 @@ impl ScoringEngine {
             action
         };
 
-        let ledger = build_ledger(
+        let mut ledger = build_ledger(
             factors,
             self.weights,
             posterior_abandoned,
@@ -610,6 +618,13 @@ impl ScoringEngine {
             certainty,
             posterior_floor_applied.then_some(self.posterior_floor_definite),
         );
+        if posterior_floor_withheld {
+            ledger.summary.push_str(&format!(
+                "; posterior_floor_withheld=idle {}m below {}h at urgency {urgency:.2}",
+                input.age.as_secs() / 60,
+                DEFINITE_FLOOR_MAINTENANCE_IDLE.as_secs() / 3600
+            ));
+        }
 
         CandidacyScore {
             path: input.path.clone(),
@@ -894,6 +909,24 @@ pub(crate) const RCH_PRESSURE_URGENCY: f64 = 0.7;
 
 /// rch's own idle floor for a per-job target dir.
 pub(crate) const RCH_PER_JOB_IDLE_HOURS: u64 = 12;
+
+/// Urgency below which a `Definite` candidate needs
+/// [`DEFINITE_FLOOR_MAINTENANCE_IDLE`] before its posterior floor applies:
+/// Green (0.0) and Yellow (0.25) in the daemon's level-to-urgency map, under
+/// Orange (0.5).
+pub(crate) const DEFINITE_FLOOR_PRESSURE_URGENCY: f64 = 0.5;
+
+/// Idle time a `Definite` candidate needs for the posterior floor below
+/// [`DEFINITE_FLOOR_PRESSURE_URGENCY`] (bd-i9uh): rch's per-job floor, so a
+/// plain cargo target waits as long as an rch per-job one already does.
+///
+/// Without it the floor made anything past `min_file_age_minutes` (30)
+/// deletable on a disk with room to spare. trj decided DELETE at Green on a
+/// 76 GB shared cargo target written 45 minutes earlier, and csd deleted a
+/// shared `cargo-target` at 35 minutes idle on two days running, rebuilt each
+/// time. Under pressure the floor still applies at any age past the minimum.
+pub(crate) const DEFINITE_FLOOR_MAINTENANCE_IDLE: Duration =
+    Duration::from_hours(RCH_PER_JOB_IDLE_HOURS);
 
 /// rch's own idle floor for a pooled (warm-cache) target dir.
 pub(crate) const RCH_POOLED_IDLE_HOURS: u64 = 168;
@@ -3075,7 +3108,7 @@ mod tests {
         CandidateInput {
             path: PathBuf::from(path),
             size_bytes: 64 * 1_048_576,
-            age: Duration::from_hours(5),
+            age: Duration::from_hours(24),
             classification: ArtifactClassification {
                 pattern_name: Cow::Borrowed("opaque-cargo-target"),
                 category: ArtifactCategory::RustTarget,
@@ -3221,6 +3254,82 @@ mod tests {
         let score = engine.score_candidate(&fresh, 0.93);
         assert!(score.vetoed, "{:?}", score.veto_reason);
         assert!(!score.decision.posterior_floor_applied);
+    }
+
+    /// bd-i9uh: at Green (urgency 0.0) trj decided DELETE on a 76 GB shared
+    /// cargo target (`/scratch/cargo-targets/inatd-receipts`) last written 45
+    /// minutes earlier, with `/scratch` 70% full; only the unit's sandbox
+    /// stopped it. csd deleted a shared `cargo-target` at 35 minutes idle on
+    /// two days running and it was rebuilt each time. Below Orange the fast
+    /// lane now waits for the same half day an rch per-job target needs.
+    #[test]
+    fn definite_floor_waits_for_a_half_day_idle_target_below_orange() {
+        let engine = default_engine();
+        let mut young = stale_definite_target("/scratch/cargo-targets/inatd-receipts");
+        young.age = Duration::from_secs(2677);
+        young.size_bytes = 76 * 1_073_741_824;
+        for urgency in [0.0, 0.05, 0.25] {
+            let score = engine.score_candidate(&young, urgency);
+            assert!(!score.vetoed, "urgency={urgency}: {:?}", score.veto_reason);
+            assert_eq!(score.decision.certainty, ArtifactCertainty::Definite);
+            assert!(
+                !score.decision.posterior_floor_applied,
+                "urgency={urgency}: {}",
+                score.ledger.summary
+            );
+            assert_ne!(
+                score.decision.action,
+                DecisionAction::Delete,
+                "urgency={urgency}: {}",
+                score.ledger.summary
+            );
+            assert!(
+                score.ledger.summary.contains("posterior_floor_withheld"),
+                "urgency={urgency}: {}",
+                score.ledger.summary
+            );
+        }
+
+        // Under pressure the same young target is still reclaimed.
+        for urgency in [0.5, 0.75, 0.93] {
+            let score = engine.score_candidate(&young, urgency);
+            assert_eq!(
+                score.decision.action,
+                DecisionAction::Delete,
+                "urgency={urgency}: {}",
+                score.ledger.summary
+            );
+            assert!(!score.ledger.summary.contains("posterior_floor_withheld"));
+        }
+
+        // The boundary: half a day idle qualifies at Green, a minute less does not.
+        let mut idle = young.clone();
+        idle.age = Duration::from_hours(12);
+        let score = engine.score_candidate(&idle, 0.0);
+        assert!(
+            score.decision.posterior_floor_applied,
+            "{}",
+            score.ledger.summary
+        );
+        assert_eq!(
+            score.decision.action,
+            DecisionAction::Delete,
+            "{}",
+            score.ledger.summary
+        );
+        idle.age = Duration::from_hours(12) - Duration::from_mins(1);
+        let score = engine.score_candidate(&idle, 0.0);
+        assert!(
+            !score.decision.posterior_floor_applied,
+            "{}",
+            score.ledger.summary
+        );
+        assert_ne!(
+            score.decision.action,
+            DecisionAction::Delete,
+            "{}",
+            score.ledger.summary
+        );
     }
 
     /// A browser's per-launch app clone sits in the temp location band and is
