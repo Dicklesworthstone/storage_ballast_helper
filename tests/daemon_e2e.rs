@@ -2270,14 +2270,23 @@ fn green_quarantine_holds_the_stale_target_and_orange_drains_it_first() {
         !store.join(format!("{decision_id}.json")).exists(),
         "its record is gone with it"
     );
+    // The worker prints the stderr line before it hands the info event to the
+    // logger thread, which writes JSONL asynchronously: wait for the event.
+    let is_drain = |e: &Value| {
+        e["details"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("quarantine under") && d.contains("for pressure"))
+    };
+    run.wait_until(
+        "the drain logged as an info event",
+        Duration::from_secs(30),
+        |run| run.events_of("info").iter().any(is_drain),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     let drain = run
         .events_of("info")
         .into_iter()
-        .find(|e| {
-            e["details"]
-                .as_str()
-                .is_some_and(|d| d.starts_with("quarantine under") && d.contains("for pressure"))
-        })
+        .find(is_drain)
         .expect("the drain is logged as an info event");
     assert!(
         drain["details"]
