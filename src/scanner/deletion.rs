@@ -2719,14 +2719,6 @@ mod tests {
         }
     }
 
-    /// Fixture root for deletion tests, guaranteed to sit OUTSIDE the
-    /// hardcoded source-tree roots (`/data/projects`, `/home/<u>/projects`,
-    /// `/Users/<u>/projects`). The preflight refuses to delete anything under
-    /// those by design, so a fixture created under a `TMPDIR` that build
-    /// tooling has redirected into a checkout is vetoed as
-    /// `HardcodedSourceTree` and every deletion test fails for an
-    /// environmental reason. Falls through the usual temp roots and fails
-    /// loudly rather than asserting something the preflight forbids.
     /// `len` bytes that a compressing filesystem cannot shrink (omarchy mounts
     /// btrfs with `compress=zstd:3`, where 64 MiB of one repeated byte takes
     /// almost no blocks, so removing it frees almost nothing).
@@ -2744,6 +2736,26 @@ mod tests {
         bytes
     }
 
+    /// Commit everything pending on `path`'s filesystem. btrfs counts an
+    /// allocation in statfs only when its transaction commits, so a blob
+    /// written, fsynced (into the log tree) and removed inside one
+    /// transaction never visibly takes space, nor gives any back.
+    #[cfg(target_os = "linux")]
+    fn commit_filesystem(path: &Path) {
+        rustix::fs::syncfs(fs::File::open(path).unwrap()).unwrap();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    const fn commit_filesystem(_path: &Path) {}
+
+    /// Fixture root for deletion tests, guaranteed to sit OUTSIDE the
+    /// hardcoded source-tree roots (`/data/projects`, `/home/<u>/projects`,
+    /// `/Users/<u>/projects`). The preflight refuses to delete anything under
+    /// those by design, so a fixture created under a `TMPDIR` that build
+    /// tooling has redirected into a checkout is vetoed as
+    /// `HardcodedSourceTree` and every deletion test fails for an
+    /// environmental reason. Falls through the usual temp roots and fails
+    /// loudly rather than asserting something the preflight forbids.
     fn scratch_dir() -> tempfile::TempDir {
         let bases = [
             std::env::temp_dir(),
@@ -3610,15 +3622,19 @@ mod tests {
         }
         // ext4 and btrfs return freed blocks when the journal or transaction
         // commits, not at unlink, so the executor's immediate measurement can
-        // miss them. Accept that only if the space does come back later.
+        // miss them. Accept that only if the space does come back later. The
+        // blob's allocation is committed before the baseline and its removal
+        // right after, or btrfs nets both out inside one transaction.
         let available = || available_bytes_beside(dir.path()).unwrap_or(0);
         let blob = dir.path().join("deferred.bin");
         let mut file = fs::File::create(&blob).unwrap();
         std::io::Write::write_all(&mut file, &incompressible_bytes(64 * 1024 * 1024, 99)).unwrap();
         file.sync_all().unwrap();
         drop(file);
+        commit_filesystem(&blob);
         let before = available();
         fs::remove_file(&blob).unwrap();
+        commit_filesystem(dir.path());
         let deadline = std::time::Instant::now() + Duration::from_secs(40);
         while std::time::Instant::now() < deadline {
             if available().saturating_sub(before) >= 16 * 1024 * 1024 {
