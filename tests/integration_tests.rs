@@ -4667,6 +4667,26 @@ fn run_launchd_config_reset(
         result.stderr,
         result.log_path.display()
     );
+    let result = run_launchd_sbh_case(
+        "macos_launchd_disable_ballast",
+        bin_path,
+        &[
+            "--config".to_string(),
+            config_path.to_string_lossy().into_owned(),
+            "config".to_string(),
+            "set".to_string(),
+            "ballast.auto_provision".to_string(),
+            "false".to_string(),
+        ],
+        env_overrides,
+    );
+    assert!(
+        result.status.success(),
+        "disabling ballast failed; stdout={:?}; stderr={:?}; log={}",
+        result.stdout,
+        result.stderr,
+        result.log_path.display()
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -4686,8 +4706,6 @@ fn run_launchd_install(
             "--launchd".to_string(),
             "--scope".to_string(),
             "user".to_string(),
-            "--ballast-count".to_string(),
-            "0".to_string(),
             "--no-verify".to_string(),
             "--offline".to_string(),
             offline_bundle.to_string_lossy().into_owned(),

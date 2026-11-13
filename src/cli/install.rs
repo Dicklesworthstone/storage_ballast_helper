@@ -15,7 +15,7 @@ use super::{
     sigstore_policy_and_probe_for_bundle, verify_artifact_supply_chain,
 };
 use crate::ballast::manager::BallastManager;
-use crate::core::config::{BallastConfig, Config};
+use crate::core::config::Config;
 #[cfg(test)]
 use crate::core::hex_lower;
 // errors module available but not directly used in this module.
@@ -42,7 +42,7 @@ pub struct InstallReport {
     pub steps: Vec<InstallStep>,
     /// Overall success.
     pub success: bool,
-    /// Path to the config file (if written).
+    /// Path to the config file (if written or preserved).
     pub config_path: Option<PathBuf>,
     /// Path to the data directory (if created).
     pub data_dir: Option<PathBuf>,
@@ -102,7 +102,7 @@ impl InstallReport {
 /// Options controlling the install orchestration.
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
-    /// Config to write.
+    /// Effective configuration to write or use with the preserved file.
     pub config: Config,
     /// Number of ballast files to create.
     pub ballast_count: usize,
@@ -110,6 +110,9 @@ pub struct InstallOptions {
     pub ballast_size_bytes: u64,
     /// Override ballast directory path.
     pub ballast_path: Option<PathBuf>,
+    /// Keep the existing config file byte-for-byte instead of rewriting it.
+    /// Ballast overrides must match `config` while preservation is enabled.
+    pub preserve_existing_config: bool,
     /// Show plan without executing.
     pub dry_run: bool,
 }
@@ -121,6 +124,7 @@ impl Default for InstallOptions {
             ballast_count: config.ballast.file_count,
             ballast_size_bytes: config.ballast.file_size_bytes,
             ballast_path: None,
+            preserve_existing_config: false,
             dry_run: false,
             config,
         }
@@ -135,7 +139,7 @@ impl Default for InstallOptions {
 ///
 /// Steps:
 /// 1. Create data directory.
-/// 2. Write config file.
+/// 2. Write or preserve the config file.
 /// 3. Provision ballast files.
 ///
 /// Service registration (systemd/launchd) is handled separately in `cli_app.rs`.
@@ -152,7 +156,15 @@ pub fn run_install_sequence_with_bundle(
     bundle_manifest_path: Option<&Path>,
 ) -> InstallReport {
     let mut report = InstallReport::new(opts.dry_run);
-    let paths = &opts.config.paths;
+
+    let config = match resolve_install_config(opts) {
+        Ok(config) => config,
+        Err(error) => {
+            report.step_fail("Validate install configuration", error.to_string());
+            return report;
+        }
+    };
+    let paths = &config.paths;
 
     if !run_bundle_preflight(bundle_manifest_path, opts.dry_run, &mut report) {
         return report;
@@ -183,16 +195,17 @@ pub fn run_install_sequence_with_bundle(
         }
     }
 
-    // Step 2: Write config file. The ballast this install provisions is the
-    // ballast the daemon keeps: `--ballast-count`/`--ballast-size` go into the
-    // written config, not only into the one-off provisioning below. Before,
-    // the daemon provisioned the default 10 x 1 GiB per pool on its first
-    // start whatever the install was told (bd-ncxh).
+    // Step 2: Persist the configuration used for provisioning and daemon startup.
     let config_path = &paths.config_file;
-    let mut config = opts.config.clone();
-    config.ballast.file_count = opts.ballast_count;
-    config.ballast.file_size_bytes = opts.ballast_size_bytes;
-    if opts.dry_run {
+    if opts.preserve_existing_config {
+        let description = format!("Preserve existing config: {}", config_path.display());
+        if opts.dry_run {
+            report.step_plan(description);
+        } else {
+            report.step_ok(description);
+            report.config_path = Some(config_path.clone());
+        }
+    } else if opts.dry_run {
         report.step_plan(format!("Write config: {}", config_path.display()));
     } else {
         match write_config(&config, config_path) {
@@ -210,62 +223,111 @@ pub fn run_install_sequence_with_bundle(
         }
     }
 
-    // Step 3: Provision ballast files.
-    let ballast_dir = opts
-        .ballast_path
-        .clone()
-        .unwrap_or_else(|| paths.ballast_dir.clone());
+    // Step 3: Provision only when the effective configuration enables it.
+    provision_install_ballast(&config, opts.dry_run, &mut report);
 
-    let ballast_config = BallastConfig {
-        file_count: opts.ballast_count,
-        file_size_bytes: opts.ballast_size_bytes,
-        ..opts.config.ballast.clone()
-    };
+    report.success = report.steps.iter().all(|s| s.error.is_none());
+    report
+}
 
-    if opts.dry_run {
-        let total_gb =
-            (opts.ballast_count as u64).saturating_mul(opts.ballast_size_bytes) / 1_073_741_824;
+fn resolve_install_config(opts: &InstallOptions) -> crate::core::errors::Result<Config> {
+    use crate::core::errors::SbhError;
+
+    if opts.preserve_existing_config
+        && (opts.ballast_count != opts.config.ballast.file_count
+            || opts.ballast_size_bytes != opts.config.ballast.file_size_bytes
+            || opts
+                .ballast_path
+                .as_ref()
+                .is_some_and(|path| path != &opts.config.paths.ballast_dir))
+    {
+        return Err(SbhError::InvalidConfig {
+            details: "preserving an existing config cannot apply unpersisted ballast overrides"
+                .to_string(),
+        });
+    }
+    let mut config = opts.config.clone();
+    config.ballast.file_count = opts.ballast_count;
+    config.ballast.file_size_bytes = opts.ballast_size_bytes;
+    if let Some(ballast_path) = &opts.ballast_path {
+        config.paths.ballast_dir.clone_from(ballast_path);
+    }
+    config.validate()?;
+    if opts.preserve_existing_config {
+        // Check before creating data directories, including for a dry run.
+        // Preserve comments and operator-authored values instead of freezing
+        // this process's environment overrides into the persisted file.
+        let path = &config.paths.config_file;
+        let metadata = std::fs::metadata(path).map_err(|error| SbhError::io(path, error))?;
+        if !metadata.is_file() {
+            return Err(SbhError::InvalidConfig {
+                details: format!(
+                    "configuration to preserve {} is not a regular file",
+                    path.display()
+                ),
+            });
+        }
+        std::fs::read_to_string(path).map_err(|error| SbhError::io(path, error))?;
+    }
+    Ok(config)
+}
+
+fn provision_install_ballast(config: &Config, dry_run: bool, report: &mut InstallReport) {
+    if !config.ballast.auto_provision {
+        let description = "Skip ballast provisioning (ballast.auto_provision=false)";
+        if dry_run {
+            report.step_plan(description);
+        } else {
+            report.step_ok(description);
+        }
+        return;
+    }
+
+    let ballast_dir = &config.paths.ballast_dir;
+    if dry_run {
+        let total_gb = (config.ballast.file_count as u64)
+            .saturating_mul(config.ballast.file_size_bytes)
+            / 1_073_741_824;
         report.step_plan(format!(
             "Provision ballast: {} files x {} MB = {} GB in {}",
-            opts.ballast_count,
-            opts.ballast_size_bytes / (1024 * 1024),
+            config.ballast.file_count,
+            config.ballast.file_size_bytes / (1024 * 1024),
             total_gb,
             ballast_dir.display()
         ));
-    } else {
-        match BallastManager::new(ballast_dir.clone(), ballast_config) {
-            Ok(mut mgr) => match mgr.provision(None) {
-                Ok(prov_report) => {
-                    report.step_ok(format!(
-                        "Provisioned ballast: {} files ({} bytes) in {}",
-                        prov_report.files_created,
-                        prov_report.total_bytes,
-                        ballast_dir.display()
-                    ));
-                    report.ballast_dir = Some(ballast_dir);
-                    report.ballast_files_created = prov_report.files_created;
-                    report.ballast_bytes = prov_report.total_bytes;
-                }
-                Err(e) => {
-                    report.step_fail(
-                        format!("Provision ballast in {}", ballast_dir.display()),
-                        e.to_string(),
-                    );
-                    // Ballast failure is non-fatal; install can proceed.
-                }
-            },
-            Err(e) => {
-                report.step_fail(
-                    format!("Initialize ballast manager in {}", ballast_dir.display()),
-                    e.to_string(),
-                );
-            }
-        }
+        return;
     }
 
-    // Mark overall success: config was written (or dry-run planned).
-    report.success = report.steps.iter().all(|s| s.error.is_none());
-    report
+    let mut manager = match BallastManager::new(ballast_dir.clone(), config.ballast.clone()) {
+        Ok(manager) => manager,
+        Err(error) => {
+            report.step_fail(
+                format!("Initialize ballast manager in {}", ballast_dir.display()),
+                error.to_string(),
+            );
+            return;
+        }
+    };
+    manager.set_provision_floor_rule(config.ballast_provision_floor());
+    match manager.provision(None) {
+        Ok(provisioned) => {
+            report.step_ok(format!(
+                "Provisioned ballast: {} files ({} bytes) in {}",
+                provisioned.files_created,
+                provisioned.total_bytes,
+                ballast_dir.display()
+            ));
+            report.ballast_dir = Some(ballast_dir.clone());
+            report.ballast_files_created = provisioned.files_created;
+            report.ballast_bytes = provisioned.total_bytes;
+        }
+        Err(error) => {
+            report.step_fail(
+                format!("Provision ballast in {}", ballast_dir.display()),
+                error.to_string(),
+            );
+        }
+    }
 }
 
 fn run_bundle_preflight(
@@ -463,13 +525,14 @@ mod tests {
         config.paths.config_file = config_path.clone();
         config.paths.state_file = data_dir.join("state.json");
         config.paths.ballast_dir = ballast_dir.clone();
-        config.ballast.file_count = 0; // skip ballast for fast test
+        config.ballast.auto_provision = false;
 
         let opts = InstallOptions {
+            ballast_count: config.ballast.file_count,
+            ballast_size_bytes: config.ballast.file_size_bytes,
             config,
-            ballast_count: 0,
-            ballast_size_bytes: 0,
             ballast_path: Some(ballast_dir),
+            preserve_existing_config: false,
             dry_run: false,
         };
 
@@ -610,13 +673,14 @@ mod tests {
         config.paths.config_file = tmp.path().join("config").join("config.toml");
         config.paths.state_file = tmp.path().join("data").join("state.json");
         config.paths.ballast_dir = tmp.path().join("ballast");
-        config.ballast.file_count = 0;
+        config.ballast.auto_provision = false;
 
         let opts = InstallOptions {
+            ballast_count: config.ballast.file_count,
+            ballast_size_bytes: config.ballast.file_size_bytes,
             config,
-            ballast_count: 0,
-            ballast_size_bytes: 0,
             ballast_path: None,
+            preserve_existing_config: false,
             dry_run: false,
         };
 
@@ -649,12 +713,14 @@ mod tests {
         config.paths.config_file = tmp.path().join("config").join("config.toml");
         config.paths.state_file = tmp.path().join("data").join("state.json");
         config.paths.ballast_dir = tmp.path().join("ballast");
+        let requested_ballast_dir = tmp.path().join("custom-reserve");
         assert_ne!(config.ballast.file_count, 2);
         let opts = InstallOptions {
             config: config.clone(),
             ballast_count: 2,
             ballast_size_bytes: 1024 * 1024,
-            ballast_path: None,
+            ballast_path: Some(requested_ballast_dir.clone()),
+            preserve_existing_config: false,
             dry_run: false,
         };
 
@@ -662,8 +728,249 @@ mod tests {
         assert!(report.success, "{report:?}");
         let written: Config =
             toml::from_str(&std::fs::read_to_string(&config.paths.config_file).unwrap()).unwrap();
+        written.validate().unwrap();
         assert_eq!(written.ballast.file_count, 2);
         assert_eq!(written.ballast.file_size_bytes, 1024 * 1024);
+        assert_eq!(written.paths.ballast_dir, requested_ballast_dir);
+        assert_eq!(
+            report.ballast_dir.as_deref(),
+            Some(requested_ballast_dir.as_path())
+        );
+        assert!(
+            !config.paths.ballast_dir.exists(),
+            "the overridden default directory must not be provisioned"
+        );
+    }
+
+    #[test]
+    fn disabled_ballast_is_skipped_and_its_effective_settings_are_persisted() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.paths.config_file = tmp.path().join("config").join("config.toml");
+        config.paths.state_file = tmp.path().join("data").join("state.json");
+        config.paths.ballast_dir = tmp.path().join("default-ballast");
+        config.ballast.auto_provision = false;
+        let requested_ballast_dir = tmp.path().join("custom-reserve");
+        let mut opts = InstallOptions {
+            config: config.clone(),
+            ballast_count: 3,
+            ballast_size_bytes: 4096,
+            ballast_path: Some(requested_ballast_dir.clone()),
+            preserve_existing_config: false,
+            dry_run: true,
+        };
+
+        for dry_run in [true, false] {
+            opts.dry_run = dry_run;
+            let report = run_install_sequence(&opts);
+            assert!(report.success, "{report:?}");
+            assert_eq!(report.ballast_files_created, 0);
+            assert_eq!(report.ballast_bytes, 0);
+            assert!(report.ballast_dir.is_none());
+            assert!(!config.paths.ballast_dir.exists());
+            assert!(!requested_ballast_dir.exists());
+            let skipped = report
+                .steps
+                .iter()
+                .find(|step| {
+                    step.description == "Skip ballast provisioning (ballast.auto_provision=false)"
+                })
+                .expect("disabled provisioning must be explicit in the report");
+            assert_eq!(skipped.done, !dry_run);
+            assert!(skipped.error.is_none());
+            assert!(!report.steps.iter().any(|step| {
+                step.description.starts_with("Provision ballast:")
+                    || step.description.starts_with("Provisioned ballast:")
+            }));
+            if dry_run {
+                assert!(!config.paths.config_file.exists());
+                assert!(!config.paths.state_file.parent().unwrap().exists());
+                assert!(report.steps.iter().all(|step| !step.done));
+            }
+        }
+
+        let written: Config =
+            toml::from_str(&std::fs::read_to_string(&config.paths.config_file).unwrap()).unwrap();
+        written.validate().unwrap();
+        assert!(!written.ballast.auto_provision);
+        assert_eq!(written.ballast.file_count, 3);
+        assert_eq!(written.ballast.file_size_bytes, 4096);
+        assert_eq!(written.paths.ballast_dir, requested_ballast_dir);
+        assert_eq!(opts.config.paths.ballast_dir, config.paths.ballast_dir);
+    }
+
+    #[test]
+    fn install_preserves_existing_config_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.paths.config_file = tmp.path().join("config.toml");
+        config.paths.state_file = tmp.path().join("data/state.json");
+        config.paths.ballast_dir = tmp.path().join("ballast");
+        config.ballast.auto_provision = false;
+        let original = format!(
+            "# Keep this operator comment and formatting.\n\n{}\n",
+            toml::to_string_pretty(&config).unwrap()
+        );
+        std::fs::write(&config.paths.config_file, &original).unwrap();
+        let mut opts = InstallOptions {
+            ballast_count: config.ballast.file_count,
+            ballast_size_bytes: config.ballast.file_size_bytes,
+            config: config.clone(),
+            ballast_path: None,
+            preserve_existing_config: true,
+            dry_run: true,
+        };
+
+        for dry_run in [true, false] {
+            opts.dry_run = dry_run;
+            let report = run_install_sequence(&opts);
+            assert!(report.success, "{report:?}");
+            assert_eq!(
+                std::fs::read_to_string(&config.paths.config_file).unwrap(),
+                original
+            );
+            let preserved = report
+                .steps
+                .iter()
+                .find(|step| step.description.starts_with("Preserve existing config:"))
+                .expect("report must name the preserved config");
+            assert_eq!(preserved.done, !dry_run);
+            assert_eq!(report.config_path.is_some(), !dry_run);
+            assert!(!config.paths.ballast_dir.exists());
+            if dry_run {
+                assert!(!config.paths.state_file.parent().unwrap().exists());
+            }
+        }
+    }
+
+    #[test]
+    fn preserve_requires_a_readable_existing_config_before_creating_data() {
+        for directory_instead_of_file in [false, true] {
+            for dry_run in [true, false] {
+                let tmp = TempDir::new().unwrap();
+                let mut config = Config::default();
+                config.paths.config_file = tmp.path().join("config.toml");
+                config.paths.state_file = tmp.path().join("data/state.json");
+                config.paths.ballast_dir = tmp.path().join("ballast");
+                config.ballast.auto_provision = false;
+                if directory_instead_of_file {
+                    std::fs::create_dir(&config.paths.config_file).unwrap();
+                }
+                let opts = InstallOptions {
+                    ballast_count: config.ballast.file_count,
+                    ballast_size_bytes: config.ballast.file_size_bytes,
+                    config: config.clone(),
+                    ballast_path: None,
+                    preserve_existing_config: true,
+                    dry_run,
+                };
+
+                let report = run_install_sequence(&opts);
+                assert!(!report.success, "{report:?}");
+                assert_eq!(report.steps.len(), 1);
+                assert!(report.steps[0].error.is_some());
+                assert!(report.config_path.is_none());
+                assert!(!config.paths.state_file.parent().unwrap().exists());
+                assert!(!config.paths.ballast_dir.exists());
+                assert_eq!(config.paths.config_file.is_dir(), directory_instead_of_file);
+            }
+        }
+    }
+
+    #[test]
+    fn preserve_rejects_unpersisted_ballast_overrides() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.paths.config_file = tmp.path().join("config.toml");
+        config.paths.state_file = tmp.path().join("data/state.json");
+        config.paths.ballast_dir = tmp.path().join("ballast");
+        config.ballast.auto_provision = false;
+        let original = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&config.paths.config_file, &original).unwrap();
+        let base = InstallOptions {
+            ballast_count: config.ballast.file_count,
+            ballast_size_bytes: config.ballast.file_size_bytes,
+            config: config.clone(),
+            ballast_path: None,
+            preserve_existing_config: true,
+            dry_run: false,
+        };
+        let overrides = [
+            InstallOptions {
+                ballast_count: 2,
+                ..base.clone()
+            },
+            InstallOptions {
+                ballast_size_bytes: 4096,
+                ..base.clone()
+            },
+            InstallOptions {
+                ballast_path: Some(tmp.path().join("other-ballast")),
+                ..base
+            },
+        ];
+        for opts in overrides {
+            let report = run_install_sequence(&opts);
+            assert!(!report.success, "{report:?}");
+            assert!(
+                report.steps[0]
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| { error.contains("unpersisted ballast overrides") })
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config.paths.config_file).unwrap(),
+                original
+            );
+            assert!(!config.paths.state_file.parent().unwrap().exists());
+            assert!(!config.paths.ballast_dir.exists());
+            assert!(!tmp.path().join("other-ballast").exists());
+        }
+    }
+
+    #[test]
+    fn invalid_effective_install_settings_cannot_overwrite_config_or_create_data() {
+        for (count, size) in [(0, 4096), (1, 0), (1, 4095), (100_001, 4096)] {
+            for dry_run in [true, false] {
+                let tmp = TempDir::new().unwrap();
+                let mut config = Config::default();
+                config.paths.config_file = tmp.path().join("config.toml");
+                config.paths.state_file = tmp.path().join("data").join("state.json");
+                config.paths.ballast_dir = tmp.path().join("default-ballast");
+                config.ballast.auto_provision = false;
+                config.validate().unwrap();
+                let original = toml::to_string_pretty(&config).unwrap();
+                std::fs::write(&config.paths.config_file, &original).unwrap();
+                let requested_ballast_dir = tmp.path().join("custom-reserve");
+                let opts = InstallOptions {
+                    config: config.clone(),
+                    ballast_count: count,
+                    ballast_size_bytes: size,
+                    ballast_path: Some(requested_ballast_dir.clone()),
+                    preserve_existing_config: false,
+                    dry_run,
+                };
+
+                let report = run_install_sequence(&opts);
+                assert!(!report.success, "{report:?}");
+                assert_eq!(report.steps.len(), 1);
+                assert_eq!(
+                    report.steps[0].description,
+                    "Validate install configuration"
+                );
+                assert!(report.steps[0].error.is_some());
+                assert!(report.config_path.is_none());
+                assert!(report.data_dir.is_none());
+                assert!(report.ballast_dir.is_none());
+                assert_eq!(
+                    std::fs::read_to_string(&config.paths.config_file).unwrap(),
+                    original
+                );
+                assert!(!config.paths.state_file.parent().unwrap().exists());
+                assert!(!config.paths.ballast_dir.exists());
+                assert!(!requested_ballast_dir.exists());
+            }
+        }
     }
 
     #[test]
@@ -712,13 +1019,14 @@ mod tests {
         config.paths.config_file = tmp.path().join("config").join("config.toml");
         config.paths.state_file = tmp.path().join("data").join("state.json");
         config.paths.ballast_dir = tmp.path().join("ballast");
-        config.ballast.file_count = 0;
+        config.ballast.auto_provision = false;
 
         let opts = InstallOptions {
+            ballast_count: config.ballast.file_count,
+            ballast_size_bytes: config.ballast.file_size_bytes,
             config,
-            ballast_count: 0,
-            ballast_size_bytes: 0,
             ballast_path: None,
+            preserve_existing_config: false,
             dry_run: false,
         };
 
@@ -778,13 +1086,14 @@ mod tests {
         config.paths.config_file = tmp.path().join("config").join("config.toml");
         config.paths.state_file = tmp.path().join("data").join("state.json");
         config.paths.ballast_dir = tmp.path().join("ballast");
-        config.ballast.file_count = 0;
+        config.ballast.auto_provision = false;
 
         let opts = InstallOptions {
+            ballast_count: config.ballast.file_count,
+            ballast_size_bytes: config.ballast.file_size_bytes,
             config,
-            ballast_count: 0,
-            ballast_size_bytes: 0,
             ballast_path: None,
+            preserve_existing_config: false,
             dry_run: false,
         };
 
@@ -831,13 +1140,14 @@ mod tests {
         config.paths.config_file = tmp.path().join("config").join("config.toml");
         config.paths.state_file = tmp.path().join("data").join("state.json");
         config.paths.ballast_dir = tmp.path().join("ballast");
-        config.ballast.file_count = 0;
+        config.ballast.auto_provision = false;
 
         let opts = InstallOptions {
+            ballast_count: config.ballast.file_count,
+            ballast_size_bytes: config.ballast.file_size_bytes,
             config,
-            ballast_count: 0,
-            ballast_size_bytes: 0,
             ballast_path: None,
+            preserve_existing_config: false,
             dry_run: false,
         };
         let missing_manifest = tmp.path().join("missing-bundle-manifest.json");

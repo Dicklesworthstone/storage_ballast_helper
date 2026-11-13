@@ -201,7 +201,7 @@ pub struct WizardSummary {
     pub answers: WizardAnswers,
     /// Path where config was (or would be) written.
     pub config_path: PathBuf,
-    /// Whether config was actually written (false in dry-run).
+    /// Whether config was actually written (false when preserved or in dry-run).
     pub config_written: bool,
     /// Any warnings generated.
     pub warnings: Vec<String>,
@@ -745,7 +745,7 @@ pub fn format_summary(summary: &WizardSummary) -> String {
     if summary.config_written {
         out.push_str("  Status: config written successfully\n");
     } else {
-        out.push_str("  Status: dry-run (config not written)\n");
+        out.push_str("  Status: config not written\n");
     }
 
     for warning in &summary.warnings {
@@ -1106,7 +1106,7 @@ mod tests {
         let output = format_summary(&summary);
         assert!(output.contains("interactive mode"));
         assert!(output.contains("system"));
-        assert!(output.contains("dry-run"));
+        assert!(output.contains("config not written"));
         assert!(output.contains("20 GB free space"));
     }
 

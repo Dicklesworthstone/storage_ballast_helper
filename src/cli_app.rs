@@ -303,15 +303,15 @@ struct InstallArgs {
     /// Run guided first-run setup wizard.
     #[arg(long)]
     wizard: bool,
-    /// Non-interactive mode: apply smart defaults without prompts.
+    /// Non-interactive setup: retain existing settings or apply first-install defaults.
     #[arg(long, conflicts_with = "wizard")]
     auto: bool,
-    /// Number of ballast files to create.
-    #[arg(long, default_value_t = 10, value_name = "N")]
-    ballast_count: usize,
-    /// Size of each ballast file in MB.
-    #[arg(long, default_value_t = 1024, value_name = "MB")]
-    ballast_size: u64,
+    /// Override the configured number of ballast files; must be greater than zero.
+    #[arg(long, value_name = "N")]
+    ballast_count: Option<usize>,
+    /// Override the configured size of each ballast file in MB.
+    #[arg(long, value_name = "MB")]
+    ballast_size: Option<u64>,
     /// Directory for ballast files.
     #[arg(long, value_name = "PATH")]
     ballast_path: Option<PathBuf>,
@@ -3199,6 +3199,7 @@ fn install_wizard_config(
     cli: &Cli,
     answers: &storage_ballast_helper::cli::wizard::WizardAnswers,
 ) -> Result<Config, CliError> {
+    use storage_ballast_helper::cli::wizard::ServiceChoice;
     use storage_ballast_helper::core::config::ConfigPathSource;
 
     let mut config = answers.to_config();
@@ -3209,9 +3210,163 @@ fn install_wizard_config(
         target.source,
         ConfigPathSource::Explicit | ConfigPathSource::Env
     ) {
-        config.paths.config_file = absolute_install_config_path(&target.path)?;
+        config.paths.config_file = target.path;
+    }
+    config.paths.config_file = absolute_install_config_path(&config.paths.config_file)?;
+
+    let scope = (answers.service != ServiceChoice::None).then_some(answers.user_scope);
+    if let Some(mut existing) = load_existing_install_config(&config.paths.config_file, scope)? {
+        // --auto has no new operator choices: keep the configuration already
+        // used on this installation. Interactive choices replace only the
+        // fields the wizard actually asked about.
+        if !answers.auto_mode {
+            existing
+                .scanner
+                .root_paths
+                .clone_from(&answers.watched_paths);
+            existing.ballast.file_count = answers.ballast_file_count;
+            existing.ballast.file_size_bytes = answers.ballast_file_size_bytes;
+            existing.policy.initial_mode = answers.initial_mode;
+        }
+        config = existing;
     }
     Ok(config)
+}
+
+/// Read a known installation destination without treating unreadable,
+/// malformed, dangling-link or non-file configurations as missing.
+fn load_existing_install_config(
+    path: &Path,
+    user_scope: Option<bool>,
+) -> Result<Option<Config>, CliError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CliError::Runtime(format!(
+                "cannot inspect existing configuration {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let metadata = if metadata.file_type().is_symlink() {
+        std::fs::metadata(path).map_err(|error| {
+            CliError::Runtime(format!(
+                "cannot inspect existing configuration {}: {error}",
+                path.display()
+            ))
+        })?
+    } else {
+        metadata
+    };
+    if !metadata.is_file() {
+        return Err(CliError::Runtime(format!(
+            "existing configuration {} is not a regular file",
+            path.display()
+        )));
+    }
+
+    let loaded = user_scope.map_or_else(
+        || Config::load(Some(path)),
+        |user_scope| Config::load_for_service_scope(Some(path), user_scope),
+    );
+    loaded.map(Some).map_err(|error| {
+        CliError::Runtime(format!(
+            "cannot load existing configuration {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Apply explicit installation choices after existing configuration or
+/// interactive answers, before any installation side effect.
+fn apply_install_ballast_options(config: &mut Config, args: &InstallArgs) -> Result<(), CliError> {
+    if let Some(count) = args.ballast_count {
+        if count == 0 {
+            return Err(CliError::User(
+                "--ballast-count must be greater than zero; set ballast.auto_provision = false in the configuration to disable automatic provisioning"
+                    .to_string(),
+            ));
+        }
+        config.ballast.file_count = count;
+    }
+    if let Some(size_mb) = args.ballast_size {
+        config.ballast.file_size_bytes = size_mb.checked_mul(1024 * 1024).ok_or_else(|| {
+            CliError::User(format!(
+                "ballast size {size_mb} MB overflows u64 when converted to bytes"
+            ))
+        })?;
+    }
+    if let Some(path) = &args.ballast_path {
+        config.paths.ballast_dir = std::path::absolute(path).map_err(|error| {
+            CliError::Runtime(format!(
+                "cannot resolve ballast directory {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    config
+        .validate()
+        .map_err(|error| CliError::User(format!("invalid install configuration: {error}")))
+}
+
+/// Leave operator-authored config bytes untouched when no new choices need
+/// to be persisted. Loading has already validated the effective configuration.
+fn should_preserve_install_config(args: &InstallArgs, config: &Config) -> Result<bool, CliError> {
+    if args.wizard
+        || args.ballast_count.is_some()
+        || args.ballast_size.is_some()
+        || args.ballast_path.is_some()
+    {
+        return Ok(false);
+    }
+
+    let path = &config.paths.config_file;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(CliError::Runtime(format!(
+                "cannot inspect configuration to preserve {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let metadata = if metadata.file_type().is_symlink() {
+        std::fs::metadata(path).map_err(|error| {
+            CliError::Runtime(format!(
+                "cannot inspect configuration to preserve {}: {error}",
+                path.display()
+            ))
+        })?
+    } else {
+        metadata
+    };
+    if !metadata.is_file() {
+        return Err(CliError::Runtime(format!(
+            "configuration to preserve {} is not a regular file",
+            path.display()
+        )));
+    }
+
+    Ok(true)
+}
+
+/// Reports describe the effective configuration, including explicit CLI
+/// overrides and configuration retained by an unattended install.
+fn apply_install_config_to_wizard_answers(
+    answers: &mut storage_ballast_helper::cli::wizard::WizardAnswers,
+    config: &Config,
+) {
+    if answers.ballast_file_count != config.ballast.file_count
+        || answers.ballast_file_size_bytes != config.ballast.file_size_bytes
+    {
+        answers.ballast_preset = storage_ballast_helper::cli::wizard::BallastPreset::Custom;
+    }
+    answers.watched_paths.clone_from(&config.scanner.root_paths);
+    answers.ballast_file_count = config.ballast.file_count;
+    answers.ballast_file_size_bytes = config.ballast.file_size_bytes;
+    answers.initial_mode = config.policy.initial_mode;
 }
 
 fn absolute_install_config_path(path: &Path) -> Result<PathBuf, CliError> {
@@ -3286,7 +3441,9 @@ fn run_install_auto_dry_run_json(cli: &Cli, args: &InstallArgs) -> Result<(), Cl
 
     let mut answers = auto_answers_for_platform(platform.as_ref());
     apply_resolved_service_to_wizard_answers(&mut answers, service);
-    let config = install_wizard_config(cli, &answers)?;
+    let mut config = install_wizard_config(cli, &answers)?;
+    apply_install_ballast_options(&mut config, args)?;
+    apply_install_config_to_wizard_answers(&mut answers, &config);
     let summary = WizardSummary {
         config_path: config.paths.config_file.clone(),
         config_written: false,
@@ -3294,6 +3451,7 @@ fn run_install_auto_dry_run_json(cli: &Cli, args: &InstallArgs) -> Result<(), Cl
         warnings: install_service_warnings(service, is_root),
     };
 
+    let preserve_existing_config = should_preserve_install_config(args, &config)?;
     let release_install = if service_kind == ServiceKind::Launchd && !args.from_source {
         let opts = build_macos_release_install_options(args, &config, service);
         let report = run_update_sequence(&opts);
@@ -3304,13 +3462,13 @@ fn run_install_auto_dry_run_json(cli: &Cli, args: &InstallArgs) -> Result<(), Cl
         None
     };
 
-    let auto_answers = &summary.answers;
     let install_report = run_install_sequence_with_bundle(
         &InstallOptions {
+            ballast_count: config.ballast.file_count,
+            ballast_size_bytes: config.ballast.file_size_bytes,
+            ballast_path: None,
+            preserve_existing_config,
             config,
-            ballast_count: auto_answers.ballast_file_count,
-            ballast_size_bytes: auto_answers.ballast_file_size_bytes,
-            ballast_path: args.ballast_path.clone(),
             dry_run: true,
         },
         args.offline.as_deref(),
@@ -3424,14 +3582,44 @@ fn install_default_paths_for_service(service: Option<ResolvedInstallService>) ->
     })
 }
 
-fn load_install_config(cli: &Cli, service: Option<ResolvedInstallService>) -> Config {
+fn load_install_config(
+    cli: &Cli,
+    service: Option<ResolvedInstallService>,
+) -> Result<Config, CliError> {
+    use storage_ballast_helper::core::errors::SbhError;
+
     let default_paths = install_default_paths_for_service(service);
+    let target = Config::resolve_config_write_path(cli.config.as_deref());
+    let destination =
+        absolute_install_config_path(if target.source.is_explicit() || service.is_none() {
+            &target.path
+        } else {
+            &default_paths.config_file
+        })?;
+    if let Some(config) =
+        load_existing_install_config(&destination, service.map(|service| service.user_scope))?
+    {
+        return Ok(config);
+    }
+
+    // Preserve the normal environment/default loading behavior when there is
+    // no existing file. An explicit new destination is valid for installation;
+    // other loading errors must never authorize replacement with defaults.
     let loaded = service.map_or_else(
         || Config::load(cli.config.as_deref()),
         |service| Config::load_for_service_scope(cli.config.as_deref(), service.user_scope),
     );
-
-    loaded.unwrap_or_else(|_| Config::with_paths(default_paths))
+    match loaded {
+        Ok(config) => Ok(config),
+        Err(SbhError::MissingConfig { .. }) => {
+            let mut config = Config::with_paths(default_paths);
+            config.paths.config_file = destination;
+            Ok(config)
+        }
+        Err(error) => Err(CliError::Runtime(format!(
+            "cannot load install configuration: {error}"
+        ))),
+    }
 }
 
 fn build_macos_release_install_options(
@@ -3685,82 +3873,46 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     let sudo_command = format_sudo_rerun_command(cli, service_kind);
     let is_root = running_as_root();
     let mut service = resolve_install_service(args, service_kind, is_root, &sudo_command)?;
-    let guided_install = if args.wizard {
+    let mut guided_install = if args.wizard || args.auto {
         use storage_ballast_helper::cli::wizard::{
-            WizardSummary, format_summary, run_interactive_for_platform_with_options, write_config,
+            WizardSummary, auto_answers_for_platform, run_interactive_for_platform_with_options,
         };
 
-        let stdin = io::stdin();
-        let mut reader = stdin.lock();
-        let mut writer = io::stderr();
-        let answers = run_interactive_for_platform_with_options(
-            &mut reader,
-            &mut writer,
-            platform.as_ref(),
-            install_wizard_service_options(args, service),
-        )
-        .map_err(|e| CliError::User(format!("wizard cancelled: {e}")))?;
-        drop(reader);
-
-        service = resolve_wizard_install_service(&answers, service_kind, is_root, &sudo_command)?;
-        let config = install_wizard_config(cli, &answers)?;
-        let config_path = config.paths.config_file.clone();
-        let config_written = if args.dry_run {
-            config_path
+        let mut answers = if args.wizard {
+            let stdin = io::stdin();
+            let mut reader = stdin.lock();
+            let mut writer = io::stderr();
+            run_interactive_for_platform_with_options(
+                &mut reader,
+                &mut writer,
+                platform.as_ref(),
+                install_wizard_service_options(args, service),
+            )
+            .map_err(|error| CliError::User(format!("wizard cancelled: {error}")))?
         } else {
-            write_config(&answers, &config_path)
-                .map_err(|e| CliError::Runtime(format!("failed to write config: {e}")))?
+            auto_answers_for_platform(platform.as_ref())
         };
+
+        if args.wizard {
+            service =
+                resolve_wizard_install_service(&answers, service_kind, is_root, &sudo_command)?;
+        } else {
+            apply_resolved_service_to_wizard_answers(&mut answers, service);
+        }
+
+        let mut config = install_wizard_config(cli, &answers)?;
+        apply_install_ballast_options(&mut config, args)?;
+        apply_install_config_to_wizard_answers(&mut answers, &config);
         let summary = WizardSummary {
             answers,
-            config_path: config_written,
-            config_written: !args.dry_run,
+            config_path: config.paths.config_file.clone(),
+            config_written: false,
             warnings: install_service_warnings(service, is_root),
         };
 
-        match output_mode(cli) {
-            OutputMode::Human => {
-                print!("{}", format_summary(&summary));
-            }
-            OutputMode::Json => {
-                let payload = serde_json::to_value(&summary)?;
-                write_json_line(&payload)?;
-            }
-        }
-
-        Some((summary, config))
-    } else if args.auto {
-        use storage_ballast_helper::cli::wizard::{
-            WizardSummary, auto_answers_for_platform, format_summary, write_config,
-        };
-
-        let mut answers = auto_answers_for_platform(platform.as_ref());
-        apply_resolved_service_to_wizard_answers(&mut answers, service);
-        let config = install_wizard_config(cli, &answers)?;
-        let config_path = config.paths.config_file.clone();
-        let config_written = if args.dry_run {
-            config_path
-        } else {
-            write_config(&answers, &config_path)
-                .map_err(|e| CliError::Runtime(format!("failed to write config: {e}")))?
-        };
-        let summary = WizardSummary {
-            answers,
-            config_path: config_written,
-            config_written: !args.dry_run,
-            warnings: install_service_warnings(service, is_root),
-        };
-
-        match output_mode(cli) {
-            OutputMode::Human => {
-                print!("{}", format_summary(&summary));
-            }
-            OutputMode::Json => {
-                let payload = serde_json::to_value(&summary)?;
-                write_json_line(&payload)?;
-            }
-        }
-
+        // The install orchestrator owns the sole config write. In particular,
+        // a failed artifact or bundle preflight must leave existing settings
+        // untouched.
         Some((summary, config))
     } else {
         None
@@ -3784,11 +3936,13 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     }
     let mut config = guided_install.as_ref().map_or_else(
         || load_install_config(cli, service),
-        |(_, config)| config.clone(),
-    );
+        |(_, config)| Ok(config.clone()),
+    )?;
+    apply_install_ballast_options(&mut config, args)?;
     if !config.paths.config_file.is_absolute() {
         config.paths.config_file = absolute_install_config_path(&config.paths.config_file)?;
     }
+    let preserve_existing_config = should_preserve_install_config(args, &config)?;
     let mut installed_binary_path = if service_kind == ServiceKind::Launchd && !args.from_source {
         run_macos_release_binary_install(cli, args, &config, service)?
     } else {
@@ -3853,9 +4007,9 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             installed_binary_path = Some(binary_path);
         }
 
-        // From-source-only installs stop after the binary install. Passing a
-        // service flag or scope asks for service registration after the build.
-        if service.is_none() {
+        // A binary-only install stops after the build. Guided configuration
+        // still needs the orchestrator even when no service was selected.
+        if service.is_none() && guided_install.is_none() {
             return Ok(());
         }
         // Otherwise, fall through to service installation below.
@@ -3867,25 +4021,12 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             InstallOptions, format_install_report, run_install_sequence_with_bundle,
         };
 
-        let auto_answers = guided_install.as_ref().map(|(summary, _)| &summary.answers);
-        let ballast_count =
-            auto_answers.map_or(args.ballast_count, |answers| answers.ballast_file_count);
-        let ballast_size_bytes = if let Some(answers) = auto_answers {
-            answers.ballast_file_size_bytes
-        } else {
-            args.ballast_size.checked_mul(1024 * 1024).ok_or_else(|| {
-                CliError::User(format!(
-                    "ballast size {} MB overflows u64 when converted to bytes",
-                    args.ballast_size
-                ))
-            })?
-        };
-
         let opts = InstallOptions {
             config: config.clone(),
-            ballast_count,
-            ballast_size_bytes,
-            ballast_path: args.ballast_path.clone(),
+            ballast_count: config.ballast.file_count,
+            ballast_size_bytes: config.ballast.file_size_bytes,
+            ballast_path: None,
+            preserve_existing_config,
             dry_run: args.dry_run,
         };
 
@@ -3905,6 +4046,23 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             return Err(CliError::Runtime(
                 "install orchestration failed".to_string(),
             ));
+        }
+
+        if let Some((summary, _)) = &mut guided_install {
+            summary.config_written =
+                !args.dry_run && !opts.preserve_existing_config && report.config_path.is_some();
+            match output_mode(cli) {
+                OutputMode::Human => {
+                    print!(
+                        "{}",
+                        storage_ballast_helper::cli::wizard::format_summary(summary)
+                    );
+                }
+                OutputMode::Json => {
+                    let payload = serde_json::to_value(&*summary)?;
+                    write_json_line(&payload)?;
+                }
+            }
         }
 
         if args.dry_run {
@@ -20841,6 +20999,260 @@ mod tests {
         assert!(options.service.is_none());
         assert!(options.user_scope.is_none());
         assert!(install_service_warnings(None, false).is_empty());
+    }
+
+    #[test]
+    fn install_ballast_options_preserve_configuration_unless_explicit() {
+        let cli = Cli::try_parse_from(["sbh", "install", "--auto"]).unwrap();
+        let Command::Install(args) = &cli.command else {
+            panic!("expected install");
+        };
+        assert_eq!(args.ballast_count, None);
+        assert_eq!(args.ballast_size, None);
+
+        let mut config = Config::default();
+        config.ballast.file_count = 3;
+        config.ballast.file_size_bytes = 8 * 1024 * 1024;
+        config.ballast.auto_provision = false;
+        apply_install_ballast_options(&mut config, args).unwrap();
+        assert_eq!(config.ballast.file_count, 3);
+        assert_eq!(config.ballast.file_size_bytes, 8 * 1024 * 1024);
+        assert!(!config.ballast.auto_provision);
+
+        let temp = tempfile::tempdir().unwrap();
+        let ballast = temp.path().join("chosen-ballast");
+        let cli = Cli::try_parse_from([
+            "sbh",
+            "install",
+            "--auto",
+            "--ballast-count",
+            "2",
+            "--ballast-size",
+            "16",
+            "--ballast-path",
+            ballast.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Command::Install(args) = &cli.command else {
+            panic!("expected install");
+        };
+        apply_install_ballast_options(&mut config, args).unwrap();
+        assert_eq!(config.ballast.file_count, 2);
+        assert_eq!(config.ballast.file_size_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.paths.ballast_dir, ballast);
+        assert!(
+            !config.ballast.auto_provision,
+            "sizing is not permission to re-enable provisioning"
+        );
+        assert!(!ballast.exists(), "planning must not create ballast");
+
+        let mut answers = test_wizard_answers(
+            storage_ballast_helper::cli::wizard::ServiceChoice::Systemd,
+            true,
+        );
+        apply_install_config_to_wizard_answers(&mut answers, &config);
+        assert_eq!(answers.ballast_file_count, 2);
+        assert_eq!(answers.ballast_file_size_bytes, 16 * 1024 * 1024);
+        assert_eq!(
+            answers.ballast_preset,
+            storage_ballast_helper::cli::wizard::BallastPreset::Custom
+        );
+    }
+
+    #[test]
+    fn guided_install_preserves_existing_protections_and_unattended_choices() {
+        use storage_ballast_helper::daemon::policy::ActiveMode;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("config.toml");
+        let root = temp.path().join("scratch");
+        let protected = root.join("important");
+        let protected_pattern = protected.to_string_lossy().into_owned();
+        std::fs::create_dir_all(&protected).unwrap();
+
+        let mut existing = Config::default();
+        existing.paths.config_file = target.clone();
+        existing.paths.state_file = temp.path().join("data/state.json");
+        existing.paths.ballast_dir = temp.path().join("reserve");
+        existing.scanner.root_paths = vec![root.clone()];
+        existing.scanner.protected_paths = vec![protected_pattern.clone()];
+        existing.scanner.include_user_temp_dir = false;
+        existing.ballast.file_count = 3;
+        existing.ballast.file_size_bytes = 8 * 1024 * 1024;
+        existing.ballast.auto_provision = false;
+        existing.policy.initial_mode = ActiveMode::Observe;
+        let original = toml::to_string_pretty(&existing).unwrap();
+        std::fs::write(&target, &original).unwrap();
+
+        for auto in [true, false] {
+            let cli = Cli::try_parse_from([
+                "sbh",
+                "--config",
+                target.to_str().unwrap(),
+                "install",
+                if auto { "--auto" } else { "--wizard" },
+                "--dry-run",
+            ])
+            .unwrap();
+            let mut answers = test_wizard_answers(
+                storage_ballast_helper::cli::wizard::ServiceChoice::Systemd,
+                true,
+            );
+            answers.auto_mode = auto;
+            answers.watched_paths = vec![temp.path().join("interactive-root")];
+            answers.ballast_file_count = 5;
+            answers.ballast_file_size_bytes = 16 * 1024 * 1024;
+
+            let config = install_wizard_config(&cli, &answers).unwrap();
+            assert_eq!(config.paths.state_file, existing.paths.state_file);
+            assert_eq!(config.paths.ballast_dir, existing.paths.ballast_dir);
+            assert!(config.scanner.protected_paths.contains(&protected_pattern));
+            assert!(!config.scanner.include_user_temp_dir);
+            assert!(!config.ballast.auto_provision);
+
+            if auto {
+                assert_eq!(config.scanner.root_paths, vec![root.clone()]);
+                assert_eq!(config.ballast.file_count, 3);
+                assert_eq!(config.ballast.file_size_bytes, 8 * 1024 * 1024);
+                assert_eq!(config.policy.initial_mode, ActiveMode::Observe);
+            } else {
+                assert_eq!(config.scanner.root_paths, answers.watched_paths);
+                assert_eq!(config.ballast.file_count, 5);
+                assert_eq!(config.ballast.file_size_bytes, 16 * 1024 * 1024);
+                assert_eq!(config.policy.initial_mode, answers.initial_mode);
+            }
+
+            apply_install_config_to_wizard_answers(&mut answers, &config);
+            assert_eq!(answers.watched_paths, config.scanner.root_paths);
+            assert_eq!(answers.initial_mode, config.policy.initial_mode);
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn install_refuses_zero_ballast_and_malformed_existing_config_before_writes() {
+        let mut config = Config::default();
+        let cli =
+            Cli::try_parse_from(["sbh", "install", "--auto", "--ballast-count", "0"]).unwrap();
+        let Command::Install(args) = &cli.command else {
+            panic!("expected install");
+        };
+        let error = apply_install_ballast_options(&mut config, args).unwrap_err();
+        assert!(error.to_string().contains("--ballast-count"));
+        assert!(error.to_string().contains("ballast.auto_provision = false"));
+        assert_eq!(
+            config.ballast.file_count,
+            Config::default().ballast.file_count
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("config.toml");
+        let original = "[ballast\ninvalid configuration";
+        std::fs::write(&target, original).unwrap();
+        let cli = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            target.to_str().unwrap(),
+            "install",
+            "--auto",
+        ])
+        .unwrap();
+        let mut answers = test_wizard_answers(
+            storage_ballast_helper::cli::wizard::ServiceChoice::Systemd,
+            true,
+        );
+        answers.auto_mode = true;
+        assert!(install_wizard_config(&cli, &answers).is_err());
+        assert!(
+            load_install_config(
+                &cli,
+                Some(ResolvedInstallService {
+                    kind: ServiceKind::Systemd,
+                    user_scope: true,
+                }),
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(target).unwrap(), original);
+    }
+
+    #[test]
+    fn install_accepts_a_new_explicit_configuration_destination_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("new/config.toml");
+        let cli = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            target.to_str().unwrap(),
+            "install",
+            "--dry-run",
+        ])
+        .unwrap();
+        let config = load_install_config(
+            &cli,
+            Some(ResolvedInstallService {
+                kind: ServiceKind::Systemd,
+                user_scope: true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(config.paths.config_file, target);
+        assert!(!target.exists());
+        assert!(!target.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn install_preserves_existing_config_only_without_new_operator_choices() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("config.toml");
+        let mut config = Config::default();
+        config.paths.config_file = target.clone();
+
+        assert!(
+            !should_preserve_install_config(&InstallArgs::default(), &config).unwrap(),
+            "a new installation still needs a config write"
+        );
+
+        let original = "# operator comments stay intact\n[ballast]\nauto_provision = false\n";
+        std::fs::write(&target, original).unwrap();
+
+        assert!(should_preserve_install_config(&InstallArgs::default(), &config).unwrap());
+        assert!(
+            should_preserve_install_config(
+                &InstallArgs {
+                    auto: true,
+                    ..InstallArgs::default()
+                },
+                &config,
+            )
+            .unwrap()
+        );
+
+        for args in [
+            InstallArgs {
+                wizard: true,
+                ..InstallArgs::default()
+            },
+            InstallArgs {
+                ballast_count: Some(2),
+                ..InstallArgs::default()
+            },
+            InstallArgs {
+                ballast_size: Some(16),
+                ..InstallArgs::default()
+            },
+            InstallArgs {
+                ballast_path: Some(temp.path().join("new-ballast")),
+                ..InstallArgs::default()
+            },
+        ] {
+            assert!(
+                !should_preserve_install_config(&args, &config).unwrap(),
+                "explicit choices require the effective configuration to be written"
+            );
+        }
+
+        assert_eq!(std::fs::read_to_string(target).unwrap(), original);
     }
 
     #[test]

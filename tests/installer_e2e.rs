@@ -54,7 +54,7 @@ fn test_config(tmp: &Path) -> Config {
     config.paths.ballast_dir = tmp.join("ballast");
     config.paths.sqlite_db = tmp.join("data").join("db.sqlite3");
     config.paths.jsonl_log = tmp.join("data").join("log.jsonl");
-    config.ballast.file_count = 0; // Skip ballast for speed in most tests.
+    config.ballast.auto_provision = false; // Skip ballast for speed in most tests.
     config
 }
 
@@ -62,10 +62,11 @@ fn test_config(tmp: &Path) -> Config {
 fn test_install_opts(tmp: &Path) -> InstallOptions {
     let config = test_config(tmp);
     InstallOptions {
+        ballast_count: config.ballast.file_count,
+        ballast_size_bytes: config.ballast.file_size_bytes,
         config,
-        ballast_count: 0,
-        ballast_size_bytes: 0,
         ballast_path: Some(tmp.join("ballast")),
+        preserve_existing_config: false,
         dry_run: false,
     }
 }
@@ -318,10 +319,7 @@ fn e2e_install_then_uninstall_removes_everything() {
     // Install first.
     let install_opts = InstallOptions {
         config: config.clone(),
-        ballast_count: 0,
-        ballast_size_bytes: 0,
-        ballast_path: Some(tmp.path().join("ballast")),
-        dry_run: false,
+        ..test_install_opts(tmp.path())
     };
     let install_report = run_install_sequence(&install_opts);
     assert!(install_report.success);
@@ -580,10 +578,7 @@ fn e2e_uninstall_dry_run_no_changes() {
     // Install.
     let install_opts = InstallOptions {
         config: config.clone(),
-        ballast_count: 0,
-        ballast_size_bytes: 0,
-        ballast_path: Some(tmp.path().join("ballast")),
-        dry_run: false,
+        ..test_install_opts(tmp.path())
     };
     assert!(run_install_sequence(&install_opts).success);
     let data_dir = write_data_footprint(&config);
@@ -926,11 +921,8 @@ fn e2e_bundle_preflight_valid_succeeds() {
     let manifest_path = create_valid_bundle(tmp.path());
 
     let opts = InstallOptions {
-        config: test_config(tmp.path()),
-        ballast_count: 0,
-        ballast_size_bytes: 0,
         ballast_path: None,
-        dry_run: false,
+        ..test_install_opts(tmp.path())
     };
 
     let report = run_install_sequence_with_bundle(&opts, Some(&manifest_path));
@@ -953,11 +945,8 @@ fn e2e_bundle_preflight_bad_checksum_fails() {
     let manifest_path = create_bad_checksum_bundle(tmp.path());
 
     let opts = InstallOptions {
-        config: test_config(tmp.path()),
-        ballast_count: 0,
-        ballast_size_bytes: 0,
         ballast_path: None,
-        dry_run: false,
+        ..test_install_opts(tmp.path())
     };
 
     let report = run_install_sequence_with_bundle(&opts, Some(&manifest_path));
@@ -977,11 +966,8 @@ fn e2e_bundle_preflight_missing_manifest_fails() {
     let missing = tmp.path().join("nonexistent-manifest.json");
 
     let opts = InstallOptions {
-        config: test_config(tmp.path()),
-        ballast_count: 0,
-        ballast_size_bytes: 0,
         ballast_path: None,
-        dry_run: false,
+        ..test_install_opts(tmp.path())
     };
 
     let report = run_install_sequence_with_bundle(&opts, Some(&missing));
@@ -994,11 +980,9 @@ fn e2e_bundle_preflight_dry_run_plans_without_executing() {
     let missing = tmp.path().join("nonexistent-manifest.json");
 
     let opts = InstallOptions {
-        config: test_config(tmp.path()),
-        ballast_count: 0,
-        ballast_size_bytes: 0,
         ballast_path: None,
         dry_run: true,
+        ..test_install_opts(tmp.path())
     };
 
     let report = run_install_sequence_with_bundle(&opts, Some(&missing));
@@ -1297,6 +1281,113 @@ fn e2e_uninstall_report_golden_with_reclaimed_space() {
 // L: CLI subcommand smoke tests
 // ============================================================================
 
+#[cfg(target_os = "linux")]
+fn run_install_cli_dry_run(config: &Path, tmp: &Path, extra: &[&str]) -> std::process::Output {
+    let mut command = std::process::Command::new(common::sbh_bin_path());
+    command
+        .args([
+            "install",
+            "--auto",
+            "--scope",
+            "user",
+            "--dry-run",
+            "--json",
+            "--no-bootstrap",
+            "--config",
+        ])
+        .arg(config)
+        .args(extra)
+        .env("HOME", tmp.join("home"))
+        .env("XDG_CONFIG_HOME", tmp.join("xdg-config"))
+        .env("XDG_DATA_HOME", tmp.join("xdg-data"));
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(|name| name.starts_with("SBH_")) {
+            command.env_remove(name);
+        }
+    }
+    command.output().unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_install_auto_dry_run_preserves_existing_config_and_honors_overrides() {
+    use storage_ballast_helper::daemon::policy::ActiveMode;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = test_config(tmp.path());
+    config.ballast.file_count = 3;
+    config.ballast.file_size_bytes = 8 * 1024 * 1024;
+    config.scanner.root_paths = vec![tmp.path().join("watched")];
+    config.scanner.include_user_temp_dir = false;
+    config.scanner.protected_paths =
+        vec![tmp.path().join("watched/protected").display().to_string()];
+    config.policy.initial_mode = ActiveMode::Observe;
+    std::fs::create_dir_all(&config.scanner.root_paths[0]).unwrap();
+    std::fs::create_dir_all(config.paths.config_file.parent().unwrap()).unwrap();
+    let original = format!(
+        "# Preserve operator comments and unknown settings.\n\n{}\n[operator_notes]\nowner = \"retain-me\"\n",
+        toml::to_string_pretty(&config).unwrap(),
+    );
+    std::fs::write(&config.paths.config_file, &original).unwrap();
+
+    let cases: [(&[&str], u64, u64); 2] = [
+        (&[], 3, 8),
+        (&["--ballast-count", "2", "--ballast-size", "16"], 2, 16),
+    ];
+    for (extra, count, size_mb) in cases {
+        let output = run_install_cli_dry_run(&config.paths.config_file, tmp.path(), extra);
+        assert!(
+            output.status.success(),
+            "install failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["success"], true);
+        assert_eq!(payload["service"]["scope"], "user");
+        assert_eq!(payload["wizard"]["config_written"], false);
+        let answers = &payload["wizard"]["answers"];
+        assert_eq!(
+            answers["watched_paths"],
+            serde_json::to_value(&config.scanner.root_paths).unwrap(),
+        );
+        assert_eq!(
+            answers["initial_mode"],
+            serde_json::to_value(ActiveMode::Observe).unwrap(),
+        );
+        assert_eq!(answers["ballast_file_count"].as_u64(), Some(count));
+        assert_eq!(
+            answers["ballast_file_size_bytes"].as_u64(),
+            Some(size_mb * 1024 * 1024),
+        );
+        let steps = payload["install"]["steps"].as_array().unwrap();
+        assert!(steps.iter().any(|step| {
+            step["description"] == "Skip ballast provisioning (ballast.auto_provision=false)"
+        }));
+        assert!(!steps.iter().any(|step| {
+            step["description"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Provision "))
+        }));
+        assert_eq!(
+            std::fs::read(&config.paths.config_file).unwrap(),
+            original.as_bytes(),
+        );
+        assert!(!tmp.path().join("data").exists());
+        assert!(!config.paths.ballast_dir.exists());
+    }
+
+    for option in ["--ballast-count", "--ballast-size"] {
+        let output = run_install_cli_dry_run(&config.paths.config_file, tmp.path(), &[option, "0"]);
+        assert!(!output.status.success(), "{option}=0 must be rejected");
+        assert_eq!(
+            std::fs::read(&config.paths.config_file).unwrap(),
+            original.as_bytes(),
+        );
+        assert!(!tmp.path().join("data").exists());
+        assert!(!config.paths.ballast_dir.exists());
+    }
+}
+
 #[test]
 fn e2e_cli_install_help() {
     let result = common::run_cli_case("e2e_cli_install_help", &["install", "--help"]);
@@ -1357,10 +1448,8 @@ fn e2e_install_failure_produces_deterministic_error() {
 
     let opts = InstallOptions {
         config,
-        ballast_count: 0,
-        ballast_size_bytes: 0,
         ballast_path: None,
-        dry_run: false,
+        ..test_install_opts(tmp.path())
     };
 
     let report = run_install_sequence(&opts);

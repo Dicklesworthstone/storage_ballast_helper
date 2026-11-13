@@ -2284,10 +2284,7 @@ mod tests {
                     ".rch-target-hz3-pool-root-activity",
                     Duration::from_mins(90),
                 ),
-                (
-                    ".rch-target-hz3-job-root-activity",
-                    Duration::from_mins(45),
-                ),
+                (".rch-target-hz3-job-root-activity", Duration::from_mins(45)),
             ] {
                 let target = tmp.path().join(name);
                 std::fs::create_dir_all(target.join("debug")).unwrap();
@@ -2299,9 +2296,8 @@ mod tests {
                     "a fully idle tree remains reclaimable"
                 );
 
-                let stamp = filetime::FileTime::from_system_time(
-                    std::time::SystemTime::now() - root_age,
-                );
+                let stamp =
+                    filetime::FileTime::from_system_time(std::time::SystemTime::now() - root_age);
                 filetime::set_file_mtime(&target, stamp).unwrap();
 
                 assert!(
@@ -2364,10 +2360,7 @@ mod tests {
                 rch_tree_activity(&directory, window, 10),
                 TreeActivity::IdleThroughout
             );
-            assert_eq!(
-                rch_tree_activity(&file, window, 10),
-                TreeActivity::Unknown
-            );
+            assert_eq!(rch_tree_activity(&file, window, 10), TreeActivity::Unknown);
             assert_eq!(
                 rch_tree_activity(&tmp.path().join("missing"), window, 10),
                 TreeActivity::Unknown

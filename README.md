@@ -375,13 +375,28 @@ Running `sbh install --wizard` launches guided setup:
 | Large | 20 | 1 GiB | 20 GiB |
 | Custom | user-specified | 1 GiB | varies |
 
-For non-interactive environments (CI, automation), `sbh install --auto` applies
-the platform-native service manager, auto-discovered watched paths, and Medium
-ballast preset. Service scope follows effective privileges: system under root
-or `sudo`, user otherwise. Explicit scope flags always take precedence, and
-`--config` or `SBH_CONFIG` retains its configuration destination. A non-root
-user service's reclamation warning is included in both human and JSON install
-summaries, including `--auto --dry-run --json`.
+For a first-time non-interactive install (CI, automation), `sbh install --auto`
+applies the platform-native service manager, auto-discovered watched paths, and
+Medium ballast preset. When the selected configuration already exists, `--auto`
+retains its settings, including watched and protected paths, policy mode, and
+`ballast.auto_provision`. Without an interactive wizard or explicit ballast
+options, an existing configuration is kept byte for byte, including comments
+and unknown keys. The interactive wizard merges the answers you choose into
+that configuration while retaining settings it does not ask about.
+
+Explicit `--ballast-count`, `--ballast-size`, and `--ballast-path` arguments
+override the existing settings or wizard choices and are saved for the daemon.
+Counts and sizes must be positive; zero is rejected. To install without creating
+ballast, set `ballast.auto_provision = false` in the selected configuration.
+Dry-run reports and real installs use the same effective configuration, and
+invalid or unreadable existing configurations are refused before writing a
+replacement.
+
+Service scope follows effective privileges: system under root or `sudo`, user
+otherwise. Explicit scope flags always take precedence, and `--config` or
+`SBH_CONFIG` retains its configuration destination. A non-root user service's
+reclamation warning is included in both human and JSON install summaries,
+including `--auto --dry-run --json`.
 
 ### macOS Configure Checklist
 
