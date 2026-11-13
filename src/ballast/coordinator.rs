@@ -478,6 +478,7 @@ impl MultiProvisionReport {
 ///
 /// Each monitored volume gets its own pool with independent file inventory.
 /// Release targets the exact volume under pressure.
+#[derive(Default)]
 pub struct BallastPoolCoordinator {
     pools: HashMap<PathBuf, BallastPool>,
     skipped_pools: HashMap<PathBuf, SkippedPoolInfo>,
@@ -491,12 +492,21 @@ pub struct BallastPoolCoordinator {
     pool_revisions: HashMap<PathBuf, u64>,
 }
 
+/// Memory-only witness that a replacement plan did not overlap a newer
+/// release, allocation, or policy change in the active coordinator.
+pub(crate) struct BallastDiscoveryRevision {
+    origin: Arc<()>,
+    pools: HashMap<PathBuf, u64>,
+}
+
 /// An independent, memory-only pool snapshot for a bounded refill worker.
 /// The coordinator retains its own release handle while this task performs I/O.
 pub(crate) struct BallastReplenishment {
     pool: BallastPool,
     origin: Arc<()>,
     revision: u64,
+    initial_provision: bool,
+    inventory_observation: Option<super::release::BallastInventoryObservation>,
 }
 
 impl BallastReplenishment {
@@ -505,7 +515,26 @@ impl BallastReplenishment {
     }
 
     pub(crate) fn run(&mut self, still_allowed: &dyn Fn() -> bool) -> Result<ProvisionReport> {
-        provision::replenish_one_guarded(&mut self.pool, still_allowed)
+        let result = if self.initial_provision {
+            provision::provision_guarded(&mut self.pool, None, still_allowed)
+        } else {
+            provision::replenish_one_guarded(&mut self.pool, still_allowed)
+        };
+        self.inventory_observation = super::release::BallastInventoryObservation::capture(
+            &self.pool.ballast_dir,
+            self.pool.available_count(),
+        );
+        result
+    }
+
+    pub(crate) fn is_initial_provision(&self) -> bool {
+        self.initial_provision
+    }
+
+    pub(crate) fn inventory_observation(
+        &self,
+    ) -> Option<super::release::BallastInventoryObservation> {
+        self.inventory_observation
     }
 }
 
@@ -635,6 +664,17 @@ struct PoolPlan {
 }
 
 impl BallastPoolCoordinator {
+    pub(crate) fn discovery_revision(&self) -> BallastDiscoveryRevision {
+        BallastDiscoveryRevision {
+            origin: Arc::clone(&self.worker_origin),
+            pools: self.pool_revisions.clone(),
+        }
+    }
+
+    pub(crate) fn matches_discovery_revision(&self, revision: &BallastDiscoveryRevision) -> bool {
+        Arc::ptr_eq(&self.worker_origin, &revision.origin) && self.pool_revisions == revision.pools
+    }
+
     /// Discover and initialize pools for all unique mount points derived from
     /// the given watched paths. Skips RAM-backed and read-only filesystems.
     pub fn discover(
@@ -1142,7 +1182,20 @@ impl BallastPoolCoordinator {
             },
             origin: Arc::clone(&self.worker_origin),
             revision: self.pool_revisions.get(key).copied().unwrap_or(0),
+            initial_provision: false,
+            inventory_observation: None,
         })
+    }
+
+    /// Startup fills each pool once, using the same guarded worker and live
+    /// headroom floor as subsequent one-file replenishment.
+    pub(crate) fn prepare_initial_provision(
+        &self,
+        mount_path: &Path,
+    ) -> Option<BallastReplenishment> {
+        let mut task = self.prepare_replenishment(mount_path)?;
+        task.initial_provision = true;
+        Some(task)
     }
 
     /// Publish completed inventory only while its pool and mutation epoch match.
@@ -1190,6 +1243,16 @@ impl BallastPoolCoordinator {
 
     /// Get inventory snapshot across all pools.
     pub fn inventory(&self) -> Vec<PoolInventory> {
+        self.inventory_inner(true)
+    }
+
+    /// Cached actuator inventory, without native directory or orphan probes.
+    /// Current reserve authority comes from the separate reserve observer.
+    pub(crate) fn inventory_cached(&self) -> Vec<PoolInventory> {
+        self.inventory_inner(false)
+    }
+
+    fn inventory_inner(&self, observe_orphans: bool) -> Vec<PoolInventory> {
         let mut inventory: Vec<PoolInventory> = self
             .pools
             .values()
@@ -1211,7 +1274,11 @@ impl BallastPoolCoordinator {
                     pool.manager.health(),
                     pool.releasable_bytes(),
                 ),
-                orphans: pool.manager.orphans(),
+                orphans: if observe_orphans {
+                    pool.manager.orphans()
+                } else {
+                    Vec::new()
+                },
                 unreachable_reserve: pool.unreachable_reserve.clone(),
                 skipped: false,
                 skip_reason: None,
@@ -1348,6 +1415,19 @@ impl BallastPoolCoordinator {
         self.pools.get(self.pool_key(mount_path))
     }
 
+    /// Capture post-actuation inventory under its current directory identity.
+    /// This performs native metadata I/O and is only for native action paths.
+    pub(crate) fn observe_pool_inventory(
+        &self,
+        mount_path: &Path,
+    ) -> Option<super::release::BallastInventoryObservation> {
+        let pool = self.pool_for_mount(mount_path)?;
+        super::release::BallastInventoryObservation::capture(
+            &pool.ballast_dir,
+            pool.available_count(),
+        )
+    }
+
     /// Resolve a path to its mount point and return the associated pool.
     pub fn pool_for_path(
         &self,
@@ -1384,6 +1464,21 @@ impl BallastPoolCoordinator {
             let pool_config = per_volume_config(config, &mount_str);
             pool.manager.update_config(pool_config);
         }
+    }
+
+    /// Retain previously verified reserve only for release while a new plan
+    /// is pending. This never rescans a directory or grants refill authority.
+    /// A redirected configured pool revokes every old alias conservatively.
+    pub(crate) fn retain_release_only(&mut self, config: &BallastConfig, redirected: bool) {
+        self.worker_origin = Arc::new(());
+        self.pools
+            .retain(|mount, _| !redirected && config.is_volume_enabled(&mount.to_string_lossy()));
+        self.aliases.retain(|alias, keeper| {
+            self.pools.contains_key(keeper) && config.is_volume_enabled(&alias.to_string_lossy())
+        });
+        self.skipped_pools.clear();
+        self.pool_revisions
+            .retain(|mount, _| self.pools.contains_key(mount));
     }
 }
 
@@ -2507,6 +2602,46 @@ mod tests {
                     .releasable_bytes(),
                 0
             );
+        }
+
+        #[test]
+        fn pending_rediscovery_retains_only_enabled_unredirected_release_pools() {
+            let (temp, platform, mut coordinator) = fixture();
+            let first = temp.path().join("first");
+            let second = temp.path().join("second");
+            coordinator.provision_all(&platform).unwrap();
+            let old_worker = coordinator.prepare_replenishment(&first).unwrap();
+            let revision = coordinator.discovery_revision();
+            assert!(coordinator.matches_discovery_revision(&revision));
+            let mut updated = tiny_ballast_config();
+            updated.file_count = 1;
+            coordinator.retain_release_only(&updated, false);
+            assert!(!coordinator.matches_discovery_revision(&revision));
+            assert!(!coordinator.finish_replenishment(old_worker));
+            assert_eq!(
+                coordinator
+                    .pool_for_mount(&first)
+                    .unwrap()
+                    .available_count(),
+                3
+            );
+            assert_eq!(
+                coordinator.pool_for_mount(&first).unwrap().expected_count(),
+                3,
+                "pending discovery preserves the old verified release view, without rescanning it"
+            );
+            updated.overrides.insert(
+                first.display().to_string(),
+                BallastVolumeOverride {
+                    enabled: false,
+                    ..BallastVolumeOverride::default()
+                },
+            );
+            coordinator.retain_release_only(&updated, false);
+            assert!(!coordinator.has_pool(&first));
+            assert!(coordinator.has_pool(&second));
+            coordinator.retain_release_only(&updated, true);
+            assert_eq!(coordinator.pool_count(), 0);
         }
 
         #[test]

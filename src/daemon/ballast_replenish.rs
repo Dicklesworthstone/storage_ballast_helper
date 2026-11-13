@@ -58,6 +58,10 @@ impl BallastReplenisher {
         self.worker.is_some()
     }
 
+    pub(super) fn worker_mount(&self) -> Option<&Path> {
+        self.worker.as_ref().map(|worker| worker.mount.as_path())
+    }
+
     /// The pool still authorized to refill. A cancelled worker retains its
     /// slot, but must not be reported as rebuilding protection.
     pub(super) fn active_mount(&self) -> Option<&Path> {

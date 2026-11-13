@@ -40,6 +40,7 @@ use crate::daemon::control::{
 };
 use crate::daemon::coverage::{UNCOVERED_REFRESH_INTERVAL, uncovered_mount_levels};
 use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD, PassCpuGuard, paced_pct};
+use crate::daemon::discovery::{DiscoverySnapshot, RetainedDiscovery};
 use crate::daemon::inode_reclaim::InodeReclaimRequest;
 use crate::daemon::mount_controller::{
     IdleReason, MountController, MountControllerConfig, MountState, MountStateRecord, MountSurface,
@@ -53,11 +54,11 @@ use crate::daemon::policy::{
 use crate::daemon::process_io_history::{ProcessIoHistory, ProcessIoSampler};
 use crate::daemon::ram_reclaim::RamReclaimRequest;
 use crate::daemon::rch_staging::RchStagingTier;
+use crate::daemon::recovery_probe::BackgroundProbes;
 use crate::daemon::scan_now::{ScanNowClaim, ScanNowQueue, ScanNowScope};
 use crate::daemon::self_monitor::{
-    DaemonLock, LoggingState, MountPressure, MountRateState, PolicyStateRecord, SelfMonitor,
-    SelfMonitorTick, ThreadHeartbeat, ThreadState, ThreadStatus, ThreadsState,
-    assess_logging_placement, nearest_existing_ancestor,
+    DaemonLock, DiscoveryState, LoggingState, MountPressure, MountRateState, PolicyStateRecord,
+    SelfMonitor, SelfMonitorTick, ThreadHeartbeat, ThreadState, ThreadStatus, ThreadsState,
 };
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat, resolve_watchdog_sec};
 use crate::daemon::target_tier::TargetTier;
@@ -1797,6 +1798,21 @@ fn record_root_candidate(
     }
 }
 
+/// A failed candidate's identity was checked by deletion preflight before
+/// the filesystem refusal. Keep that device evidence instead of requiring a
+/// new native lookup merely to deliver the incident to its controller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecoveryIncident {
+    path: PathBuf,
+    device_id: Option<u64>,
+    /// Captured after the executor observed the refusal, before queueing.
+    failed_at: Instant,
+}
+
+/// Unresolved paths stay bounded; excess reports retain their place in the
+/// existing bounded worker channel until the monitor can admit their incidents.
+const MAX_PENDING_RECOVERY_INCIDENTS: usize = 256;
+
 #[derive(Debug)]
 enum WorkerReport {
     /// Scanner completed a scan pass.
@@ -1824,11 +1840,36 @@ enum WorkerReport {
         failed: u64,
         /// Candidates whose filesystem answered EROFS or ENOSPC: their
         /// mounts need recovery, not another attempt.
-        recovery_paths: Vec<PathBuf>,
+        recovery_incidents: Vec<RecoveryIncident>,
         /// Set when the deletion-failure e-process crossed its alarm
         /// threshold on this batch: the dominant failure reason and count.
         failure_alarm: Option<(&'static str, u64)>,
     },
+}
+
+/// Statistics may be dropped under backpressure; filesystem incidents may
+/// not. A full monitor queue retains the report on this existing executor
+/// thread, with shutdown checked at every bounded wait.
+fn send_worker_report(
+    sender: &Sender<WorkerReport>,
+    mut report: WorkerReport,
+    shutdown: &AtomicBool,
+) -> bool {
+    if !matches!(
+        &report,
+        WorkerReport::DeletionCompleted { recovery_incidents, .. }
+            if !recovery_incidents.is_empty()
+    ) {
+        return sender.try_send(report).is_ok();
+    }
+    while !shutdown.load(Ordering::Acquire) {
+        match sender.send_timeout(report, WORKER_SHUTDOWN_POLL_INTERVAL) {
+            Ok(()) => return true,
+            Err(SendTimeoutError::Timeout(pending)) => report = pending,
+            Err(SendTimeoutError::Disconnected(_)) => return false,
+        }
+    }
+    false
 }
 
 /// Commands the control socket cannot run on its own thread: they need the
@@ -2581,6 +2622,17 @@ impl CatalogObservationKey {
 
 type CatalogObserver = BoundedObserver<CatalogObservationKey, Vec<ExpandedCatalogRoot>>;
 
+/// A successful recovery probe belongs to this native mount and these
+/// authorized surfaces. Config reload separately revokes every pending probe.
+#[derive(PartialEq, Eq)]
+struct RecoveryProbeKey {
+    mount: CatalogObservationKey,
+    ballast_dir: Option<PathBuf>,
+    roots: Vec<PathBuf>,
+    catalog_paths: Vec<PathBuf>,
+    cross_device_fallback: bool,
+}
+
 #[derive(Clone)]
 struct RamLogMirrorObservation {
     start_refusal: Option<String>,
@@ -2838,11 +2890,37 @@ fn probe_mount_writable(
     cross_device_fallback: bool,
     scanner: &ScannerConfig,
 ) -> bool {
-    use crate::daemon::recovery_probe::probe_writable_surface;
+    probe_mount_writable_guarded(
+        mount,
+        ballast_dir,
+        roots,
+        catalog,
+        cross_device_fallback,
+        scanner,
+        || true,
+    )
+}
+
+fn probe_mount_writable_guarded(
+    mount: &Path,
+    ballast_dir: Option<&Path>,
+    roots: &[PathBuf],
+    catalog: &[ExpandedCatalogRoot],
+    cross_device_fallback: bool,
+    scanner: &ScannerConfig,
+    continuing: impl Fn() -> bool,
+) -> bool {
+    use crate::daemon::recovery_probe::probe_writable_surface_guarded;
+
+    if !continuing() {
+        return false;
+    }
 
     // An existing managed ballast pool already has independent write authority.
     // A missing pool is not permission to create a directory during recovery.
-    if ballast_dir.is_some_and(|base| probe_writable_surface(mount, base, |_| true)) {
+    if ballast_dir
+        .is_some_and(|base| probe_writable_surface_guarded(mount, base, |_| true, &continuing))
+    {
         return true;
     }
     let mut surfaces: Vec<PathBuf> = roots
@@ -2866,9 +2944,12 @@ fn probe_mount_writable(
     // Whole-root Git inspection is report-only (#33); a Git clone elsewhere
     // below /tmp cannot forbid a private probe that never touches its entries.
     if surfaces.iter().any(|base| {
-        probe_writable_surface(mount, base, |resolved| {
-            recovery_probe_surface_allowed(base, resolved, scanner)
-        })
+        probe_writable_surface_guarded(
+            mount,
+            base,
+            |resolved| recovery_probe_surface_allowed(base, resolved, scanner),
+            &continuing,
+        )
     }) {
         return true;
     }
@@ -2877,13 +2958,16 @@ fn probe_mount_writable(
     // nevertheless within the existing scan scope only when cross-device
     // traversal is enabled and a configured root contains it. A pressure
     // observation alone never authorizes writing an unrelated mount root.
-    if !cross_device_fallback || !scanner.cross_devices {
+    if !continuing() || !cross_device_fallback || !scanner.cross_devices {
         return false;
     }
     let Ok(expected_mount) = std::fs::canonicalize(mount) else {
         return false;
     };
     scanner.root_paths.iter().any(|root| {
+        if !continuing() {
+            return false;
+        }
         let Ok(expected_root) = std::fs::canonicalize(root) else {
             return false;
         };
@@ -2896,12 +2980,17 @@ fn probe_mount_writable(
         // Retain the configured alias in the spelling so pinning also binds
         // it, rather than bypassing it through a canonical mount pathname.
         let base = root.join(relative);
-        probe_writable_surface(mount, &base, |resolved| {
-            resolved == expected_mount
-                && std::fs::canonicalize(root).is_ok_and(|current| current == expected_root)
-                && recovery_probe_surface_allowed(root, &expected_root, scanner)
-                && recovery_probe_surface_allowed(&base, resolved, scanner)
-        })
+        probe_writable_surface_guarded(
+            mount,
+            &base,
+            |resolved| {
+                resolved == expected_mount
+                    && std::fs::canonicalize(root).is_ok_and(|current| current == expected_root)
+                    && recovery_probe_surface_allowed(root, &expected_root, scanner)
+                    && recovery_probe_surface_allowed(&base, resolved, scanner)
+            },
+            &continuing,
+        )
     })
 }
 
@@ -3216,6 +3305,8 @@ impl MountMonitor {
 // ──────────────────── main daemon struct ────────────────────
 
 /// The monitoring daemon: orchestrates all sbh components.
+// Discovery, cleanup, swap pressure, and permission logging have independent lifecycles.
+#[allow(clippy::struct_excessive_bools)]
 pub struct MonitoringDaemon {
     config: Config,
     #[allow(dead_code)] // used by downstream beads (walker, protection)
@@ -3246,6 +3337,10 @@ pub struct MonitoringDaemon {
     /// Mounts the executor reported as read-only or out of metadata space
     /// since the last tick; each enters `MountState::Recovery`.
     pending_recovery: HashSet<PathBuf>,
+    pending_recovery_incidents: Vec<RecoveryIncident>,
+    deferred_worker_report: Option<WorkerReport>,
+    /// One retained native recovery probe per mount, with a fixed global cap.
+    recovery_probes: BackgroundProbes<RecoveryProbeKey>,
     /// Policy transitions already logged as `policy_transition` events
     /// (a cursor into `PolicyEngine::transitions_total`).
     policy_transitions_seen: u64,
@@ -3311,6 +3406,15 @@ pub struct MonitoringDaemon {
     quarantine_held: HashMap<PathBuf, u64>,
     special_locations: SpecialLocationRegistry,
     ballast_coordinator: BallastPoolCoordinator,
+    /// Whole-plan discovery and config loading have independent retained slots.
+    /// An unavailable optional volume cannot block monitoring or a newer policy.
+    discovery: Option<RetainedDiscovery<DiscoverySnapshot>>,
+    config_reload: Option<RetainedDiscovery<Config>>,
+    initial_discovery: bool,
+    /// Capture restart credit before the first new state write. Pending state
+    /// republishes only its identity-bound history, never its old availability.
+    startup_pool_history: Vec<super::self_monitor::BallastPoolState>,
+    initial_provision: HashSet<PathBuf>,
     /// One retained worker keeps reserve allocation off the pressure monitor.
     ballast_replenisher: BallastReplenisher,
     /// Read-only availability is independent of the actuator's cached inventory.
@@ -5046,14 +5150,12 @@ fn diagnose_state_volume_inodes(
 impl MonitoringDaemon {
     /// Build and initialize the daemon from configuration.
     pub fn init(config: Config, args: &DaemonArgs) -> Result<Self> {
-        let mut daemon = Self::init_with_platform(config, args, detect_platform()?)?;
-        daemon.enable_background_filesystem_observations();
-        Ok(daemon)
+        Self::init_with_platform_mode(config, args, detect_platform()?, true)
     }
 
     /// Collect capacity and pressure evidence off the control thread. Startup
-    /// discovery and filesystem mutations retain their existing lifecycle;
-    /// the synchronous constructor remains the platform-injected test seam.
+    /// discovery has its own bounded worker; the synchronous constructor
+    /// remains the platform-injected test seam.
     fn enable_background_filesystem_observations(&mut self) {
         self.fs_collector = FsStatsCollector::new_background(
             Arc::clone(&self.platform),
@@ -5123,6 +5225,7 @@ impl MonitoringDaemon {
         // grace without waiting indefinitely for any unavailable peer.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            self.poll_discovery();
             match self.check_pressure() {
                 Ok(response) => return Ok(response),
                 Err(error) => {
@@ -5137,11 +5240,21 @@ impl MonitoringDaemon {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     fn init_with_platform(
         config: Config,
         args: &DaemonArgs,
         platform: Arc<dyn Platform>,
+    ) -> Result<Self> {
+        Self::init_with_platform_mode(config, args, platform, false)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn init_with_platform_mode(
+        config: Config,
+        args: &DaemonArgs,
+        platform: Arc<dyn Platform>,
+        background: bool,
     ) -> Result<Self> {
         let start_time = Instant::now();
 
@@ -5192,121 +5305,36 @@ impl MonitoringDaemon {
             Duration::from_millis(config.telemetry.fs_cache_ttl_ms),
         );
 
-        // 5. Discover special locations.
-        let special_locations = SpecialLocationRegistry::discover(
-            platform.as_ref(),
-            &[], // custom paths from config can be added later
-        )?;
-
-        // 6. Initialize ballast coordinator (multi-volume).
-        let discovery_paths = ballast_discovery_paths(&config, &special_locations);
-        let mut ballast_coordinator = BallastPoolCoordinator::discover_inner(
-            &config.ballast,
-            &discovery_paths,
-            platform.as_ref(),
-            &platform,
-            Some(config.paths.ballast_dir.as_path()),
-        )?;
-        ballast_coordinator.set_provision_floor_rule(config.ballast_provision_floor());
-        // bd-rc-master-ajg1.7.4: the daemon's own files against the mounts
-        // it reclaims. Not a refusal (single-volume hosts are common), but
-        // said once at startup, carried in state.json, and acted on while
-        // that mount is pressured (JSONL mirrored to the RAM fallback).
-        let logging_placement = {
-            let mut monitored: BTreeSet<PathBuf> = BTreeSet::new();
-            for path in config
-                .scanner
-                .root_paths
-                .iter()
-                .chain(special_locations.all().iter().map(|l| &l.path))
-            {
-                if let Ok(stats) = fs_collector.collect(path) {
-                    monitored.insert(stats.mount_point);
-                }
-            }
-            monitored.extend(
-                ballast_coordinator
-                    .inventory()
-                    .into_iter()
-                    .filter(|pool| !pool.skipped)
-                    .map(|pool| pool.mount_point),
-            );
-            assess_logging_placement(
-                |path| {
-                    nearest_existing_ancestor(path)
-                        .and_then(|existing| fs_collector.collect(&existing).ok())
-                        .map(|stats| stats.mount_point)
-                },
-                &[
-                    config.paths.sqlite_db.as_path(),
-                    config.paths.jsonl_log.as_path(),
-                    config.paths.state_file.as_path(),
-                ],
-                &monitored,
-            )
+        // 5/6. Optional volume discovery never delays production readiness.
+        // The injected synchronous constructor retains its established seam.
+        let startup_pool_history = if background {
+            SelfMonitor::read_state(&config.paths.state_file)
+                .map(|state| state.ballast_pools)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
         };
-        eprintln!(
-            "[SBH-DAEMON] logging.on_monitored_fs={} device={} paths=[{}]",
-            logging_placement.on_monitored_fs,
-            logging_placement.device,
-            logging_placement.paths.join(", ")
-        );
-        if logging_placement.on_monitored_fs {
-            logger_handle.send(ActivityEvent::Warning {
-                code: "SBH-1105".to_string(),
-                message: format!(
-                    "the activity database, JSONL log or state file live on {}, which sbh \
-                     reclaims ({}): move them to a volume sbh does not reclaim, or accept \
-                     that logging degrades to the RAM fallback under pressure",
-                    logging_placement.device,
-                    logging_placement.paths.join(", ")
+        let DiscoverySnapshot {
+            prior_revision: _,
+            special_locations,
+            ballast_coordinator,
+            logging_placement,
+            inventory,
+            release_controller,
+        } = if background {
+            DiscoverySnapshot {
+                prior_revision: None,
+                special_locations: SpecialLocationRegistry::from_mounts(Vec::new(), &[]),
+                ballast_coordinator: BallastPoolCoordinator::default(),
+                logging_placement: LoggingState::default(),
+                inventory: Vec::new(),
+                release_controller: BallastReleaseController::new(
+                    config.ballast.replenish_cooldown_minutes,
                 ),
-            });
-        }
-        // Surface the resolved ballast directories so the configured
-        // `[paths] ballast_dir` is observable at startup (issue #14).
-        eprintln!(
-            "[SBH-DAEMON] configured ballast_dir: {}",
-            config.paths.ballast_dir.display()
-        );
-        for inv in ballast_coordinator.inventory() {
-            eprintln!(
-                "[SBH-DAEMON] ballast pool on mount {} -> {}{}",
-                inv.mount_point.display(),
-                inv.ballast_dir.display(),
-                if inv.skipped { " (skipped)" } else { "" }
-            );
-            for dir in &inv.unreachable_reserve {
-                eprintln!(
-                    "[SBH-DAEMON] ballast reserve at {} is read-only to this service and \
-                     cannot be released for {} (systemd ProtectSystem=strict without it in \
-                     ReadWritePaths=): grant it there, or release those files by hand",
-                    dir.display(),
-                    inv.mount_point.display()
-                );
             }
-        }
-
-        // 7. Release controller.
-        let mut release_controller =
-            BallastReleaseController::new(config.ballast.replenish_cooldown_minutes);
-        if let Ok(previous) = SelfMonitor::read_state(&config.paths.state_file) {
-            for saved in previous.ballast_pools {
-                let mount = PathBuf::from(&saved.mount);
-                let Some(pool) = ballast_coordinator.pool_for_mount(&mount) else {
-                    continue;
-                };
-                if saved.skipped {
-                    continue;
-                }
-                if let Some(history) = saved.release_history
-                    && release_controller.restore_pool_history(&mount, &pool.ballast_dir, history)
-                    && let Some(efficiency) = saved.release_efficiency
-                {
-                    release_controller.set_release_efficiency(&mount, efficiency);
-                }
-            }
-        }
+        } else {
+            DiscoverySnapshot::collect(&config, &platform)?
+        };
 
         // 8. Scoring engine.
         let scoring_engine =
@@ -5394,7 +5422,7 @@ impl MonitoringDaemon {
             .with_burst_secs(config.telemetry.cpu_budget_burst_secs),
         ));
 
-        Ok(Self {
+        let mut daemon = Self {
             config,
             platform,
             logger_handle,
@@ -5410,6 +5438,9 @@ impl MonitoringDaemon {
             mount_responses: Vec::new(),
             wake_next_tick: WakeSignals::default(),
             pending_recovery: HashSet::new(),
+            pending_recovery_incidents: Vec::new(),
+            deferred_worker_report: None,
+            recovery_probes: BackgroundProbes::default(),
             policy_transitions_seen: 0,
             floor_limited: HashSet::new(),
             reclaim_alerts: AlertThrottle::default(),
@@ -5435,6 +5466,11 @@ impl MonitoringDaemon {
             quarantine_held: HashMap::new(),
             special_locations,
             ballast_coordinator,
+            discovery: background.then(RetainedDiscovery::default),
+            config_reload: background.then(RetainedDiscovery::default),
+            initial_discovery: background,
+            startup_pool_history,
+            initial_provision: HashSet::new(),
             ballast_replenisher: BallastReplenisher::default(),
             ballast_reserve_monitor: BallastReserveMonitor::default(),
             ballast_refill_blockers: HashMap::new(),
@@ -5502,7 +5538,154 @@ impl MonitoringDaemon {
             scanner_heartbeat,
             executor_heartbeat,
             shared_guard_diagnostics,
-        })
+        };
+        if background {
+            daemon.enable_background_filesystem_observations();
+            daemon
+                .discovery
+                .as_mut()
+                .expect("background discovery")
+                .request();
+            daemon.poll_discovery();
+            daemon.logger_handle.send(ActivityEvent::Info {
+                message: "filesystem discovery pending; pressure monitoring is active and new ballast allocations await the current plan".into(),
+            });
+        } else {
+            daemon.log_discovery(&inventory);
+        }
+        Ok(daemon)
+    }
+
+    fn log_discovery(&self, inventory: &[crate::ballast::coordinator::PoolInventory]) {
+        eprintln!(
+            "[SBH-DAEMON] logging.on_monitored_fs={} device={} paths=[{}]",
+            self.logging_placement.on_monitored_fs,
+            self.logging_placement.device,
+            self.logging_placement.paths.join(", ")
+        );
+        if self.logging_placement.on_monitored_fs {
+            self.logger_handle.send(ActivityEvent::Warning {
+                code: "SBH-1105".into(),
+                message: format!(
+                    "the activity database, JSONL log or state file share monitored mount {} ({}); logging may degrade to the RAM fallback under pressure",
+                    self.logging_placement.device,
+                    self.logging_placement.paths.join(", ")
+                ),
+            });
+        }
+        eprintln!(
+            "[SBH-DAEMON] configured ballast_dir: {}",
+            self.config.paths.ballast_dir.display()
+        );
+        for pool in inventory {
+            eprintln!(
+                "[SBH-DAEMON] ballast pool on mount {} -> {}{}",
+                pool.mount_point.display(),
+                pool.ballast_dir.display(),
+                if pool.skipped { " (skipped)" } else { "" }
+            );
+            for directory in &pool.unreachable_reserve {
+                eprintln!(
+                    "[SBH-DAEMON] ballast reserve at {} is read-only to this service and cannot be released for {}; check systemd ReadWritePaths= or release those files by hand",
+                    directory.display(),
+                    pool.mount_point.display()
+                );
+            }
+        }
+    }
+
+    fn discovery_pending(&self) -> bool {
+        self.discovery
+            .as_ref()
+            .is_some_and(RetainedDiscovery::pending)
+            || self
+                .config_reload
+                .as_ref()
+                .is_some_and(RetainedDiscovery::pending)
+    }
+
+    fn poll_discovery(&mut self) {
+        let Some(discovery) = self.discovery.as_mut() else {
+            return;
+        };
+        let config = self.config.clone();
+        let platform = Arc::clone(&self.platform);
+        let prior_revision = self.ballast_coordinator.discovery_revision();
+        let previous_pools = self.startup_pool_history.clone();
+        // Cancellation cannot interrupt an in-flight native allocation. Wait
+        // for that retained worker to exit before reading or adopting a plan;
+        // its rejected old result cannot advance the live mutation witness.
+        let completed = if self.ballast_replenisher.busy() {
+            None
+        } else {
+            discovery.poll(Instant::now(), move || {
+                DiscoverySnapshot::collect_with_history(&config, &platform, previous_pools)
+                    .map(|mut snapshot| {
+                        snapshot.prior_revision = Some(prior_revision);
+                        snapshot
+                    })
+                    .map_err(|error| error.to_string())
+            })
+        };
+        if let Some(snapshot) = completed {
+            if snapshot.prior_revision.as_ref().is_some_and(|revision| {
+                !self
+                    .ballast_coordinator
+                    .matches_discovery_revision(revision)
+            }) {
+                // A release or refill while discovery was reading owns newer
+                // inventory. Never replace it with the older native snapshot.
+                self.discovery
+                    .as_mut()
+                    .expect("background discovery")
+                    .request();
+            } else {
+                self.ballast_replenisher.cancel();
+                self.ballast_reserve_monitor.invalidate_all();
+                self.initial_provision.clear();
+                if self.initial_discovery {
+                    self.release_controller = snapshot.release_controller;
+                    if self.config.ballast.auto_provision {
+                        self.initial_provision.extend(
+                            snapshot
+                                .inventory
+                                .iter()
+                                .filter(|pool| !pool.skipped && pool.configured_bytes > 0)
+                                .map(|pool| pool.mount_point.clone()),
+                        );
+                    }
+                    self.initial_discovery = false;
+                    self.startup_pool_history.clear();
+                }
+                self.ballast_coordinator = snapshot.ballast_coordinator;
+                self.special_locations = snapshot.special_locations;
+                self.invalidate_logging_ram_observations();
+                self.logging_placement = snapshot.logging_placement;
+                self.self_monitor
+                    .set_logging_snapshot(self.logging_placement.clone());
+                self.prime_filesystem_observations();
+                self.log_discovery(&snapshot.inventory);
+                self.logger_handle.send(ActivityEvent::Info {
+                    message: "filesystem discovery completed; current pool plan adopted".into(),
+                });
+            }
+        }
+        if let Some(discovery) = &self.discovery {
+            self.self_monitor.set_discovery_snapshot(DiscoveryState {
+                pending: discovery.pending(),
+                generation: discovery.generation(),
+                reload_pending: self
+                    .config_reload
+                    .as_ref()
+                    .is_some_and(RetainedDiscovery::pending),
+                last_error: discovery.error().map(str::to_owned).or_else(|| {
+                    self.config_reload
+                        .as_ref()
+                        .and_then(RetainedDiscovery::error)
+                        .map(str::to_owned)
+                }),
+            });
+        }
     }
 
     fn maybe_log_full_disk_access_status(&mut self, force: bool) {
@@ -6067,6 +6250,9 @@ impl MonitoringDaemon {
         &mut self,
         action: &ControlBallastAction,
     ) -> std::result::Result<Value, String> {
+        if self.discovery_pending() && matches!(action, ControlBallastAction::Replenish { .. }) {
+            return Err("ballast discovery is pending for the current configuration; retry replenishment after discovery completes".into());
+        }
         let requested = match action {
             ControlBallastAction::Release { mount, .. }
             | ControlBallastAction::Replenish { mount } => mount.clone(),
@@ -6074,7 +6260,7 @@ impl MonitoringDaemon {
         let mounts: Vec<PathBuf> = requested.map_or_else(
             || {
                 self.ballast_coordinator
-                    .inventory()
+                    .inventory_cached()
                     .into_iter()
                     .map(|pool| pool.mount_point)
                     .collect()
@@ -6102,6 +6288,7 @@ impl MonitoringDaemon {
                         Ok(Some(report)) => {
                             self.release_controller
                                 .on_released(&pool_mount, report.files_released);
+                            self.reconcile_ballast_inventory(&pool_mount);
                             self.log_control_ballast_release(&mount, &report.released);
                             Ok(json!({
                                 "mount": mount,
@@ -6124,6 +6311,7 @@ impl MonitoringDaemon {
                                 self.release_controller
                                     .on_replenished(&pool_mount, report.files_created);
                             }
+                            self.reconcile_ballast_inventory(&pool_mount);
                             for (path, size_bytes) in &report.created {
                                 self.logger_handle.send(ActivityEvent::BallastReplenished {
                                     path: path.display().to_string(),
@@ -6173,7 +6361,7 @@ impl MonitoringDaemon {
 
     fn emit_status_dump(&self, response: &PressureResponse) {
         let mount_stats = self.fs_collector.collect(&response.causing_mount).ok();
-        let ballast_inventory = self.ballast_coordinator.inventory();
+        let ballast_inventory = self.ballast_coordinator.inventory_cached();
         let ballast_available = ballast_inventory
             .iter()
             .map(|entry| entry.files_available)
@@ -6318,13 +6506,13 @@ impl MonitoringDaemon {
         let mount_str = state_path.to_string_lossy().into_owned();
         let ballast_available = self
             .ballast_coordinator
-            .inventory()
+            .inventory_cached()
             .iter()
             .map(|i| i.files_available)
             .sum();
         let ballast_total = self
             .ballast_coordinator
-            .inventory()
+            .inventory_cached()
             .iter()
             .map(|i| i.files_total)
             .sum();
@@ -6332,7 +6520,7 @@ impl MonitoringDaemon {
         // release/replenish to; sorted so two writes agree on the order.
         let mut pools: Vec<super::self_monitor::BallastPoolState> = self
             .ballast_coordinator
-            .inventory()
+            .inventory_cached()
             .into_iter()
             .map(|pool| {
                 // Bind/reset the physical observation before serializing its
@@ -6342,6 +6530,9 @@ impl MonitoringDaemon {
                 // pool's mount.
                 let release_history = if pool.skipped {
                     None
+                } else if self.fs_collector.is_background() {
+                    self.release_controller
+                        .cached_pool_history(&pool.mount_point)
                 } else {
                     self.release_controller.pool_history(
                         &pool.mount_point,
@@ -6381,6 +6572,15 @@ impl MonitoringDaemon {
                 }
             })
             .collect();
+        if self.initial_discovery {
+            for saved in &self.startup_pool_history {
+                if saved.release_history.is_some()
+                    && !pools.iter().any(|pool| pool.mount == saved.mount)
+                {
+                    pools.push(saved.pending_history(&self.config.ballast));
+                }
+            }
+        }
         pools.sort_by(|a, b| a.mount.cmp(&b.mount));
         self.self_monitor.set_ballast_pools(pools);
         self.self_monitor
@@ -6447,7 +6647,7 @@ impl MonitoringDaemon {
         // The reserve on each mount: what is releasable now against what
         // the configuration asks for, how long it would last at the mount's
         // fill rate, and whether the headroom floor is what keeps it short.
-        let inventory = self.ballast_coordinator.inventory();
+        let inventory = self.ballast_coordinator.inventory_cached();
         for record in &mut controllers {
             let mount = PathBuf::from(&record.mount);
             record.backing_pressure = self
@@ -6576,17 +6776,18 @@ impl MonitoringDaemon {
                 volumes_monitored: self.ballast_coordinator.pool_count(),
             });
 
-        // Provision ballast files (idempotent). This precedes READY=1, and on
-        // a fresh install it writes every pool (random data on CoW
-        // filesystems) at disk speed: 20 GiB took 45 s in a systemd container
-        // and the unit was killed at TimeoutStartSec=30, then restarted.
-        with_startup_extension(
-            self.platform.service_manager(),
-            "provisioning ballast",
-            StartupExtension::DEFAULT,
-            &self.signal_handler.shutdown_token(),
-            || self.provision_ballast(),
-        )?;
+        // Production growth uses the retained allocation worker after the
+        // complete current discovery plan arrives. Readiness does not wait
+        // for optional volumes or gigabytes of reserve writes.
+        if self.discovery.is_none() {
+            with_startup_extension(
+                self.platform.service_manager(),
+                "provisioning ballast",
+                StartupExtension::DEFAULT,
+                &self.signal_handler.shutdown_token(),
+                || self.provision_ballast(),
+            )?;
+        }
 
         // Wait only a bounded time for the first background observation.
         let initial_response = self.initial_pressure_check()?;
@@ -6666,9 +6867,14 @@ impl MonitoringDaemon {
             if self.signal_handler.should_reload() {
                 self.handle_config_reload(&scan_tx);
             }
+            self.poll_config_reload();
+            self.poll_discovery();
 
             // 2b. Periodically re-check macOS FDA grants and log success when granted.
             self.maybe_log_full_disk_access_status(false);
+            // A queued filesystem failure must revoke an earlier recovery
+            // success before this tick consumes it or dispatches more work.
+            self.drain_worker_reports(&report_rx);
 
             // 3. Collect filesystem stats and run pressure analysis.
             let response = match self.check_pressure() {
@@ -6760,6 +6966,7 @@ impl MonitoringDaemon {
 
             // 5. Handle pressure response per mount; the tick follows the
             //    tightest mount sbh is actually working on.
+            self.drain_worker_reports(&report_rx);
             let requested_tick = self.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
             self.watchdog.maybe_notify("pressure handled");
 
@@ -6780,105 +6987,7 @@ impl MonitoringDaemon {
             ));
 
             // 7b. Drain worker reports so summaries and future state writes are current.
-            while let Ok(report) = report_rx.try_recv() {
-                match report {
-                    WorkerReport::ScanCompleted {
-                        candidates,
-                        duration,
-                        root_stats,
-                        timed_out,
-                        pressure_level,
-                        background,
-                    } => {
-                        self.summary_scans += 1;
-                        if timed_out {
-                            self.summary_scan_timeouts += 1;
-                        }
-                        self.summary_candidates += candidates as u64;
-                        self.self_monitor.record_scan(candidates, 0, duration);
-                        self.last_scan_completed = Some((Instant::now(), duration));
-                        let now = Instant::now();
-                        for stat in &root_stats {
-                            stat.record_scheduler_feedback(&mut self.voi_scheduler, now);
-                        }
-                        self.voi_scheduler.end_window();
-                        // Positive findings help even after a timeout. Only
-                        // proven root coverage can justify an empty mount.
-                        self.note_scan_pass_per_mount(&root_stats, pressure_level, background, now);
-                    }
-                    WorkerReport::DeletionCompleted {
-                        deleted,
-                        bytes_freed,
-                        freed_basis,
-                        bytes_freed_observed,
-                        failed,
-                        recovery_paths,
-                        failure_alarm,
-                    } => {
-                        self.summary_deleted += deleted;
-                        self.summary_failed += failed;
-                        self.summary_bytes_freed += bytes_freed;
-                        self.summary_freed_basis = self.summary_freed_basis.combine(freed_basis);
-                        self.summary_bytes_freed_observed = self
-                            .summary_bytes_freed_observed
-                            .zip(bytes_freed_observed)
-                            .map(|(sum, bytes)| sum.saturating_add(bytes));
-                        self.self_monitor.record_deletions(deleted, bytes_freed);
-                        self.self_monitor
-                            .record_freed_basis(freed_basis, bytes_freed_observed);
-                        // One reaction cycle: poll, scan, then the reclaim
-                        // that followed it; it sizes the burst windows.
-                        if let Some((scan_completed_at, scan_duration)) =
-                            self.last_scan_completed.take()
-                        {
-                            let poll = Duration::from_millis(self.config.pressure.poll_interval_ms);
-                            self.burst_stats
-                                .record_cycle(poll + scan_duration + scan_completed_at.elapsed());
-                        }
-                        // Mount incidents: park the owning mounts in recovery
-                        // on the next tick instead of retrying.
-                        for path in &recovery_paths {
-                            if let Ok(stats) = self.fs_collector.collect(path) {
-                                self.pending_recovery.insert(stats.mount_point);
-                            }
-                        }
-                        if let Some((reason, count)) = failure_alarm {
-                            let message = format!(
-                                "deletion failure rate alarm (e-process >= 20:1 against a <=10% \
-                                 failure rate): dominant reason {reason} x{count}; see \
-                                 `sbh stats` and the [SBH-EXECUTOR] skip lines"
-                            );
-                            self.logger_handle.send(ActivityEvent::Error {
-                                code: "SBH-2005".to_string(),
-                                message: message.clone(),
-                            });
-                            self.notification_manager.notify(&NotificationEvent::Error {
-                                code: "SBH-2005".to_string(),
-                                message,
-                            });
-                        }
-                        if deleted > 0 {
-                            // A completed removal also censors any forecast
-                            // issued while this asynchronous batch was running.
-                            self.last_tick_cleanup_ran = true;
-                            // Best effort: we don't have the mount point here easily without tracking
-                            // it through the batch. Use "primary" or "various".
-                            let items_deleted = usize::try_from(deleted).unwrap_or(usize::MAX);
-                            self.notification_manager.notify(
-                                &NotificationEvent::CleanupCompleted {
-                                    items_deleted,
-                                    bytes_freed,
-                                    freed_basis,
-                                    mount: "various".to_string(),
-                                },
-                            );
-                        }
-                        for _ in 0..failed {
-                            self.self_monitor.record_error();
-                        }
-                    }
-                }
-            }
+            self.drain_worker_reports(&report_rx);
 
             // 9. Forced scan signal (SIGUSR1). Also wakes idle mounts next tick.
             // A full scan queue defers it to the next tick instead of
@@ -7095,6 +7204,216 @@ impl MonitoringDaemon {
 
     // ──────────────────── helpers ────────────────────
 
+    /// Resolve incidents from existing physical-device evidence first. An
+    /// exact-path cache miss only schedules a bounded observation; it never
+    /// means the reported filesystem failure did not happen.
+    fn recovery_incident_mounts(&self, incident: &RecoveryIncident) -> Vec<PathBuf> {
+        if let Some(device) = incident.device_id {
+            let max_age = Self::filesystem_observation_max_age(&self.config);
+            let mounts: Vec<_> = self
+                .mount_monitors
+                .iter()
+                .filter_map(|(mount, monitor)| {
+                    monitor
+                        .last_observation
+                        .as_ref()
+                        .filter(|observation| {
+                            observation.sample.collected_at.elapsed() <= max_age
+                                && pressure_observation_device_id(
+                                    &observation.sample,
+                                    self.fs_collector.is_background(),
+                                ) == Some(device)
+                        })
+                        .map(|_| mount.clone())
+                })
+                .collect();
+            if !mounts.is_empty() {
+                // Aliases, including APFS views sharing st_dev, must not keep
+                // a previous success alive for the same failed filesystem.
+                return mounts;
+            }
+        }
+        self.fs_collector
+            .collect_sample(&incident.path)
+            .ok()
+            .filter(|sample| {
+                sample.collected_at >= incident.failed_at
+                    && incident.device_id.is_none_or(|device| {
+                        pressure_observation_device_id(sample, self.fs_collector.is_background())
+                            == Some(device)
+                    })
+            })
+            .map_or_else(Vec::new, |sample| vec![sample.stats.mount_point])
+    }
+
+    fn note_recovery_mounts(&mut self, mounts: Vec<PathBuf>) {
+        for mount in mounts {
+            self.recovery_probes.cancel_mount(&mount);
+            self.pending_recovery.insert(mount);
+        }
+    }
+
+    fn resolve_pending_recovery_incidents(&mut self) {
+        let pending = std::mem::take(&mut self.pending_recovery_incidents);
+        for incident in pending {
+            let mounts = self.recovery_incident_mounts(&incident);
+            if mounts.is_empty() {
+                self.pending_recovery_incidents.push(incident);
+            } else {
+                self.note_recovery_mounts(mounts);
+            }
+        }
+    }
+
+    /// Transfer each incident once, either to a known mount or to the bounded
+    /// unresolved store. A deferred report keeps only unadmitted incidents;
+    /// its counters remain untouched until all incidents have a durable home.
+    fn admit_recovery_incidents(&mut self, incidents: &mut Vec<RecoveryIncident>) -> bool {
+        incidents.retain(|incident| {
+            // Revocation can use an old device receipt: it grants nothing.
+            // Do this before trying the fresh mapping, so a renewed pressure
+            // frame cannot revive a success that predates this failure.
+            let mut revoked = false;
+            if let Some(device) = incident.device_id {
+                for (mount, monitor) in &self.mount_monitors {
+                    if monitor
+                        .last_observation
+                        .as_ref()
+                        .is_some_and(|observation| {
+                            pressure_observation_device_id(
+                                &observation.sample,
+                                self.fs_collector.is_background(),
+                            ) == Some(device)
+                        })
+                    {
+                        self.recovery_probes.cancel_mount(mount);
+                        revoked = true;
+                    }
+                }
+            }
+            if !revoked {
+                self.recovery_probes.cancel_all();
+            }
+            let mounts = self.recovery_incident_mounts(incident);
+            if !mounts.is_empty() {
+                self.note_recovery_mounts(mounts);
+                return false;
+            }
+            if let Some(pending) = self.pending_recovery_incidents.iter_mut().find(|pending| {
+                pending.path == incident.path && pending.device_id == incident.device_id
+            }) {
+                pending.failed_at = pending.failed_at.max(incident.failed_at);
+                return false;
+            }
+            if self.pending_recovery_incidents.len() == MAX_PENDING_RECOVERY_INCIDENTS {
+                return true;
+            }
+            self.pending_recovery_incidents.push(incident.clone());
+            false
+        });
+        incidents.is_empty()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn drain_worker_reports(&mut self, reports: &Receiver<WorkerReport>) {
+        self.resolve_pending_recovery_incidents();
+        while let Some(mut report) = self
+            .deferred_worker_report
+            .take()
+            .or_else(|| reports.try_recv().ok())
+        {
+            if let WorkerReport::DeletionCompleted {
+                recovery_incidents, ..
+            } = &mut report
+                && !self.admit_recovery_incidents(recovery_incidents)
+            {
+                self.deferred_worker_report = Some(report);
+                break;
+            }
+            match report {
+                WorkerReport::ScanCompleted {
+                    candidates,
+                    duration,
+                    root_stats,
+                    timed_out,
+                    pressure_level,
+                    background,
+                } => {
+                    self.summary_scans += 1;
+                    if timed_out {
+                        self.summary_scan_timeouts += 1;
+                    }
+                    self.summary_candidates += candidates as u64;
+                    self.self_monitor.record_scan(candidates, 0, duration);
+                    self.last_scan_completed = Some((Instant::now(), duration));
+                    let now = Instant::now();
+                    for stat in &root_stats {
+                        stat.record_scheduler_feedback(&mut self.voi_scheduler, now);
+                    }
+                    self.voi_scheduler.end_window();
+                    self.note_scan_pass_per_mount(&root_stats, pressure_level, background, now);
+                }
+                WorkerReport::DeletionCompleted {
+                    deleted,
+                    bytes_freed,
+                    freed_basis,
+                    bytes_freed_observed,
+                    failed,
+                    recovery_incidents: _,
+                    failure_alarm,
+                } => {
+                    self.summary_deleted += deleted;
+                    self.summary_failed += failed;
+                    self.summary_bytes_freed += bytes_freed;
+                    self.summary_freed_basis = self.summary_freed_basis.combine(freed_basis);
+                    self.summary_bytes_freed_observed = self
+                        .summary_bytes_freed_observed
+                        .zip(bytes_freed_observed)
+                        .map(|(sum, bytes)| sum.saturating_add(bytes));
+                    self.self_monitor.record_deletions(deleted, bytes_freed);
+                    self.self_monitor
+                        .record_freed_basis(freed_basis, bytes_freed_observed);
+                    if let Some((scan_completed_at, scan_duration)) =
+                        self.last_scan_completed.take()
+                    {
+                        let poll = Duration::from_millis(self.config.pressure.poll_interval_ms);
+                        self.burst_stats
+                            .record_cycle(poll + scan_duration + scan_completed_at.elapsed());
+                    }
+                    if let Some((reason, count)) = failure_alarm {
+                        let message = format!(
+                            "deletion failure rate alarm (e-process >= 20:1 against a <=10% \
+                             failure rate): dominant reason {reason} x{count}; see \
+                             `sbh stats` and the [SBH-EXECUTOR] skip lines"
+                        );
+                        self.logger_handle.send(ActivityEvent::Error {
+                            code: "SBH-2005".to_string(),
+                            message: message.clone(),
+                        });
+                        self.notification_manager.notify(&NotificationEvent::Error {
+                            code: "SBH-2005".to_string(),
+                            message,
+                        });
+                    }
+                    if deleted > 0 {
+                        self.last_tick_cleanup_ran = true;
+                        let items_deleted = usize::try_from(deleted).unwrap_or(usize::MAX);
+                        self.notification_manager
+                            .notify(&NotificationEvent::CleanupCompleted {
+                                items_deleted,
+                                bytes_freed,
+                                freed_basis,
+                                mount: "various".to_string(),
+                            });
+                    }
+                    for _ in 0..failed {
+                        self.self_monitor.record_error();
+                    }
+                }
+            }
+        }
+    }
+
     fn rss_hard_limit_error(&self, tick: SelfMonitorTick) -> SbhError {
         let details = format!(
             "daemon RSS hard limit exceeded: rss={} bytes hard_limit={} bytes; exiting nonzero so the service manager can restart after its throttle interval",
@@ -7115,6 +7434,7 @@ impl MonitoringDaemon {
     /// A later successful sample must admit fresh work; it cannot revive a
     /// cancelled staging pass, compression probe or target-only batch.
     fn withdraw_pressure_authority(&mut self) {
+        self.recovery_probes.cancel_all();
         self.invalidate_logging_ram_observations();
         self.ballast_replenisher.cancel();
         self.ballast_refill_blockers.clear();
@@ -7149,6 +7469,29 @@ impl MonitoringDaemon {
                 .filter(|path| path.as_path() != Path::new("/"))
                 .cloned(),
         );
+        // A failed nested filesystem can be outside the ordinary observation
+        // set. Keep its existing incident/recovery controller observable until
+        // a fresh write probe decides whether it may resume.
+        for mount in self
+            .pending_recovery
+            .iter()
+            .chain(
+                self.mount_controllers
+                    .iter()
+                    .filter_map(|(mount, controller)| {
+                        (controller.state() == MountState::Recovery).then_some(mount)
+                    }),
+            )
+        {
+            if !paths.contains(mount) {
+                paths.push(mount.clone());
+            }
+        }
+        if self.discovery.is_some() {
+            for pool in self.ballast_coordinator.reserve_observation_seeds() {
+                push_unique_path(&mut paths, pool.mount_point);
+            }
+        }
 
         // Group paths by mount point to avoid redundant updates.
         let mut stats_by_mount: HashMap<PathBuf, FsStatsSample> = HashMap::new();
@@ -7181,6 +7524,8 @@ impl MonitoringDaemon {
         now: Instant,
     ) -> Result<PressureResponse> {
         self.special_rates.begin_tick();
+        self.recovery_probes
+            .retain_mounts(|mount| stats_by_mount.contains_key(mount));
         if self.logging_ram_observer.is_some()
             && self.logging_placement.on_monitored_fs
             && !stats_by_mount
@@ -7281,6 +7626,7 @@ impl MonitoringDaemon {
                 // exhausted-surface backoff, reserve growth or release result.
                 self.mount_controllers.remove(&mount_path);
                 self.pending_recovery.remove(&mount_path);
+                self.recovery_probes.cancel_mount(&mount_path);
                 self.catalog_root_cache.remove(&mount_path);
                 self.catalog_epochs.remove(&mount_path);
                 self.release_controller.reset_effectiveness(&mount_path);
@@ -7716,6 +8062,73 @@ impl MonitoringDaemon {
 
     // ──────────────────── pressure response ────────────────────
 
+    /// Pending recovery writes do not delay other mounts. Only a fresh result
+    /// for the currently observed mount and still-authorized surfaces can
+    /// release its Recovery hold.
+    fn recovery_probe_result(
+        &mut self,
+        mount: &Path,
+        ballast_dir: Option<&Path>,
+        roots: &[PathBuf],
+        catalog: &[ExpandedCatalogRoot],
+        cross_device_fallback: bool,
+    ) -> Option<bool> {
+        if !self.fs_collector.is_background() {
+            return Some(probe_mount_writable(
+                mount,
+                ballast_dir,
+                roots,
+                catalog,
+                cross_device_fallback,
+                &self.config.scanner,
+            ));
+        }
+        let sample = &self
+            .mount_monitors
+            .get(mount)?
+            .last_observation
+            .as_ref()?
+            .sample;
+        let Some(binding) = CatalogObservationKey::from_sample(mount, sample) else {
+            self.recovery_probes.cancel_mount(mount);
+            return None;
+        };
+        let deadline = sample
+            .collected_at
+            .checked_add(Self::filesystem_observation_max_age(&self.config))?;
+        let key = RecoveryProbeKey {
+            mount: binding.clone(),
+            ballast_dir: ballast_dir.map(Path::to_path_buf),
+            roots: roots.to_vec(),
+            catalog_paths: catalog.iter().map(|root| root.path.clone()).collect(),
+            cross_device_fallback,
+        };
+        let scanner = self.config.scanner.clone();
+        let platform = Arc::clone(&self.platform);
+        let ballast_dir = key.ballast_dir.clone();
+        let roots = key.roots.clone();
+        let catalog = catalog.to_vec();
+        self.recovery_probes.poll_or_start(
+            mount,
+            key,
+            deadline,
+            self.signal_handler.shutdown_token(),
+            move |permit| {
+                catalog_mount_matches(&binding, platform.as_ref())
+                    && probe_mount_writable_guarded(
+                        &binding.mount,
+                        ballast_dir.as_deref(),
+                        &roots,
+                        &catalog,
+                        cross_device_fallback,
+                        &scanner,
+                        || permit.allowed(),
+                    )
+                    && catalog_mount_matches(&binding, platform.as_ref())
+            },
+        )
+    }
+
     /// Drive every mount from its own reading through its `MountController`
     /// and return the tick the daemon should sleep for.
     ///
@@ -7837,20 +8250,28 @@ impl MonitoringDaemon {
                 cross_device_fallback,
             };
             let recovery_needed = self.pending_recovery.remove(&mount);
-            let controller = self
+            let recovering = self
                 .mount_controllers
-                .entry(mount.clone())
-                .or_insert_with(|| MountController::new(mount.clone(), controller_config));
-            let recovery_probe_ok = (controller.state() == MountState::Recovery).then(|| {
-                probe_mount_writable(
+                .get(&mount)
+                .is_some_and(|controller| controller.state() == MountState::Recovery);
+            let recovery_probe_ok = if recovering && !recovery_needed {
+                self.recovery_probe_result(
                     &mount,
                     ballast_dir.as_deref(),
                     &roots_here,
                     &catalog,
                     cross_device_fallback,
-                    &self.config.scanner,
                 )
-            });
+            } else {
+                // A new failure requires a later probe. Never consume a
+                // completed success from a previous recovery episode.
+                self.recovery_probes.cancel_mount(&mount);
+                None
+            };
+            let controller = self
+                .mount_controllers
+                .entry(mount.clone())
+                .or_insert_with(|| MountController::new(mount.clone(), controller_config));
             let decision = controller.observe(MountTickInput {
                 level: tick.response.level,
                 urgency: tick.response.urgency,
@@ -7930,6 +8351,19 @@ impl MonitoringDaemon {
                 tick.response.level
             };
             let refill_mount = self.pool_mount(&mount);
+            // Initial provisioning precedes the ordinary Green cooldown. It
+            // still needs current pressure evidence and must not fight a cell
+            // that would immediately release the reserve it is creating.
+            let initial_provision = self.initial_provision.contains(&refill_mount)
+                && !self.discovery_pending()
+                && !behavior_should_release_ballast(
+                    self.behavior_state
+                        .table()
+                        .mode_for(self.behavior_state.memory_level, tick.response.level),
+                );
+            let refill_state_allows =
+                matches!(decision.state, MountState::Maintain | MountState::Idle)
+                    || (initial_provision && decision.state == MountState::Reclaim);
             let blockers = self
                 .ballast_refill_blockers
                 .entry(refill_mount.clone())
@@ -7938,7 +8372,7 @@ impl MonitoringDaemon {
             // pool is admitted or consumes a cooldown/attempt slot.
             for (blocked, reason) in [
                 (
-                    replenish_level != PressureLevel::Green,
+                    !initial_provision && replenish_level != PressureLevel::Green,
                     BallastRefillBlocker::PressurePolicy,
                 ),
                 (tick.imminent_danger, BallastRefillBlocker::Forecast),
@@ -7955,10 +8389,7 @@ impl MonitoringDaemon {
                     BallastRefillBlocker::MountRecovery,
                 ),
                 (
-                    !matches!(
-                        decision.state,
-                        MountState::Maintain | MountState::Idle | MountState::Recovery
-                    ),
+                    !refill_state_allows && decision.state != MountState::Recovery,
                     BallastRefillBlocker::MountInactive,
                 ),
             ] {
@@ -7970,11 +8401,11 @@ impl MonitoringDaemon {
                 .entry(refill_mount.clone())
                 .and_modify(|level: &mut PressureLevel| *level = (*level).max(replenish_level))
                 .or_insert(replenish_level);
-            if replenish_level != PressureLevel::Green
+            if (!initial_provision && replenish_level != PressureLevel::Green)
                 || tick.imminent_danger
                 || tick.ram_reclaim.is_some()
                 || tick.inode_reclaim.is_some()
-                || !matches!(decision.state, MountState::Maintain | MountState::Idle)
+                || !refill_state_allows
             {
                 // An alias may recover earlier than another view of the same
                 // filesystem. Any refusal on the physical pool wins this tick.
@@ -8066,6 +8497,9 @@ impl MonitoringDaemon {
                 }
                 MountState::Recovery | MountState::Idle => {}
             }
+            if initial_provision {
+                replenish_mounts.insert(self.pool_mount(&mount), mount.clone());
+            }
 
             // Truthful emergency events: this mount's real free percent, the
             // files actually released, and only on entering Critical. A tick
@@ -8116,8 +8550,14 @@ impl MonitoringDaemon {
         if self.config.policy.kill_switch
             || self.config.scanner.dry_run
             || self.signal_handler.should_shutdown()
+            || self.discovery_pending()
         {
             replenish_mounts.clear();
+        }
+        if self.discovery_pending() {
+            for blockers in self.ballast_refill_blockers.values_mut() {
+                blockers.push(BallastRefillBlocker::NotEvaluated);
+            }
         }
         let eligible_refills = replenish_mounts.keys().cloned().collect();
         self.ballast_replenisher.observe(&eligible_refills, now);
@@ -8741,6 +9181,7 @@ impl MonitoringDaemon {
             released = report.files_released;
             self.release_controller
                 .on_released(&pool_mount, report.files_released);
+            self.reconcile_ballast_inventory(&pool_mount);
             self.log_ballast_releases(&report.released, response);
         }
 
@@ -8831,6 +9272,15 @@ impl MonitoringDaemon {
             .map_or_else(|| mount.to_path_buf(), |pool| pool.mount_point.clone())
     }
 
+    /// Only native release/control actions call this. Periodic state output
+    /// reads the resulting cached history and never probes the directory.
+    fn reconcile_ballast_inventory(&mut self, mount: &Path) {
+        if let Some(observation) = self.ballast_coordinator.observe_pool_inventory(mount) {
+            self.release_controller
+                .observe_pool_inventory(mount, observation);
+        }
+    }
+
     /// Admit one background reserve validation/refill after the pool's cooldown.
     /// Returns whether the worker started, never speculative creation credit.
     fn maybe_replenish_pool(
@@ -8843,6 +9293,7 @@ impl MonitoringDaemon {
             || self.config.policy.kill_switch
             || self.config.scanner.dry_run
             || self.signal_handler.should_shutdown()
+            || self.discovery_pending()
         {
             return false;
         }
@@ -8855,19 +9306,28 @@ impl MonitoringDaemon {
         // Admission uses only cached cooldown state. The worker validates the
         // physical pool before allocation; even a directory stat here could
         // stall pressure monitoring on an unresponsive filesystem.
-        if !self.release_controller.is_ready_for_replenish(
-            &pool_mount,
-            level,
-            pool.available_count(),
-            pool.expected_count(),
-        ) {
+        let initial = self.initial_provision.contains(&pool_mount);
+        if !initial
+            && !self.release_controller.is_ready_for_replenish(
+                &pool_mount,
+                level,
+                pool.available_count(),
+                pool.expected_count(),
+            )
+        {
             self.ballast_refill_blockers
                 .entry(pool_mount.clone())
                 .or_default()
                 .push(BallastRefillBlocker::Cooldown);
             return false;
         }
-        let Some(task) = self.ballast_coordinator.prepare_replenishment(&pool_mount) else {
+        let task = if initial {
+            self.ballast_coordinator
+                .prepare_initial_provision(&pool_mount)
+        } else {
+            self.ballast_coordinator.prepare_replenishment(&pool_mount)
+        };
+        let Some(task) = task else {
             return false;
         };
         match self.ballast_replenisher.start(
@@ -8889,9 +9349,16 @@ impl MonitoringDaemon {
 
     /// Publish finished reserve inventory and account only completed files.
     fn poll_ballast_replenishment(&mut self) {
+        let worker_mount = self
+            .ballast_replenisher
+            .worker_mount()
+            .map(Path::to_path_buf);
         let Some(completed) = self.ballast_replenisher.poll() else {
             return;
         };
+        if let Some(mount) = worker_mount {
+            self.initial_provision.remove(&mount);
+        }
         let Ok((task, result)) = completed else {
             eprintln!(
                 "[SBH-BALLAST] refill worker panicked; the next paced attempt will revalidate the pool"
@@ -8899,9 +9366,15 @@ impl MonitoringDaemon {
             return;
         };
         let pool_mount = task.mount().to_path_buf();
+        let initial = task.is_initial_provision();
+        let observation = task.inventory_observation();
         let current = self.ballast_coordinator.finish_replenishment(task);
         if current {
             self.ballast_reserve_monitor.invalidate(&pool_mount);
+            if let Some(observation) = observation {
+                self.release_controller
+                    .observe_pool_inventory(&pool_mount, observation);
+            }
         }
         let report = match result {
             Ok(report) => report,
@@ -8914,9 +9387,16 @@ impl MonitoringDaemon {
             }
         };
         for (path, size_bytes) in &report.created {
-            self.logger_handle.send(ActivityEvent::BallastReplenished {
-                path: path.display().to_string(),
-                size_bytes: *size_bytes,
+            self.logger_handle.send(if initial {
+                ActivityEvent::BallastProvisioned {
+                    path: path.display().to_string(),
+                    size_bytes: *size_bytes,
+                }
+            } else {
+                ActivityEvent::BallastReplenished {
+                    path: path.display().to_string(),
+                    size_bytes: *size_bytes,
+                }
             });
         }
         for error in &report.errors {
@@ -8984,6 +9464,7 @@ impl MonitoringDaemon {
                 released = report.files_released;
                 self.release_controller
                     .on_released(&pool_mount, report.files_released);
+                self.reconcile_ballast_inventory(&pool_mount);
                 self.release_controller.record_release(
                     &pool_mount,
                     report.bytes_freed,
@@ -9814,11 +10295,31 @@ impl MonitoringDaemon {
 
     // ──────────────────── config reload ────────────────────
 
-    #[allow(clippy::too_many_lines)]
     fn handle_config_reload(&mut self, _scan_tx: &Sender<ScanRequest>) {
         eprintln!("[SBH-DAEMON] config reload requested (SIGHUP)");
+        if let Some(loader) = &mut self.config_reload {
+            loader.request();
+            self.poll_config_reload();
+        } else {
+            self.apply_config_reload(Config::load(Some(&self.config.paths.config_file)));
+        }
+    }
 
-        match Config::load(Some(&self.config.paths.config_file)) {
+    fn poll_config_reload(&mut self) {
+        let Some(loader) = &mut self.config_reload else {
+            return;
+        };
+        let path = self.config.paths.config_file.clone();
+        if let Some(config) = loader.poll(Instant::now(), move || {
+            Config::load(Some(&path)).map_err(|error| error.to_string())
+        }) {
+            self.apply_config_reload(Ok(config));
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_config_reload(&mut self, loaded: Result<Config>) {
+        match loaded {
             Ok(new_config) => {
                 let old_hash = self.config.stable_hash().unwrap_or_default();
                 let new_hash = new_config.stable_hash().unwrap_or_default();
@@ -9830,12 +10331,24 @@ impl MonitoringDaemon {
                     // ballast rediscovery can block in native filesystem I/O.
                     // Keep occupied observation workers accounted for, while
                     // rejecting any result started under the old config.
+                    self.recovery_probes.cancel_all();
                     self.fs_collector.invalidate_observations();
                     self.invalidate_logging_ram_observations();
                     self.invalidate_catalog_observations(&new_config);
                     self.flush_pending_state_write_failure();
                     self.uncovered_checked_at = None;
                     self.ballast_replenisher.cancel();
+                    self.initial_provision.clear();
+                    if self.discovery.is_some() {
+                        self.ballast_coordinator.retain_release_only(
+                            &new_config.ballast,
+                            self.config.paths.ballast_dir != new_config.paths.ballast_dir,
+                        );
+                        // Derived mount-table paths regain automatic special
+                        // scope only from the replacement complete plan.
+                        self.special_locations =
+                            SpecialLocationRegistry::from_mounts(Vec::new(), &[]);
+                    }
                     self.quarantine_sweeper.cancel();
                     self.compress_tier.update_config(&new_config);
                     // Update components that can be reconfigured at runtime.
@@ -9984,28 +10497,34 @@ impl MonitoringDaemon {
                     // scans before filesystem discovery can block. A valid
                     // reload must not leave old deletion authority running
                     // while a mount or ballast directory is unresponsive.
-                    let discovery_paths =
-                        ballast_discovery_paths(&self.config, &self.special_locations);
-                    match BallastPoolCoordinator::discover_inner(
-                        &self.config.ballast,
-                        &discovery_paths,
-                        self.platform.as_ref(),
-                        &self.platform,
-                        Some(self.config.paths.ballast_dir.as_path()),
-                    ) {
-                        Ok(coordinator) => {
-                            self.ballast_coordinator = coordinator;
-                            self.ballast_coordinator
-                                .set_provision_floor_rule(self.config.ballast_provision_floor());
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "[SBH-DAEMON] ballast coordinator rediscovery failed during reload: {err}"
-                            );
-                            self.ballast_coordinator.update_config(&self.config.ballast);
-                            // The kept pools still follow the new thresholds.
-                            self.ballast_coordinator
-                                .set_provision_floor_rule(self.config.ballast_provision_floor());
+                    if let Some(discovery) = &mut self.discovery {
+                        discovery.request();
+                    } else {
+                        let discovery_paths =
+                            ballast_discovery_paths(&self.config, &self.special_locations);
+                        match BallastPoolCoordinator::discover_inner(
+                            &self.config.ballast,
+                            &discovery_paths,
+                            self.platform.as_ref(),
+                            &self.platform,
+                            Some(self.config.paths.ballast_dir.as_path()),
+                        ) {
+                            Ok(coordinator) => {
+                                self.ballast_coordinator = coordinator;
+                                self.ballast_coordinator.set_provision_floor_rule(
+                                    self.config.ballast_provision_floor(),
+                                );
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "[SBH-DAEMON] ballast coordinator rediscovery failed during reload: {err}"
+                                );
+                                self.ballast_coordinator.update_config(&self.config.ballast);
+                                // The kept pools still follow the new thresholds.
+                                self.ballast_coordinator.set_provision_floor_rule(
+                                    self.config.ballast_provision_floor(),
+                                );
+                            }
                         }
                     }
                     eprintln!("[SBH-DAEMON] config reloaded successfully");
@@ -10316,6 +10835,7 @@ impl MonitoringDaemon {
 
         // 1. Broadcast cancellation, then drop channel senders to signal worker threads to exit.
         self.signal_handler.request_shutdown();
+        self.recovery_probes.cancel_all();
         self.process_io_history.stop();
         self.ballast_replenisher.cancel();
         self.quarantine_sweeper.cancel();
@@ -14664,15 +15184,32 @@ fn executor_thread_main(
         // truncated probes, or a 100 MiB floor) where it frees them at commit
         // or a removal could not be measured, marked as such (bd-oj33).
         let (bytes_freed, freed_basis) = report.reported_freed();
-        let _ = report_tx.try_send(WorkerReport::DeletionCompleted {
-            deleted: report.items_deleted as u64,
-            bytes_freed,
-            freed_basis,
-            bytes_freed_observed: report.bytes_freed_observed,
-            failed: report.items_failed as u64,
-            recovery_paths: report.recovery_paths().cloned().collect(),
-            failure_alarm,
-        });
+        let recovery_incidents = report
+            .recovery_paths()
+            .map(|path| RecoveryIncident {
+                path: path.clone(),
+                failed_at: Instant::now(),
+                device_id: plan
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.path == *path)
+                    .and_then(|candidate| candidate.identity)
+                    .map(|identity| identity.device_id),
+            })
+            .collect();
+        let _ = send_worker_report(
+            report_tx,
+            WorkerReport::DeletionCompleted {
+                deleted: report.items_deleted as u64,
+                bytes_freed,
+                freed_basis,
+                bytes_freed_observed: report.bytes_freed_observed,
+                failed: report.items_failed as u64,
+                recovery_incidents,
+                failure_alarm,
+            },
+            shutdown,
+        );
 
         if report.circuit_breaker_tripped {
             last_circuit_breaker_trip = Some(Instant::now());
@@ -14974,6 +15511,501 @@ mod tests {
                 let _ = logger.join();
             }
         }
+    }
+
+    #[cfg(unix)]
+    struct DiscoveryGatePlatform {
+        inner: MockPlatform,
+        control_thread: std::thread::ThreadId,
+        block: AtomicBool,
+        entered: Sender<()>,
+        release: Receiver<()>,
+    }
+
+    #[cfg(unix)]
+    impl Platform for DiscoveryGatePlatform {
+        fn fs_stats(&self, path: &Path) -> Result<crate::platform::pal::FsStats> {
+            assert_ne!(std::thread::current().id(), self.control_thread);
+            self.inner.fs_stats(path)
+        }
+
+        fn mount_identity(&self, path: &Path) -> Result<crate::platform::pal::MountPoint> {
+            assert_ne!(std::thread::current().id(), self.control_thread);
+            self.inner.mount_identity(path)
+        }
+
+        fn mount_points(&self) -> Result<Vec<crate::platform::pal::MountPoint>> {
+            assert_ne!(std::thread::current().id(), self.control_thread);
+            if std::thread::current().name() == Some("sbh-discovery")
+                && self.block.swap(false, Ordering::AcqRel)
+            {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            self.inner.mount_points()
+        }
+
+        fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+            assert_ne!(std::thread::current().id(), self.control_thread);
+            self.inner.is_ram_backed(path)
+        }
+
+        fn default_paths(&self) -> crate::platform::pal::PlatformPaths {
+            self.inner.default_paths()
+        }
+
+        fn memory_info(&self) -> Result<MemoryInfo> {
+            self.inner.memory_info()
+        }
+
+        fn service_manager(&self) -> Box<dyn crate::platform::pal::ServiceManager> {
+            self.inner.service_manager()
+        }
+    }
+
+    #[cfg(unix)]
+    fn pending_discovery_fixture() -> (RegretDaemonFixture, Sender<()>) {
+        pending_discovery_fixture_with_history(false)
+    }
+
+    #[cfg(unix)]
+    fn pending_discovery_fixture_with_history(
+        prior_history: bool,
+    ) -> (RegretDaemonFixture, Sender<()>) {
+        use crate::core::config::PathsConfig;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut config = Config::with_paths(PathsConfig {
+            config_file: root.join("config.toml"),
+            ballast_dir: root.join("ballast"),
+            state_file: root.join("state.json"),
+            sqlite_db: root.join("activity.sqlite3"),
+            jsonl_log: root.join("activity.jsonl"),
+        });
+        config.scanner.root_paths = vec![root.to_path_buf()];
+        config.ballast.file_count = 2;
+        config.ballast.file_size_bytes = 8192;
+        config.ballast.auto_provision = true;
+        if prior_history {
+            let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy().with_home(root));
+            let mut snapshot = DiscoverySnapshot::collect(&config, &platform).unwrap();
+            snapshot
+                .ballast_coordinator
+                .provision_all(platform.as_ref())
+                .unwrap();
+            let mut controller = BallastReleaseController::new(10);
+            controller
+                .pool_history(Path::new("/"), &config.paths.ballast_dir, 2)
+                .unwrap();
+            snapshot
+                .ballast_coordinator
+                .release_for_mount(Path::new("/"), 1)
+                .unwrap();
+            let history = controller
+                .pool_history(Path::new("/"), &config.paths.ballast_dir, 1)
+                .unwrap();
+            let previous = super::super::self_monitor::DaemonState {
+                ballast_pools: vec![super::super::self_monitor::BallastPoolState {
+                    mount: "/".into(),
+                    ballast_dir: config.paths.ballast_dir.display().to_string(),
+                    available: 1,
+                    total: 2,
+                    releasable_bytes: 8192,
+                    release_history: Some(history),
+                    release_efficiency: Some(0.5),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            std::fs::write(
+                &config.paths.state_file,
+                serde_json::to_vec(&previous).unwrap(),
+            )
+            .unwrap();
+        }
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let platform = Arc::new(DiscoveryGatePlatform {
+            inner: MockPlatform::healthy().with_home(root),
+            control_thread: std::thread::current().id(),
+            block: AtomicBool::new(true),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let daemon = MonitoringDaemon::init_with_platform_mode(
+            config,
+            &DaemonArgs::default(),
+            platform,
+            true,
+        )
+        .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        (RegretDaemonFixture { daemon, directory }, release_tx)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_startup_preserves_restart_credit_without_claiming_old_reserve() {
+        use crate::ballast::coordinator::BallastReserveState;
+        let (mut fixture, release) = pending_discovery_fixture_with_history(true);
+        let daemon = &mut fixture.daemon;
+        let expected = daemon.startup_pool_history[0].release_history;
+        let response = daemon.initial_pressure_check().unwrap();
+        daemon.maybe_write_self_monitor_state(&response);
+        let pending = SelfMonitor::read_state(&daemon.config.paths.state_file).unwrap();
+        assert!(pending.discovery.unwrap().pending);
+        assert_eq!(pending.ballast.available, 0);
+        assert_eq!(pending.ballast_pools.len(), 1);
+        let saved = &pending.ballast_pools[0];
+        assert_eq!(
+            saved.release_history, expected,
+            "a restart during discovery must retain identity-bound credit"
+        );
+        assert_eq!(saved.available, 0);
+        assert_eq!(saved.releasable_bytes, 0);
+        assert_eq!(
+            saved.reserve.as_ref().unwrap().state,
+            BallastReserveState::Unknown
+        );
+        assert!(!saved.reserve.as_ref().unwrap().inventory_authoritative);
+
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while daemon.discovery_pending() {
+            daemon.poll_discovery();
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(
+            daemon
+                .release_controller
+                .cached_pool_history(Path::new("/")),
+            expected
+        );
+        assert_eq!(
+            daemon.release_controller.release_efficiency(Path::new("/")),
+            0.5
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_pressure_and_state_progress_while_complete_discovery_is_blocked() {
+        let (mut fixture, release) = pending_discovery_fixture();
+        let daemon = &mut fixture.daemon;
+        let response = daemon.initial_pressure_check().unwrap();
+        assert_eq!(response.level, PressureLevel::Green);
+        assert!(daemon.discovery_pending());
+        assert_eq!(daemon.ballast_coordinator.pool_count(), 0);
+        assert!(
+            daemon
+                .execute_ballast_action(&ControlBallastAction::Replenish { mount: None })
+                .unwrap_err()
+                .contains("discovery is pending")
+        );
+        assert!(!daemon.maybe_replenish_pool(Path::new("/"), PressureLevel::Green, Instant::now()));
+        daemon.maybe_write_self_monitor_state(&response);
+        let state = SelfMonitor::read_state(&daemon.config.paths.state_file).unwrap();
+        assert!(state.discovery.unwrap().pending);
+        assert!(!daemon.config.paths.ballast_dir.exists());
+
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while daemon.discovery_pending() {
+            daemon.poll_discovery();
+            assert!(Instant::now() < deadline, "completed plan was not adopted");
+            thread::yield_now();
+        }
+        assert!(daemon.initial_provision.contains(Path::new("/")));
+        assert!(daemon.maybe_replenish_pool(Path::new("/"), PressureLevel::Yellow, Instant::now()));
+        while daemon.ballast_replenisher.busy() {
+            daemon.poll_ballast_replenishment();
+            assert!(Instant::now() < deadline, "initial growth did not finish");
+            thread::yield_now();
+        }
+        assert!(daemon.initial_provision.is_empty());
+        assert_eq!(
+            daemon
+                .ballast_coordinator
+                .pool_for_mount(Path::new("/"))
+                .unwrap()
+                .available_count(),
+            2
+        );
+        let history = serde_json::to_value(
+            daemon
+                .release_controller
+                .cached_pool_history(Path::new("/"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            history["available"], 2,
+            "initial growth binds its newly created directory"
+        );
+        assert_eq!(history["release_credit"], 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_release_and_accepted_refill_update_cached_history_without_another_recommendation() {
+        for action in ["automatic", "recovery", "operator"] {
+            let mut fixture = RegretDaemonFixture::new();
+            let daemon = &mut fixture.daemon;
+            daemon.config.ballast.file_count = 2;
+            daemon.config.ballast.file_size_bytes = 8192;
+            daemon.ballast_coordinator =
+                DiscoverySnapshot::collect(&daemon.config, &daemon.platform)
+                    .unwrap()
+                    .ballast_coordinator;
+            daemon
+                .ballast_coordinator
+                .provision_all(daemon.platform.as_ref())
+                .unwrap();
+            let mount = Path::new("/");
+            let response = quarantine_tick(PressureLevel::Critical, mount).response;
+            match action {
+                "automatic" => assert_eq!(daemon.release_ballast(mount, &response).unwrap(), 2),
+                "recovery" => daemon.enter_mount_recovery(mount, &response),
+                "operator" => {
+                    daemon
+                        .execute_ballast_action(&ControlBallastAction::Release {
+                            mount: Some(mount.to_path_buf()),
+                            count: 2,
+                        })
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let history = serde_json::to_value(
+                daemon
+                    .release_controller
+                    .cached_pool_history(mount)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(history["available"], 0, "{action}");
+            assert_eq!(history["release_credit"], 2, "{action}");
+
+            let task = daemon
+                .ballast_coordinator
+                .prepare_replenishment(mount)
+                .unwrap();
+            assert!(
+                daemon
+                    .ballast_replenisher
+                    .start(task, daemon.signal_handler.shutdown_token(), Instant::now())
+                    .unwrap()
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while daemon.ballast_replenisher.busy() {
+                daemon.poll_ballast_replenishment();
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            let history = serde_json::to_value(
+                daemon
+                    .release_controller
+                    .cached_pool_history(mount)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(history["available"], 1, "{action}");
+            assert_eq!(history["release_credit"], 1, "{action}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_waits_for_cancelled_native_allocation_without_blocking_pressure() {
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        daemon.config.ballast.file_count = 2;
+        daemon.config.ballast.file_size_bytes = 8192;
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let allocator_platform: Arc<dyn Platform> = Arc::new(BackgroundOnlyFilesystemPlatform {
+            inner: MockPlatform::healthy(),
+            control_thread: std::thread::current().id(),
+            blocked: daemon.config.paths.ballast_dir.clone(),
+            started: entered_tx,
+            release: release_rx,
+        });
+        daemon.ballast_coordinator = BallastPoolCoordinator::discover_inner(
+            &daemon.config.ballast,
+            &daemon.config.scanner.root_paths,
+            daemon.platform.as_ref(),
+            &allocator_platform,
+            Some(&daemon.config.paths.ballast_dir),
+        )
+        .unwrap();
+        let task = daemon
+            .ballast_coordinator
+            .prepare_replenishment(Path::new("/"))
+            .unwrap();
+        assert!(
+            daemon
+                .ballast_replenisher
+                .start(task, daemon.signal_handler.shutdown_token(), Instant::now(),)
+                .unwrap()
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        daemon.ballast_replenisher.cancel();
+        let mut discovery = RetainedDiscovery::default();
+        discovery.request();
+        daemon.discovery = Some(discovery);
+        for _ in 0..8 {
+            daemon.poll_discovery();
+            assert!(daemon.discovery_pending());
+            assert!(
+                !daemon.discovery.as_ref().unwrap().occupied(),
+                "a cancelled native writer still occupies its allocation slot"
+            );
+            assert_eq!(daemon.check_pressure().unwrap().level, PressureLevel::Green);
+        }
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while daemon.ballast_replenisher.busy() {
+            daemon.poll_ballast_replenishment();
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        daemon.poll_discovery();
+        assert!(daemon.discovery.as_ref().unwrap().occupied());
+        while daemon.discovery_pending() {
+            daemon.poll_discovery();
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_discovery_cannot_restore_inventory_released_while_it_was_running() {
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        daemon.config.ballast.file_count = 2;
+        daemon.config.ballast.file_size_bytes = 8192;
+        let first = DiscoverySnapshot::collect(&daemon.config, &daemon.platform).unwrap();
+        daemon.ballast_coordinator = first.ballast_coordinator;
+        daemon
+            .ballast_coordinator
+            .provision_all(daemon.platform.as_ref())
+            .unwrap();
+        assert_eq!(
+            daemon
+                .ballast_coordinator
+                .pool_for_mount(Path::new("/"))
+                .unwrap()
+                .available_count(),
+            2
+        );
+
+        let mut snapshot = DiscoverySnapshot::collect(&daemon.config, &daemon.platform).unwrap();
+        snapshot.prior_revision = Some(daemon.ballast_coordinator.discovery_revision());
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let mut discovery = RetainedDiscovery::default();
+        discovery.request();
+        discovery.poll(Instant::now(), move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(snapshot)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        daemon.discovery = Some(discovery);
+        daemon
+            .ballast_coordinator
+            .release_for_mount(Path::new("/"), 1)
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while daemon.discovery.as_ref().unwrap().generation() == 1 {
+            daemon.poll_discovery();
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(
+            daemon.discovery_pending(),
+            "the newer inventory requires a new full plan"
+        );
+        assert_eq!(
+            daemon
+                .ballast_coordinator
+                .pool_for_mount(Path::new("/"))
+                .unwrap()
+                .available_count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_reload_completes_while_old_discovery_is_blocked_and_rejects_its_plan() {
+        use crate::core::config::BallastVolumeOverride;
+        let (mut fixture, release) = pending_discovery_fixture();
+        let daemon = &mut fixture.daemon;
+        let old_special = fixture.directory.path().join("previous-special-mount");
+        daemon.special_locations = SpecialLocationRegistry::new(vec![SpecialLocation {
+            path: old_special.clone(),
+            kind: SpecialKind::Tmpfs,
+            buffer_pct: 15,
+            scan_interval: Duration::from_secs(5),
+            priority: 200,
+        }]);
+        let mut updated = daemon.config.clone();
+        updated.scanner.dry_run = true;
+        updated.ballast.auto_provision = false;
+        updated.ballast.overrides.insert(
+            "/".into(),
+            BallastVolumeOverride {
+                enabled: false,
+                ..BallastVolumeOverride::default()
+            },
+        );
+        std::fs::write(
+            &updated.paths.config_file,
+            toml::to_string(&updated).unwrap(),
+        )
+        .unwrap();
+        let (scan_tx, _scan_rx) = bounded(1);
+        daemon.handle_config_reload(&scan_tx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !daemon.config.scanner.dry_run {
+            daemon.poll_config_reload();
+            daemon.poll_discovery();
+            assert!(
+                Instant::now() < deadline,
+                "policy waited for old native discovery"
+            );
+            thread::yield_now();
+        }
+        assert!(
+            daemon
+                .shared_executor_config
+                .dry_run
+                .load(Ordering::Acquire)
+        );
+        assert!(daemon.discovery_pending());
+        assert_eq!(daemon.discovery.as_ref().unwrap().generation(), 2);
+        assert!(
+            daemon
+                .special_locations
+                .all()
+                .iter()
+                .all(|location| location.path != old_special)
+        );
+        assert!(!daemon.maybe_replenish_pool(Path::new("/"), PressureLevel::Green, Instant::now()));
+
+        release.send(()).unwrap();
+        while daemon.discovery_pending() {
+            daemon.poll_discovery();
+            assert!(Instant::now() < deadline, "new plan was not adopted");
+            thread::yield_now();
+        }
+        assert_eq!(daemon.ballast_coordinator.pool_count(), 0);
+        assert!(daemon.initial_provision.is_empty());
+        assert!(!daemon.config.paths.ballast_dir.exists());
     }
 
     #[cfg(unix)]
@@ -16738,6 +17770,479 @@ mod tests {
             before,
             "operator sampling adds no global monitor or tier authority"
         );
+    }
+
+    #[cfg(unix)]
+    fn recovery_receipt(incidents: Vec<RecoveryIncident>) -> WorkerReport {
+        WorkerReport::DeletionCompleted {
+            deleted: 3,
+            bytes_freed: 30,
+            freed_basis: FreedBasis::Observed,
+            bytes_freed_observed: Some(30),
+            failed: 1,
+            recovery_incidents: incidents,
+            failure_alarm: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn observed_recovery_fixture(fixture: &mut RegretDaemonFixture) -> FsStatsSample {
+        let mount = fixture.directory.path().to_path_buf();
+        let daemon = &mut fixture.daemon;
+        daemon.platform = Arc::new(
+            disk_pressure_platform(vec![
+                disk_pressure_sample("/", 1_000_000, 900_000),
+                disk_pressure_sample(&mount.to_string_lossy(), 1_000_000, 300_000),
+            ])
+            .with_home(fixture.directory.path()),
+        );
+        daemon.config.scanner.root_paths = vec![mount.clone()];
+        daemon.enable_background_filesystem_observations();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = daemon.check_pressure();
+            if let Some(observation) = daemon
+                .mount_monitors
+                .get(&mount)
+                .and_then(|monitor| monitor.last_observation.as_ref())
+            {
+                return observation.sample.clone();
+            }
+            assert!(Instant::now() < deadline, "fixture mount was not observed");
+            thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cold_recovery_receipt_uses_device_evidence_and_retains_pending_paths() {
+        let mut fixture = RegretDaemonFixture::new();
+        let sample = observed_recovery_fixture(&mut fixture);
+        let mount = fixture.directory.path().to_path_buf();
+        let failed = mount.join("failed-candidate");
+        std::fs::create_dir(&failed).unwrap();
+        let identity = crate::scanner::walker::identity_for_path(&failed, false).unwrap();
+        assert_eq!(sample.mount_device_id(), Some(identity.device_id));
+        let (sender, receiver) = bounded(4);
+        sender
+            .send(recovery_receipt(vec![RecoveryIncident {
+                path: failed,
+                device_id: Some(identity.device_id),
+                failed_at: Instant::now(),
+            }]))
+            .unwrap();
+        fixture.daemon.drain_worker_reports(&receiver);
+        assert!(fixture.daemon.pending_recovery.contains(&mount));
+        assert!(fixture.daemon.pending_recovery_incidents.is_empty());
+        assert_eq!(fixture.daemon.summary_deleted, 3);
+        fixture.daemon.drain_worker_reports(&receiver);
+        assert_eq!(fixture.daemon.summary_deleted, 3, "receipt applies once");
+
+        // A v1 receipt without identity starts an exact-path query. The first
+        // pending result must survive instead of disappearing from the report.
+        let unknown = mount.join("legacy-candidate");
+        std::fs::create_dir(&unknown).unwrap();
+        sender
+            .send(recovery_receipt(vec![RecoveryIncident {
+                path: unknown.clone(),
+                device_id: None,
+                failed_at: Instant::now(),
+            }]))
+            .unwrap();
+        fixture.daemon.drain_worker_reports(&receiver);
+        assert_eq!(fixture.daemon.pending_recovery_incidents.len(), 1);
+        assert_eq!(fixture.daemon.pending_recovery_incidents[0].path, unknown);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fixture.daemon.pending_recovery_incidents.is_empty() {
+            fixture.daemon.drain_worker_reports(&receiver);
+            assert!(
+                Instant::now() < deadline,
+                "cold path incident did not resolve"
+            );
+            thread::yield_now();
+        }
+        assert!(fixture.daemon.pending_recovery.contains(&mount));
+        assert_eq!(fixture.daemon.summary_deleted, 6);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unidentified_recovery_receipt_requires_post_failure_owner_evidence() {
+        let mut fixture = RegretDaemonFixture::new();
+        observed_recovery_fixture(&mut fixture);
+        let mount = fixture.directory.path().to_path_buf();
+        let failed = mount.join("previously-observed-candidate");
+        std::fs::create_dir(&failed).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let previous = loop {
+            if let Ok(sample) = fixture.daemon.fs_collector.collect_sample(&failed) {
+                break sample;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        };
+        let (sender, receiver) = bounded(2);
+        let failed_at = Instant::now();
+        assert!(previous.collected_at < failed_at);
+        sender
+            .send(recovery_receipt(vec![RecoveryIncident {
+                path: failed.clone(),
+                device_id: None,
+                failed_at,
+            }]))
+            .unwrap();
+        fixture.daemon.drain_worker_reports(&receiver);
+        assert!(fixture.daemon.pending_recovery.is_empty());
+        assert_eq!(fixture.daemon.pending_recovery_incidents.len(), 1);
+
+        // Repeated failures for the same path occupy one slot, but require
+        // evidence newer than the latest failure and apply each report once.
+        let latest_failure = Instant::now();
+        sender
+            .send(recovery_receipt(vec![RecoveryIncident {
+                path: failed,
+                device_id: None,
+                failed_at: latest_failure,
+            }]))
+            .unwrap();
+        fixture.daemon.drain_worker_reports(&receiver);
+        assert_eq!(fixture.daemon.pending_recovery_incidents.len(), 1);
+        assert_eq!(
+            fixture.daemon.pending_recovery_incidents[0].failed_at,
+            latest_failure
+        );
+        assert_eq!(fixture.daemon.summary_deleted, 6);
+
+        fixture.daemon.fs_collector.invalidate_observations();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fixture.daemon.pending_recovery_incidents.is_empty() {
+            fixture.daemon.drain_worker_reports(&receiver);
+            assert!(
+                Instant::now() < deadline,
+                "post-failure owner did not resolve"
+            );
+            thread::yield_now();
+        }
+        assert!(fixture.daemon.pending_recovery.contains(&mount));
+        fixture.daemon.drain_worker_reports(&receiver);
+        assert_eq!(fixture.daemon.summary_deleted, 6);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_recovery_receipt_revokes_old_success_even_when_device_mapping_expired() {
+        let mut fixture = RegretDaemonFixture::new();
+        let sample = observed_recovery_fixture(&mut fixture);
+        let mount = fixture.directory.path().to_path_buf();
+        let binding = CatalogObservationKey::from_sample(&mount, &sample).unwrap();
+        let key = || RecoveryProbeKey {
+            mount: binding.clone(),
+            ballast_dir: None,
+            roots: vec![mount.clone()],
+            catalog_paths: Vec::new(),
+            cross_device_fallback: false,
+        };
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let shutdown = fixture.daemon.signal_handler.shutdown_token();
+        let permission_deadline = Instant::now() + Duration::from_secs(30);
+        fixture.daemon.recovery_probes.poll_or_start(
+            &mount,
+            key(),
+            permission_deadline,
+            Arc::clone(&shutdown),
+            move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                true
+            },
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let expired = Instant::now()
+            - MonitoringDaemon::filesystem_observation_max_age(&fixture.daemon.config)
+            - Duration::from_secs(1);
+        for monitor in fixture.daemon.mount_monitors.values_mut() {
+            if let Some(observation) = &mut monitor.last_observation {
+                observation.sample.collected_at = expired;
+            }
+        }
+        let failed = mount.join("new-failure");
+        std::fs::create_dir(&failed).unwrap();
+        let (sender, receiver) = bounded(1);
+        sender
+            .send(recovery_receipt(vec![RecoveryIncident {
+                path: failed,
+                device_id: sample.mount_device_id(),
+                failed_at: Instant::now(),
+            }]))
+            .unwrap();
+        fixture.daemon.drain_worker_reports(&receiver);
+        assert_eq!(fixture.daemon.pending_recovery_incidents.len(), 1);
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(success) = fixture.daemon.recovery_probes.poll_or_start(
+                &mount,
+                key(),
+                permission_deadline,
+                Arc::clone(&shutdown),
+                |_| false,
+            ) {
+                assert!(
+                    !success,
+                    "only a new probe may decide recovery after the failure"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled recovery probe did not retire"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_recovery_incidents_defer_reports_without_replaying_counters() {
+        let mut fixture = RegretDaemonFixture::new();
+        fixture.daemon.enable_background_filesystem_observations();
+        fixture.daemon.pending_recovery_incidents = (0..MAX_PENDING_RECOVERY_INCIDENTS)
+            .map(|index| RecoveryIncident {
+                path: fixture.directory.path().join(format!("unresolved-{index}")),
+                device_id: Some(u64::MAX),
+                failed_at: Instant::now(),
+            })
+            .collect();
+        let (sender, receiver) = bounded(2);
+        sender
+            .send(recovery_receipt(vec![RecoveryIncident {
+                path: fixture.directory.path().join("overflow"),
+                device_id: Some(u64::MAX),
+                failed_at: Instant::now(),
+            }]))
+            .unwrap();
+        sender.send(recovery_receipt(Vec::new())).unwrap();
+        fixture.daemon.drain_worker_reports(&receiver);
+        assert!(fixture.daemon.deferred_worker_report.is_some());
+        assert_eq!(
+            fixture.daemon.pending_recovery_incidents.len(),
+            MAX_PENDING_RECOVERY_INCIDENTS
+        );
+        assert_eq!(fixture.daemon.summary_deleted, 0);
+        assert_eq!(
+            receiver.len(),
+            1,
+            "later counters must not overtake a deferred receipt"
+        );
+
+        // Model one unresolved incident being resolved by its next native
+        // frame. This admits the deferred receipt without growing the bound.
+        fixture.daemon.pending_recovery_incidents.pop();
+        fixture.daemon.drain_worker_reports(&receiver);
+        assert!(fixture.daemon.deferred_worker_report.is_none());
+        assert_eq!(
+            fixture.daemon.pending_recovery_incidents.len(),
+            MAX_PENDING_RECOVERY_INCIDENTS
+        );
+        assert_eq!(fixture.daemon.summary_deleted, 6);
+        assert_eq!(fixture.daemon.summary_failed, 2);
+        fixture.daemon.drain_worker_reports(&receiver);
+        assert_eq!(fixture.daemon.summary_deleted, 6);
+        assert_eq!(fixture.daemon.summary_failed, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn critical_recovery_report_survives_full_channel_and_honors_shutdown() {
+        for stopping in [false, true] {
+            let (sender, receiver) = bounded(1);
+            sender.send(recovery_receipt(Vec::new())).unwrap();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let worker_shutdown = Arc::clone(&shutdown);
+            let (entered_tx, entered_rx) = bounded(1);
+            let (done_tx, done_rx) = bounded(1);
+            let worker = thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                let sent = send_worker_report(
+                    &sender,
+                    recovery_receipt(vec![RecoveryIncident {
+                        path: PathBuf::from("/failed-candidate"),
+                        device_id: Some(42),
+                        failed_at: Instant::now(),
+                    }]),
+                    &worker_shutdown,
+                );
+                done_tx.send(sent).unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                done_rx.try_recv().is_err(),
+                "full queue must not drop the incident"
+            );
+            if stopping {
+                shutdown.store(true, Ordering::Release);
+                assert!(!done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+                assert_eq!(receiver.len(), 1);
+            } else {
+                let _ = receiver.recv().unwrap();
+                let report = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(matches!(report, WorkerReport::DeletionCompleted {
+                    recovery_incidents, ..
+                } if recovery_incidents.len() == 1));
+                assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+            worker.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn background_recovery_probe_keeps_healthy_mounts_live_and_rejects_revoked_writes() {
+        struct RecoveryPlatform {
+            inner: MockPlatform,
+            control: thread::ThreadId,
+            blocked: PathBuf,
+            pause: AtomicBool,
+            entered: Sender<()>,
+            resume: Receiver<()>,
+        }
+        impl Platform for RecoveryPlatform {
+            fn fs_stats(&self, path: &Path) -> Result<crate::platform::pal::FsStats> {
+                self.inner.fs_stats(path)
+            }
+            fn mount_points(&self) -> Result<Vec<crate::platform::pal::MountPoint>> {
+                self.inner.mount_points()
+            }
+            fn mount_identity(&self, path: &Path) -> Result<crate::platform::pal::MountPoint> {
+                assert_ne!(thread::current().id(), self.control);
+                if path == self.blocked
+                    && thread::current().name() == Some("sbh-recovery-probe")
+                    && self.pause.swap(false, Ordering::AcqRel)
+                {
+                    self.entered.send(()).unwrap();
+                    self.resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                self.inner.mount_identity(path)
+            }
+            fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+                self.inner.is_ram_backed(path)
+            }
+            fn default_paths(&self) -> crate::platform::pal::PlatformPaths {
+                self.inner.default_paths()
+            }
+            fn memory_info(&self) -> Result<MemoryInfo> {
+                self.inner.memory_info()
+            }
+            fn service_manager(&self) -> Box<dyn crate::platform::pal::ServiceManager> {
+                self.inner.service_manager()
+            }
+        }
+
+        let mut fixture = RegretDaemonFixture::new();
+        let healthy = fixture.directory.path().join("healthy");
+        let blocked = fixture.directory.path().join("blocked");
+        for root in [&healthy, &blocked] {
+            std::fs::create_dir(root).unwrap();
+            std::fs::write(root.join("user-data"), b"keep").unwrap();
+        }
+        let (entered, waiting) = bounded(1);
+        let (resume, release) = bounded(1);
+        let daemon = &mut fixture.daemon;
+        daemon.platform = Arc::new(RecoveryPlatform {
+            inner: disk_pressure_platform(vec![
+                disk_pressure_sample("/", 1_000_000, 900_000),
+                disk_pressure_sample(&healthy.to_string_lossy(), 1_000_000, 1_000),
+                disk_pressure_sample(&blocked.to_string_lossy(), 1_000_000, 1_000),
+            ])
+            .with_home(fixture.directory.path()),
+            control: thread::current().id(),
+            blocked: blocked.clone(),
+            pause: AtomicBool::new(true),
+            entered,
+            resume: release,
+        });
+        daemon.config.scanner.root_paths = vec![blocked.clone(), healthy.clone()];
+        daemon.config.scanner.excluded_paths.clear();
+        daemon.config.scanner.protected_paths.clear();
+        daemon.config.scanner.catalog_roots_on_pressured_device = false;
+        *daemon.shared_scanner_config.write() = daemon.config.scanner.clone();
+        daemon.behavior_state.mode = mock_behavior_mode(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::None,
+            NotificationPriority::Low,
+        );
+        daemon.enable_background_filesystem_observations();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (scan_tx, scan_rx) = bounded(8);
+        let (del_tx, _del_rx) = bounded(4);
+        daemon.pending_recovery.insert(blocked.clone());
+        loop {
+            if let Ok(response) = daemon.check_pressure() {
+                daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+                if waiting.try_recv().is_ok() {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "recovery probe was not started");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            daemon.mount_controllers[&blocked].state(),
+            MountState::Recovery
+        );
+        let response = daemon.check_pressure().unwrap();
+        daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+        daemon.maybe_write_self_monitor_state(&response);
+        let requests: Vec<_> = scan_rx.try_iter().collect();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.paths.contains(&healthy))
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.paths.contains(&blocked))
+        );
+        assert!(
+            Instant::now() < deadline,
+            "native recovery probe blocked control"
+        );
+
+        // The former pressure tick cannot keep a pending worker's write
+        // permission when observations disappear. Revocation is checked after
+        // the blocked identity call, before it creates a private workspace.
+        daemon.withdraw_pressure_authority();
+        resume.send(()).unwrap();
+        daemon.config.scanner.protected_paths = vec![blocked.to_string_lossy().into_owned()];
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            daemon.check_pressure().unwrap();
+            if daemon.recovery_probe_result(
+                &blocked,
+                None,
+                std::slice::from_ref(&blocked),
+                &[],
+                false,
+            ) == Some(false)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fresh protected-surface refusal missing"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            daemon.mount_controllers[&blocked].state(),
+            MountState::Recovery
+        );
+        assert_eq!(std::fs::read(blocked.join("user-data")).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(blocked).unwrap().count(), 1);
     }
 
     #[cfg(unix)]

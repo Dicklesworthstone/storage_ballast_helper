@@ -1126,8 +1126,33 @@ pending samples before their freshness window expires. On macOS, pressure
 sampling uses native `statfs` and memory-cached APFS geometry; optional metadata
 refresh cannot hold up the sample, and cached free space cannot exceed current
 native headroom. These bounds cover pressure observations and automatic scan
-planning. Startup discovery, configuration-reload discovery, and filesystem
-mutations still include synchronous operations.
+planning.
+
+Startup and reload discovery run as a separate, read-only background job.
+Readiness waits for a healthy pressure observation and the control workers,
+without waiting for optional mount inventories or ballast scans. A complete
+plan is adopted only for the current configuration, within 60 seconds of its
+start, and only if no intervening release or refill changed the active pool
+inventory. An unavailable volume can keep the whole optional plan pending;
+it cannot stall monitoring of healthy roots. `state.json.discovery` reports
+pending discovery, reload progress and errors. Saved release history survives
+this pending window, but its old file and byte counts are reported as unknown.
+
+Configuration loading has its own retained worker, so a blocked discovery job
+cannot prevent a newer policy from being read and applied. While a new policy
+or pool plan is pending, new ballast allocations are deferred. Previously
+verified pools remain available for release unless the new configuration
+disables or redirects them. Blocked jobs keep their slots across reloads.
+Rediscovery also waits for any cancelled allocation worker to exit, so a late
+native write cannot change a pool after its replacement inventory was captured.
+Required configuration, liveness and persisted-state access during initialization,
+state-file writes, emergency release and explicit filesystem mutations still
+include synchronous operations.
+
+Write-recovery probes use at most four retained workers. Pending results keep
+only the affected mounts in Recovery. Each new probe write requires a fresh
+native mount and cleanup-scope binding plus a live permission deadline; expiry,
+reload, missing samples and newer failure incidents discard earlier success.
 
 An `ENOSPC` state-write failure gets a separate bounded inode diagnostic started
 after the failure. Only fresh evidence from the actual destination can preserve
@@ -1865,7 +1890,15 @@ When local snapshots are present, `sbh ballast release` emits a warning for the 
 
 When a mount has been Green for the full `ballast.replenish_cooldown_minutes`, the replenishment controller rebuilds its missing ballast files one per cycle, at most one every five minutes, while the volume stays above the headroom floor. The cooldown is observed on every daemon tick, whatever the mount is doing: a Yellow or Orange excursion of more than three ticks (a compilation burst is forgiven, a real pressure episode is not) restarts it, and any release resets it. The controller also counts the files it released on each mount since the last completed Green cooldown, so the reserve being rebuilt is visible; a reserve that is short for any other reason (an operator deleted files, a floor-limited provision) is rebuilt the same way, up to the configured count.
 
-Automatic refill runs on one background worker across all pools, so writing and syncing a reserve file does not stall the pressure monitor. Each allocation boundary renews permission, file identity and the headroom needed for the remaining bytes. Renewed pressure, missing monitor evidence, a config reload or shutdown cancels the attempt; a cancelled worker keeps its slot until native I/O returns. Emergency release never waits for its pool lock and retries after the writer stops. Only completed files receive replenishment credit, and a late worker result cannot overwrite inventory from a newer release or reload. Startup provisioning also checks shutdown between allocation chunks.
+Automatic refill runs on one background worker across all pools, so writing and syncing a reserve file does not stall the pressure monitor. Each allocation boundary renews permission, file identity and the headroom needed for the remaining bytes. Renewed pressure, missing monitor evidence, a config reload or shutdown cancels the attempt; a cancelled worker keeps its slot until native I/O returns. Emergency release never waits for its pool lock and retries after the writer stops. Only completed files receive replenishment credit, and a late worker result cannot overwrite inventory from a newer release or reload.
+
+When `ballast.auto_provision` is enabled, initial provisioning uses that same
+guarded worker after a complete current discovery plan arrives. It builds each
+pool without waiting for the ordinary Green replenishment cooldown, subject to
+fresh pressure evidence, the allocation floor, and the forecast, RAM, inode,
+recovery and policy guards. Monitoring and service readiness continue during
+the writes. A completed, floor-limited, failed or cancelled initial attempt
+returns that pool to the ordinary paced replenishment policy.
 
 All ballast operations (provision, release, replenish, verify) are serialized per-volume via `flock()` on a lockfile, preventing races between the daemon and CLI commands. Read paths never mutate a pool: `sbh ballast status` opens the configured directory without creating it and reports files outside the configured index range as **orphans** instead of deleting them. Explicit `provision` and `replenish` prune orphans under the lock; background growth retains surplus reserve for emergency release.
 

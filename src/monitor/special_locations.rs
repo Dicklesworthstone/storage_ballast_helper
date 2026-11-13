@@ -67,7 +67,14 @@ impl SpecialLocationRegistry {
     }
 
     pub fn discover(platform: &dyn Platform, custom_paths: &[PathBuf]) -> Result<Self> {
-        let mounts = platform.mount_points()?;
+        Ok(Self::from_mounts(platform.mount_points()?, custom_paths))
+    }
+
+    /// Build the registry from an already observed mount table. An empty table
+    /// retains the conventional scratch paths while discovery is pending;
+    /// each path still requires its own current filesystem observation.
+    #[must_use]
+    pub(crate) fn from_mounts(mounts: Vec<MountPoint>, custom_paths: &[PathBuf]) -> Self {
         let mut locations = Vec::<SpecialLocation>::new();
 
         for mount in mounts {
@@ -131,7 +138,7 @@ impl SpecialLocationRegistry {
             });
         }
 
-        Ok(Self::new(locations))
+        Self::new(locations)
     }
 
     #[must_use]

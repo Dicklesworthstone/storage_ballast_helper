@@ -586,6 +586,10 @@ pub struct DaemonState {
     /// (bd-rc-master-ajg1.7.4).
     #[serde(default)]
     pub logging: LoggingState,
+    /// Optional-volume discovery is independent of service readiness. Pending
+    /// means new pool authority is withheld, not that configured reserve is zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<DiscoveryState>,
     /// Set by the final write on shutdown.
     pub stopped_at: Option<String>,
     /// Why the daemon stopped (final write only).
@@ -629,6 +633,44 @@ pub struct BallastPoolState {
     /// Absent until this daemon has observed the pool, or in older state files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserve: Option<crate::ballast::coordinator::BallastReserveSnapshot>,
+}
+
+impl BallastPoolState {
+    /// Preserve restart credit while its volume is still undiscovered. The
+    /// saved identity is revalidated by discovery before restoration; none of
+    /// the previous process's byte or file counts imply current protection.
+    pub(crate) fn pending_history(&self, config: &crate::core::config::BallastConfig) -> Self {
+        use crate::ballast::coordinator::{
+            BallastRefillBlocker, BallastReserveSnapshot, BallastReserveState,
+        };
+        let mut pending = self.clone();
+        pending.available = 0;
+        pending.releasable_bytes = 0;
+        pending.total = if config.is_volume_enabled(&self.mount) {
+            config.effective_file_count(&self.mount)
+        } else {
+            0
+        };
+        pending.reserve = Some(BallastReserveSnapshot {
+            observed_at: String::new(),
+            mount_point: self.mount.clone().into(),
+            ballast_dir: self.ballast_dir.clone().into(),
+            files_available: 0,
+            files_total: pending.total,
+            releasable_bytes: 0,
+            configured_bytes: config
+                .effective_file_size_bytes(&self.mount)
+                .saturating_mul(u64::try_from(pending.total).unwrap_or(u64::MAX)),
+            state: BallastReserveState::Unknown,
+            inventory_authoritative: false,
+            unreadable_count: 0,
+            headroom: None,
+            headroom_error: None,
+            refill_blockers: vec![BallastRefillBlocker::NotEvaluated],
+            refill_in_progress: false,
+        });
+        pending
+    }
 }
 
 /// One path in the last VOI scan plan, as the dashboard's overlay lists it.
@@ -732,6 +774,16 @@ pub struct LoggingState {
     pub level: Option<String>,
     /// JSONL lines are being mirrored to the RAM fallback right now.
     pub mirroring: bool,
+}
+
+/// Bounded startup/reload discovery status, with no inferred empty inventory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiscoveryState {
+    pub pending: bool,
+    pub generation: u64,
+    pub reload_pending: bool,
+    pub last_error: Option<String>,
 }
 
 /// The daemon's own files against the mounts it reclaims.
@@ -1091,6 +1143,7 @@ pub struct SelfMonitor {
     /// Latest policy engine snapshot.
     policy_snapshot: PolicyStateRecord,
     logging_snapshot: LoggingState,
+    discovery_snapshot: Option<DiscoveryState>,
     pools_snapshot: Vec<BallastPoolState>,
     voi_snapshot: VoiState,
     /// Latest thread health, set by the main loop each tick.
@@ -1149,6 +1202,13 @@ impl SelfMonitor {
     /// Where the daemon's own files live relative to what it reclaims.
     pub fn set_logging_snapshot(&mut self, logging: LoggingState) {
         self.logging_snapshot = logging;
+    }
+
+    pub(crate) fn set_discovery_snapshot(&mut self, discovery: DiscoveryState) {
+        if self.discovery_snapshot.as_ref() != Some(&discovery) {
+            self.discovery_snapshot = Some(discovery);
+            self.force_next_write();
+        }
     }
 
     /// The per-mount pool inventory the next state file write carries.
@@ -1259,6 +1319,7 @@ impl SelfMonitor {
             idle_reason: None,
             policy_snapshot: PolicyStateRecord::default(),
             logging_snapshot: LoggingState::default(),
+            discovery_snapshot: None,
             pools_snapshot: Vec::new(),
             voi_snapshot: VoiState::default(),
             run_id: generate_run_id(),
@@ -1369,6 +1430,7 @@ impl SelfMonitor {
             idle_reason: self.idle_reason.clone(),
             policy: self.policy_snapshot.clone(),
             logging: self.logging_snapshot.clone(),
+            discovery: self.discovery_snapshot.clone(),
             ballast_pools: self.pools_snapshot.clone(),
             voi: self.voi_snapshot.clone(),
             stopped_at: None,

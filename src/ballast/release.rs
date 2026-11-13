@@ -41,6 +41,23 @@ struct PoolIdentity {
     directory_created_at: Option<(u64, u32)>,
 }
 
+/// A completed native inventory observation, bound to the actual pool directory.
+/// Capturing it belongs to a native actuator or its worker, never a state tick.
+#[derive(Clone, Copy)]
+pub(crate) struct BallastInventoryObservation {
+    identity: PoolIdentity,
+    available: usize,
+}
+
+impl BallastInventoryObservation {
+    pub(crate) fn capture(directory: &Path, available: usize) -> Option<Self> {
+        Some(Self {
+            identity: BallastReleaseHistory::pool_identity(directory)?,
+            available,
+        })
+    }
+}
+
 impl BallastReleaseHistory {
     fn pool_identity(directory: &Path) -> Option<PoolIdentity> {
         #[cfg(unix)]
@@ -192,12 +209,37 @@ impl BallastReleaseController {
         directory: &Path,
         available: usize,
     ) -> Option<BallastReleaseHistory> {
-        let state = self.state_for_pool(mount_path, directory)?;
-        state.observe_inventory(available);
-        let identity = state.pool_identity?;
+        let observation = BallastInventoryObservation::capture(directory, available)?;
+        self.observe_pool_inventory(mount_path, observation);
+        self.cached_pool_history(mount_path)
+    }
+
+    /// Reconcile actual completed inventory without repeating native reads.
+    /// Updating the stored baseline makes subsequent observations idempotent;
+    /// a different directory cannot inherit the previous pool's depletion.
+    pub(crate) fn observe_pool_inventory(
+        &mut self,
+        mount_path: &Path,
+        observation: BallastInventoryObservation,
+    ) {
+        let state = self.states.entry(mount_path.to_path_buf()).or_default();
+        if state
+            .pool_identity
+            .is_some_and(|old| old != observation.identity)
+        {
+            *state = MountReleaseState::default();
+        }
+        state.pool_identity = Some(observation.identity);
+        state.observe_inventory(observation.available);
+    }
+
+    /// Last identity-bound observation, without probing a possibly stalled
+    /// directory during state publication. Restore still checks native identity.
+    pub(crate) fn cached_pool_history(&self, mount_path: &Path) -> Option<BallastReleaseHistory> {
+        let state = self.states.get(mount_path)?;
         Some(BallastReleaseHistory {
-            identity,
-            available,
+            identity: state.pool_identity?,
+            available: state.last_available_count?,
             release_credit: state.release_credit,
         })
     }
@@ -614,6 +656,39 @@ mod tests {
             free_pct: 5.0,
             predicted_seconds: None,
         }
+    }
+
+    #[test]
+    fn confirmed_inventory_updates_cached_credit_once_and_rebinds_replaced_pools() {
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("pool");
+        std::fs::create_dir(&directory).unwrap();
+        let mount = Path::new("/test");
+        let mut controller = BallastReleaseController::new(0);
+        controller.pool_history(mount, &directory, 2).unwrap();
+        controller.on_released(mount, 2);
+        let empty = BallastInventoryObservation::capture(&directory, 0).unwrap();
+        controller.observe_pool_inventory(mount, empty);
+        controller.observe_pool_inventory(mount, empty);
+        let saved = controller.cached_pool_history(mount).unwrap();
+        assert_eq!((saved.available, saved.release_credit), (0, 2));
+
+        let refilled = BallastInventoryObservation::capture(&directory, 1).unwrap();
+        controller.observe_pool_inventory(mount, refilled);
+        controller.on_replenished(mount, 1);
+        controller.observe_pool_inventory(mount, refilled);
+        let saved = controller.cached_pool_history(mount).unwrap();
+        assert_eq!((saved.available, saved.release_credit), (1, 1));
+
+        std::fs::rename(&directory, fixture.path().join("old-pool")).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        controller.observe_pool_inventory(
+            mount,
+            BallastInventoryObservation::capture(&directory, 1).unwrap(),
+        );
+        let replacement = controller.cached_pool_history(mount).unwrap();
+        assert_ne!(replacement.identity, saved.identity);
+        assert_eq!((replacement.available, replacement.release_credit), (1, 0));
     }
 
     #[test]

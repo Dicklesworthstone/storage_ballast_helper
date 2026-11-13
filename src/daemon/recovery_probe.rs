@@ -5,22 +5,370 @@
 //! to verified directory descriptors. Namespace uncertainty retains the private
 //! workspace rather than risking cleanup of somebody else's replacement.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+/// Permission expires even if the monitor cannot poll again. Cancellation
+/// never frees a worker slot until its native operation actually returns.
+pub(super) struct ProbePermit {
+    cancelled: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
+impl ProbePermit {
+    pub(super) fn allowed(&self) -> bool {
+        !self.cancelled.load(Ordering::Acquire)
+            && !self.shutdown.load(Ordering::Acquire)
+            && Instant::now() < self.deadline
+    }
+}
+
+struct PendingProbe<K> {
+    key: K,
+    started_at: Instant,
+    cancelled: Arc<AtomicBool>,
+    receiver: Receiver<bool>,
+    worker: JoinHandle<()>,
+}
+
+/// Recovery writes must not hold up pressure control on other filesystems.
+/// Results are single-use and bound to the requesting mount incarnation and
+/// surface. A blocked probe retains one of four slots across invalidation;
+/// neither polling, shutdown nor dropping this coordinator joins workers.
+pub(super) struct BackgroundProbes<K> {
+    pending: HashMap<PathBuf, PendingProbe<K>>,
+    max_workers: usize,
+    max_age: Duration,
+}
+
+impl<K> Default for BackgroundProbes<K> {
+    fn default() -> Self {
+        Self {
+            pending: HashMap::new(),
+            max_workers: 4,
+            // A Recovery mount normally contributes a 30-second cadence.
+            // Permit a completed probe to reach the next tick, but never
+            // treat a delayed native return as a newly collected result.
+            max_age: Duration::from_secs(60),
+        }
+    }
+}
+
+impl<K: PartialEq> BackgroundProbes<K> {
+    pub(super) fn poll_or_start(
+        &mut self,
+        mount: &Path,
+        key: K,
+        permission_deadline: Instant,
+        shutdown: Arc<AtomicBool>,
+        probe: impl FnOnce(&ProbePermit) -> bool + Send + 'static,
+    ) -> Option<bool> {
+        let now = Instant::now();
+        if shutdown.load(Ordering::Acquire) || now >= permission_deadline {
+            self.cancel_mount(mount);
+            return None;
+        }
+        self.pending.retain(|_, pending| {
+            if now.saturating_duration_since(pending.started_at) >= self.max_age {
+                pending.cancelled.store(true, Ordering::Release);
+            }
+            !pending.cancelled.load(Ordering::Acquire) || !pending.worker.is_finished()
+        });
+        if let Some(pending) = self.pending.get(mount) {
+            if pending.key != key {
+                pending.cancelled.store(true, Ordering::Release);
+            }
+            if !pending.worker.is_finished() {
+                return None;
+            }
+            let pending = self.pending.remove(mount).expect("probe exists");
+            if !pending.cancelled.load(Ordering::Acquire) && !shutdown.load(Ordering::Acquire) {
+                return Some(pending.receiver.try_recv().unwrap_or(false));
+            }
+        }
+        if self.pending.len() >= self.max_workers {
+            return None;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let permit = ProbePermit {
+            cancelled: Arc::clone(&cancelled),
+            shutdown,
+            deadline: permission_deadline.min(now + self.max_age),
+        };
+        let (sender, receiver) = sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("sbh-recovery-probe".to_string())
+            .spawn(move || {
+                let success = permit.allowed() && probe(&permit) && permit.allowed();
+                let _ = sender.try_send(success);
+            })
+            .ok()?;
+        self.pending.insert(
+            mount.to_path_buf(),
+            PendingProbe {
+                key,
+                started_at: now,
+                cancelled,
+                receiver,
+                worker,
+            },
+        );
+        None
+    }
+
+    pub(super) fn cancel_mount(&self, mount: &Path) {
+        if let Some(pending) = self.pending.get(mount) {
+            pending.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    pub(super) fn retain_mounts(&self, mut current: impl FnMut(&Path) -> bool) {
+        for (mount, pending) in &self.pending {
+            if !current(mount) {
+                pending.cancelled.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    pub(super) fn cancel_all(&self) {
+        self.retain_mounts(|_| false);
+    }
+}
+
+impl<K> Drop for BackgroundProbes<K> {
+    fn drop(&mut self) {
+        for pending in self.pending.values() {
+            pending.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc::channel;
+
+    fn until_finished<K>(probes: &BackgroundProbes<K>, mount: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !probes.pending[mount].worker.is_finished() {
+            assert!(Instant::now() < deadline, "probe did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn blocked_recovery_probe_retains_its_slot_while_other_mounts_progress() {
+        let mut probes = BackgroundProbes::<u64> {
+            pending: HashMap::new(),
+            max_workers: 2,
+            max_age: Duration::from_secs(60),
+        };
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mount = Path::new("/blocked");
+        let (entered_tx, entered_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        assert_eq!(
+            probes.poll_or_start(mount, 0, deadline, Arc::clone(&shutdown), move |permit| {
+                entered_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                permit.allowed()
+            }),
+            None
+        );
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        for key in 1..100 {
+            probes.cancel_all();
+            assert_eq!(
+                probes.poll_or_start(mount, key, deadline, Arc::clone(&shutdown), |_| {
+                    panic!("a cancelled but blocked worker still owns its slot")
+                }),
+                None
+            );
+            assert_eq!(probes.pending.len(), 1);
+        }
+        let healthy = Path::new("/healthy");
+        assert_eq!(
+            probes.poll_or_start(healthy, 0, deadline, Arc::clone(&shutdown), |_| true),
+            None
+        );
+        until_finished(&probes, healthy);
+        assert_eq!(
+            probes.poll_or_start(healthy, 0, deadline, Arc::clone(&shutdown), |_| false),
+            Some(true)
+        );
+        // Successful evidence is consumed once; another request needs its own
+        // native result, even with identical path and scope.
+        assert_eq!(
+            probes.poll_or_start(healthy, 0, deadline, Arc::clone(&shutdown), |_| false),
+            None
+        );
+        until_finished(&probes, healthy);
+        assert_eq!(
+            probes.poll_or_start(healthy, 0, deadline, Arc::clone(&shutdown), |_| true),
+            Some(false)
+        );
+        resume_tx.send(()).unwrap();
+        until_finished(&probes, mount);
+        assert_eq!(
+            probes.poll_or_start(mount, 99, deadline, shutdown, |_| false),
+            None,
+            "late success from the cancelled worker is never accepted"
+        );
+    }
+
+    #[test]
+    fn recovery_probe_worker_limit_survives_missing_mounts_and_reloads() {
+        let mut probes = BackgroundProbes::<u64>::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut release = Vec::new();
+        for index in 0..4 {
+            let (resume_tx, resume_rx) = channel();
+            release.push(resume_tx);
+            let calls = Arc::clone(&calls);
+            probes.poll_or_start(
+                Path::new(&format!("/blocked-{index}")),
+                0,
+                deadline,
+                Arc::clone(&shutdown),
+                move |permit| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    resume_rx.recv().unwrap();
+                    permit.allowed()
+                },
+            );
+        }
+        let started_deadline = Instant::now() + Duration::from_secs(3);
+        while calls.load(Ordering::SeqCst) != 4 {
+            assert!(Instant::now() < started_deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..100 {
+            probes.retain_mounts(|_| false);
+            probes.cancel_all();
+            assert_eq!(
+                probes.poll_or_start(
+                    Path::new("/another"),
+                    0,
+                    deadline,
+                    Arc::clone(&shutdown),
+                    |_| panic!("all native slots are still occupied"),
+                ),
+                None
+            );
+        }
+        assert_eq!(probes.pending.len(), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        for sender in release {
+            sender.send(()).unwrap();
+        }
+        for mount in probes.pending.keys() {
+            until_finished(&probes, mount);
+        }
+    }
+
+    #[test]
+    fn recovery_probe_rejects_replaced_scope_expired_delivery_and_missing_evidence() {
+        for reason in ["scope", "expired", "missing", "shutdown"] {
+            let mut probes = BackgroundProbes::<u64>::default();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mount = Path::new("/mount");
+            probes.poll_or_start(mount, 0, deadline, Arc::clone(&shutdown), |_| true);
+            until_finished(&probes, mount);
+            let mut current_deadline = deadline;
+            let key = u64::from(reason == "scope");
+            match reason {
+                "expired" => {
+                    probes.pending.get_mut(mount).unwrap().started_at =
+                        Instant::now() - Duration::from_secs(120);
+                }
+                "missing" => current_deadline = Instant::now(),
+                "shutdown" => shutdown.store(true, Ordering::Release),
+                _ => {}
+            }
+            assert_eq!(
+                probes.poll_or_start(mount, key, current_deadline, shutdown, |_| false),
+                None,
+                "{reason} must not admit a completed success"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_recovery_probes_revokes_permission_without_waiting_for_native_io() {
+        let mut probes = BackgroundProbes::<u64>::default();
+        let (entered_tx, entered_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        let (permitted_tx, permitted_rx) = channel();
+        probes.poll_or_start(
+            Path::new("/mount"),
+            0,
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(AtomicBool::new(false)),
+            move |permit| {
+                entered_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                permitted_tx.send(permit.allowed()).unwrap();
+                true
+            },
+        );
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (dropped_tx, dropped_rx) = channel();
+        let dropper = std::thread::spawn(move || {
+            drop(probes);
+            dropped_tx.send(()).unwrap();
+        });
+        let dropped = dropped_rx.recv_timeout(Duration::from_secs(3));
+        resume_tx.send(()).unwrap();
+        dropped.expect("dropping probes must not join a blocked worker");
+        dropper.join().unwrap();
+        assert!(!permitted_rx.recv_timeout(Duration::from_secs(3)).unwrap());
+    }
+}
 
 /// Test allocation and writeback on `mount` through one existing authorized
 /// directory. Admission sees the pinned canonical base, after opening it and
 /// before any write. The base must still have that identity after admission.
 /// This never creates missing bases or follows a workspace/leaf symlink.
+#[cfg(test)]
 pub(super) fn probe_writable_surface(
     mount: &Path,
     base: &Path,
+    admit: impl FnMut(&Path) -> bool,
+) -> bool {
+    probe_writable_surface_guarded(mount, base, admit, || true)
+}
+
+/// As above, with revocable permission checked after potentially blocking
+/// identity reads and immediately before each new allocation or write.
+pub(super) fn probe_writable_surface_guarded(
+    mount: &Path,
+    base: &Path,
     mut admit: impl FnMut(&Path) -> bool,
+    continuing: impl Fn() -> bool,
 ) -> bool {
     #[cfg(unix)]
     {
         for _ in 0..4 {
             let name = format!(".sbh-recovery-{:032x}", rand::random::<u128>());
-            match unix::probe_with_admission(mount, base, &name, &mut admit, &mut |_, _| Ok(())) {
+            match unix::probe_with_admission_and_guard(
+                mount,
+                base,
+                &name,
+                &mut admit,
+                &continuing,
+                &mut |_, _| Ok(()),
+            ) {
                 Ok(()) => return true,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(_) => return false,
@@ -30,7 +378,7 @@ pub(super) fn probe_writable_surface(
     }
     #[cfg(not(unix))]
     {
-        let _ = (mount, base, &mut admit);
+        let _ = (mount, base, &mut admit, continuing);
         false
     }
 }
@@ -56,6 +404,17 @@ mod unix {
             io::ErrorKind::InvalidData,
             "recovery probe identity changed",
         )
+    }
+
+    fn check_permission(continuing: &impl Fn() -> bool) -> io::Result<()> {
+        if continuing() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "recovery probe permission expired or was revoked",
+            ))
+        }
     }
 
     fn same_identity(left: &Stat, right: &Stat) -> bool {
@@ -170,14 +529,25 @@ mod unix {
     }
 
     impl Workspace {
-        fn create(base: Directory, name: &str) -> io::Result<Self> {
-            Self::create_with_mode(base, name, Mode::RUSR | Mode::WUSR | Mode::XUSR)
+        fn create(base: Directory, name: &str, continuing: &impl Fn() -> bool) -> io::Result<Self> {
+            Self::create_guarded(base, name, Mode::RUSR | Mode::WUSR | Mode::XUSR, continuing)
         }
 
+        #[cfg(test)]
         fn create_with_mode(base: Directory, name: &str, mode: Mode) -> io::Result<Self> {
+            Self::create_guarded(base, name, mode, &|| true)
+        }
+
+        fn create_guarded(
+            base: Directory,
+            name: &str,
+            mode: Mode,
+            continuing: &impl Fn() -> bool,
+        ) -> io::Result<Self> {
             // mkdirat is exclusive: a file, link, directory or other existing
             // entry with this name is a collision, never a cleanup target.
             base.current()?;
+            check_permission(continuing)?;
             mkdirat(&base.file, name, mode)?;
             let identity = statat(&base.file, name, AtFlags::SYMLINK_NOFOLLOW)?;
             let mut reservation = EmptyReservation {
@@ -241,8 +611,9 @@ mod unix {
             Ok(())
         }
 
-        fn create_leaf(&mut self) -> io::Result<()> {
+        fn create_leaf(&mut self, continuing: &impl Fn() -> bool) -> io::Result<()> {
             self.current()?;
+            check_permission(continuing)?;
             let file = File::from(openat(
                 &self.directory,
                 LEAF,
@@ -315,6 +686,7 @@ mod unix {
         probe_with_admission(mount, base, name, &mut |_| true, hook)
     }
 
+    #[cfg(test)]
     pub(super) fn probe_with_admission(
         mount: &Path,
         base: &Path,
@@ -322,6 +694,18 @@ mod unix {
         admit: &mut impl FnMut(&Path) -> bool,
         hook: &mut impl FnMut(Step, &Path) -> io::Result<()>,
     ) -> io::Result<()> {
+        probe_with_admission_and_guard(mount, base, name, admit, &|| true, hook)
+    }
+
+    pub(super) fn probe_with_admission_and_guard(
+        mount: &Path,
+        base: &Path,
+        name: &str,
+        admit: &mut impl FnMut(&Path) -> bool,
+        continuing: &impl Fn() -> bool,
+        hook: &mut impl FnMut(Step, &Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        check_permission(continuing)?;
         let mount = Directory::open(mount)?;
         let base = Directory::open(base)?;
         if base.identity.st_dev != mount.identity.st_dev {
@@ -334,21 +718,24 @@ mod unix {
             ));
         }
         mount.current()?;
-        let mut workspace = Workspace::create(base, name)?;
+        let mut workspace = Workspace::create(base, name, continuing)?;
         let path = workspace.base.resolved.join(name);
         hook(Step::WorkspaceCreated, &path)?;
         mount.current()?;
-        workspace.create_leaf()?;
+        workspace.create_leaf(continuing)?;
         hook(Step::FileCreated, &path)?;
         mount.current()?;
         workspace.current()?;
+        check_permission(continuing)?;
         let file = &mut workspace.leaf.as_mut().ok_or_else(changed)?.0;
         file.write_all(&[0_u8; PROBE_BYTES])?;
+        check_permission(continuing)?;
         file.sync_all()?;
         hook(Step::Written, &path)?;
         mount.current()?;
         workspace.current()?;
-        workspace.cleanup()
+        workspace.cleanup()?;
+        check_permission(continuing)
     }
 
     #[cfg(test)]
@@ -419,6 +806,60 @@ mod tests {
     use std::fs;
     use std::io;
     use std::os::unix::fs::{MetadataExt, symlink};
+
+    #[test]
+    fn recovery_probe_revocation_stops_each_new_write_and_preserves_user_files() {
+        use std::cell::Cell;
+
+        for revoke_at in [Step::WorkspaceCreated, Step::FileCreated, Step::Written] {
+            let root = tempfile::tempdir().unwrap();
+            fs::write(root.path().join("user-data"), b"keep").unwrap();
+            let allowed = Cell::new(true);
+            let mut seen = Vec::new();
+            let result = unix::probe_with_admission_and_guard(
+                root.path(),
+                root.path(),
+                ".sbh-recovery-cancelled",
+                &mut |_| true,
+                &|| allowed.get(),
+                &mut |step, path| {
+                    seen.push(step);
+                    if step == revoke_at {
+                        if step == Step::FileCreated {
+                            assert_eq!(fs::metadata(path.join("write-test"))?.len(), 0);
+                        }
+                        allowed.set(false);
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+            assert_eq!(seen.last(), Some(&revoke_at));
+            assert_eq!(fs::read(root.path().join("user-data")).unwrap(), b"keep");
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn recovery_probe_revoked_during_admission_creates_nothing() {
+        use std::cell::Cell;
+
+        let root = tempfile::tempdir().unwrap();
+        let allowed = Cell::new(true);
+        let result = unix::probe_with_admission_and_guard(
+            root.path(),
+            root.path(),
+            ".sbh-recovery-cancelled",
+            &mut |_| {
+                allowed.set(false);
+                true
+            },
+            &|| allowed.get(),
+            &mut |_, _| panic!("revoked admission cannot create a workspace"),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn recovery_probe_is_private_and_never_touches_the_legacy_probe() {

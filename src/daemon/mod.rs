@@ -12,6 +12,8 @@ pub mod control;
 pub mod coverage;
 pub mod cpu_budget;
 #[cfg(feature = "daemon")]
+mod discovery;
+#[cfg(feature = "daemon")]
 pub mod inode_reclaim;
 #[cfg(feature = "daemon")]
 pub mod loop_main;
