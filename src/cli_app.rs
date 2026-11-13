@@ -18,7 +18,8 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use storage_ballast_helper::ballast::coordinator::{
-    BallastReserveSnapshot, BallastReserveState, resolve_configured_pool_alias,
+    BallastRefillBlocker, BallastReserveSnapshot, BallastReserveState,
+    resolve_configured_pool_alias,
 };
 use storage_ballast_helper::ballast::manager::{
     BallastAvailability, BallastHealth, BallastManager,
@@ -35,7 +36,9 @@ use storage_ballast_helper::core::config::{
 use storage_ballast_helper::daemon::loop_main::{
     DaemonArgs as RuntimeDaemonArgs, MonitoringDaemon,
 };
-use storage_ballast_helper::daemon::mount_controller::{MountStateRecord, unprotected_pressure};
+use storage_ballast_helper::daemon::mount_controller::{
+    MountStateRecord, ReclaimCapability, unprotected_pressure,
+};
 use storage_ballast_helper::daemon::process_io_history::ProcessIoHistory;
 use storage_ballast_helper::daemon::self_monitor::{
     BallastPoolState, DAEMON_STATE_STALE_THRESHOLD_SECS, assess_logging_placement,
@@ -10913,28 +10916,239 @@ impl BallastReserveStatus {
     }
 }
 
+fn daemon_reserve_state_is_current(
+    state: &Value,
+    now: chrono::DateTime<chrono::Utc>,
+    current_pid: Option<u32>,
+) -> bool {
+    if state
+        .get("stopped_at")
+        .is_some_and(|value| !value.is_null())
+        || current_pid
+            .is_some_and(|pid| state.get("pid").and_then(Value::as_u64) != Some(u64::from(pid)))
+    {
+        return false;
+    }
+    state
+        .get("last_updated")
+        .and_then(Value::as_str)
+        .and_then(|updated| chrono::DateTime::parse_from_rfc3339(updated).ok())
+        .and_then(|updated| now.signed_duration_since(updated).to_std().ok())
+        .is_some_and(|age| age < Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS))
+}
+
+/// Reserve observations require both a live writer and a fresh document. A
+/// recently copied old state file must not restore a previous daemon's reserve.
+fn read_live_reserve_state(
+    state_path: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+    service_active: Option<bool>,
+) -> Option<Value> {
+    let liveness = detect_daemon_liveness(state_path, service_active);
+    if !liveness.running {
+        return None;
+    }
+    let modified = std::fs::metadata(state_path).ok()?.modified().ok()?;
+    if SystemTime::from(now).duration_since(modified).ok()?
+        >= Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS)
+    {
+        return None;
+    }
+    let state = serde_json::from_str(&std::fs::read_to_string(state_path).ok()?).ok()?;
+    daemon_reserve_state_is_current(&state, now, liveness.lock.as_ref().map(|lock| lock.pid))
+        .then_some(state)
+}
+
+fn reserve_discovery_pending(state: &Value) -> bool {
+    state.get("discovery").is_some_and(|discovery| {
+        discovery.get("pending").and_then(Value::as_bool) == Some(true)
+            || discovery.get("reload_pending").and_then(Value::as_bool) == Some(true)
+    })
+}
+
+/// Controller records retain planning history, not authoritative inventory.
+/// Keep their configuration while deriving every availability claim from the
+/// same per-pool observation used by the reserve summary and dashboard.
+#[derive(Debug, Serialize)]
+struct ControllerReserveView {
+    state: BallastReserveState,
+    inventory_authoritative: bool,
+    present_bytes: Option<u64>,
+    target_bytes: Option<u64>,
+    horizon_minutes: Option<f64>,
+    floor_limited: Option<bool>,
+}
+
+fn controller_reserve_view(
+    controller: &Value,
+    live_state: Option<&Value>,
+    now: chrono::DateTime<chrono::Utc>,
+    current_pid: Option<u32>,
+) -> ControllerReserveView {
+    let state = live_state.filter(|state| daemon_reserve_state_is_current(state, now, current_pid));
+    let mount = controller.get("mount").and_then(Value::as_str);
+    let reserve = state.and_then(|state| {
+        let mount = mount?;
+        let mut matches = state
+            .get("ballast_pools")?
+            .as_array()?
+            .iter()
+            .filter(|pool| {
+                pool.get("mount").and_then(Value::as_str) == Some(mount)
+                    && pool.get("skipped").and_then(Value::as_bool) != Some(true)
+            });
+        let pool: BallastPoolState = serde_json::from_value(matches.next()?.clone()).ok()?;
+        // A controller has only a display path. Distinct native paths can
+        // share that spelling; neither may borrow the other's observation.
+        if matches.next().is_some() {
+            return None;
+        }
+        pool.reserve_status_at(now)
+    });
+    let target_bytes = reserve
+        .as_ref()
+        .map(|reserve| reserve.configured_bytes)
+        .or_else(|| {
+            controller
+                .get("reserve_state")?
+                .get("target_bytes")?
+                .as_u64()
+        });
+    let inventory_authoritative = reserve
+        .as_ref()
+        .is_some_and(|reserve| reserve.inventory_authoritative);
+    let present_bytes = reserve
+        .as_ref()
+        .filter(|reserve| reserve.inventory_authoritative)
+        .map(|reserve| reserve.releasable_bytes);
+    let horizon_minutes = present_bytes.filter(|bytes| *bytes > 0).and_then(|bytes| {
+        let rate = state?
+            .get("rates")?
+            .get(mount?)?
+            .get("bytes_per_sec")?
+            .as_f64()?;
+        if !rate.is_finite() || rate <= 0.0 {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let minutes = bytes as f64 / rate / 60.0;
+        minutes.is_finite().then_some(minutes)
+    });
+    let floor_limited = reserve.as_ref().and_then(|reserve| {
+        if reserve
+            .refill_blockers
+            .contains(&BallastRefillBlocker::SafetyFloor)
+        {
+            Some(true)
+        } else {
+            reserve.headroom.as_ref().map(|_| false)
+        }
+    });
+    ControllerReserveView {
+        state: reserve
+            .as_ref()
+            .map_or(BallastReserveState::Unknown, |reserve| reserve.state),
+        inventory_authoritative,
+        present_bytes,
+        target_bytes,
+        horizon_minutes,
+        floor_limited,
+    }
+}
+
+impl ControllerReserveView {
+    fn summary(&self, controller: &Value) -> String {
+        let available = self.present_bytes.map_or_else(|| "?".into(), format_bytes);
+        let target = self.target_bytes.map_or_else(|| "?".into(), format_bytes);
+        let mut text = format!(
+            "{} {available}/{target}",
+            self.state.as_str().to_ascii_uppercase()
+        );
+        if let Some(minutes) = self.horizon_minutes {
+            text = format!("{text} ({minutes:.0} min)");
+        }
+        if self.floor_limited == Some(true) {
+            text.push_str(" floor");
+        }
+        if let Some(history) = controller.get("reserve_state") {
+            if let Some(eta) = history.get("release_efficiency").and_then(Value::as_f64) {
+                text = format!("{text} (eta {eta:.2})");
+            }
+            if let Some(burst) = history.get("burst") {
+                let recommended = burst.get("recommended_bytes").and_then(Value::as_u64);
+                let windows = burst.get("windows").and_then(Value::as_u64).unwrap_or(0);
+                let method = burst
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("floor");
+                if let Some(recommended) = recommended {
+                    text = format!(
+                        "{text} need {} ({method}, {windows} windows)",
+                        format_bytes(recommended)
+                    );
+                }
+            }
+        }
+        text
+    }
+
+    fn to_controller_json(&self, controller: &Value) -> Value {
+        let mut result = controller.clone();
+        let mut reserve = controller
+            .get("reserve_state")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (field, value) in [
+            ("state", json!(self.state)),
+            (
+                "inventory_authoritative",
+                json!(self.inventory_authoritative),
+            ),
+            ("present_bytes", json!(self.present_bytes)),
+            ("target_bytes", json!(self.target_bytes)),
+            ("horizon_minutes", json!(self.horizon_minutes)),
+            ("floor_limited", json!(self.floor_limited)),
+        ] {
+            reserve.insert(field.into(), value);
+        }
+        // The cached burst runway also used cached available bytes. Preserve
+        // its recommendation/history, but do not publish that old runway.
+        if let Some(Value::Object(burst)) = reserve.get_mut("burst") {
+            burst.insert("horizon_minutes".into(), Value::Null);
+        }
+        if let Some(object) = result.as_object_mut() {
+            object.insert("reserve_state".into(), Value::Object(reserve));
+        }
+        result
+    }
+}
+
+/// Presentation only: the mutation/check gate keeps its existing controller
+/// contract. Unknown reserve cannot prove either protection or exhaustion.
+fn controller_observably_unprotected(
+    record: &MountStateRecord,
+    reserve: &ControllerReserveView,
+) -> bool {
+    record.level != "green"
+        && match record.reclaim_capability {
+            ReclaimCapability::None => true,
+            ReclaimCapability::BallastOnly => reserve.present_bytes == Some(0),
+            _ => false,
+        }
+}
+
 fn daemon_reserve_status(
     state: &Value,
     now: chrono::DateTime<chrono::Utc>,
     current_pid: Option<u32>,
 ) -> Option<BallastReserveStatus> {
-    if state
-        .get("stopped_at")
-        .is_some_and(|value| !value.is_null())
-    {
-        return None;
-    }
-    if current_pid
-        .is_some_and(|pid| state.get("pid").and_then(Value::as_u64) != Some(u64::from(pid)))
-    {
+    if !daemon_reserve_state_is_current(state, now, current_pid) {
         return None;
     }
     let records: Vec<BallastPoolState> =
         serde_json::from_value(state.get("ballast_pools")?.clone()).ok()?;
-    let discovery_pending = state.get("discovery").is_some_and(|discovery| {
-        discovery.get("pending").and_then(Value::as_bool) == Some(true)
-            || discovery.get("reload_pending").and_then(Value::as_bool) == Some(true)
-    });
+    let discovery_pending = reserve_discovery_pending(state);
     let mut pools = Vec::new();
     let mut skipped_pools = Vec::new();
     for record in records {
@@ -11052,18 +11266,17 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     let daemon_state = std::fs::read_to_string(&config.paths.state_file)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-    let reserve_status = daemon_running
-        .then(|| read_fresh_daemon_state(&config.paths.state_file))
-        .flatten()
+    let observation_now = chrono::Utc::now();
+    let live_reserve_state =
+        read_live_reserve_state(&config.paths.state_file, observation_now, service_active);
+    let reserve_status = live_reserve_state
         .as_ref()
-        .and_then(|state| {
-            daemon_reserve_status(
-                state,
-                chrono::Utc::now(),
-                liveness.lock.as_ref().map(|lock| lock.pid),
-            )
-        })
+        .and_then(|state| daemon_reserve_status(state, observation_now, None))
         .unwrap_or_else(|| observe_reserve_status(&config, platform.as_ref()));
+    // The reserve summary and controller projections use one validated
+    // document and clock. Old controller rows may still describe configuration
+    // when the daemon is unavailable, but cannot restore inventory authority.
+    let controller_state = live_reserve_state.as_ref().or(daemon_state.as_ref());
 
     // Open SQLite database for recent activity (optional, read-only).
     let db_stats = if config.paths.sqlite_db.exists() {
@@ -11298,8 +11511,9 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
 
             // Per-mount control state from the daemon: what it is doing on
             // each device and why it is idle on the others.
-            if let Some(state) = &daemon_state
-                && let Some(controllers) = state.get("mount_controllers").and_then(Value::as_array)
+            if let Some(controllers) = controller_state
+                .and_then(|state| state.get("mount_controllers"))
+                .and_then(Value::as_array)
                 && !controllers.is_empty()
             {
                 if let Some(budget) = daemon_state
@@ -11405,56 +11619,18 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     if note == "-" {
                         note.clear();
                     }
-                    let reserve = controller.get("reserve_state").map_or_else(
-                        || "-".to_string(),
-                        |reserve| {
-                            let present = reserve
-                                .get("present_bytes")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            let target = reserve
-                                .get("target_bytes")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            let mut text =
-                                format!("{}/{}", format_bytes(present), format_bytes(target));
-                            if let Some(minutes) =
-                                reserve.get("horizon_minutes").and_then(Value::as_f64)
-                            {
-                                text = format!("{text} ({minutes:.0} min)");
-                            }
-                            if reserve.get("floor_limited") == Some(&Value::Bool(true)) {
-                                text.push_str(" floor");
-                            }
-                            if let Some(eta) =
-                                reserve.get("release_efficiency").and_then(Value::as_f64)
-                            {
-                                text = format!("{text} (eta {eta:.2})");
-                            }
-                            // bd-rc-master-ajg1.2.18: what the observed
-                            // bursts say the reserve should be.
-                            if let Some(burst) = reserve.get("burst") {
-                                let recommended = burst
-                                    .get("recommended_bytes")
-                                    .and_then(Value::as_u64)
-                                    .unwrap_or(0);
-                                let windows =
-                                    burst.get("windows").and_then(Value::as_u64).unwrap_or(0);
-                                let method = burst
-                                    .get("method")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("floor");
-                                text = format!(
-                                    "{text} need {} ({method}, {windows} windows)",
-                                    format_bytes(recommended)
-                                );
-                            }
-                            text
-                        },
+                    let reserve_view = controller_reserve_view(
+                        controller,
+                        live_reserve_state.as_ref(),
+                        observation_now,
+                        None,
                     );
+                    let reserve = reserve_view.summary(controller);
                     let record: Option<MountStateRecord> =
                         serde_json::from_value(controller.clone()).ok();
-                    if record.as_ref().is_some_and(unprotected_pressure) {
+                    if record.as_ref().is_some_and(|record| {
+                        controller_observably_unprotected(record, &reserve_view)
+                    }) {
                         note = if note.is_empty() {
                             "UNPROTECTED".to_string()
                         } else {
@@ -11718,10 +11894,18 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     "path": path,
                     "inodes": inodes,
                 })).collect::<Vec<_>>(),
-                "mount_controllers": daemon_state
-                    .as_ref()
-                    .and_then(|state| state.get("mount_controllers").cloned())
-                    .unwrap_or_else(|| json!([])),
+                "mount_controllers": controller_state
+                    .and_then(|state| state.get("mount_controllers"))
+                    .and_then(Value::as_array)
+                    .map(|controllers| controllers.iter().map(|controller| {
+                        controller_reserve_view(
+                            controller,
+                            live_reserve_state.as_ref(),
+                            observation_now,
+                            None,
+                        ).to_controller_json(controller)
+                    }).collect::<Vec<_>>())
+                    .unwrap_or_default(),
             },
                 "ballast": {
                     "inventory_scope": "configured_directory",
@@ -16317,18 +16501,18 @@ fn unprotected_pressure_at(state_path: &Path, mount: &Path) -> Option<Unprotecte
         })
 }
 
-/// `doctor --system`: every mount the daemon reports at Yellow or worse
-/// must have a reclaim surface and a reserve; each failing mount is its own
-/// FAIL with the exact remediation. Without a fresh state file the check
-/// is a WARN, since nothing is known.
+/// `doctor --system`: evaluate pressured mounts using current per-pool
+/// observations, not the controller's cached actuator inventory.
 fn reclaim_capability_doctor_checks(config: &Config) -> Vec<DoctorCheck> {
-    let Some(state) = read_fresh_daemon_state(&config.paths.state_file) else {
+    let now = chrono::Utc::now();
+    let Some(state) = read_live_reserve_state(&config.paths.state_file, now, None) else {
         return vec![doctor_check(
             "reclaim.capability",
             "Reclaim capability under pressure",
             "WARN",
             format!(
-                "no fresh daemon state at {} (daemon not running, or state older than {}s): \
+                "no live, fresh daemon state at {} (daemon stopped, identity unknown, or \
+                 publication not within {}s): \
                  per-mount reclaim capability is unknown",
                 config.paths.state_file.display(),
                 DAEMON_STATE_STALE_THRESHOLD_SECS
@@ -16338,19 +16522,75 @@ fn reclaim_capability_doctor_checks(config: &Config) -> Vec<DoctorCheck> {
             ),
         )];
     };
-    let records: Vec<MountStateRecord> = state
-        .get("mount_controllers")
-        .cloned()
-        .and_then(|records| serde_json::from_value(records).ok())
-        .unwrap_or_default();
+    reclaim_capability_checks_at(&state, now, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn reclaim_capability_checks_at(
+    state: &Value,
+    now: chrono::DateTime<chrono::Utc>,
+    current_pid: Option<u32>,
+) -> Vec<DoctorCheck> {
+    if !daemon_reserve_state_is_current(state, now, current_pid) {
+        return vec![doctor_check(
+            "reclaim.capability",
+            "Reclaim capability under pressure",
+            "WARN",
+            "daemon publication is stopped, stale, invalid, or from another run; \
+             per-mount reclaim capability and reserve availability are unknown",
+            Some("Start the daemon and wait for fresh inventory observations.".into()),
+        )];
+    }
     let mut checks = Vec::new();
+    if reserve_discovery_pending(state) {
+        checks.push(doctor_check(
+            "reclaim.reserve",
+            "Ballast reserve under pressure",
+            "WARN",
+            "pool discovery is pending; overall reserve availability is unknown, while \
+             existing per-mount observations remain independent",
+            Some("Wait for pool discovery to finish and re-run `sbh doctor --system`.".into()),
+        ));
+    }
+    let Some(controllers) = state
+        .get("mount_controllers")
+        .and_then(Value::as_array)
+        .filter(|controllers| !controllers.is_empty())
+    else {
+        checks.push(doctor_check(
+            "reclaim.capability",
+            "Reclaim capability under pressure",
+            "WARN",
+            "daemon mount-controller inventory is unavailable; pressure and reserve coverage are unknown",
+            Some("Wait for a complete daemon status publication and re-run.".into()),
+        ));
+        return checks;
+    };
     let mut pressured = 0usize;
-    for record in &records {
+    for controller in controllers {
+        let Ok(record) = serde_json::from_value::<MountStateRecord>(controller.clone()) else {
+            checks.push(doctor_check(
+                "reclaim.capability",
+                "Reclaim capability under pressure",
+                "WARN",
+                format!(
+                    "invalid daemon mount-controller record for {}; pressure and reserve coverage are unknown",
+                    controller.get("mount").and_then(Value::as_str).unwrap_or("an unidentified mount")
+                ),
+                Some("Inspect daemon status errors and wait for a complete publication.".into()),
+            ));
+            continue;
+        };
         if record.level == "green" {
             continue;
         }
         pressured += 1;
-        if unprotected_pressure(record) {
+        let reserve = controller_reserve_view(controller, Some(state), now, current_pid);
+        if record.reclaim_capability == ReclaimCapability::None
+            || (record.reclaim_capability == ReclaimCapability::BallastOnly
+                && reserve.state == BallastReserveState::Unconfigured
+                && reserve.present_bytes == Some(0))
+        {
             checks.push(doctor_check(
                 "reclaim.capability",
                 "Reclaim capability under pressure",
@@ -16371,32 +16611,42 @@ fn reclaim_capability_doctor_checks(config: &Config) -> Vec<DoctorCheck> {
             ));
             continue;
         }
-        if let Some(reserve) = record.reserve_state
-            && reserve.target_bytes > 0
-            && reserve.present_bytes == 0
-        {
-            checks.push(doctor_check(
-                "reclaim.reserve",
-                "Ballast reserve under pressure",
-                "FAIL",
-                format!(
-                    "{} is at {} with an empty ballast reserve ({} configured{})",
-                    record.mount,
-                    record.level,
-                    format_bytes(reserve.target_bytes),
-                    if reserve.floor_limited {
-                        ", provisioning stopped at the headroom floor"
-                    } else {
-                        ""
-                    }
-                ),
-                Some(
-                    "Run `sbh ballast provision`; files are created one at a time while the \
-                     volume stays above the headroom floor."
-                        .to_string(),
-                ),
-            ));
-        }
+        let severity = match reserve.state {
+            BallastReserveState::Exhausted | BallastReserveState::Critical => "FAIL",
+            BallastReserveState::Depleted | BallastReserveState::Unknown => "WARN",
+            BallastReserveState::Healthy | BallastReserveState::Unconfigured => continue,
+        };
+        let available = reserve
+            .present_bytes
+            .map_or_else(|| "unknown".into(), format_bytes);
+        let target = reserve
+            .target_bytes
+            .map_or_else(|| "unknown".into(), format_bytes);
+        checks.push(doctor_check(
+            "reclaim.reserve",
+            "Ballast reserve under pressure",
+            severity,
+            format!(
+                "{} is at {} with {} ballast reserve: {available} available of {target} configured{}",
+                record.mount,
+                record.level,
+                reserve.state.as_str(),
+                if reserve.floor_limited == Some(true) {
+                    "; replenishment blocked by the headroom floor"
+                } else {
+                    ""
+                }
+            ),
+            Some(if reserve.state == BallastReserveState::Unknown {
+                "Inspect daemon inventory errors and wait for an authoritative pool \
+                 observation before relying on ballast protection."
+                    .into()
+            } else {
+                "Free space on this volume. Automatic replenishment resumes only when \
+                 the pressure policy and headroom floor permit it."
+                    .into()
+            }),
+        ));
     }
     if checks.is_empty() {
         checks.push(doctor_check(
@@ -16406,12 +16656,12 @@ fn reclaim_capability_doctor_checks(config: &Config) -> Vec<DoctorCheck> {
             if pressured == 0 {
                 format!(
                     "no mount under pressure ({} mount(s) reported by the daemon)",
-                    records.len()
+                    controllers.len()
                 )
             } else {
                 format!(
-                    "{pressured} mount(s) under pressure, each with a reclaim surface and a \
-                     reserve"
+                    "{pressured} mount(s) under pressure, each with reclaim capability; \
+                     observed reserves are healthy or unconfigured"
                 )
             },
             None,
@@ -20722,7 +20972,12 @@ mod tests {
         let write = |controllers: &str| {
             std::fs::write(
                 &state_path,
-                format!(r#"{{"schema_version":2,"mount_controllers":{controllers}}}"#),
+                serde_json::to_vec(&json!({
+                    "schema_version": 2,
+                    "last_updated": chrono::Utc::now().to_rfc3339(),
+                    "mount_controllers": serde_json::from_str::<Value>(controllers).unwrap(),
+                }))
+                .unwrap(),
             )
             .unwrap();
         };
@@ -20754,8 +21009,9 @@ mod tests {
             );
         }
 
-        // doctor --system: one FAIL per unprotected pressured mount, an
-        // empty-reserve FAIL for the ballast-only mount, Yellow counts too.
+        // Doctor still diagnoses missing reclaim surfaces, including Yellow.
+        // Controller-only cached zero cannot establish an exhausted reserve;
+        // the check gate above retains its existing controller contract.
         let mut config = Config::default();
         config.paths.state_file.clone_from(&state_path);
         let checks = reclaim_capability_doctor_checks(&config);
@@ -20764,7 +21020,7 @@ mod tests {
             .filter(|c| c.status == "FAIL")
             .map(|c| (c.id, c.message.as_str()))
             .collect();
-        assert_eq!(fails.len(), 3, "{checks:?}");
+        assert_eq!(fails.len(), 2, "{checks:?}");
         assert!(
             fails
                 .iter()
@@ -20775,11 +21031,20 @@ mod tests {
                 .iter()
                 .any(|(id, m)| *id == "reclaim.capability" && m.starts_with("/srv is at yellow"))
         );
-        assert!(
-            fails
-                .iter()
-                .any(|(id, m)| *id == "reclaim.capability" && m.starts_with("/pool is at red"))
-        );
+        assert!(checks.iter().any(|check| {
+            check.id == "reclaim.reserve"
+                && check.status == "WARN"
+                && check
+                    .message
+                    .starts_with("/pool is at red with unknown ballast reserve")
+        }));
+        assert!(checks.iter().any(|check| {
+            check.id == "reclaim.reserve"
+                && check.status == "WARN"
+                && check
+                    .message
+                    .starts_with("/data is at orange with unknown ballast reserve")
+        }));
         assert!(
             checks
                 .iter()
@@ -24864,6 +25129,418 @@ mod tests {
         }
     }
 
+    fn reserve_controller_fixture(mount: &str) -> Value {
+        json!({
+            "mount": mount,
+            "state": "reclaim",
+            "surface": "configured",
+            "level": "yellow",
+            "urgency": 0.3,
+            "reclaim_capability": "configured",
+            "reserve_state": {
+                "present_bytes": 1000,
+                "target_bytes": 1000,
+                "horizon_minutes": 999.0,
+                "floor_limited": true,
+                "quarantined_bytes": 456,
+                "release_efficiency": 0.8,
+                "burst": {
+                    "recommended_bytes": 2048,
+                    "q99_bytes": 600,
+                    "windows": 20,
+                    "reaction_window_secs": 60.0,
+                    "method": "quantile",
+                    "horizon_minutes": 888.0,
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn controller_reserve_and_doctor_follow_observed_depletion_and_recovery() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:06:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let controller = reserve_controller_fixture("/data");
+        let healthy = reserve_controller_fixture("/healthy");
+        let mut state = json!({
+            "pid": 42,
+            "last_updated": now.to_rfc3339(),
+            "mount_controllers": [controller, healthy],
+            "rates": { "/data": { "bytes_per_sec": 10.0 } },
+            "ballast_pools": [
+                reserve_status_fixture("/data", 0, true),
+                reserve_status_fixture("/healthy", 1000, true),
+            ],
+        });
+        for (bytes, expected_state, severity) in [
+            (0, BallastReserveState::Exhausted, "FAIL"),
+            (100, BallastReserveState::Critical, "FAIL"),
+            (400, BallastReserveState::Depleted, "WARN"),
+            (1000, BallastReserveState::Healthy, "PASS"),
+        ] {
+            let mut pool = reserve_status_fixture("/data", bytes, true);
+            pool.reserve
+                .as_mut()
+                .unwrap()
+                .refill_blockers
+                .push(BallastRefillBlocker::SafetyFloor);
+            state["ballast_pools"][0] = json!(pool);
+            let view = controller_reserve_view(&controller, Some(&state), now, Some(42));
+            assert_eq!(view.state, expected_state);
+            assert!(view.inventory_authoritative);
+            assert_eq!(view.present_bytes, Some(bytes));
+            assert_eq!(view.target_bytes, Some(1000));
+            assert_eq!(view.floor_limited, Some(true));
+            if bytes == 0 {
+                assert!(view.horizon_minutes.is_none());
+                assert!(view.summary(&controller).starts_with("EXHAUSTED 0 B/"));
+            } else {
+                let expected = f64::from(u32::try_from(bytes).unwrap()) / 600.0;
+                assert!((view.horizon_minutes.unwrap() - expected).abs() < 1e-9);
+            }
+            let encoded = view.to_controller_json(&controller);
+            let reserve = &encoded["reserve_state"];
+            assert_eq!(reserve["state"], expected_state.as_str());
+            assert_eq!(reserve["present_bytes"], bytes);
+            assert_eq!(reserve["quarantined_bytes"], 456);
+            assert_eq!(reserve["release_efficiency"], json!(0.8));
+            assert_eq!(reserve["burst"]["recommended_bytes"], 2048);
+            assert_eq!(reserve["burst"]["q99_bytes"], 600);
+            assert_eq!(reserve["burst"]["windows"], 20);
+            assert!(reserve["burst"]["horizon_minutes"].is_null());
+            assert_eq!(controller["reserve_state"]["horizon_minutes"], json!(999.0));
+            assert_eq!(controller["reserve_state"]["present_bytes"], 1000);
+            let sibling = controller_reserve_view(&healthy, Some(&state), now, Some(42));
+            assert_eq!(sibling.state, BallastReserveState::Healthy);
+            assert_eq!(sibling.present_bytes, Some(1000));
+            assert!(
+                sibling.horizon_minutes.is_none(),
+                "borrowed another mount's rate"
+            );
+
+            let checks = reclaim_capability_checks_at(&state, now, Some(42));
+            assert_eq!(checks.len(), 1, "{checks:?}");
+            assert_eq!(checks[0].status, severity, "{checks:?}");
+            if severity != "PASS" {
+                assert_eq!(checks[0].id, "reclaim.reserve");
+                assert!(checks[0].message.starts_with("/data is at yellow"));
+                assert!(checks[0].message.contains(expected_state.as_str()));
+                assert!(checks[0].message.contains("headroom floor"));
+            }
+        }
+        for rate in [json!(0), json!(-1), Value::Null, json!("invalid")] {
+            state["rates"]["/data"]["bytes_per_sec"] = rate;
+            assert!(
+                controller_reserve_view(&controller, Some(&state), now, Some(42))
+                    .horizon_minutes
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn controller_reserve_unknown_inventory_does_not_erase_healthy_siblings() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:06:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let controller = reserve_controller_fixture("/data");
+        let healthy = reserve_controller_fixture("/healthy");
+        for invalid in [
+            "unreadable",
+            "expired",
+            "future",
+            "pending",
+            "malformed_time",
+            "missing",
+            "identity",
+            "duplicate",
+            "skipped",
+        ] {
+            let mut pool = json!(reserve_status_fixture("/data", 1000, true));
+            pool["reserve"]["refill_blockers"] = json!([BallastRefillBlocker::SafetyFloor]);
+            match invalid {
+                "unreadable" => pool["reserve"]["inventory_authoritative"] = json!(false),
+                "expired" => pool["reserve"]["observed_at"] = json!("2026-11-12T12:04:30Z"),
+                "future" => pool["reserve"]["observed_at"] = json!("2026-11-12T12:06:01Z"),
+                "pending" => {
+                    pool["reserve"]["observed_at"] = json!("");
+                    pool["reserve"]["inventory_authoritative"] = json!(false);
+                }
+                "malformed_time" => pool["reserve"]["observed_at"] = json!("invalid"),
+                "missing" => pool["reserve"] = Value::Null,
+                "identity" => pool["ballast_dir"] = json!("/another/pool"),
+                "skipped" => pool["skipped"] = json!(true),
+                "duplicate" => {}
+                _ => unreachable!(),
+            }
+            let mut state = json!({
+                "pid": 42,
+                "last_updated": now.to_rfc3339(),
+                "mount_controllers": [controller, healthy],
+                "rates": { "/data": { "bytes_per_sec": 10.0 } },
+                "ballast_pools": [pool, reserve_status_fixture("/healthy", 1000, true)],
+            });
+            if invalid == "duplicate" {
+                state["ballast_pools"].as_array_mut().unwrap().push(pool);
+            }
+            let view = controller_reserve_view(&controller, Some(&state), now, Some(42));
+            assert_eq!(view.state, BallastReserveState::Unknown, "{invalid}");
+            assert!(!view.inventory_authoritative, "{invalid}");
+            assert!(view.present_bytes.is_none(), "{invalid}");
+            assert!(view.horizon_minutes.is_none(), "{invalid}");
+            assert_eq!(view.target_bytes, Some(1000), "{invalid}");
+            assert_eq!(
+                view.floor_limited,
+                (invalid == "unreadable").then_some(true),
+                "{invalid}"
+            );
+            assert!(
+                view.summary(&controller).starts_with("UNKNOWN ?/"),
+                "{invalid}"
+            );
+            let encoded = view.to_controller_json(&controller);
+            assert!(
+                encoded["reserve_state"]["present_bytes"].is_null(),
+                "{invalid}"
+            );
+            assert!(
+                encoded["reserve_state"]["horizon_minutes"].is_null(),
+                "{invalid}"
+            );
+            assert!(
+                encoded["reserve_state"]["burst"]["horizon_minutes"].is_null(),
+                "{invalid}"
+            );
+            assert_eq!(
+                controller_reserve_view(&healthy, Some(&state), now, Some(42)).state,
+                BallastReserveState::Healthy,
+                "{invalid}"
+            );
+            let checks = reclaim_capability_checks_at(&state, now, Some(42));
+            assert_eq!(checks.len(), 1, "{invalid}: {checks:?}");
+            assert_eq!(checks[0].status, "WARN", "{invalid}");
+            assert!(
+                checks[0]
+                    .message
+                    .contains("/data is at yellow with unknown"),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_reserve_rejects_invalid_document_even_with_fresh_pool_evidence() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:06:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let controller = reserve_controller_fixture("/data");
+        let state = json!({
+            "pid": 42,
+            "last_updated": now.to_rfc3339(),
+            "mount_controllers": [controller],
+            "ballast_pools": [reserve_status_fixture("/data", 1000, true)],
+            "rates": { "/data": { "bytes_per_sec": 10.0 } },
+        });
+        for (field, value) in [
+            ("last_updated", Value::Null),
+            ("last_updated", json!("invalid")),
+            ("last_updated", json!("2026-11-12T12:06:01Z")),
+            ("last_updated", json!("2026-11-12T12:04:30Z")),
+            ("stopped_at", json!("2026-11-12T12:05:50Z")),
+            ("pid", json!(43)),
+        ] {
+            let mut invalid = state.clone();
+            invalid[field] = value;
+            let view = controller_reserve_view(&controller, Some(&invalid), now, Some(42));
+            assert_eq!(view.state, BallastReserveState::Unknown, "{invalid}");
+            assert!(!view.inventory_authoritative);
+            assert!(view.present_bytes.is_none());
+            assert!(view.horizon_minutes.is_none());
+            assert!(view.floor_limited.is_none());
+            assert_eq!(view.target_bytes, Some(1000));
+            assert!(daemon_reserve_status(&invalid, now, Some(42)).is_none());
+            let checks = reclaim_capability_checks_at(&invalid, now, Some(42));
+            assert_eq!(checks.len(), 1);
+            assert_eq!(checks[0].status, "WARN");
+            assert!(checks[0].message.contains("unknown"));
+        }
+        let view = controller_reserve_view(&controller, None, now, Some(42));
+        assert!(view.present_bytes.is_none());
+        assert!(view.to_controller_json(&controller)["reserve_state"]["horizon_minutes"].is_null());
+    }
+
+    #[test]
+    fn doctor_discovery_and_missing_controllers_never_claim_complete_protection() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:06:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let controller = reserve_controller_fixture("/data");
+        let healthy = reserve_controller_fixture("/healthy");
+        let mut state = json!({
+            "pid": 42,
+            "last_updated": now.to_rfc3339(),
+            "mount_controllers": [controller, healthy],
+            "ballast_pools": [
+                reserve_status_fixture("/data", 0, true),
+                reserve_status_fixture("/healthy", 1000, true),
+            ],
+        });
+        for (pending, reload_pending) in [(true, false), (false, true)] {
+            state["discovery"] = json!({ "pending": pending, "reload_pending": reload_pending });
+            let checks = reclaim_capability_checks_at(&state, now, Some(42));
+            assert_eq!(checks.len(), 2, "{checks:?}");
+            assert!(
+                checks.iter().any(|check| check.status == "WARN"
+                    && check.message.contains("discovery is pending"))
+            );
+            assert!(checks.iter().any(|check| check.status == "FAIL"
+                && check.message.contains("/data is at yellow with exhausted")));
+            assert_eq!(
+                controller_reserve_view(&healthy, Some(&state), now, Some(42)).state,
+                BallastReserveState::Healthy
+            );
+        }
+        state["mount_controllers"] = json!([]);
+        state["ballast_pools"] = json!([]);
+        let startup = reclaim_capability_checks_at(&state, now, Some(42));
+        assert!(startup.iter().all(|check| check.status == "WARN"));
+        assert!(
+            startup
+                .iter()
+                .any(|check| check.message.contains("coverage are unknown"))
+        );
+        state["discovery"] = json!({ "pending": false, "reload_pending": false });
+        for controllers in [
+            Value::Null,
+            json!([]),
+            json!("malformed"),
+            json!([7, healthy]),
+        ] {
+            state["mount_controllers"] = controllers;
+            state["ballast_pools"] = json!([reserve_status_fixture("/healthy", 1000, true)]);
+            let checks = reclaim_capability_checks_at(&state, now, Some(42));
+            assert_eq!(checks.len(), 1, "{checks:?}");
+            assert_eq!(checks[0].status, "WARN");
+            assert!(checks[0].message.contains("unknown"));
+        }
+        let malformed = json!(7);
+        assert_eq!(
+            controller_reserve_view(&malformed, Some(&state), now, Some(42))
+                .to_controller_json(&malformed),
+            malformed
+        );
+        let mut alias = reserve_status_fixture("/healthy", 0, true);
+        alias.skipped = true;
+        state["ballast_pools"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(alias));
+        assert_eq!(
+            controller_reserve_view(&healthy, Some(&state), now, Some(42)).state,
+            BallastReserveState::Healthy,
+            "skipped alias contaminated the managed pool"
+        );
+    }
+
+    #[test]
+    fn controller_ballast_only_notes_require_observed_exhaustion() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:06:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut controller = reserve_controller_fixture("/data");
+        controller["reclaim_capability"] = json!("ballast_only");
+        controller["surface"] = json!("ballast_only");
+        controller["reserve_state"]["present_bytes"] = json!(0);
+        let record = serde_json::from_value::<MountStateRecord>(controller.clone()).unwrap();
+        for (bytes, authoritative, unprotected, severity) in [
+            (1000, true, false, "PASS"),
+            (0, false, false, "WARN"),
+            (0, true, true, "FAIL"),
+        ] {
+            let state = json!({
+                "pid": 42,
+                "last_updated": now.to_rfc3339(),
+                "mount_controllers": [controller],
+                "ballast_pools": [reserve_status_fixture("/data", bytes, authoritative)],
+            });
+            let view = controller_reserve_view(&controller, Some(&state), now, Some(42));
+            assert_eq!(
+                controller_observably_unprotected(&record, &view),
+                unprotected
+            );
+            let checks = reclaim_capability_checks_at(&state, now, Some(42));
+            assert_eq!(checks.len(), 1);
+            assert_eq!(checks[0].status, severity);
+            if severity == "FAIL" {
+                assert_eq!(checks[0].id, "reclaim.reserve");
+            }
+        }
+        controller["reserve_state"]["target_bytes"] = json!(0);
+        let view = controller_reserve_view(&controller, None, now, Some(42));
+        assert_eq!(view.state, BallastReserveState::Unknown);
+        assert_eq!(view.target_bytes, Some(0));
+        assert!(
+            view.present_bytes.is_none(),
+            "quarantine-only target invented empty inventory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_reserve_reader_rejects_copied_old_stopped_and_restarted_documents() {
+        use storage_ballast_helper::daemon::self_monitor::DaemonLock;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:06:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let state = json!({
+            "pid": std::process::id(),
+            "last_updated": now.to_rfc3339(),
+            "mount_controllers": [reserve_controller_fixture("/data")],
+            "ballast_pools": [reserve_status_fixture("/data", 1000, true)],
+        });
+        let write = |document: &Value, modified: chrono::DateTime<chrono::Utc>| {
+            std::fs::write(&state_path, serde_json::to_vec(document).unwrap()).unwrap();
+            filetime::set_file_mtime(
+                &state_path,
+                filetime::FileTime::from_system_time(SystemTime::from(modified)),
+            )
+            .unwrap();
+        };
+        let lock = DaemonLock::acquire(&state_path).unwrap();
+        write(&state, now);
+        assert!(read_live_reserve_state(&state_path, now, None).is_some());
+        for (field, value) in [
+            ("last_updated", json!("2026-11-12T12:04:30Z")),
+            ("stopped_at", json!("2026-11-12T12:05:50Z")),
+            ("pid", json!(u64::from(std::process::id()) + 1)),
+        ] {
+            let mut invalid = state.clone();
+            invalid[field] = value;
+            write(&invalid, now);
+            assert!(read_live_reserve_state(&state_path, now, None).is_none());
+        }
+        for modified in [
+            now - chrono::Duration::seconds(90),
+            now + chrono::Duration::seconds(1),
+        ] {
+            write(&state, modified);
+            assert!(read_live_reserve_state(&state_path, now, None).is_none());
+        }
+        write(&state, now);
+        drop(lock);
+        assert!(
+            read_live_reserve_state(&state_path, now, None).is_none(),
+            "released daemon lock retained authority"
+        );
+        let _restarted = DaemonLock::acquire(&state_path).unwrap();
+        write(&state, now);
+        assert!(read_live_reserve_state(&state_path, now, None).is_some());
+    }
+
     #[test]
     fn status_reserve_report_keeps_pool_risk_separate_from_yellow_pressure() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:06:00Z")
@@ -24872,6 +25549,7 @@ mod tests {
         let state = json!({
             "pid": 42,
             "pressure": {"level": "yellow"},
+            "last_updated": now.to_rfc3339(),
             "ballast_pools": [
                 reserve_status_fixture("/healthy", 1000, true),
                 reserve_status_fixture("/empty", 0, true),
@@ -24923,7 +25601,11 @@ mod tests {
         .collect();
         let mut records = skipped.clone();
         records.push(reserve_status_fixture("/healthy", 1000, true));
-        let state = json!({ "pid": 42, "ballast_pools": records });
+        let state = json!({
+            "pid": 42,
+            "last_updated": now.to_rfc3339(),
+            "ballast_pools": records,
+        });
         let report = daemon_reserve_status(&state, now, Some(42)).unwrap();
         assert_eq!(report.pools.len(), 1);
         assert!(report.warning_summary().is_none());
@@ -25007,6 +25689,7 @@ mod tests {
             .with_timezone(&chrono::Utc);
         let state = json!({
             "pid": 42,
+            "last_updated": now.to_rfc3339(),
             "ballast_pools": [
                 reserve_status_fixture("/data", 1000, true),
                 reserve_status_fixture("/healthy", 1000, true),
@@ -25066,6 +25749,7 @@ mod tests {
             .with_timezone(&chrono::Utc);
         let state = json!({
             "pid": 42,
+            "last_updated": now.to_rfc3339(),
             "ballast_pools": [reserve_status_fixture("/data", 0, false)],
         });
         let report = daemon_reserve_status(&state, now, Some(42)).unwrap();
@@ -25091,7 +25775,11 @@ mod tests {
             .with_timezone(&chrono::Utc);
         let mut record = reserve_status_fixture("/data", 0, false);
         record.reserve.as_mut().unwrap().observed_at.clear();
-        let state = json!({ "pid": 42, "ballast_pools": [record] });
+        let state = json!({
+            "pid": 42,
+            "last_updated": now.to_rfc3339(),
+            "ballast_pools": [record],
+        });
         let report = daemon_reserve_status(&state, now, Some(42)).unwrap();
         assert_eq!(report.source, "daemon_observation");
         assert_eq!(report.pools[0].state, BallastReserveState::Unknown);
@@ -25114,6 +25802,7 @@ mod tests {
         for (pending, reload_pending) in [(true, false), (false, true)] {
             let mut state = json!({
                 "pid": 42,
+                "last_updated": now.to_rfc3339(),
                 "discovery": { "pending": pending, "reload_pending": reload_pending },
                 "ballast": { "available": 0, "total": 0 },
                 "ballast_pools": [],

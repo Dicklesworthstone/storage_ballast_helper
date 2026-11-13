@@ -2549,6 +2549,32 @@ The top-level fields of the state document, generated from `DaemonState` by `sbh
 | `exit_reason` | absent or value | Why the daemon stopped (final write only) |
 <!-- sbh-docs:end -->
 
+#### Reserve availability in CLI reports
+
+`sbh status` reports the observed reserve condition separately from disk
+pressure. Its Mount Control table and `sbh doctor --system` use the same
+per-pool evidence: an exhausted reserve has no bytes left to release, while
+unknown inventory cannot establish either available protection or exhaustion.
+The CLI checks the daemon's liveness, document timestamp, pool identity and
+inventory age before using an observation. A healthy pool on another mount
+does not hide an impaired reserve.
+
+In `sbh status --json`,
+`pressure.mount_controllers[].reserve_state` includes `state` and
+`inventory_authoritative`. `present_bytes` is a confirmed byte count or `null`;
+`target_bytes` retains a known configured target or is `null` when unavailable.
+`horizon_minutes` requires a confirmed positive reserve and a usable current
+fill rate, and `floor_limited` is `null` when the current floor result is
+unknown. Consumers must accept these nullable presentation fields. Burst
+sizing history remains available, but its cached `horizon_minutes` is cleared.
+The daemon's internal `state.json` controller schema remains unchanged.
+
+For mounts under pressure, doctor reports confirmed exhausted or critically
+depleted reserves as `FAIL`, and partial depletion or unknown availability as
+`WARN`. Doctor names an observed safety-floor blocker and recommends freeing
+space; rebuilding a reserve continues to obey the existing pressure policy and
+headroom floor.
+
 ### Service Management
 
 `sbh` generates platform-native service configurations for both Linux (systemd) and macOS (launchd), with security hardening appropriate to each platform.

@@ -1993,6 +1993,28 @@ fn yellow_exhausted_reserve_reports_floor_and_dry_run_through_status_and_restart
     assert_eq!(reported["inventory_authoritative"], true, "{reported}");
     assert_eq!(reported["releasable_bytes"], 0, "{reported}");
     assert_eq!(reported["headroom"]["can_allocate"], false, "{reported}");
+    let controller = payload["pressure"]["mount_controllers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|controller| controller["mount"] == mount_key)
+        .unwrap();
+    let controller_reserve = &controller["reserve_state"];
+    assert_eq!(controller_reserve["state"], "exhausted", "{controller}");
+    assert_eq!(controller_reserve["present_bytes"], 0, "{controller}");
+    assert_eq!(
+        controller_reserve["target_bytes"], reported["configured_bytes"],
+        "{controller}"
+    );
+    assert_eq!(
+        controller_reserve["inventory_authoritative"], true,
+        "{controller}"
+    );
+    assert!(
+        controller_reserve["horizon_minutes"].is_null(),
+        "{controller}"
+    );
+    assert_eq!(controller_reserve["floor_limited"], true, "{controller}");
     for reason in ["safety_floor", "dry_run"] {
         assert!(
             reported["refill_blockers"]
@@ -2017,11 +2039,41 @@ fn yellow_exhausted_reserve_reports_floor_and_dry_run_through_status_and_restart
     );
     assert!(human.contains("safety floor 15.000%"), "{human}");
     assert!(human.contains("scanner dry-run is enabled"), "{human}");
+    let control_table = human.split_once("Mount Control:").unwrap().1;
+    assert!(
+        control_table
+            .lines()
+            .any(|line| { line.contains(&mount_key) && line.contains("EXHAUSTED 0 B/") }),
+        "{human}"
+    );
     assert!(
         human.lines().any(|line| {
             line.contains(&mount_key) && line.contains("15.1%") && line.contains("YELLOW")
         }),
         "{human}"
+    );
+
+    let doctor_output = status(&["--json", "doctor", "--system"]);
+    let doctor: Value = serde_json::from_slice(&doctor_output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{error}: {}\n{}",
+            String::from_utf8_lossy(&doctor_output.stdout),
+            String::from_utf8_lossy(&doctor_output.stderr)
+        )
+    });
+    assert!(
+        doctor["system"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| {
+                check["id"] == "reclaim.reserve"
+                    && check["status"] == "FAIL"
+                    && check["message"].as_str().is_some_and(|message| {
+                        message.contains(&mount_key) && message.contains("exhausted")
+                    })
+            }),
+        "{doctor}"
     );
 
     run.wait_until(
