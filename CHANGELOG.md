@@ -51,6 +51,65 @@ host runs a version that has it.
   24 MB/s with 72 minutes to full, forecasts under 30 minutes fell from 45 of
   111 samples to 3.
 
+- **A stalled filesystem no longer stalls pressure control.** Capacity, inode,
+  RAM-classification and mount-ownership probes run on bounded workers, and
+  pressure handling, discovery and the RAM log mirror act only on completed
+  observations. Missing or stale evidence cannot authorize automatic
+  maintenance or widen the scan scope, and a SIGUSR1 scan stays pending until
+  every requested root has evidence. The macOS Full Disk Access checks,
+  startup and reload discovery, and writable-recovery probes also moved off
+  the pressure loop; initial ballast provisioning waits for a complete,
+  current plan. Discovery at startup or reload and filesystem mutations still
+  include synchronous steps.
+
+- **Ballast status reports the reserve that is actually on disk (#41).**
+  `sbh status` (human and JSON), the Prometheus metrics, both cockpit views
+  and `sbh doctor` count a reserve as available only from a fresh inventory
+  observation of that pool. Missing, unreadable, stale or stopped inventory
+  shows as unknown instead of the allocator's bookkeeping, and unknown metric
+  values are omitted rather than reported as zero. Exhausted and depleted
+  reserves are reported per volume and raise a `ballast_reserve_changed`
+  notification once per transition; doctor fails on an exhausted or critical
+  reserve and warns on a depleted or unknown one. A reload keeps a pending
+  observation's original deadline, so a pool whose inventory I/O hangs cannot
+  stay silent through reloads. Release, refill and pressure rules are
+  unchanged. Status JSON fields that can be null are documented.
+
+- **Emergency cleanup asks before it drains quarantine, and `sbh clean` plans
+  each filesystem on its own.** Emergency mode emptied quarantine before its
+  confirmation prompt; it now needs authorization first, and interactive
+  consent covers only the entries shown. `clean` planned every filesystem
+  against the first root's space target and risk budget; each physical
+  filesystem now gets its own plan, aliases of one filesystem share a budget,
+  and APFS volumes are told apart even when their device numbers match. A
+  filesystem whose ownership or capacity cannot be observed is refused rather
+  than planned, and target-driven execution pauses while capacity is
+  unavailable.
+
+- **rch idle floors count activity at the cache root.** Removing or renaming
+  a direct child of an rch pool, per-job target or project Go cache now
+  counts as activity for the pooled and learned repeat-deletion idle windows.
+  A root that is missing, not a real directory, or has an unreadable
+  timestamp is held.
+
+- **Reinstalling keeps the operator's configuration (#42).** An unattended
+  reinstall leaves an existing config byte for byte, comments and unknown
+  keys included. Interactive answers merge into it, an invalid or unreadable
+  config is refused, and the config is written only after the install
+  preflight passes. Explicit ballast count, size and directory overrides now
+  reach the report, the saved config and provisioning alike. A zero ballast
+  count is refused with a pointer to `auto_provision = false`, which is now
+  honored.
+
+- **Homebrew installs reuse the Homebrew binary, and automatic scan roots stay
+  in temp directories.** On macOS the launchd service is registered against
+  the running Homebrew keg's stable `opt` link instead of a second,
+  separately managed copy; a missing, retargeted, non-executable or untrusted
+  link is refused. Newly generated automatic scan roots are limited to the
+  platform's existing temp directories, never a home directory, one of its
+  ancestors or a root alias. Existing configs and interactive choices are
+  kept, and automatic setup is refused when no safe root exists.
+
 ## v0.7.13 **[release]**
 
 Compare: [`v0.7.12...v0.7.13`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.12...v0.7.13)
