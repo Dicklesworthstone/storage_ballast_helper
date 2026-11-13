@@ -27782,6 +27782,112 @@ mod tests {
         assert!(outside_target.join("debug/deps/libfixture.rlib").exists());
     }
 
+    /// bd-i9uh, wired through the scanner thread: a Green pass waits for a
+    /// half-day-idle definite target (a fixture's birth time is now), an
+    /// Orange pass does not, whatever its urgency, and 0 hours turns the
+    /// wait off. trj decided DELETE at Green on a 76 GB target 45 minutes
+    /// idle before this.
+    #[cfg(unix)]
+    #[test]
+    fn scanner_green_pass_waits_for_a_half_day_idle_definite_target() {
+        fn dispatched_in_one_pass(level: PressureLevel, urgency: f64, idle_hours: u64) -> bool {
+            let temp = temp_root_scratch_dir();
+            let root = temp.path().join("scan-root");
+            let project = root.join("proj");
+            let target = project.join("target");
+            for child in ["debug/deps", "debug/incremental", "debug/.fingerprint"] {
+                std::fs::create_dir_all(target.join(child)).unwrap();
+            }
+            std::fs::write(
+                project.join("Cargo.toml"),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+            write_cargo_cachedir_tag(&target);
+            std::fs::write(target.join("debug/deps/libfixture.rlib"), [0xA5_u8; 8192]).unwrap();
+
+            let mut config = Config::default();
+            config.scanner.root_paths = vec![root.clone()];
+            config.scanner.parallelism = 1;
+            config.scanner.min_file_age_minutes = 0;
+            config.scanner.active_reference_min_size_bytes = u64::MAX;
+            config.scanner.min_rescan_interval_secs = 0;
+            config.scanner.max_scan_duty_cycle_pct = 100;
+            config.scanner.scan_time_budget_secs = 30;
+            config.scanner.log_truncation.enabled = false;
+            config.scoring.min_score = 0.0;
+            config.scoring.definite_floor_maintenance_idle_hours = idle_hours;
+
+            let executor_config = Arc::new(SharedExecutorConfig::new(
+                false, 10, 0.0, 60, 3600, false, 0,
+            ));
+            let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+            let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+                sqlite_path: None,
+                jsonl_config: crate::logger::jsonl::JsonlConfig {
+                    path: temp.path().join("activity.jsonl"),
+                    fallback_path: None,
+                    max_size_bytes: 1_048_576,
+                    max_rotated_files: 0,
+                    fsync_interval_secs: 0,
+                },
+                channel_capacity: 64,
+                run_id: None,
+            })
+            .unwrap();
+            let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+            let (del_tx, del_rx) = bounded::<DeletionBatch>(16);
+            let (report_tx, _report_rx) = bounded::<WorkerReport>(2);
+            let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+            let (index_path, cursor_path) = scanner_state_paths(temp.path());
+            let mut request = event_test_request(vec![root]);
+            request.pressure_level = level;
+            request.urgency = urgency;
+            request.maintenance = level == PressureLevel::Green;
+            request.force_full_scan = true;
+            scan_tx.send(request).unwrap();
+            drop(scan_tx);
+            scanner_thread_main(
+                &scan_rx,
+                &del_tx,
+                &logger,
+                &Arc::new(RwLock::new(config.scoring.clone())),
+                &Arc::new(RwLock::new(config.scanner.clone())),
+                &platform,
+                &ThreadHeartbeat::new("definite-idle-test"),
+                &report_tx,
+                &Arc::new(AtomicBool::new(false)),
+                &index_path,
+                &cursor_path,
+                &feedback_rx,
+                &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+                &executor_config,
+                &Arc::new(SharedRegret::new(&config)),
+                None,
+                &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
+            );
+            logger.shutdown();
+            logger_join.join().unwrap();
+            del_rx
+                .try_iter()
+                .flat_map(|batch| batch.candidates.into_iter().map(|candidate| candidate.path))
+                .any(|path| path.ends_with("proj/target"))
+        }
+
+        assert!(
+            dispatched_in_one_pass(PressureLevel::Green, 0.0, 0),
+            "positive control: with the wait off a Green pass nominates the fresh target"
+        );
+        assert!(
+            !dispatched_in_one_pass(PressureLevel::Green, 0.0, 12),
+            "a Green pass must wait 12 h for a definite target created just now"
+        );
+        assert!(
+            dispatched_in_one_pass(PressureLevel::Orange, 0.1, 12),
+            "an Orange pass does not wait, even at a low urgency"
+        );
+    }
+
     /// A pre-scan phase that runs out of *its own* wall budget must hand the
     /// pass over to the general walker, not end it.
     ///

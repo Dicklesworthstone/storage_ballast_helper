@@ -369,6 +369,7 @@ fn strip_escapes(raw: &str) -> String {
 /// file through the daemon (its event and pool count prove it), and `q`
 /// exits cleanly.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn pty_session_walks_the_screens_and_releases_one_ballast_file() {
     if Command::new("setsid").arg("--version").output().is_err() {
         eprintln!("SKIP: util-linux setsid is not installed; the pty session needs it");

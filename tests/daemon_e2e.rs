@@ -197,6 +197,22 @@ impl Default for ScenarioConfig {
     }
 }
 
+/// The latest `logging.on_monitored_fs=true` line the daemon printed.
+fn latest_logging_line(run: &DaemonRun) -> String {
+    run.stderr()
+        .lines()
+        .rfind(|line| line.contains("logging.on_monitored_fs=true"))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Whether that line settles the RAM log mirror: mirroring, or a refusal
+/// other than the pending "RAM log headroom is unavailable" one.
+fn mirror_settled(line: &str) -> bool {
+    line.contains("mirror_to_ram=true")
+        || (line.contains("(not mirroring:") && !line.contains("RAM log headroom is unavailable"))
+}
+
 fn write_config(dir: &Path, scenario: &ScenarioConfig) -> PathBuf {
     let data = dir.join("data");
     fs::create_dir_all(&data).unwrap();
@@ -1383,19 +1399,6 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
     // decides: the RAM headroom check runs off the pressure loop (181e46b6),
     // so a pressured tick can report "RAM log headroom is unavailable" while
     // the observation is pending and mirror on a later tick.
-    fn latest_logging_line(run: &DaemonRun) -> String {
-        run.stderr()
-            .lines()
-            .filter(|line| line.contains("logging.on_monitored_fs=true"))
-            .last()
-            .unwrap_or_default()
-            .to_string()
-    }
-    fn mirror_settled(line: &str) -> bool {
-        line.contains("mirror_to_ram=true")
-            || (line.contains("(not mirroring:")
-                && !line.contains("RAM log headroom is unavailable"))
-    }
     run.wait_until(
         "a settled logging placement in state.json",
         Duration::from_secs(40),
