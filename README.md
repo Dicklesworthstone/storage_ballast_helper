@@ -173,8 +173,9 @@ so its open-file check is never complete and the scanner refuses deletion
 candidates. Ballast release still works. The installer explains this limit
 before service registration; `sbh status` and `sbh doctor --system` also report it.
 
-Under root, `scanner.include_user_temp_dir` adds root's temporary directory,
-not yours: list your `$TMPDIR` in `scanner.root_paths` explicitly.
+When enabled, `scanner.include_user_temp_dir` adds the service user's temporary
+directory. Under root this is root's directory: list your `$TMPDIR` in
+`scanner.root_paths` explicitly if you want the system service to watch it.
 
 Homebrew is supported by the packaged formula skeleton and the
 `Dicklesworthstone/homebrew-sbh` tap. Every release runs
@@ -365,7 +366,7 @@ Running `sbh install --wizard` launches guided setup:
 
 1. **Service manager** -- systemd (Linux default), launchd (macOS default), or none (manual start).
 2. **Service scope** -- system-wide when running as root, user service otherwise. The wizard explains the scanner limitations of non-root services. Explicit service and scope flags are retained without asking those questions again.
-3. **Watched paths** -- auto-detects `/data/projects`, `/tmp`, and `$HOME` if they exist. Custom paths can be added interactively.
+3. **Watched paths** -- suggests existing platform temporary directories, resolving and deduplicating aliases. Home directories, their ancestors, and filesystem-root aliases are excluded from automatic selection. Add project or other custom paths interactively when you want them watched.
 4. **Ballast sizing** -- choose a preset or enter custom file counts:
 
 | Preset | Files | Per-File Size | Total |
@@ -376,8 +377,11 @@ Running `sbh install --wizard` launches guided setup:
 | Custom | user-specified | 1 GiB | varies |
 
 For a first-time non-interactive install (CI, automation), `sbh install --auto`
-applies the platform-native service manager, auto-discovered watched paths, and
-Medium ballast preset. When the selected configuration already exists, `--auto`
+applies the platform-native service manager, temporary-directory watched paths,
+and Medium ballast preset. If no safe temporary directory is available, setup
+asks for explicit paths through the wizard or a configuration file. New wizard
+configurations record the selected roots and disable implicit per-user temp
+expansion. When the selected configuration already exists, `--auto`
 retains its settings, including watched and protected paths, policy mode, and
 `ballast.auto_provision`. Without an interactive wizard or explicit ballast
 options, an existing configuration is kept byte for byte, including comments
@@ -410,14 +414,18 @@ including `--auto --dry-run --json`.
 - **Service control:** use `sbh service --launchd --scope user status` and
   `sbh service --launchd --scope user restart` for user installs; replace
   `--scope user` with `--scope system` for LaunchDaemons.
-- **Per-user temp dir:** the daemon also scans `$TMPDIR`
-  (`/var/folders/<x>/<y>/T`), where cargo test tempdirs and most tools write;
-  `/tmp` and `/var/tmp` resolve to `/private/...` and never reach it. It is
-  added at load unless a configured root already is, contains, or lies inside
-  it. Set `scanner.include_user_temp_dir = false` to opt out.
+- **Per-user temp dir:** `$TMPDIR` (`/var/folders/<x>/<y>/T`) is separate from
+  `/tmp` and `/var/tmp`, which resolve to `/private/...`. The wizard selects
+  existing temporary directories explicitly. Existing configurations with
+  `scanner.include_user_temp_dir = true` also add the service user's temp
+  directory at load unless a configured root already covers it.
 - **Homebrew paths:** Apple Silicon installs normally live under
-  `/opt/homebrew`, Intel installs under `/usr/local`; bootstrap and doctor
-  checks inspect both families and repair stale launchd plist paths.
+  `/opt/homebrew`, Intel installs under `/usr/local`. When run from a Homebrew
+  keg, `sbh install` verifies the current binary and registers launchd against
+  the matching stable `PREFIX/opt/sbh/bin/sbh` link. A missing or retargeted link
+  is refused with repair instructions. This also appears in dry-run JSON;
+  an explicitly supplied offline bundle retains precedence. Use
+  `brew upgrade sbh` to update a reused Homebrew installation.
 
 ## Command Reference
 

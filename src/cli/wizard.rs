@@ -182,6 +182,9 @@ impl WizardAnswers {
 
         // Override scanner root paths with wizard selections.
         config.scanner.root_paths.clone_from(&self.watched_paths);
+        // Detected temporary directories are already in the selected roots.
+        // Reloading must not add unchecked aliases or broaden explicit choices.
+        config.scanner.include_user_temp_dir = false;
 
         // Override ballast settings.
         config.ballast.file_count = self.ballast_file_count;
@@ -231,7 +234,7 @@ impl WizardPlatformDefaults {
             |_| Self {
                 service: ServiceChoice::None,
                 watched_paths: auto_detect_watched_paths_from_candidates(
-                    Vec::<PathBuf>::new(),
+                    [PathBuf::from("/tmp")],
                     std::env::var_os("HOME").map(PathBuf::from),
                 ),
                 is_root: effective_user_is_root(),
@@ -268,7 +271,8 @@ fn effective_user_is_root() -> bool {
 ///
 /// Applies smart defaults without prompting:
 /// - Service: systemd on Linux, launchd on macOS, none on Windows.
-/// - Watched paths: `/data/projects`, `/tmp`, and `$HOME` if set.
+/// - Watched paths: existing platform temporary directories, excluding `/`
+///   and the user's home directory. Broader roots require an explicit choice.
 /// - Ballast: medium preset (10 GB).
 /// - Scope: system service when running as root; user service otherwise.
 #[must_use]
@@ -306,9 +310,6 @@ fn auto_detect_watched_paths() -> Vec<PathBuf> {
 fn auto_detect_watched_paths_for_platform(platform: &dyn Platform) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
-    // Standard defaults.
-    candidates.push(PathBuf::from("/data/projects"));
-
     for path in platform.temp_dirs() {
         candidates.push(path);
     }
@@ -322,19 +323,21 @@ fn auto_detect_watched_paths_from_candidates(
     home: Option<PathBuf>,
 ) -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    // If a supplied HOME cannot be resolved, we cannot rule out a candidate
+    // alias or ancestor of it. Leave the choice to the operator in that case.
+    let Ok(home) = home.map(|path| path.canonicalize()).transpose() else {
+        return paths;
+    };
 
     for path in candidates {
-        push_existing_unique(&mut paths, path);
-    }
-
-    if let Some(home_path) = home {
-        push_existing_unique(&mut paths, home_path);
-    }
-
-    // Guarantee at least the defaults if nothing exists.
-    if paths.is_empty() {
-        paths.push(PathBuf::from("/data/projects"));
-        paths.push(PathBuf::from("/tmp"));
+        let Ok(path) = path.canonicalize() else {
+            continue;
+        };
+        // TMPDIR may name HOME, one of its ancestors, or a symlink to either.
+        // Canonicalization also deduplicates /tmp and /private/tmp on macOS.
+        if path.parent().is_some() && home.as_ref().is_none_or(|home| !home.starts_with(&path)) {
+            push_existing_unique(&mut paths, path);
+        }
     }
 
     paths
@@ -881,6 +884,10 @@ mod tests {
         );
         assert_eq!(config.ballast.file_count, 5);
         assert_eq!(config.ballast.file_size_bytes, 1_073_741_824);
+        assert!(
+            !config.scanner.include_user_temp_dir,
+            "reloading must preserve the exact watched roots selected by the wizard"
+        );
     }
 
     #[test]
@@ -1124,12 +1131,143 @@ mod tests {
     }
 
     #[test]
-    fn auto_detect_watched_paths_not_empty() {
-        let paths = auto_detect_watched_paths();
+    fn auto_detect_watched_paths_are_existing_directories() {
+        for path in auto_detect_watched_paths() {
+            assert!(path.is_dir());
+            assert_eq!(path.canonicalize().unwrap(), path);
+        }
+    }
+
+    #[test]
+    fn automatic_roots_use_temporary_directories_without_adding_home_or_projects() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let scratch = temp.path().join("scratch");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let platform = MockPlatform::healthy()
+            .with_home(&home)
+            .with_temp_dirs(vec![scratch.clone(), home.clone(), PathBuf::from("/")]);
+
+        let answers = auto_answers_for_platform(&platform);
+
         assert!(
-            !paths.is_empty(),
-            "should always return at least default paths"
+            answers
+                .watched_paths
+                .contains(&scratch.canonicalize().unwrap())
         );
+        assert!(
+            !answers
+                .watched_paths
+                .contains(&home.canonicalize().unwrap())
+        );
+        assert!(!answers.watched_paths.contains(&PathBuf::from("/")));
+        assert!(
+            !answers
+                .watched_paths
+                .contains(&PathBuf::from("/data/projects"))
+        );
+        assert_eq!(answers.initial_mode, PolicyConfig::default().initial_mode);
+        assert!(!answers.to_config().scanner.include_user_temp_dir);
+    }
+
+    #[test]
+    fn automatic_roots_exclude_home_ancestors_but_allow_temporary_subdirectories() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let scratch = home.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let paths = auto_detect_watched_paths_from_candidates(
+            [temp.path().to_path_buf(), home.clone(), scratch.clone()],
+            Some(home),
+        );
+
+        assert_eq!(paths, vec![scratch.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn automatic_roots_fail_closed_for_unresolvable_home_but_allow_an_absent_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let ancestor = temp.path().to_path_buf();
+        let unresolved_home = ancestor.join("missing-home");
+
+        assert!(
+            auto_detect_watched_paths_from_candidates([ancestor.clone()], Some(unresolved_home),)
+                .is_empty()
+        );
+        assert_eq!(
+            auto_detect_watched_paths_from_candidates([ancestor.clone()], None),
+            vec![ancestor.canonicalize().unwrap()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_roots_deduplicate_aliases_and_exclude_home_and_root_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let scratch = temp.path().join("scratch");
+        let scratch_alias = temp.path().join("scratch-alias");
+        let home_alias = temp.path().join("home-alias");
+        let root_alias = temp.path().join("root-alias");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        symlink(&scratch, &scratch_alias).unwrap();
+        symlink(&home, &home_alias).unwrap();
+        symlink("/", &root_alias).unwrap();
+
+        let paths = auto_detect_watched_paths_from_candidates(
+            [scratch.clone(), scratch_alias, home_alias, root_alias],
+            Some(home),
+        );
+
+        assert_eq!(paths, vec![scratch.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn automatic_roots_stay_empty_when_no_safe_directory_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let file = temp.path().join("regular-file");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(&file, "not a directory").unwrap();
+
+        let paths = auto_detect_watched_paths_from_candidates(
+            [
+                home.clone(),
+                PathBuf::from("/"),
+                temp.path().join("missing"),
+                file,
+            ],
+            Some(home),
+        );
+
+        assert!(
+            paths.is_empty(),
+            "unsafe defaults must not invent a broad fallback"
+        );
+    }
+
+    #[test]
+    fn interactive_roots_preserve_an_explicit_home_choice() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let defaults = WizardPlatformDefaults {
+            service: ServiceChoice::None,
+            watched_paths: vec![temp.path().join("scratch")],
+            is_root: false,
+        };
+        let input = format!("{}\n", home.display());
+        let mut reader = io::Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+
+        let paths = prompt_watched_paths(&mut reader, &mut output, &defaults).unwrap();
+
+        assert_eq!(paths, vec![home]);
     }
 
     #[test]

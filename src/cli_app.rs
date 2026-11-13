@@ -25,7 +25,10 @@ use storage_ballast_helper::ballast::manager::{
     BallastAvailability, BallastHealth, BallastManager,
 };
 use storage_ballast_helper::cli::RELEASE_REPOSITORY;
-use storage_ballast_helper::cli::update::{UpdateReport, UpdateServiceRestart};
+use storage_ballast_helper::cli::update::{
+    BinaryTrustPolicy, UpdateOptions, UpdateReport, UpdateServiceRestart, UpdateStep,
+    verify_binary_trust,
+};
 use storage_ballast_helper::core::config::{
     Config, PathsConfig, ScannerEngineMode, load_sacred_config, sacred_config_path_for,
     write_sacred_config,
@@ -3233,6 +3236,11 @@ fn install_wizard_config(
             existing.policy.initial_mode = answers.initial_mode;
         }
         config = existing;
+    } else if answers.auto_mode && config.scanner.root_paths.is_empty() {
+        return Err(CliError::User(
+            "no safe temporary directories were found for automatic setup; use --wizard to choose watched paths, or create a configuration with scanner.root_paths before installing"
+                .to_string(),
+        ));
     }
     Ok(config)
 }
@@ -3434,7 +3442,6 @@ fn apply_resolved_service_to_wizard_answers(
 
 fn run_install_auto_dry_run_json(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     use storage_ballast_helper::cli::install::{InstallOptions, run_install_sequence_with_bundle};
-    use storage_ballast_helper::cli::update::run_update_sequence;
     use storage_ballast_helper::cli::wizard::{WizardSummary, auto_answers_for_platform};
 
     let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -3457,8 +3464,7 @@ fn run_install_auto_dry_run_json(cli: &Cli, args: &InstallArgs) -> Result<(), Cl
 
     let preserve_existing_config = should_preserve_install_config(args, &config)?;
     let release_install = if service_kind == ServiceKind::Launchd && !args.from_source {
-        let opts = build_macos_release_install_options(args, &config, service);
-        let report = run_update_sequence(&opts);
+        let report = macos_binary_install_report(args, &config, service)?;
         let install_path = report.install_path.clone();
         let validation = validate_macos_release_install_report(args, &report, install_path);
         Some((report, validation))
@@ -3649,16 +3655,179 @@ fn build_macos_release_install_options(
     }
 }
 
+/// A Homebrew service must use the stable opt link, not a versioned Cellar
+/// path that `brew upgrade` may remove. Only reuse the running installation;
+/// never search PATH or silently switch to a different linked keg.
+fn homebrew_service_binary(executable: &Path) -> Result<Option<PathBuf>, CliError> {
+    let executable = executable.canonicalize().map_err(|error| {
+        CliError::Runtime(format!(
+            "cannot inspect the running executable {}: {error}",
+            executable.display()
+        ))
+    })?;
+    if executable.file_name().is_none_or(|name| name != "sbh") {
+        return Ok(None);
+    }
+    let Some(bin) = executable
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "bin"))
+    else {
+        return Ok(None);
+    };
+    let Some(keg) = bin.parent() else {
+        return Ok(None);
+    };
+    let Some(formula) = keg
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "sbh"))
+    else {
+        return Ok(None);
+    };
+    let Some(cellar) = formula
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "Cellar"))
+    else {
+        return Ok(None);
+    };
+    let Some(prefix) = cellar.parent() else {
+        return Ok(None);
+    };
+    if !executable.is_file() {
+        return Err(CliError::Runtime(format!(
+            "Homebrew executable {} is not a regular file; run `brew reinstall sbh`",
+            executable.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = std::fs::metadata(&executable).map_err(|error| {
+            CliError::Runtime(format!(
+                "cannot inspect Homebrew executable {}: {error}",
+                executable.display()
+            ))
+        })?;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(CliError::Runtime(format!(
+                "Homebrew binary {} is not executable; run `brew reinstall sbh`",
+                executable.display()
+            )));
+        }
+    }
+
+    let linked = prefix.join("opt/sbh/bin/sbh");
+    let resolved = linked.canonicalize().map_err(|error| {
+        CliError::Runtime(format!(
+            "Homebrew service link {} is unavailable: {error}; run `brew link sbh` and retry from that linked binary",
+            linked.display()
+        ))
+    })?;
+    if resolved != executable {
+        return Err(CliError::Runtime(format!(
+            "Homebrew service link {} points to {}, but this process runs {}; retry using {} so the service keeps the selected installation",
+            linked.display(),
+            resolved.display(),
+            executable.display(),
+            linked.display()
+        )));
+    }
+    Ok(Some(linked))
+}
+
+/// Resolve and report the same binary choice for every macOS install flow.
+fn macos_binary_install_report(
+    args: &InstallArgs,
+    config: &Config,
+    service: Option<ResolvedInstallService>,
+) -> Result<UpdateReport, CliError> {
+    use storage_ballast_helper::cli::update::run_update_sequence;
+
+    let executable = std::env::current_exe().map_err(|error| {
+        CliError::Runtime(format!("cannot locate the running sbh executable: {error}"))
+    })?;
+    macos_binary_install_report_with(
+        args,
+        config,
+        service,
+        &executable,
+        verify_binary_trust,
+        run_update_sequence,
+    )
+}
+
+fn macos_binary_install_report_with<F, G>(
+    args: &InstallArgs,
+    config: &Config,
+    service: Option<ResolvedInstallService>,
+    executable: &Path,
+    verify: F,
+    install_release: G,
+) -> Result<UpdateReport, CliError>
+where
+    F: FnOnce(&Path, BinaryTrustPolicy) -> std::result::Result<(), String>,
+    G: FnOnce(&UpdateOptions) -> UpdateReport,
+{
+    // An explicit offline bundle names the artifact to install. Otherwise,
+    // registering a package-managed binary must not create a second install.
+    if args.offline.is_none()
+        && let Some(binary) = homebrew_service_binary(executable)?
+    {
+        let policy = if args.no_verify {
+            BinaryTrustPolicy::BypassNoVerify
+        } else {
+            BinaryTrustPolicy::Enforce
+        };
+        verify(&binary, policy).map_err(|error| {
+            CliError::Runtime(format!(
+                "refusing to register Homebrew binary {}: {error}; run `brew reinstall sbh` to restore the signed release",
+                binary.display()
+            ))
+        })?;
+        let description = if args.no_verify {
+            format!(
+                "Reuse Homebrew binary at {} (verification bypassed via --no-verify)",
+                binary.display()
+            )
+        } else {
+            format!("Reuse verified Homebrew binary at {}", binary.display())
+        };
+        return Ok(UpdateReport {
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            target_version: None,
+            update_available: false,
+            applied: false,
+            check_only: false,
+            dry_run: args.dry_run,
+            artifact_url: None,
+            notices_enabled: config.update.notices_enabled,
+            install_path: Some(binary),
+            backup_id: None,
+            steps: vec![UpdateStep {
+                description,
+                done: !args.dry_run,
+                error: None,
+            }],
+            success: true,
+            follow_up: vec!["Manage this binary with Homebrew (`brew upgrade sbh`).".to_string()],
+            service_restart: None,
+        });
+    }
+
+    Ok(install_release(&build_macos_release_install_options(
+        args, config, service,
+    )))
+}
+
 fn run_macos_release_binary_install(
     cli: &Cli,
     args: &InstallArgs,
     config: &Config,
     service: Option<ResolvedInstallService>,
 ) -> Result<Option<PathBuf>, CliError> {
-    use storage_ballast_helper::cli::update::{format_update_report, run_update_sequence};
+    use storage_ballast_helper::cli::update::format_update_report;
 
-    let opts = build_macos_release_install_options(args, config, service);
-    let report = run_update_sequence(&opts);
+    let report = macos_binary_install_report(args, config, service)?;
     let install_path = report.install_path.clone();
 
     match output_mode(cli) {
@@ -20881,6 +21050,258 @@ mod tests {
         assert_eq!(service.scope_name(), "user");
     }
 
+    #[cfg(unix)]
+    fn homebrew_install_fixture(prefix: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let keg = prefix.join("Cellar/sbh/0.7.13");
+        let executable = keg.join("bin/sbh");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, b"packaged sbh").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(prefix.join("opt")).unwrap();
+        symlink(&keg, prefix.join("opt/sbh")).unwrap();
+        (
+            executable.canonicalize().unwrap(),
+            prefix.canonicalize().unwrap().join("opt/sbh/bin/sbh"),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_homebrew_install_reuses_verified_binary_in_real_and_dry_run_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        for prefix in ["opt/homebrew", "usr/local", "custom prefix"] {
+            let (executable, linked) = homebrew_install_fixture(&temp.path().join(prefix));
+            for dry_run in [false, true] {
+                for no_verify in [false, true] {
+                    let args = InstallArgs {
+                        auto: true,
+                        dry_run,
+                        no_verify,
+                        ..InstallArgs::default()
+                    };
+                    let mut verified = false;
+                    let report = macos_binary_install_report_with(
+                        &args,
+                        &Config::default(),
+                        None,
+                        &executable,
+                        |path, policy| {
+                            verified = true;
+                            assert_eq!(path, linked);
+                            assert_eq!(
+                                policy,
+                                if no_verify {
+                                    BinaryTrustPolicy::BypassNoVerify
+                                } else {
+                                    BinaryTrustPolicy::Enforce
+                                }
+                            );
+                            Ok(())
+                        },
+                        |_| panic!("Homebrew reuse must not download a second binary"),
+                    )
+                    .unwrap();
+
+                    assert!(verified);
+                    assert!(report.success);
+                    assert!(!report.applied);
+                    assert!(!report.update_available);
+                    assert!(report.artifact_url.is_none());
+                    assert!(report.target_version.is_none());
+                    assert_eq!(report.steps[0].done, !dry_run);
+                    assert!(report.steps[0].description.contains("Reuse"));
+                    assert_eq!(
+                        report.steps[0].description.contains("--no-verify"),
+                        no_verify
+                    );
+                    assert_eq!(
+                        validate_macos_release_install_report(
+                            &args,
+                            &report,
+                            report.install_path.clone(),
+                        )
+                        .unwrap(),
+                        Some(linked.clone())
+                    );
+                    assert_eq!(std::fs::read(&executable).unwrap(), b"packaged sbh");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_homebrew_install_refuses_missing_or_changed_opt_link() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = temp.path().join("brew");
+        let (executable, linked) = homebrew_install_fixture(&prefix);
+        let opt = prefix.join("opt/sbh");
+        std::fs::rename(&opt, prefix.join("opt/sbh-unlinked")).unwrap();
+
+        let install = || {
+            macos_binary_install_report_with(
+                &InstallArgs::default(),
+                &Config::default(),
+                None,
+                &executable,
+                |_, _| panic!("a missing or changed link must fail before trust verification"),
+                |_| panic!("an invalid Homebrew link must not trigger a second install"),
+            )
+        };
+        let error = install().unwrap_err().to_string();
+        assert!(error.contains("brew link sbh"));
+
+        let other_keg = prefix.join("Cellar/sbh/0.7.14");
+        std::fs::create_dir_all(other_keg.join("bin")).unwrap();
+        std::fs::write(other_keg.join("bin/sbh"), b"other version").unwrap();
+        symlink(&other_keg, &opt).unwrap();
+        let error = install().unwrap_err().to_string();
+        assert!(error.contains("but this process runs"));
+        assert!(error.contains(linked.to_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_homebrew_install_refuses_untrusted_or_nonexecutable_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (executable, _) = homebrew_install_fixture(temp.path());
+        let error = macos_binary_install_report_with(
+            &InstallArgs::default(),
+            &Config::default(),
+            None,
+            &executable,
+            |_, policy| {
+                assert_eq!(policy, BinaryTrustPolicy::Enforce);
+                Err("wrong Developer ID".to_string())
+            },
+            |_| panic!("failed trust must not fall back to a second install"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("wrong Developer ID"));
+        assert!(error.contains("brew reinstall sbh"));
+
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = homebrew_service_binary(&executable)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not executable"));
+        assert!(error.contains("brew reinstall sbh"));
+        assert_eq!(std::fs::read(executable).unwrap(), b"packaged sbh");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_release_install_still_handles_offline_and_non_homebrew_binaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let (packaged, _) = homebrew_install_fixture(&temp.path().join("brew"));
+        let ordinary = temp.path().join("sbh");
+        std::fs::write(&ordinary, b"standalone sbh").unwrap();
+        let manifest = temp.path().join("bundle.json");
+
+        for (executable, offline) in [(&ordinary, None), (&packaged, Some(manifest))] {
+            let args = InstallArgs {
+                offline: offline.clone(),
+                ..InstallArgs::default()
+            };
+            let mut release_called = false;
+            let report = macos_binary_install_report_with(
+                &args,
+                &Config::default(),
+                None,
+                executable,
+                |_, _| panic!("release installs perform their own trust verification"),
+                |options| {
+                    release_called = true;
+                    assert_eq!(options.offline_bundle_manifest, offline);
+                    applied_update_report()
+                },
+            )
+            .unwrap();
+
+            assert!(release_called);
+            assert!(report.applied);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_auto_dry_run_json_reports_homebrew_reuse_without_a_release_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let (executable, linked) = homebrew_install_fixture(temp.path());
+        let args = InstallArgs {
+            auto: true,
+            dry_run: true,
+            ..InstallArgs::default()
+        };
+        let service = Some(ResolvedInstallService {
+            kind: ServiceKind::Launchd,
+            user_scope: true,
+        });
+        let report = macos_binary_install_report_with(
+            &args,
+            &Config::default(),
+            service,
+            &executable,
+            |_, _| Ok(()),
+            |_| panic!("JSON dry-run must use the same package reuse decision"),
+        )
+        .unwrap();
+        let mut answers = test_wizard_answers(
+            storage_ballast_helper::cli::wizard::ServiceChoice::Launchd,
+            true,
+        );
+        answers.auto_mode = true;
+        let summary = storage_ballast_helper::cli::wizard::WizardSummary {
+            config_path: temp.path().join("config.toml"),
+            config_written: false,
+            answers,
+            warnings: Vec::new(),
+        };
+        let install_report = storage_ballast_helper::cli::install::InstallReport {
+            steps: Vec::new(),
+            success: true,
+            config_path: None,
+            data_dir: None,
+            ballast_dir: None,
+            ballast_files_created: 0,
+            ballast_bytes: 0,
+            dry_run: true,
+        };
+        let payload = build_install_auto_dry_run_json_payload(
+            &args,
+            service,
+            &summary,
+            Some(&report),
+            None,
+            &install_report,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            payload["release_install"]["install_path"],
+            linked.to_str().unwrap()
+        );
+        assert_eq!(payload["release_install"]["applied"], false);
+        assert!(payload["release_install"]["artifact_url"].is_null());
+        assert!(
+            payload["release_install"]["steps"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Reuse verified Homebrew binary")
+        );
+        assert_eq!(payload["release_install"]["steps"][0]["done"], false);
+        assert!(payload["release_error"].is_null());
+        assert_eq!(payload["success"], true);
+    }
+
     #[test]
     fn macos_release_install_defaults_to_user_local_bin() {
         let args = InstallArgs::default();
@@ -21333,6 +21754,45 @@ mod tests {
             assert_eq!(answers.initial_mode, config.policy.initial_mode);
             assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
         }
+    }
+
+    #[test]
+    fn automatic_install_requires_safe_roots_only_for_a_new_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("config.toml");
+        let cli = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            target.to_str().unwrap(),
+            "install",
+            "--auto",
+        ])
+        .unwrap();
+        let mut answers = test_wizard_answers(
+            storage_ballast_helper::cli::wizard::ServiceChoice::Systemd,
+            true,
+        );
+        answers.auto_mode = true;
+        answers.watched_paths.clear();
+
+        let error = install_wizard_config(&cli, &answers)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--wizard"));
+        assert!(error.contains("scanner.root_paths"));
+        assert!(!target.exists());
+
+        let mut existing = Config::default();
+        existing.paths.config_file = target.clone();
+        existing.scanner.root_paths.clear();
+        existing.scanner.include_user_temp_dir = false;
+        let original = toml::to_string_pretty(&existing).unwrap();
+        std::fs::write(&target, &original).unwrap();
+
+        let config = install_wizard_config(&cli, &answers).unwrap();
+        assert!(config.scanner.root_paths.is_empty());
+        assert!(!config.scanner.include_user_temp_dir);
+        assert_eq!(std::fs::read_to_string(target).unwrap(), original);
     }
 
     #[test]

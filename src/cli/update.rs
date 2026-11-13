@@ -143,9 +143,12 @@ pub enum UpdateServiceRestartStatus {
     Failed,
 }
 
+/// Signature policy shared by release replacement and existing-binary installs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BinaryTrustPolicy {
+pub enum BinaryTrustPolicy {
+    /// Require the expected macOS Developer ID signature and team.
     Enforce,
+    /// Honor the operator's explicit `--no-verify` override.
     BypassNoVerify,
 }
 
@@ -1371,6 +1374,11 @@ fn extract_and_install(
     result
 }
 
+/// Verify a binary with the same trust policy used before an update swap.
+///
+/// Existing package-managed binaries must pass this check before the installer
+/// registers them with a service manager. Non-macOS binaries have no additional
+/// platform signature requirement here.
 #[cfg_attr(
     not(target_os = "macos"),
     allow(
@@ -1378,7 +1386,10 @@ fn extract_and_install(
         reason = "the shared update flow needs a fallible trust check on macOS"
     )
 )]
-fn verify_binary_trust(path: &Path, policy: BinaryTrustPolicy) -> std::result::Result<(), String> {
+pub fn verify_binary_trust(
+    path: &Path,
+    policy: BinaryTrustPolicy,
+) -> std::result::Result<(), String> {
     if matches!(policy, BinaryTrustPolicy::BypassNoVerify) {
         return Ok(());
     }
