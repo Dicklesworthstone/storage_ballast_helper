@@ -6,6 +6,51 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+Upgrade note: `scoring.definite_floor_maintenance_idle_hours` is a new key.
+Releases before it reject a config that sets it, so set it only once every
+host runs a version that has it.
+
+### Fixed
+
+- **A Green or Yellow pass no longer deletes a build target in use today
+  (bd-i9uh).** The definite-artifact fast lane (`posterior_floor_definite`)
+  made any definite artifact past `min_file_age_minutes` (30) deletable at
+  Green. trj decided DELETE on a 76 GB shared cargo target written 45 minutes
+  earlier on a disk 70% full, and csd deleted a shared `cargo-target` at 35
+  minutes idle on two days running; it was rebuilt each time. In a Green or
+  Yellow daemon pass the floor now applies only to a candidate idle for
+  `scoring.definite_floor_maintenance_idle_hours` (default 12, rch's per-job
+  idle floor; 0 turns it off; env
+  `SBH_SCORING_DEFINITE_FLOOR_MAINTENANCE_IDLE_HOURS`). The pass's pressure
+  level decides, not its urgency. Orange and above, and an operator's own
+  `sbh scan` or `sbh clean`, still apply the floor at any age past the minimum.
+  A withheld floor shows in the decision summary as
+  `posterior_floor_withheld=idle <N>m below <H>h`.
+
+- **The priority pre-scan no longer follows directory symlinks out of its
+  roots.** It classified a symlinked directory as a directory at depths 1-3.
+  On trj a symlink under `/data/tmp/rch` to a source checkout outside every
+  root got that checkout's `.rch-target` nominated, and only the unit's sandbox
+  stopped the deletion. Without `scanner.follow_symlinks` the pre-scan now
+  treats only real directories as directories, as the walker always did.
+
+- **A repeated Delete verdict is recorded once, and again when it executes
+  (bd-jl92).** A Delete that executor gates held back was written to
+  `decision_log` on every pass until it ran: fmd wrote 45,614 rows in 24 hours,
+  and its database sat at the size cap with about 8 days of history instead of
+  30. Delete verdicts now dedupe like any other verdict (one row per artifact
+  version and verdict per 24 hours), and the executor records the verdict it
+  carried out as a `DecisionExecuted` event, so `sbh explain --id` still shows
+  the evidence each deletion ran on.
+
+- **Time-to-full forecasts are linear (bd-hosd).** The projection
+  extrapolated a noisy acceleration term, so under build traffic it swung
+  between "full in minutes" and "never fills", and fleet daemons logged
+  "Predicted disk full in ~20m" 100-280 times a day on hosts with flat free
+  space. It is now distance over the smoothed rate. On hz4, which filled at
+  24 MB/s with 72 minutes to full, forecasts under 30 minutes fell from 45 of
+  111 samples to 3.
+
 ## v0.7.13 **[release]**
 
 Compare: [`v0.7.12...v0.7.13`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.12...v0.7.13)
