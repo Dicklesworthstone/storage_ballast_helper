@@ -1646,15 +1646,23 @@ TOML
 
   if [[ -f "${installer}" ]]; then
     create_installer_fixture "${installer_fixture}"
+    # Even with --dest, the installer writes its agent skill under
+    # $HOME/.claude/skills and $HOME/.codex/skills. Give it a fixture home so
+    # the suite never overwrites the host user's skills.
+    local installer_home="${installer_fixture}/home"
+    mkdir -p "${installer_home}"
     tally_case run_case installer_help "Usage:" "${installer}" --help
     tally_case run_case installer_dry_run "dry-run complete (no changes applied)" \
+      env HOME="${installer_home}" \
       "${installer}" --dry-run --dest "${installer_fixture}/bin" --no-color
     tally_case run_case installer_first_install "installed sbh to" env \
+      HOME="${installer_home}" \
       SBH_INSTALLER_ASSET_URL="file://${installer_fixture}/artifact.tar.xz" \
       SBH_INSTALLER_CHECKSUM_URL="file://${installer_fixture}/artifact.sha256" \
       "${installer}" --dest "${installer_fixture}/bin" --version "v${EXPECTED_VERSION}" --no-verify --no-color \
       --event-log "${installer_events}" --trace-id "trace-install-1"
     tally_case run_case installer_idempotent_rerun "already up to date" env \
+      HOME="${installer_home}" \
       SBH_INSTALLER_ASSET_URL="file://${installer_fixture}/artifact.tar.xz" \
       SBH_INSTALLER_CHECKSUM_URL="file://${installer_fixture}/artifact.sha256" \
       "${installer}" --dest "${installer_fixture}/bin" --version "v${EXPECTED_VERSION}" --no-verify --no-color \
@@ -1663,6 +1671,8 @@ TOML
     tally_case assert_file_contains installer_events_trace2 "${installer_events}" '"trace_id":"trace-install-2"'
     tally_case assert_file_contains installer_events_download_phase "${installer_events}" '"phase":"download_artifact"'
     tally_case assert_file_contains installer_events_success "${installer_events}" '"status":"success"'
+    tally_case assert_file_contains installer_skill_in_fixture_home \
+      "${installer_home}/.claude/skills/sbh/SKILL.md" 'name: sbh'
   else
     log "SKIP: installer tests (scripts/install.sh not found)"
   fi
