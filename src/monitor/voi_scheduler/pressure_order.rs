@@ -10,19 +10,20 @@
 //! ordinary dirty/index winner. Histories are per path, not a global cursor:
 //! interleaved requests for disjoint mounts cannot consume each other's turn.
 //! No remembered path is ever added to a caller's scope or registered for
-//! maintenance. Configuration reload discards this opportunity history.
+//! maintenance. Callers may reset this history on configuration changes;
+//! scanner checkpoints retain only currently configured roots.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Opportunity {
     last_lead: u64,
     ordinary_due: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PressureOrder {
     history: BTreeMap<PathBuf, Opportunity>,
     sequence: u64,
@@ -31,6 +32,44 @@ pub struct PressureOrder {
 impl PressureOrder {
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// Scheduling hints only: restoring these tickets never supplies a scan
+    /// scope, completed coverage, or permission to remove an artifact.
+    pub(crate) fn opportunities(&self) -> impl Iterator<Item = (&Path, u64, bool)> {
+        self.history
+            .iter()
+            .map(|(path, entry)| (path.as_path(), entry.last_lead, entry.ordinary_due))
+    }
+
+    pub(crate) fn from_opportunities(
+        entries: impl IntoIterator<Item = (PathBuf, u64, bool)>,
+    ) -> Self {
+        let mut order = Self::default();
+        for (path, last_lead, ordinary_due) in entries {
+            order.sequence = order.sequence.max(last_lead);
+            order.history.insert(
+                path,
+                Opportunity {
+                    last_lead,
+                    ordinary_due,
+                },
+            );
+        }
+        order
+    }
+
+    /// Keep the full configured scope, not just the mount admitted this pass.
+    /// Unconfigured and temporary event scopes must not accumulate in storage.
+    pub(crate) fn retain_roots(&mut self, roots: &[PathBuf]) {
+        let roots: BTreeSet<_> = roots.iter().collect();
+        self.history.retain(|path, _| roots.contains(path));
+        self.sequence = self
+            .history
+            .values()
+            .map(|entry| entry.last_lead)
+            .max()
+            .unwrap_or(0);
     }
 
     fn compare(&self, left: &Path, right: &Path) -> Ordering {

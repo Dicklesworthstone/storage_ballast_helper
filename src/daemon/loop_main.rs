@@ -11975,6 +11975,17 @@ fn start_recursive_walk(
     Ok((stream, cancel_token, None))
 }
 
+fn persist_prescan_cursor(cursor: &PrescanCursor, path: &Path, logger: &ActivityLoggerHandle) {
+    if let Err(err) = cursor.save(path) {
+        logger.send(ActivityEvent::Info {
+            message: format!(
+                "prescan_cursor: could not persist {}: {err}",
+                path.display()
+            ),
+        });
+    }
+}
+
 /// Scanner thread: receives scan requests, walks directories, scores candidates,
 /// and sends deletion batches to the executor.
 ///
@@ -12015,8 +12026,14 @@ fn scanner_thread_main(
     // large to enumerate in one pass is covered across passes.
     let mut prescan_cursor = PrescanCursor::load(prescan_cursor_path);
     // Producer-side rankings can be replaced in the queue or deferred by
-    // pacing. Track actual recursive starts independently of those requests.
-    let mut admitted_root_order = PressureOrder::default();
+    // pacing. Restore only actual recursive opportunities, never barren
+    // exclusions or approvals: events while stopped require fresh discovery.
+    let mut admitted_root_order = prescan_cursor.walk_order().clone();
+    admitted_root_order.retain_roots(&shared_scanner_config.read().root_paths);
+    prescan_cursor.remember_walk_order(
+        &admitted_root_order,
+        &shared_scanner_config.read().root_paths,
+    );
     // A budget-truncated pass is normal on a large tree, so the operator-facing
     // `SBH-2007` warning is rate-limited: the activity log has no retention
     // policy (its `activity.sqlite3` grows unbounded), and one warning per
@@ -12179,6 +12196,11 @@ fn scanner_thread_main(
         scan_cursor.reconfigure(&current_scanner_config);
         if request.config_update.is_some() {
             admitted_root_order.reset();
+            if prescan_cursor
+                .remember_walk_order(&admitted_root_order, &current_scanner_config.root_paths)
+            {
+                persist_prescan_cursor(&prescan_cursor, prescan_cursor_path, logger);
+            }
             // A reload's own pass covers the new roots; a waiting routine
             // pass would walk the old ones.
             waiting_maintenance = None;
@@ -13464,16 +13486,8 @@ fn scanner_thread_main(
         // Only a pass over the configured roots owns the resume point, and
         // only a moved cursor is worth a write: this daemon exists to keep
         // disks quiet.
-        if prescan_uses_cursor
-            && prescan_cursor != prescan_cursor_before
-            && let Err(err) = prescan_cursor.save(prescan_cursor_path)
-        {
-            logger.send(ActivityEvent::Info {
-                message: format!(
-                    "prescan_cursor: could not persist {}: {err}",
-                    prescan_cursor_path.display()
-                ),
-            });
+        if prescan_uses_cursor && prescan_cursor != prescan_cursor_before {
+            persist_prescan_cursor(&prescan_cursor, prescan_cursor_path, logger);
         }
 
         // Dispatch priority candidates immediately if any found.
@@ -13763,6 +13777,15 @@ fn scanner_thread_main(
                 None,
             )
         };
+
+        // Only a successfully started, funded recursive walk spends a turn.
+        // Persist it even if shallow discovery did not move, so restarting
+        // between finite slices cannot keep selecting the same leading root.
+        if prescan_cursor
+            .remember_walk_order(&admitted_root_order, &current_scanner_config.root_paths)
+        {
+            persist_prescan_cursor(&prescan_cursor, prescan_cursor_path, logger);
+        }
 
         let mut paths_scanned = 0;
         // Which limit ended the general walk, if any.
@@ -29255,6 +29278,8 @@ mod tests {
         request.free_pct = Some(1.0);
         let heartbeat = ThreadHeartbeat::new("finite-root-turns");
         let mut order = PressureOrder::default();
+        let cursor_path = scratch.path().join("prescan-cursor.json");
+        let mut cursor = PrescanCursor::new();
         let mut budget_at = Instant::now();
         let cpu = Arc::new(Mutex::new(0.0_f64));
         let mut budget = CpuBudget::new(10, budget_at, 0.0);
@@ -29294,6 +29319,13 @@ mod tests {
             )
             .unwrap();
             assert_eq!(stop, None);
+            // Every successful stream start is followed by a daemon restart.
+            // Shallow discovery never moves in this fixture, so only the
+            // admitted recursive opportunity can preserve this rotation.
+            assert!(cursor.remember_walk_order(&order, &roots));
+            cursor.save(&cursor_path).unwrap();
+            cursor = PrescanCursor::load(&cursor_path);
+            order = cursor.walk_order().clone();
             let first = stream.recv_timeout(WALK_STOP_WAIT).unwrap();
             let expected_root = scratch.path().join(expected);
             assert_eq!(first.path.parent(), Some(expected_root.as_path()));

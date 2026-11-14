@@ -42,6 +42,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
+use crate::monitor::voi_scheduler::pressure_order::PressureOrder;
+
 mod checkpoint;
 mod enumeration;
 
@@ -76,6 +78,10 @@ pub struct PrescanCursor {
     /// Resume points survive rotation through a different request's mounts.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     continuations: BTreeMap<PathBuf, PathBuf>,
+    /// Actual recursive leading-root opportunities survive restart alongside
+    /// discovery progress. The checkpoint supplies byte-preserving encoding.
+    #[serde(skip)]
+    walk_order: PressureOrder,
     /// Interior bookkeeping preserves the read-only page-selection API and
     /// Send + Sync. A clone owns its own proof, so a budget rewind is isolated.
     #[serde(skip)]
@@ -93,6 +99,7 @@ impl Default for PrescanCursor {
             root: None,
             after: None,
             continuations: BTreeMap::new(),
+            walk_order: PressureOrder::default(),
             page: Mutex::new(None),
             enumeration: enumeration::shared_cache(),
         }
@@ -105,6 +112,7 @@ impl Clone for PrescanCursor {
             root: self.root.clone(),
             after: self.after.clone(),
             continuations: self.continuations.clone(),
+            walk_order: self.walk_order.clone(),
             page: Mutex::new(self.page_proof().clone()),
             enumeration: Arc::clone(&self.enumeration),
         }
@@ -118,6 +126,7 @@ impl PartialEq for PrescanCursor {
         self.root == other.root
             && self.after == other.after
             && self.continuations == other.continuations
+            && self.walk_order == other.walk_order
     }
 }
 
@@ -142,6 +151,21 @@ impl PrescanCursor {
     /// Failure before publication preserves the previous checkpoint.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         checkpoint::save(self, path)
+    }
+
+    pub(crate) fn walk_order(&self) -> &PressureOrder {
+        &self.walk_order
+    }
+
+    /// A partial request cannot erase another mount's leading-root history.
+    pub(crate) fn remember_walk_order(&mut self, order: &PressureOrder, roots: &[PathBuf]) -> bool {
+        let mut remembered = order.clone();
+        remembered.retain_roots(roots);
+        if self.walk_order == remembered {
+            return false;
+        }
+        self.walk_order = remembered;
+        true
     }
 
     /// Where the next pass will resume: the root, and the entry it will
@@ -282,7 +306,11 @@ impl PrescanCursor {
         // A forced scan must not reuse a page selected before the request.
         // Peers lose only speculative reads, not their completed positions.
         self.clear_enumeration();
-        *self = Self::default();
+        let walk_order = std::mem::take(&mut self.walk_order);
+        *self = Self {
+            walk_order,
+            ..Self::default()
+        };
     }
 }
 

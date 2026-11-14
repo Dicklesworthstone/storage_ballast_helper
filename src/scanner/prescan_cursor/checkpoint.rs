@@ -5,7 +5,7 @@
 //! Unix publication is relative to the opened state directory, so replacing its
 //! pathname cannot redirect writes or staging-file cleanup to another directory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::PrescanCursor;
+use super::{PrescanCursor, PressureOrder};
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MAX_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ROOTS: usize = 8192;
 const MAX_PATH_BYTES: usize = 16 * 1024;
@@ -38,6 +38,9 @@ struct Progress {
     // JSON object keys cannot represent arbitrary Unix names. An ordered
     // sequence preserves both roots and resume points without lossy conversion.
     continuations: Vec<(StoredPath, StoredPath)>,
+    // Omit an absent order so version 1 progress retains its original checksum.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    walk_order: Vec<(StoredPath, u64, bool)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -100,6 +103,9 @@ fn validate(cursor: &PrescanCursor) -> io::Result<()> {
     if cursor.continuations.len() > MAX_ROOTS {
         return Err(invalid("pre-scan continuation count exceeds the limit"));
     }
+    if cursor.walk_order.opportunities().count() > MAX_ROOTS {
+        return Err(invalid("recursive walk root count exceeds the limit"));
+    }
     if let Some(after) = &cursor.after
         && cursor
             .root
@@ -123,6 +129,8 @@ fn validate(cursor: &PrescanCursor) -> io::Result<()> {
         .iter()
         .chain(&cursor.after)
         .chain(cursor.continuations.iter().flat_map(<[_; 2]>::from))
+        .map(PathBuf::as_path)
+        .chain(cursor.walk_order.opportunities().map(|(path, _, _)| path))
     {
         let bytes = path.as_os_str().as_encoded_bytes();
         if bytes.is_empty() || bytes.len() > MAX_PATH_BYTES || bytes.contains(&0) {
@@ -168,12 +176,22 @@ impl Progress {
                     ))
                 })
                 .collect::<io::Result<_>>()?,
+            walk_order: cursor
+                .walk_order
+                .opportunities()
+                .map(|(path, last_lead, ordinary_due)| {
+                    Ok((StoredPath::try_from(path)?, last_lead, ordinary_due))
+                })
+                .collect::<io::Result<_>>()?,
         })
     }
 
     fn into_cursor(self) -> io::Result<PrescanCursor> {
         if self.continuations.len() > MAX_ROOTS {
             return Err(invalid("pre-scan continuation count exceeds the limit"));
+        }
+        if self.walk_order.len() > MAX_ROOTS {
+            return Err(invalid("recursive walk root count exceeds the limit"));
         }
         let mut continuations = BTreeMap::new();
         for (root, after) in self.continuations {
@@ -184,10 +202,20 @@ impl Progress {
                 return Err(invalid("duplicate pre-scan continuation root"));
             }
         }
+        let mut roots = BTreeSet::new();
+        let mut opportunities = Vec::with_capacity(self.walk_order.len());
+        for (path, last_lead, ordinary_due) in self.walk_order {
+            let path = PathBuf::try_from(path)?;
+            if !roots.insert(path.clone()) {
+                return Err(invalid("duplicate recursive walk root"));
+            }
+            opportunities.push((path, last_lead, ordinary_due));
+        }
         let cursor = PrescanCursor {
             root: self.root.map(PathBuf::try_from).transpose()?,
             after: self.after.map(PathBuf::try_from).transpose()?,
             continuations,
+            walk_order: PressureOrder::from_opportunities(opportunities),
             ..PrescanCursor::default()
         };
         validate(&cursor)?;
@@ -224,9 +252,9 @@ fn encode(value: &impl Serialize) -> io::Result<Vec<u8>> {
     Ok(writer.inner)
 }
 
-fn checksum(progress: &Progress) -> io::Result<[u8; 32]> {
+fn checksum(version: u32, progress: &Progress) -> io::Result<[u8; 32]> {
     let mut digest = Sha256::new();
-    digest.update(VERSION.to_le_bytes());
+    digest.update(version.to_le_bytes());
     digest.update(encode(progress)?);
     Ok(digest.finalize().into())
 }
@@ -239,7 +267,9 @@ fn decode(bytes: &[u8]) -> io::Result<PrescanCursor> {
     {
         // Never reinterpret a damaged/newer envelope as an empty legacy cursor.
         let checkpoint: Checkpoint = serde_json::from_value(value).map_err(io::Error::other)?;
-        if checkpoint.version != VERSION || checksum(&checkpoint.progress)? != checkpoint.checksum {
+        if !matches!(checkpoint.version, 1 | VERSION)
+            || checksum(checkpoint.version, &checkpoint.progress)? != checkpoint.checksum
+        {
             return Err(invalid("pre-scan checkpoint version or checksum mismatch"));
         }
         checkpoint.progress.into_cursor()
@@ -459,7 +489,7 @@ pub(super) fn save(cursor: &PrescanCursor, path: &Path) -> io::Result<()> {
     let progress = Progress::from_cursor(cursor)?;
     let checkpoint = Checkpoint {
         version: VERSION,
-        checksum: checksum(&progress)?,
+        checksum: checksum(VERSION, &progress)?,
         progress,
     };
     // Bound serialization and reject invalid progress BEFORE creating anything.
@@ -508,6 +538,63 @@ mod tests {
         assert!(json["progress"]["continuations"].is_array());
     }
 
+    #[test]
+    fn version_one_checkpoint_keeps_its_original_checksum_and_discovery_progress() {
+        let original = br#"{"root":"/root","after":"/root/a","continuations":[]}"#;
+        let mut digest = Sha256::new();
+        digest.update(1_u32.to_le_bytes());
+        digest.update(original);
+        let checksum: [u8; 32] = digest.finalize().into();
+        let envelope = serde_json::json!({
+            "version": 1,
+            "progress": serde_json::from_slice::<serde_json::Value>(original).unwrap(),
+            "checksum": checksum,
+        });
+        let restored = decode(&serde_json::to_vec(&envelope).unwrap()).unwrap();
+        assert_eq!(restored, cursor("/root", "a"));
+        assert_eq!(restored.walk_order.opportunities().count(), 0);
+    }
+
+    #[test]
+    fn recursive_turns_survive_restart_partial_mount_scopes_and_forced_prescans() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cursor.json");
+        let roots: Vec<_> = ["/left/hot", "/left/a", "/right/hot", "/right/a"]
+            .map(PathBuf::from)
+            .into();
+        let mut state = PrescanCursor::new();
+        for expected in ["a", "hot", "a", "hot"] {
+            for scope in roots.chunks_exact(2) {
+                let mut order = state.walk_order().clone();
+                let mut ranked = scope.to_vec();
+                order.reorder(&mut ranked, false, |_| true);
+                assert_eq!(ranked[0].file_name().unwrap(), expected);
+                assert!(state.remember_walk_order(&order, &roots));
+                // An operator's fresh pre-scan must not consume or erase
+                // recursive opportunities already granted to either mount.
+                state.advance(&scope[0], &scope[0].join("examined"));
+                state.reset();
+                save(&state, &path).unwrap();
+                state = read(&path).unwrap();
+            }
+        }
+        assert_eq!(state.walk_order.opportunities().count(), 4);
+
+        let mut order = state.walk_order().clone();
+        let retained = &roots[..2];
+        order.retain_roots(retained);
+        assert!(state.remember_walk_order(&order, retained));
+        assert!(!state.remember_walk_order(&order, retained));
+        save(&state, &path).unwrap();
+        let restored = read(&path).unwrap();
+        let mut order = restored.walk_order().clone();
+        let mut ranked = retained.to_vec();
+        order.reorder(&mut ranked, false, |_| true);
+        assert_eq!(ranked.len(), retained.len());
+        assert!(ranked.iter().all(|root| retained.contains(root)));
+        assert_eq!(restored.walk_order.opportunities().count(), 2);
+    }
+
     #[cfg(unix)]
     #[test]
     fn arbitrary_unix_roots_and_resume_names_survive_restart_byte_for_byte() {
@@ -520,6 +607,10 @@ mod tests {
         let mut expected = PrescanCursor::new();
         expected.advance(&root, &child);
         expected.advance(Path::new("/other"), Path::new("/other/entry"));
+        let roots = vec![root.clone(), PathBuf::from("/other")];
+        let mut order = PressureOrder::default();
+        order.reorder(&mut roots.clone(), false, |_| true);
+        assert!(expected.remember_walk_order(&order, &roots));
         assert!(
             serde_json::to_vec(&expected).is_err(),
             "legacy PathBuf JSON cannot store these names"
@@ -528,6 +619,33 @@ mod tests {
         let restored = read(&checkpoint).unwrap();
         assert_eq!(restored, expected);
         assert_eq!(restored.resume_after(&root), Some(child.as_path()));
+    }
+
+    #[test]
+    fn invalid_recursive_history_cannot_replace_a_good_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cursor.json");
+        let good = cursor("/root", "a");
+        save(&good, &path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let mut too_many = good.clone();
+        too_many.walk_order = PressureOrder::from_opportunities(
+            (0..=MAX_ROOTS).map(|index| (PathBuf::from(format!("/r{index}")), 0, true)),
+        );
+        assert!(save(&too_many, &path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        let mut duplicate = Progress::from_cursor(&good).unwrap();
+        duplicate.walk_order = vec![
+            (StoredPath::Text("/root".into()), 1, false),
+            (StoredPath::Text("/root".into()), 0, true),
+        ];
+        assert!(duplicate.into_cursor().is_err());
+
+        let mut changed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        changed["progress"]["walk_order"] = serde_json::json!([["/root", 10, false]]);
+        assert!(decode(&serde_json::to_vec(&changed).unwrap()).is_err());
+        assert_eq!(read(&path).unwrap(), good);
     }
 
     #[test]
@@ -566,6 +684,7 @@ mod tests {
         let duplicate = Progress {
             root: None,
             after: None,
+            walk_order: Vec::new(),
             continuations: vec![
                 (
                     StoredPath::Text("/r".into()),

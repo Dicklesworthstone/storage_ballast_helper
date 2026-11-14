@@ -27,6 +27,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Finite pressure scans retain root scheduling across daemon restarts**
+  (bd-kf7k). Only a recursive walk that actually starts spends a leading-root
+  opportunity. Those opportunities now share the bounded, checksummed pre-scan
+  checkpoint, preserving turns across interleaved mounts and forced pre-scans.
+  Removed roots cannot reappear. Restarted daemons still discover changed
+  ground afresh; cached approvals and barren
+  subtree exclusions are not restored from disk.
 - **Completed walker pages release their directory handles immediately.**
   Cached names and traversal progress remain reusable across finite scan
   slices, but reaching directory EOF no longer keeps an unnecessary handle
