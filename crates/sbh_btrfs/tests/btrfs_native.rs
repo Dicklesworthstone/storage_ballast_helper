@@ -9,6 +9,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use sbh_btrfs::{
     FileStamp, IdleIoPriority, ZstdConsent, compress_range, discovery_exclusion, inspect, is_btrfs,
-    reclaim_evidence,
+    raw_ranges, reclaim_evidence,
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -51,12 +52,23 @@ fn fixture_with(bytes: Vec<u8>) -> (PathBuf, Vec<u8>, File) {
 
 /// Each FIEMAP extent's (logical, length, flags) as `filefrag -v` sees it,
 /// for failure messages: discovery reads FIEMAP, `inspect` the extent tree.
-fn fiemap_flags_now(path: &std::path::Path) -> String {
+fn fiemap_now(path: &std::path::Path) -> String {
     let output = Command::new("filefrag").arg("-v").arg(path).output();
     match output {
         Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
         Err(error) => format!("filefrag unavailable: {error}"),
     }
+}
+
+/// The longest run of raw (unencoded) bytes FIEMAP reports. Each lone block
+/// btrfs leaves uncompressed is one sector; adjacent ones would merge here.
+fn largest_raw_range(file: &File, size: u64) -> u64 {
+    raw_ranges(file, 0, size, deadline())
+        .unwrap()
+        .iter()
+        .map(|range| range.1)
+        .max()
+        .unwrap_or(0)
 }
 
 fn deadline() -> Instant {
@@ -99,10 +111,23 @@ fn native_compression_preserves_every_byte_size_and_mtime() {
     assert!(stamp.same_contents_and_identity(after.stamp));
     assert!(after.physical_data_bytes < before.physical_data_bytes / 2);
     assert_eq!(
-        discovery_exclusion(&file, deadline()).unwrap(),
-        Some("already_compressed_extents"),
-        "after compression: {after:?}; FIEMAP now: {:?}",
-        fiemap_flags_now(&path),
+        after.exclusion(),
+        Some("already_encoded_or_compressed"),
+        "{after:?}; FIEMAP now: {}",
+        fiemap_now(&path)
+    );
+    // Discovery reads FIEMAP, which cannot tell a lone raw block (btrfs never
+    // compresses one sector; each commit landing mid-defrag can split one off,
+    // about 1 run in 80 under forced commits, twice in one run under a parallel
+    // suite) from a bookend into a raw allocation. It may keep such a file for
+    // the executor, whose inspection (asserted above) excludes it.
+    let discovery = discovery_exclusion(&file, deadline()).unwrap();
+    let largest_raw = largest_raw_range(&file, stamp.size);
+    assert!(
+        discovery == Some("already_compressed_extents")
+            || (discovery.is_none() && largest_raw <= file.metadata().unwrap().blksize()),
+        "discovery {discovery:?} with a {largest_raw}-byte raw range; FIEMAP now: {}",
+        fiemap_now(&path)
     );
     let mut actual = Vec::new();
     File::open(&path).unwrap().read_to_end(&mut actual).unwrap();
@@ -320,4 +345,45 @@ fn a_committed_large_extent_is_compressed_completely() {
     );
     assert!(before.stamp.same_contents_and_identity(after.stamp));
     assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+#[ignore = "requires an explicitly supplied disposable Btrfs mount and root"]
+fn a_lone_raw_tail_block_leaves_a_compressed_file_excluded() {
+    // Btrfs compresses in 128 KiB chunks and never compresses a final chunk
+    // of one sector or less, so these files keep their last block raw. That
+    // block kept them eligible, and every pass re-hashed them and rewrote it
+    // for nothing (bd-rxq5).
+    for tail in [1_u64, 4096] {
+        let size = 4 * 1024 * 1024 + tail;
+        let (path, bytes, file) = fixture_with((0..size).map(|i| (i % 251) as u8).collect());
+        let before = inspect(&file, deadline()).unwrap();
+        assert_eq!(before.exclusion(), None);
+        compress_range(
+            &file,
+            0,
+            size,
+            before.inode_flags,
+            consent(),
+            deadline(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let after = inspect(&file, deadline()).unwrap();
+        let largest_raw = largest_raw_range(&file, size);
+        assert!(
+            largest_raw <= file.metadata().unwrap().blksize(),
+            "tail {tail}: a {largest_raw}-byte raw range; FIEMAP: {}",
+            fiemap_now(&path)
+        );
+        assert!(after.encoded && !after.raw, "tail {tail}: {after:?}");
+        assert_eq!(
+            after.exclusion(),
+            Some("already_encoded_or_compressed"),
+            "tail {tail}"
+        );
+        assert!(after.physical_data_bytes < before.physical_data_bytes / 4);
+        assert!(before.stamp.same_contents_and_identity(after.stamp));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
 }

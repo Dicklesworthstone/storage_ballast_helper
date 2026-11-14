@@ -271,3 +271,30 @@ fn budgets_and_byte_sums_cannot_wrap() {
     assert_eq!(checked_sum([4096, 8192].into_iter()).unwrap(), 12_288);
     assert!(checked_sum([u64::MAX, 1].into_iter()).is_err());
 }
+
+#[test]
+fn a_raw_allocation_of_one_sector_cannot_shrink_but_a_bookend_into_a_larger_one_can() {
+    let sector = 4096;
+    let raw = |disk_num_bytes| ParsedExtent {
+        extent: Some(DataExtent {
+            bytenr: 1_048_576,
+            disk_num_bytes,
+        }),
+        ..ParsedExtent::default()
+    };
+    // The lone tail block btrfs wrote raw because one sector cannot shrink.
+    assert!(!raw(4096).shrinkable_raw(sector));
+    // Two sectors can still compress into one.
+    assert!(raw(8192).shrinkable_raw(sector));
+    // A one-block reference into a large original allocation keeps all of it.
+    let bookend = parse_file_extent(&regular_item(1_048_576, 4 * 1_048_576, 4096, 0)).unwrap();
+    assert!(bookend.shrinkable_raw(sector));
+    let compressed = parse_file_extent(&regular_item(1_048_576, 131_072, 131_072, 3)).unwrap();
+    assert!(!compressed.shrinkable_raw(sector));
+    let preallocated = ParsedExtent {
+        preallocated: true,
+        ..raw(1_048_576)
+    };
+    assert!(!preallocated.shrinkable_raw(sector));
+    assert!(!ParsedExtent::default().shrinkable_raw(sector), "a hole");
+}

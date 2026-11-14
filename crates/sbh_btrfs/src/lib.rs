@@ -131,8 +131,10 @@ pub struct ExtentMap {
     /// At least one extent uses compression or another encoding.
     pub encoded: bool,
     /// At least one written data extent is stored raw (neither compressed nor
-    /// otherwise encoded). With `encoded`, the file is part-compressed: a pass
-    /// stopped inside it, and a later one finishes it.
+    /// otherwise encoded) in an allocation larger than one sector. With
+    /// `encoded`, the file is part-compressed: a pass stopped inside it, and a
+    /// later one finishes it. A raw allocation of at most one sector does not
+    /// count, because compression can never shrink it (see [`inspect`]).
     pub raw: bool,
     /// At least one extent is encrypted or encoded beyond compression.
     pub foreign_encoding: bool,
@@ -215,6 +217,8 @@ pub fn inspect(file: &File, deadline: Instant) -> io::Result<ExtentMap> {
     }
     let inode_flags = ioctl::inode_flags(file)?;
     let fiemap_flags = ioctl::fiemap_flags(file, 0, stamp.size, deadline)?;
+    // st_blksize is the filesystem's sector size on Btrfs.
+    let sector = file.metadata()?.blksize();
     let mut allocations = BTreeMap::new();
     let mut inline_bytes = 0_u64;
     let mut encoded = false;
@@ -224,7 +228,7 @@ pub fn inspect(file: &File, deadline: Instant) -> io::Result<ExtentMap> {
     ioctl::visit_items(file, 0, stamp.inode, 108, deadline, |_, item| {
         let parsed = parse_file_extent(item)?;
         encoded |= parsed.encoded;
-        raw |= parsed.extent.is_some() && !parsed.encoded && !parsed.preallocated;
+        raw |= parsed.shrinkable_raw(sector);
         foreign_encoding |= parsed.foreign_encoding;
         preallocated |= parsed.preallocated;
         inline_bytes = inline_bytes
@@ -663,6 +667,25 @@ struct ParsedExtent {
     /// btrfs leaves zero): never touched.
     foreign_encoding: bool,
     preallocated: bool,
+}
+
+impl ParsedExtent {
+    /// A raw data allocation that compression could still shrink. Btrfs never
+    /// compresses a non-inline range of one sector or less, so a raw
+    /// allocation that small is final. It is the last block of a file whose
+    /// size lies at most one sector past a 128 KiB compression chunk (about
+    /// one file in 32), or a block a concurrent commit split off. Counting it
+    /// kept a fully compressed file eligible, and every later pass re-hashed
+    /// it and rewrote that block for nothing (bd-rxq5). A small reference into
+    /// a larger raw allocation still counts: `disk_num_bytes` is the whole
+    /// allocation it keeps alive.
+    fn shrinkable_raw(&self, sector: u64) -> bool {
+        !self.encoded
+            && !self.preallocated
+            && self
+                .extent
+                .is_some_and(|extent| extent.disk_num_bytes > sector)
+    }
 }
 
 fn parse_file_extent(item: &[u8]) -> io::Result<ParsedExtent> {
