@@ -15,6 +15,15 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   the daemon's `active-reference visibility incomplete` log line, now names
   the source: the process list, the build-directory, open-file or executable
   sweep, or the memory-map sweep (with its error).
+- **On macOS the desktop channel is on by default, at Critical only**
+  (bd-z1nm). The daemon there is a root LaunchDaemon. Its journal and file
+  channels land in `/var/log/sbh/sbh.err` and `/private/var/sbh`, where
+  nobody looks: on one Mac a Critical swap and disk event preceded a kernel
+  panic by 40 minutes, unseen. New macOS configs list the desktop channel and
+  enable it at `critical`. It reaches the console user's Notification Center
+  and does nothing when nobody is logged in. Configs written by an older
+  install keep their explicit `enabled = false`. Other platforms keep it
+  opt-in.
 
 ### Fixed
 
@@ -79,6 +88,53 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   17)" and the CLI silently stayed a release behind (trj, 2026-11-14). It now
   names the link and its missing target. As before, nothing is installed
   without a backup.
+- **A budget-stopped scan of a huge tree keeps its progress** (bd-kf7k).
+  - **The barren-directory hint cap now keeps the right directories.**
+    Excluding a barren directory skips its whole subtree. The 50,000-entry
+    cap was filled in hash order, so on a 1.87M-directory tree it kept an
+    arbitrary subset of ~450,000 barren directories, and the next pass
+    re-walked most of what the last one covered. It now keeps the topmost
+    barren directories first, then shallower ones.
+  - **Hints outlast a sweep.** They expired after 30 minutes, while such a
+    sweep takes about four hours in 5 CPU-second slices, so the earliest
+    lapsed before the walk reached its deep candidates. They now last six
+    hours. A completed walk still clears them, file events still revoke them
+    at once, and a hint can only delay discovery, never cause a deletion.
+  - **Rebuilding watches no longer resets discovery.** A watch rebuild that
+    only changed coverage threw away the barren hints. It no longer does.
+    Queued changes from the replaced inotify backend are drained once the new
+    watches are in place. Overflow, lost FSEvents history and fallback
+    transitions still reset conservatively.
+- **A reload that removes a root releases its directory handles**
+  (bd-656i). The walker's read-ahead (up to 16 finished directory pages and
+  4 paused readers) and the pre-scan's per-root enumeration session each
+  hold an open directory for up to an hour of idleness. Nothing pruned them
+  when a reload dropped a root, so `hdiutil detach` or `umount` of the
+  unconfigured volume failed with EBUSY until the daemon restarted (on the
+  test host, 15 directory fds stayed open under the removed root). The
+  scanner now drops retained read-ahead outside the configured roots as soon
+  as they change. Durable pre-scan progress is kept. A volume that is still
+  configured is not covered: its idle handles still expire after up to an
+  hour.
+- **Restarting the control endpoint is no longer refused by its own
+  released lease** (bd-skat). A child that another thread forks holds a copy
+  of the lease's open file description, and with it the `flock`, until it
+  execs. In a process that spawns children, a restarted server failed with
+  EAGAIN in 2,523 of 3,000 attempts. The guard now unlocks the lease
+  explicitly when it drops, and only in the process that acquired it. A new
+  server also retries the lock for up to one second, which covers a
+  previous owner that exited while one of its children sat between fork and
+  exec.
+- **A compressed file with one raw block left is no longer re-compressed
+  every pass** (btrfs, bd-rxq5). Btrfs never compresses a non-inline range
+  of one sector or less. A file whose size lies at most one sector past a
+  128 KiB compression chunk (about 1 file in 32) keeps its last block raw
+  after a complete compression. A transaction commit landing mid-defrag can
+  also split such a block off any file. Inspection counted that block as
+  raw, so the file stayed eligible: every later pass re-hashed it, rewrote
+  the block, and journaled a run that saved nothing. Only raw allocations
+  larger than one sector now count. A one-block reference into a larger raw
+  allocation still counts, because it keeps the whole allocation alive.
 
 ## v0.7.14 **[release]**
 
