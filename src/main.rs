@@ -232,15 +232,15 @@ mod rollback {
 
     use super::cli_app::CliError;
 
-    pub(super) struct Request {
+    pub struct Request {
         pub install_path: PathBuf,
         pub backup_id: Option<String>,
         pub dry_run: bool,
         pub check_only: bool,
     }
 
-    pub(super) struct Service {
-        pub service_type: &'static str,
+    pub struct Service {
+        pub backend: &'static str,
         pub user_scope: bool,
         pub manager: Box<dyn ServiceManager>,
     }
@@ -264,7 +264,7 @@ mod rollback {
         service_restart: Option<UpdateServiceRestart>,
     }
 
-    pub(super) fn run<F>(
+    pub fn run<F>(
         request: &Request,
         store: &BackupStore,
         json: bool,
@@ -343,7 +343,7 @@ mod rollback {
 
     fn activate(service: &Service, root: bool) -> UpdateServiceRestart {
         let scope = if service.user_scope { "user" } else { "system" };
-        let service_type = service.service_type;
+        let service_type = service.backend;
         // Match the ordinary update's ordering: missing services succeed even
         // for non-root callers; only loaded system services require root.
         match service.manager.is_loaded() {
@@ -506,7 +506,7 @@ mod rollback {
                     let restarts = Arc::new(AtomicUsize::new(0));
                     let report = execute(&request, &store, root, || {
                         Ok(Some(Service {
-                            service_type,
+                            backend: service_type,
                             user_scope,
                             manager: Box::new(MockService {
                                 loaded,
@@ -551,7 +551,7 @@ mod rollback {
                     let restarts = Arc::new(AtomicUsize::new(0));
                     let report = execute(&request, &store, false, || {
                         Ok(Some(Service {
-                            service_type,
+                            backend: service_type,
                             user_scope: true,
                             manager: Box::new(MockService {
                                 loaded: true,

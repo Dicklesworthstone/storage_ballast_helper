@@ -6231,10 +6231,17 @@ fn update_rollback_previews_preserve_isolated_binary_and_backups() {
             assert_eq!(report["install_path"], binary.to_str().unwrap());
             let after = fs::metadata(&binary).unwrap();
             assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
-            assert_eq!(hex_lower(Sha256::digest(fs::read(&binary).unwrap())), digest);
+            assert_eq!(
+                hex_lower(Sha256::digest(fs::read(&binary).unwrap())),
+                digest
+            );
             assert_eq!(store.list().len(), backups.len());
             for backup in &backups {
-                assert!(backup.path.is_file(), "preview removed backup {}", backup.id);
+                assert!(
+                    backup.path.is_file(),
+                    "preview removed backup {}",
+                    backup.id
+                );
             }
             assert!(!service_calls.exists(), "preview queried a service manager");
         }

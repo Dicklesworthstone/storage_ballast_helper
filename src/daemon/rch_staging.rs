@@ -1349,6 +1349,7 @@ pub(super) mod tests {
         resume: Option<mpsc::Sender<()>>,
         logger: Logger,
         _dir: tempfile::TempDir,
+        _rch_dir: tempfile::TempDir,
     }
 
     impl BlockedAdmission {
@@ -1356,9 +1357,16 @@ pub(super) mod tests {
             let (dir, root) = scratch();
             let base = root.join("rch");
             fs::create_dir(&base).unwrap();
+            // Keep the failing executable under the test user's trusted home:
+            // system binaries can have foreign owners, and /tmp is untrusted.
+            let test_home = std::env::var_os("HOME").expect("test user's home directory");
+            let rch_dir = tempfile::tempdir_in(test_home).unwrap();
+            let runner = script_runner(rch_dir.path(), "#!/bin/sh\nexit 1\n");
+            let binary = trusted_binary(&runner.binary, effective_uid())
+                .expect("isolated probe executable must pass the production trust checks");
             let mut config = Config::default();
             config.scanner.rch_staging_bases = vec![base.clone()];
-            config.scanner.rch_binary = Some(PathBuf::from("/usr/bin/false"));
+            config.scanner.rch_binary = Some(binary);
             let (entered_tx, entered_rx) = mpsc::channel();
             let (resume_tx, resume_rx) = mpsc::channel();
             let platform = Arc::new(PausedPlatform {
@@ -1377,6 +1385,7 @@ pub(super) mod tests {
                 resume: Some(resume_tx),
                 logger: Logger::new(),
                 _dir: dir,
+                _rch_dir: rch_dir,
             };
             probe.tick(probe.started, &mount_at(PressureLevel::Critical));
             entered_rx

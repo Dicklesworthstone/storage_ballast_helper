@@ -18216,7 +18216,7 @@ fn rollback_service(
         UpdateServiceRestart::failed(service_type, service.scope_name(), error.to_string())
     })?;
     Ok(Some(crate::rollback::Service {
-        service_type,
+        backend: service_type,
         user_scope: service.user_scope,
         manager,
     }))
