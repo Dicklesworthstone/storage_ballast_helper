@@ -2799,6 +2799,16 @@ impl ActiveReferenceIndex {
         self.complete
     }
 
+    /// Record that one reference source fell short. The first source to
+    /// fall short names the reason, so a held candidate (and the daemon's
+    /// "visibility incomplete" log line) says which sweep to look at.
+    fn note_incomplete(&mut self, reason: impl FnOnce() -> String) {
+        self.complete = false;
+        if self.incomplete_reason.is_none() {
+            self.incomplete_reason = Some(reason());
+        }
+    }
+
     #[must_use]
     pub fn incomplete_reason(&self) -> Option<&str> {
         self.incomplete_reason.as_deref().or_else(|| {
@@ -2917,7 +2927,7 @@ pub fn collect_active_reference_index(
                 process_names.insert(process.pid, process.name);
             }
         }
-        Err(_) => index.complete = false,
+        Err(error) => index.note_incomplete(|| format!("process list unavailable: {error}")),
     }
 
     code_sign_clones::add_owners(&mut index, &roots, &app_instances);
@@ -2927,7 +2937,7 @@ pub fn collect_active_reference_index(
     // missing build metadata is unknown use, not proof that a path is idle.
     let (build_directories, build_complete) = platform.build_directories_in_use_checked();
     if !build_complete {
-        index.complete = false;
+        index.note_incomplete(|| fell_short("build-directory sweep"));
     }
     for (pid, directory) in build_directories {
         let name = process_names.get(&pid).cloned();
@@ -2944,12 +2954,12 @@ pub fn collect_active_reference_index(
     match platform.open_files_under_roots(&roots) {
         Ok(result) => {
             if !result.complete {
-                index.complete = false;
-                if index.incomplete_reason.is_none() {
-                    index.incomplete_reason = result
-                        .incomplete_reason
-                        .map(|reason| format!("open-file sweep incomplete: {reason}"));
-                }
+                index.note_incomplete(|| {
+                    result.incomplete_reason.as_deref().map_or_else(
+                        || fell_short("open-file sweep"),
+                        |reason| format!("open-file sweep incomplete: {reason}"),
+                    )
+                });
             }
             for open_file in result.files {
                 if own_directory_handle(&open_file) {
@@ -2961,13 +2971,13 @@ pub fn collect_active_reference_index(
                 });
             }
         }
-        Err(_) => index.complete = false,
+        Err(error) => index.note_incomplete(|| format!("open-file sweep failed: {error}")),
     }
 
     match platform.executables_under_roots(&roots) {
         Ok(result) => {
             if !result.complete {
-                index.complete = false;
+                index.note_incomplete(|| fell_short("executable sweep"));
             }
             for process in result.processes {
                 if let Some(executable) = process.executable.as_deref() {
@@ -2978,7 +2988,7 @@ pub fn collect_active_reference_index(
                 }
             }
         }
-        Err(_) => index.complete = false,
+        Err(error) => index.note_incomplete(|| format!("executable sweep failed: {error}")),
     }
 
     match platform.mmap_regions_under_roots(&roots) {
@@ -2990,10 +3000,15 @@ pub fn collect_active_reference_index(
                 });
             }
         }
-        Err(_) => index.complete = false,
+        Err(error) => index.note_incomplete(|| format!("memory-map sweep failed: {error}")),
     }
 
     index
+}
+
+/// The reason a sweep that inspected fewer than every visible process gives.
+fn fell_short(sweep: &str) -> String {
+    format!("{sweep} did not cover every visible process")
 }
 
 /// sbh's own directory handles are its scanner walking a tree (or the
@@ -3463,6 +3478,11 @@ mod tests {
             }
             self.inner.mmap_regions_under(path)
         }
+
+        fn build_directories_in_use_checked(&self) -> (Vec<(i32, PathBuf)>, bool) {
+            let (directories, complete) = self.inner.build_directories_in_use_checked();
+            (directories, complete && self.failed_source != 4)
+        }
     }
 
     #[test]
@@ -3475,7 +3495,7 @@ mod tests {
         fs::create_dir(&unobserved).unwrap();
         let held = active.join("object");
         fs::write(&held, b"keep").unwrap();
-        for failed_source in 0..4 {
+        for failed_source in 0..5 {
             let platform = PartialActiveRefPlatform {
                 failed_source,
                 inner: TestActiveRefPlatform {
@@ -3491,7 +3511,16 @@ mod tests {
             };
             let index = collect_active_reference_index(&platform, std::slice::from_ref(&root));
             assert!(!index.is_complete(), "source {failed_source}");
-            assert!(index.incomplete_reason().is_some());
+            // The reason names the sweep that fell short, not only that one did.
+            let named = [
+                "process list unavailable",
+                "open-file sweep",
+                "executable sweep",
+                "memory-map sweep failed",
+                "build-directory sweep",
+            ][failed_source];
+            let reason = index.incomplete_reason().unwrap();
+            assert!(reason.contains(named), "source {failed_source}: {reason}");
             for path in [&active, &unobserved] {
                 let identity = identity_for_path(path, false).unwrap();
                 for summary in [

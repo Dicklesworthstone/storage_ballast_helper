@@ -6,6 +6,16 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+### Changed
+
+- **An incomplete active-reference sweep names itself.** A candidate held
+  because sbh could not see every process's references used to say only
+  "active-reference inspection did not cover every visible process", whichever
+  of five sweeps had fallen short. The reason, in `explain --why-not` and in
+  the daemon's `active-reference visibility incomplete` log line, now names
+  the source: the process list, the build-directory, open-file or executable
+  sweep, or the memory-map sweep (with its error).
+
 ### Fixed
 
 - **A routine maintenance pass the CPU budget defers is no longer lost**
