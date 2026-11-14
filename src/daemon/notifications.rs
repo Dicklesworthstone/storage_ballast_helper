@@ -1644,11 +1644,15 @@ mod tests {
         let config = NotificationConfig::default();
         let manager = NotificationManager::from_config(&config);
         assert!(manager.is_enabled());
-        // Default channels: journal + file (desktop and webhook are disabled by default).
-        assert_eq!(manager.channel_count(), 2);
+        // Default channels: journal + file, plus desktop on macOS only (bd-z1nm).
+        // Webhook is never on by default.
+        let desktop_default = cfg!(target_os = "macos");
+        assert_eq!(manager.channel_count(), 2 + usize::from(desktop_default));
         let names = manager.channel_names();
         assert!(names.contains(&"journal"));
         assert!(names.contains(&"file"));
+        assert_eq!(names.contains(&"desktop"), desktop_default);
+        assert!(!names.contains(&"webhook"));
     }
 
     #[test]
