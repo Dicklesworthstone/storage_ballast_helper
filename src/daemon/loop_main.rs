@@ -11634,6 +11634,19 @@ fn mark_active_reference_budget_incomplete(input: &mut crate::scanner::scoring::
         .mark_incomplete(ACTIVE_REFERENCE_BUDGET_SKIP_REASON);
 }
 
+/// How long a barren hint from a budget-stopped pass is trusted.
+///
+/// The hints are the sweep's progress: a host whose walks finish clears them
+/// on the first complete pass, so the lifetime only matters where every pass
+/// stops at its CPU slice. It must outlast one sweep of such a tree. css walks
+/// 1.87M dirs in about 742 CPU-s, about 2.5 CPU-s of walking per pass and 70
+/// passes an hour, so a sweep takes about four hours; with 30 minutes the
+/// earliest hints expired first and the walk never reached its deep candidates
+/// (bd-kf7k). A hint only delays discovery and can never cause a deletion.
+/// Events still revoke watched ground at once; unwatched ground waits at most
+/// this long.
+const BARREN_HINT_TTL: Duration = Duration::from_hours(6);
+
 /// Incremental scan cursor — persists across scan iterations within the scanner
 /// thread to avoid re-walking large directory subtrees that contained zero
 /// cleanup candidates on the previous pass.
@@ -11657,7 +11670,7 @@ impl ScanCursor {
     fn new() -> Self {
         Self {
             barren_dirs: HashMap::new(),
-            ttl: Duration::from_mins(30), // 30 minutes
+            ttl: BARREN_HINT_TTL,
             max_entries: 50_000,
         }
     }
@@ -11731,16 +11744,34 @@ impl ScanCursor {
             .retain(|_, ts| now.duration_since(*ts) < self.ttl);
 
         // Newly discovered barren dirs. They are newer than every cached one,
-        // so the cap keeps them first; take no more than fit. Copying every
-        // barren dir and truncating afterwards cloned ~450k paths per pass on
-        // a host whose passes stop at the entry budget, the daemon's largest
-        // allocation burst (ts2, 2026-10-18). A dir already cached keeps its
-        // older timestamp.
-        let fresh: Vec<&PathBuf> = visited_dirs
+        // so the cap keeps them first; take no more than fit. Only references
+        // are gathered: cloning every barren dir and truncating afterwards
+        // cloned ~450k paths per pass on a host whose passes stop at the entry
+        // budget, the daemon's largest allocation burst (ts2, 2026-10-18). A
+        // dir already cached keeps its older timestamp.
+        //
+        // Excluding a barren dir skips its whole subtree, so a barren dir
+        // under another barren dir adds nothing while its ancestor is cached.
+        // When the cap binds, the topmost barren dirs go first, then shallower
+        // ones (they keep re-walks narrow after an event revokes a top).
+        // Filling the cap in hash order kept an arbitrary 50,000 of the
+        // ~450,000 barren dirs such a pass sees, so the next pass re-walked
+        // most of what this one had covered and a 1.87M-dir tree never
+        // finished (css, bd-kf7k).
+        let is_barren = |dir: &Path| visited_dirs.contains(dir) && !non_barren_dirs.contains(dir);
+        let mut fresh: Vec<&PathBuf> = visited_dirs
             .iter()
             .filter(|dir| !non_barren_dirs.contains(*dir) && !self.barren_dirs.contains_key(*dir))
-            .take(self.max_entries)
             .collect();
+        if fresh.len() > self.max_entries {
+            fresh.select_nth_unstable_by_key(self.max_entries - 1, |dir| {
+                (
+                    dir.parent().is_some_and(&is_barren),
+                    dir.components().count(),
+                )
+            });
+            fresh.truncate(self.max_entries);
+        }
 
         // Cap size: the newest older entries fill whatever room is left.
         let room = self.max_entries - fresh.len();
@@ -25669,6 +25700,72 @@ mod tests {
         // A pass that completes forgets everything.
         cursor.update(&visited, &HashSet::new(), false);
         assert!(cursor.barren_dirs.is_empty());
+    }
+
+    /// bd-kf7k: excluding a barren dir skips its subtree, so when barren dirs
+    /// outnumber the cap the cursor keeps the topmost ones, and one
+    /// budget-stopped pass leaves everything it covered excluded. Filling the
+    /// cap in hash order kept the three tops here about once in 455 runs.
+    #[test]
+    fn scan_cursor_keeps_topmost_barren_dirs_so_the_cap_covers_whole_subtrees() {
+        let mut cursor = scan_cursor(3, &[]);
+        let non_barren = path_set(&["/r", "/r/target"]);
+        let mut visited = non_barren.clone();
+        for top in ["a", "b", "c"] {
+            let mut dir = Path::new("/r").join(top);
+            for depth in 0..5 {
+                visited.insert(dir.clone());
+                dir.push(format!("d{depth}"));
+            }
+        }
+        assert_eq!(visited.len(), 17, "15 barren dirs against a cap of 3");
+
+        cursor.update(&visited, &non_barren, true);
+
+        let mut kept: Vec<&str> = cursor
+            .barren_dirs
+            .keys()
+            .map(|dir| dir.to_str().unwrap())
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["/r/a", "/r/b", "/r/c"]);
+        let excluded = cursor.barren_exclusions();
+        for dir in visited.difference(&non_barren) {
+            assert!(
+                dir.ancestors().any(|ancestor| excluded.contains(ancestor)),
+                "{} would be walked again",
+                dir.display()
+            );
+        }
+        assert_eq!(ScanCursor::new().ttl, BARREN_HINT_TTL);
+    }
+
+    /// With room to spare beyond the tops, shallower barren dirs fill it
+    /// first, so an event that revokes a top re-walks the least it can.
+    #[test]
+    fn scan_cursor_fills_room_past_the_tops_with_shallower_barren_dirs() {
+        let mut cursor = scan_cursor(4, &[]);
+        let non_barren = path_set(&["/r", "/r/target"]);
+        let mut visited = non_barren.clone();
+        visited.extend(path_set(&[
+            "/r/a",
+            "/r/a/b",
+            "/r/a/b/c",
+            "/r/a/b/c/d",
+            "/r/e",
+            "/r/e/f",
+            "/r/e/f/g",
+        ]));
+
+        cursor.update(&visited, &non_barren, true);
+
+        let mut kept: Vec<&str> = cursor
+            .barren_dirs
+            .keys()
+            .map(|dir| dir.to_str().unwrap())
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["/r/a", "/r/a/b", "/r/e", "/r/e/f"]);
     }
 
     #[test]
