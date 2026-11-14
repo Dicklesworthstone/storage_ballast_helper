@@ -587,6 +587,17 @@ impl Drop for DaemonRun {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Timeouts keep the daemon's outputs, but a failed assertion on a
+        // finished run (a release count, a final state) used to leave
+        // nothing behind to explain a rare failure.
+        if std::thread::panicking() {
+            let kept = self.preserve_outputs();
+            let _ = writeln!(
+                std::io::stderr(),
+                "daemon outputs kept in {}",
+                kept.display()
+            );
+        }
     }
 }
 

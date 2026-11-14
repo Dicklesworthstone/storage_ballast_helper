@@ -42,6 +42,11 @@ const MAX_EXECUTABLE_STAT_BYTES: usize = 8192;
 const MAX_UNIX_SOCKET_TABLE_BYTES: usize = 32 * 1024 * 1024;
 // Linux include/linux/sched.h: task has no user executable (PF_KTHREAD).
 const PF_KTHREAD: u64 = 0x0020_0000;
+// Linux include/linux/sched.h: the task has entered do_exit (PF_EXITING) and
+// never returns to user mode.
+const PF_EXITING: u64 = 0x0000_0004;
+/// A thread group larger than this is not walked for exit evidence.
+const MAX_EXIT_EVIDENCE_THREADS: usize = 4096;
 
 type Entries = Box<dyn Iterator<Item = io::Result<OsString>>>;
 
@@ -446,6 +451,44 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
         self.proc
             .read_bounded(&process.join("stat"), MAX_EXECUTABLE_STAT_BYTES)
             .is_ok_and(|raw| stat_has_no_user_executable(&raw, pid))
+            || self.every_thread_exiting(process)
+    }
+
+    /// Whether every thread of the group has entered do_exit, so none can
+    /// run user code again. A big process loses its exe link in exit_mm and
+    /// may then spend far longer than the settle unmapping its memory before
+    /// it becomes a zombie: a rust-lld on a loaded rch worker did, and held
+    /// a whole batch (2026-11-14). One thread outside do_exit, such as a
+    /// sibling of a main thread that called pthread_exit, keeps the process
+    /// unproven, as does any thread whose state cannot be read.
+    fn every_thread_exiting(&mut self, process: &Path) -> bool {
+        let task = process.join("task");
+        let Ok(threads) = self.proc.entries(&task) else {
+            return false;
+        };
+        let mut seen = 0;
+        for thread in threads {
+            if seen >= MAX_EXIT_EVIDENCE_THREADS || self.expired() {
+                return false;
+            }
+            seen += 1;
+            let Ok(name) = thread else {
+                return false;
+            };
+            let Some(tid) = name.to_str().and_then(|name| name.parse::<i32>().ok()) else {
+                return false;
+            };
+            match self
+                .proc
+                .read_bounded(&task.join(&name).join("stat"), MAX_EXECUTABLE_STAT_BYTES)
+            {
+                Ok(raw) if task_stat_exiting(&raw, tid) => {}
+                // A thread released after the listing runs nothing.
+                Err(error) if disappeared(&error) => {}
+                _ => return false,
+            }
+        }
+        seen > 0
     }
 
     /// [`Self::no_user_executable`], giving an exiting process a moment to
@@ -503,28 +546,33 @@ fn read_proc_bytes(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
 }
 
 fn stat_has_no_user_executable(raw: &[u8], pid: i32) -> bool {
-    let Ok(raw) = std::str::from_utf8(raw) else {
-        return false;
-    };
-    let Some((observed_pid, _)) = raw.split_once('(') else {
-        return false;
-    };
+    task_stat_fields(raw, pid).is_some_and(|(state, flags, threads)| {
+        threads > 0
+            && (flags & PF_KTHREAD != 0 || (threads == 1 && matches!(state, "Z" | "X" | "x")))
+    })
+}
+
+/// Whether one thread's stat shows it inside do_exit or already dead.
+fn task_stat_exiting(raw: &[u8], tid: i32) -> bool {
+    task_stat_fields(raw, tid).is_some_and(|(state, flags, _)| {
+        flags & PF_EXITING != 0 || matches!(state, "Z" | "X" | "x")
+    })
+}
+
+/// State, flags and thread count from a stat record that names `pid`:
+/// stat fields 3, 9 and 20.
+fn task_stat_fields(raw: &[u8], pid: i32) -> Option<(&str, u64, u64)> {
+    let raw = std::str::from_utf8(raw).ok()?;
+    let (observed_pid, _) = raw.split_once('(')?;
     if observed_pid.trim().parse::<i32>().ok() != Some(pid) {
-        return false;
+        return None;
     }
-    let Ok(fields) = super::proc_stat_fields_after_comm(raw) else {
-        return false;
-    };
-    // stat fields 9 (flags) and 20 (num_threads); fields[0] is field 3 (state).
-    let Some(flags) = fields.get(6).and_then(|value| value.parse::<u64>().ok()) else {
-        return false;
-    };
-    let Some(threads) = fields.get(17).and_then(|value| value.parse::<u64>().ok()) else {
-        return false;
-    };
-    threads > 0
-        && (flags & PF_KTHREAD != 0
-            || (threads == 1 && matches!(fields.first().copied(), Some("Z" | "X" | "x"))))
+    let fields = super::proc_stat_fields_after_comm(raw).ok()?;
+    // fields[0] is stat field 3 (state).
+    let state = *fields.first()?;
+    let flags = fields.get(6)?.parse::<u64>().ok()?;
+    let threads = fields.get(17)?.parse::<u64>().ok()?;
+    Some((state, flags, threads))
 }
 
 fn disappeared(error: &io::Error) -> bool {
@@ -2094,6 +2142,53 @@ mod tests {
             task_stat(1, "S", 0, 1).as_bytes(),
             1
         ));
+    }
+
+    fn thread_stat(process: &Path, tid: i32, state: &str, flags: u64) {
+        let thread = process.join("task").join(tid.to_string());
+        fs::create_dir_all(&thread).unwrap();
+        fs::write(thread.join("stat"), task_stat(tid, state, flags, 2)).unwrap();
+    }
+
+    /// A big process loses its exe link in exit_mm and can take far longer
+    /// than the exit settle to become a zombie: a rust-lld unmapping its
+    /// inputs on a loaded rch worker did (2026-11-14). Every thread inside
+    /// do_exit proves that no user code runs again.
+    #[test]
+    fn a_group_whose_every_thread_is_exiting_does_not_hold_the_batch() {
+        let fixture = Fixture::new();
+        let process = fixture.pid(1);
+        fs::write(process.join("stat"), task_stat(1, "R", PF_EXITING, 2)).unwrap();
+        thread_stat(&process, 1, "R", PF_EXITING);
+        thread_stat(&process, 2, "D", PF_EXITING);
+        let result = fixture.scan_executables(&NativeProc, Limits::default());
+        assert!(result.complete);
+        assert!(result.processes.is_empty());
+    }
+
+    #[test]
+    fn an_exiting_group_with_unproven_threads_still_holds_the_batch() {
+        // One sibling still outside do_exit; a thread record naming another
+        // task; no thread records at all.
+        for case in 0..3 {
+            let fixture = Fixture::new();
+            let process = fixture.pid(1);
+            fs::write(process.join("stat"), task_stat(1, "Z", PF_EXITING, 2)).unwrap();
+            match case {
+                0 => {
+                    thread_stat(&process, 1, "Z", PF_EXITING);
+                    thread_stat(&process, 2, "S", 0);
+                }
+                1 => {
+                    let thread = process.join("task/2");
+                    fs::create_dir_all(&thread).unwrap();
+                    fs::write(thread.join("stat"), task_stat(3, "R", PF_EXITING, 2)).unwrap();
+                }
+                _ => fs::create_dir_all(process.join("task")).unwrap(),
+            }
+            let result = fixture.scan_executables(&NativeProc, Limits::default());
+            assert!(!result.complete, "case {case}");
+        }
     }
 
     /// bd-p18q: a process caught between releasing its memory and becoming a

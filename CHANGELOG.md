@@ -45,6 +45,15 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   the sweep deadline), and 0 of 300 were incomplete in the same wall time.
   A process still running after the settle, such as a group leader whose
   siblings run on, still holds the batch.
+- **A large process whose exit outlasts that settle no longer holds the
+  batch either** (Linux, bd-p18q). A big linker (`rust-lld`) can spend longer
+  than the settle tearing down its memory after its `/proc/PID/exe` link is
+  gone, and on a busy rch worker it still made about one sweep in 300-600
+  incomplete. The kernel marks every thread in `do_exit` with `PF_EXITING`,
+  and a thread with that flag never returns to user code. A process whose
+  every thread carries it (or is a zombie) now counts as holding no
+  executable. A process with any thread not proven exiting, an unreadable
+  thread list, or more than 4096 threads still holds the batch.
 - **A config reload wakes every idle mount, including one sampled a tick
   late** (bd-yh04). A reload drops every cached filesystem reading and re-probes them
   in the background, and a tick drives only the mounts it has a reading
