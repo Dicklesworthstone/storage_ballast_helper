@@ -376,8 +376,12 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
         let process = proc_root.join(pid.to_string());
         let target = match self.proc.link(&process.join("exe")) {
             Ok(target) => target,
+            // An exiting process loses its exe link when it releases its
+            // memory, a moment before it becomes a zombie. Under process
+            // churn that made 23 of 300 sweeps incomplete (bd-p18q), so it
+            // gets the same bounded settle as an empty argv.
             Err(error) => {
-                if !disappeared(&error) || !self.no_user_executable(&process, pid) {
+                if !disappeared(&error) || !self.exited_without_user_executable(&process, pid) {
                     self.complete = false;
                 }
                 return;
@@ -445,8 +449,8 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
     }
 
     /// [`Self::no_user_executable`], giving an exiting process a moment to
-    /// finish. Its argv reads empty once its memory is released, shortly
-    /// before it becomes a zombie or is reaped. On a busy build host (trj,
+    /// finish. Its argv reads empty and its exe link is gone once its memory
+    /// is released, shortly before it becomes a zombie or is reaped. On a busy build host (trj,
     /// 2,373 processes) short-lived compilers exited mid-sweep in two of
     /// three sweeps, and each one made the whole sweep incomplete and held
     /// the batch. A process still running after the settle, such as one
@@ -2090,6 +2094,28 @@ mod tests {
             task_stat(1, "S", 0, 1).as_bytes(),
             1
         ));
+    }
+
+    /// bd-p18q: a process caught between releasing its memory and becoming a
+    /// zombie has no exe link yet still reads as running. With four threads
+    /// spawning /bin/true on vmi1149989, 23 of 300 executable sweeps came out
+    /// incomplete, and every candidate in the pass was held as unverifiable.
+    /// The process finishes exiting during the settle (as an exiting build
+    /// process's empty argv does since 8a89b93f), so the sweep stays complete.
+    #[test]
+    fn a_process_finishing_its_exit_during_the_executable_sweep_does_not_hold_the_batch() {
+        let fixture = Fixture::new();
+        let process = fixture.pid(1);
+        let stat = process.join("stat");
+        fs::write(&stat, task_stat(1, "R", 0, 1)).unwrap();
+        let exit = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            fs::write(stat, task_stat(1, "Z", 0, 1)).unwrap();
+        });
+        let result = fixture.scan_executables(&NativeProc, Limits::default());
+        exit.join().unwrap();
+        assert!(result.complete);
+        assert!(result.processes.is_empty());
     }
 
     #[test]

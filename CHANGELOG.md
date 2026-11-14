@@ -22,6 +22,19 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   cycle admit it, logging `maintenance pass waits for the CPU budget` once.
   A config reload discards it, since the reload's own pass covers the new
   roots.
+- **A process exiting mid-sweep no longer makes the executable sweep
+  incomplete** (Linux, bd-p18q). An exiting process loses its
+  `/proc/PID/exe` link when it releases its memory, a moment before it
+  becomes a zombie, while its state still reads as running. The executable
+  sweep counted it as an uninspectable process, so the active-reference
+  index came out incomplete and every candidate in the pass was held as
+  "active-reference inspection did not cover every visible process". With
+  four threads spawning short-lived processes on an rch worker, 23 of 300
+  sweeps were incomplete. They now get the same bounded settle as an
+  exiting build process's empty argv (re-checks after 2, 10 and 50 ms within
+  the sweep deadline), and 0 of 300 were incomplete in the same wall time.
+  A process still running after the settle, such as a group leader whose
+  siblings run on, still holds the batch.
 - **Service queries wait briefly for a writer that outlives them.** The
   bounded `systemctl`/`busctl` queries that `sbh update` and rollback run
   before restarting the service refused any reply whose output pipe was still
