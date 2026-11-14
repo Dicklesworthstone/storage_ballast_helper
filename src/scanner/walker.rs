@@ -6060,6 +6060,13 @@ mod tests {
                 let mut stream = walker.stream().unwrap();
                 let seen: HashSet<PathBuf> =
                     stream.by_ref().take(take).map(|entry| entry.path).collect();
+                if take == tree.len() {
+                    // A directory's entry comes from its parent's listing, so
+                    // every entry can be out while a worker still lists the
+                    // last (empty) leaves; a cancel then rightly reports one
+                    // unfinished. The walk is finished only once its stream ends.
+                    assert_eq!(stream.by_ref().count(), 0, "no entries past the tree");
+                }
                 cancel.store(true, Ordering::Relaxed);
                 let unfinished = stream
                     .unfinished_after_cancel(Duration::from_secs(10))
