@@ -37,6 +37,8 @@ pub mod disk;
 #[cfg(target_os = "linux")]
 pub mod memory;
 #[cfg(target_os = "linux")]
+pub(crate) mod no_symlinks;
+#[cfg(target_os = "linux")]
 pub mod process;
 #[cfg(target_os = "linux")]
 pub mod service;

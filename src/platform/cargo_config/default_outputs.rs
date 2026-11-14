@@ -52,14 +52,20 @@ impl Resolver {
     ) {
         let selected = if let ManifestRequest::Explicit(explicit) = request {
             let Some(path) = byte_path(explicit, cwd) else {
-                observation.complete = false;
+                observation.incomplete("--manifest-path is not a usable path");
                 return;
             };
-            let Cached::Present(parsed) = self.cached(&path, read) else {
-                observation.complete = false;
-                return;
-            };
-            Some((path, parsed.manifest))
+            match self.cached(&path, read) {
+                Cached::Present(parsed) => Some((path, parsed.manifest)),
+                Cached::Missing => {
+                    observation.incomplete(format_args!("{} is missing", path.display()));
+                    return;
+                }
+                Cached::Unavailable(reason) => {
+                    observation.incomplete(reason);
+                    return;
+                }
+            }
         } else {
             self.find_manifest(cwd, false, observation, read)
         };
@@ -67,29 +73,41 @@ impl Resolver {
             return;
         };
         let Some(directory) = path.parent() else {
-            observation.complete = false;
+            observation.incomplete(format_args!("{} has no directory", path.display()));
             return;
         };
         if manifest.invalid || (!manifest.package && !manifest.workspace) {
-            observation.complete = false;
+            observation.incomplete(format_args!(
+                "{} is neither a package nor a workspace manifest sbh can read",
+                path.display()
+            ));
             return;
         }
         if manifest.workspace {
             observation.add(Some(directory), "target");
         } else if let Some(external) = manifest.external_workspace {
             let Some(workspace) = byte_path(external.as_bytes(), Some(directory)) else {
-                observation.complete = false;
+                observation.incomplete(format_args!(
+                    "{} names an unusable package.workspace path",
+                    path.display()
+                ));
                 return;
             };
             // Cargo expects this exact directory to be a workspace root,
             // not another member pointing elsewhere. Never follow a cycle.
-            match self.cached(&workspace.join("Cargo.toml"), read) {
+            let root = workspace.join("Cargo.toml");
+            match self.cached(&root, read) {
                 Cached::Present(parsed)
                     if parsed.manifest.workspace && !parsed.manifest.invalid =>
                 {
                     observation.add(Some(&workspace), "target");
                 }
-                _ => observation.complete = false,
+                Cached::Unavailable(reason) => observation.incomplete(reason),
+                _ => observation.incomplete(format_args!(
+                    "{}, named by {}, is not a workspace root",
+                    root.display(),
+                    path.display()
+                )),
             }
         } else {
             observation.add(Some(directory), "target");
@@ -111,19 +129,24 @@ impl Resolver {
         let start = start?;
         for (index, directory) in start.ancestors().enumerate() {
             if index >= MAX_ANCESTORS {
-                observation.complete = false;
+                observation.incomplete(format_args!(
+                    "no Cargo.toml within {MAX_ANCESTORS} levels of the working directory"
+                ));
                 break;
             }
             let path = directory.join("Cargo.toml");
             match self.cached(&path, read) {
                 Cached::Missing => {}
-                Cached::Unavailable => {
-                    observation.complete = false;
+                Cached::Unavailable(reason) => {
+                    observation.incomplete(reason);
                     break;
                 }
                 Cached::Present(parsed) => {
                     if parsed.manifest.invalid {
-                        observation.complete = false;
+                        observation.incomplete(format_args!(
+                            "{} has a package or workspace table sbh cannot read",
+                            path.display()
+                        ));
                         break;
                     }
                     if !workspace_only || parsed.manifest.workspace {

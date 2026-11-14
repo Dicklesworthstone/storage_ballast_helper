@@ -27,6 +27,19 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Live Cargo builds no longer hold every deletion under a hardened
+  systemd unit** (Linux, bd-mun4). The Cargo configuration reader opened
+  files only with `openat2(RESOLVE_NO_SYMLINKS)`. systemd's
+  `RestrictSUIDSGID=` cannot inspect openat2's arguments, so its seccomp
+  filter fails every openat2 with ENOSYS. Under that filter every existing
+  `.cargo/config.toml` or manifest read as unavailable, and every live Cargo
+  build with one held its whole deletion batch as "Cargo configuration
+  observation incomplete". On one host that held 294 batches in a day, and
+  the daemon deleted nothing. The reader now falls back, on ENOSYS or EPERM
+  only, to walking the canonical path one component at a time with
+  `O_NOFOLLOW`. A symlink, magic links included, is still refused at every
+  step. The hold also names its first cause: the file and the error, never
+  configuration or argument bytes.
 - **Very wide directories retain their processing window across restarts**
   (bd-kf7k), within the bounded dispatch history. Fresh enumeration still
   checks all names for protection markers;

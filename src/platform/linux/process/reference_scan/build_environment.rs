@@ -133,11 +133,7 @@ pub(super) fn sweep(proc: &impl ProcAccess, proc_root: &Path, limits: Limits) ->
                     cwd.as_deref(),
                 );
                 if !evidence.complete {
-                    result.missing(
-                        pid,
-                        "cargo config",
-                        io::Error::other("Cargo configuration observation incomplete"),
-                    );
+                    result.missing(pid, "cargo config", incomplete_configuration(&evidence));
                 }
                 for directory in evidence.directories {
                     if !paths.contains(&directory) {
@@ -220,6 +216,18 @@ fn metadata(
     }
 }
 
+/// The hold's diagnostic: the observation's first cause, which names a path
+/// but never configuration or argv bytes.
+fn incomplete_configuration(evidence: &cargo_config::Evidence) -> io::Error {
+    let reason = evidence
+        .incomplete
+        .as_deref()
+        .unwrap_or("no cause recorded");
+    io::Error::other(format!(
+        "Cargo configuration observation incomplete: {reason}"
+    ))
+}
+
 /// What a Cargo process's configuration files name as its outputs. Without
 /// HOME, Cargo reads the config of its account's passwd home (bd-ny5j #2).
 fn cargo_configuration(
@@ -237,7 +245,10 @@ fn cargo_configuration(
     );
     configurations.observe(argv, environ, cwd, uid, |path, limit| {
         if sweep.expired() {
-            Err(io::ErrorKind::TimedOut.into())
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "not read: the reference sweep's deadline passed",
+            ))
         } else {
             cargo_config::read_file(path, limit)
         }
@@ -798,7 +809,16 @@ mod tests {
             found.directories,
             vec![(fixture.pid, PathBuf::from("/known"))]
         );
-        assert_eq!(found.denied.unwrap().file, "cargo config");
+        let denied = found.denied.unwrap();
+        assert_eq!(denied.file, "cargo config");
+        // The hold names the file and the cause, never the file's bytes.
+        assert_eq!(
+            denied.error.to_string(),
+            format!(
+                "Cargo configuration observation incomplete: {} is not UTF-8 TOML",
+                config_dir.join("config.toml").display()
+            )
+        );
         let (targets, complete) =
             open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
         assert!(!complete);

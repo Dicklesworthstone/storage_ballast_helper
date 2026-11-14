@@ -31,6 +31,9 @@ const MAX_CLI_CONFIGS: usize = 32;
 pub struct Evidence {
     pub directories: Vec<PathBuf>,
     pub complete: bool,
+    /// The first reason the observation is incomplete, for the operator: it
+    /// may name a configuration path but never configuration bytes.
+    pub incomplete: Option<String>,
 }
 
 #[derive(Clone)]
@@ -51,7 +54,8 @@ struct Parsed {
 #[derive(Clone)]
 enum Cached {
     Missing,
-    Unavailable,
+    /// Why the file is unknown rather than absent.
+    Unavailable(String),
     Present(Parsed),
 }
 
@@ -69,15 +73,25 @@ pub struct Resolver {
 struct Observation {
     paths: BTreeSet<PathBuf>,
     complete: bool,
+    reason: Option<String>,
     visits: usize,
     target_override: bool,
 }
 
 impl Observation {
+    /// Mark the observation incomplete, keeping its first cause: later
+    /// causes are often consequences of the first (a spent budget).
+    fn incomplete(&mut self, reason: impl std::fmt::Display) {
+        self.complete = false;
+        if self.reason.is_none() {
+            self.reason = Some(reason.to_string());
+        }
+    }
+
     fn add(&mut self, base: Option<&Path>, value: &str) {
         let path = Path::new(value);
         if value.is_empty() || value.len() > MAX_PATH_BYTES {
-            self.complete = false;
+            self.incomplete("a configured output directory is empty or too long");
             return;
         }
         let path = if path.is_absolute() {
@@ -86,13 +100,15 @@ impl Observation {
             // Do not lexically erase '..': an intervening symlink matters.
             base.join(path)
         } else {
-            self.complete = false;
+            self.incomplete("a relative configured output directory has no absolute base");
             return;
         };
-        if path.as_os_str().as_encoded_bytes().len() > MAX_PATH_BYTES
-            || (!self.paths.contains(&path) && self.paths.len() >= MAX_DESTINATIONS)
-        {
-            self.complete = false;
+        if path.as_os_str().as_encoded_bytes().len() > MAX_PATH_BYTES {
+            self.incomplete("a configured output directory is too long");
+        } else if !self.paths.contains(&path) && self.paths.len() >= MAX_DESTINATIONS {
+            self.incomplete(format_args!(
+                "more than {MAX_DESTINATIONS} configured output directories"
+            ));
         } else {
             self.paths.insert(path);
         }
@@ -130,6 +146,7 @@ impl Resolver {
         let mut observation = Observation {
             paths: BTreeSet::new(),
             complete: true,
+            reason: None,
             visits: 0,
             target_override: [b"CARGO_TARGET_DIR".as_slice(), b"CARGO_BUILD_TARGET_DIR"]
                 .iter()
@@ -139,19 +156,22 @@ impl Resolver {
             return Evidence {
                 directories: Vec::new(),
                 complete: false,
+                incomplete: Some("argv is not a complete Cargo command line".to_owned()),
             };
         }
         let cwd = cwd.filter(|path| path.is_absolute());
         if let Some(cwd) = cwd {
             for (index, directory) in cwd.ancestors().enumerate() {
                 if index >= MAX_ANCESTORS {
-                    observation.complete = false;
+                    observation.incomplete(format_args!(
+                        "the working directory is more than {MAX_ANCESTORS} levels deep"
+                    ));
                     break;
                 }
                 self.directory(&directory.join(".cargo"), &mut observation, &mut read);
             }
         } else {
-            observation.complete = false;
+            observation.incomplete("the working directory is unknown");
         }
         // Complete explicit environment entries remain useful even if a later
         // entry was truncated. Defaults require the complete environment.
@@ -160,7 +180,7 @@ impl Resolver {
             if let Some(home) = byte_path(home, cwd) {
                 self.directory(&home, &mut observation, &mut read);
             } else {
-                observation.complete = false;
+                observation.incomplete("CARGO_HOME is not a usable path");
             }
         } else if environment.is_empty() || environment.ends_with(b"\0") {
             // Cargo's home without CARGO_HOME: HOME as given (relative to the
@@ -174,7 +194,9 @@ impl Resolver {
                 );
             match home {
                 Some(home) => self.directory(&home.join(".cargo"), &mut observation, &mut read),
-                None => observation.complete = false,
+                None => observation.incomplete(
+                    "Cargo's home is unknown: no usable HOME and no passwd home for the real uid",
+                ),
             }
         }
         self.command_line(argv, cwd, &mut observation, &mut read);
@@ -183,7 +205,7 @@ impl Resolver {
         // suppresses that default; an independent build-dir override does not.
         if !observation.target_override {
             if !environment.is_empty() && !environment.ends_with(b"\0") {
-                observation.complete = false;
+                observation.incomplete("the process environment was truncated");
             } else if let Some(request) = default_outputs::request(argv) {
                 self.default_target(request, cwd, &mut observation, &mut read);
             }
@@ -191,6 +213,7 @@ impl Resolver {
         Evidence {
             directories: observation.paths.into_iter().collect(),
             complete: observation.complete,
+            incomplete: observation.reason,
         }
     }
 
@@ -235,26 +258,43 @@ impl Resolver {
             return cached.clone();
         }
         let path_bytes = path.as_os_str().as_encoded_bytes().len();
-        if !path.is_absolute()
-            || path_bytes > MAX_PATH_BYTES
-            || self.files.len() >= MAX_FILES
-            || path_bytes > TOTAL_BYTES.saturating_sub(self.path_bytes)
-            || self.bytes >= TOTAL_BYTES
-        {
-            return Cached::Unavailable;
+        let refused = if !path.is_absolute() || path_bytes > MAX_PATH_BYTES {
+            Some("is not an absolute path within bounds".to_owned())
+        } else if self.files.len() >= MAX_FILES {
+            Some(format!(
+                "was not read: this sweep already observed {MAX_FILES} configuration files"
+            ))
+        } else if path_bytes > TOTAL_BYTES.saturating_sub(self.path_bytes) {
+            Some("was not read: this sweep's configuration path budget is spent".to_owned())
+        } else if self.bytes >= TOTAL_BYTES {
+            Some(format!(
+                "was not read: this sweep's {TOTAL_BYTES}-byte configuration budget is spent"
+            ))
+        } else {
+            None
+        };
+        if let Some(refused) = refused {
+            return Cached::Unavailable(format!("{} {refused}", path.display()));
         }
         let limit = FILE_BYTES.min(TOTAL_BYTES - self.bytes);
         let cached = match read(path, limit) {
             Ok(raw) if raw.len() <= limit => {
                 self.bytes += raw.len();
-                parse(&raw).map_or(Cached::Unavailable, Cached::Present)
+                parse(&raw).map_or_else(
+                    || Cached::Unavailable(format!("{} is not UTF-8 TOML", path.display())),
+                    Cached::Present,
+                )
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Cached::Missing,
             // A reader may have consumed the full allowance before refusing.
             // Charge failed attempts too; errors cannot evade the byte budget.
-            Ok(_) | Err(_) => {
+            Ok(_) => {
                 self.bytes += limit;
-                Cached::Unavailable
+                Cached::Unavailable(format!("{} exceeds {limit} bytes", path.display()))
+            }
+            Err(error) => {
+                self.bytes += limit;
+                Cached::Unavailable(format!("{}: {error}", path.display()))
             }
         };
         self.path_bytes += path_bytes;
@@ -275,7 +315,7 @@ impl Resolver {
             Cached::Missing => {
                 self.file(&directory.join("config.toml"), true, 0, observation, read);
             }
-            Cached::Unavailable => observation.complete = false,
+            Cached::Unavailable(reason) => observation.incomplete(reason),
             Cached::Present(_) => self.file(&legacy, false, 0, observation, read),
         }
     }
@@ -289,18 +329,28 @@ impl Resolver {
         read: &mut impl FnMut(&Path, usize) -> io::Result<Vec<u8>>,
     ) {
         if observation.visits >= MAX_VISITS || depth > MAX_INCLUDE_DEPTH {
-            observation.complete = false;
+            observation.incomplete(format_args!(
+                "configuration includes exceed {MAX_VISITS} files or depth {MAX_INCLUDE_DEPTH}"
+            ));
             return;
         }
         observation.visits += 1;
         match self.cached(path, read) {
-            Cached::Missing => observation.complete &= optional,
-            Cached::Unavailable => observation.complete = false,
+            Cached::Missing if optional => {}
+            Cached::Missing => {
+                observation.incomplete(format_args!("{} is missing", path.display()));
+            }
+            Cached::Unavailable(reason) => observation.incomplete(reason),
             Cached::Present(parsed) => {
                 // File-defined values are relative to TWO levels above the
                 // config file, including files supplied with --config.
                 let base = path.parent().and_then(Path::parent);
-                observation.complete &= !parsed.incomplete;
+                if parsed.incomplete {
+                    observation.incomplete(format_args!(
+                        "{} has a build directory or include sbh cannot resolve",
+                        path.display()
+                    ));
+                }
                 observation.target_override |= parsed.target_override;
                 for value in parsed.destinations {
                     observation.add(base, &value);
@@ -314,7 +364,7 @@ impl Resolver {
                     } else if let Some(parent) = path.parent() {
                         parent.join(include.path)
                     } else {
-                        observation.complete = false;
+                        observation.incomplete("a relative include has no base directory");
                         continue;
                     };
                     self.file(&included, include.optional, depth + 1, observation, read);
@@ -338,7 +388,7 @@ impl Resolver {
             }
             let value = if arg == b"--config" {
                 let Some(value) = operands.next() else {
-                    observation.complete = false;
+                    observation.incomplete("--config has no value");
                     break;
                 };
                 value
@@ -348,30 +398,38 @@ impl Resolver {
                 // Operands must not impersonate a new Cargo option. The
                 // observed cwd already reflects Cargo's -C, if applied.
                 if cargo_value_option(arg) && operands.next().is_none() {
-                    observation.complete = false;
+                    observation.incomplete("a Cargo option has no operand");
                 }
                 continue;
             };
             count += 1;
             if count > MAX_CLI_CONFIGS || value.is_empty() || value.starts_with(b"-") {
-                observation.complete = false;
+                observation.incomplete(format_args!(
+                    "more than {MAX_CLI_CONFIGS} --config values, or an empty or option-like one"
+                ));
                 break;
             }
             if value.contains(&b'=') {
+                // Inline values are argv bytes: describe, never quote them.
                 match parse(value) {
                     Some(parsed) => {
-                        observation.complete &= !parsed.incomplete && parsed.includes.is_empty();
+                        if parsed.incomplete || !parsed.includes.is_empty() {
+                            observation.incomplete(
+                                "an inline --config value has an include or a build directory \
+                                 sbh cannot resolve",
+                            );
+                        }
                         observation.target_override |= parsed.target_override;
                         for value in parsed.destinations {
                             observation.add(cwd, &value);
                         }
                     }
-                    None => observation.complete = false,
+                    None => observation.incomplete("an inline --config value is not TOML"),
                 }
             } else if let Some(path) = byte_path(value, cwd) {
                 self.file(&path, false, 0, observation, read);
             } else {
-                observation.complete = false;
+                observation.incomplete("a --config file path is not usable");
             }
         }
     }
@@ -559,16 +617,19 @@ fn read_observed_file(
 /// checks above and this open cannot make root open a device, and a file on
 /// a kernel pseudo-filesystem is refused before a byte is read: reading
 /// /proc/kmsg as root drains the kernel log.
+///
+/// Where a seccomp filter makes openat2 unavailable (systemd's
+/// `RestrictSUIDSGID=`, which a hardened unit may set), the same no-symlink
+/// contract is enforced one component at a time. Before that fallback every
+/// existing Cargo configuration there was unreadable, so every live build
+/// with one held its whole deletion batch as incompletely observed.
 #[cfg(target_os = "linux")]
 fn open_config(resolved: &Path) -> io::Result<fs::File> {
-    use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, fstatfs, openat2};
+    use rustix::fs::{OFlags, fstatfs};
 
-    let file = fs::File::from(openat2(
-        CWD,
+    let file = fs::File::from(crate::platform::linux::no_symlinks::open_without_symlinks(
         resolved,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        OFlags::RDONLY | OFlags::NONBLOCK,
     )?);
     if is_pseudo_filesystem(fstatfs(&file)?.f_type) {
         return Err(io::Error::other(
@@ -766,6 +827,13 @@ mod tests {
         let found = files.observe(&mut Resolver::default(), ARGV, b"");
         assert!(!found.complete);
         assert!(found.directories.is_empty());
+        // The operator learns which file and why, not just "incomplete".
+        let reason = found.incomplete.unwrap();
+        assert!(
+            reason.starts_with("/work/project/.cargo/config: ")
+                && reason.to_lowercase().contains("permission denied"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -867,6 +935,14 @@ mod tests {
         let found = files.observe(&mut Resolver::default(), ARGV, b"");
         assert!(!found.complete);
         assert_eq!(found.directories, vec![PathBuf::from("/known")]);
+        // The first cause wins; later ones are often its consequences.
+        assert_eq!(
+            found.incomplete.as_deref(),
+            Some(
+                "/work/project/.cargo/config.toml has a build directory or include sbh \
+                 cannot resolve"
+            )
+        );
         let mut resolver = Resolver::default();
         let found = resolver.observe(
             b"cargo\0--config=build.target-dir='/inline'\0",
@@ -877,6 +953,24 @@ mod tests {
         );
         assert!(!found.complete);
         assert_eq!(found.directories, vec![PathBuf::from("/inline")]);
+        let reason = found.incomplete.unwrap();
+        assert!(
+            reason.starts_with("/work/.cargo/config: ") && reason.contains("timed out"),
+            "{reason}"
+        );
+        // Inline values are argv bytes: a reason describes them, never quotes.
+        let found = Resolver::default().observe(
+            b"cargo\0--config=build.target-dir=['/secret']\0",
+            b"HOME=/home/builder\0",
+            Some(Path::new("/work")),
+            Some(1000),
+            |_, _| Err(io::ErrorKind::NotFound.into()),
+        );
+        let reason = found.incomplete.unwrap();
+        assert!(
+            reason.starts_with("an inline --config value") && !reason.contains("secret"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -1020,6 +1114,7 @@ mod tests {
         let mut observation = Observation {
             paths: BTreeSet::from([PathBuf::from("/independent")]),
             complete: true,
+            reason: None,
             visits: 0,
             target_override: false,
         };
@@ -1031,13 +1126,19 @@ mod tests {
             !observation.complete,
             "an optional layer existed but was lost mid-read"
         );
+        let reason = observation.reason.as_deref().unwrap();
+        assert!(
+            reason.starts_with(&path.display().to_string())
+                && reason.contains("disappeared during observation"),
+            "{reason}"
+        );
         assert_eq!(
             observation.paths,
             BTreeSet::from([PathBuf::from("/independent")])
         );
         assert!(matches!(
             resolver.cached(&path, &mut |_, _| panic!("cached failure must not retry")),
-            Cached::Unavailable
+            Cached::Unavailable(_)
         ));
         assert_eq!(fs::read(saved).unwrap(), b"[build]\ntarget-dir='/active'");
     }
