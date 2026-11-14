@@ -552,6 +552,7 @@ impl ScanNowClaim {
             .expect("only observed scans are claimed");
         ScanRequest {
             paths: pending.scope.paths(),
+            admitted_scanner: Arc::new(pending.scope.scanner.clone()),
             urgency: response.urgency,
             pressure_level: response.level,
             free_pct: Some(response.free_pct),

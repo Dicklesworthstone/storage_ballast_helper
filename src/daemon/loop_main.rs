@@ -1165,6 +1165,9 @@ impl AdaptiveTickThrottle {
 #[derive(Debug, Clone)]
 pub struct ScanRequest {
     pub paths: Vec<PathBuf>,
+    /// Scope and safety settings that admitted this request. Queue waits must
+    /// not turn an old root or exclusion policy into current permission.
+    pub admitted_scanner: Arc<ScannerConfig>,
     pub urgency: f64,
     pub pressure_level: PressureLevel,
     /// Actual free percentage for the mount/root that triggered this scan.
@@ -1680,6 +1683,9 @@ fn scan_reason_for_request(request: &ScanRequest) -> &'static str {
 #[derive(Debug, Clone)]
 pub struct DeletionBatch {
     pub candidates: Vec<CandidacyScore>,
+    /// The scanner admission that produced these candidates, shared by every
+    /// batch from the pass and checked before policy and each mutation.
+    pub admitted_scanner: Arc<ScannerConfig>,
     pub pressure_level: PressureLevel,
     pub urgency: f64,
     /// The original operator scope survives queue waits and config reloads.
@@ -3973,6 +3979,7 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// authorized paths and that mount's level, free space and deletion limit.
 struct EventPassTemplate {
     paths: Vec<PathBuf>,
+    admitted_scanner: Arc<ScannerConfig>,
     event_config: EventSourceConfig,
     pressure_level: PressureLevel,
     free_pct: Option<f64>,
@@ -3983,11 +3990,17 @@ impl EventPassTemplate {
     fn from_request(request: &ScanRequest, config: &ScannerConfig) -> Self {
         Self {
             paths: request.paths.clone(),
+            admitted_scanner: Arc::clone(&request.admitted_scanner),
             event_config: EventSourceConfig::from_scanner_config(&config.root_paths, config),
             pressure_level: request.pressure_level,
             free_pct: request.free_pct,
             max_delete_batch: request.max_delete_batch,
         }
+    }
+
+    fn matches_config(&self, event_config: &EventSourceConfig, config: &ScannerConfig) -> bool {
+        self.event_config == *event_config
+            && scanner_mutation_scope_matches(&self.admitted_scanner, config, false)
     }
 }
 
@@ -4005,7 +4018,10 @@ impl EventPassTemplates {
     fn remember(&mut self, request: &ScanRequest, config: &ScannerConfig) {
         let event_config = EventSourceConfig::from_scanner_config(&config.root_paths, config);
         self.templates
-            .retain(|template| template.event_config == event_config);
+            .retain(|template| template.matches_config(&event_config, config));
+        if !scanner_mutation_scope_matches(&request.admitted_scanner, config, false) {
+            return;
+        }
         // Transient requests outside the subscriptions cannot acquire idle
         // event authority. Intersecting also preserves a requested child
         // without widening it to its configured ancestor.
@@ -4064,17 +4080,23 @@ impl EventPassTemplates {
         &mut self,
         pending: &PendingScannerEvents,
         event_config: &EventSourceConfig,
+        config: &ScannerConfig,
     ) -> Option<ScanRequest> {
+        // Protection and other authority changes need not restart the event
+        // source. Retire their old templates before selection: a dirty stale
+        // front scope would otherwise be rejected at dequeue forever, hiding
+        // fresh scopes behind it. Its work remains pending for a new request.
+        self.templates
+            .retain(|template| template.matches_config(event_config, config));
         for _ in 0..self.templates.len() {
             let template = self.templates.pop_front()?;
-            let request = (template.event_config == *event_config
-                && matches!(
-                    template.pressure_level,
-                    PressureLevel::Green | PressureLevel::Yellow
-                )
-                && pending.has_work_within(&template.paths))
+            let request = (matches!(
+                template.pressure_level,
+                PressureLevel::Green | PressureLevel::Yellow
+            ) && pending.has_work_within(&template.paths))
             .then(|| ScanRequest {
                 paths: template.paths.clone(),
+                admitted_scanner: Arc::clone(&template.admitted_scanner),
                 urgency: 0.0,
                 pressure_level: template.pressure_level,
                 free_pct: template.free_pct,
@@ -4277,7 +4299,7 @@ fn event_triggered_request(
     // and supplies a fresh pressure/authorization template.
     let event_config = current_event_source_config(Some(source), config)?;
     pending.remember(source.drain());
-    templates.next_request(pending, &event_config)
+    templates.next_request(pending, &event_config, config)
 }
 
 /// Dirty scan paths may be unwatched frontier subtrees below a configured
@@ -7031,7 +7053,7 @@ impl MonitoringDaemon {
             if self.signal_handler.should_scan() {
                 if self.forced_scan_pending_since.is_none()
                     && !Self::trigger_forced_scan(
-                        &self.config.scanner.root_paths,
+                        &self.config.scanner,
                         &scan_tx,
                         forced_scan_response.as_ref(),
                     )
@@ -7044,7 +7066,7 @@ impl MonitoringDaemon {
                 self.wake_next_tick.forced_scan = true;
             } else if let Some(since) = self.forced_scan_pending_since
                 && Self::trigger_forced_scan(
-                    &self.config.scanner.root_paths,
+                    &self.config.scanner,
                     &scan_tx,
                     forced_scan_response.as_ref(),
                 )
@@ -8839,6 +8861,7 @@ impl MonitoringDaemon {
                 self.logger_handle.send(ActivityEvent::Info { message });
                 let request = ScanRequest {
                     paths,
+                    admitted_scanner: Arc::new(self.config.scanner.clone()),
                     urgency: response.urgency.max(0.05),
                     pressure_level: response.level,
                     free_pct: Some(response.free_pct),
@@ -9634,6 +9657,7 @@ impl MonitoringDaemon {
             });
         let request = ScanRequest {
             paths,
+            admitted_scanner: Arc::new(self.config.scanner.clone()),
             urgency: response.urgency,
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
@@ -9740,6 +9764,7 @@ impl MonitoringDaemon {
     ) {
         let request = ScanRequest {
             paths: catalog_roots.iter().map(|root| root.path.clone()).collect(),
+            admitted_scanner: Arc::new(self.config.scanner.clone()),
             urgency: response.urgency,
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
@@ -9880,7 +9905,7 @@ impl MonitoringDaemon {
     }
 
     fn trigger_forced_scan(
-        root_paths: &[PathBuf],
+        scanner: &ScannerConfig,
         scan_tx: &Sender<ScanRequest>,
         response: Option<&PressureResponse>,
     ) -> bool {
@@ -9888,7 +9913,8 @@ impl MonitoringDaemon {
             return false;
         };
         let request = ScanRequest {
-            paths: root_paths.to_vec(),
+            paths: scanner.root_paths.clone(),
+            admitted_scanner: Arc::new(scanner.clone()),
             urgency: response.urgency.max(0.5), // at least moderate urgency for forced scans
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
@@ -10219,6 +10245,7 @@ impl MonitoringDaemon {
 
                 let request = ScanRequest {
                     paths: scan_paths,
+                    admitted_scanner: Arc::new(self.config.scanner.clone()),
                     urgency,
                     pressure_level,
                     free_pct: Some(stats.free_pct()),
@@ -11129,6 +11156,7 @@ fn dispatch_top_candidates(
 
     let mut batch = DeletionBatch {
         candidates: Vec::new(),
+        admitted_scanner: Arc::clone(&request.admitted_scanner),
         pressure_level: request.pressure_level,
         urgency: request.urgency,
         scan_now: request.scan_now.clone(),
@@ -12101,6 +12129,17 @@ fn scanner_thread_main(
         // Read latest config at the start of each scan.
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
+        if !scanner_mutation_scope_matches(
+            &request.admitted_scanner,
+            &current_scanner_config,
+            false,
+        ) {
+            // This includes deferred maintenance and forced/catalog requests:
+            // none may mint fresh deletion authority for its old paths after
+            // a reload. A new monitor request uses the replacement scope.
+            heartbeat.beat();
+            continue;
+        }
         if request.config_update.is_some() {
             admitted_root_order.reset();
             // A reload's own pass covers the new roots; a waiting routine
@@ -14463,12 +14502,14 @@ fn target_only_consent_current(
 /// Policy changes defer the remaining work without per-path failure backoff.
 fn authorize_scanner_mutation_scope(
     batch: &DeletionBatch,
-    planned: &crate::core::config::ScannerConfig,
     current: &RwLock<crate::core::config::ScannerConfig>,
 ) -> std::result::Result<(), SkipReason> {
     let current = current.read();
-    if scanner_mutation_scope_matches(planned, &current, batch.target_only_root.is_some())
-        && target_only_consent_current(batch, &current)
+    if scanner_mutation_scope_matches(
+        &batch.admitted_scanner,
+        &current,
+        batch.target_only_root.is_some(),
+    ) && target_only_consent_current(batch, &current)
     {
         Ok(())
     } else {
@@ -14686,6 +14727,22 @@ fn executor_thread_main(
             continue;
         }
         let scanner_snapshot = shared_scanner_config.read().clone();
+        if !scanner_mutation_scope_matches(
+            &batch.admitted_scanner,
+            &scanner_snapshot,
+            batch.target_only_root.is_some(),
+        ) {
+            // A dequeue-time snapshot cannot authorize work collected before
+            // the reload. Reject it before it spends a Canary slot or logs
+            // a fresh verdict, without treating changed policy as a failure.
+            logger.send(ActivityEvent::Info {
+                message: format!(
+                    "dropped {} queued candidate(s): scanner mutation scope changed",
+                    batch.candidates.len(),
+                ),
+            });
+            continue;
+        }
         if let Some(relief) = &batch.ram_reclaim {
             if batch.target_only_root.is_some() || batch.inode_reclaim.is_some() {
                 // Swap pressure cannot borrow the target-only protection
@@ -15110,7 +15167,7 @@ fn executor_thread_main(
             // A batch planned as a dry-run cannot mutate and still owes its
             // preview counts. Real batches must obey newly restrictive policy.
             if !dry_run {
-                authorize_scanner_mutation_scope(&batch, &scanner_snapshot, shared_scanner_config)?;
+                authorize_scanner_mutation_scope(&batch, shared_scanner_config)?;
                 // Renew recursive age and process evidence before the cheap
                 // live gates. The survey must not hide a policy change while
                 // it runs or outlive a newly published compression hold.
@@ -15191,7 +15248,7 @@ fn executor_thread_main(
                     .quarantine_first
                     .authorize(candidate, platform)?;
                 // A pressure probe can block; renew permissions after it.
-                authorize_scanner_mutation_scope(&batch, &scanner_snapshot, shared_scanner_config)?;
+                authorize_scanner_mutation_scope(&batch, shared_scanner_config)?;
                 shared_config.authorize_dispatch(
                     batch.ram_reclaim.is_some(),
                     batch.inode_reclaim.is_some(),
@@ -16362,7 +16419,7 @@ mod tests {
         let (scan_tx, scan_rx) = bounded(4);
         let (del_tx, _del_rx) = bounded(4);
         assert!(!MonitoringDaemon::trigger_forced_scan(
-            &daemon.config.scanner.root_paths,
+            &daemon.config.scanner,
             &scan_tx,
             daemon.forced_filesystem_response().as_ref(),
         ));
@@ -16401,7 +16458,7 @@ mod tests {
             thread::yield_now();
         };
         assert!(MonitoringDaemon::trigger_forced_scan(
-            &daemon.config.scanner.root_paths,
+            &daemon.config.scanner,
             &scan_tx,
             Some(&forced),
         ));
@@ -17699,6 +17756,7 @@ mod tests {
             scan_tx
                 .send(ScanRequest {
                     paths: daemon.config.scanner.root_paths.clone(),
+                    admitted_scanner: Arc::new(daemon.config.scanner.clone()),
                     urgency: 1.0,
                     pressure_level: PressureLevel::Critical,
                     free_pct: Some(0.0),
@@ -20370,6 +20428,7 @@ mod tests {
         });
         let routine = |label: &str, level| ScanRequest {
             paths: vec![directory.path().join(label)],
+            admitted_scanner: Arc::new(scanner.clone()),
             urgency: 0.5,
             pressure_level: level,
             free_pct: Some(70.0),
@@ -20414,7 +20473,7 @@ mod tests {
         assert!(claim.is_none());
         assert!(deferred.is_some());
         let mut config_request = routine("config", PressureLevel::Green);
-        config_request.config_update = Some((Config::default().scoring, scanner));
+        config_request.config_update = Some((Config::default().scoring, scanner.clone()));
         send.send(config_request).unwrap();
         let (request, claim) = ready_scanner_request(&receive, Some(&queue), &mut deferred);
         assert!(request.unwrap().config_update.is_some());
@@ -20729,19 +20788,19 @@ mod tests {
             // A full queue leaves the signal pending. When room returns,
             // both the first attempt and its retry use physical pressure.
             assert!(MonitoringDaemon::trigger_forced_scan(
-                roots,
+                &daemon.config.scanner,
                 &forced_tx,
                 Some(&physical),
             ));
             assert!(!MonitoringDaemon::trigger_forced_scan(
-                roots,
+                &daemon.config.scanner,
                 &forced_tx,
                 Some(&physical),
             ));
             for retry in [false, true] {
                 if retry {
                     assert!(MonitoringDaemon::trigger_forced_scan(
-                        roots,
+                        &daemon.config.scanner,
                         &forced_tx,
                         Some(&physical),
                     ));
@@ -24731,6 +24790,7 @@ mod tests {
         scan_tx
             .send(ScanRequest {
                 paths: vec![root],
+                admitted_scanner: Arc::new(scanner_cfg.read().clone()),
                 urgency: 0.9,
                 pressure_level: PressureLevel::Orange,
                 free_pct: Some(9.0),
@@ -24862,6 +24922,7 @@ mod tests {
             scan_tx
                 .send(ScanRequest {
                     paths: vec![root],
+                    admitted_scanner: Arc::new(config.scanner.clone()),
                     urgency: 0.9,
                     pressure_level: PressureLevel::Orange,
                     free_pct: Some(9.0),
@@ -24977,6 +25038,7 @@ mod tests {
         let open_files: HashSet<PathBuf> = HashSet::new();
         let request = ScanRequest {
             paths: vec![temp.path().to_path_buf()],
+            admitted_scanner: Arc::new(config.scanner.clone()),
             urgency: 0.7,
             pressure_level: PressureLevel::Orange,
             free_pct: Some(8.0),
@@ -26035,6 +26097,7 @@ mod tests {
             Some(crate::scanner::walker::identity_for_path(&target, false).unwrap());
         let batch = DeletionBatch {
             candidates: vec![candidate],
+            admitted_scanner: Arc::new(scanner.clone()),
             pressure_level: PressureLevel::Red,
             urgency: 0.8,
             target_bytes: None,
@@ -26189,6 +26252,7 @@ mod tests {
         let live_scanner = RwLock::new(scanner.clone());
         let mut batch = DeletionBatch {
             candidates,
+            admitted_scanner: Arc::new(scanner.clone()),
             pressure_level: PressureLevel::Critical,
             urgency: 0.9,
             target_bytes: None,
@@ -26219,9 +26283,9 @@ mod tests {
         let plan = executor.plan(std::mem::take(&mut batch.candidates));
         assert_eq!(plan.candidates.len(), 2);
         let authorize = |candidate: &CandidacyScore| {
-            authorize_scanner_mutation_scope(&batch, &scanner, &live_scanner)?;
+            authorize_scanner_mutation_scope(&batch, &live_scanner)?;
             authorize_target_only_candidate(candidate, batch.target_only_root.as_deref())?;
-            authorize_scanner_mutation_scope(&batch, &scanner, &live_scanner)
+            authorize_scanner_mutation_scope(&batch, &live_scanner)
         };
         let change_after_first = |candidate: &CandidacyScore, _: Instant| {
             assert_eq!(candidate.path, first);
@@ -26259,6 +26323,174 @@ mod tests {
         assert_scanner_reload_defers_remaining_candidate(false, |scanner, _| {
             scanner.catalog_roots_on_pressured_device = false;
         });
+    }
+
+    /// A worker must use the policy that admitted the candidates, not a new
+    /// snapshot taken after they have already waited in the deletion queue.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn executor_rejects_queued_batches_after_scanner_scope_reload_before_policy() {
+        for case in [
+            "unchanged",
+            "scheduling",
+            "roots",
+            "excluded",
+            "protected",
+            "age",
+            "source roots",
+            "catalog",
+            "symlinks",
+            "devices",
+        ] {
+            let mut fixture = RegretDaemonFixture::new();
+            let scanner = fixture.daemon.shared_scanner_config.read().clone();
+            let path = scanner.root_paths[0].join("queued.o");
+            std::fs::write(&path, b"retain these bytes").unwrap();
+            let mut candidate = test_candidate(&path.to_string_lossy(), 3.0);
+            candidate.identity =
+                Some(crate::scanner::walker::identity_for_path(&path, false).unwrap());
+            let mut request = event_test_request(scanner.root_paths.clone());
+            request.admitted_scanner = Arc::new(scanner);
+            request.pressure_level = PressureLevel::Critical;
+            request.urgency = 1.0;
+            let (send, receive) = bounded(1);
+            assert!(dispatch_top_candidates(
+                &mut vec![candidate],
+                &request,
+                &send,
+                &mut PassDispatch::default(),
+                &test_dispatch_config(),
+            ));
+            assert_eq!(receive.len(), 1, "{case}: enqueue before the reload");
+            {
+                let mut current = fixture.daemon.shared_scanner_config.write();
+                match case {
+                    "scheduling" => current.parallelism += 1,
+                    "roots" => current.root_paths.clear(),
+                    "excluded" => current.excluded_paths.push(path.clone()),
+                    "protected" => current
+                        .protected_paths
+                        .push(path.to_string_lossy().into_owned()),
+                    "age" => current.min_file_age_minutes += 60,
+                    "source roots" => {
+                        current.allow_source_tree_roots = !current.allow_source_tree_roots;
+                    }
+                    "catalog" => {
+                        current.catalog_roots_on_pressured_device =
+                            !current.catalog_roots_on_pressured_device;
+                    }
+                    "symlinks" => current.follow_symlinks = !current.follow_symlinks,
+                    "devices" => current.cross_devices = !current.cross_devices,
+                    _ => {}
+                }
+            }
+            drop(send);
+            let (reports, _report_rx) = bounded(8);
+            let (feedback, _feedback_rx) = bounded(8);
+            fixture
+                .daemon
+                .spawn_executor_thread(
+                    receive,
+                    fixture.daemon.logger_handle.clone(),
+                    ThreadHeartbeat::new("queued-scope-test"),
+                    reports,
+                    feedback,
+                )
+                .unwrap()
+                .join()
+                .unwrap();
+            fixture.flush_logger();
+
+            let allowed = matches!(case, "unchanged" | "scheduling");
+            let ledger = crate::logger::sqlite::SqliteLogger::open_read_only(
+                &fixture.daemon.config.paths.sqlite_db,
+            )
+            .unwrap();
+            assert_eq!(
+                ledger
+                    .decisions_for_path(&path.to_string_lossy(), 10)
+                    .unwrap()
+                    .len(),
+                usize::from(allowed),
+                "{case}: stale admission must not spend a policy decision",
+            );
+            let log = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
+            assert_eq!(
+                log.contains("queued candidate(s): scanner mutation scope changed"),
+                !allowed,
+                "{case}: {log}",
+            );
+            // The positive controls reach policy, then observe that this
+            // fixture's healthy filesystem no longer needs disk relief.
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"retain these bytes",
+                "{case}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queued_scanner_admission_is_renewed_at_actual_unlink() {
+        for changed in [false, true] {
+            let scratch = temp_root_scratch_dir();
+            let root = scratch.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            let path = root.join("queued.o");
+            std::fs::write(&path, b"queued object").unwrap();
+            let scanner = ScannerConfig {
+                root_paths: vec![root.clone()],
+                min_file_age_minutes: 0,
+                ..ScannerConfig::default()
+            };
+            let mut candidate = test_candidate(&path.to_string_lossy(), 3.0);
+            candidate.identity =
+                Some(crate::scanner::walker::identity_for_path(&path, false).unwrap());
+            let mut request = event_test_request(vec![root]);
+            request.admitted_scanner = Arc::new(scanner.clone());
+            request.pressure_level = PressureLevel::Critical;
+            request.urgency = 1.0;
+            let (send, receive) = bounded(1);
+            assert!(dispatch_top_candidates(
+                &mut vec![candidate],
+                &request,
+                &send,
+                &mut PassDispatch::default(),
+                &test_dispatch_config(),
+            ));
+            let mut batch = receive.try_recv().unwrap();
+            let current = RwLock::new(scanner);
+            if changed {
+                current.write().root_paths.clear();
+            }
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    min_score: 0.0,
+                    require_identity: true,
+                    ..DeletionConfig::default()
+                },
+                None,
+            )
+            .with_platform(Arc::new(MockPlatform::healthy()));
+            let plan = executor.plan(std::mem::take(&mut batch.candidates));
+            assert_eq!(plan.candidates.len(), 1);
+            let authorize = |_: &CandidacyScore| authorize_scanner_mutation_scope(&batch, &current);
+            let report = executor.execute_with_hooks(&plan, None, Some(&authorize), None);
+            assert_eq!(report.items_deleted, usize::from(!changed), "{report:?}");
+            assert_eq!(report.items_failed, 0, "{report:?}");
+            assert!(report.backoff_candidates.is_empty(), "{report:?}");
+            if changed {
+                assert_eq!(report.skipped_by_reason.get("policy_changed"), Some(&1));
+                assert_eq!(std::fs::read(&path).unwrap(), b"queued object");
+            } else {
+                assert!(
+                    !path.exists(),
+                    "unchanged admission must allow real cleanup"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -26308,6 +26540,7 @@ mod tests {
             let (send, receive) = crossbeam_channel::bounded(1);
             send.send(DeletionBatch {
                 candidates: vec![candidate],
+                admitted_scanner: Arc::new(scanner.clone()),
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.9,
                 target_bytes: None,
@@ -26351,10 +26584,12 @@ mod tests {
             executor.join().unwrap();
             fixture.flush_logger();
             let log = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
-            assert!(
-                log.contains("dropped 1 target-only candidate(s) outside"),
-                "{case}: {log}"
-            );
+            let refusal = if matches!(case, "removed root" | "longer idle") {
+                "dropped 1 queued candidate(s): scanner mutation scope changed"
+            } else {
+                "dropped 1 target-only candidate(s) outside"
+            };
+            assert!(log.contains(refusal), "{case}: {log}");
             assert!(
                 !log.contains(target.to_string_lossy().as_ref()),
                 "{case}: stale work reached policy: {log}"
@@ -26428,6 +26663,7 @@ mod tests {
         };
         let run = |paths: &[&PathBuf], target_only_root: Option<&Path>| {
             let mut batch = DeletionBatch {
+                admitted_scanner: Arc::new(scanner.clone()),
                 candidates: paths
                     .iter()
                     .map(|path| {
@@ -26698,6 +26934,7 @@ mod tests {
         };
         let mut batch = DeletionBatch {
             candidates,
+            admitted_scanner: Arc::new(scanner.clone()),
             pressure_level: PressureLevel::Critical,
             urgency: 0.9,
             target_bytes: None,
@@ -26808,6 +27045,7 @@ mod tests {
         };
         let batch = |target_only_root: Option<PathBuf>| DeletionBatch {
             candidates: candidates(),
+            admitted_scanner: Arc::new(scanner.clone()),
             pressure_level: PressureLevel::Critical,
             urgency: 0.9,
             target_bytes: None,
@@ -26894,6 +27132,7 @@ mod tests {
         del_tx
             .send(DeletionBatch {
                 candidates,
+                admitted_scanner: Arc::new(fixture.daemon.shared_scanner_config.read().clone()),
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.9,
                 target_bytes: None,
@@ -26962,6 +27201,7 @@ mod tests {
         del_tx
             .send(DeletionBatch {
                 candidates,
+                admitted_scanner: Arc::new(fixture.daemon.shared_scanner_config.read().clone()),
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.9,
                 target_bytes: None,
@@ -26995,6 +27235,7 @@ mod tests {
     #[test]
     fn zero_byte_candidates_are_dropped_and_counted() {
         let mut batch = DeletionBatch {
+            admitted_scanner: test_scanner_admission(&[PathBuf::from("/data/tmp")]),
             candidates: vec![
                 test_candidate("/data/tmp/a/node_modules", 2.0),
                 test_candidate("/data/tmp/b/target", 2.5),
@@ -27069,6 +27310,7 @@ mod tests {
 
         for mode in ["bytes", "ram", "operator", "inode"] {
             let mut request = event_test_request(vec![root.clone()]);
+            request.admitted_scanner = Arc::new(scanner.clone());
             request.pressure_level = PressureLevel::Critical;
             request.urgency = 1.0;
             match mode {
@@ -27091,6 +27333,7 @@ mod tests {
             let expected = usize::from(mode == "inode");
             let mut batch = DeletionBatch {
                 candidates: candidates.clone(),
+                admitted_scanner: Arc::new(scanner.clone()),
                 pressure_level: request.pressure_level,
                 urgency: request.urgency,
                 target_bytes: None,
@@ -27224,6 +27467,7 @@ mod tests {
             Err(SkipReason::PolicyChanged),
         );
         let mut request = event_test_request(vec![root.clone()]);
+        request.admitted_scanner = Arc::new(config.scanner.clone());
         request.pressure_level = PressureLevel::Critical;
         request.urgency = 1.0;
         request.inode_reclaim = Some(relief.clone());
@@ -27642,6 +27886,7 @@ mod tests {
         for posture in [ScanAggressiveness::DefiniteOnly, ScanAggressiveness::Skip] {
             shared.set_scan_posture(posture);
             let mut request = event_test_request(vec![root.clone()]);
+            request.admitted_scanner = Arc::new(config.scanner.clone());
             request.pressure_level = PressureLevel::Critical;
             assert_eq!(shared.scan_posture_for(&request), posture);
             assert!(shared.holds_recursive_scan(&request));
@@ -27696,6 +27941,7 @@ mod tests {
         }
 
         let mut request = event_test_request(vec![root.clone()]);
+        request.admitted_scanner = Arc::new(config.scanner.clone());
         request.catalog_roots = vec![ExpandedCatalogRoot {
             path: root,
             rule: "test-catalog-cache",
@@ -27779,6 +28025,7 @@ mod tests {
         let (index_path, cursor_path) = scanner_state_paths(temp.path());
         let request_for = |level| {
             let mut request = event_test_request(vec![root.clone()]);
+            request.admitted_scanner = Arc::new(config.scanner.clone());
             request.pressure_level = level;
             request.free_pct = Some(if level == PressureLevel::Critical {
                 1.0
@@ -28051,6 +28298,7 @@ mod tests {
         let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
         let (index_path, cursor_path) = scanner_state_paths(temp.path());
         let mut request = event_test_request(vec![root]);
+        request.admitted_scanner = Arc::new(config.scanner.clone());
         request.pressure_level = PressureLevel::Critical;
         request.free_pct = Some(1.0);
         request.urgency = 1.0;
@@ -28189,6 +28437,7 @@ mod tests {
             scan_tx
                 .send(ScanRequest {
                     paths: vec![root.clone()],
+                    admitted_scanner: Arc::new(shared_scanner_config.read().clone()),
                     urgency: 0.05,
                     pressure_level: PressureLevel::Green,
                     free_pct: Some(50.0),
@@ -28279,6 +28528,7 @@ mod tests {
         scan_tx
             .send(ScanRequest {
                 paths: vec![root],
+                admitted_scanner: Arc::new(shared_scanner_config.read().clone()),
                 urgency: 0.9,
                 pressure_level: PressureLevel::Orange,
                 free_pct: Some(9.0),
@@ -28338,6 +28588,114 @@ mod tests {
 
         logger.shutdown();
         logger_join.join().unwrap();
+    }
+
+    /// The request queue is an admission boundary too: a reload must not
+    /// let the scanner manufacture fresh batches from withdrawn root paths.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn scanner_rejects_a_queued_request_after_its_root_is_removed() {
+        for case in ["unchanged", "scheduling", "selected root", "removed root"] {
+            let temp = temp_root_scratch_dir();
+            let root = temp.path().join("scan-root");
+            let project = root.join("project");
+            let target = project.join("target");
+            for child in ["debug/deps", "debug/incremental", "debug/.fingerprint"] {
+                std::fs::create_dir_all(target.join(child)).unwrap();
+            }
+            std::fs::write(
+                project.join("Cargo.toml"),
+                "[package]\nname = \"queued\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+            write_cargo_cachedir_tag(&target);
+            std::fs::write(target.join("debug/deps/libqueued.rlib"), [0xA5_u8; 8192]).unwrap();
+            let mut config = Config::default();
+            config.scanner.root_paths = vec![if case == "selected root" {
+                // Special-location probes may legitimately select a path
+                // outside the ordinary roots under the same admission.
+                let other = temp.path().join("configured-root");
+                std::fs::create_dir(&other).unwrap();
+                other
+            } else {
+                root.clone()
+            }];
+            config.scanner.parallelism = 1;
+            config.scanner.min_file_age_minutes = 0;
+            config.scanner.active_reference_min_size_bytes = u64::MAX;
+            config.scanner.log_truncation.enabled = false;
+            config.scoring.min_score = 0.0;
+            let (scan_tx, scan_rx) = bounded(1);
+            let mut request = event_test_request(vec![root]);
+            request.admitted_scanner = Arc::new(config.scanner.clone());
+            request.pressure_level = PressureLevel::Critical;
+            request.urgency = 1.0;
+            scan_tx.send(request).unwrap();
+            drop(scan_tx);
+            let mut current = config.scanner.clone();
+            match case {
+                "removed root" => current.root_paths.clear(),
+                "scheduling" => current.parallelism += 1,
+                _ => {}
+            }
+            let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+                sqlite_path: None,
+                jsonl_config: crate::logger::jsonl::JsonlConfig {
+                    path: temp.path().join("activity.jsonl"),
+                    fallback_path: None,
+                    max_size_bytes: 1_048_576,
+                    max_rotated_files: 0,
+                    fsync_interval_secs: 0,
+                },
+                channel_capacity: 64,
+                run_id: None,
+            })
+            .unwrap();
+            let (del_tx, del_rx) = bounded(16);
+            let (report_tx, report_rx) = bounded(2);
+            let (_feedback_tx, feedback_rx) = bounded(1);
+            let (index_path, cursor_path) = scanner_state_paths(temp.path());
+            scanner_thread_main(
+                &scan_rx,
+                &del_tx,
+                &logger,
+                &Arc::new(RwLock::new(config.scoring.clone())),
+                &Arc::new(RwLock::new(current)),
+                &(Arc::new(MockPlatform::healthy()) as Arc<dyn Platform>),
+                &ThreadHeartbeat::new("queued-root-test"),
+                &report_tx,
+                &Arc::new(AtomicBool::new(false)),
+                &index_path,
+                &cursor_path,
+                &feedback_rx,
+                &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+                &Arc::new(SharedExecutorConfig::new(
+                    false, 10, 0.0, 60, 3600, false, 0,
+                )),
+                &Arc::new(SharedRegret::new(&config)),
+                None,
+                &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
+            );
+            logger.shutdown();
+            logger_join.join().unwrap();
+            let dispatched: Vec<_> = del_rx
+                .try_iter()
+                .flat_map(|batch| batch.candidates.into_iter().map(|candidate| candidate.path))
+                .collect();
+            let allowed = case != "removed root";
+            assert_eq!(
+                dispatched.contains(&target),
+                allowed,
+                "{case}: {dispatched:?}"
+            );
+            assert_eq!(report_rx.try_recv().is_ok(), allowed, "{case}");
+            assert_eq!(
+                std::fs::read(target.join("debug/deps/libqueued.rlib")).unwrap(),
+                [0xA5_u8; 8192],
+                "the scanner only proposes work",
+            );
+        }
     }
 
     /// trj 2026-11-13: `/data/tmp/rch/ft-dsr-qualification-1031-c91` was a
@@ -28409,6 +28767,7 @@ mod tests {
         let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
         let (index_path, cursor_path) = scanner_state_paths(temp.path());
         let mut request = event_test_request(vec![root.clone()]);
+        request.admitted_scanner = Arc::new(config.scanner.clone());
         request.pressure_level = PressureLevel::Critical;
         request.free_pct = Some(1.0);
         request.urgency = 1.0;
@@ -28515,6 +28874,7 @@ mod tests {
             let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
             let (index_path, cursor_path) = scanner_state_paths(temp.path());
             let mut request = event_test_request(vec![root]);
+            request.admitted_scanner = Arc::new(config.scanner.clone());
             request.pressure_level = level;
             request.urgency = urgency;
             request.maintenance = level == PressureLevel::Green;
@@ -29094,6 +29454,7 @@ mod tests {
         let configured = vec![PathBuf::from("/data/projects")];
         let request = |level| ScanRequest {
             paths: configured.clone(),
+            admitted_scanner: test_scanner_admission(&configured),
             urgency: 0.2,
             pressure_level: level,
             free_pct: Some(30.0),
@@ -29208,6 +29569,7 @@ mod tests {
                 )])),
             );
             let mut request = event_test_request(vec![root.clone()]);
+            request.admitted_scanner = Arc::new(config.scanner.clone());
             request.pressure_level = PressureLevel::Orange;
             request.free_pct = Some(9.0);
             request.urgency = 0.9;
@@ -29385,6 +29747,7 @@ mod tests {
         scan_tx
             .send(ScanRequest {
                 paths: vec![root.clone()],
+                admitted_scanner: Arc::new(shared_scanner_config.read().clone()),
                 urgency: 0.9,
                 pressure_level: PressureLevel::Orange,
                 free_pct: Some(9.0),
@@ -29497,7 +29860,7 @@ mod tests {
 
         let (scanner_index_path, prescan_cursor_path) = scanner_state_paths(temp.path());
         let scoring = Arc::new(RwLock::new(config.scoring.clone()));
-        let scanner_cfg = Arc::new(RwLock::new(config.scanner));
+        let scanner_cfg = Arc::new(RwLock::new(config.scanner.clone()));
         let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -29522,6 +29885,7 @@ mod tests {
             scan_tx
                 .send(ScanRequest {
                     paths: vec![root.clone()],
+                    admitted_scanner: Arc::new(config.scanner.clone()),
                     urgency: 0.9,
                     pressure_level: PressureLevel::Orange,
                     free_pct: Some(9.0),
@@ -29774,6 +30138,7 @@ mod tests {
         scan_tx
             .send(ScanRequest {
                 paths: vec![root],
+                admitted_scanner: Arc::new(shared_scanner_config.read().clone()),
                 urgency: 0.9,
                 pressure_level: PressureLevel::Orange,
                 free_pct: Some(9.0),
@@ -30073,6 +30438,7 @@ mod tests {
         scan_tx
             .send(ScanRequest {
                 paths: vec![root],
+                admitted_scanner: Arc::new(shared_scanner_config.read().clone()),
                 urgency: 0.9,
                 pressure_level: PressureLevel::Orange,
                 free_pct: Some(9.0),
@@ -30318,6 +30684,7 @@ mod tests {
             scan_tx
                 .send(ScanRequest {
                     paths: vec![pass_root.to_path_buf()],
+                    admitted_scanner: Arc::new(config.scanner.clone()),
                     urgency: 0.9,
                     pressure_level: PressureLevel::Orange,
                     free_pct: Some(9.0),
@@ -30464,6 +30831,7 @@ mod tests {
                 scan_tx
                     .send(ScanRequest {
                         paths: vec![root.to_path_buf()],
+                        admitted_scanner: Arc::new(shared_scanner_config.read().clone()),
                         urgency: 0.9,
                         pressure_level: PressureLevel::Orange,
                         free_pct: Some(9.0),
@@ -30741,6 +31109,7 @@ mod tests {
         scan_tx
             .send(ScanRequest {
                 paths: vec![root],
+                admitted_scanner: Arc::new(shared_scanner_config.read().clone()),
                 urgency: 0.5,
                 pressure_level: PressureLevel::Green,
                 free_pct: Some(50.0),
@@ -31510,6 +31879,7 @@ mod tests {
         let (del_tx, del_rx) = bounded::<DeletionBatch>(1);
         let request = ScanRequest {
             paths: vec![PathBuf::from("/tmp")],
+            admitted_scanner: test_scanner_admission(&[PathBuf::from("/tmp")]),
             urgency: 0.5,
             pressure_level: PressureLevel::Yellow,
             free_pct: None,
@@ -31548,6 +31918,7 @@ mod tests {
         let relief = RamReclaimRequest::new(PathBuf::from("/tmp"), 17, 2, &[PathBuf::from("/tmp")]);
         let request = ScanRequest {
             paths: vec![PathBuf::from("/tmp")],
+            admitted_scanner: test_scanner_admission(&[PathBuf::from("/tmp")]),
             urgency: 1.0,
             pressure_level: PressureLevel::Red,
             free_pct: Some(29.0),
@@ -31618,7 +31989,7 @@ mod tests {
             excluded_paths: vec![root.join("keep")],
             ..ScannerConfig::default()
         };
-        let mut request = event_test_request(scanner.root_paths.clone());
+        let mut request = event_test_request_for_config(scanner.root_paths.clone(), &scanner);
         let mut templates = EventPassTemplates::default();
         templates.remember(&request, &scanner);
         assert_eq!(templates.templates.len(), 1);
@@ -31962,6 +32333,7 @@ mod tests {
         let (feedback, _feedback_rx) = bounded(8);
         send.send(DeletionBatch {
             candidates: vec![candidate],
+            admitted_scanner: Arc::new(fixture.daemon.shared_scanner_config.read().clone()),
             pressure_level: PressureLevel::Critical,
             urgency: 1.0,
             scan_now: None,
@@ -32109,6 +32481,7 @@ mod tests {
         let (del_tx, del_rx) = bounded::<DeletionBatch>(2);
         let request = ScanRequest {
             paths: vec![PathBuf::from("/tmp")],
+            admitted_scanner: test_scanner_admission(&[PathBuf::from("/tmp")]),
             urgency: 1.0,
             pressure_level: PressureLevel::Critical,
             free_pct: None,
@@ -32525,6 +32898,10 @@ mod tests {
     fn scan_request_serializes_correctly() {
         let request = ScanRequest {
             paths: vec![PathBuf::from("/tmp"), PathBuf::from("/data/projects")],
+            admitted_scanner: test_scanner_admission(&[
+                PathBuf::from("/tmp"),
+                PathBuf::from("/data/projects"),
+            ]),
             urgency: 0.7,
             pressure_level: PressureLevel::Orange,
             free_pct: Some(8.5),
@@ -32587,6 +32964,7 @@ mod tests {
             scan_tx
                 .send(ScanRequest {
                     paths: daemon.config.scanner.root_paths.clone(),
+                    admitted_scanner: Arc::new(daemon.config.scanner.clone()),
                     urgency: 1.0,
                     pressure_level,
                     free_pct,
@@ -32647,18 +33025,22 @@ mod tests {
             predicted_seconds: None,
         };
         let roots = [PathBuf::from("/data/tmp")];
+        let scanner = ScannerConfig {
+            root_paths: roots.to_vec(),
+            ..ScannerConfig::default()
+        };
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
         assert!(!MonitoringDaemon::trigger_forced_scan(
-            &roots, &scan_tx, None,
+            &scanner, &scan_tx, None,
         ));
         assert!(scan_rx.try_recv().is_err(), "missing evidence must defer");
         assert!(MonitoringDaemon::trigger_forced_scan(
-            &roots,
+            &scanner,
             &scan_tx,
             Some(&response)
         ));
         assert!(!MonitoringDaemon::trigger_forced_scan(
-            &roots,
+            &scanner,
             &scan_tx,
             Some(&response)
         ));
@@ -32670,7 +33052,7 @@ mod tests {
             "the full-queue attempt queued nothing"
         );
         assert!(MonitoringDaemon::trigger_forced_scan(
-            &roots,
+            &scanner,
             &scan_tx,
             Some(&response)
         ));
@@ -32681,7 +33063,7 @@ mod tests {
         drop(scan_rx);
         // Disconnected: given up (true) rather than retried forever.
         assert!(MonitoringDaemon::trigger_forced_scan(
-            &roots,
+            &scanner,
             &scan_tx,
             Some(&response)
         ));
@@ -32770,6 +33152,7 @@ mod tests {
         // Send a scan request.
         let request = ScanRequest {
             paths: vec![],
+            admitted_scanner: test_scanner_admission(&[]),
             urgency: 0.5,
             pressure_level: PressureLevel::Orange,
             free_pct: None,
@@ -32795,6 +33178,7 @@ mod tests {
         // Send a deletion batch.
         let batch = DeletionBatch {
             candidates: Vec::new(),
+            admitted_scanner: Arc::clone(&received.admitted_scanner),
             pressure_level: PressureLevel::Orange,
             urgency: 0.5,
             target_bytes: None,
@@ -32970,6 +33354,7 @@ mod tests {
     fn v2_pressure_candidate_byte_target_only_applies_under_cleanup_pressure() {
         let mut request = ScanRequest {
             paths: vec![PathBuf::from("/tmp")],
+            admitted_scanner: test_scanner_admission(&[PathBuf::from("/tmp")]),
             urgency: 0.5,
             pressure_level: PressureLevel::Yellow,
             free_pct: Some(15.0),
@@ -33000,6 +33385,10 @@ mod tests {
     fn v2_active_scan_paths_skip_green_yellow_without_dirty_roots() {
         let mut request = ScanRequest {
             paths: vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")],
+            admitted_scanner: test_scanner_admission(&[
+                PathBuf::from("/tmp"),
+                PathBuf::from("/var/tmp"),
+            ]),
             urgency: 0.0,
             pressure_level: PressureLevel::Green,
             free_pct: Some(50.0),
@@ -33028,8 +33417,16 @@ mod tests {
         assert_eq!(v2_active_scan_paths(&request, &dirty), None);
     }
 
+    fn test_scanner_admission(paths: &[PathBuf]) -> Arc<ScannerConfig> {
+        Arc::new(ScannerConfig {
+            root_paths: paths.to_vec(),
+            ..ScannerConfig::default()
+        })
+    }
+
     fn event_test_request(paths: Vec<PathBuf>) -> ScanRequest {
         ScanRequest {
+            admitted_scanner: test_scanner_admission(&paths),
             paths,
             urgency: 0.0,
             pressure_level: PressureLevel::Green,
@@ -33044,6 +33441,12 @@ mod tests {
             target_bytes: None,
             ram_reclaim: None,
         }
+    }
+
+    fn event_test_request_for_config(paths: Vec<PathBuf>, config: &ScannerConfig) -> ScanRequest {
+        let mut request = event_test_request(paths);
+        request.admitted_scanner = Arc::new(config.clone());
+        request
     }
 
     #[test]
@@ -33293,7 +33696,10 @@ mod tests {
         );
         let mut last_poll = Instant::now().checked_sub(EVENT_POLL_INTERVAL).unwrap();
         let mut templates = EventPassTemplates::default();
-        templates.remember(&event_test_request(vec![root_a]), &config);
+        templates.remember(
+            &event_test_request_for_config(vec![root_a], &config),
+            &config,
+        );
         assert!(
             event_triggered_request(
                 Some(&mut source),
@@ -33305,7 +33711,10 @@ mod tests {
             .is_none()
         );
         assert!(pending.has_work_within(std::slice::from_ref(&root_b)));
-        templates.remember(&event_test_request(vec![root_b.clone()]), &config);
+        templates.remember(
+            &event_test_request_for_config(vec![root_b.clone()], &config),
+            &config,
+        );
         last_poll = Instant::now().checked_sub(EVENT_POLL_INTERVAL).unwrap();
         let request = event_triggered_request(
             Some(&mut source),
@@ -33371,12 +33780,12 @@ mod tests {
         let mut source = ScannerEventSource::start(event_config.clone());
         source.drain();
         let mut templates = EventPassTemplates::default();
-        let mut request_a = event_test_request(vec![root_a.clone()]);
+        let mut request_a = event_test_request_for_config(vec![root_a.clone()], &config);
         request_a.pressure_level = PressureLevel::Yellow;
         request_a.free_pct = Some(20.0);
         request_a.max_delete_batch = 3;
         templates.remember(&request_a, &config);
-        let mut request_b = event_test_request(vec![root_b.clone()]);
+        let mut request_b = event_test_request_for_config(vec![root_b.clone()], &config);
         request_b.free_pct = Some(70.0);
         request_b.max_delete_batch = 8;
         templates.remember(&request_b, &config);
@@ -33408,7 +33817,7 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(
                 templates
-                    .next_request(&pending, &event_config)
+                    .next_request(&pending, &event_config, &config)
                     .unwrap()
                     .paths,
                 vec![root_a.clone()]
@@ -33441,6 +33850,75 @@ mod tests {
     }
 
     #[test]
+    fn idle_event_templates_drop_revoked_authority_without_starving_fresh_scopes() {
+        let config = ScannerConfig {
+            root_paths: vec!["/a".into(), "/b".into()],
+            ..ScannerConfig::default()
+        };
+        let event_config = EventSourceConfig::from_scanner_config(&config.root_paths, &config);
+        let stale_a = event_test_request_for_config(vec!["/a".into()], &config);
+        let reloaded = ScannerConfig {
+            protected_paths: vec!["/a/keep/**".to_string()],
+            ..config.clone()
+        };
+        assert_eq!(
+            event_config,
+            EventSourceConfig::from_scanner_config(&reloaded.root_paths, &reloaded),
+            "a protection-only reload keeps the existing event subscription"
+        );
+        let mut pending = PendingScannerEvents {
+            reconciliation: config.root_paths.iter().cloned().collect(),
+            ..PendingScannerEvents::default()
+        };
+
+        // A poll before the next monitor request must retire old authority
+        // without consuming the dirty work or restamping it with new consent.
+        let mut waiting = EventPassTemplates::default();
+        waiting.remember(&stale_a, &config);
+        assert!(
+            waiting
+                .next_request(&pending, &event_config, &reloaded)
+                .is_none()
+        );
+        assert!(waiting.templates.is_empty());
+        assert_eq!(pending.reconciliation.len(), 2);
+
+        // When B receives fresh pressure evidence first, stale dirty A must
+        // not keep winning selection and getting rejected at scanner dequeue.
+        let mut templates = EventPassTemplates::default();
+        templates.remember(&stale_a, &config);
+        let fresh_b = event_test_request_for_config(vec!["/b".into()], &reloaded);
+        templates.remember(&fresh_b, &reloaded);
+        // Nor may a delayed stale request recreate A's retired template.
+        templates.remember(&stale_a, &reloaded);
+        assert_eq!(templates.templates.len(), 1);
+        for _ in 0..3 {
+            let request = templates
+                .next_request(&pending, &event_config, &reloaded)
+                .expect("fresh B remains eligible while stale A stays dirty");
+            assert_eq!(request.paths, fresh_b.paths);
+            assert!(Arc::ptr_eq(
+                &request.admitted_scanner,
+                &fresh_b.admitted_scanner
+            ));
+        }
+        assert!(pending.has_work_within(&stale_a.paths));
+
+        // A can consume its retained work once it has its own fresh request.
+        pending.acknowledge_walk(&fresh_b.paths, Some(&[]));
+        let fresh_a = event_test_request_for_config(stale_a.paths.clone(), &reloaded);
+        templates.remember(&fresh_a, &reloaded);
+        let request = templates
+            .next_request(&pending, &event_config, &reloaded)
+            .unwrap();
+        assert_eq!(request.paths, fresh_a.paths);
+        assert!(Arc::ptr_eq(
+            &request.admitted_scanner,
+            &fresh_a.admitted_scanner
+        ));
+    }
+
+    #[test]
     fn idle_event_templates_update_pressure_without_silencing_other_mounts() {
         let config = ScannerConfig {
             root_paths: vec!["/a".into(), "/b".into()],
@@ -33448,8 +33926,11 @@ mod tests {
         };
         let event_config = EventSourceConfig::from_scanner_config(&config.root_paths, &config);
         let mut templates = EventPassTemplates::default();
-        templates.remember(&event_test_request(config.root_paths.clone()), &config);
-        let mut pressure_request = event_test_request(vec!["/a".into()]);
+        templates.remember(
+            &event_test_request_for_config(config.root_paths.clone(), &config),
+            &config,
+        );
+        let mut pressure_request = event_test_request_for_config(vec!["/a".into()], &config);
         pressure_request.pressure_level = PressureLevel::Orange;
         templates.remember(&pressure_request, &config);
         let pending = PendingScannerEvents {
@@ -33457,7 +33938,9 @@ mod tests {
             ..PendingScannerEvents::default()
         };
         for _ in 0..3 {
-            let request = templates.next_request(&pending, &event_config).unwrap();
+            let request = templates
+                .next_request(&pending, &event_config, &config)
+                .unwrap();
             assert_eq!(request.paths, vec![PathBuf::from("/b")]);
             assert_eq!(request.pressure_level, PressureLevel::Green);
         }
@@ -33470,7 +33953,9 @@ mod tests {
             reconciliation: BTreeSet::from([PathBuf::from("/a")]),
             ..PendingScannerEvents::default()
         };
-        let request = templates.next_request(&only_a, &event_config).unwrap();
+        let request = templates
+            .next_request(&only_a, &event_config, &config)
+            .unwrap();
         assert_eq!(request.paths, pressure_request.paths);
         assert_eq!(request.pressure_level, PressureLevel::Yellow);
         assert_eq!(request.free_pct, Some(17.0));
@@ -33481,10 +33966,16 @@ mod tests {
         pressure_request.paths = vec!["/a/project".into()];
         pressure_request.pressure_level = PressureLevel::Orange;
         templates.remember(&pressure_request, &config);
-        assert!(templates.next_request(&only_a, &event_config).is_none());
+        assert!(
+            templates
+                .next_request(&only_a, &event_config, &config)
+                .is_none()
+        );
         pressure_request.pressure_level = PressureLevel::Green;
         templates.remember(&pressure_request, &config);
-        let request = templates.next_request(&only_a, &event_config).unwrap();
+        let request = templates
+            .next_request(&only_a, &event_config, &config)
+            .unwrap();
         assert_eq!(request.paths, vec![PathBuf::from("/a/project")]);
     }
 
@@ -33496,15 +33987,27 @@ mod tests {
         };
         let event_config = EventSourceConfig::from_scanner_config(&config.root_paths, &config);
         let mut templates = EventPassTemplates::default();
-        templates.remember(&event_test_request(vec!["/b".into()]), &config);
-        templates.remember(&event_test_request(vec!["/a/nested".into()]), &config);
+        templates.remember(
+            &event_test_request_for_config(vec!["/b".into()], &config),
+            &config,
+        );
+        templates.remember(
+            &event_test_request_for_config(vec!["/a/nested".into()], &config),
+            &config,
+        );
         for child in 0..(EventPassTemplates::MAX_SCOPES_PER_ROOT + 5) {
             templates.remember(
-                &event_test_request(vec![PathBuf::from(format!("/a/project-{child}"))]),
+                &event_test_request_for_config(
+                    vec![PathBuf::from(format!("/a/project-{child}"))],
+                    &config,
+                ),
                 &config,
             );
         }
-        templates.remember(&event_test_request(vec!["/unsubscribed".into()]), &config);
+        templates.remember(
+            &event_test_request_for_config(vec!["/unsubscribed".into()], &config),
+            &config,
+        );
         assert_eq!(
             templates.templates.len(),
             EventPassTemplates::MAX_SCOPES_PER_ROOT + 2
@@ -33515,7 +34018,7 @@ mod tests {
         };
         assert_eq!(
             templates
-                .next_request(&only_b, &event_config)
+                .next_request(&only_b, &event_config, &config)
                 .unwrap()
                 .paths,
             vec![PathBuf::from("/b")]
@@ -33526,7 +34029,7 @@ mod tests {
         };
         assert_eq!(
             templates
-                .next_request(&only_nested, &event_config)
+                .next_request(&only_nested, &event_config, &config)
                 .unwrap()
                 .paths,
             vec![PathBuf::from("/a/nested")]
@@ -33535,17 +34038,27 @@ mod tests {
             reconciliation: BTreeSet::from([PathBuf::from("/unsubscribed")]),
             ..PendingScannerEvents::default()
         };
-        assert!(templates.next_request(&outside, &event_config).is_none());
+        assert!(
+            templates
+                .next_request(&outside, &event_config, &config)
+                .is_none()
+        );
 
         // Replacing child templates with a whole-root request coalesces
         // retained scopes, while a configuration reload discards old roots.
-        templates.remember(&event_test_request(vec!["/a".into()]), &config);
+        templates.remember(
+            &event_test_request_for_config(vec!["/a".into()], &config),
+            &config,
+        );
         assert_eq!(templates.templates.len(), 2);
         let reloaded = ScannerConfig {
             root_paths: vec!["/replacement".into()],
             ..config
         };
-        templates.remember(&event_test_request(reloaded.root_paths.clone()), &reloaded);
+        templates.remember(
+            &event_test_request_for_config(reloaded.root_paths.clone(), &reloaded),
+            &reloaded,
+        );
         assert_eq!(templates.templates.len(), 1);
         assert_eq!(templates.templates[0].paths, reloaded.root_paths);
     }
@@ -33640,6 +34153,7 @@ mod tests {
                 // use the existing pacing exemption, leaving scope selection
                 // and the native event backend fully active.
                 let mut request = event_test_request(vec![path.clone()]);
+                request.admitted_scanner = Arc::new(scanner_config.read().clone());
                 if catalog {
                     request.pressure_level = PressureLevel::Yellow;
                     request.catalog_roots.push(ExpandedCatalogRoot {
@@ -33706,6 +34220,10 @@ mod tests {
     fn v2_active_scan_paths_do_not_skip_forced_green_scan() {
         let request = ScanRequest {
             paths: vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")],
+            admitted_scanner: test_scanner_admission(&[
+                PathBuf::from("/tmp"),
+                PathBuf::from("/var/tmp"),
+            ]),
             urgency: 0.5,
             pressure_level: PressureLevel::Green,
             free_pct: Some(50.0),
@@ -33877,6 +34395,7 @@ mod tests {
     fn cooldown_request(pressure: PressureLevel) -> ScanRequest {
         ScanRequest {
             paths: vec![PathBuf::from("/tmp")],
+            admitted_scanner: test_scanner_admission(&[PathBuf::from("/tmp")]),
             urgency: 0.5,
             pressure_level: pressure,
             free_pct: Some(10.0),
@@ -34583,6 +35102,7 @@ mod tests {
 
         let make_request = |urgency: f64| ScanRequest {
             paths: vec![],
+            admitted_scanner: test_scanner_admission(&[]),
             urgency,
             pressure_level: PressureLevel::Critical,
             free_pct: None,
@@ -34615,6 +35135,7 @@ mod tests {
 
         let make_request = |urgency: f64| ScanRequest {
             paths: vec![],
+            admitted_scanner: test_scanner_admission(&[]),
             urgency,
             pressure_level: PressureLevel::Critical,
             free_pct: None,
@@ -34956,6 +35477,7 @@ mod tests {
         let (tx, _rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
         let make_request = || ScanRequest {
             paths: vec![],
+            admitted_scanner: test_scanner_admission(&[]),
             urgency: 0.9,
             pressure_level: PressureLevel::Critical,
             free_pct: None,
@@ -35467,6 +35989,7 @@ mod tests {
     fn dispatch_top_candidates_retains_overflow_after_send() {
         let request = ScanRequest {
             paths: vec![PathBuf::from("/tmp")],
+            admitted_scanner: test_scanner_admission(&[PathBuf::from("/tmp")]),
             urgency: 1.0,
             pressure_level: PressureLevel::Critical,
             free_pct: None,
@@ -35506,6 +36029,7 @@ mod tests {
     fn dispatch_top_candidates_requeues_when_executor_full() {
         let request = ScanRequest {
             paths: vec![PathBuf::from("/tmp")],
+            admitted_scanner: test_scanner_admission(&[PathBuf::from("/tmp")]),
             urgency: 1.0,
             pressure_level: PressureLevel::Critical,
             free_pct: None,
@@ -35523,6 +36047,7 @@ mod tests {
         del_tx
             .send(DeletionBatch {
                 candidates: vec![test_candidate("/tmp/already-queued", 0.2)],
+                admitted_scanner: Arc::clone(&request.admitted_scanner),
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.5,
                 target_bytes: None,
@@ -35576,6 +36101,7 @@ mod tests {
     fn a_pass_never_dispatches_the_same_tree_twice() {
         let request = ScanRequest {
             paths: vec![PathBuf::from("/tmp")],
+            admitted_scanner: test_scanner_admission(&[PathBuf::from("/tmp")]),
             urgency: 0.9,
             pressure_level: PressureLevel::Orange,
             free_pct: None,

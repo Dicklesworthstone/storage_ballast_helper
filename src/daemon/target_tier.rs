@@ -1689,6 +1689,7 @@ fn run_root(
     }
     let batch = DeletionBatch {
         candidates: selection.candidates,
+        admitted_scanner: Arc::new(config.scanner.clone()),
         pressure_level: current.level,
         urgency: current.urgency,
         target_bytes: None,
