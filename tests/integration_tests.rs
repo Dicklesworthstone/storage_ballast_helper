@@ -656,11 +656,23 @@ mod protect_cli_regressions {
             ])
             .arg(&fixture.binary);
         fixture.configure(&mut command, true);
-        let output = command
-            .arg("protect")
-            .arg(&fixture.target)
-            .output()
-            .unwrap();
+        command.arg("protect").arg(&fixture.target);
+        // The shell, not this process, execs the copied binary, so run_at's
+        // spawn retry cannot see a fork-held write descriptor (ETXTBSY): the
+        // shell exits 126 before sbh runs. Retry that the same way.
+        let mut attempts = 0;
+        let output = loop {
+            let output = command.output().unwrap();
+            if output.status.code() == Some(126)
+                && String::from_utf8_lossy(&output.stderr).contains("Text file busy")
+                && attempts < 50
+            {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            break output;
+        };
         let partial = report(&output, 4);
         assert!(partial["marker_created"].is_null());
         assert_eq!(partial["marker_present"], true);

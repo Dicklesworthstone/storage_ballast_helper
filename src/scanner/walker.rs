@@ -6697,10 +6697,17 @@ mod tests {
                 .unwrap(),
         );
         let process = PathBuf::from(format!("/proc/{}", holder.0.id()));
-        assert_eq!(
-            fs::read_to_string(process.join("comm")).unwrap().trim(),
-            "cargo"
-        );
+        // glibc posix_spawn returns once exec has installed the new image, a
+        // moment before the kernel renames the task: until then comm is still
+        // this test thread's name ("scanner::walker"). Wait for the rename.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while fs::read_to_string(process.join("comm")).unwrap().trim() != "cargo" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fixture never became cargo"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(
             !fs::read_link(process.join("cwd"))
                 .unwrap()

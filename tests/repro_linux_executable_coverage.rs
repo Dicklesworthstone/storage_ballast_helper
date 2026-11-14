@@ -50,7 +50,15 @@ fn public_executable_query_finds_a_live_program_with_a_non_utf8_kernel_name() {
     assert!(child.0.try_wait().unwrap().is_none());
     let pid = i32::try_from(child.0.id()).unwrap();
     let proc_path = std::path::PathBuf::from(format!("/proc/{pid}"));
-    let comm = fs::read(proc_path.join("comm")).unwrap();
+    // glibc posix_spawn returns once exec has installed the new image, a
+    // moment before the kernel renames the task: until then comm is still
+    // this test thread's (UTF-8) name. Wait for the rename.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut comm = fs::read(proc_path.join("comm")).unwrap();
+    while comm != b"sbh-\xff-sh\n" && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        comm = fs::read(proc_path.join("comm")).unwrap();
+    }
     assert!(
         std::str::from_utf8(&comm).is_err(),
         "fixture must exercise an actually non-UTF-8 kernel name: {comm:?}"
