@@ -30,6 +30,8 @@
 //!
 //! Checkpoint I/O is bounded, byte-preserving and crash-consistent. Existing
 //! UTF-8 checkpoints still load; invalid or corrupt checkpoints start over.
+//! The same checkpoint retains recursive child-dispatch priorities separately:
+//! they select the next fresh traversal, never certify old coverage or safety.
 
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -43,6 +45,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::voi_scheduler::pressure_order::PressureOrder;
+use crate::scanner::walker::{WalkDispatchCursor, WalkDispatchPosition};
 
 mod checkpoint;
 mod enumeration;
@@ -82,6 +85,11 @@ pub struct PrescanCursor {
     /// discovery progress. The checkpoint supplies byte-preserving encoding.
     #[serde(skip)]
     walk_order: PressureOrder,
+    /// Per-directory scheduling hints, independently revalidated by the walker.
+    /// The checkpoint codec preserves native directory and child-name bytes.
+    /// Shallow per-entry rewind snapshots share this immutable history.
+    #[serde(skip)]
+    walk_dispatch: Arc<Vec<WalkDispatchPosition>>,
     /// Interior bookkeeping preserves the read-only page-selection API and
     /// Send + Sync. A clone owns its own proof, so a budget rewind is isolated.
     #[serde(skip)]
@@ -100,6 +108,7 @@ impl Default for PrescanCursor {
             after: None,
             continuations: BTreeMap::new(),
             walk_order: PressureOrder::default(),
+            walk_dispatch: Arc::default(),
             page: Mutex::new(None),
             enumeration: enumeration::shared_cache(),
         }
@@ -113,6 +122,7 @@ impl Clone for PrescanCursor {
             after: self.after.clone(),
             continuations: self.continuations.clone(),
             walk_order: self.walk_order.clone(),
+            walk_dispatch: Arc::clone(&self.walk_dispatch),
             page: Mutex::new(self.page_proof().clone()),
             enumeration: Arc::clone(&self.enumeration),
         }
@@ -127,6 +137,7 @@ impl PartialEq for PrescanCursor {
             && self.after == other.after
             && self.continuations == other.continuations
             && self.walk_order == other.walk_order
+            && self.walk_dispatch == other.walk_dispatch
     }
 }
 
@@ -165,6 +176,24 @@ impl PrescanCursor {
             return false;
         }
         self.walk_order = remembered;
+        true
+    }
+
+    /// Scheduling hints to restore before a fresh recursive traversal.
+    /// These contain neither completed-work evidence nor deletion authority.
+    #[must_use]
+    pub fn walk_dispatch(&self) -> &[WalkDispatchPosition] {
+        self.walk_dispatch.as_slice()
+    }
+
+    /// Capture a stopped walk's bounded dispatch history. The live cursor
+    /// retains disjoint roots; its owner separately prunes withdrawn scope.
+    pub fn remember_walk_dispatch(&mut self, dispatch: &WalkDispatchCursor) -> bool {
+        let positions = dispatch.snapshot();
+        if *self.walk_dispatch == positions {
+            return false;
+        }
+        self.walk_dispatch = Arc::new(positions);
         true
     }
 
@@ -307,8 +336,10 @@ impl PrescanCursor {
         // Peers lose only speculative reads, not their completed positions.
         self.clear_enumeration();
         let walk_order = std::mem::take(&mut self.walk_order);
+        let walk_dispatch = std::mem::take(&mut self.walk_dispatch);
         *self = Self {
             walk_order,
+            walk_dispatch,
             ..Self::default()
         };
     }

@@ -127,8 +127,9 @@ use crate::scanner::scoring::{
     ScoringEngine, cache_redeletion_counts, is_warm_cache,
 };
 use crate::scanner::walker::{
-    ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkEntry, WalkStream,
-    WalkerConfig, collect_active_reference_index_cached, collect_open_path_ancestors_cached,
+    ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkDispatchCursor,
+    WalkEntry, WalkStream, WalkerConfig, collect_active_reference_index_cached,
+    collect_open_path_ancestors_cached,
 };
 
 #[path = "quarantine_worker.rs"]
@@ -11924,6 +11925,7 @@ impl MaintenanceKeepLog {
 /// Give finite automatic pressure walks a leading-root opportunity only
 /// when the recursive stream actually starts. Queued, deferred, pre-scan-only
 /// and held requests must not spend the next root's turn (bd-kf7k).
+#[allow(clippy::too_many_arguments)]
 fn start_recursive_walk(
     mut config: WalkerConfig,
     protection: ProtectionRegistry,
@@ -11932,6 +11934,7 @@ fn start_recursive_walk(
     budget_allowance: Option<f64>,
     limits: &mut PassLimits,
     root_order: &mut PressureOrder,
+    dispatch_cursor: Option<&Arc<Mutex<WalkDispatchCursor>>>,
 ) -> Result<(WalkStream, Arc<AtomicBool>, Option<PassStop>)> {
     // The final pre-scan probe or history read may have used the remaining
     // allowance. Do not launch workers or spend a turn for an expired pass.
@@ -11967,6 +11970,11 @@ fn start_recursive_walk(
             let heartbeat = Arc::clone(heartbeat);
             move || heartbeat.beat()
         });
+    let walker = if let Some(cursor) = dispatch_cursor {
+        walker.with_dispatch_cursor(Arc::clone(cursor))
+    } else {
+        walker
+    };
     let cancel_token = walker.cancel_token();
     let stream = walker.stream()?;
     if let Some(pending) = pending_order {
@@ -12034,6 +12042,15 @@ fn scanner_thread_main(
         &admitted_root_order,
         &shared_scanner_config.read().root_paths,
     );
+    // Restore only child-dispatch priority. Every ancestor is still freshly
+    // traversed under the current policy; no cached names, safety verdicts or
+    // "already observed" flags survive a daemon restart.
+    let mut restored_dispatch =
+        WalkDispatchCursor::from_positions(prescan_cursor.walk_dispatch().to_vec())
+            .unwrap_or_default();
+    restored_dispatch.retain_roots(&shared_scanner_config.read().root_paths);
+    prescan_cursor.remember_walk_dispatch(&restored_dispatch);
+    let mut walk_dispatch_cursor = restored_dispatch;
     // A budget-truncated pass is normal on a large tree, so the operator-facing
     // `SBH-2007` warning is rate-limited: the activity log has no retention
     // policy (its `activity.sqlite3` grows unbounded), and one warning per
@@ -12127,6 +12144,11 @@ fn scanner_thread_main(
             read_ahead_roots.clone_from(&shared_scanner_config.read().root_paths);
             prescan_cursor.release_read_ahead_outside(&read_ahead_roots);
             crate::scanner::walker::release_read_ahead_outside(&read_ahead_roots);
+            walk_dispatch_cursor.retain_roots(&read_ahead_roots);
+            let changed = prescan_cursor.remember_walk_dispatch(&walk_dispatch_cursor);
+            if changed {
+                persist_prescan_cursor(&prescan_cursor, prescan_cursor_path, logger);
+            }
         }
 
         let (ready_request, mut operator_claim) =
@@ -13723,6 +13745,19 @@ fn scanner_thread_main(
         // candidate unit, sized and dated by a bounded probe, and flows
         // through the same classification, scoring, vetoes and dispatch below.
         let recursive_scan_held = executor_config.holds_recursive_scan(&request);
+        let uses_dispatch_cursor = request.scan_now.is_none()
+            && (!request.force_full_scan || request.has_resource_reclaim())
+            && request.catalog_roots.is_empty()
+            && !recursive_scan_held;
+        // Workers may outlive the bounded stop wait. Give each walk a private
+        // copy so a late worker can never alter settled checkpoint history or
+        // the next pass's scheduling state.
+        let pass_dispatch_cursor = uses_dispatch_cursor.then(|| {
+            Arc::new(Mutex::new(
+                WalkDispatchCursor::from_positions(walk_dispatch_cursor.snapshot())
+                    .unwrap_or_default(),
+            ))
+        });
         let (mut rx, cancel_token, prewalk_stop) = if recursive_scan_held {
             // DefiniteOnly retains index replay and the bounded artifact
             // pre-scan above. It does not start a broad discovery walk. An
@@ -13744,6 +13779,7 @@ fn scanner_thread_main(
                 budget_allowance,
                 &mut limits,
                 &mut admitted_root_order,
+                pass_dispatch_cursor.as_ref(),
             ) {
                 Ok(stream) => stream,
                 Err(e) => {
@@ -14184,6 +14220,7 @@ fn scanner_thread_main(
         // at or above that ground may be cached as barren (bd-y70k). If the
         // walker threads do not stop in time, what they left is unknown, and
         // the pass caches nothing new.
+        let mut walk_stopped = false;
         if walk_exhausted
             && request.catalog_roots.is_empty()
             && !scan_timed_out
@@ -14195,12 +14232,18 @@ fn scanner_thread_main(
             // coverage receipt cannot wait. A directory-window stop or other
             // recorded unfinished subtree still keeps the event work pending.
             let unfinished = rx.unfinished_after_cancel(Duration::ZERO);
+            walk_stopped = unfinished.is_some();
             pending_event_invalidation.acknowledge_walk(&active_scan_paths, unfinished.as_deref());
             for stat in root_stats_map.values_mut() {
                 stat.finish_recursive_walk(unfinished.as_deref());
             }
-        } else if scan_timed_out {
+        } else if scan_timed_out || uses_dispatch_cursor {
+            // Byte-target and shutdown stops also owe final consumer
+            // receipts before their dispatch priority can be checkpointed.
+            // Draining loses unconsumed results; it never acknowledges them.
+            cancel_token.store(true, Ordering::Relaxed);
             let unfinished = rx.unfinished_after_cancel(WALK_STOP_WAIT);
+            walk_stopped = unfinished.is_some();
             for path in unfinished.iter().flatten() {
                 mark_non_barren(&mut non_barren_dirs, path);
             }
@@ -14289,6 +14332,32 @@ fn scanner_thread_main(
                 .filter(|stat| stat.coverage_complete)
                 .map(|stat| stat.path.as_path()),
         );
+
+        // Publish only settled scheduling progress. A timed-out worker may
+        // still own a page, so an unknown stop receipt keeps the last good
+        // checkpoint. Full recursive coverage retires only that scope;
+        // catalog probes and completed sibling roots cannot erase an
+        // unfinished root's saved child-dispatch opportunities.
+        if walk_stopped && request.catalog_roots.is_empty() && !recursive_scan_held {
+            let current_roots = shared_scanner_config.read().root_paths.clone();
+            let completed: Vec<PathBuf> = root_stats_map
+                .values()
+                .filter(|stat| stat.coverage_complete)
+                .map(|stat| stat.path.clone())
+                .collect();
+            if let Some(cursor) = &pass_dispatch_cursor {
+                // Copy plain positions, not cells retained by live read-ahead
+                // pages. A later walk always gets another independent fork.
+                walk_dispatch_cursor = WalkDispatchCursor::from_positions(cursor.lock().snapshot())
+                    .unwrap_or_default();
+            }
+            walk_dispatch_cursor.retain_roots(&current_roots);
+            walk_dispatch_cursor.forget_scopes(&completed);
+            let changed = prescan_cursor.remember_walk_dispatch(&walk_dispatch_cursor);
+            if changed {
+                persist_prescan_cursor(&prescan_cursor, prescan_cursor_path, logger);
+            }
+        }
 
         // Persist v2 candidate-index state before reporting completion.
         if scanner_index_enabled && let Some(index) = scanner_index.as_mut() {
@@ -29316,6 +29385,7 @@ mod tests {
                 allowance,
                 &mut limits,
                 &mut order,
+                None,
             )
             .unwrap();
             assert_eq!(stop, None);
@@ -29403,6 +29473,7 @@ mod tests {
                 Some(5.0),
                 &mut limits,
                 &mut order,
+                None,
             )
             .unwrap();
             assert_eq!(stop, Some(expected));
@@ -29434,6 +29505,7 @@ mod tests {
                 Some(5.0),
                 &mut fresh_limits(),
                 &mut order,
+                None,
             )
             .is_err()
         );
@@ -29445,6 +29517,7 @@ mod tests {
             Some(5.0),
             &mut fresh_limits(),
             &mut order,
+            None,
         )
         .unwrap();
         assert_eq!(stop, None);
@@ -29496,6 +29569,7 @@ mod tests {
                 allowance,
                 &mut limits,
                 &mut order,
+                None,
             )
             .unwrap();
             assert_eq!(stop, None);
@@ -29558,6 +29632,7 @@ mod tests {
             Some(5.0),
             &mut limits,
             &mut order,
+            None,
         )
         .unwrap();
         assert_eq!(stop, None);

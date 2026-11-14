@@ -10,14 +10,18 @@ use std::ffi::OsString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{PrescanCursor, PressureOrder};
+use super::{PrescanCursor, PressureOrder, WalkDispatchCursor, WalkDispatchPosition};
+use crate::scanner::walker::MAX_DISPATCH_CURSOR_ROWS;
 
-const VERSION: u32 = 2;
-const MAX_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
+const VERSION: u32 = 3;
+// The existing pre-scan allowance and recursive dispatch allowance each retain
+// their own 512 KiB of native names. JSON escaping can expand a byte sixfold.
+const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ROOTS: usize = 8192;
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const MAX_RAW_PATH_BYTES: usize = 512 * 1024;
@@ -41,6 +45,9 @@ struct Progress {
     // Omit an absent order so version 1 progress retains its original checksum.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     walk_order: Vec<(StoredPath, u64, bool)>,
+    // Empty dispatch history must not alter original v1/v2 checksum bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    walk_dispatch: Vec<(StoredPath, StoredPath)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -106,6 +113,9 @@ fn validate(cursor: &PrescanCursor) -> io::Result<()> {
     if cursor.walk_order.opportunities().count() > MAX_ROOTS {
         return Err(invalid("recursive walk root count exceeds the limit"));
     }
+    // The same validation as runtime restoration rejects duplicate directory
+    // rows, traversal components, invalid basenames, and oversized history.
+    WalkDispatchCursor::from_positions(cursor.walk_dispatch.as_ref().clone())?;
     if let Some(after) = &cursor.after
         && cursor
             .root
@@ -183,6 +193,16 @@ impl Progress {
                     Ok((StoredPath::try_from(path)?, last_lead, ordinary_due))
                 })
                 .collect::<io::Result<_>>()?,
+            walk_dispatch: cursor
+                .walk_dispatch
+                .iter()
+                .map(|position| {
+                    Ok((
+                        StoredPath::try_from(position.directory.as_path())?,
+                        StoredPath::try_from(Path::new(&position.next_child))?,
+                    ))
+                })
+                .collect::<io::Result<_>>()?,
         })
     }
 
@@ -192,6 +212,9 @@ impl Progress {
         }
         if self.walk_order.len() > MAX_ROOTS {
             return Err(invalid("recursive walk root count exceeds the limit"));
+        }
+        if self.walk_dispatch.len() > MAX_DISPATCH_CURSOR_ROWS {
+            return Err(invalid("recursive dispatch row count exceeds the limit"));
         }
         let mut continuations = BTreeMap::new();
         for (root, after) in self.continuations {
@@ -211,11 +234,23 @@ impl Progress {
             }
             opportunities.push((path, last_lead, ordinary_due));
         }
+        let positions = self
+            .walk_dispatch
+            .into_iter()
+            .map(|(directory, next_child)| {
+                Ok(WalkDispatchPosition {
+                    directory: PathBuf::try_from(directory)?,
+                    next_child: PathBuf::try_from(next_child)?.into_os_string(),
+                })
+            })
+            .collect::<io::Result<_>>()?;
+        let walk_dispatch = WalkDispatchCursor::from_positions(positions)?.snapshot();
         let cursor = PrescanCursor {
             root: self.root.map(PathBuf::try_from).transpose()?,
             after: self.after.map(PathBuf::try_from).transpose()?,
             continuations,
             walk_order: PressureOrder::from_opportunities(opportunities),
+            walk_dispatch: Arc::new(walk_dispatch),
             ..PrescanCursor::default()
         };
         validate(&cursor)?;
@@ -267,7 +302,8 @@ fn decode(bytes: &[u8]) -> io::Result<PrescanCursor> {
     {
         // Never reinterpret a damaged/newer envelope as an empty legacy cursor.
         let checkpoint: Checkpoint = serde_json::from_value(value).map_err(io::Error::other)?;
-        if !matches!(checkpoint.version, 1 | VERSION)
+        if !matches!(checkpoint.version, 1..=VERSION)
+            || (checkpoint.version < VERSION && !checkpoint.progress.walk_dispatch.is_empty())
             || checksum(checkpoint.version, &checkpoint.progress)? != checkpoint.checksum
         {
             return Err(invalid("pre-scan checkpoint version or checksum mismatch"));
@@ -553,6 +589,100 @@ mod tests {
         let restored = decode(&serde_json::to_vec(&envelope).unwrap()).unwrap();
         assert_eq!(restored, cursor("/root", "a"));
         assert_eq!(restored.walk_order.opportunities().count(), 0);
+        assert!(restored.walk_dispatch().is_empty());
+    }
+
+    #[test]
+    fn version_two_checkpoint_keeps_its_original_checksum_and_root_rotation() {
+        let original = br#"{"root":"/root","after":"/root/a","continuations":[["/other","/other/b"]],"walk_order":[["/other",1,false],["/root",2,true]]}"#;
+        let mut digest = Sha256::new();
+        digest.update(2_u32.to_le_bytes());
+        digest.update(original);
+        let checksum: [u8; 32] = digest.finalize().into();
+        let envelope = serde_json::json!({
+            "version": 2,
+            "progress": serde_json::from_slice::<serde_json::Value>(original).unwrap(),
+            "checksum": checksum,
+        });
+        let restored = decode(&serde_json::to_vec(&envelope).unwrap()).unwrap();
+        assert_eq!(
+            restored.position(),
+            (Some(Path::new("/root")), Some(Path::new("/root/a")))
+        );
+        assert_eq!(
+            restored.resume_after(Path::new("/other")),
+            Some(Path::new("/other/b"))
+        );
+        assert_eq!(
+            restored.walk_order.opportunities().collect::<Vec<_>>(),
+            vec![
+                (Path::new("/other"), 1, false),
+                (Path::new("/root"), 2, true)
+            ],
+        );
+        assert!(restored.walk_dispatch().is_empty());
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cursor.json");
+        save(&restored, &path).unwrap();
+        assert_eq!(read(&path).unwrap(), restored);
+        let upgraded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(upgraded["version"], VERSION);
+    }
+
+    #[test]
+    fn recursive_dispatch_survives_shallow_resets_and_keeps_disjoint_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cursor.json");
+        let mut dispatch = WalkDispatchCursor::from_positions(vec![
+            WalkDispatchPosition {
+                directory: PathBuf::from("/left/projects"),
+                next_child: OsString::from("next-left"),
+            },
+            WalkDispatchPosition {
+                directory: PathBuf::from("/right/projects"),
+                next_child: OsString::from("next-right"),
+            },
+        ])
+        .unwrap();
+        let mut state = cursor("/left", "examined");
+        assert!(state.remember_walk_dispatch(&dispatch));
+        assert!(!state.remember_walk_dispatch(&dispatch));
+        let rewind = state.clone();
+        assert!(
+            Arc::ptr_eq(&state.walk_dispatch, &rewind.walk_dispatch),
+            "per-entry rewind snapshots must not clone all recursive paths",
+        );
+        state.reset();
+        assert_eq!(state.position(), (None, None));
+        save(&state, &path).unwrap();
+        let mut restored = read(&path).unwrap();
+        assert_eq!(restored.walk_dispatch(), dispatch.snapshot());
+        // A shallow pass on one mount preserves the other's recursive turn.
+        restored.advance(Path::new("/left"), Path::new("/left/later"));
+        save(&restored, &path).unwrap();
+        assert_eq!(read(&path).unwrap().walk_dispatch(), dispatch.snapshot());
+
+        // Removing scope is an explicit current-config operation, not a
+        // consequence of the last pass having selected only one mount.
+        dispatch.retain_roots(&[PathBuf::from("/right")]);
+        assert!(state.remember_walk_dispatch(&dispatch));
+        assert_eq!(state.walk_dispatch().len(), 1);
+        assert_eq!(
+            rewind.walk_dispatch().len(),
+            2,
+            "replacement leaves prior snapshots isolated"
+        );
+        assert!(restored.remember_walk_dispatch(&dispatch));
+        save(&restored, &path).unwrap();
+        let final_state = read(&path).unwrap();
+        assert_eq!(final_state.walk_dispatch().len(), 1);
+        assert_eq!(
+            final_state.walk_dispatch()[0].directory,
+            Path::new("/right/projects")
+        );
+        assert_eq!(final_state.walk_dispatch()[0].next_child, "next-right");
     }
 
     #[test]
@@ -611,6 +741,12 @@ mod tests {
         let mut order = PressureOrder::default();
         order.reorder(&mut roots.clone(), false, |_| true);
         assert!(expected.remember_walk_order(&order, &roots));
+        let dispatch = WalkDispatchCursor::from_positions(vec![WalkDispatchPosition {
+            directory: root.join(OsString::from_vec(b"nested-\xfd".to_vec())),
+            next_child: OsString::from_vec(b"pending-\xfc".to_vec()),
+        }])
+        .unwrap();
+        assert!(expected.remember_walk_dispatch(&dispatch));
         assert!(
             serde_json::to_vec(&expected).is_err(),
             "legacy PathBuf JSON cannot store these names"
@@ -619,6 +755,162 @@ mod tests {
         let restored = read(&checkpoint).unwrap();
         assert_eq!(restored, expected);
         assert_eq!(restored.resume_after(&root), Some(child.as_path()));
+        assert_eq!(restored.walk_dispatch(), dispatch.snapshot());
+    }
+
+    #[test]
+    fn malformed_dispatch_names_and_duplicate_directories_cannot_replace_good_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cursor.json");
+        let mut good = cursor("/root", "examined");
+        let dispatch = WalkDispatchCursor::from_positions(vec![WalkDispatchPosition {
+            directory: PathBuf::from("/root/nested"),
+            next_child: OsString::from("next"),
+        }])
+        .unwrap();
+        good.remember_walk_dispatch(&dispatch);
+        save(&good, &path).unwrap();
+        let original = fs::read(&path).unwrap();
+        for child in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "/outside",
+            "nested/child",
+            "child/",
+            "./child",
+            "child/.",
+            "bad\0name",
+        ] {
+            let mut invalid_cursor = good.clone();
+            Arc::make_mut(&mut invalid_cursor.walk_dispatch)[0].next_child = OsString::from(child);
+            assert!(save(&invalid_cursor, &path).is_err(), "{child:?}");
+            // Recompute the checksum to distinguish malformed-path refusal
+            // from an incidental corruption check.
+            let mut progress = Progress::from_cursor(&good).unwrap();
+            progress.walk_dispatch[0].1 = StoredPath::Text(child.into());
+            let envelope = Checkpoint {
+                version: VERSION,
+                checksum: checksum(VERSION, &progress).unwrap(),
+                progress,
+            };
+            assert!(decode(&encode(&envelope).unwrap()).is_err(), "{child:?}");
+        }
+        for directory in ["relative", "/root/../outside", "/bad\0directory"] {
+            let mut invalid_cursor = good.clone();
+            Arc::make_mut(&mut invalid_cursor.walk_dispatch)[0].directory =
+                PathBuf::from(directory);
+            assert!(save(&invalid_cursor, &path).is_err(), "{directory:?}");
+        }
+        let mut duplicate = Progress::from_cursor(&good).unwrap();
+        duplicate.walk_dispatch.push((
+            StoredPath::Text("/root/nested".into()),
+            StoredPath::Text("another".into()),
+        ));
+        assert!(duplicate.into_cursor().is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(read(&path).unwrap(), good);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn dispatch_history_has_independent_row_path_and_raw_byte_limits() {
+        use crate::scanner::walker::{MAX_DISPATCH_CURSOR_BYTES, MAX_DISPATCH_CURSOR_PATH_BYTES};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cursor.json");
+        let good = cursor("/root", "a");
+        save(&good, &path).unwrap();
+        let original = fs::read(&path).unwrap();
+        let mut too_many = good.clone();
+        too_many.walk_dispatch = Arc::new(
+            (0..=MAX_DISPATCH_CURSOR_ROWS)
+                .map(|index| WalkDispatchPosition {
+                    directory: PathBuf::from(format!("/root-{index}")),
+                    next_child: OsString::from("next"),
+                })
+                .collect(),
+        );
+        assert!(save(&too_many, &path).is_err());
+        let mut too_long = good.clone();
+        too_long.walk_dispatch = Arc::new(vec![WalkDispatchPosition {
+            directory: PathBuf::from("/root"),
+            next_child: OsString::from("x".repeat(MAX_DISPATCH_CURSOR_PATH_BYTES + 1)),
+        }]);
+        assert!(save(&too_long, &path).is_err());
+        let mut too_large = good.clone();
+        too_large.walk_dispatch = Arc::new(
+            (0..=MAX_DISPATCH_CURSOR_BYTES / (MAX_DISPATCH_CURSOR_PATH_BYTES - 32))
+                .map(|index| WalkDispatchPosition {
+                    directory: PathBuf::from(format!(
+                        "/root-{index}/{}",
+                        "x".repeat(MAX_DISPATCH_CURSOR_PATH_BYTES - 32),
+                    )),
+                    next_child: OsString::from("next"),
+                })
+                .collect(),
+        );
+        assert!(save(&too_large, &path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(read(&path).unwrap(), good);
+    }
+
+    #[test]
+    fn both_bounded_histories_fit_even_when_native_names_need_json_escaping() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cursor.json");
+        let mut state = cursor("/root", "a");
+        // Two nearly-full independent native-name budgets must not starve
+        // each other's checkpoint writes when JSON expands control bytes.
+        for index in 0..16 {
+            let root = PathBuf::from(format!("/{}{index}", "\u{1}".repeat(15_000)));
+            state.continuations.insert(root.clone(), root.join("after"));
+        }
+        let dispatch = WalkDispatchCursor::from_positions(
+            (0..32)
+                .map(|index| WalkDispatchPosition {
+                    directory: PathBuf::from(format!("/{}{index}", "\u{2}".repeat(15_000))),
+                    next_child: OsString::from("next"),
+                })
+                .collect(),
+        )
+        .unwrap();
+        state.remember_walk_dispatch(&dispatch);
+        save(&state, &path).unwrap();
+        let encoded_len = fs::metadata(&path).unwrap().len();
+        assert!(encoded_len > 4 * 1024 * 1024);
+        assert!(encoded_len < MAX_CHECKPOINT_BYTES as u64);
+        assert_eq!(read(&path).unwrap(), state);
+    }
+
+    #[test]
+    fn dispatch_corruption_and_history_in_old_envelopes_are_refused() {
+        let dispatch = WalkDispatchCursor::from_positions(vec![WalkDispatchPosition {
+            directory: PathBuf::from("/root/nested"),
+            next_child: OsString::from("next"),
+        }])
+        .unwrap();
+        let mut state = cursor("/root", "a");
+        state.remember_walk_dispatch(&dispatch);
+        let progress = Progress::from_cursor(&state).unwrap();
+        let envelope = Checkpoint {
+            version: VERSION,
+            checksum: checksum(VERSION, &progress).unwrap(),
+            progress,
+        };
+        let mut corrupt = serde_json::to_value(&envelope).unwrap();
+        corrupt["progress"]["walk_dispatch"][0][1] = serde_json::json!("changed");
+        assert!(decode(&serde_json::to_vec(&corrupt).unwrap()).is_err());
+        for version in [1, 2] {
+            let progress = Progress::from_cursor(&state).unwrap();
+            let old = Checkpoint {
+                version,
+                checksum: checksum(version, &progress).unwrap(),
+                progress,
+            };
+            assert!(decode(&encode(&old).unwrap()).is_err());
+        }
     }
 
     #[test]
@@ -685,6 +977,7 @@ mod tests {
             root: None,
             after: None,
             walk_order: Vec::new(),
+            walk_dispatch: Vec::new(),
             continuations: vec![
                 (
                     StoredPath::Text("/r".into()),

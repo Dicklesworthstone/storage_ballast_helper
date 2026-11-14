@@ -33,6 +33,12 @@ mod build_scopes;
 use build_scopes::BuildDirectoryScopes;
 mod code_sign_clones;
 use code_sign_clones::AppInstance;
+mod dispatch_cursor;
+use dispatch_cursor::DispatchContext;
+pub use dispatch_cursor::{
+    MAX_DISPATCH_CURSOR_BYTES, MAX_DISPATCH_CURSOR_PATH_BYTES, MAX_DISPATCH_CURSOR_ROWS,
+    WalkDispatchCursor, WalkDispatchPosition,
+};
 mod read_ahead;
 
 /// Release this thread's retained directory read-ahead outside `roots`.
@@ -1023,6 +1029,9 @@ pub struct DirectoryWalker {
     dir_window: u32,
     /// Whether a walked directory's entry carries its immediate files' size.
     measure_files: bool,
+    /// Optional durable branch priority; current traversal still supplies all
+    /// metadata, protection, depth and device context.
+    dispatch_cursor: Option<Arc<parking_lot::Mutex<WalkDispatchCursor>>>,
     #[cfg(test)]
     btrfs_devices: HashSet<u64>,
 }
@@ -1036,6 +1045,7 @@ impl DirectoryWalker {
             cancel: Arc::new(AtomicBool::new(false)),
             dir_window: MAX_ENTRIES_PER_DIR,
             measure_files: true,
+            dispatch_cursor: None,
             #[cfg(test)]
             btrfs_devices: HashSet::new(),
         }
@@ -1052,6 +1062,21 @@ impl DirectoryWalker {
     #[must_use]
     pub fn without_file_sizes(mut self) -> Self {
         self.measure_files = false;
+        self
+    }
+
+    /// Resume recursive branch priority through freshly examined ancestors.
+    ///
+    /// This only applies to name-only, no-follow walks. Restored priorities
+    /// reorder a full circular child page; they never skip siblings or restore
+    /// safety observations. Partial name enumeration and oversized-directory
+    /// window offsets remain volatile and must be repeated after a restart.
+    #[must_use]
+    pub fn with_dispatch_cursor(
+        mut self,
+        cursor: Arc<parking_lot::Mutex<WalkDispatchCursor>>,
+    ) -> Self {
+        self.dispatch_cursor = Some(cursor);
         self
     }
 
@@ -1101,6 +1126,10 @@ impl DirectoryWalker {
     /// walker's cancel flag, so one walker serves one stream.
     pub fn stream(&self) -> Result<WalkStream> {
         let parallelism = self.config.parallelism.max(1);
+        let dispatch_cursor = self
+            .dispatch_cursor
+            .as_ref()
+            .map(|cursor| DispatchContext::new(Arc::clone(cursor)));
 
         // Work is unbounded: a bounded queue can deadlock when every worker
         // enqueues children and none can drain it. Device admission keeps
@@ -1168,6 +1197,7 @@ impl DirectoryWalker {
             starts: oversized_window_starts().lock().clone(),
             reads: read_ahead::shared(),
             unfinished: Arc::clone(&unfinished),
+            dispatch_cursor,
         });
         // Clone sender for workers; drop original so channel closes when workers finish.
         for _ in 0..parallelism {
@@ -1652,7 +1682,7 @@ fn process_directory(
         if is_dir {
             // These names do not carry the caller's depth/exclusion policy.
             // Apply it below, every time a retained listing is dispatched.
-            read.children.push(name_os);
+            Arc::make_mut(&mut read.children).push(name_os);
         }
     }
 
@@ -1702,6 +1732,33 @@ fn process_directory(
 
     if read.total_count > 0 && read.object_count > 0 {
         read.signals.mostly_object_files = read.object_count.saturating_mul(2) >= read.total_count;
+    }
+
+    if dispatch.is_none() {
+        // Register a fresh page after every ancestor and marker check. A
+        // bookmark changes only the circular starting child, preserving the
+        // normal root-relative depth, device and opaque-classification path.
+        // Reused pages keep their existing order while receipts may refer to
+        // its indices; a first dispatch uses stable raw basename order.
+        read.priority = None;
+        if retain_reads
+            && depth < config.max_depth
+            && !read.children.is_empty()
+            && let Some(cursor) = &windows.dispatch_cursor
+        {
+            if !read.dispatch_started {
+                Arc::make_mut(&mut read.children).sort_unstable();
+                read.next_child.store(0, Ordering::Relaxed);
+            }
+            if let Some(priority) = cursor.register(dir_path, Arc::clone(&read.children)) {
+                if let Some(start) = priority.start {
+                    read.next_child.store(start, Ordering::Relaxed);
+                    read.dispatch_interrupted.store(true, Ordering::Relaxed);
+                }
+                read.priority = Some(priority);
+            }
+        }
+        read.dispatch_started = true;
     }
 
     // Keep ordinary parallel dispatch. Only a page whose dispatch or queued
@@ -2453,6 +2510,8 @@ struct DirWindows {
     reads: Arc<parking_lot::Mutex<ReadAhead>>,
     /// Shared receipt also used by queued dispatch frames on cancellation.
     unfinished: Arc<parking_lot::Mutex<Vec<PathBuf>>>,
+    /// Per-walk registration epoch for durable branch-priority cells.
+    dispatch_cursor: Option<DispatchContext>,
 }
 
 /// Where the next pass's window starts, after a pass that processed
@@ -5467,6 +5526,7 @@ mod tests {
                 starts: HashMap::new(),
                 reads: Arc::default(),
                 unfinished: Arc::clone(&worker_unfinished),
+                dispatch_cursor: None,
             };
             process_directory(
                 WorkItem {
@@ -5593,7 +5653,7 @@ mod tests {
             false,
         )
         .unwrap();
-        page.children = vec!["first".into(), "second".into()];
+        page.children = Arc::new(vec!["first".into(), "second".into()]);
         let mut first = WalkResult::plain(bare_entry("/parent/first"));
         first.progress.push(ChildProgress::new(&page, 0));
         first.observed = Some(Arc::clone(&page.observed));
@@ -5632,7 +5692,7 @@ mod tests {
             false,
         )
         .unwrap();
-        page.children = vec!["first".into(), "second".into()];
+        page.children = Arc::new(vec!["first".into(), "second".into()]);
         let (tx, _rx) = channel::bounded(1);
         tx.send(vec![WalkResult::plain(bare_entry("/occupied"))])
             .unwrap();
@@ -5781,6 +5841,7 @@ mod tests {
             starts: HashMap::new(),
             reads: Arc::default(),
             unfinished: Arc::clone(&unfinished),
+            dispatch_cursor: None,
         };
         let protection = parking_lot::RwLock::new(ProtectionRegistry::marker_only());
         let cancel = AtomicBool::new(false);

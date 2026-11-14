@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
+use super::dispatch_cursor::PagePriority;
 use super::{MAX_ENTRIES_PER_DIR, StructuralSignals};
 
 const MAX_PENDING_READERS: usize = 4;
@@ -58,7 +59,11 @@ pub(super) struct DirectoryRead {
     pub(super) parent_has_node_manifest: bool,
     pub(super) entries_incomplete: bool,
     // Store basenames rather than repeating a potentially long parent path.
-    pub(super) children: Vec<OsString>,
+    pub(super) children: Arc<Vec<OsString>>,
+    /// Durable priority uses only collector receipts. Full name pages stay
+    /// with the live read/receipts and are never retained by cursor history.
+    pub(super) priority: Option<Arc<PagePriority>>,
+    pub(super) dispatch_started: bool,
     /// Scheduling priority only: a new walk still visits a whole circular page.
     pub(super) next_child: Arc<AtomicUsize>,
     pub(super) dispatch_interrupted: Arc<AtomicBool>,
@@ -87,7 +92,9 @@ impl DirectoryRead {
             content_size: 0,
             parent_has_node_manifest: false,
             entries_incomplete: false,
-            children: Vec::new(),
+            children: Arc::new(Vec::new()),
+            priority: None,
+            dispatch_started: false,
             next_child: Arc::new(AtomicUsize::new(0)),
             dispatch_interrupted: Arc::new(AtomicBool::new(false)),
             observed: Arc::new(AtomicBool::new(false)),
@@ -129,6 +136,7 @@ pub(super) struct ChildProgress {
     interrupted: Arc<AtomicBool>,
     current: usize,
     next: usize,
+    durable: Option<Arc<PagePriority>>,
 }
 
 impl ChildProgress {
@@ -138,22 +146,33 @@ impl ChildProgress {
             interrupted: Arc::clone(&read.dispatch_interrupted),
             current,
             next: (current + 1) % read.children.len(),
+            durable: read.priority.clone(),
         }
     }
 
     pub(super) fn observed(&self) {
         self.priority.store(self.next, Ordering::Relaxed);
+        if let Some(durable) = &self.durable {
+            durable.observed(self.next);
+        }
     }
 
     pub(super) fn skipped(&self) {
         // A policy refusal may advance the current priority, but must not
         // jump past an earlier result the consumer has not received yet.
-        let _ = self.priority.compare_exchange(
-            self.current,
-            self.next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        if self
+            .priority
+            .compare_exchange(
+                self.current,
+                self.next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+            && let Some(durable) = &self.durable
+        {
+            durable.observed(self.next);
+        }
     }
 
     pub(super) fn unfinished(&self) {
@@ -518,7 +537,7 @@ mod tests {
         let mut reader = read(temp.path());
         cache.admit(temp.path(), &mut reader);
         let first = reader.next_entry().unwrap().unwrap().file_name();
-        reader.children.push(first);
+        Arc::make_mut(&mut reader.children).push(first);
         cache.retain(temp.path(), reader);
         assert!(cache.pending[temp.path()].read.is_some());
 
@@ -529,13 +548,16 @@ mod tests {
         assert!(resumed.reused);
         assert!(!resumed.is_exhausted());
         while let Some(entry) = resumed.next_entry() {
-            resumed.children.push(entry.unwrap().file_name());
+            Arc::make_mut(&mut resumed.children).push(entry.unwrap().file_name());
         }
         assert!(resumed.is_exhausted());
         assert!(resumed.next_entry().is_none());
-        resumed.children.sort();
+        Arc::make_mut(&mut resumed.children).sort();
         expected.sort();
-        assert_eq!(resumed.children, expected, "no name is skipped or repeated");
+        assert_eq!(
+            *resumed.children, expected,
+            "no name is skipped or repeated"
+        );
         cache.retain(temp.path(), resumed);
         assert!(cache.pending.is_empty());
 
@@ -543,7 +565,7 @@ mod tests {
             .take(temp.path(), &stamp, 0, MAX_ENTRIES_PER_DIR, false)
             .unwrap();
         assert!(ready.is_exhausted());
-        assert_eq!(ready.children, expected, "completed names remain reusable");
+        assert_eq!(*ready.children, expected, "completed names remain reusable");
     }
 
     #[test]
@@ -596,7 +618,7 @@ mod tests {
             fs::create_dir(&path).unwrap();
             let mut parent = read(&path);
             assert!(parent.next_entry().is_none());
-            parent.children = vec![OsString::from("child"); MAX_READY_CHILDREN / 3];
+            parent.children = Arc::new(vec![OsString::from("child"); MAX_READY_CHILDREN / 3]);
             cache.retain(&path, parent);
             assert!(cache.ready.len() <= MAX_READY_PAGES);
             assert!(
