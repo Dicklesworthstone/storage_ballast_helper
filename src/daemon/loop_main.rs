@@ -7603,6 +7603,26 @@ impl MonitoringDaemon {
             None
         };
         let background_observations = self.fs_collector.is_background();
+        // Resource relief needs the configured directory identities as well
+        // as the mount's pressure. Resolve them on the existing bounded
+        // filesystem workers: exhausted swap/inodes must not make the
+        // monitor stat every root, including unrelated stalled filesystems.
+        // An unknown root contributes no authority, and cached observations
+        // retain the collector's original freshness deadline.
+        let observed_roots = background_observations.then(|| {
+            self.config
+                .scanner
+                .root_paths
+                .iter()
+                .filter_map(|root| {
+                    self.fs_collector
+                        .collect_sample(root)
+                        .ok()?
+                        .query_directory()
+                        .cloned()
+                })
+                .collect::<Vec<_>>()
+        });
 
         // Update monitors for each active mount.
         for (mount_path, sample) in stats_by_mount {
@@ -7790,12 +7810,20 @@ impl MonitoringDaemon {
                     // filesystem free percentage and forecast stay intact.
                     response.release_ballast_files = 0;
                     backing_pressure = Some(pressure);
-                    ram_reclaim = Some(RamReclaimRequest::new(
-                        mount_path.clone(),
-                        device_id,
-                        pressure.target_bytes,
-                        &self.config.scanner.root_paths,
-                    ));
+                    ram_reclaim = Some(match &observed_roots {
+                        Some(roots) => RamReclaimRequest::from_observed_roots(
+                            mount_path.clone(),
+                            device_id,
+                            pressure.target_bytes,
+                            roots,
+                        ),
+                        None => RamReclaimRequest::new(
+                            mount_path.clone(),
+                            device_id,
+                            pressure.target_bytes,
+                            &self.config.scanner.root_paths,
+                        ),
+                    });
                 }
             } else {
                 // Recovery or lost evidence revokes backing-only authority
@@ -7836,17 +7864,29 @@ impl MonitoringDaemon {
                 // inode recovery and a finite artifact count, never swap bytes.
                 ram_reclaim = None;
                 backing_pressure = None;
-                inode_reclaim = Some(InodeReclaimRequest::new(
-                    mount_path.clone(),
-                    device_id,
-                    pressure.total,
-                    pressure.target_available,
-                    response
-                        .max_delete_batch
-                        .min(self.config.scanner.max_delete_batch),
-                    &self.config.pressure.inodes,
-                    &self.config.scanner.root_paths,
-                ));
+                let max_artifacts = response
+                    .max_delete_batch
+                    .min(self.config.scanner.max_delete_batch);
+                inode_reclaim = Some(match &observed_roots {
+                    Some(roots) => InodeReclaimRequest::from_observed_roots(
+                        mount_path.clone(),
+                        device_id,
+                        pressure.total,
+                        pressure.target_available,
+                        max_artifacts,
+                        &self.config.pressure.inodes,
+                        roots,
+                    ),
+                    None => InodeReclaimRequest::new(
+                        mount_path.clone(),
+                        device_id,
+                        pressure.total,
+                        pressure.target_available,
+                        max_artifacts,
+                        &self.config.pressure.inodes,
+                        &self.config.scanner.root_paths,
+                    ),
+                });
             }
 
             // Evaluate predictive policy with full confidence/trend gating.
@@ -19722,6 +19762,94 @@ mod tests {
         fixture.daemon.platform = Arc::clone(&platform);
         fixture.daemon.fs_collector = FsStatsCollector::new(platform, Duration::ZERO);
         (mount, other)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resource_pressure_uses_completed_root_observations_without_recapturing_directories() {
+        use crate::platform::pal::InodeStats;
+
+        for inode in [false, true] {
+            let mut fixture = RegretDaemonFixture::new();
+            let (mount, _) = if inode {
+                install_inode_pressure_probe(&mut fixture, InodeStats::new(10_000, 0, 0))
+            } else {
+                install_tmpfs_pressure_probe(
+                    &mut fixture,
+                    exhausted_swap_sample(),
+                    "tmpfs",
+                    29 << 30,
+                    false,
+                )
+            };
+            let stable = mount.join("stable");
+            let replaced = mount.join("replaced");
+            let pending = mount.join("pending");
+            for root in [&stable, &replaced, &pending] {
+                std::fs::create_dir_all(root.join("target")).unwrap();
+            }
+            let daemon = &mut fixture.daemon;
+            daemon.config.scanner.root_paths =
+                vec![stable.clone(), replaced.clone(), pending.clone()];
+            daemon.fs_collector = FsStatsCollector::new_background(
+                Arc::clone(&daemon.platform),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut samples = HashMap::new();
+            for root in [&stable, &replaced] {
+                let sample = loop {
+                    if let Ok(sample) = daemon.fs_collector.collect_sample(root) {
+                        break sample;
+                    }
+                    assert!(Instant::now() < deadline, "root observation did not finish");
+                    thread::yield_now();
+                };
+                samples.insert(mount.clone(), sample);
+            }
+            // Preserve the candidate inode while replacing its configured
+            // root. A monitor-side constructor used to recapture and admit
+            // this new directory instead of retaining the worker's evidence.
+            let retired = mount.join("retired");
+            std::fs::rename(&replaced, &retired).unwrap();
+            std::fs::create_dir(&replaced).unwrap();
+            std::fs::rename(retired.join("target"), replaced.join("target")).unwrap();
+
+            let response = daemon
+                .evaluate_pressure_samples(samples, Instant::now())
+                .unwrap();
+            assert_eq!(response.level, PressureLevel::Critical);
+            let tick = daemon
+                .mount_responses
+                .iter()
+                .find(|tick| tick.response.causing_mount == mount)
+                .unwrap();
+            let authorize = |path: &Path| {
+                if inode {
+                    tick.inode_reclaim
+                        .as_ref()
+                        .unwrap()
+                        .authorize_scope(path, &daemon.config.scanner)
+                } else {
+                    tick.ram_reclaim
+                        .as_ref()
+                        .unwrap()
+                        .authorize_scope(path, &daemon.config.scanner)
+                }
+            };
+            assert!(authorize(&stable.join("target")).is_ok());
+            assert_eq!(
+                authorize(&replaced.join("target")),
+                Err(SkipReason::PolicyChanged),
+                "inode={inode}: a replaced root must retain its sampled identity"
+            );
+            assert_eq!(
+                authorize(&pending.join("target")),
+                Err(SkipReason::PolicyChanged),
+                "inode={inode}: the first pending observation cannot grant scope"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

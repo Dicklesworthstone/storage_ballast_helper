@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::core::config::{InodePressureConfig, ScannerConfig};
+use crate::monitor::fs_stats::ObservedDirectory;
 use crate::platform::pal::Platform;
 use crate::scanner::deletion::SkipReason;
 use crate::scanner::quarantine::QuarantineRecord;
@@ -49,17 +50,37 @@ impl InodeReclaimRequest {
     ) -> Self {
         let roots = roots
             .iter()
-            .filter_map(|root| {
-                let resolved = std::fs::canonicalize(root).ok()?;
-                let identity = identity_for_path(root, true).ok()?;
-                if identity.device_id != device_id || !resolved.is_dir() {
-                    return None;
-                }
-                Some(AdmittedRoot {
-                    original: root.clone(),
-                    resolved,
-                    identity,
-                })
+            .filter_map(|root| ObservedDirectory::collect(root))
+            .collect::<Vec<_>>();
+        Self::from_observed_roots(
+            mount,
+            device_id,
+            total,
+            target_available,
+            max_artifacts,
+            policy,
+            &roots,
+        )
+    }
+
+    /// Build pressure authority from already-completed directory observations.
+    /// Unknown roots stay absent; this constructor never performs native I/O.
+    pub(super) fn from_observed_roots(
+        mount: PathBuf,
+        device_id: u64,
+        total: u64,
+        target_available: u64,
+        max_artifacts: usize,
+        policy: &InodePressureConfig,
+        roots: &[ObservedDirectory],
+    ) -> Self {
+        let roots = roots
+            .iter()
+            .filter(|root| root.identity.device_id == device_id)
+            .map(|root| AdmittedRoot {
+                original: root.original.clone(),
+                resolved: root.resolved.clone(),
+                identity: root.identity,
             })
             .collect();
         Self {

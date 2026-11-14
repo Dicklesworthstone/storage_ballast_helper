@@ -292,6 +292,11 @@ fn cached_frame_carries_native_auxiliary_evidence_without_reprobing() {
     assert_eq!(platform.calls.lock().len(), call_count);
     assert_eq!(second.inode_stats(), InodeStats::new(100, 80, 70));
     assert_eq!(second.is_ram_backed(), Some(false));
+    assert_eq!(second.query_directory(), first.query_directory());
+    assert_eq!(
+        second.query_directory(),
+        ObservedDirectory::collect(&path).as_ref()
+    );
     #[cfg(unix)]
     assert_eq!(
         second.mount_device_id(),
@@ -347,6 +352,41 @@ fn reused_directory_path_cannot_preserve_a_replaced_inode_identity() {
     std::fs::create_dir(&owner).unwrap();
     resume.send(()).unwrap();
     await_error(&collector, &owner, "mount ownership changed");
+}
+
+#[cfg(unix)]
+#[test]
+fn replaced_query_directory_cannot_publish_admission_on_an_unchanged_mount() {
+    let (_temporary, mount, platform) = fixture();
+    let query = mount.join("configured-root");
+    std::fs::create_dir(&query).unwrap();
+    let (entered, resume) = platform.gate(Stage::Capacity, &mount);
+    let collector = FsStatsCollector::new_background(platform, CACHE, CACHE);
+    assert!(collector.collect(&query).is_err());
+    entered.recv_timeout(WAIT).unwrap();
+    std::fs::rename(&query, mount.join("retired-root")).unwrap();
+    std::fs::create_dir(&query).unwrap();
+    resume.send(()).unwrap();
+    await_error(&collector, &query, "mount ownership changed");
+
+    collector.invalidate_observations();
+    let fresh = await_sample(&collector, &query);
+    assert_eq!(
+        fresh.query_directory(),
+        ObservedDirectory::collect(&query).as_ref()
+    );
+    assert_eq!(fresh.stats.mount_point, mount);
+}
+
+#[test]
+fn a_file_capacity_query_cannot_become_directory_admission() {
+    let (_temporary, mount, platform) = fixture();
+    let query = mount.join("state.json");
+    std::fs::write(&query, b"{}").unwrap();
+    let collector = FsStatsCollector::new_background(platform, CACHE, CACHE);
+    let sample = await_sample(&collector, &query);
+    assert_eq!(sample.stats.mount_point, mount);
+    assert!(sample.query_directory().is_none());
 }
 
 #[test]

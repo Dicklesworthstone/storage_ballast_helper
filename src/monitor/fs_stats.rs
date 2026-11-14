@@ -11,6 +11,7 @@ use parking_lot::RwLock;
 
 use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::{FsStats, InodeStats, MountPoint, Platform};
+use crate::scanner::walker::{FsEntryKind, FsIdentity, identity_for_path};
 
 pub(crate) mod background;
 
@@ -80,6 +81,41 @@ impl FsStatsSample {
             .as_ref()
             .map(|evidence| evidence.resolved_query.as_path())
     }
+
+    /// A queried directory's real canonical spelling and identity, captured
+    /// on the same worker as the capacity sample. The mount-lookup spelling
+    /// is deliberately separate: macOS firmlinks use a different namespace.
+    pub(crate) fn query_directory(&self) -> Option<&ObservedDirectory> {
+        self.auxiliary
+            .as_ref()
+            .and_then(|evidence| evidence.query_directory.as_ref())
+    }
+}
+
+/// Directory admission evidence which can cross onto the monitoring thread
+/// without another canonicalize/stat operation. Mutation boundaries still
+/// revalidate the original alias, canonical path and directory identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedDirectory {
+    pub original: PathBuf,
+    pub resolved: PathBuf,
+    pub identity: FsIdentity,
+}
+
+impl ObservedDirectory {
+    /// Collect only on a filesystem worker or an explicitly synchronous path.
+    pub(crate) fn collect(path: &Path) -> Option<Self> {
+        let resolved = std::fs::canonicalize(path).ok()?;
+        let identity = identity_for_path(&resolved, false).ok()?;
+        if identity.kind != FsEntryKind::Directory {
+            return None;
+        }
+        Some(Self {
+            original: path.to_path_buf(),
+            resolved,
+            identity,
+        })
+    }
 }
 
 /// Background probes collect every native input needed by the pressure path.
@@ -90,6 +126,7 @@ struct AuxiliaryEvidence {
     is_ram_backed: bool,
     directory_identity: Option<(u64, u64)>,
     resolved_query: PathBuf,
+    query_directory: Option<ObservedDirectory>,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -545,6 +582,7 @@ impl FsStatsCollector {
 fn collect_background_sample(platform: &dyn Platform, path: &Path) -> Result<FsStatsSample> {
     let collected_at = Instant::now();
     let resolved_query = platform.observe_mount_lookup_path(path)?;
+    let query_directory = ObservedDirectory::collect(path);
     let owner = platform.mount_identity(path)?;
     let resolved_owner = platform.observe_mount_lookup_path(&owner.path)?;
     if !resolved_query.starts_with(&resolved_owner) {
@@ -579,6 +617,7 @@ fn collect_background_sample(platform: &dyn Platform, path: &Path) -> Result<FsS
         || platform.mount_identity(path)? != owner
         || platform.observe_mount_lookup_path(&owner.path)? != resolved_owner
         || mount_directory_identity(&owner.path)? != directory_identity
+        || ObservedDirectory::collect(path) != query_directory
     {
         return Err(changed_mount(path));
     }
@@ -591,6 +630,7 @@ fn collect_background_sample(platform: &dyn Platform, path: &Path) -> Result<FsS
             is_ram_backed,
             directory_identity,
             resolved_query,
+            query_directory,
         }),
     })
 }

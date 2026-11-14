@@ -12,6 +12,15 @@ host runs a version that has it.
 
 ### Fixed
 
+- **RAM and inode relief no longer inspect every root on the pressure thread.**
+  Building a resource-specific cleanup request used to canonicalize and stat
+  every configured scan root synchronously, so an unrelated stalled filesystem
+  could stop pressure monitoring and watchdog progress during swap or inode
+  exhaustion. Requests now consume completed, fresh observations from the
+  existing bounded filesystem workers. Directory identity and canonical path
+  are checked around each observation; unknown or replaced roots grant no
+  cleanup authority, and the executor still revalidates scope before mutation.
+
 - **A compression safety stop now stops the whole daemon pass (bd-rxq5).**
   An incomplete or unverified rewrite, failed durable journal, or failed I/O
   priority restoration previously stopped only the current root; the daemon
