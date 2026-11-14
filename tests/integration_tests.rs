@@ -6154,6 +6154,93 @@ fn update_list_backups_with_isolated_home_reports_empty_json_inventory() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn update_rollback_previews_preserve_isolated_binary_and_backups() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use storage_ballast_helper::cli::update::BackupStore;
+
+    let fixture = tempfile::tempdir().expect("create rollback preview fixture");
+    // current_exe resolves /var aliases on macOS; use the same spelling.
+    let root = fixture.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let binary = root.join("bin/sbh");
+    let commands = root.join("commands");
+    for directory in [home.as_path(), binary.parent().unwrap(), commands.as_path()] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let store = BackupStore::open(home.join(".local/share/sbh/backups"));
+    for (version, contents) in [("older", b"older binary"), ("newer", b"newer binary")] {
+        fs::write(&binary, contents).unwrap();
+        store.create(&binary, version).unwrap();
+    }
+    let backups = store.list();
+    assert_eq!(backups.len(), 2);
+    // The updater targets current_exe().parent(), not HOME/.local/bin.
+    // A regressed preview must only be able to replace this disposable copy.
+    fs::copy(common::sbh_bin_path(), &binary).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    let before = fs::metadata(&binary).unwrap();
+    let digest = hex_lower(Sha256::digest(fs::read(&binary).unwrap()));
+    let service_calls = root.join("service-calls");
+    for program in ["systemctl", "busctl", "launchctl"] {
+        let trap = commands.join(program);
+        fs::write(
+            &trap,
+            b"#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> \"$SBH_TEST_ROLLBACK_SERVICE_CALLS\"\nexit 91\n",
+        )
+        .unwrap();
+        fs::set_permissions(&trap, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    for preview in ["--dry-run", "--check"] {
+        for explicit in [false, true] {
+            let selected = if explicit { &backups[1] } else { &backups[0] };
+            let mut command = Command::new(&binary);
+            command
+                .env_clear()
+                .current_dir(&root)
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("XDG_DATA_HOME", home.join(".local/share"))
+                .env("XDG_CACHE_HOME", home.join(".cache"))
+                .env("XDG_RUNTIME_DIR", &root)
+                .env("PATH", &commands)
+                .env("SBH_TEST_ROLLBACK_SERVICE_CALLS", &service_calls)
+                .args(["--json", "update", "--rollback"]);
+            if explicit {
+                command.arg(&selected.id);
+            }
+            let output = command
+                .args([preview, "--prune", "0"])
+                .output()
+                .expect("run copied sbh rollback preview");
+            assert!(
+                output.status.success(),
+                "{preview}, explicit={explicit}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["success"], true);
+            assert_eq!(report["applied"], false);
+            assert_eq!(report["dry_run"], preview == "--dry-run");
+            assert_eq!(report["check_only"], preview == "--check");
+            assert!(report["service_restart"].is_null());
+            assert_eq!(report["snapshot_id"], selected.id.as_str());
+            assert_eq!(report["restored_version"], selected.version.as_str());
+            assert_eq!(report["install_path"], binary.to_str().unwrap());
+            let after = fs::metadata(&binary).unwrap();
+            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+            assert_eq!(hex_lower(Sha256::digest(fs::read(&binary).unwrap())), digest);
+            assert_eq!(store.list().len(), backups.len());
+            for backup in &backups {
+                assert!(backup.path.is_file(), "preview removed backup {}", backup.id);
+            }
+            assert!(!service_calls.exists(), "preview queried a service manager");
+        }
+    }
+}
+
 #[test]
 fn update_prune_with_isolated_home_reports_zero_removed_json() {
     let home = tempfile::tempdir().expect("create temp home");

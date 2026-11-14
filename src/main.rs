@@ -70,15 +70,6 @@ fn main() {
             std::process::exit(2);
         }
     };
-    #[cfg(target_os = "linux")]
-    match linux_rollback::run(&matches) {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(error) => {
-            eprintln!("sbh: {error}");
-            std::process::exit(error.exit_code());
-        }
-    }
     match cli_source_roots::run(&matches) {
         Ok(Some(0)) => return,
         Ok(Some(code)) => std::process::exit(code),
@@ -100,7 +91,7 @@ fn update_mutates_binary(matches: &clap::ArgMatches) -> bool {
         return false;
     };
     // Inventory still takes precedence over rollback, and rollback over prune.
-    // Linux rollback previews never publish or activate an image.
+    // Rollback previews never publish or activate an image.
     if update.get_flag("list_backups") {
         return false;
     }
@@ -226,30 +217,32 @@ mod entrypoint_tests {
     }
 }
 
-// Linux rollback needs the same verified activation as an ordinary update.
-// Keep this entrypoint transaction inside the update lock; the BackupStore API
-// remains a file-only operation for library callers and non-Linux platforms.
-#[cfg(target_os = "linux")]
-mod linux_rollback {
+// Rollback shares one transaction on every platform: preview before mutation,
+// then restore and activate the selected service. On Linux the entrypoint's
+// update lock remains held throughout. BackupStore remains a file-only API.
+mod rollback {
     use std::io::{self, Write as _};
     use std::path::{Path, PathBuf};
 
-    use clap::ArgMatches;
     use serde::Serialize;
     use storage_ballast_helper::cli::update::{
         BackupStore, RollbackResult, UpdateServiceRestart, UpdateServiceRestartStatus,
     };
-    use storage_ballast_helper::daemon::service::{SystemdConfig, SystemdServiceManager};
     use storage_ballast_helper::platform::pal::ServiceManager;
 
     use super::cli_app::CliError;
 
-    struct Request {
-        install_path: PathBuf,
-        backup_id: Option<String>,
-        user_scope: bool,
-        dry_run: bool,
-        check_only: bool,
+    pub(super) struct Request {
+        pub install_path: PathBuf,
+        pub backup_id: Option<String>,
+        pub dry_run: bool,
+        pub check_only: bool,
+    }
+
+    pub(super) struct Service {
+        pub service_type: &'static str,
+        pub user_scope: bool,
+        pub manager: Box<dyn ServiceManager>,
     }
 
     impl Request {
@@ -271,38 +264,19 @@ mod linux_rollback {
         service_restart: Option<UpdateServiceRestart>,
     }
 
-    pub fn run(matches: &ArgMatches) -> Result<bool, CliError> {
-        let Some(("update", update)) = matches.subcommand() else {
-            return Ok(false);
-        };
-        if update.get_flag("list_backups") || !update.contains_id("rollback") {
-            return Ok(false);
-        }
-        let install_path = storage_ballast_helper::update_handoff::install_path()
-            .ok_or_else(|| CliError::Internal("missing rollback destination".to_string()))?;
-        let request = Request {
-            install_path: install_path.to_path_buf(),
-            backup_id: update.get_one::<String>("rollback").cloned(),
-            user_scope: update.get_flag("user"),
-            dry_run: update.get_flag("dry_run"),
-            check_only: update.get_flag("check"),
-        };
-        let report = execute(
-            &request,
-            &BackupStore::open_default(),
-            nix::unistd::geteuid().is_root(),
-            || {
-                // Lifecycle control only: no unit is generated or installed.
-                // Use the selected destination, not current_exe after replacement.
-                Box::new(SystemdServiceManager::new(SystemdConfig {
-                    user_scope: request.user_scope,
-                    binary_path: request.install_path.clone(),
-                    read_write_paths: Vec::new(),
-                }))
-            },
-        );
+    pub(super) fn run<F>(
+        request: &Request,
+        store: &BackupStore,
+        json: bool,
+        root: bool,
+        service: F,
+    ) -> Result<(), CliError>
+    where
+        F: FnOnce() -> Result<Option<Service>, UpdateServiceRestart>,
+    {
+        let report = execute(request, store, root, service);
         let mut out = io::stdout().lock();
-        if matches.get_flag("json") {
+        if json {
             serde_json::to_writer(&mut out, &report)?;
             writeln!(out)?;
         } else {
@@ -310,7 +284,7 @@ mod linux_rollback {
         }
         out.flush()?;
         if report.result.success {
-            Ok(true)
+            Ok(())
         } else if report.applied {
             Err(CliError::Runtime(
                 "rollback applied but service restart failed".to_string(),
@@ -325,9 +299,9 @@ mod linux_rollback {
         }
     }
 
-    fn execute<F>(request: &Request, store: &BackupStore, root: bool, manager: F) -> Report
+    fn execute<F>(request: &Request, store: &BackupStore, root: bool, service: F) -> Report
     where
-        F: FnOnce() -> Box<dyn ServiceManager>,
+        F: FnOnce() -> Result<Option<Service>, UpdateServiceRestart>,
     {
         let result = if request.preview() {
             preview_restore(store, &request.install_path, request.backup_id.as_deref())
@@ -351,8 +325,11 @@ mod linux_rollback {
         if !report.applied {
             return report;
         }
-        let manager = manager();
-        let restart = activate(manager.as_ref(), request.user_scope, root);
+        let restart = match service() {
+            Ok(Some(service)) => activate(&service, root),
+            Ok(None) => return report,
+            Err(error) => error,
+        };
         if restart.status == UpdateServiceRestartStatus::Failed {
             report.result.success = false;
             report.result.error = Some(format!(
@@ -364,29 +341,31 @@ mod linux_rollback {
         report
     }
 
-    fn activate(
-        manager: &dyn ServiceManager,
-        user_scope: bool,
-        root: bool,
-    ) -> UpdateServiceRestart {
-        let scope = if user_scope { "user" } else { "system" };
+    fn activate(service: &Service, root: bool) -> UpdateServiceRestart {
+        let scope = if service.user_scope { "user" } else { "system" };
+        let service_type = service.service_type;
         // Match the ordinary update's ordering: missing services succeed even
         // for non-root callers; only loaded system services require root.
-        match manager.is_loaded() {
-            Ok(false) => UpdateServiceRestart::skipped("systemd", scope, "service is not loaded"),
-            Ok(true) if !user_scope && !root => UpdateServiceRestart::failed(
-                "systemd",
+        match service.manager.is_loaded() {
+            Ok(false) => {
+                UpdateServiceRestart::skipped(service_type, scope, "service is not loaded")
+            }
+            Ok(true) if !service.user_scope && !root => UpdateServiceRestart::failed(
+                service_type,
                 scope,
-                "restarting a system-scope service requires root; the binary was restored; run `sudo sbh service --systemd restart`",
+                format!(
+                    "restarting a system-scope service requires root; the binary was restored; \
+                     run `sudo sbh service --{service_type} --scope system restart`"
+                ),
             ),
-            Ok(true) => match manager.restart() {
+            Ok(true) => match service.manager.restart() {
                 // With the update handoff armed, the existing Linux manager
                 // verifies both ExecStart and the running replacement's inode.
-                Ok(()) => UpdateServiceRestart::restarted("systemd", scope),
-                Err(error) => UpdateServiceRestart::failed("systemd", scope, error.to_string()),
+                Ok(()) => UpdateServiceRestart::restarted(service_type, scope),
+                Err(error) => UpdateServiceRestart::failed(service_type, scope, error.to_string()),
             },
             Err(error) => UpdateServiceRestart::failed(
-                "systemd",
+                service_type,
                 scope,
                 format!("failed to determine whether service is loaded: {error}"),
             ),
@@ -448,7 +427,7 @@ mod linux_rollback {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     mod tests {
         use super::*;
         use std::sync::Arc;
@@ -508,7 +487,6 @@ mod linux_rollback {
             let request = Request {
                 install_path,
                 backup_id: Some(backup.id),
-                user_scope: true,
                 dry_run: false,
                 check_only: false,
             };
@@ -517,79 +495,138 @@ mod linux_rollback {
 
         #[test]
         fn rollback_activates_loaded_services_and_skips_absent_ones() {
-            for (loaded, user_scope, root, expected, restart_count) in [
-                (false, false, false, UpdateServiceRestartStatus::Skipped, 0),
-                (true, true, false, UpdateServiceRestartStatus::Restarted, 1),
-                (true, false, true, UpdateServiceRestartStatus::Restarted, 1),
-                (true, false, false, UpdateServiceRestartStatus::Failed, 0),
-            ] {
-                let (_temp, store, mut request) = fixture();
-                request.user_scope = user_scope;
-                let restarts = Arc::new(AtomicUsize::new(0));
-                let report = execute(&request, &store, root, || {
-                    Box::new(MockService {
-                        loaded,
-                        probe_fails: false,
-                        restart_fails: false,
-                        restarts: restarts.clone(),
-                    })
-                });
-                assert!(report.applied);
-                assert_eq!(
-                    report.result.success,
-                    expected != UpdateServiceRestartStatus::Failed
-                );
-                assert_eq!(report.service_restart.as_ref().unwrap().status, expected);
-                assert_eq!(restarts.load(Ordering::SeqCst), restart_count);
-                assert_eq!(
-                    std::fs::read(&request.install_path).unwrap(),
-                    b"previous image"
-                );
-                let json = serde_json::to_value(&report).unwrap();
-                assert_eq!(json["applied"], true);
-                assert_eq!(json["snapshot_id"], request.backup_id.as_deref().unwrap());
-                if expected == UpdateServiceRestartStatus::Failed {
-                    assert!(report.result.error.unwrap().contains("requires root"));
+            for service_type in ["systemd", "launchd"] {
+                for (loaded, user_scope, root, expected, restart_count) in [
+                    (false, false, false, UpdateServiceRestartStatus::Skipped, 0),
+                    (true, true, false, UpdateServiceRestartStatus::Restarted, 1),
+                    (true, false, true, UpdateServiceRestartStatus::Restarted, 1),
+                    (true, false, false, UpdateServiceRestartStatus::Failed, 0),
+                ] {
+                    let (_temp, store, request) = fixture();
+                    let restarts = Arc::new(AtomicUsize::new(0));
+                    let report = execute(&request, &store, root, || {
+                        Ok(Some(Service {
+                            service_type,
+                            user_scope,
+                            manager: Box::new(MockService {
+                                loaded,
+                                probe_fails: false,
+                                restart_fails: false,
+                                restarts: restarts.clone(),
+                            }),
+                        }))
+                    });
+                    assert!(report.applied);
+                    assert_eq!(
+                        report.result.success,
+                        expected != UpdateServiceRestartStatus::Failed
+                    );
+                    let activation = report.service_restart.as_ref().unwrap();
+                    assert_eq!(activation.status, expected);
+                    assert_eq!(activation.service_type, service_type);
+                    assert_eq!(activation.scope, if user_scope { "user" } else { "system" });
+                    assert_eq!(restarts.load(Ordering::SeqCst), restart_count);
+                    assert_eq!(
+                        std::fs::read(&request.install_path).unwrap(),
+                        b"previous image"
+                    );
+                    let json = serde_json::to_value(&report).unwrap();
+                    assert_eq!(json["applied"], true);
+                    assert_eq!(json["snapshot_id"], request.backup_id.as_deref().unwrap());
+                    if expected == UpdateServiceRestartStatus::Failed {
+                        let error = report.result.error.unwrap();
+                        assert!(error.contains("requires root"));
+                        let remediation = format!("--{service_type} --scope system restart");
+                        assert!(error.contains(&remediation));
+                    }
                 }
             }
         }
 
         #[test]
         fn activation_errors_do_not_claim_the_restoration_was_undone() {
-            for probe_fails in [true, false] {
-                let (_temp, store, request) = fixture();
-                let restarts = Arc::new(AtomicUsize::new(0));
-                let report = execute(&request, &store, false, || {
-                    Box::new(MockService {
-                        loaded: true,
-                        probe_fails,
-                        restart_fails: true,
-                        restarts: restarts.clone(),
-                    })
-                });
-                assert!(report.applied);
-                assert!(!report.result.success);
-                assert_eq!(
-                    report.service_restart.as_ref().unwrap().status,
-                    UpdateServiceRestartStatus::Failed
-                );
-                assert_eq!(restarts.load(Ordering::SeqCst), usize::from(!probe_fails));
-                assert_eq!(
-                    std::fs::read(&request.install_path).unwrap(),
-                    b"previous image"
-                );
-                let expected = if probe_fails {
-                    "fixture query denied"
-                } else {
-                    "fixture activation failed"
-                };
-                assert!(report.result.error.as_ref().unwrap().contains(expected));
-                let mut out = Vec::new();
-                write_human(&mut out, &report).unwrap();
-                let text = String::from_utf8(out).unwrap();
-                assert!(text.contains("Restored 0.7.0"));
-                assert!(text.contains("Rollback failed"));
+            for service_type in ["systemd", "launchd"] {
+                for probe_fails in [true, false] {
+                    let (_temp, store, request) = fixture();
+                    let restarts = Arc::new(AtomicUsize::new(0));
+                    let report = execute(&request, &store, false, || {
+                        Ok(Some(Service {
+                            service_type,
+                            user_scope: true,
+                            manager: Box::new(MockService {
+                                loaded: true,
+                                probe_fails,
+                                restart_fails: true,
+                                restarts: restarts.clone(),
+                            }),
+                        }))
+                    });
+                    assert!(report.applied);
+                    assert!(!report.result.success);
+                    let activation = report.service_restart.as_ref().unwrap();
+                    assert_eq!(activation.status, UpdateServiceRestartStatus::Failed);
+                    assert_eq!(activation.service_type, service_type);
+                    assert_eq!(restarts.load(Ordering::SeqCst), usize::from(!probe_fails));
+                    assert_eq!(
+                        std::fs::read(&request.install_path).unwrap(),
+                        b"previous image"
+                    );
+                    let expected = if probe_fails {
+                        "fixture query denied"
+                    } else {
+                        "fixture activation failed"
+                    };
+                    assert!(report.result.error.as_ref().unwrap().contains(expected));
+                    let mut out = Vec::new();
+                    write_human(&mut out, &report).unwrap();
+                    let text = String::from_utf8(out).unwrap();
+                    assert!(text.contains("Restored 0.7.0"));
+                    assert!(text.contains("Rollback failed"));
+                }
             }
+        }
+
+        #[test]
+        fn service_resolution_failure_preserves_applied_rollback() {
+            let (_temp, store, request) = fixture();
+            let report = execute(&request, &store, true, || {
+                Err(UpdateServiceRestart::failed(
+                    "launchd",
+                    "system",
+                    "fixture service resolution failed",
+                ))
+            });
+            assert!(report.applied);
+            assert!(!report.result.success);
+            let activation = report.service_restart.as_ref().unwrap();
+            assert_eq!(activation.status, UpdateServiceRestartStatus::Failed);
+            assert_eq!(activation.service_type, "launchd");
+            assert_eq!(activation.scope, "system");
+            assert!(
+                report
+                    .result
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains("fixture service resolution failed")
+            );
+            assert_eq!(
+                std::fs::read(&request.install_path).unwrap(),
+                b"previous image"
+            );
+        }
+
+        #[test]
+        fn rollback_without_a_service_backend_restores_the_binary() {
+            let (_temp, store, request) = fixture();
+            let report = execute(&request, &store, false, || Ok(None));
+            assert!(report.applied);
+            assert!(report.result.success);
+            assert!(report.service_restart.is_none());
+            assert_eq!(
+                std::fs::read(&request.install_path).unwrap(),
+                b"previous image"
+            );
         }
 
         #[test]

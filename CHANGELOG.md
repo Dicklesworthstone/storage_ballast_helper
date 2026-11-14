@@ -12,6 +12,14 @@ host runs a version that has it.
 
 ### Fixed
 
+- **Rollback previews are read-only on macOS as well as Linux.**
+  `sbh update --rollback --dry-run` and `--rollback --check` now share the
+  same preview transaction on every platform instead of reaching a fallback
+  that replaced the executable. An applied rollback activates the selected
+  loaded service using the updater's existing systemd or launchd scope rules.
+  If activation fails after restoration, the report retains `applied: true`
+  and reports the failure; previews leave the executable and services alone.
+
 - **RAM and inode relief no longer inspect every root on the pressure thread.**
   Building a resource-specific cleanup request used to canonicalize and stat
   every configured scan root synchronously, so an unrelated stalled filesystem

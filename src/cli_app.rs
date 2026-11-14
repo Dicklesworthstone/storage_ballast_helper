@@ -18108,7 +18108,7 @@ fn build_update_options(
 fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<(), CliError> {
     use storage_ballast_helper::cli::update::{
         BackupStore, default_install_dir, format_backup_list, format_prune_result,
-        format_rollback_result, format_update_report, run_update_sequence,
+        format_update_report, run_update_sequence,
     };
 
     let install_dir = if args.system {
@@ -18132,26 +18132,23 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<(), CliError> {
         return Ok(());
     }
 
-    // Handle --rollback.
+    // Every platform uses the same preview/restore/activation transaction.
+    // In particular, --dry-run and --check must not replace a macOS binary.
     if let Some(ref rollback_arg) = args.rollback {
-        let snap_id = rollback_arg.as_deref();
-        let install_path = install_dir.join("sbh");
-        match store.rollback(&install_path, snap_id) {
-            Ok(result) => {
-                match output_mode(cli) {
-                    OutputMode::Human => print!("{}", format_rollback_result(&result)),
-                    OutputMode::Json => {
-                        let payload = serde_json::to_value(&result)?;
-                        write_json_line(&payload)?;
-                    }
-                }
-                if result.success {
-                    return Ok(());
-                }
-                return Err(CliError::Runtime("rollback failed".to_string()));
-            }
-            Err(e) => return Err(CliError::Runtime(e)),
-        }
+        let request = crate::rollback::Request {
+            install_path: storage_ballast_helper::update_handoff::install_path()
+                .map_or_else(|| install_dir.join("sbh"), Path::to_path_buf),
+            backup_id: rollback_arg.clone(),
+            dry_run: args.dry_run,
+            check_only: args.check,
+        };
+        return crate::rollback::run(
+            &request,
+            &store,
+            output_mode(cli) == OutputMode::Json,
+            running_as_root(),
+            || rollback_service(args),
+        );
     }
 
     // Handle --prune.
@@ -18197,6 +18194,32 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<(), CliError> {
     } else {
         Err(CliError::Runtime("update failed".to_string()))
     }
+}
+
+/// Resolve lifecycle control only after an actual rollback. Use the same
+/// backend and scope policy as ordinary updates; no unit or plist is installed.
+fn rollback_service(
+    args: &UpdateArgs,
+) -> Result<Option<crate::rollback::Service>, UpdateServiceRestart> {
+    let platform = detect_platform().map_err(|error| {
+        UpdateServiceRestart::failed(
+            "unknown",
+            "unknown",
+            format!("failed to detect service backend after rollback: {error}"),
+        )
+    })?;
+    let Some(service) = resolve_update_service_control(args, platform.service_kind()) else {
+        return Ok(None);
+    };
+    let service_type = service_kind_name(service.kind);
+    let manager = service_manager_for_control(service).map_err(|error| {
+        UpdateServiceRestart::failed(service_type, service.scope_name(), error.to_string())
+    })?;
+    Ok(Some(crate::rollback::Service {
+        service_type,
+        user_scope: service.user_scope,
+        manager,
+    }))
 }
 
 fn maybe_restart_service_after_update(cli: &Cli, args: &UpdateArgs, report: &mut UpdateReport) {
@@ -20890,6 +20913,21 @@ mod tests {
 
         assert_eq!(service.kind, ServiceKind::Systemd);
         assert!(service.user_scope);
+    }
+
+    #[test]
+    fn update_service_control_honors_system_scope_for_both_backends() {
+        let args = UpdateArgs {
+            system: true,
+            ..UpdateArgs::default()
+        };
+        for kind in [ServiceKind::Systemd, ServiceKind::Launchd] {
+            let service = resolve_update_service_control(&args, kind).unwrap();
+            assert_eq!(service.kind, kind);
+            assert!(!service.user_scope);
+            assert_eq!(service.scope_name(), "system");
+        }
+        assert!(resolve_update_service_control(&args, ServiceKind::None).is_none());
     }
 
     #[test]
