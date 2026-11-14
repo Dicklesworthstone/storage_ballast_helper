@@ -238,6 +238,7 @@ impl LinuxInotifyBackend {
             if collapsed {
                 next.dirty_paths.clear();
                 next.dirty_roots.clear();
+                next.discovery_roots.clear();
             }
             invalidation.merge(next);
             if !collapsed && invalidation.dirty_paths.len() > budget.dirty_paths {
@@ -245,6 +246,7 @@ impl LinuxInotifyBackend {
                 // memory also bounds the subsequent project-root mapping work.
                 invalidation.dirty_paths.clear();
                 invalidation.dirty_roots.clear();
+                invalidation.discovery_roots.clear();
                 invalidation.mark_all_roots(
                     config.root_paths(),
                     "recursive inotify dirty-path budget exceeded",
@@ -692,6 +694,7 @@ mod tests {
         let invalidation = handle(&mut backend, &config, &created);
         assert!(backend.needs_repair());
         assert!(invalidation.requires_index_generation_bump());
+        assert!(!invalidation.requires_discovery_reset());
         assert_eq!(backend.watched_dirs().count(), 2);
         assert!(invalidation.dirty_paths().contains(&root.join("new")));
     }

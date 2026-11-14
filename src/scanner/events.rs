@@ -560,6 +560,10 @@ pub struct FsEvent {
 pub struct EventInvalidation {
     dirty_roots: BTreeSet<PathBuf>,
     dirty_paths: BTreeSet<PathBuf>,
+    /// Observed changes, separate from coverage-only reconciliation scopes.
+    discovery_roots: BTreeSet<PathBuf>,
+    /// Unknown or lost events revoke every negative discovery hint.
+    history_lost: bool,
     generation_bump: bool,
     reasons: BTreeSet<String>,
 }
@@ -570,6 +574,8 @@ impl EventInvalidation {
         Self {
             dirty_roots: BTreeSet::new(),
             dirty_paths: BTreeSet::new(),
+            discovery_roots: BTreeSet::new(),
+            history_lost: false,
             generation_bump: false,
             reasons: BTreeSet::new(),
         }
@@ -579,6 +585,7 @@ impl EventInvalidation {
     /// overflow, even while the next expensive reconciliation is deferred.
     fn deferred_overflow() -> Self {
         let mut invalidation = Self::empty();
+        invalidation.history_lost = true;
         invalidation.generation_bump = true;
         invalidation
             .reasons
@@ -604,6 +611,22 @@ impl EventInvalidation {
     #[must_use]
     pub fn requires_index_generation_bump(&self) -> bool {
         self.generation_bump
+    }
+
+    /// Whether missing event history makes every cached barren subtree stale.
+    /// Watch-plan gaps still revoke candidate evidence, but do not erase
+    /// bounded discovery progress merely because a directory is unwatched.
+    #[must_use]
+    pub fn requires_discovery_reset(&self) -> bool {
+        self.history_lost
+    }
+
+    /// Observed changes that revoke overlapping negative discovery hints.
+    /// Coverage-only scopes remain in `dirty_roots` for reconciliation and
+    /// candidate-index invalidation, without restarting an unfinished sweep.
+    #[must_use]
+    pub fn discovery_roots(&self) -> &BTreeSet<PathBuf> {
+        &self.discovery_roots
     }
 
     #[must_use]
@@ -641,6 +664,7 @@ impl EventInvalidation {
     }
 
     fn mark_dirty_root(&mut self, root: PathBuf, reason: impl Into<String>) {
+        self.discovery_roots.insert(root.clone());
         self.dirty_roots.insert(root);
         self.reasons.insert(reason.into());
     }
@@ -678,8 +702,10 @@ impl EventInvalidation {
         }
         for (root, scan_roots) in per_root {
             if scan_roots.len() > MAX_EVENT_SCAN_PATHS_PER_ROOT || scan_roots.contains(&root) {
+                self.discovery_roots.insert(root.clone());
                 self.dirty_roots.insert(root);
             } else {
+                self.discovery_roots.extend(scan_roots.iter().cloned());
                 self.dirty_roots.extend(scan_roots);
             }
         }
@@ -705,13 +731,26 @@ impl EventInvalidation {
         generation_bump: bool,
     ) {
         self.dirty_roots.extend(roots.iter().cloned());
+        self.discovery_roots.extend(roots.iter().cloned());
         self.reasons.insert(reason.into());
+        self.history_lost |= generation_bump;
         self.generation_bump |= generation_bump;
+    }
+
+    /// A coverage change is not evidence that all previously barren ground
+    /// changed. Keep reconciliation and index revocation conservative while
+    /// letting the bounded discovery sweep continue.
+    fn mark_coverage_roots(&mut self, roots: &[PathBuf], reason: impl Into<String>) {
+        self.dirty_roots.extend(roots.iter().cloned());
+        self.reasons.insert(reason.into());
+        self.generation_bump = true;
     }
 
     pub fn merge(&mut self, other: Self) {
         self.dirty_roots.extend(other.dirty_roots);
         self.dirty_paths.extend(other.dirty_paths);
+        self.discovery_roots.extend(other.discovery_roots);
+        self.history_lost |= other.history_lost;
         self.generation_bump |= other.generation_bump;
         self.reasons.extend(other.reasons);
     }
@@ -744,7 +783,7 @@ impl DirtyRootTracker {
                 if let Some(path) = event.path {
                     invalidation.mark_dirty_root(path, format!("{:?}", event.kind));
                 } else {
-                    invalidation.mark_all_roots(&self.roots, format!("{:?}", event.kind), true);
+                    invalidation.mark_coverage_roots(&self.roots, format!("{:?}", event.kind));
                 }
             }
             FsEventKind::Create
@@ -1755,6 +1794,83 @@ mod tests {
         foreign.resolve_scan_roots(&roots);
         assert!(foreign.dirty_roots().contains(&root));
         assert!(foreign.requires_index_generation_bump());
+    }
+
+    #[test]
+    fn coverage_gaps_revoke_candidates_without_erasing_discovery_progress() {
+        let root = PathBuf::from("/tmp/root");
+        let (mut index, _) = replay_fixture(&root);
+        let tracker = DirtyRootTracker::new(std::slice::from_ref(&root));
+        let gap = tracker.apply_event(FsEvent {
+            kind: FsEventKind::WatchBudgetExceeded,
+            path: None,
+        });
+
+        assert!(gap.requires_reconciliation());
+        assert!(gap.requires_index_generation_bump());
+        assert!(!gap.requires_discovery_reset());
+        assert!(gap.discovery_roots().is_empty());
+        gap.apply_to_index(&mut index);
+        assert_eq!(index.event_generation(), 1);
+        assert!(
+            index
+                .ranked_records(SystemTime::UNIX_EPOCH, usize::MAX)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn coverage_gaps_do_not_broaden_observed_discovery_changes() {
+        let root = PathBuf::from("/tmp/root");
+        let roots = vec![root.clone()];
+        let tracker = DirtyRootTracker::new(&roots);
+        let mut gap = tracker.apply_event(FsEvent {
+            kind: FsEventKind::WatchBudgetExceeded,
+            path: None,
+        });
+        gap.merge(tracker.apply_event(FsEvent {
+            kind: FsEventKind::Modify,
+            path: Some(root.join("proj/target/debug/object.o")),
+        }));
+        gap.resolve_scan_roots(&roots);
+
+        assert!(gap.dirty_roots().contains(&root));
+        assert_eq!(gap.discovery_roots(), &BTreeSet::from([root.join("proj")]));
+        assert!(!gap.requires_discovery_reset());
+    }
+
+    #[test]
+    fn deferred_event_loss_survives_coverage_only_merges() {
+        let roots = vec![PathBuf::from("/tmp/root")];
+        let tracker = DirtyRootTracker::new(&roots);
+        let gap = tracker.apply_event(FsEvent {
+            kind: FsEventKind::WatchBudgetExceeded,
+            path: None,
+        });
+        let loss = EventInvalidation::deferred_overflow();
+        assert!(!loss.requires_reconciliation());
+        assert!(loss.requires_discovery_reset());
+        for (mut first, second) in [(gap.clone(), loss.clone()), (loss, gap)] {
+            first.merge(second);
+            assert!(first.requires_discovery_reset());
+            assert!(first.requires_index_generation_bump());
+        }
+        for kind in [
+            FsEventKind::Overflow,
+            FsEventKind::BackendRestart,
+            FsEventKind::PermissionLost,
+            FsEventKind::Create,
+            FsEventKind::Modify,
+            FsEventKind::Remove,
+            FsEventKind::Rename,
+        ] {
+            assert!(
+                tracker
+                    .apply_event(FsEvent { kind, path: None })
+                    .requires_discovery_reset(),
+                "{kind:?} must invalidate unknown changed ground"
+            );
+        }
     }
 
     #[test]

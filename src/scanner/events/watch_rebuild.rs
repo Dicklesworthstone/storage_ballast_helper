@@ -201,19 +201,40 @@ pub(super) fn poll_or_start(source: &mut ScannerEventSource, now: Instant) -> Ev
                 )
             }
             Ok(Prepared { plan, backend }) => {
-                let old = std::mem::replace(&mut source.backend, backend);
+                let mut old = std::mem::replace(&mut source.backend, backend);
+                let mut invalidation = EventInvalidation::empty();
+                // The replacement is fully installed before this last bounded
+                // drain. Preserve changes queued on the old watches during
+                // installation; the new backend retains overlapping events.
+                // A failed drain carries its own history-loss invalidation.
+                if let (
+                    EventSourceBackend::RecursiveInotify(previous),
+                    EventSourceBackend::RecursiveInotify(_),
+                ) = (&mut old, &source.backend)
+                {
+                    invalidation.merge(previous.drain(
+                        &source.tracker,
+                        &source.config,
+                        &mut source.rates,
+                        &mut source.backoff,
+                        now,
+                    ));
+                    invalidation.mark_coverage_roots(
+                        source.config.root_paths(),
+                        "recursive inotify watch coverage rebuilt",
+                    );
+                } else {
+                    // A transition to or from polling cannot account for
+                    // events during installation, so discard discovery hints.
+                    invalidation.mark_all_roots(
+                        source.config.root_paths(),
+                        "recursive inotify watch coverage rebuilt",
+                        true,
+                    );
+                }
                 source.rates.retain_watched(&plan.watched_dirs);
                 source.capability = EventSourceCapability::from_plan(&plan);
                 task.retire(old);
-                let mut invalidation = EventInvalidation::empty();
-                // The old queue may still contain events and the new watches
-                // were installed at different times. A ready plan alone is
-                // never evidence that a checkpoint remained fresh throughout.
-                invalidation.mark_all_roots(
-                    source.config.root_paths(),
-                    "recursive inotify watch coverage rebuilt",
-                    true,
-                );
                 invalidation
             }
             Err(error) => failed(source, &error),
@@ -601,6 +622,41 @@ mod tests {
         assert!(!next.requires_index_generation_bump());
         let quiet = source.drain_at(now);
         assert!(!quiet.requires_reconciliation());
+        wait_free(&gate);
+    }
+
+    #[test]
+    fn handoff_drains_changes_queued_before_replacement_watches_existed() {
+        let (_temp, mut source, root, now) = fixture();
+        let gate = gate();
+        // Only the old subscription can see this event. Do not use
+        // drain_at while waiting: the handoff itself must drain that queue.
+        let changed = root.join("project/old-queue-only.o");
+        fs::write(&changed, b"queued before replacement").unwrap();
+        let config = source.config.clone();
+        source.rebuild = Some(
+            Rebuild::spawn(Arc::clone(&gate), move |cancelled| {
+                build(&config, &EventRateTracker::default(), now, cancelled)
+            })
+            .unwrap(),
+        );
+        let deadline = Instant::now() + TEST_WAIT;
+        let mut handoff = EventInvalidation::empty();
+        while source.rebuild.is_some() {
+            assert!(Instant::now() < deadline, "replacement did not finish");
+            handoff.merge(poll_or_start(&mut source, now));
+            thread::sleep(Duration::from_millis(1));
+        }
+        handoff.resolve_scan_roots(source.config.root_paths());
+
+        assert!(handoff.requires_index_generation_bump());
+        assert!(!handoff.requires_discovery_reset());
+        assert!(handoff.dirty_paths().contains(&changed));
+        assert_eq!(
+            handoff.discovery_roots(),
+            &std::collections::BTreeSet::from([root.join("project")])
+        );
+        assert!(handoff.dirty_roots().contains(&root));
         wait_free(&gate);
     }
 

@@ -182,7 +182,9 @@ fn record_loss(
     now: Instant,
 ) -> EventInvalidation {
     let mut invalidation = EventInvalidation::empty();
-    // Pace the expensive rescan, never the revocation of stale candidates.
+    // Pace the expensive rescan, never the revocation of stale candidates
+    // or negative discovery hints, including coalesced overflows.
+    invalidation.history_lost = true;
     invalidation.generation_bump = true;
     match backoff.record(now) {
         OverflowDecision::Reconcile { .. } => {
@@ -528,6 +530,7 @@ mod tests {
         assert!(record_loss(&roots, &mut backoff, now).requires_reconciliation());
         let next = record_loss(&roots, &mut backoff, now + Duration::from_secs(1));
         assert!(next.requires_index_generation_bump());
+        assert!(next.requires_discovery_reset());
         assert!(!next.requires_reconciliation());
         assert!(backoff.take_deferred(now + RETRY_INTERVAL));
     }

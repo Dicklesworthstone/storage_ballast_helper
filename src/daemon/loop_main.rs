@@ -11626,17 +11626,20 @@ impl ScanCursor {
     /// resolved changed paths into bounded scan scopes. An ancestor hint
     /// would skip the scope, and a descendant hint would skip part of it.
     fn invalidate_events(&mut self, invalidation: &EventInvalidation) {
-        if invalidation.requires_index_generation_bump() {
+        if invalidation.requires_discovery_reset() {
             // Lost event history cannot establish which cached paths changed.
             self.barren_dirs.clear();
             return;
         }
-        if invalidation.dirty_roots().is_empty() {
+        // Watch-plan churn still revokes candidate-index evidence and requests
+        // reconciliation, but must not repeatedly erase an unfinished sweep.
+        // Unwatched barren hints retain their ordinary bounded lifetime.
+        if invalidation.discovery_roots().is_empty() {
             return;
         }
         self.barren_dirs.retain(|cached, _| {
             !invalidation
-                .dirty_roots()
+                .discovery_roots()
                 .iter()
                 .any(|dirty| cached.starts_with(dirty) || dirty.starts_with(cached))
         });
@@ -25324,6 +25327,42 @@ mod tests {
         cursor.invalidate_events(&invalidation);
         assert_eq!(cursor.barren_exclusions(), HashSet::from([unrelated]));
         assert!(walk(&cursor).contains(&target));
+    }
+
+    #[test]
+    fn watch_coverage_churn_preserves_barren_progress_but_real_changes_reopen_it() {
+        use crate::scanner::events::{DirtyRootTracker, FsEvent, FsEventKind};
+
+        let roots = vec![PathBuf::from("/r")];
+        let tracker = DirtyRootTracker::new(&roots);
+        let mut cursor = scan_cursor(100, &[("/r/proj/old", 1), ("/r/other", 1)]);
+        for _ in 0..8 {
+            let coverage = tracker.apply_event(FsEvent {
+                kind: FsEventKind::WatchBudgetExceeded,
+                path: None,
+            });
+            assert!(coverage.requires_index_generation_bump());
+            cursor.invalidate_events(&coverage);
+        }
+        assert_eq!(cursor.barren_exclusions().len(), 2);
+
+        let mut changed = tracker.apply_event(FsEvent {
+            kind: FsEventKind::Modify,
+            path: Some(PathBuf::from("/r/proj/old/new.o")),
+        });
+        changed.merge(tracker.apply_event(FsEvent {
+            kind: FsEventKind::WatchBudgetExceeded,
+            path: None,
+        }));
+        changed.resolve_scan_roots(&roots);
+        cursor.invalidate_events(&changed);
+        assert_eq!(cursor.barren_exclusions(), path_set(&["/r/other"]));
+
+        cursor.invalidate_events(&tracker.apply_event(FsEvent {
+            kind: FsEventKind::PermissionLost,
+            path: None,
+        }));
+        assert!(cursor.barren_exclusions().is_empty());
     }
 
     #[test]
