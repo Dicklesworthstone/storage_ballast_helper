@@ -21,6 +21,27 @@ fn remaining(start: Instant, budget: Duration, now: Instant) -> io::Result<Durat
         .ok_or_else(timed_out)
 }
 
+/// Accept a per-call socket timeout that XNU refuses on a dead connection.
+///
+/// XNU fails `setsockopt` with EINVAL once a socket is shut down in both
+/// directions, and a Unix socket is as soon as its peer closes; Linux accepts
+/// the option there. On such a socket a read cannot block (it drains what is
+/// buffered, then reports EOF) and a write fails at once with EPIPE, so the
+/// call goes ahead without the timeout and the outcome matches Linux. Seen as
+/// `sbh status` falling back to the state file on macOS once the daemon's
+/// status reply outgrew one 4 KiB read: the daemon had written it and closed
+/// before the client's second read.
+fn set_call_timeout(set: io::Result<()>) -> io::Result<()> {
+    match set {
+        Err(error)
+            if cfg!(target_vendor = "apple") && error.raw_os_error() == Some(libc::EINVAL) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 fn normalize_timeout(error: io::Error) -> io::Error {
     match error.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => timed_out(),
@@ -42,7 +63,7 @@ pub(super) fn read_frame(
         start,
         budget,
         |bytes, left| {
-            stream.set_read_timeout(Some(left))?;
+            set_call_timeout(stream.set_read_timeout(Some(left)))?;
             reader.read(bytes)
         },
         Instant::now,
@@ -100,7 +121,7 @@ pub(super) fn write_frame(
         start,
         budget,
         |bytes, left| {
-            stream.set_write_timeout(Some(left))?;
+            set_call_timeout(stream.set_write_timeout(Some(left)))?;
             writer.write(bytes)
         },
         Instant::now,
@@ -367,6 +388,29 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&received).unwrap(),
             value
         );
+    }
+
+    #[test]
+    fn a_reply_longer_than_one_read_survives_the_peer_closing_first() {
+        // The daemon writes its reply and closes. The client's second read
+        // then sets its timeout on a socket shut down both ways, which XNU
+        // refuses with EINVAL.
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let mut reply = vec![b'x'; 6000];
+        reply.push(b'\n');
+        writer.write_all(&reply).unwrap();
+        drop(writer);
+        let frame = read_frame(&reader, 64 * 1024, Instant::now(), Duration::from_secs(5)).unwrap();
+        assert_eq!(frame, reply);
+    }
+
+    #[test]
+    fn writing_to_a_closed_peer_is_a_broken_pipe_on_every_platform() {
+        let (writer, reader) = UnixStream::pair().unwrap();
+        drop(reader);
+        let error =
+            write_frame(&writer, b"{}\n", Instant::now(), Duration::from_secs(5)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe, "{error}");
     }
 
     #[test]

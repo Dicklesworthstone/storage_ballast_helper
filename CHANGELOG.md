@@ -12,6 +12,14 @@ host runs a version that has it.
 
 ### Fixed
 
+- **macOS: control-socket replies longer than 4 KiB are read in full.**
+  The daemon writes its reply and closes. The client renewed its per-read
+  timeout before each read, and macOS refuses that `setsockopt` with EINVAL
+  once the peer has closed. Any reply needing a second read failed with
+  "Invalid argument", so `sbh status` fell back to the state file once the
+  reserve observations made its reply larger than one read. Linux was
+  unaffected; macOS now matches it (a closed socket drains, then reports EOF).
+
 - **Rollback previews are read-only on macOS as well as Linux.**
   `sbh update --rollback --dry-run` and `--rollback --check` now share the
   same preview transaction on every platform instead of reaching a fallback
