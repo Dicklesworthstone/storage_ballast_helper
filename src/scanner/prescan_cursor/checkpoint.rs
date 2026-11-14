@@ -782,7 +782,7 @@ mod tests {
             .into();
         let mut state = PrescanCursor::new();
         for expected in ["a", "hot", "a", "hot"] {
-            for scope in roots.chunks_exact(2) {
+            for scope in roots.as_chunks::<2>().0 {
                 let mut order = state.walk_order().clone();
                 let mut ranked = scope.to_vec();
                 order.reorder(&mut ranked, false, |_| true);

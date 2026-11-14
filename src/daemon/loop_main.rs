@@ -25759,8 +25759,7 @@ mod tests {
         assert!(complete.coverage_complete);
         cursor.update(&visited, &HashSet::new(), false);
         cursor.complete_scopes(
-            [&complete]
-                .into_iter()
+            std::iter::once(&complete)
                 .filter(|stat| stat.coverage_complete)
                 .map(|stat| stat.path.as_path()),
         );
@@ -26097,8 +26096,7 @@ mod tests {
 
         cursor.update(&path_set(&["/small/visited"]), &HashSet::new(), false);
         cursor.complete_scopes(
-            [&small]
-                .into_iter()
+            std::iter::once(&small)
                 .filter(|stat| stat.coverage_complete)
                 .map(|stat| stat.path.as_path()),
         );
@@ -26124,8 +26122,7 @@ mod tests {
             false,
         );
         cursor.complete_scopes(
-            [&partial]
-                .into_iter()
+            std::iter::once(&partial)
                 .filter(|stat| stat.coverage_complete)
                 .map(|stat| stat.path.as_path()),
         );
@@ -28152,7 +28149,7 @@ mod tests {
         }
 
         let mut request = event_test_request(vec![root.clone()]);
-        request.admitted_scanner = Arc::new(config.scanner.clone());
+        request.admitted_scanner = Arc::new(config.scanner);
         request.catalog_roots = vec![ExpandedCatalogRoot {
             path: root,
             rule: "test-catalog-cache",
@@ -28691,6 +28688,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn scanner_prescan_does_not_dispatch_protected_rust_fuzz_target() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("scan-root");

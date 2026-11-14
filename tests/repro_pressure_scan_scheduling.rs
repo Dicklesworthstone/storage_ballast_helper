@@ -678,7 +678,7 @@ fn finite_recursive_dispatch_reaches_deep_targets_across_process_restarts() {
     let base = fs::canonicalize(temp.path()).unwrap();
     let root = base.join("tree");
     let expected = deep_restart_fixture(&root);
-    let mut request = RestartRequest::new(TEST, &base, vec![root.clone()]);
+    let mut request = RestartRequest::new(TEST, &base, vec![root]);
 
     // Keep a cold-start control in the same invocation. With its checkpoint
     // reset, another process spends the same finite slice on the same leaf.
