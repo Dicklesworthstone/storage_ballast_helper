@@ -420,6 +420,7 @@ mod tests {
     #[test]
     fn guarded_growth_revalidates_a_cached_full_pool_before_crediting_it() {
         use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt;
 
         for sparse in [false, true] {
             let (_temp, mut pool) = fixture(3, UNIT, 0, UNIT);
@@ -431,6 +432,13 @@ mod tests {
                 slot.set_len(UNIT).unwrap();
                 slot.write_all(&header).unwrap();
                 slot.sync_all().unwrap();
+                // The case needs a hole. APFS allocates the extended range
+                // here, so the slot is a real, fully allocated reserve and
+                // keeping it is right; only a filesystem that kept the hole
+                // can build this damage.
+                if fs::metadata(&damaged).unwrap().blocks().saturating_mul(512) >= UNIT {
+                    continue;
+                }
             } else {
                 fs::write(&damaged, vec![7; usize::try_from(UNIT).unwrap()]).unwrap();
             }
