@@ -488,9 +488,17 @@ run_stage() {
   case "${stage}" in
     fmt) stage_fmt "${logfile}" || rc=$? ;;
     e2e) stage_e2e "${logfile}" || rc=$? ;;
-    native-btrfs) stage_native_btrfs "${logfile}" || rc=$? ;;
-    native-systemd) stage_native_systemd "${logfile}" || rc=$? ;;
-    native-ram-scratch) stage_native_ram_scratch "${logfile}" || rc=$? ;;
+    # A native stage runs several commands in a subshell under `set -e`. Bash
+    # ignores errexit for everything inside a `||` list, that subshell
+    # included, so `stage || rc=$?` reported only the stage's LAST command:
+    # 2 failed service-contract tests left native-systemd green on 2026-11-14.
+    # Call them as plain commands with errexit off out here instead.
+    native-btrfs|native-systemd|native-ram-scratch)
+      set +e
+      "stage_${stage//-/_}" "${logfile}"
+      rc=$?
+      set -e
+      ;;
     *)   run_cargo "${logfile}" "${command}" || rc=$? ;;
   esac
 
@@ -650,9 +658,23 @@ self_test() {
   run_stage "self-vacuous|HARD|test|Self Test|accounting|${zero_cmd}|n/a" > /dev/null
   run_stage "self-real|SOFT|test|Self Test|accounting|${real_cmd}|n/a" > /dev/null
   run_stage "self-check|HARD|check|Self Test|accounting|true|n/a" > /dev/null
+  # A native stage whose early command fails must fail even though its last
+  # command passes. This stand-in replaces the real stage for the self-test only.
+  local saved_native="${NATIVE}"
+  NATIVE=1
+  stage_native_systemd() {
+    (
+      set -euo pipefail
+      false
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'
+    ) > "$1" 2>&1
+  }
+  run_stage "native-systemd|SOFT|test|Self Test|errexit|n/a|n/a" > /dev/null
+  NATIVE="${saved_native}"
   CI_MODE="${saved_ci}"
 
   local vacuous_entry="${GATE_RESULTS[0]}" real_entry="${GATE_RESULTS[1]}" check_entry="${GATE_RESULTS[2]}"
+  check "native stage fails on an early failing command" "native-systemd:SOFT:fail" "${GATE_RESULTS[3]%:*:*}"
   check "zero-test stage is recorded vacuous" "self-vacuous:HARD:vacuous" "${vacuous_entry%:*:*}"
   check "real stage passes with its count" "self-real:SOFT:pass" "${real_entry%:*:*}"
   check "real stage executed count" 5 "${real_entry##*:}"
