@@ -31,6 +31,33 @@ fn failed_backup_does_not_leave_a_published_or_partial_snapshot() {
     assert_eq!(fs::read_dir(store.dir()).unwrap().count(), 0);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_backup_store_relocated_to_a_missing_target_names_the_link() {
+    let temp = tempfile::tempdir().unwrap();
+    let link = temp.path().join("backups");
+    let missing = temp.path().join("bulk/sbh_backups");
+    std::os::unix::fs::symlink(&missing, &link).unwrap();
+    let store = BackupStore::open(link.clone());
+    let source = temp.path().join("sbh");
+    fs::write(&source, b"installed").unwrap();
+
+    let error = store.create(&source, "installed").unwrap_err();
+    assert!(
+        error.contains(&format!(
+            "{} is a symlink to missing {}",
+            link.display(),
+            missing.display()
+        )),
+        "{error}"
+    );
+    assert!(
+        !missing.exists(),
+        "the missing target is reported, not created"
+    );
+    assert_eq!(fs::read(&source).unwrap(), b"installed");
+}
+
 #[test]
 fn incomplete_binary_is_not_visible_to_inventory_or_rollback() {
     let temp = tempfile::tempdir().unwrap();

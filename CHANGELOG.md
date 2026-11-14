@@ -17,6 +17,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   its deadline, for every writer to close; a descendant that keeps the pipe
   open is still refused.
 
+- **`sbh update` names a backup directory relocated to a missing target
+  (bd-qovt).** When `~/.local/share/sbh/backups` (or a parent) is a symlink
+  whose target is gone, the update stopped with a bare "File exists (os error
+  17)" and the CLI silently stayed a release behind (trj, 2026-11-14). It now
+  names the link and its missing target. As before, nothing is installed
+  without a backup.
+
 ## v0.7.14 **[release]**
 
 Compare: [`v0.7.13...v0.7.14`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.13...v0.7.14)

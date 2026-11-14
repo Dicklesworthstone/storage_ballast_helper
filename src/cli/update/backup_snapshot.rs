@@ -18,7 +18,7 @@ pub(super) fn create(
     install_path: &Path,
     version: &str,
 ) -> Result<BackupSnapshot, String> {
-    fs::create_dir_all(store).map_err(|error| format!("failed to create backup dir: {error}"))?;
+    create_store(store)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -30,6 +30,37 @@ pub(super) fn create(
         let _ = fs::remove_dir_all(&entry);
     }
     result
+}
+
+/// Create the backup store. A relocated store whose symlink target is gone
+/// fails `create_dir_all` with a bare "File exists"; name the link instead.
+fn create_store(store: &Path) -> Result<(), String> {
+    fs::create_dir_all(store).map_err(|error| match dangling_link_on(store) {
+        Some((link, target)) => format!(
+            "failed to create backup dir {}: {} is a symlink to missing {}; create the target or remove the link",
+            store.display(),
+            link.display(),
+            target.display()
+        ),
+        None => format!("failed to create backup dir {}: {error}", store.display()),
+    })
+}
+
+/// The outermost component of `path` (itself included) that is a symlink to
+/// a target that does not exist, with that link's target.
+fn dangling_link_on(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut components: Vec<&Path> = path.ancestors().collect();
+    components.reverse();
+    components.into_iter().find_map(|component| {
+        let is_link = fs::symlink_metadata(component)
+            .ok()?
+            .file_type()
+            .is_symlink();
+        if !is_link || fs::metadata(component).is_ok() {
+            return None;
+        }
+        Some((component.to_path_buf(), fs::read_link(component).ok()?))
+    })
 }
 
 /// Verify that a published snapshot still matches the digest recorded when it
