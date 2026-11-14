@@ -11692,6 +11692,8 @@ struct ScanCursor {
     ttl: Duration,
     /// Maximum entries to cache (prevents unbounded growth on huge trees).
     max_entries: usize,
+    /// Traversal settings under which the cached ground was examined.
+    discovery_config: Option<ScannerConfig>,
 }
 
 impl ScanCursor {
@@ -11700,6 +11702,40 @@ impl ScanCursor {
             barren_dirs: HashMap::new(),
             ttl: BARREN_HINT_TTL,
             max_entries: 50_000,
+            discovery_config: None,
+        }
+    }
+
+    /// A hint only describes ground visible to its original traversal. A
+    /// reload can expose protected, excluded, deeper or cross-device ground
+    /// without rebuilding the event backend, including on the v1 engine.
+    /// Scheduling and post-classification settings do not change coverage.
+    fn reconfigure(&mut self, current: &ScannerConfig) {
+        let same_coverage = self.discovery_config.as_ref().is_some_and(|previous| {
+            previous.root_paths == current.root_paths
+                && previous.excluded_paths == current.excluded_paths
+                && previous.protected_paths == current.protected_paths
+                && previous.allow_source_tree_roots == current.allow_source_tree_roots
+                && previous.follow_symlinks == current.follow_symlinks
+                && previous.cross_devices == current.cross_devices
+                && previous.max_depth == current.max_depth
+                && previous.engine == current.engine
+        });
+        if !same_coverage {
+            self.barren_dirs.clear();
+            self.discovery_config = Some(current.clone());
+        }
+    }
+
+    /// An explicit full scan starts fresh. Automatic resource-relief scans
+    /// also carry `force_full_scan`, but must retain their bounded progress.
+    fn exclusions_for_request(&self, request: &ScanRequest) -> HashSet<PathBuf> {
+        if request.scan_now.is_some()
+            || (request.force_full_scan && !request.has_resource_reclaim())
+        {
+            HashSet::new()
+        } else {
+            self.barren_exclusions()
         }
     }
 
@@ -12140,6 +12176,7 @@ fn scanner_thread_main(
             heartbeat.beat();
             continue;
         }
+        scan_cursor.reconfigure(&current_scanner_config);
         if request.config_update.is_some() {
             admitted_root_order.reset();
             // A reload's own pass covers the new roots; a waiting routine
@@ -13654,11 +13691,7 @@ fn scanner_thread_main(
                 // These are subtrees that yielded zero candidates on a prior
                 // timed-out pass — skipping them lets the walker explore new
                 // territory instead of re-walking known-empty subtrees.
-                let barren = if request.scan_now.is_some() {
-                    HashSet::new()
-                } else {
-                    scan_cursor.barren_exclusions()
-                };
+                let barren = scan_cursor.exclusions_for_request(&request);
                 if !barren.is_empty() {
                     eprintln!(
                         "[SBH-SCANNER] incremental cursor: skipping {} barren dirs from prior pass",
@@ -25466,11 +25499,97 @@ mod tests {
                 .collect(),
             ttl: Duration::from_mins(30),
             max_entries,
+            discovery_config: None,
         }
     }
 
     fn path_set(paths: &[&str]) -> HashSet<PathBuf> {
         paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn scan_cursor_reopens_newly_visible_ground_after_a_policy_reload() {
+        let scratch = temp_root_scratch_dir();
+        let root = scratch.path().join("scan");
+        let parent = root.join("project");
+        let hidden = parent.join("hidden");
+        let target = hidden.join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let mut config = ScannerConfig {
+            root_paths: vec![root],
+            excluded_paths: vec![hidden],
+            ..ScannerConfig::default()
+        };
+        let walk = |config: &ScannerConfig, cursor: &ScanCursor| -> HashSet<PathBuf> {
+            let mut excluded_paths = cursor.barren_exclusions();
+            excluded_paths.extend(config.excluded_paths.iter().cloned());
+            DirectoryWalker::new(
+                WalkerConfig {
+                    root_paths: config.root_paths.clone(),
+                    excluded_paths,
+                    max_depth: config.max_depth,
+                    follow_symlinks: config.follow_symlinks,
+                    cross_devices: config.cross_devices,
+                    parallelism: 1,
+                    opaque_pruning: false,
+                },
+                ProtectionRegistry::marker_only(),
+            )
+            .walk()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect()
+        };
+        let mut cursor = ScanCursor::new();
+        cursor.reconfigure(&config);
+        let visited = walk(&config, &cursor);
+        assert!(visited.contains(&parent));
+        assert!(!visited.contains(&target));
+        // This subtree was fully examined while a larger pass ran out of
+        // budget elsewhere. Its parent appeared barren under the exclusion.
+        cursor.update(&visited, &HashSet::new(), true);
+        assert!(cursor.barren_exclusions().contains(&parent));
+        let observed_at = cursor.barren_dirs[&parent];
+
+        // Worker and budget tuning must not throw away hours of progress.
+        config.parallelism += 1;
+        config.scan_time_budget_secs += 1;
+        config.min_file_age_minutes += 1;
+        cursor.reconfigure(&config);
+        assert_eq!(cursor.barren_dirs[&parent], observed_at);
+
+        config.excluded_paths.clear();
+        assert!(
+            !walk(&config, &cursor).contains(&target),
+            "old coverage would still hide the newly authorized subtree"
+        );
+        cursor.reconfigure(&config);
+        assert!(walk(&config, &cursor).contains(&target));
+    }
+
+    #[test]
+    fn explicit_full_scans_bypass_hints_while_forced_resource_relief_resumes() {
+        let cursor = scan_cursor(100, &[("/r/covered", 1)]);
+        let mut request = event_test_request(vec![PathBuf::from("/r")]);
+        assert_eq!(
+            cursor.exclusions_for_request(&request),
+            path_set(&["/r/covered"])
+        );
+        request.force_full_scan = true;
+        assert!(cursor.exclusions_for_request(&request).is_empty());
+
+        request.ram_reclaim = Some(RamReclaimRequest::new(
+            PathBuf::from("/r"),
+            17,
+            100,
+            &request.paths,
+        ));
+        assert_eq!(
+            cursor.exclusions_for_request(&request),
+            path_set(&["/r/covered"]),
+            "a forced automatic relief pass still needs its next discovery slice"
+        );
     }
 
     #[test]
