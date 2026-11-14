@@ -49,6 +49,16 @@ fn fixture_with(bytes: Vec<u8>) -> (PathBuf, Vec<u8>, File) {
     (path, bytes, file)
 }
 
+/// Each FIEMAP extent's (logical, length, flags) as `filefrag -v` sees it,
+/// for failure messages: discovery reads FIEMAP, `inspect` the extent tree.
+fn fiemap_flags_now(path: &std::path::Path) -> String {
+    let output = Command::new("filefrag").arg("-v").arg(path).output();
+    match output {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Err(error) => format!("filefrag unavailable: {error}"),
+    }
+}
+
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(120)
 }
@@ -90,7 +100,9 @@ fn native_compression_preserves_every_byte_size_and_mtime() {
     assert!(after.physical_data_bytes < before.physical_data_bytes / 2);
     assert_eq!(
         discovery_exclusion(&file, deadline()).unwrap(),
-        Some("already_compressed_extents")
+        Some("already_compressed_extents"),
+        "after compression: {after:?}; FIEMAP now: {:?}",
+        fiemap_flags_now(&path),
     );
     let mut actual = Vec::new();
     File::open(&path).unwrap().read_to_end(&mut actual).unwrap();
@@ -260,4 +272,52 @@ fn an_incompressible_range_marks_the_file_but_does_not_stop_the_rest() {
         discovery_exclusion(&file, deadline()).unwrap(),
         Some("nocow_nocompress_immutable_or_append_only")
     );
+}
+
+#[test]
+#[ignore = "requires an explicitly supplied disposable Btrfs mount and root"]
+fn a_committed_large_extent_is_compressed_completely() {
+    // 3110b29: on a large raw extent that a transaction had already
+    // committed, one DEFRAG_RANGE per 16 MiB chunk compressed only the first
+    // 256 KiB. The raw remainder kept the whole original allocation, so the
+    // file used more space than before. fsync goes through the log tree and
+    // hides this, so commit the transaction before compressing.
+    let (path, bytes, file) =
+        fixture_with((0..24 * 1024 * 1024).map(|i| (i % 251) as u8).collect());
+    let committed = Command::new("btrfs")
+        .args(["filesystem", "sync"])
+        .arg(path.parent().unwrap())
+        .status()
+        .unwrap();
+    assert!(committed.success(), "btrfs filesystem sync: {committed}");
+    let before = inspect(&file, deadline()).unwrap();
+    assert_eq!(before.exclusion(), None);
+    assert!(before.raw && !before.encoded, "{before:?}");
+    // The executor's chunking: at most 16 MiB per range.
+    let chunk = 16 * 1024 * 1024;
+    let mut offset = 0;
+    while offset < before.stamp.size {
+        let length = chunk.min(before.stamp.size - offset);
+        compress_range(
+            &file,
+            offset,
+            length,
+            before.inode_flags,
+            consent(),
+            deadline(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        offset += length;
+    }
+    let after = inspect(&file, deadline()).unwrap();
+    assert!(after.encoded && !after.raw, "raw ranges remain: {after:?}");
+    assert!(
+        after.physical_data_bytes < before.physical_data_bytes / 4,
+        "{} -> {} bytes",
+        before.physical_data_bytes,
+        after.physical_data_bytes
+    );
+    assert!(before.stamp.same_contents_and_identity(after.stamp));
+    assert_eq!(fs::read(&path).unwrap(), bytes);
 }
