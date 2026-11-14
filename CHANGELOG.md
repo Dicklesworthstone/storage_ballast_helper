@@ -35,6 +35,16 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   the sweep deadline), and 0 of 300 were incomplete in the same wall time.
   A process still running after the settle, such as a group leader whose
   siblings run on, still holds the batch.
+- **A config reload wakes every idle mount, including one sampled a tick
+  late** (bd-yh04). A reload drops every cached filesystem reading and re-probes them
+  in the background, and a tick drives only the mounts it has a reading
+  for. The reload's wake was spent on the first tick after it, so a mount
+  whose fresh reading was still pending missed it. That mount stayed idle
+  for its whole rescan backoff (90 s after one empty pass, longer after
+  more), and a root the reload had just added went unscanned. Seen as a
+  flaky `sighup_reload_scans_the_new_root_and_relogs_the_matrix` e2e. A
+  wake (reload or SIGUSR1) is now held for each controlled mount until a
+  tick that samples the mount delivers it.
 - **Service queries wait briefly for a writer that outlives them.** The
   bounded `systemctl`/`busctl` queries that `sbh update` and rollback run
   before restarting the service refused any reply whose output pipe was still

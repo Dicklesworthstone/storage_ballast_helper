@@ -210,6 +210,17 @@ impl WakeSignals {
     pub const fn any(self) -> bool {
         self.dirty_roots || self.forced_scan || self.reload
     }
+
+    /// Every signal raised in either set: a wake held for a mount keeps all
+    /// the signals raised since it last reached that mount's controller.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self {
+            dirty_roots: self.dirty_roots || other.dirty_roots,
+            forced_scan: self.forced_scan || other.forced_scan,
+            reload: self.reload || other.reload,
+        }
+    }
 }
 
 /// Everything the controller looks at on one tick.

@@ -3361,6 +3361,13 @@ pub struct MonitoringDaemon {
     /// Wake signals (SIGUSR1, reload) collected for the next tick's
     /// controllers.
     wake_next_tick: WakeSignals,
+    /// Raised wake signals a controlled mount has not observed yet. A tick
+    /// drives only the mounts it could sample, and a reload invalidates
+    /// every sample: a mount whose fresh probe was still pending on the next
+    /// tick lost its reload wake and idled out its rescan backoff with a new
+    /// root unscanned. Each mount now gets its wake on the first tick that
+    /// samples it (bd-yh04).
+    undelivered_wakes: HashMap<PathBuf, WakeSignals>,
     /// Mounts the executor reported as read-only or out of metadata space
     /// since the last tick; each enters `MountState::Recovery`.
     pending_recovery: HashSet<PathBuf>,
@@ -5464,6 +5471,7 @@ impl MonitoringDaemon {
             mount_controllers: HashMap::new(),
             mount_responses: Vec::new(),
             wake_next_tick: WakeSignals::default(),
+            undelivered_wakes: HashMap::new(),
             pending_recovery: HashSet::new(),
             pending_recovery_incidents: Vec::new(),
             deferred_worker_report: None,
@@ -8227,7 +8235,7 @@ impl MonitoringDaemon {
         let release_ballast = behavior_should_release_ballast(behavior);
         let base_poll = Duration::from_millis(self.config.pressure.poll_interval_ms.max(1));
         let now = Instant::now();
-        let wake = std::mem::take(&mut self.wake_next_tick);
+        let raised_wake = std::mem::take(&mut self.wake_next_tick);
         let controller_config = mount_controller_config(&self.config);
 
         // Which configured roots live on which mount, resolved once per tick.
@@ -8255,6 +8263,21 @@ impl MonitoringDaemon {
             self.config.scanner.cross_devices && !observed_root_paths.is_empty();
 
         let mut responses = std::mem::take(&mut self.mount_responses);
+        // A wake is held for every controlled mount (and every mount sampled
+        // now) until a tick that samples that mount delivers it. A replaced
+        // or forgotten controller starts afresh and drops its held wake.
+        self.undelivered_wakes
+            .retain(|mount, _| self.mount_controllers.contains_key(mount));
+        if raised_wake.any() {
+            for mount in self
+                .mount_controllers
+                .keys()
+                .chain(responses.iter().map(|tick| &tick.response.causing_mount))
+            {
+                let held = self.undelivered_wakes.entry(mount.clone()).or_default();
+                *held = held.union(raised_wake);
+            }
+        }
         let policy_transitions = self.policy_engine.lock().transitions_total();
         for tick in &mut responses {
             self.quarantine_sweeper
@@ -8335,6 +8358,7 @@ impl MonitoringDaemon {
                 self.recovery_probes.cancel_mount(&mount);
                 None
             };
+            let wake = self.undelivered_wakes.remove(&mount).unwrap_or_default();
             let controller = self
                 .mount_controllers
                 .entry(mount.clone())
@@ -29554,6 +29578,84 @@ mod tests {
 
         logger.shutdown();
         logger_join.join().unwrap();
+    }
+
+    /// A reload invalidates every filesystem sample, so the next tick may
+    /// drive only the mounts whose fresh probe already finished. The reload
+    /// wake must still reach an idle mount sampled a tick later; it used to
+    /// be spent on the first tick, leaving the mount idle for its whole
+    /// rescan backoff with a newly configured root unscanned.
+    #[cfg(unix)]
+    #[test]
+    fn a_reload_wake_reaches_an_idle_mount_first_sampled_a_tick_later() {
+        let mut fixture = RegretDaemonFixture::new();
+        let mounts = [
+            fixture.directory.path().join("a-mount"),
+            fixture.directory.path().join("b-mount"),
+        ];
+        for mount in &mounts {
+            std::fs::create_dir(mount).unwrap();
+        }
+        let base: Arc<dyn Platform> = Arc::new(disk_pressure_platform(
+            mounts
+                .iter()
+                .map(|mount| disk_pressure_sample(&mount.to_string_lossy(), 1_000_000, 900_000))
+                .collect(),
+        ));
+        let daemon = &mut fixture.daemon;
+        daemon.platform = Arc::clone(&base);
+        daemon.fs_collector = FsStatsCollector::new(base, Duration::ZERO);
+        daemon.config.scanner.root_paths = mounts.to_vec();
+        daemon.config.scanner.catalog_roots_on_pressured_device = false;
+        *daemon.shared_scanner_config.write() = daemon.config.scanner.clone();
+
+        // Both mounts finished an empty pass and idle out their backoff.
+        let now = Instant::now();
+        for mount in &mounts {
+            let mut controller =
+                MountController::new(mount.clone(), mount_controller_config(&daemon.config));
+            controller.observe(MountTickInput {
+                level: PressureLevel::Green,
+                urgency: 0.0,
+                free_pct: 90.0,
+                seconds_to_red: None,
+                prediction_confident: false,
+                surface: MountSurface {
+                    configured_roots: 1,
+                    catalog_roots: 0,
+                    ballast_pool: false,
+                    cross_device_fallback: false,
+                },
+                releasable_ballast: false,
+                recovery_needed: false,
+                recovery_probe_ok: None,
+                wake: WakeSignals::default(),
+                now,
+            });
+            controller.note_pass(0, false, now);
+            assert_eq!(controller.state(), MountState::Idle);
+            daemon.mount_controllers.insert(mount.clone(), controller);
+        }
+
+        daemon.wake_next_tick.reload = true;
+        let (scan_tx, scan_rx) = bounded(8);
+        let (del_tx, _del_rx) = bounded(4);
+        for mount in &mounts {
+            // Each tick samples only this mount.
+            let tick = quarantine_tick(PressureLevel::Green, mount);
+            daemon.mount_responses = vec![tick.clone()];
+            daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+            let _ = scan_rx.try_iter().count();
+            let controller = &daemon.mount_controllers[mount];
+            assert_ne!(
+                controller.state(),
+                MountState::Idle,
+                "the reload wake never reached {}",
+                mount.display()
+            );
+            assert_eq!(controller.empty_passes(), 0, "{}", mount.display());
+        }
+        assert!(daemon.undelivered_wakes.is_empty());
     }
 
     #[test]
