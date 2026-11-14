@@ -75,6 +75,8 @@ pub(super) struct EndpointGuard {
     lease_name: OsString,
     lease: File,
     bound: Option<Identity>,
+    /// Only the acquiring process unlocks the lease (see `Drop`).
+    owner_pid: u32,
 }
 
 impl EndpointGuard {
@@ -117,6 +119,13 @@ impl Drop for EndpointGuard {
             // No pathname traversal here, including when a parent was renamed.
             // Never remove the sidecar: another process may have opened it.
             let _ = self.remove_same_socket(expected);
+        }
+        // Closing the lease alone leaves its lock held while a child another
+        // thread is forking has a copy of the descriptor (bd-skat), so unlock
+        // explicitly once the socket is gone. Only the acquiring process
+        // unlocks; a forked copy must not unlock its parent's lease.
+        if self.owner_pid == std::process::id() {
+            let _ = flock(&self.lease, FlockOperation::Unlock);
         }
     }
 }
@@ -168,6 +177,7 @@ pub(super) fn bind(path: &Path) -> io::Result<(UnixListener, EndpointGuard)> {
         lease_name,
         lease,
         bound: None,
+        owner_pid: std::process::id(),
     };
     guard.check_location()?;
     if let Some(existing) = inspect(&guard.parent, &guard.name)? {
@@ -215,10 +225,12 @@ pub(super) fn bind(path: &Path) -> io::Result<(UnixListener, EndpointGuard)> {
 
 /// How long a refused lease lock is retried. A child that another thread
 /// forks holds a copy of the lease's open file description, and with it the
-/// lock, until it execs and `O_CLOEXEC` closes it. Without a retry, a server
-/// restarted in a process that spawns children was refused by its own
-/// released lease: 2,523 of 3,000 restarts with 8 threads spawning `true`
-/// (bd-skat). A live server's lease is still refused, one second later.
+/// lock, until it execs and `O_CLOEXEC` closes it. Before the guard unlocked
+/// explicitly, a server restarted in a process that spawns children was
+/// refused by its own released lease: 2,523 of 3,000 restarts with 8 threads
+/// spawning `true` (bd-skat). The retry still covers a previous owner that
+/// exited while one of its children was between fork and exec. A live
+/// server's lease is still refused, one second later.
 const LEASE_LOCK_RETRY: Duration = Duration::from_secs(1);
 
 fn lock_lease(lease: &File) -> io::Result<()> {
@@ -324,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lease_copy_held_until_a_forked_child_execs_does_not_refuse_the_restart() {
+    fn dropping_the_guard_unlocks_a_lease_a_forked_child_still_holds() {
         // A child forked while the lease was open holds its file description,
         // and with it the lock, until exec closes it (bd-skat).
         let temp = tempfile::tempdir().unwrap();
@@ -333,9 +345,25 @@ mod tests {
         let child_copy = guard.lease.try_clone().unwrap();
         drop(listener);
         drop(guard);
+        let lease = File::open(temp.path().join(lease_name(OsStr::new("control.sock")))).unwrap();
+        flock(&lease, FlockOperation::NonBlockingLockExclusive)
+            .expect("the guard released its lock although a copy is still open");
+        flock(&lease, FlockOperation::Unlock).unwrap();
+        drop(child_copy);
+    }
+
+    #[test]
+    fn a_lease_released_moments_later_does_not_refuse_the_restart() {
+        // A previous owner exited while its forked child still held the lock.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.sock");
+        drop(bind(&path).unwrap());
+        let leftover =
+            File::open(temp.path().join(lease_name(OsStr::new("control.sock")))).unwrap();
+        flock(&leftover, FlockOperation::NonBlockingLockExclusive).unwrap();
         let exec = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
-            drop(child_copy);
+            drop(leftover);
         });
         let (listener, guard) = bind(&path).unwrap();
         exec.join().unwrap();
