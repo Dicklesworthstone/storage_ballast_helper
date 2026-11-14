@@ -12,6 +12,14 @@ host runs a version that has it.
 
 ### Fixed
 
+- **A compression safety stop now stops the whole daemon pass (bd-rxq5).**
+  An incomplete or unverified rewrite, failed durable journal, or failed I/O
+  priority restoration previously stopped only the current root; the daemon
+  could then start rewriting a different root. Executor stops now propagate
+  across every selected root, including failures after the last selected file.
+  Unvisited files and roots keep their continuation, while ordinary checked
+  skips and failures before mutation still allow healthy roots to progress.
+
 - **A Green or Yellow pass no longer deletes a build target in use today
   (bd-i9uh).** The definite-artifact fast lane (`posterior_floor_definite`)
   made any definite artifact past `min_file_age_minutes` (30) deletable at

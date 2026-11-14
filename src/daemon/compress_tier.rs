@@ -20,6 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::ops::ControlFlow;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -31,8 +32,8 @@ use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle};
 use crate::monitor::pid::{PressureLevel, classify_level};
 use crate::platform::pal::{FsStats, Platform};
 use crate::scanner::compression::{
-    self, CompressionMode, CompressionObservation, CompressionReport, ConcurrencyAcknowledgement,
-    discovery,
+    self, CompressionMode, CompressionObservation, CompressionPolicy, CompressionReport,
+    ConcurrencyAcknowledgement, discovery,
 };
 use crate::scanner::walker::identity_for_path;
 use crate::tuning::writeback::human_bytes;
@@ -1027,7 +1028,6 @@ fn run_pass(
     let mut budget = DiscoveryBudget::new(config);
     let (pending, mut messages) =
         discover_roots(roots, config, platform, resume_after, stop, &mut budget);
-    let mut deadline = None;
     let mode = CompressionMode {
         apply: true,
         allow_zstd_feature: config.compress.allow_zstd_feature,
@@ -1036,13 +1036,49 @@ fn run_pass(
     let mut observer = |observation: CompressionObservation<'_>| {
         record_outcome(observation, logger);
     };
-    for PendingSelection {
-        selection,
-        cursor,
-        next,
-    } in pending
-    {
-        let mut policy = config.compress.policy.clone();
+    messages.extend(execute_pending(
+        pending,
+        &config.compress.policy,
+        stop,
+        |selection, policy| {
+            compression::run_discovered(
+                selection,
+                policy,
+                mode,
+                config,
+                platform,
+                Some(stop),
+                &mut observer,
+            )
+        },
+    ));
+    if messages.is_empty() {
+        "no compression work started within the shared pass budget".into()
+    } else {
+        messages.join("; ")
+    }
+}
+
+/// Execute discovered roots in order with the same pass clock and cancellation
+/// boundary. The native executor's stop applies to this whole pass, including
+/// roots which discovery selected before that stop occurred.
+fn execute_pending(
+    pending: Vec<PendingSelection>,
+    pass_policy: &CompressionPolicy,
+    stop: &AtomicBool,
+    mut execute: impl FnMut(&discovery::Selection, &CompressionPolicy) -> io::Result<CompressionReport>,
+) -> Vec<String> {
+    let mut messages = Vec::new();
+    let mut deadline = None;
+    let root_count = pending.len();
+    for (index, pending) in pending.into_iter().enumerate() {
+        let PendingSelection {
+            selection,
+            cursor,
+            next,
+        } = pending;
+        let remaining_roots = root_count - index - 1;
+        let mut policy = pass_policy.clone();
         policy.timeout_secs = execution_seconds(&mut deadline, policy.timeout_secs, Instant::now());
         if stop.load(Ordering::Acquire) || policy.timeout_secs == 0 {
             messages.push(
@@ -1050,28 +1086,22 @@ fn run_pass(
             );
             break;
         }
-        messages.push(execute_and_resume(
-            &selection.paths(),
-            next,
-            &cursor,
-            || {
-                compression::run_discovered(
-                    &selection,
-                    &policy,
-                    mode,
-                    config,
-                    platform,
-                    Some(stop),
-                    &mut observer,
-                )
-            },
-        ));
+        match execute_and_resume(&selection.paths(), next, &cursor, || {
+            execute(&selection, &policy)
+        }) {
+            ControlFlow::Continue(summary) => messages.push(summary),
+            ControlFlow::Break(summary) => {
+                messages.push(summary);
+                if remaining_roots != 0 {
+                    messages.push(format!(
+                        "{remaining_roots} remaining compression root(s) deferred after executor stop",
+                    ));
+                }
+                break;
+            }
+        }
     }
-    if messages.is_empty() {
-        "no compression work started within the shared pass budget".into()
-    } else {
-        messages.join("; ")
-    }
+    messages
 }
 
 /// Commit a skip hint only after the checked executor returns. Discovery can
@@ -1083,19 +1113,25 @@ fn execute_and_resume(
     discovery_next: Option<PathBuf>,
     resume_after: &Mutex<Option<PathBuf>>,
     execute: impl FnOnce() -> io::Result<CompressionReport>,
-) -> String {
+) -> ControlFlow<String, String> {
     let before = match resume_after.lock() {
         Ok(resume) => resume.clone(),
-        Err(_) => return "pass refused before any rewrite: continuation state is poisoned".into(),
+        Err(_) => {
+            return ControlFlow::Break(
+                "pass refused before any rewrite: continuation state is poisoned".into(),
+            );
+        }
     };
     // Do not hold the cursor mutex during native I/O or activity callbacks.
     let report = match execute() {
         Ok(report) => report,
-        Err(error) => return format!("pass refused before any rewrite: {error}"),
+        Err(error) => {
+            return ControlFlow::Break(format!("pass refused before any rewrite: {error}"));
+        }
     };
     let summary = summarize(&report);
     if !report.supported || report.dry_run {
-        return summary;
+        return ControlFlow::Break(summary);
     }
     let visited = report.files.len();
     if visited.checked_add(report.unvisited_files) != Some(selected.len())
@@ -1108,8 +1144,20 @@ fn execute_and_resume(
         // A canonical path changing after selection, or a future executor
         // changing its ordering, must not move the cursor outside the observed
         // prefix. Retrying is safer than guessing from lossy display strings.
-        return format!("{summary}; continuation retained: execution was not a selected prefix");
+        return ControlFlow::Break(format!(
+            "{summary}; continuation retained: execution was not a selected prefix"
+        ));
     }
+    // A failed footer or priority restore can stop after the last selected
+    // file, so unvisited_files alone is insufficient. Ordinary checked skips
+    // and nonmutating file failures have no stop reason and may continue.
+    // The pass clock and work allowance are shared across roots; exhaustion
+    // cannot grant another root a fresh budget.
+    let halted = report.stop_reason.is_some()
+        || report.unvisited_files != 0
+        || report.files.iter().any(|file| {
+            file.mutation_attempted && (file.outcome != "compressed" || !file.content_verified)
+        });
     let next = if report.unvisited_files == 0 {
         discovery_next
     } else if visited == 0 {
@@ -1123,9 +1171,15 @@ fn execute_and_resume(
     match resume_after.lock() {
         Ok(mut resume) => {
             *resume = next;
-            summary
+            if halted {
+                ControlFlow::Break(summary)
+            } else {
+                ControlFlow::Continue(summary)
+            }
         }
-        Err(_) => format!("{summary}; continuation unavailable: next pass must rediscover"),
+        Err(_) => ControlFlow::Break(format!(
+            "{summary}; continuation unavailable: next pass must rediscover"
+        )),
     }
 }
 
@@ -1280,6 +1334,186 @@ pub(super) mod tests {
                 ..Config::default()
             };
             (directory, roots, config)
+        }
+
+        #[test]
+        fn an_executor_safety_stop_never_starts_the_next_discovered_root() {
+            for (outcome, mutation_attempted, reason) in [
+                ("partial", true, Some("postflight verification incomplete")),
+                ("partial", true, Some("physical data allocation grew")),
+                ("failed", false, Some("durable intent write failed")),
+                ("compressed", true, Some("durable journal footer failed")),
+                ("compressed", true, Some("I/O priority restore failed")),
+                ("partial", true, None),
+            ] {
+                let (_directory, roots, config) = fixture(&[8, 8]);
+                let mut progress = PassProgress::default();
+                let ordered = progress.order(roots.clone());
+                let later_before = roots[1].join("0-before.bin");
+                *ordered[1].1.lock().unwrap() = Some(later_before.clone());
+                let (pending, _) = discover_pass(
+                    ordered,
+                    &config,
+                    &MockPlatform::healthy(),
+                    &AtomicBool::new(false),
+                    &mut DiscoveryBudget::new(&config),
+                );
+                assert_eq!(pending.len(), 2);
+                let mut visited = Vec::new();
+                let messages = execute_pending(
+                    pending,
+                    &config.compress.policy,
+                    &AtomicBool::new(false),
+                    |selection, _policy| {
+                        let selected = selection.paths();
+                        visited.extend(selected.iter().cloned());
+                        let mut report = execution_report(&selected, &[outcome]);
+                        report.files[0].mutation_attempted = mutation_attempted;
+                        report.files[0].content_verified = outcome == "compressed";
+                        report.stop_reason = reason.map(str::to_owned);
+                        report.exit_code = if mutation_attempted { 4 } else { 2 };
+                        // Even a stop after the last selected file must not
+                        // grant permission to rewrite the following root.
+                        assert_eq!(report.unvisited_files, 0);
+                        Ok(report)
+                    },
+                );
+                assert_eq!(visited, [roots[0].join("cold.bin")], "{reason:?}");
+                if let Some(reason) = reason {
+                    assert!(messages.iter().any(|message| message.contains(reason)));
+                }
+                assert!(messages.iter().any(|message| message.contains("deferred")));
+                assert_eq!(
+                    *progress.cursors[&roots[1]].lock().unwrap(),
+                    Some(later_before),
+                    "an unexecuted root must retain its continuation: {reason:?}",
+                );
+            }
+        }
+
+        #[test]
+        fn an_interrupted_root_keeps_its_unvisited_tail_and_later_roots_pending() {
+            let (_directory, roots, config) = fixture(&[8, 8]);
+            let tail = roots[0].join("z-next.bin");
+            fs::write(&tail, b"still pending").unwrap();
+            filetime::set_file_mtime(&tail, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+            let mut progress = PassProgress::default();
+            let (pending, _) = discover_pass(
+                progress.order(roots.clone()),
+                &config,
+                &MockPlatform::healthy(),
+                &AtomicBool::new(false),
+                &mut DiscoveryBudget::new(&config),
+            );
+            assert_eq!(pending.len(), 2);
+            let mut visits = 0;
+            execute_pending(
+                pending,
+                &config.compress.policy,
+                &AtomicBool::new(false),
+                |selection, _policy| {
+                    visits += 1;
+                    let selected = selection.paths();
+                    assert_eq!(selected, [roots[0].join("cold.bin"), tail.clone()]);
+                    Ok(execution_report(&selected, &["skipped"]))
+                },
+            );
+            assert_eq!(visits, 1);
+            assert_eq!(
+                *progress.cursors[&roots[0]].lock().unwrap(),
+                Some(roots[0].join("cold.bin")),
+            );
+            assert_eq!(*progress.cursors[&roots[1]].lock().unwrap(), None);
+        }
+
+        #[test]
+        fn checked_nonmutating_refusals_do_not_starve_healthy_later_roots() {
+            let (_directory, roots, config) = fixture(&[8, 8, 8]);
+            let mut progress = PassProgress::default();
+            let ordered = progress.order(roots.clone());
+            for (root, cursor) in &ordered {
+                *cursor.lock().unwrap() = Some(root.join("0-before.bin"));
+            }
+            let (pending, _) = discover_pass(
+                ordered,
+                &config,
+                &MockPlatform::healthy(),
+                &AtomicBool::new(false),
+                &mut DiscoveryBudget::new(&config),
+            );
+            let mut visited = Vec::new();
+            let mut outcomes = ["failed", "skipped", "compressed"].into_iter();
+            execute_pending(
+                pending,
+                &config.compress.policy,
+                &AtomicBool::new(false),
+                |selection, _policy| {
+                    let selected = selection.paths();
+                    visited.extend(selected.iter().cloned());
+                    let outcome = outcomes.next().unwrap();
+                    let mut report = execution_report(&selected, &[outcome]);
+                    report.exit_code = if outcome == "failed" { 2 } else { 0 };
+                    report.files[0].mutation_attempted = outcome == "compressed";
+                    report.files[0].content_verified = outcome == "compressed";
+                    assert!(report.stop_reason.is_none());
+                    Ok(report)
+                },
+            );
+            let expected: Vec<_> = roots.iter().map(|root| root.join("cold.bin")).collect();
+            assert_eq!(visited, expected);
+            for cursor in progress.cursors.values() {
+                assert_eq!(*cursor.lock().unwrap(), None);
+            }
+        }
+
+        #[test]
+        fn missing_or_inconsistent_execution_evidence_stops_before_later_roots() {
+            for failure in ["admission", "wrong_prefix", "missing_stop_reason"] {
+                let (_directory, roots, config) = fixture(&[8, 8]);
+                let mut progress = PassProgress::default();
+                let ordered = progress.order(roots.clone());
+                for (root, cursor) in &ordered {
+                    *cursor.lock().unwrap() = Some(root.join("0-before.bin"));
+                }
+                let (pending, _) = discover_pass(
+                    ordered,
+                    &config,
+                    &MockPlatform::healthy(),
+                    &AtomicBool::new(false),
+                    &mut DiscoveryBudget::new(&config),
+                );
+                assert_eq!(pending.len(), 2);
+                let mut visits = 0;
+                execute_pending(
+                    pending,
+                    &config.compress.policy,
+                    &AtomicBool::new(false),
+                    |selection, _policy| {
+                        visits += 1;
+                        let selected = selection.paths();
+                        if failure == "admission" {
+                            return Err(io::Error::other("I/O priority admission failed"));
+                        }
+                        let mut report = execution_report(&selected, &["skipped"]);
+                        if failure == "wrong_prefix" {
+                            report.files[0].path = roots[1].join("foreign.bin");
+                        } else {
+                            report.files.clear();
+                            report.unvisited_files = selected.len();
+                            report.stop_reason = None;
+                        }
+                        Ok(report)
+                    },
+                );
+                assert_eq!(visits, 1, "{failure}");
+                for (root, cursor) in &progress.cursors {
+                    assert_eq!(
+                        *cursor.lock().unwrap(),
+                        Some(root.join("0-before.bin")),
+                        "{failure}",
+                    );
+                }
+            }
         }
 
         #[test]
@@ -3058,7 +3292,9 @@ pub(super) mod tests {
                 "no early cursor publication"
             );
             Ok(execution_report(&selected, &["compressed"]))
-        });
+        })
+        .break_value()
+        .expect("incomplete execution stops the pass");
         assert_eq!(*cursor.lock().unwrap(), Some(selected[0].clone()));
         assert!(message.contains("2 unvisited"), "{message}");
     }
@@ -3067,9 +3303,10 @@ pub(super) mod tests {
     fn complete_discovery_does_not_wrap_while_selected_files_are_unvisited() {
         let selected = paths();
         let cursor = Mutex::new(None);
-        execute_and_resume(&selected, None, &cursor, || {
+        let result = execute_and_resume(&selected, None, &cursor, || {
             Ok(execution_report(&selected, &["skipped", "failed"]))
         });
+        assert!(result.is_break());
         assert_eq!(*cursor.lock().unwrap(), Some(selected[1].clone()));
     }
 
@@ -3079,12 +3316,13 @@ pub(super) mod tests {
         // Discovery can finish excluded entries beyond the last selected file.
         for next in [Some(PathBuf::from("/cache/z-excluded")), None] {
             let cursor = Mutex::new(Some(PathBuf::from("/cache/0.bin")));
-            execute_and_resume(&selected, next.clone(), &cursor, || {
+            let result = execute_and_resume(&selected, next.clone(), &cursor, || {
                 Ok(execution_report(
                     &selected,
                     &["skipped", "failed", "compressed"],
                 ))
             });
+            assert!(result.is_continue());
             assert_eq!(*cursor.lock().unwrap(), next);
         }
     }
@@ -3096,12 +3334,15 @@ pub(super) mod tests {
             let cursor = Mutex::new(previous.clone());
             let message = execute_and_resume(&selected, Some(selected[2].clone()), &cursor, || {
                 Err(io::Error::other("I/O priority admission failed"))
-            });
+            })
+            .break_value()
+            .expect("a refused executor stops the pass");
             assert!(message.contains("I/O priority admission failed"));
             assert_eq!(*cursor.lock().unwrap(), previous);
-            execute_and_resume(&selected, None, &cursor, || {
+            let result = execute_and_resume(&selected, None, &cursor, || {
                 Ok(execution_report(&selected, &[]))
             });
+            assert!(result.is_break());
             assert_eq!(*cursor.lock().unwrap(), previous);
         }
     }
@@ -3112,12 +3353,13 @@ pub(super) mod tests {
         let previous = Some(PathBuf::from("/cache/0.bin"));
         for (supported, dry_run) in [(false, false), (true, true)] {
             let cursor = Mutex::new(previous.clone());
-            execute_and_resume(&selected, None, &cursor, || {
+            let result = execute_and_resume(&selected, None, &cursor, || {
                 let mut report = execution_report(&selected, &["eligible", "eligible", "eligible"]);
                 report.supported = supported;
                 report.dry_run = dry_run;
                 Ok(report)
             });
+            assert!(result.is_break());
             assert_eq!(*cursor.lock().unwrap(), previous);
         }
     }
@@ -3138,7 +3380,9 @@ pub(super) mod tests {
                     _ => report.files[0].path = PathBuf::from("/other/replaced.bin"),
                 }
                 Ok(report)
-            });
+            })
+            .break_value()
+            .expect("inconsistent execution evidence stops the pass");
             assert!(
                 message.contains("continuation retained"),
                 "case {case}: {message}"
@@ -3160,10 +3404,11 @@ pub(super) mod tests {
                 .cloned()
                 .collect();
             assert_eq!(remaining.first(), Some(expected));
-            execute_and_resume(&remaining, None, &cursor, || {
+            let result = execute_and_resume(&remaining, None, &cursor, || {
                 visited.push(remaining[0].clone());
                 Ok(execution_report(&remaining, &["skipped"]))
             });
+            assert_eq!(result.is_break(), remaining.len() > 1);
         }
         assert_eq!(visited, selected);
         assert_eq!(*cursor.lock().unwrap(), None);
@@ -3180,16 +3425,19 @@ pub(super) mod tests {
             PathBuf::from("/cache/b.bin"),
         ];
         let cursor = Mutex::new(None);
-        execute_and_resume(&selected, None, &cursor, || {
+        let result = execute_and_resume(&selected, None, &cursor, || {
             Ok(execution_report(&selected, &["skipped"]))
         });
+        assert!(result.is_break());
         assert_eq!(*cursor.lock().unwrap(), Some(selected[0].clone()));
         let cursor = Mutex::new(None);
         let message = execute_and_resume(&selected, None, &cursor, || {
             let mut report = execution_report(&selected, &["skipped"]);
             report.files[0].path = PathBuf::from(selected[0].to_string_lossy().into_owned());
             Ok(report)
-        });
+        })
+        .break_value()
+        .expect("lossy execution paths cannot authorize more work");
         assert!(message.contains("continuation retained"));
         assert_eq!(*cursor.lock().unwrap(), None);
     }
