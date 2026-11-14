@@ -97,6 +97,8 @@ sbh_mach = { path = "crates/sbh_mach" }
 sysctl = "0.7.1"
 whichdisk = "0.6"
 [dev-dependencies]
+# Thread CPU clock for the decision-plane benchmark (test builds only).
+rustix = { version = "=1.1.4", features = ["fs", "time"] }
 tempfile = "3.17"
 proptest = "1.6"
 filetime = "0.2"

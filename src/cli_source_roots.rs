@@ -283,6 +283,18 @@ mod tests {
         std::fs::create_dir_all(first.join("team/repository/.git")).unwrap();
         std::fs::create_dir_all(&second).unwrap();
         std::fs::write(second.join(".git"), "gitdir: /missing/linked/worktree\n").unwrap();
+        // Inspection probes a root's ancestors before its subtree. When TMPDIR
+        // lies inside a checkout (rch's live-checkout mode puts it in the
+        // worker's git mirror), that checkout is the first repository found
+        // and the nested one is never named (bd-skat).
+        let canonical = std::fs::canonicalize(directory.path()).unwrap();
+        let expected_repository = canonical
+            .ancestors()
+            .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
+            .map_or_else(
+                || "team/repository".to_string(),
+                |checkout| checkout.display().to_string(),
+            );
         let mut config = Config::default();
         config.scanner.root_paths = vec![first.clone(), second.clone()];
         let assessment = Assessment::from_config(Diagnostic::ConfigValidate, &config);
@@ -314,7 +326,7 @@ mod tests {
         assessment.write(false, &mut text).unwrap();
         let text = String::from_utf8(text).unwrap();
         assert!(text.contains("Source-root configuration: WARN"));
-        assert!(text.contains("team/repository"));
+        assert!(text.contains(&expected_repository), "{text}");
         assert!(text.contains("scanner.allow_source_tree_roots = true"));
         assert!(text.contains("report-only in this release"));
         assert!(text.contains("reclaim would be blocked once enforced"));
@@ -323,7 +335,7 @@ mod tests {
         assessment.warn(&mut stderr).unwrap();
         let stderr = String::from_utf8(stderr).unwrap();
         assert_eq!(stderr.matches("sbh: warning: ").count(), 3);
-        assert!(stderr.contains("team/repository"));
+        assert!(stderr.contains(&expected_repository), "{stderr}");
         assert!(!stderr.contains("BLOCKED"));
     }
 

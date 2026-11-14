@@ -15,6 +15,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use nix::errno::Errno as NixErrno;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
@@ -159,7 +160,7 @@ pub(super) fn bind(path: &Path) -> io::Result<(UnixListener, EndpointGuard)> {
             "control socket lease is not a private owned regular file",
         ));
     }
-    flock(&lease, FlockOperation::NonBlockingLockExclusive)?;
+    lock_lease(&lease)?;
     let mut guard = EndpointGuard {
         parent,
         parent_path,
@@ -210,6 +211,26 @@ pub(super) fn bind(path: &Path) -> io::Result<(UnixListener, EndpointGuard)> {
     }
     listener.set_nonblocking(true)?;
     Ok((listener, guard))
+}
+
+/// How long a refused lease lock is retried. A child that another thread
+/// forks holds a copy of the lease's open file description, and with it the
+/// lock, until it execs and `O_CLOEXEC` closes it. Without a retry, a server
+/// restarted in a process that spawns children was refused by its own
+/// released lease: 2,523 of 3,000 restarts with 8 threads spawning `true`
+/// (bd-skat). A live server's lease is still refused, one second later.
+const LEASE_LOCK_RETRY: Duration = Duration::from_secs(1);
+
+fn lock_lease(lease: &File) -> io::Result<()> {
+    let deadline = Instant::now() + LEASE_LOCK_RETRY;
+    loop {
+        match flock(lease, FlockOperation::NonBlockingLockExclusive) {
+            Err(Errno::WOULDBLOCK) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            result => return result.map_err(io::Error::from),
+        }
+    }
 }
 
 fn connection_refused(path: &Path) -> io::Result<bool> {
@@ -300,6 +321,26 @@ mod tests {
                 .ok
         );
         replacement.stop();
+    }
+
+    #[test]
+    fn a_lease_copy_held_until_a_forked_child_execs_does_not_refuse_the_restart() {
+        // A child forked while the lease was open holds its file description,
+        // and with it the lock, until exec closes it (bd-skat).
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.sock");
+        let (listener, guard) = bind(&path).unwrap();
+        let child_copy = guard.lease.try_clone().unwrap();
+        drop(listener);
+        drop(guard);
+        let exec = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(child_copy);
+        });
+        let (listener, guard) = bind(&path).unwrap();
+        exec.join().unwrap();
+        drop(listener);
+        drop(guard);
     }
 
     #[test]

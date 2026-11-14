@@ -1422,7 +1422,18 @@ impl BenchmarkStats {
     }
 }
 
-/// Benchmark report comparing scoring and evaluation latency.
+/// Milliseconds of CPU this thread has used. The benchmark measures the
+/// scoring code, not the scheduler: under 2x oversubscription on ts1, wall
+/// p99 rose from 0.75 ms to 7-13 ms in ~3 ms timeslice steps while the median
+/// stayed near 1 ms, and a loaded worker once reached 81 ms (bd-skat).
+fn thread_cpu_ms() -> f64 {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+    let secs = u64::try_from(now.tv_sec).expect("thread CPU time is non-negative");
+    let nanos = u32::try_from(now.tv_nsec).expect("nanoseconds below one second");
+    std::time::Duration::new(secs, nanos).as_secs_f64() * 1000.0
+}
+
+/// Benchmark report comparing scoring and evaluation CPU cost.
 #[derive(Debug, Clone)]
 struct BenchmarkReport {
     scoring_stats: BenchmarkStats,
@@ -1445,17 +1456,15 @@ impl BenchmarkReport {
             let mut rng = SeededRng::new(seed + i as u64);
             let candidates = random_candidates(&mut rng, candidates_per_iter);
 
-            // Benchmark scoring.
-            let t0 = std::time::Instant::now();
+            // Benchmark scoring (single-threaded, so thread CPU is its cost).
+            let t0 = thread_cpu_ms();
             let scored = engine.score_batch(&candidates, 0.5);
-            let scoring_dur = t0.elapsed();
-            scoring_times.push(scoring_dur.as_secs_f64() * 1000.0);
+            scoring_times.push(thread_cpu_ms() - t0);
 
             // Benchmark policy evaluation.
-            let t1 = std::time::Instant::now();
+            let t1 = thread_cpu_ms();
             let _decision = policy.evaluate(&scored, None);
-            let eval_dur = t1.elapsed();
-            eval_times.push(eval_dur.as_secs_f64() * 1000.0);
+            eval_times.push(thread_cpu_ms() - t1);
         }
 
         Self {
