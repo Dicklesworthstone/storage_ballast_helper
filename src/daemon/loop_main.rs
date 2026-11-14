@@ -12010,6 +12010,8 @@ fn scanner_thread_main(
     // the startup CPU to the bucket after enqueueing the request, and a
     // scanner that woke after that charge found the bucket short.
     let mut waiting_maintenance: Option<ScanRequest> = None;
+    // Roots the retained read-ahead was last bounded to (bd-656i).
+    let mut read_ahead_roots = shared_scanner_config.read().root_paths.clone();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -12019,6 +12021,17 @@ fn scanner_thread_main(
         // Bounded ledger reads run here even when there is no scan request.
         // The monitor never waits on SQLite or filesystem history reads.
         regret.refresh_history();
+
+        // bd-656i: read-ahead keeps directories open between passes. After a
+        // reload removes a root, its handles kept the volume busy (umount
+        // EBUSY) for up to an hour. Release them on the scanner's next poll,
+        // pass or no pass. Other scopes outside the new roots lose only
+        // speculative reads.
+        if shared_scanner_config.read().root_paths != read_ahead_roots {
+            read_ahead_roots.clone_from(&shared_scanner_config.read().root_paths);
+            prescan_cursor.release_read_ahead_outside(&read_ahead_roots);
+            crate::scanner::walker::release_read_ahead_outside(&read_ahead_roots);
+        }
 
         let (ready_request, mut operator_claim) =
             ready_scanner_request(scan_rx, scan_now_queue, &mut deferred_routine);

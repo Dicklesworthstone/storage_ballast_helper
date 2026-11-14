@@ -2935,6 +2935,84 @@ fn sighup_reload_scans_the_new_root_and_relogs_the_matrix() {
     assert!(status.success(), "{status}");
 }
 
+/// The daemon's open descriptors whose target lies under `dir` (Linux /proc).
+#[cfg(target_os = "linux")]
+fn descriptors_under(pid: u32, dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let target = fs::read_link(entry.path()).ok()?;
+            target
+                .starts_with(dir)
+                .then(|| (entry.file_name().to_string_lossy().into_owned(), target))
+        })
+        .collect()
+}
+
+/// bd-656i: a reload that removes a root must release every descriptor the
+/// daemon holds under it, or an unconfigured volume cannot be unmounted
+/// (EBUSY) until the daemon restarts.
+#[cfg(target_os = "linux")]
+#[test]
+fn reload_that_removes_a_root_releases_its_descriptors() {
+    let dir = scratch();
+    let root_a = dir.path().join("root");
+    fs::create_dir_all(&root_a).unwrap();
+    let root_b = dir.path().join("root-b");
+    for n in 0..64 {
+        let project = root_b.join(format!("proj-{n:03}"));
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+    }
+    let fixture_mount = dir.path().to_path_buf();
+    let table = injected_table(&[
+        (&fixture_mount, 1_000_000_000_000, 500_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let mut scenario = ScenarioConfig {
+        root_paths: vec![root_a.clone(), root_b.clone()],
+        min_file_age_minutes: 0,
+        maintenance_interval_secs: 5,
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    let pid = run.child.id();
+    run.wait_until("two scan passes", Duration::from_secs(60), |run| {
+        run.events_of("scan_complete").len() >= 2
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    let before = descriptors_under(pid, &root_b);
+    assert!(
+        !before.is_empty(),
+        "the scenario must retain read-ahead under root-b to prove its release"
+    );
+
+    scenario.root_paths = vec![root_a];
+    write_config(dir.path(), &scenario);
+    run.signal("-HUP");
+    run.wait_until("the config_reload event", Duration::from_secs(15), |run| {
+        !run.events_of("config_reload").is_empty()
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    let passes = run.events_of("scan_complete").len();
+    run.wait_until(
+        "two passes after the reload",
+        Duration::from_secs(60),
+        |run| run.events_of("scan_complete").len() >= passes + 2,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let after = descriptors_under(pid, &root_b);
+    assert!(
+        after.is_empty(),
+        "descriptors still open under the removed root: {after:?}"
+    );
+    let status = run.stop();
+    assert!(status.success(), "{status}");
+}
+
 /// Scenario `special-location-horizon`: the operator host's 5.5 TiB `/` at
 /// 13.9% free carries /tmp; with no consumption its horizon is infinite,
 /// so a minute of polling raises no special-location alert. The daemon's

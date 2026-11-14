@@ -34,6 +34,12 @@ use build_scopes::BuildDirectoryScopes;
 mod code_sign_clones;
 use code_sign_clones::AppInstance;
 mod read_ahead;
+
+/// Release this thread's retained directory read-ahead outside `roots`.
+/// Only speculative enumeration is lost; a later walk reads those names again.
+pub fn release_read_ahead_outside(roots: &[PathBuf]) {
+    read_ahead::shared().lock().release_outside(roots);
+}
 use read_ahead::{
     ChildProgress, DirectoryRead, DispatchPermit, DispatchReceipt, ReadAhead, ReadReservation,
 };

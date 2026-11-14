@@ -461,6 +461,17 @@ impl PrescanCursor {
         Ok(page)
     }
 
+    /// Release read-ahead for roots outside `roots`. A session holds its
+    /// directory open even after EOF, so a root a reload removed would keep
+    /// its volume busy (bd-656i). Durable resume positions are untouched.
+    pub fn release_read_ahead_outside(&self, roots: &[PathBuf]) {
+        self.enumeration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .retain(|path, _| roots.iter().any(|root| path.starts_with(root)));
+    }
+
     pub(super) fn discard_enumeration(&self, root: &Path) {
         self.enumeration
             .lock()
@@ -766,6 +777,29 @@ mod tests {
         );
         assert_eq!(cursor, before);
         assert!(cursor.enumeration.lock().unwrap().sessions.is_empty());
+    }
+
+    #[test]
+    fn released_roots_close_their_reader_but_keep_progress_and_other_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let kept = make_root(temp.path(), "kept", 600);
+        let removed = make_root(temp.path(), "removed", 600);
+        let mut cursor = PrescanCursor::new();
+        cursor.advance(&removed, &removed.join("item-0003"));
+        let before = cursor.clone();
+        assert!(limited_poll(&cursor, &kept).unwrap().is_none());
+        assert!(limited_poll(&cursor, &removed).unwrap().is_none());
+        cursor.release_read_ahead_outside(std::slice::from_ref(&kept));
+        let live: Vec<PathBuf> = cursor
+            .enumeration
+            .lock()
+            .unwrap()
+            .sessions
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(live, vec![kept]);
+        assert_eq!(cursor, before, "durable progress survives the release");
     }
 
     #[test]

@@ -301,6 +301,18 @@ impl ReadAhead {
         }
     }
 
+    /// Drop paused readers and ready pages outside `roots`. Each holds an
+    /// open directory, so after a reload removes a root its volume could not
+    /// be unmounted (EBUSY) until idle expiry an hour later (bd-656i). A
+    /// reader a worker has checked out holds no cached handle; it keeps its
+    /// reservation and returns through the normal paths.
+    pub(super) fn release_outside(&mut self, roots: &[PathBuf]) {
+        let kept = |path: &Path| roots.iter().any(|root| path.starts_with(root));
+        self.ready.retain(|path, _| kept(path));
+        self.pending
+            .retain(|path, entry| entry.read.is_none() || kept(path));
+    }
+
     fn expire(&mut self, now: Instant) {
         // A checked-out reader owns its reservation even during slow native
         // I/O. Evicting it would allow cyclic scans to thrash every partial
@@ -562,6 +574,40 @@ mod tests {
         assert!(!cache.pending.contains_key(&paused_path));
         assert!(cache.pending.contains_key(&running_path));
         cache.discard(&running_path, &running);
+        assert!(cache.pending.is_empty());
+    }
+
+    #[test]
+    fn released_roots_close_paused_and_ready_handles_but_not_checked_out_readers() {
+        let temp = tempfile::tempdir().unwrap();
+        let kept_root = temp.path().join("kept");
+        let removed_root = temp.path().join("removed");
+        let paused = removed_root.join("paused");
+        let running = removed_root.join("running");
+        let done = removed_root.join("done");
+        let kept_done = kept_root.join("done");
+        for path in [&paused, &running, &done, &kept_done] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let mut cache = ReadAhead::default();
+        let mut reader = read(&paused);
+        cache.admit(&paused, &mut reader);
+        cache.retain(&paused, reader);
+        let mut checked_out = read(&running);
+        cache.admit(&running, &mut checked_out);
+        for path in [&done, &kept_done] {
+            let mut page = read(path);
+            page.exhausted = true;
+            cache.retain(path, page);
+        }
+        cache.release_outside(std::slice::from_ref(&kept_root));
+        assert!(!cache.pending.contains_key(&paused));
+        assert!(
+            cache.pending.contains_key(&running),
+            "a checked-out reader keeps its reservation"
+        );
+        assert_eq!(cache.ready.keys().collect::<Vec<_>>(), vec![&kept_done]);
+        cache.discard(&running, &checked_out);
         assert!(cache.pending.is_empty());
     }
 
