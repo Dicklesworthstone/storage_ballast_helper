@@ -1529,6 +1529,33 @@ fn duty_cycle_defer_active(
     last_pass_finished_at.is_some_and(|last| now.duration_since(last) < debt)
 }
 
+/// The monitor's once-per-interval routine pass: not an event pass synthesized
+/// by the scanner, not an operator request. Only this one is kept when pacing
+/// defers it; the monitor re-sends the others (bd-p18q).
+const fn is_routine_maintenance(request: &ScanRequest, from_events: bool) -> bool {
+    request.maintenance && !from_events && request.scan_now.is_none()
+}
+
+/// Whether the duty cycle and the CPU budget, the pacing gates that defer a
+/// routine pass, would let `request` start now.
+fn scan_pacing_admits(
+    request: &ScanRequest,
+    budget: &CpuBudget,
+    last_pass_finished_at: Option<Instant>,
+    last_pass_duration: Duration,
+    duty_cycle_pct: u8,
+) -> bool {
+    !duty_cycle_defer_active(
+        last_pass_finished_at,
+        last_pass_duration,
+        Instant::now(),
+        request,
+        duty_cycle_pct,
+    ) && budget
+        .pass_cpu_allowance(request.pressure_level)
+        .is_none_or(|cpu_secs| cpu_secs > 0.0)
+}
+
 /// B6: exponential backoff for the empty-pass cooldown.
 ///
 /// `min_rescan_interval_secs` is the *base* pause after a single no-progress
@@ -11919,6 +11946,15 @@ fn scanner_thread_main(
     // `ProtectionRegistry::adopt_verdict_cache`).
     let mut carried_verdicts = protection::SacredVerdictCache::default();
     let mut deferred_routine = None;
+    // bd-p18q: a maintenance request the CPU budget or the duty cycle defers
+    // waits here and runs once pacing admits it. The monitor marks the
+    // routine pass as sent when it enqueues it and sends the next one only a
+    // whole `maintenance_interval_secs` later, so dropping it lost the pass
+    // for that long. A fresh daemon lost more: the event source starts with
+    // the first pass, so nothing else asked for one. The first tick charges
+    // the startup CPU to the bucket after enqueueing the request, and a
+    // scanner that woke after that charge found the bucket short.
+    let mut waiting_maintenance: Option<ScanRequest> = None;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -11945,18 +11981,32 @@ fn scanner_thread_main(
                     // Idle is alive: "stalled" must mean stuck inside a pass,
                     // not waiting for one.
                     heartbeat.beat();
-                    let event_config = shared_scanner_config.read().clone();
-                    let Some(request) = event_triggered_request(
-                        scanner_event_source.as_mut(),
-                        &mut pending_event_invalidation,
-                        &mut last_event_poll,
-                        &mut event_request_templates,
-                        &event_config,
-                    ) else {
-                        continue;
-                    };
-                    request_from_events = true;
-                    request
+                    let duty_cycle_pct = shared_scanner_config.read().max_scan_duty_cycle_pct;
+                    if let Some(request) = waiting_maintenance.take_if(|request| {
+                        scan_pacing_admits(
+                            request,
+                            &cpu_budget.lock(),
+                            last_pass_finished_at,
+                            last_pass_duration,
+                            duty_cycle_pct,
+                        )
+                    }) {
+                        request_from_events = false;
+                        request
+                    } else {
+                        let event_config = shared_scanner_config.read().clone();
+                        let Some(request) = event_triggered_request(
+                            scanner_event_source.as_mut(),
+                            &mut pending_event_invalidation,
+                            &mut last_event_poll,
+                            &mut event_request_templates,
+                            &event_config,
+                        ) else {
+                            continue;
+                        };
+                        request_from_events = true;
+                        request
+                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -11970,6 +12020,9 @@ fn scanner_thread_main(
         let current_scanner_config = shared_scanner_config.read().clone();
         if request.config_update.is_some() {
             admitted_root_order.reset();
+            // A reload's own pass covers the new roots; a waiting routine
+            // pass would walk the old ones.
+            waiting_maintenance = None;
         }
         if executor_config.scan_posture_for(&request) == ScanAggressiveness::Skip {
             // Queued and event-triggered automatic work must observe the
@@ -12127,13 +12180,21 @@ fn scanner_thread_main(
             if let Some(claim) = &mut operator_claim {
                 claim.defer(WORKER_SHUTDOWN_POLL_INTERVAL);
             }
+            if is_routine_maintenance(&request, request_from_events) {
+                if waiting_maintenance.is_none() {
+                    eprintln!("[SBH-SCANNER] maintenance pass waits out the scan duty cycle");
+                }
+                waiting_maintenance = Some(request);
+            }
             continue;
         }
 
         // Q7: the daemon-wide CPU budget. A discretionary pass waits until
-        // the bucket is nearly full (the next tick re-requests it), then
-        // walks only for its funded CPU slice, including at Critical.
-        // Forced operator and config-reload scans bypass that pacing.
+        // the bucket is nearly full, then walks only for its funded CPU
+        // slice, including at Critical. A pressure-driven request is sent
+        // again by the next tick; a maintenance request waits in
+        // `waiting_maintenance`. Forced operator and config-reload scans
+        // bypass that pacing.
         let budget_allowance = if request.bypass_scan_pacing() || request.config_update.is_some() {
             None
         } else {
@@ -12144,7 +12205,23 @@ fn scanner_thread_main(
             if let Some(claim) = &mut operator_claim {
                 claim.defer(WORKER_SHUTDOWN_POLL_INTERVAL);
             }
+            if is_routine_maintenance(&request, request_from_events) {
+                if waiting_maintenance.is_none() {
+                    let (available, burst) = {
+                        let budget = cpu_budget.lock();
+                        (budget.available_secs(), budget.burst_secs())
+                    };
+                    eprintln!(
+                        "[SBH-SCANNER] maintenance pass waits for the CPU budget ({available:.2} of {burst:.2} CPU-s available)"
+                    );
+                }
+                waiting_maintenance = Some(request);
+            }
             continue;
+        }
+        if is_routine_maintenance(&request, request_from_events) {
+            // This is the routine pass; an older deferred one is covered.
+            waiting_maintenance = None;
         }
         if request_from_events {
             event_request_templates.pass_started(&request);
@@ -27721,6 +27798,128 @@ mod tests {
         );
         let log = std::fs::read_to_string(log_path).unwrap();
         assert!(log.contains("scanner posture deferred recursive discovery"));
+    }
+
+    /// bd-p18q: the first tick charges the startup CPU to the bucket after
+    /// enqueueing the maintenance request, so a scanner that woke late found
+    /// the bucket short and dropped the request. The monitor sends the next
+    /// one an interval later, and with no first pass there was no event
+    /// source to ask for another: the daemon sat idle (2 CPU-seconds in
+    /// 152 s on a loaded vmi1149989). A deferred maintenance request waits
+    /// for the bucket and then runs.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_maintenance_request_the_cpu_budget_defers_runs_once_the_bucket_refills() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("scan-root");
+        std::fs::create_dir_all(root.join("project/src")).unwrap();
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![root.clone()];
+
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: temp.path().join("activity.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 64,
+            run_id: None,
+        })
+        .unwrap();
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+        let (del_tx, _del_rx) = bounded::<DeletionBatch>(1);
+        let (report_tx, report_rx) = bounded::<WorkerReport>(1);
+        let (_index_feedback_tx, index_feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        // 25% of a core, a one-CPU-second bucket, half of it already charged
+        // to startup: a discretionary pass may not start yet.
+        let started = Instant::now();
+        let cpu_budget = Arc::new(Mutex::new(
+            CpuBudget::new(25, started, 0.0).with_burst_secs(1.0),
+        ));
+        cpu_budget.lock().observe(started, 0.5);
+        assert_eq!(
+            cpu_budget.lock().pass_cpu_allowance(PressureLevel::Green),
+            Some(0.0)
+        );
+        let heartbeat = Arc::new(ThreadHeartbeat::new("test-scanner"));
+        let shared_scoring_config = Arc::new(RwLock::new(config.scoring));
+        let shared_scanner_config = Arc::new(RwLock::new(config.scanner));
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (scanner_index_path, prescan_cursor_path) = scanner_state_paths(temp.path());
+        let executor_config = Arc::new(SharedExecutorConfig::new(
+            false, 10, 0.0, 60, 3600, false, 0,
+        ));
+        let regret = Arc::new(SharedRegret::new(&Config::default()));
+        let policy = Mutex::new(PolicyEngine::new(PolicyConfig::default()));
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                scanner_thread_main(
+                    &scan_rx,
+                    &del_tx,
+                    &logger,
+                    &shared_scoring_config,
+                    &shared_scanner_config,
+                    &platform,
+                    &heartbeat,
+                    &report_tx,
+                    &shutdown,
+                    &scanner_index_path,
+                    &prescan_cursor_path,
+                    &index_feedback_rx,
+                    &cpu_budget,
+                    &executor_config,
+                    &regret,
+                    None,
+                    &policy,
+                );
+            });
+            scan_tx
+                .send(ScanRequest {
+                    paths: vec![root.clone()],
+                    urgency: 0.05,
+                    pressure_level: PressureLevel::Green,
+                    free_pct: Some(50.0),
+                    max_delete_batch: 0,
+                    force_full_scan: false,
+                    scan_now: None,
+                    inode_reclaim: None,
+                    config_update: None,
+                    catalog_roots: Vec::new(),
+                    maintenance: true,
+                    target_bytes: None,
+                    ram_reclaim: None,
+                })
+                .unwrap();
+            // The scanner has taken the request to its gates before the
+            // bucket refills; otherwise this would not test the deferral.
+            let taken_by = Instant::now() + Duration::from_secs(10);
+            while !scan_rx.is_empty() && Instant::now() < taken_by {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let early = report_rx.recv_timeout(Duration::from_millis(500));
+            // Ten wall-seconds at 25% refill the bucket.
+            cpu_budget
+                .lock()
+                .observe(started + Duration::from_secs(10), 0.5);
+            let report = report_rx.recv_timeout(Duration::from_secs(20));
+            shutdown.store(true, Ordering::Relaxed);
+            assert!(
+                early.is_err(),
+                "the pass must wait for the bucket: {early:?}"
+            );
+            assert!(
+                matches!(report, Ok(WorkerReport::ScanCompleted { .. })),
+                "the deferred maintenance pass never ran: {report:?}"
+            );
+        });
+
+        logger.shutdown();
+        logger_join.join().unwrap();
     }
 
     #[test]

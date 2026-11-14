@@ -8,6 +8,20 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **A routine maintenance pass the CPU budget defers is no longer lost**
+  (bd-p18q). The monitor marks the maintenance pass as sent when it queues
+  it and sends the next one a whole `maintenance_interval_secs` later. When
+  the scanner found the CPU bucket short, or still owed duty-cycle idle time,
+  it dropped the request, so the routine pass was lost for that interval. A
+  fresh daemon lost more: the first tick charges the startup CPU to the
+  bucket after queueing the request, a scanner that woke after that charge
+  dropped it, and with no first pass there was no file-change event source
+  to ask for another. The daemon then idled at about 1% CPU with nothing
+  scanned (2 CPU-seconds in 152 s on a loaded worker). The scanner now holds
+  a deferred maintenance request and runs it once the bucket and the duty
+  cycle admit it, logging `maintenance pass waits for the CPU budget` once.
+  A config reload discards it, since the reload's own pass covers the new
+  roots.
 - **Service queries wait briefly for a writer that outlives them.** The
   bounded `systemctl`/`busctl` queries that `sbh update` and rollback run
   before restarting the service refused any reply whose output pipe was still
