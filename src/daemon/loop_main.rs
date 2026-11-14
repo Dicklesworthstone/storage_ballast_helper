@@ -11716,21 +11716,16 @@ impl ScanCursor {
     /// or above ground the pass left unseen (see [`mark_non_barren`]).
     /// `timed_out` — whether the scan hit its time/entry budget.
     ///
-    /// Only caches barren dirs when the scan timed out (no point caching if the
-    /// scan completed — next scan should be fresh). On a full completion, the
-    /// cache is cleared to allow re-discovery.
+    /// Only caches new barren dirs when the scan timed out. A pass that did
+    /// not time out may have stopped at its byte target, or only visited a
+    /// catalog unit or another mount. It cannot retire this sweep's progress;
+    /// [`Self::complete_scopes`] consumes proven recursive coverage separately.
     fn update(
         &mut self,
         visited_dirs: &HashSet<PathBuf>,
         non_barren_dirs: &HashSet<PathBuf>,
         timed_out: bool,
     ) {
-        if !timed_out {
-            // Full scan completed — clear cache so next scan is fresh.
-            self.barren_dirs.clear();
-            return;
-        }
-
         let now = Instant::now();
 
         // Remove dirs that turned out to have candidates (they may have been
@@ -11742,6 +11737,10 @@ impl ScanCursor {
         // Expire old entries.
         self.barren_dirs
             .retain(|_, ts| now.duration_since(*ts) < self.ttl);
+
+        if !timed_out {
+            return;
+        }
 
         // Newly discovered barren dirs. They are newer than every cached one,
         // so the cap keeps them first; take no more than fit. Only references
@@ -11784,6 +11783,22 @@ impl ScanCursor {
         for dir in fresh {
             self.barren_dirs.insert(dir.clone(), now);
         }
+    }
+
+    /// Retire progress only where a recursive walk proved coverage. A small
+    /// completed root must not restart a larger root's budgeted sweep. Hints
+    /// overlapping a completed dirty subtree are removed too, so an ancestor
+    /// hint cannot hide that subtree on its next reconciliation.
+    fn complete_scopes<'a>(&mut self, roots: impl Iterator<Item = &'a Path>) {
+        let roots: HashSet<&Path> = roots.collect();
+        if roots.is_empty() {
+            return;
+        }
+        let ancestors: HashSet<&Path> = roots.iter().flat_map(|root| root.ancestors()).collect();
+        self.barren_dirs.retain(|path, _| {
+            !ancestors.contains(path.as_path())
+                && !path.ancestors().any(|ancestor| roots.contains(ancestor))
+        });
     }
 }
 
@@ -14168,10 +14183,17 @@ fn scanner_thread_main(
             }
         }
 
-        // Update the incremental scan cursor. On timeout, barren dirs are
-        // cached so the next pass skips them. On full completion, cache is
-        // cleared for a fresh scan.
+        // Keep budgeted discovery progress independently of this pass's
+        // scope and stopping reason. Only proven recursive coverage retires
+        // hints: a completed small mount, catalog probe or byte-target stop
+        // must not send an unfinished large-root sweep back to its beginning.
         scan_cursor.update(&visited_dirs, &non_barren_dirs, scan_timed_out);
+        scan_cursor.complete_scopes(
+            root_stats_map
+                .values()
+                .filter(|stat| stat.coverage_complete)
+                .map(|stat| stat.path.as_path()),
+        );
 
         // Persist v2 candidate-index state before reporting completion.
         if scanner_index_enabled && let Some(index) = scanner_index.as_mut() {
@@ -25415,6 +25437,83 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_completed_walk_preserves_progress_toward_later_candidates() {
+        let scratch = temp_root_scratch_dir();
+        let large = scratch.path().join("large");
+        let covered = large.join("covered");
+        let target = large.join("pending/target");
+        let small = scratch.path().join("small");
+        for index in 0..32 {
+            std::fs::create_dir_all(covered.join(format!("entry-{index}"))).unwrap();
+        }
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        std::fs::create_dir_all(small.join("empty")).unwrap();
+        let walker = |root: &Path, excluded_paths| {
+            DirectoryWalker::new(
+                WalkerConfig {
+                    root_paths: vec![root.to_path_buf()],
+                    max_depth: 10,
+                    follow_symlinks: false,
+                    cross_devices: false,
+                    parallelism: 1,
+                    excluded_paths,
+                    opaque_pruning: false,
+                },
+                ProtectionRegistry::marker_only(),
+            )
+        };
+
+        // Model the first slice's covered ground with a real parent-rooted
+        // walk, deferring the pending branch explicitly instead of depending
+        // on enumeration order. The walker emits children, not its scan root,
+        // so this observes `covered` itself as well as its complete subtree.
+        let visited = walker(&large, HashSet::from([large.join("pending")]))
+            .walk()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+        let mut cursor = ScanCursor::new();
+        cursor.update(&visited, &HashSet::new(), true);
+
+        // An intervening pass genuinely finishes another root. Its EOF
+        // receipt must not make the next large-root pass repeat old ground.
+        let mut stream = walker(&small, cursor.barren_exclusions()).stream().unwrap();
+        let visited = stream.by_ref().map(|entry| entry.path).collect();
+        let unfinished = stream.unfinished_after_cancel(Duration::ZERO);
+        let mut complete = RootScanResult::unvisited(small, false);
+        complete.finish_recursive_walk(unfinished.as_deref());
+        assert!(complete.coverage_complete);
+        cursor.update(&visited, &HashSet::new(), false);
+        cursor.complete_scopes(
+            [&complete]
+                .into_iter()
+                .filter(|stat| stat.coverage_complete)
+                .map(|stat| stat.path.as_path()),
+        );
+
+        // Eight entries suffice for the remaining ground, but not for
+        // re-walking the 33 directories already covered. This is a work
+        // budget, so the assertion does not depend on wall-clock speed.
+        let walker = walker(&large, cursor.barren_exclusions());
+        let mut stream = walker.stream().unwrap();
+        let observed: Vec<PathBuf> = stream.by_ref().take(8).map(|entry| entry.path).collect();
+        walker.cancel_token().store(true, Ordering::Relaxed);
+        assert!(
+            stream
+                .unfinished_after_cancel(Duration::from_secs(5))
+                .is_some(),
+            "the bounded walk's workers must stop"
+        );
+        assert!(observed.contains(&target), "{observed:?}");
+        assert!(
+            observed.iter().all(|path| !path.starts_with(&covered)),
+            "an unrelated completed root erased discovery progress: {observed:?}"
+        );
+        assert!(observed.len() < 8, "the remaining tree fits the next slice");
+    }
+
+    #[test]
     fn fresh_events_reopen_cached_barren_ground_for_the_next_walk() {
         use crate::scanner::events::{DirtyRootTracker, FsEvent, FsEventKind};
 
@@ -25710,9 +25809,84 @@ mod tests {
             "a dir already cached keeps its older timestamp"
         );
 
-        // A pass that completes forgets everything.
+        // Only proven coverage of these roots retires their progress.
         cursor.update(&visited, &HashSet::new(), false);
+        cursor.complete_scopes([Path::new("/new"), Path::new("/old")].into_iter());
         assert!(cursor.barren_dirs.is_empty());
+    }
+
+    #[test]
+    fn scan_cursor_preserves_other_mounts_when_a_small_root_finishes() {
+        let mut cursor = scan_cursor(100, &[("/large/covered", 1), ("/small/covered", 1)]);
+        let remembered_at = cursor.barren_dirs[Path::new("/large/covered")];
+        let mut small = RootScanResult::unvisited(PathBuf::from("/small"), false);
+        small.finish_recursive_walk(Some(&[]));
+
+        cursor.update(&path_set(&["/small/visited"]), &HashSet::new(), false);
+        cursor.complete_scopes(
+            [&small]
+                .into_iter()
+                .filter(|stat| stat.coverage_complete)
+                .map(|stat| stat.path.as_path()),
+        );
+
+        assert_eq!(cursor.barren_exclusions(), path_set(&["/large/covered"]));
+        assert_eq!(
+            cursor.barren_dirs[Path::new("/large/covered")],
+            remembered_at,
+            "an unrelated pass cannot refresh the discovery hint's lifetime"
+        );
+    }
+
+    #[test]
+    fn scan_cursor_requires_coverage_after_a_byte_target_or_catalog_pass() {
+        let mut cursor = scan_cursor(100, &[("/r/covered", 1), ("/r/changed", 1)]);
+        // These passes can finish without a timeout, but never obtain a
+        // recursive EOF receipt. Their positive observations still revoke
+        // an old barren classification.
+        let partial = RootScanResult::unvisited(PathBuf::from("/r"), false);
+        cursor.update(
+            &path_set(&["/r/changed/target", "/r/unproven"]),
+            &path_set(&["/r/changed", "/r/changed/target"]),
+            false,
+        );
+        cursor.complete_scopes(
+            [&partial]
+                .into_iter()
+                .filter(|stat| stat.coverage_complete)
+                .map(|stat| stat.path.as_path()),
+        );
+        assert_eq!(cursor.barren_exclusions(), path_set(&["/r/covered"]));
+    }
+
+    #[test]
+    fn scan_cursor_retires_only_roots_with_complete_recursive_receipts() {
+        let mut cursor = scan_cursor(
+            100,
+            &[
+                ("/large/covered", 1),
+                ("/small/project", 1),
+                ("/small/project/changed/covered", 1),
+                ("/small/project/sibling", 1),
+            ],
+        );
+        let mut large = RootScanResult::unvisited(PathBuf::from("/large"), false);
+        let mut changed = RootScanResult::unvisited(PathBuf::from("/small/project/changed"), true);
+        let unfinished = [PathBuf::from("/large/unreadable")];
+        for stat in [&mut large, &mut changed] {
+            stat.finish_recursive_walk(Some(&unfinished));
+        }
+        cursor.update(&HashSet::new(), &HashSet::new(), false);
+        cursor.complete_scopes(
+            [&large, &changed]
+                .into_iter()
+                .filter(|stat| stat.coverage_complete)
+                .map(|stat| stat.path.as_path()),
+        );
+        assert_eq!(
+            cursor.barren_exclusions(),
+            path_set(&["/large/covered", "/small/project/sibling"])
+        );
     }
 
     /// bd-kf7k: excluding a barren dir skips its subtree, so when barren dirs
