@@ -427,7 +427,7 @@ impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            channels: vec!["journal".to_string(), "file".to_string()],
+            channels: default_channels(),
             min_notify_interval_secs: DEFAULT_NOTIFY_INTERVAL_SECS,
             urgent_notify_interval_secs: DEFAULT_URGENT_NOTIFY_INTERVAL_SECS,
             desktop: DesktopConfig::default(),
@@ -446,11 +446,33 @@ pub struct DesktopConfig {
     pub min_level: NotificationLevel,
 }
 
+/// On macOS the desktop channel is on by default, at Critical only. There the
+/// daemon is a root LaunchDaemon: its journal and file channels land in
+/// `/var/log/sbh/sbh.err` and `/private/var/sbh`, where nobody looks, and a
+/// Critical swap or disk event once preceded a kernel panic by 40 minutes
+/// unseen (bd-z1nm). The channel reaches the console user's Notification
+/// Center and does nothing when nobody is logged in. Elsewhere it stays
+/// opt-in: Linux hosts are mostly headless.
+fn default_channels() -> Vec<String> {
+    let mut channels = vec!["journal".to_string(), "file".to_string()];
+    if cfg!(target_os = "macos") {
+        channels.push("desktop".to_string());
+    }
+    channels
+}
+
 impl Default for DesktopConfig {
     fn default() -> Self {
-        Self {
-            enabled: false,
-            min_level: NotificationLevel::Orange,
+        if cfg!(target_os = "macos") {
+            Self {
+                enabled: true,
+                min_level: NotificationLevel::Critical,
+            }
+        } else {
+            Self {
+                enabled: false,
+                min_level: NotificationLevel::Orange,
+            }
         }
     }
 }
@@ -1578,7 +1600,16 @@ mod tests {
         assert!(config.enabled);
         assert!(config.channels.contains(&"journal".to_string()));
         assert!(config.channels.contains(&"file".to_string()));
-        assert!(!config.desktop.enabled);
+        // bd-z1nm: desktop is on by default only on macOS, and only at Critical.
+        let desktop_default = cfg!(target_os = "macos");
+        assert_eq!(
+            config.channels.contains(&"desktop".to_string()),
+            desktop_default
+        );
+        assert_eq!(config.desktop.enabled, desktop_default);
+        if desktop_default {
+            assert_eq!(config.desktop.min_level, NotificationLevel::Critical);
+        }
         assert!(!config.webhook.enabled);
         assert_eq!(
             config.min_notify_interval_secs,

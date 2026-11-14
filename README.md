@@ -922,13 +922,13 @@ recovery_trigger_windows = 5
 
 [notifications]
 enabled = true
-channels = ["journal", "file"]
+channels = ["journal", "file"]          # macOS default adds "desktop"
 min_notify_interval_secs = 60
 urgent_notify_interval_secs = 300
 
 [notifications.desktop]
-enabled = false
-min_level = "orange"
+enabled = false                         # macOS default: true
+min_level = "orange"                    # macOS default: "critical"
 
 [notifications.webhook]
 enabled = false
@@ -2232,7 +2232,11 @@ window. This is best-effort delivery, and other synchronous daemon diagnostics
 can still wait on service-log I/O.
 
 On macOS, the desktop channel uses `osascript -e 'display notification ...'` as the
-first supported user-notification path. Red and Critical events are still
+first supported user-notification path. The root LaunchDaemon runs it in the
+console user's session (`launchctl asuser`), and does nothing when nobody is
+logged in. It is on by default on macOS at `critical` only, because the
+LaunchDaemon's other channels write to files nobody watches; configs written
+by an older install keep their explicit `enabled = false` until edited. Red and Critical events are still
 throttled per event category by `urgent_notify_interval_secs` (default five
 minutes), so a Critical+Critical memory/disk event can alert promptly without
 spamming Notification Center.
