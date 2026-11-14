@@ -20,13 +20,13 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use super::dispatch_cursor::PagePriority;
+use super::dispatch_cursor::{PagePriority, PriorityReceipt};
 use super::{MAX_ENTRIES_PER_DIR, StructuralSignals};
 
 const MAX_PENDING_READERS: usize = 4;
 const MAX_READY_PAGES: usize = 16;
 const MAX_READY_CHILDREN: usize = MAX_ENTRIES_PER_DIR as usize;
-const MAX_DISPATCH_FRAMES: usize = 16;
+pub(super) const MAX_DISPATCH_FRAMES: usize = 16;
 const MAX_DISPATCH_CHILDREN: usize = MAX_READY_CHILDREN;
 const IDLE_LIFETIME: Duration = Duration::from_hours(1);
 
@@ -47,7 +47,7 @@ pub(super) fn shared() -> Arc<Mutex<ReadAhead>> {
 pub(super) struct DirectoryRead {
     entries: Option<ReadDir>,
     stamp: Metadata,
-    window_start: u32,
+    pub(super) window_start: u32,
     window_size: u32,
     follow_symlinks: bool,
     ticket: Option<u64>,
@@ -61,7 +61,7 @@ pub(super) struct DirectoryRead {
     // Store basenames rather than repeating a potentially long parent path.
     pub(super) children: Arc<Vec<OsString>>,
     /// Durable priority uses only collector receipts. Full name pages stay
-    /// with the live read/receipts and are never retained by cursor history.
+    /// with live reads, never with queued receipts or cursor history.
     pub(super) priority: Option<Arc<PagePriority>>,
     pub(super) dispatch_started: bool,
     /// Scheduling priority only: a new walk still visits a whole circular page.
@@ -136,24 +136,25 @@ pub(super) struct ChildProgress {
     interrupted: Arc<AtomicBool>,
     current: usize,
     next: usize,
-    durable: Option<Arc<PagePriority>>,
+    durable: Option<Arc<PriorityReceipt>>,
 }
 
 impl ChildProgress {
     pub(super) fn new(read: &DirectoryRead, current: usize) -> Self {
+        let next = (current + 1) % read.children.len();
         Self {
             priority: Arc::clone(&read.next_child),
             interrupted: Arc::clone(&read.dispatch_interrupted),
             current,
-            next: (current + 1) % read.children.len(),
-            durable: read.priority.clone(),
+            next,
+            durable: read.priority.as_ref().map(|page| page.receipt(next)),
         }
     }
 
     pub(super) fn observed(&self) {
         self.priority.store(self.next, Ordering::Relaxed);
         if let Some(durable) = &self.durable {
-            durable.observed(self.next);
+            durable.observed();
         }
     }
 
@@ -171,7 +172,7 @@ impl ChildProgress {
             .is_ok()
             && let Some(durable) = &self.durable
         {
-            durable.observed(self.next);
+            durable.observed();
         }
     }
 

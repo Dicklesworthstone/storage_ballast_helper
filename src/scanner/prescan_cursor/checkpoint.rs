@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use super::{PrescanCursor, PressureOrder, WalkDispatchCursor, WalkDispatchPosition};
 use crate::scanner::walker::MAX_DISPATCH_CURSOR_ROWS;
 
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 // The existing pre-scan allowance and recursive dispatch allowance each retain
 // their own 512 KiB of native names. JSON escaping can expand a byte sixfold.
 const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
@@ -47,7 +47,24 @@ struct Progress {
     walk_order: Vec<(StoredPath, u64, bool)>,
     // Empty dispatch history must not alter original v1/v2 checksum bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    walk_dispatch: Vec<(StoredPath, StoredPath)>,
+    walk_dispatch: Vec<StoredDispatch>,
+}
+
+/// Preserve a v3 row's exact encoding until its checksum has been verified.
+/// New window metadata must never be accepted under an older format version.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredDispatch {
+    Legacy((StoredPath, StoredPath)),
+    Window(StoredWindow),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredWindow {
+    directory: StoredPath,
+    window_start: u32,
+    next_child: Option<StoredPath>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -197,10 +214,16 @@ impl Progress {
                 .walk_dispatch
                 .iter()
                 .map(|position| {
-                    Ok((
-                        StoredPath::try_from(position.directory.as_path())?,
-                        StoredPath::try_from(Path::new(&position.next_child))?,
-                    ))
+                    Ok(StoredDispatch::Window(StoredWindow {
+                        directory: StoredPath::try_from(position.directory.as_path())?,
+                        window_start: position.window_start,
+                        next_child: position
+                            .next_child
+                            .as_deref()
+                            .map(Path::new)
+                            .map(StoredPath::try_from)
+                            .transpose()?,
+                    }))
                 })
                 .collect::<io::Result<_>>()?,
         })
@@ -237,10 +260,20 @@ impl Progress {
         let positions = self
             .walk_dispatch
             .into_iter()
-            .map(|(directory, next_child)| {
+            .map(|stored| {
+                let (directory, window_start, next_child) = match stored {
+                    StoredDispatch::Legacy((directory, child)) => (directory, 0, Some(child)),
+                    StoredDispatch::Window(window) => {
+                        (window.directory, window.window_start, window.next_child)
+                    }
+                };
                 Ok(WalkDispatchPosition {
                     directory: PathBuf::try_from(directory)?,
-                    next_child: PathBuf::try_from(next_child)?.into_os_string(),
+                    window_start,
+                    next_child: next_child
+                        .map(PathBuf::try_from)
+                        .transpose()?
+                        .map(PathBuf::into_os_string),
                 })
             })
             .collect::<io::Result<_>>()?;
@@ -303,7 +336,13 @@ fn decode(bytes: &[u8]) -> io::Result<PrescanCursor> {
         // Never reinterpret a damaged/newer envelope as an empty legacy cursor.
         let checkpoint: Checkpoint = serde_json::from_value(value).map_err(io::Error::other)?;
         if !matches!(checkpoint.version, 1..=VERSION)
-            || (checkpoint.version < VERSION && !checkpoint.progress.walk_dispatch.is_empty())
+            || (checkpoint.version < 3 && !checkpoint.progress.walk_dispatch.is_empty())
+            || (checkpoint.version < 4
+                && checkpoint
+                    .progress
+                    .walk_dispatch
+                    .iter()
+                    .any(|row| matches!(row, StoredDispatch::Window(_))))
             || checksum(checkpoint.version, &checkpoint.progress)? != checkpoint.checksum
         {
             return Err(invalid("pre-scan checkpoint version or checksum mismatch"));
@@ -632,17 +671,65 @@ mod tests {
     }
 
     #[test]
+    fn version_three_checkpoint_keeps_its_original_checksum_and_child_priority() {
+        // Independently encode the shipped v3 tuple shape. Deserializing it
+        // directly into a v4 window would change bytes before verification.
+        let original = br#"{"root":"/root","after":"/root/a","continuations":[],"walk_dispatch":[["/root/nested","next"]]}"#;
+        let mut digest = Sha256::new();
+        digest.update(3_u32.to_le_bytes());
+        digest.update(original);
+        let checksum: [u8; 32] = digest.finalize().into();
+        let envelope = serde_json::json!({
+            "version": 3,
+            "progress": serde_json::from_slice::<serde_json::Value>(original).unwrap(),
+            "checksum": checksum,
+        });
+        let restored = decode(&serde_json::to_vec(&envelope).unwrap()).unwrap();
+        assert_eq!(
+            restored.resume_after(Path::new("/root")),
+            Some(Path::new("/root/a"))
+        );
+        assert_eq!(
+            restored.walk_dispatch(),
+            &[WalkDispatchPosition {
+                directory: PathBuf::from("/root/nested"),
+                window_start: 0,
+                next_child: Some(OsString::from("next")),
+            }]
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cursor.json");
+        save(&restored, &path).unwrap();
+        assert_eq!(read(&path).unwrap(), restored);
+        let upgraded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(upgraded["version"], VERSION);
+        let row = &upgraded["progress"]["walk_dispatch"][0];
+        assert_eq!(row["directory"], "/root/nested");
+        assert_eq!(row["window_start"], 0);
+        assert_eq!(row["next_child"], "next");
+
+        // Window-only metadata cannot be smuggled into a claimed legacy row.
+        let mut forged = envelope;
+        forged["progress"]["walk_dispatch"][0] = serde_json::json!(["/root/nested", "next", 2048]);
+        assert!(serde_json::from_value::<Checkpoint>(forged).is_err());
+    }
+
+    #[test]
     fn recursive_dispatch_survives_shallow_resets_and_keeps_disjoint_roots() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("cursor.json");
         let mut dispatch = WalkDispatchCursor::from_positions(vec![
             WalkDispatchPosition {
                 directory: PathBuf::from("/left/projects"),
-                next_child: OsString::from("next-left"),
+                window_start: 2048,
+                next_child: Some(OsString::from("next-left")),
             },
             WalkDispatchPosition {
                 directory: PathBuf::from("/right/projects"),
-                next_child: OsString::from("next-right"),
+                window_start: 4096,
+                next_child: None,
             },
         ])
         .unwrap();
@@ -682,7 +769,8 @@ mod tests {
             final_state.walk_dispatch()[0].directory,
             Path::new("/right/projects")
         );
-        assert_eq!(final_state.walk_dispatch()[0].next_child, "next-right");
+        assert_eq!(final_state.walk_dispatch()[0].window_start, 4096);
+        assert!(final_state.walk_dispatch()[0].next_child.is_none());
     }
 
     #[test]
@@ -743,7 +831,8 @@ mod tests {
         assert!(expected.remember_walk_order(&order, &roots));
         let dispatch = WalkDispatchCursor::from_positions(vec![WalkDispatchPosition {
             directory: root.join(OsString::from_vec(b"nested-\xfd".to_vec())),
-            next_child: OsString::from_vec(b"pending-\xfc".to_vec()),
+            window_start: 12_345,
+            next_child: Some(OsString::from_vec(b"pending-\xfc".to_vec())),
         }])
         .unwrap();
         assert!(expected.remember_walk_dispatch(&dispatch));
@@ -765,7 +854,8 @@ mod tests {
         let mut good = cursor("/root", "examined");
         let dispatch = WalkDispatchCursor::from_positions(vec![WalkDispatchPosition {
             directory: PathBuf::from("/root/nested"),
-            next_child: OsString::from("next"),
+            window_start: 0,
+            next_child: Some(OsString::from("next")),
         }])
         .unwrap();
         good.remember_walk_dispatch(&dispatch);
@@ -784,12 +874,16 @@ mod tests {
             "bad\0name",
         ] {
             let mut invalid_cursor = good.clone();
-            Arc::make_mut(&mut invalid_cursor.walk_dispatch)[0].next_child = OsString::from(child);
+            Arc::make_mut(&mut invalid_cursor.walk_dispatch)[0].next_child =
+                Some(OsString::from(child));
             assert!(save(&invalid_cursor, &path).is_err(), "{child:?}");
             // Recompute the checksum to distinguish malformed-path refusal
             // from an incidental corruption check.
             let mut progress = Progress::from_cursor(&good).unwrap();
-            progress.walk_dispatch[0].1 = StoredPath::Text(child.into());
+            let StoredDispatch::Window(window) = &mut progress.walk_dispatch[0] else {
+                panic!("new checkpoints use window rows");
+            };
+            window.next_child = Some(StoredPath::Text(child.into()));
             let envelope = Checkpoint {
                 version: VERSION,
                 checksum: checksum(VERSION, &progress).unwrap(),
@@ -804,10 +898,13 @@ mod tests {
             assert!(save(&invalid_cursor, &path).is_err(), "{directory:?}");
         }
         let mut duplicate = Progress::from_cursor(&good).unwrap();
-        duplicate.walk_dispatch.push((
-            StoredPath::Text("/root/nested".into()),
-            StoredPath::Text("another".into()),
-        ));
+        duplicate
+            .walk_dispatch
+            .push(StoredDispatch::Window(StoredWindow {
+                directory: StoredPath::Text("/root/nested".into()),
+                window_start: 2048,
+                next_child: Some(StoredPath::Text("another".into())),
+            }));
         assert!(duplicate.into_cursor().is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
         assert_eq!(read(&path).unwrap(), good);
@@ -828,7 +925,8 @@ mod tests {
             (0..=MAX_DISPATCH_CURSOR_ROWS)
                 .map(|index| WalkDispatchPosition {
                     directory: PathBuf::from(format!("/root-{index}")),
-                    next_child: OsString::from("next"),
+                    window_start: 0,
+                    next_child: Some(OsString::from("next")),
                 })
                 .collect(),
         );
@@ -836,7 +934,10 @@ mod tests {
         let mut too_long = good.clone();
         too_long.walk_dispatch = Arc::new(vec![WalkDispatchPosition {
             directory: PathBuf::from("/root"),
-            next_child: OsString::from("x".repeat(MAX_DISPATCH_CURSOR_PATH_BYTES + 1)),
+            window_start: 0,
+            next_child: Some(OsString::from(
+                "x".repeat(MAX_DISPATCH_CURSOR_PATH_BYTES + 1),
+            )),
         }]);
         assert!(save(&too_long, &path).is_err());
         let mut too_large = good.clone();
@@ -847,7 +948,8 @@ mod tests {
                         "/root-{index}/{}",
                         "x".repeat(MAX_DISPATCH_CURSOR_PATH_BYTES - 32),
                     )),
-                    next_child: OsString::from("next"),
+                    window_start: 0,
+                    next_child: Some(OsString::from("next")),
                 })
                 .collect(),
         );
@@ -871,7 +973,8 @@ mod tests {
             (0..32)
                 .map(|index| WalkDispatchPosition {
                     directory: PathBuf::from(format!("/{}{index}", "\u{2}".repeat(15_000))),
-                    next_child: OsString::from("next"),
+                    window_start: 0,
+                    next_child: Some(OsString::from("next")),
                 })
                 .collect(),
         )
@@ -888,7 +991,8 @@ mod tests {
     fn dispatch_corruption_and_history_in_old_envelopes_are_refused() {
         let dispatch = WalkDispatchCursor::from_positions(vec![WalkDispatchPosition {
             directory: PathBuf::from("/root/nested"),
-            next_child: OsString::from("next"),
+            window_start: 2048,
+            next_child: Some(OsString::from("next")),
         }])
         .unwrap();
         let mut state = cursor("/root", "a");
@@ -900,9 +1004,12 @@ mod tests {
             progress,
         };
         let mut corrupt = serde_json::to_value(&envelope).unwrap();
-        corrupt["progress"]["walk_dispatch"][0][1] = serde_json::json!("changed");
+        corrupt["progress"]["walk_dispatch"][0]["next_child"] = serde_json::json!("changed");
         assert!(decode(&serde_json::to_vec(&corrupt).unwrap()).is_err());
-        for version in [1, 2] {
+        let mut shifted = serde_json::to_value(&envelope).unwrap();
+        shifted["progress"]["walk_dispatch"][0]["window_start"] = serde_json::json!(4096);
+        assert!(decode(&serde_json::to_vec(&shifted).unwrap()).is_err());
+        for version in [1, 2, 3] {
             let progress = Progress::from_cursor(&state).unwrap();
             let old = Checkpoint {
                 version,

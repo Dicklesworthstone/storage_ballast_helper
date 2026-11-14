@@ -22,7 +22,8 @@ use storage_ballast_helper::monitor::voi_scheduler::{
 use storage_ballast_helper::scanner::prescan_cursor::PrescanCursor;
 use storage_ballast_helper::scanner::protection::ProtectionRegistry;
 use storage_ballast_helper::scanner::walker::{
-    DirectoryWalker, WalkDispatchCursor, WalkDispatchPosition, WalkEntry, WalkerConfig,
+    DirectoryWalker, MAX_ENTRIES_PER_DIR, WalkDispatchCursor, WalkDispatchPosition, WalkEntry,
+    WalkerConfig,
 };
 
 fn fixture(count: usize) -> (tempfile::TempDir, Vec<PathBuf>) {
@@ -326,6 +327,30 @@ fn finite_walker_slice(
     (received, unfinished)
 }
 
+fn unconsumed_walker_slice(
+    walker: DirectoryWalker,
+    allowance: usize,
+) -> (Vec<WalkEntry>, Vec<PathBuf>) {
+    let (stopped_tx, stopped_rx) = crossbeam_channel::bounded(1);
+    let cancel = walker.cancel_token();
+    let ticks = AtomicUsize::new(0);
+    let walker = walker.with_heartbeat(move || {
+        if ticks.fetch_add(1, Ordering::Relaxed) + 1 >= allowance {
+            cancel.store(true, Ordering::Relaxed);
+            let _ = stopped_tx.try_send(());
+        }
+    });
+    let stream = walker.stream().unwrap();
+    drop(walker);
+    stopped_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the worker must reach its finite queued-work boundary");
+    let unfinished = stream
+        .unfinished_after_cancel(Duration::from_secs(5))
+        .expect("unconsumed output must settle without receiving its receipts");
+    (Vec::new(), unfinished)
+}
+
 fn child_fixture(root: &Path, count: usize) -> BTreeSet<PathBuf> {
     (0..count)
         .map(|index| {
@@ -504,6 +529,7 @@ struct RestartRequest {
     observations: PathBuf,
     allowance: Option<usize>,
     stop_depth: usize,
+    consume_results: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -534,6 +560,7 @@ impl RestartRequest {
             observations: base.join("observations.json"),
             allowance: Some(48),
             stop_depth: 3,
+            consume_results: true,
         }
     }
 
@@ -579,10 +606,23 @@ fn restart_child_if_requested(test: &str) -> bool {
     let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only())
         .without_file_sizes()
         .with_dispatch_cursor(Arc::clone(&dispatch));
-    let (received, unfinished) = if let Some(allowance) = request.allowance {
+    let (received, unfinished) = if !request.consume_results {
+        unconsumed_walker_slice(
+            walker,
+            request
+                .allowance
+                .expect("unconsumed work needs a finite budget"),
+        )
+    } else if let Some(allowance) = request.allowance {
         finite_walker_slice(walker, allowance, |entry| entry.depth >= request.stop_depth)
     } else {
-        (walker.walk().unwrap(), Vec::new())
+        let mut stream = walker.stream().unwrap();
+        drop(walker);
+        let received = stream.by_ref().collect();
+        let unfinished = stream
+            .unfinished_after_cancel(Duration::from_secs(5))
+            .expect("completed workers must publish final coverage receipts");
+        (received, unfinished)
     };
     // The finite helper waits for canceled workers and never acknowledges
     // buffered output after cancellation. Persist only those actual receipts.
@@ -708,7 +748,7 @@ fn offline_insertions_before_restored_child_priority_are_still_visited() {
         .find(|position| position.directory == group)
         .expect("the consumed leaf must remember its next sibling");
     let inserted = group.join("000-offline-insertion");
-    assert!(prior.next_child.as_os_str() > inserted.file_name().unwrap());
+    assert!(prior.next_child.as_deref().unwrap() > inserted.file_name().unwrap());
     fs::create_dir(&inserted).unwrap();
     fs::write(inserted.join("payload"), b"preserved").unwrap();
     expected.insert(inserted.clone());
@@ -819,7 +859,7 @@ fn old_checkpoint_checksums_and_root_opportunities_survive_public_api_upgrade() 
     let temp = tempfile::tempdir().unwrap();
     // These are literal old-format payloads, independently of the current
     // checkpoint encoder. Their checksum includes their original version.
-    let fixtures: [(u32, &[u8]); 2] = [
+    let fixtures: [(u32, &[u8]); 3] = [
         (
             1,
             br#"{"root":"/legacy-a","after":"/legacy-a/seen","continuations":[["/legacy-b","/legacy-b/previous"]]}"#,
@@ -827,6 +867,10 @@ fn old_checkpoint_checksums_and_root_opportunities_survive_public_api_upgrade() 
         (
             2,
             br#"{"root":"/legacy-a","after":"/legacy-a/seen","continuations":[["/legacy-b","/legacy-b/previous"]],"walk_order":[["/legacy-a",7,false],["/legacy-b",11,true]]}"#,
+        ),
+        (
+            3,
+            br#"{"root":"/legacy-a","after":"/legacy-a/seen","continuations":[["/legacy-b","/legacy-b/previous"]],"walk_order":[["/legacy-a",7,false],["/legacy-b",11,true]],"walk_dispatch":[["/legacy-a/projects","next"]]}"#,
         ),
     ];
     for (version, payload) in fixtures {
@@ -850,12 +894,23 @@ fn old_checkpoint_checksums_and_root_opportunities_survive_public_api_upgrade() 
                 Some(Path::new("/legacy-a/seen")),
             )
         );
-        assert!(restored.walk_dispatch().is_empty());
+        if version == 3 {
+            assert_eq!(
+                restored.walk_dispatch(),
+                [WalkDispatchPosition {
+                    directory: PathBuf::from("/legacy-a/projects"),
+                    window_start: 0,
+                    next_child: Some("next".into()),
+                }]
+            );
+        } else {
+            assert!(restored.walk_dispatch().is_empty());
+        }
         restored.save(&path).unwrap();
         assert_eq!(PrescanCursor::load(&path), restored);
         let upgraded: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(upgraded["version"], 3);
+        assert_eq!(upgraded["version"], 4);
         assert_eq!(
             upgraded["progress"]["continuations"],
             envelope["progress"]["continuations"]
@@ -880,9 +935,18 @@ fn native_dispatch_names_round_trip_through_the_public_checkpoint_api() {
     let after = root.join(OsString::from_vec(b"examined-\xfe".to_vec()));
     let position = WalkDispatchPosition {
         directory: root.join(OsString::from_vec(b"nested-\xfd".to_vec())),
-        next_child: OsString::from_vec(b"pending-\xfc".to_vec()),
+        window_start: MAX_ENTRIES_PER_DIR,
+        next_child: Some(OsString::from_vec(b"pending-\xfc".to_vec())),
     };
-    let dispatch = WalkDispatchCursor::from_positions(vec![position.clone()]).unwrap();
+    let positions = vec![
+        position,
+        WalkDispatchPosition {
+            directory: PathBuf::from("/other"),
+            window_start: 2 * MAX_ENTRIES_PER_DIR,
+            next_child: None,
+        },
+    ];
+    let dispatch = WalkDispatchCursor::from_positions(positions.clone()).unwrap();
     let mut state = PrescanCursor::new();
     state.advance(&root, &after);
     assert!(state.remember_walk_dispatch(&dispatch));
@@ -894,9 +958,13 @@ fn native_dispatch_names_round_trip_through_the_public_checkpoint_api() {
         restored.position(),
         (Some(root.as_path()), Some(after.as_path()))
     );
-    assert_eq!(restored.walk_dispatch(), [position.clone()]);
+    assert_eq!(restored.walk_dispatch(), positions);
     assert_eq!(
-        restored.walk_dispatch()[0].next_child.as_bytes(),
+        restored.walk_dispatch()[0]
+            .next_child
+            .as_deref()
+            .unwrap()
+            .as_bytes(),
         b"pending-\xfc"
     );
 
@@ -905,7 +973,253 @@ fn native_dispatch_names_round_trip_through_the_public_checkpoint_api() {
     restored.save(&checkpoint).unwrap();
     let reset = PrescanCursor::load(&checkpoint);
     assert_eq!(reset.position(), (None, None));
-    assert_eq!(reset.walk_dispatch(), [position.clone()]);
+    assert_eq!(reset.walk_dispatch(), positions);
     assert!(restored.remember_walk_dispatch(&WalkDispatchCursor::new()));
-    assert_eq!(rewind.walk_dispatch(), [position]);
+    assert_eq!(rewind.walk_dispatch(), positions);
+}
+
+fn save_restart_priority(request: &RestartRequest, position: WalkDispatchPosition) {
+    let mut state = PrescanCursor::load(&request.checkpoint);
+    let mut positions = state.walk_dispatch().to_vec();
+    positions.retain(|existing| existing.directory != position.directory);
+    positions.push(position);
+    let dispatch = WalkDispatchCursor::from_positions(positions).unwrap();
+    state.remember_walk_dispatch(&dispatch);
+    state.save(&request.checkpoint).unwrap();
+}
+
+fn restart_priority(request: &RestartRequest, root: &Path) -> WalkDispatchPosition {
+    PrescanCursor::load(&request.checkpoint)
+        .walk_dispatch()
+        .iter()
+        .find(|position| position.directory == root)
+        .expect("the stopped root must preserve its next processing window")
+        .clone()
+}
+
+fn received_children(observed: &RestartObservation, parent: &Path) -> BTreeSet<PathBuf> {
+    observed
+        .received
+        .iter()
+        .filter(|entry| entry.path.parent() == Some(parent))
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
+fn assert_oversized_restart_rechecks_marker_and_shrink(
+    request: &mut RestartRequest,
+    root: &Path,
+    boundary: &Path,
+    later_window: WalkDispatchPosition,
+) {
+    let window = usize::try_from(MAX_ENTRIES_PER_DIR).unwrap();
+    let authorized_ancestors: BTreeSet<_> = root
+        .ancestors()
+        .filter(|path| {
+            request
+                .roots
+                .iter()
+                .any(|configured| path.starts_with(configured))
+        })
+        .map(Path::to_path_buf)
+        .collect();
+    let marker = root.join(".sbh-protect");
+    fs::write(&marker, b"new offline protection").unwrap();
+    let marker_index = fs::read_dir(root)
+        .unwrap()
+        .position(|entry| entry.unwrap().path() == marker)
+        .unwrap();
+    // Select a processing window that does not contain the new marker. A
+    // fresh name scan beyond that window must still protect the whole root.
+    save_restart_priority(
+        request,
+        WalkDispatchPosition {
+            directory: root.to_path_buf(),
+            window_start: if marker_index < window {
+                MAX_ENTRIES_PER_DIR
+            } else {
+                0
+            },
+            next_child: None,
+        },
+    );
+    request.allowance = None;
+    let protected = request.run();
+    assert!(
+        protected.received.iter().all(|entry| {
+            !entry.path.starts_with(root) && authorized_ancestors.contains(&entry.path)
+        }),
+        "a restored window cannot expose any protected subtree entry: {protected:?}"
+    );
+    assert_eq!(fs::read(&marker).unwrap(), b"new offline protection");
+
+    // Keep the actual later-window receipt, then shrink the configured path
+    // offline by moving its complete old tree aside. Nothing is deleted.
+    save_restart_priority(request, later_window);
+    let retained = request.checkpoint.with_file_name("retained-wide-tree");
+    fs::rename(root, &retained).unwrap();
+    let replacement = BTreeSet::from([root.join("new-a"), root.join("new-b")]);
+    for child in &replacement {
+        fs::create_dir_all(child).unwrap();
+        fs::write(child.join("payload"), b"new fixture").unwrap();
+    }
+    request.allowance = Some(48);
+    let out_of_range = request.run();
+    assert!(
+        out_of_range
+            .received
+            .iter()
+            .all(|entry| authorized_ancestors.contains(&entry.path)),
+        "an ancestor observation cannot count as the skipped children: {out_of_range:?}"
+    );
+    assert!(out_of_range.unfinished.contains(&root.to_path_buf()));
+    let reset = PrescanCursor::load(&request.checkpoint);
+    assert!(
+        reset
+            .walk_dispatch()
+            .iter()
+            .all(|position| { position.directory != root || position.window_start == 0 }),
+        "an obsolete window cannot remain the next priority"
+    );
+    request.allowance = None;
+    let revisited = request.run();
+    assert!(revisited.unfinished.is_empty(), "{revisited:?}");
+    assert_eq!(received_children(&revisited, root), replacement);
+
+    // Even an offset still inside EOF skipped a prefix. A now-small listing
+    // cannot certify that prefix merely because it fits the ordinary window.
+    save_restart_priority(
+        request,
+        WalkDispatchPosition {
+            directory: root.to_path_buf(),
+            window_start: 1,
+            next_child: None,
+        },
+    );
+    let tail = request.run();
+    let tail_children = received_children(&tail, root);
+    assert_eq!(tail_children.len(), 1, "{tail:?}");
+    assert!(replacement.contains(tail_children.first().unwrap()));
+    assert!(tail.unfinished.contains(&root.to_path_buf()));
+    assert_eq!(restart_priority(request, root).window_start, 0);
+    let fresh = request.run();
+    assert!(fresh.unfinished.is_empty(), "{fresh:?}");
+    assert_eq!(received_children(&fresh, root), replacement);
+    for child in replacement {
+        assert_eq!(fs::read(child.join("payload")).unwrap(), b"new fixture");
+    }
+    assert_eq!(
+        fs::read(retained.join(boundary.file_name().unwrap()).join("payload")).unwrap(),
+        b"retained wide fixture"
+    );
+    assert_eq!(fs::read_dir(&retained).unwrap().count(), window + 9);
+}
+
+#[test]
+fn oversized_windows_survive_process_restart_only_after_received_boundary_work() {
+    const TEST: &str =
+        "oversized_windows_survive_process_restart_only_after_received_boundary_work";
+    if restart_child_if_requested(TEST) {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let configured = base.join("tree");
+    let root = configured.join("wide-tree");
+    fs::create_dir_all(&root).unwrap();
+    let window = usize::try_from(MAX_ENTRIES_PER_DIR).unwrap();
+    for index in 0..window + 8 {
+        fs::create_dir(root.join(format!("child-{index:05}"))).unwrap();
+    }
+    // Native enumeration order is intentionally unspecified. Observe this
+    // unchanged first page, then start near its sorted dispatch boundary;
+    // the real production window remains 65,536, without a test-only knob.
+    let first_page: BTreeSet<_> = fs::read_dir(&root)
+        .unwrap()
+        .take(window)
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(first_page.len(), window);
+    let remainder: BTreeSet<_> = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| !first_page.contains(path))
+        .collect();
+    assert_eq!(remainder.len(), 8);
+    let boundary = first_page.last().unwrap().clone();
+    fs::write(boundary.join("payload"), b"retained wide fixture").unwrap();
+    let mut request = RestartRequest::new(TEST, &base, vec![configured.clone()]);
+    request.allowance = Some(window / 256 + 32);
+    request.stop_depth = 2;
+    // The ancestor's ordinary dispatch permit must not permanently prevent
+    // its child from opening a full production-size processing window.
+    save_restart_priority(
+        &request,
+        WalkDispatchPosition {
+            directory: configured,
+            window_start: 0,
+            next_child: Some(root.file_name().unwrap().to_os_string()),
+        },
+    );
+    let initial = WalkDispatchPosition {
+        directory: root.clone(),
+        window_start: 0,
+        next_child: Some(boundary.file_name().unwrap().to_os_string()),
+    };
+    save_restart_priority(&request, initial.clone());
+
+    request.consume_results = false;
+    let queued = request.run();
+    assert!(queued.received.is_empty());
+    assert!(queued.unfinished.contains(&boundary), "{queued:?}");
+    assert_eq!(restart_priority(&request, &root), initial);
+
+    request.consume_results = true;
+    let received = request.run();
+    assert_eq!(
+        received_children(&received, &root),
+        BTreeSet::from([boundary.clone()]),
+        "{received:?}"
+    );
+    assert_eq!(
+        received
+            .received
+            .iter()
+            .find(|entry| entry.path == boundary)
+            .unwrap()
+            .depth,
+        2,
+        "restored window work must retain its ordinary ancestor depth"
+    );
+    let later_window = restart_priority(&request, &root);
+    assert_eq!(later_window.window_start, MAX_ENTRIES_PER_DIR);
+    assert!(later_window.next_child.is_none());
+    assert!(received.unfinished.contains(&root));
+
+    let mut later_seen = BTreeSet::new();
+    for _ in 0..remainder.len() {
+        let resumed = request.run();
+        let later_children = received_children(&resumed, &root);
+        assert_eq!(later_children.len(), 1, "{resumed:?}");
+        assert!(remainder.contains(later_children.first().unwrap()));
+        assert!(
+            resumed
+                .received
+                .iter()
+                .filter(|entry| entry.path.parent() == Some(root.as_path()))
+                .all(|entry| entry.depth == 2)
+        );
+        assert!(resumed.restored_positions > 0);
+        later_seen.extend(later_children);
+    }
+    assert_eq!(later_seen, remainder);
+    let wrapped = restart_priority(&request, &root);
+    assert_eq!(wrapped.window_start, 0);
+    assert!(wrapped.next_child.is_none());
+    assert_oversized_restart_rechecks_marker_and_shrink(
+        &mut request,
+        &root,
+        &boundary,
+        later_window,
+    );
 }

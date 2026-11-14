@@ -27,14 +27,24 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Very wide directories retain their processing window across restarts**
+  (bd-kf7k), within the bounded dispatch history. Fresh enumeration still
+  checks all names for protection markers;
+  a window advances only after its boundary child is received or explicitly
+  skipped, so queued but unconsumed work keeps its turn. A stale window after
+  directory shrink resets to zero and remains unfinished until revisited.
+  Deep dispatch releases ancestor continuations when they would prevent a
+  wider child from obtaining capacity, retaining their unfinished scopes and
+  compact receipts. Buffered results no longer pin entire child-name pages.
+  The v4 checkpoint continues to read original v1, v2 and v3 checkpoints.
 - **Recursive scans retain child-dispatch priority across daemon restarts**
   (bd-kf7k). Bounded, byte-preserving next-child bookmarks now accompany root
   scheduling in the existing checkpoint. Fresh processes can continue into
   later nested branches while re-reading ancestors and applying current
   protections, exclusions, depth and filesystem boundaries. Only consumed
   results or explicit policy skips advance priority; canceled workers cannot
-  change a later pass's settled checkpoint. Partial directory enumeration and
-  oversized-directory window positions still require a live daemon.
+  change a later pass's settled checkpoint. Partial directory enumeration
+  still requires a live daemon.
 - **Finite pressure scans retain root scheduling across daemon restarts**
   (bd-kf7k). Only a recursive walk that actually starts spends a leading-root
   opportunity. Those opportunities now share the bounded, checksummed pre-scan

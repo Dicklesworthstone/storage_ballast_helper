@@ -1,9 +1,9 @@
 //! Durable scheduling hints for recursive directory dispatch.
 //!
-//! Only the next child basename is remembered. A restored walk still starts
-//! from its current roots, reads every ancestor's names and protection markers,
-//! and visits a full circular child page. No metadata, classification, observed
-//! result, directory handle or coverage receipt is restored.
+//! Only the current child window and next basename are remembered. A restored
+//! walk still starts from its current roots, reads every ancestor's names and
+//! protection markers, and visits a full circular child page. No metadata,
+//! classification, observed result, handle or coverage receipt is restored.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,27 +25,47 @@ pub const MAX_DISPATCH_CURSOR_PATH_BYTES: usize = 16 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalkDispatchPosition {
     pub directory: PathBuf,
-    pub next_child: OsString,
+    pub window_start: u32,
+    pub next_child: Option<OsString>,
+}
+
+#[derive(Debug, Clone)]
+struct RecordedPosition {
+    window_start: u32,
+    next_child: Option<OsString>,
 }
 
 #[derive(Debug, Default)]
 struct PositionCell {
-    next_child: Mutex<Option<OsString>>,
+    position: Mutex<Option<RecordedPosition>>,
 }
 
 impl PositionCell {
-    fn snapshot(&self) -> Option<OsString> {
-        self.next_child.lock().clone()
+    fn snapshot(&self) -> Option<RecordedPosition> {
+        self.position.lock().clone()
     }
 
-    fn record(&self, next_child: &OsStr) {
-        let mut position = self.next_child.lock();
+    fn record(&self, from_window: u32, window_start: u32, next_child: Option<&OsStr>) {
+        let mut position = self.position.lock();
         if let Some(current) = position.as_mut() {
-            if current.as_os_str() != next_child {
-                next_child.clone_into(current);
+            // A boundary receipt has already moved this page to its next
+            // window. Repeated ancestor receipts or late wrapped children
+            // cannot roll it back or spend another window's opportunity.
+            if current.window_start != from_window {
+                return;
+            }
+            current.window_start = window_start;
+            match (current.next_child.as_mut(), next_child) {
+                (Some(kept), Some(next)) if kept.as_os_str() != next => next.clone_into(kept),
+                (None, Some(next)) => current.next_child = Some(next.to_os_string()),
+                (_, None) => current.next_child = None,
+                _ => {}
             }
         } else {
-            *position = Some(next_child.to_os_string());
+            *position = Some(RecordedPosition {
+                window_start,
+                next_child: next_child.map(OsStr::to_os_string),
+            });
         }
     }
 }
@@ -64,6 +84,8 @@ struct Remembered {
 /// Worker pages register once; collector receipts update independent per-page
 /// cells, without locking this map on every result. A newer page replaces its
 /// cell, so an older canceled worker cannot overwrite newer progress.
+/// History is best effort within the row and raw-byte limits: an evicted
+/// directory's window and child priority may restart from the first window.
 #[derive(Debug, Default)]
 pub struct WalkDispatchCursor {
     positions: BTreeMap<PathBuf, Remembered>,
@@ -88,8 +110,11 @@ impl WalkDispatchCursor {
         let mut cursor = Self::new();
         for position in positions {
             validate_directory(&position.directory)?;
-            validate_child(&position.next_child)?;
-            let bytes = raw_len(position.directory.as_os_str()) + raw_len(&position.next_child);
+            if let Some(child) = &position.next_child {
+                validate_child(child)?;
+            }
+            let bytes = raw_len(position.directory.as_os_str())
+                + position.next_child.as_deref().map_or(0, raw_len);
             if bytes > MAX_DISPATCH_CURSOR_BYTES.saturating_sub(cursor.bytes) {
                 return Err(invalid("recursive dispatch path storage exceeds the limit"));
             }
@@ -99,7 +124,10 @@ impl WalkDispatchCursor {
             cursor.insert(
                 position.directory,
                 Arc::new(PositionCell {
-                    next_child: Mutex::new(Some(position.next_child)),
+                    position: Mutex::new(Some(RecordedPosition {
+                        window_start: position.window_start,
+                        next_child: position.next_child,
+                    })),
                 }),
                 bytes,
             );
@@ -117,9 +145,10 @@ impl WalkDispatchCursor {
                 remembered
                     .cell
                     .snapshot()
-                    .map(|next_child| WalkDispatchPosition {
+                    .map(|position| WalkDispatchPosition {
                         directory: directory.clone(),
-                        next_child,
+                        window_start: position.window_start,
+                        next_child: position.next_child,
                     })
             })
             .collect()
@@ -197,9 +226,11 @@ impl WalkDispatchCursor {
         &mut self,
         generation: u64,
         directory: &Path,
+        window_start: u32,
+        next_window: Option<u32>,
         children: Arc<Vec<OsString>>,
     ) -> Option<Arc<PagePriority>> {
-        if generation != self.generation || children.is_empty() {
+        if generation != self.generation {
             return None;
         }
         validate_directory(directory).ok()?;
@@ -214,13 +245,25 @@ impl WalkDispatchCursor {
             .positions
             .get(directory)
             .and_then(|entry| entry.cell.snapshot());
-        let bytes = raw_len(directory.as_os_str())
-            + maximum_name.max(remembered.as_deref().map_or(0, raw_len));
-        let start = remembered
-            .as_deref()
+        if remembered
+            .as_ref()
+            .is_some_and(|position| position.window_start != window_start)
+        {
+            // Another page of an overlapping walk already moved this
+            // directory forward. Its earlier page may finish normally but
+            // cannot replace the newer scheduling position.
+            return None;
+        }
+        let next_child = remembered
+            .as_ref()
+            .and_then(|position| position.next_child.as_deref());
+        let bytes =
+            raw_len(directory.as_os_str()) + maximum_name.max(next_child.map_or(0, raw_len));
+        let start = next_child
+            .filter(|_| !children.is_empty())
             .map(|name| start_index(&children, name));
         let cell = Arc::new(PositionCell {
-            next_child: Mutex::new(remembered),
+            position: Mutex::new(remembered),
         });
         self.insert(directory.to_path_buf(), Arc::clone(&cell), bytes);
         self.enforce_bounds();
@@ -235,6 +278,8 @@ impl WalkDispatchCursor {
             cell,
             children,
             start,
+            window_start,
+            next_window,
         }))
     }
 }
@@ -255,26 +300,88 @@ impl DispatchContext {
     pub(super) fn register(
         &self,
         directory: &Path,
+        window_start: u32,
+        next_window: Option<u32>,
         children: Arc<Vec<OsString>>,
     ) -> Option<Arc<PagePriority>> {
+        self.cursor.lock().register(
+            self.generation,
+            directory,
+            window_start,
+            next_window,
+            children,
+        )
+    }
+
+    pub(super) fn window_start(&self, directory: &Path) -> u32 {
         self.cursor
             .lock()
-            .register(self.generation, directory, children)
+            .positions
+            .get(directory)
+            .and_then(|entry| entry.cell.snapshot())
+            .map_or(0, |position| position.window_start)
     }
 }
 
-/// Live receipts share a page's existing names. The cursor registry retains
-/// only `cell`, so durable history cannot pin thousands of full name pages.
+/// A live read owns its child names. The cursor registry and queued collector
+/// receipts retain only small cells and individual next basenames.
 #[derive(Debug)]
 pub(super) struct PagePriority {
     cell: Arc<PositionCell>,
     children: Arc<Vec<OsString>>,
     pub(super) start: Option<usize>,
+    window_start: u32,
+    next_window: Option<u32>,
 }
 
 impl PagePriority {
+    pub(super) fn receipt(&self, next: usize) -> Arc<PriorityReceipt> {
+        let (window_start, next_child) = if next == 0
+            && let Some(next_window) = self.next_window
+        {
+            (next_window, None)
+        } else {
+            (self.window_start, Some(self.children[next].clone()))
+        };
+        Arc::new(PriorityReceipt {
+            cell: Arc::clone(&self.cell),
+            from_window: self.window_start,
+            window_start,
+            next_child,
+        })
+    }
+
+    #[cfg(test)]
     pub(super) fn observed(&self, next: usize) {
-        self.cell.record(&self.children[next]);
+        self.receipt(next).observed();
+    }
+
+    pub(super) fn skip_empty_window(&self) {
+        if self.children.is_empty()
+            && let Some(next_window) = self.next_window
+        {
+            self.cell.record(self.window_start, next_window, None);
+        }
+    }
+}
+
+/// A pending result must not keep an evicted page's full child vector alive.
+/// Clones share just this receipt's next basename and its bounded cursor cell.
+#[derive(Debug)]
+pub(super) struct PriorityReceipt {
+    cell: Arc<PositionCell>,
+    from_window: u32,
+    window_start: u32,
+    next_child: Option<OsString>,
+}
+
+impl PriorityReceipt {
+    pub(super) fn observed(&self) {
+        self.cell.record(
+            self.from_window,
+            self.window_start,
+            self.next_child.as_deref(),
+        );
     }
 }
 
@@ -366,7 +473,7 @@ mod tests {
         let first = DispatchContext::new(Arc::clone(&cursor));
         let names = Arc::new(vec![OsString::from("a"), OsString::from("b")]);
         let old = first
-            .register(Path::new("/root"), Arc::clone(&names))
+            .register(Path::new("/root"), 0, None, Arc::clone(&names))
             .unwrap();
         assert!(
             cursor.lock().snapshot().is_empty(),
@@ -375,12 +482,41 @@ mod tests {
         old.observed(1);
         let second = DispatchContext::new(Arc::clone(&cursor));
         let current = second
-            .register(Path::new("/root"), Arc::clone(&names))
+            .register(Path::new("/root"), 0, None, Arc::clone(&names))
             .unwrap();
         current.observed(0);
         old.observed(1);
-        assert!(first.register(Path::new("/root"), names).is_none());
-        assert_eq!(cursor.lock().snapshot()[0].next_child, OsStr::new("a"));
+        assert!(first.register(Path::new("/root"), 0, None, names).is_none());
+        assert_eq!(
+            cursor.lock().snapshot()[0].next_child.as_deref(),
+            Some(OsStr::new("a"))
+        );
+    }
+
+    #[test]
+    fn compact_receipt_outlives_its_page_without_retaining_child_names() {
+        let cursor = Arc::new(Mutex::new(WalkDispatchCursor::new()));
+        let walk = DispatchContext::new(Arc::clone(&cursor));
+        let names = Arc::new(vec![OsString::from("a"), OsString::from("b")]);
+        let weak_names = Arc::downgrade(&names);
+        let page = walk
+            .register(Path::new("/root"), 0, None, Arc::clone(&names))
+            .unwrap();
+        let receipt = page.receipt(1);
+        drop(page);
+        drop(names);
+        assert!(weak_names.upgrade().is_none());
+        assert!(cursor.lock().snapshot().is_empty());
+
+        receipt.observed();
+        assert_eq!(
+            cursor.lock().snapshot(),
+            vec![WalkDispatchPosition {
+                directory: PathBuf::from("/root"),
+                window_start: 0,
+                next_child: Some(OsString::from("b")),
+            }]
+        );
     }
 
     #[test]
@@ -389,7 +525,7 @@ mod tests {
         let old_walk = DispatchContext::new(Arc::clone(&abandoned));
         let names = Arc::new(vec![OsString::from("a"), OsString::from("b")]);
         let old_page = old_walk
-            .register(Path::new("/root"), Arc::clone(&names))
+            .register(Path::new("/root"), 0, None, Arc::clone(&names))
             .unwrap();
         old_page.observed(1);
         let settled = WalkDispatchCursor::from_positions(abandoned.lock().snapshot()).unwrap();
@@ -397,13 +533,21 @@ mod tests {
             WalkDispatchCursor::from_positions(settled.snapshot()).unwrap(),
         ));
         let next_walk = DispatchContext::new(Arc::clone(&next));
-        let next_page = next_walk.register(Path::new("/root"), names).unwrap();
+        let next_page = next_walk
+            .register(Path::new("/root"), 0, None, names)
+            .unwrap();
         next_page.observed(0);
 
         old_page.observed(0);
-        assert_eq!(settled.snapshot()[0].next_child, OsStr::new("b"));
+        assert_eq!(
+            settled.snapshot()[0].next_child.as_deref(),
+            Some(OsStr::new("b"))
+        );
         old_page.observed(1);
-        assert_eq!(next.lock().snapshot()[0].next_child, OsStr::new("a"));
+        assert_eq!(
+            next.lock().snapshot()[0].next_child.as_deref(),
+            Some(OsStr::new("a"))
+        );
     }
 
     #[test]
@@ -412,7 +556,8 @@ mod tests {
         let remembered = OsString::from("x".repeat(MAX_DISPATCH_CURSOR_PATH_BYTES));
         let mut cursor = WalkDispatchCursor::from_positions(vec![WalkDispatchPosition {
             directory: directory.clone(),
-            next_child: remembered.clone(),
+            window_start: 0,
+            next_child: Some(remembered.clone()),
         }])
         .unwrap();
         let generation = cursor.begin_walk();
@@ -420,13 +565,118 @@ mod tests {
             .register(
                 generation,
                 &directory,
+                0,
+                None,
                 Arc::new(vec![OsString::from("new")]),
             )
             .unwrap();
-        assert_eq!(cursor.snapshot()[0].next_child, remembered);
+        assert_eq!(cursor.snapshot()[0].next_child, Some(remembered.clone()));
         assert_eq!(
             cursor.bytes,
             raw_len(directory.as_os_str()) + raw_len(&remembered)
+        );
+    }
+
+    #[test]
+    fn a_window_boundary_receipt_is_sticky_until_the_next_page() {
+        let directory = PathBuf::from("/root");
+        let cursor = Arc::new(Mutex::new(
+            WalkDispatchCursor::from_positions(vec![WalkDispatchPosition {
+                directory: directory.clone(),
+                window_start: 0,
+                next_child: Some("b".into()),
+            }])
+            .unwrap(),
+        ));
+        let first = DispatchContext::new(Arc::clone(&cursor));
+        let page = first
+            .register(
+                &directory,
+                0,
+                Some(2),
+                Arc::new(vec!["a".into(), "b".into()]),
+            )
+            .unwrap();
+        assert_eq!(page.start, Some(1));
+        assert_eq!(
+            cursor.lock().snapshot()[0].window_start,
+            0,
+            "reading and registering the boundary is not receiving it"
+        );
+
+        page.observed(0);
+        page.observed(1);
+        page.observed(0);
+        assert_eq!(
+            cursor.lock().snapshot(),
+            vec![WalkDispatchPosition {
+                directory: directory.clone(),
+                window_start: 2,
+                next_child: None,
+            }],
+            "wrapped or repeated old-page receipts cannot roll back the window"
+        );
+
+        let settled = cursor.lock().snapshot();
+        let next_cursor = Arc::new(Mutex::new(
+            WalkDispatchCursor::from_positions(settled).unwrap(),
+        ));
+        let second = DispatchContext::new(Arc::clone(&next_cursor));
+        let last_page = second
+            .register(&directory, 2, Some(0), Arc::new(vec!["c".into()]))
+            .unwrap();
+        assert_eq!(
+            last_page.start, None,
+            "a new window starts at its beginning"
+        );
+        assert_eq!(next_cursor.lock().snapshot()[0].window_start, 2);
+        last_page.observed(0);
+        last_page.observed(0);
+        assert_eq!(
+            next_cursor.lock().snapshot(),
+            vec![WalkDispatchPosition {
+                directory,
+                window_start: 0,
+                next_child: None,
+            }],
+            "receiving the last window wraps once for a fresh later inspection"
+        );
+    }
+
+    #[test]
+    fn an_empty_window_moves_only_after_an_explicit_complete_skip() {
+        let directory = PathBuf::from("/root");
+        let cursor = Arc::new(Mutex::new(
+            WalkDispatchCursor::from_positions(vec![WalkDispatchPosition {
+                directory: directory.clone(),
+                window_start: 8,
+                next_child: None,
+            }])
+            .unwrap(),
+        ));
+        let walk = DispatchContext::new(Arc::clone(&cursor));
+        let failed = walk
+            .register(&directory, 8, None, Arc::new(Vec::new()))
+            .unwrap();
+        failed.skip_empty_window();
+        assert_eq!(
+            cursor.lock().snapshot()[0].window_start,
+            8,
+            "an incomplete observation has no next-window authority"
+        );
+        let complete = walk
+            .register(&directory, 8, Some(0), Arc::new(Vec::new()))
+            .unwrap();
+        assert_eq!(cursor.lock().snapshot()[0].window_start, 8);
+        complete.skip_empty_window();
+        complete.skip_empty_window();
+        assert_eq!(
+            cursor.lock().snapshot(),
+            vec![WalkDispatchPosition {
+                directory,
+                window_start: 0,
+                next_child: None,
+            }]
         );
     }
 }

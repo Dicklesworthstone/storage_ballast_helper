@@ -344,6 +344,9 @@ impl Drop for DispatchFrame {
 struct TaskCompletion {
     parent: Option<Box<DispatchFrame>>,
     receipt: Option<DispatchReceipt>,
+    /// Ancestor pages can yield their bounded frame/name allowance while
+    /// genuine descendant receipts still advance their scheduling priority.
+    detached_receipts: Vec<DispatchReceipt>,
     flush: bool,
     interrupted: bool,
     emitted: bool,
@@ -354,6 +357,12 @@ impl TaskCompletion {
         let mut progress = Vec::new();
         let mut completion = Some(self);
         while let Some(current) = completion {
+            progress.extend(
+                current
+                    .detached_receipts
+                    .iter()
+                    .filter_map(|receipt| receipt.0.clone()),
+            );
             if let Some(receipt) = &current.receipt
                 && let Some(child) = &receipt.0
             {
@@ -376,6 +385,28 @@ impl TaskCompletion {
         item.completion = std::mem::take(self);
     }
 
+    fn release_ancestor_continuations(&mut self) {
+        if self.parent.is_none() {
+            return;
+        }
+        let progress = self.progress();
+        // Transfer receipt ownership without recording a skip or a result.
+        // Ancestor frame drops retain their speculative pages, record every
+        // abandoned continuation as unfinished, and release their permits.
+        if let Some(receipt) = self.receipt.take() {
+            receipt.handled();
+        }
+        for receipt in self.detached_receipts.drain(..) {
+            receipt.handled();
+        }
+        self.detached_receipts = progress
+            .into_iter()
+            .map(|progress| DispatchReceipt(Some(progress)))
+            .collect();
+        drop(self.parent.take());
+        self.flush = true;
+    }
+
     fn handled(mut self, work: &WorkQueue, cancel: &AtomicBool) {
         if !self.emitted {
             for progress in self.progress() {
@@ -389,6 +420,9 @@ impl TaskCompletion {
             }
         }
         if let Some(receipt) = self.receipt.take() {
+            receipt.handled();
+        }
+        for receipt in self.detached_receipts.drain(..) {
             receipt.handled();
         }
     }
@@ -1068,9 +1102,9 @@ impl DirectoryWalker {
     /// Resume recursive branch priority through freshly examined ancestors.
     ///
     /// This only applies to name-only, no-follow walks. Restored priorities
-    /// reorder a full circular child page; they never skip siblings or restore
-    /// safety observations. Partial name enumeration and oversized-directory
-    /// window offsets remain volatile and must be repeated after a restart.
+    /// reorder a full circular child page and rotate oversized-directory
+    /// windows after received work. Every name and protection marker is still
+    /// examined afresh after restart. Partial name enumeration remains volatile.
     #[must_use]
     pub fn with_dispatch_cursor(
         mut self,
@@ -1129,6 +1163,7 @@ impl DirectoryWalker {
         let dispatch_cursor = self
             .dispatch_cursor
             .as_ref()
+            .filter(|_| !self.measure_files && !self.config.follow_symlinks && cfg!(unix))
             .map(|cursor| DispatchContext::new(Arc::clone(cursor)));
 
         // Work is unbounded: a bounded queue can deadlock when every worker
@@ -1454,8 +1489,22 @@ fn process_directory(
         return;
     }
 
-    // The entries this pass processes; every name is still checked.
-    let window_start = windows.starts.get(dir_path).copied().unwrap_or(0);
+    // The entries this pass processes; every name is still checked. An active
+    // child/parent frame keeps its own window even after a collector receipt
+    // advances the next pass's priority. Cursor-backed walks never inherit
+    // speculative global progress from an abandoned or unrelated walk.
+    let window_start = dispatch
+        .as_ref()
+        .and_then(|frame| frame.read.as_ref())
+        .map_or_else(
+            || {
+                windows.dispatch_cursor.as_ref().map_or_else(
+                    || windows.starts.get(dir_path).copied().unwrap_or(0),
+                    |cursor| cursor.window_start(dir_path),
+                )
+            },
+            |read| read.window_start,
+        );
     let window = window_start..window_start.saturating_add(windows.size);
     // Only name-only, no-follow walks retain read-ahead. File sizes and a
     // symlink target's type can change without changing the parent stamp;
@@ -1721,9 +1770,9 @@ fn process_directory(
         read.signals.has_cachedir_tag = tagged;
     }
 
-    // A listing longer than one window still leaves ground unseen. Advance
-    // its next window only after dispatch: cancellation must not skip the
-    // children that were read but never queued.
+    // A listing longer than one window still leaves ground unseen. A stale
+    // window beyond fresh EOF also leaves the earlier names unvisited, even
+    // when the shrunken directory now fits one window.
     let next_start = next_window_start(window_start, read.total_count, windows.size);
     if next_start.is_some() || read.entries_incomplete {
         // A window or failed child observation left part of this ground unseen.
@@ -1743,17 +1792,28 @@ fn process_directory(
         read.priority = None;
         if retain_reads
             && depth < config.max_depth
-            && !read.children.is_empty()
+            && (!read.children.is_empty() || next_start.is_some())
             && let Some(cursor) = &windows.dispatch_cursor
         {
             if !read.dispatch_started {
                 Arc::make_mut(&mut read.children).sort_unstable();
                 read.next_child.store(0, Ordering::Relaxed);
             }
-            if let Some(priority) = cursor.register(dir_path, Arc::clone(&read.children)) {
+            if let Some(priority) = cursor.register(
+                dir_path,
+                window_start,
+                (!read.entries_incomplete).then_some(next_start).flatten(),
+                Arc::clone(&read.children),
+            ) {
                 if let Some(start) = priority.start {
                     read.next_child.store(start, Ordering::Relaxed);
                     read.dispatch_interrupted.store(true, Ordering::Relaxed);
+                }
+                if !read.entries_incomplete && !cancel.load(Ordering::Relaxed) {
+                    // A fully inspected window containing no eligible child
+                    // directories is an explicit skip, not queued discovery.
+                    // Ordinary empty leaves never register a page above.
+                    priority.skip_empty_window();
                 }
                 read.priority = Some(priority);
             }
@@ -1761,28 +1821,49 @@ fn process_directory(
         read.dispatch_started = true;
     }
 
-    // Keep ordinary parallel dispatch. Only a page whose dispatch or queued
-    // child was interrupted opts into child/parent turns on its next visit.
-    // A full turn cycle restores the fast path. Admission also bounds pages
-    // waiting in the work queue, not just pages currently held by workers.
+    // Keep ordinary parallel dispatch for small fresh pages. Interrupted
+    // pages and durable oversized windows use child/parent turns, so a queued
+    // boundary child cannot move the window before its result is received.
+    // Admission also bounds pages waiting in the work queue.
+    let serial_window = read.priority.is_some() && next_start.is_some();
     if dispatch.is_none()
         && retain_reads
         && depth < config.max_depth
         && !read.children.is_empty()
-        && (read.dispatch_interrupted.load(Ordering::Relaxed) || completion.parent.is_some())
-        && let Some(permit) = DispatchPermit::reserve(&windows.reads, read.children.len())
+        && (serial_window
+            || read.dispatch_interrupted.load(Ordering::Relaxed)
+            || completion.parent.is_some())
     {
-        dispatch = Some(Box::new(DispatchFrame {
-            path: path.clone(),
-            parent: None,
-            read: None,
-            remaining: read.children.len(),
-            next_child: read.next_child.load(Ordering::Relaxed) % read.children.len(),
-            emitted: false,
-            finished: false,
-            permit,
-            unfinished: Arc::clone(&windows.unfinished),
-        }));
+        let mut permit = DispatchPermit::reserve(&windows.reads, read.children.len());
+        if permit.is_none() && windows.dispatch_cursor.is_some() && completion.parent.is_some() {
+            // A full window needs the whole name allowance; retaining even
+            // one serialized ancestor would starve it on every restart.
+            // Release only our own continuation frames, keeping compact
+            // collector receipts and this task's current traversal context.
+            completion.release_ancestor_continuations();
+            permit = DispatchPermit::reserve(&windows.reads, read.children.len());
+        }
+        if let Some(permit) = permit {
+            dispatch = Some(Box::new(DispatchFrame {
+                path: path.clone(),
+                parent: None,
+                read: None,
+                remaining: read.children.len(),
+                next_child: read.next_child.load(Ordering::Relaxed) % read.children.len(),
+                emitted: false,
+                finished: false,
+                permit,
+                unfinished: Arc::clone(&windows.unfinished),
+            }));
+        } else if serial_window {
+            // Parallel fallback could receive the boundary while earlier
+            // siblings remain queued. Keep this window for another slice.
+            results.mark_unfinished(dir_path);
+            completion.interrupted = true;
+            read.dispatch_interrupted.store(true, Ordering::Relaxed);
+            windows.reads.lock().retain(dir_path, read);
+            return;
+        }
     }
     if let Some(frame) = dispatch {
         drop(reservation);
@@ -1890,7 +1971,7 @@ fn process_directory(
     if cancel.load(Ordering::Relaxed) {
         results.mark_unfinished(dir_path);
         read.dispatch_interrupted.store(true, Ordering::Relaxed);
-    } else if next_start.is_some() || window_start > 0 {
+    } else if windows.dispatch_cursor.is_none() && (next_start.is_some() || window_start > 0) {
         let mut starts = oversized_window_starts().lock();
         match next_start {
             Some(start) => starts.insert(dir_path.to_path_buf(), start),
@@ -1991,9 +2072,9 @@ fn dispatch_turn(
     // starting index is scheduling priority, not cumulative coverage.
     frame.finished = true;
     read.dispatch_interrupted.store(false, Ordering::Relaxed);
-    let window_start = windows.starts.get(&parent.path).copied().unwrap_or(0);
+    let window_start = read.window_start;
     let next_start = next_window_start(window_start, read.total_count, windows.size);
-    if next_start.is_some() || window_start > 0 {
+    if windows.dispatch_cursor.is_none() && (next_start.is_some() || window_start > 0) {
         let mut starts = oversized_window_starts().lock();
         match next_start {
             Some(start) => starts.insert(parent.path.clone(), start),
@@ -2519,7 +2600,10 @@ struct DirWindows {
 /// listing fits one window. Windows run to the end of the listing, then
 /// start over from the top.
 fn next_window_start(start: u32, read: u32, size: u32) -> Option<u32> {
-    if read <= size {
+    if start > 0 && start >= read {
+        return Some(0);
+    }
+    if start == 0 && read <= size {
         return None;
     }
     let next = start.saturating_add(size);
@@ -5682,6 +5766,61 @@ mod tests {
     }
 
     #[test]
+    fn only_receiving_a_window_boundary_advances_its_durable_offset() {
+        for receive_boundary in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let cursor = Arc::new(parking_lot::Mutex::new(
+                WalkDispatchCursor::from_positions(vec![WalkDispatchPosition {
+                    directory: temp.path().to_path_buf(),
+                    window_start: 0,
+                    next_child: Some("second".into()),
+                }])
+                .unwrap(),
+            ));
+            let context = DispatchContext::new(Arc::clone(&cursor));
+            let mut page =
+                DirectoryRead::open(temp.path(), fs::metadata(temp.path()).unwrap(), 0, 2, false)
+                    .unwrap();
+            page.children = Arc::new(vec!["first".into(), "second".into()]);
+            let names = Arc::downgrade(&page.children);
+            page.priority = context.register(temp.path(), 0, Some(2), Arc::clone(&page.children));
+            page.next_child.store(1, Ordering::Relaxed);
+            let mut boundary = WalkResult::plain(bare_entry("/parent/second"));
+            boundary.progress.push(ChildProgress::new(&page, 1));
+            let mut wrapped = WalkResult::plain(bare_entry("/parent/first"));
+            wrapped.progress.push(ChildProgress::new(&page, 0));
+            let (tx, rx) = channel::unbounded();
+            tx.send(vec![boundary, wrapped]).unwrap();
+            drop(tx);
+            drop(page);
+            assert!(
+                names.upgrade().is_none(),
+                "buffered collector receipts must not pin a full child-name page"
+            );
+            assert_eq!(cursor.lock().snapshot()[0].window_start, 0);
+
+            let mut stream = WalkStream::new(rx, None, Arc::default(), Arc::default());
+            if receive_boundary {
+                assert_eq!(stream.next().unwrap().path, Path::new("/parent/second"));
+                assert_eq!(cursor.lock().snapshot()[0].window_start, 2);
+                assert_eq!(stream.next().unwrap().path, Path::new("/parent/first"));
+            }
+            let unfinished = stream.unfinished_after_cancel(Duration::ZERO).unwrap();
+            let position = cursor.lock().snapshot().pop().unwrap();
+            assert_eq!(position.window_start, if receive_boundary { 2 } else { 0 });
+            assert_eq!(
+                position.next_child.as_deref(),
+                if receive_boundary {
+                    None
+                } else {
+                    Some(std::ffi::OsStr::new("second"))
+                }
+            );
+            assert_eq!(unfinished.len(), if receive_boundary { 0 } else { 2 });
+        }
+    }
+
+    #[test]
     fn failed_full_batch_cannot_be_acknowledged_by_a_later_empty_flush() {
         let temp = TempDir::new().unwrap();
         let mut page = DirectoryRead::open(
@@ -6389,6 +6528,13 @@ mod tests {
         assert_eq!(next_window_start(8, 10, 4), Some(0));
         // A listing that shrank below its window start starts over.
         assert_eq!(next_window_start(8, 6, 4), Some(0));
+        assert_eq!(next_window_start(8, 2, 4), Some(0));
+        assert_eq!(next_window_start(8, 0, 4), Some(0));
+        assert_eq!(
+            next_window_start(2, 6, 10),
+            Some(0),
+            "a nonzero start left a prefix unseen"
+        );
         // ts2's /data/tmp: 68,519 entries take two passes.
         assert_eq!(
             next_window_start(0, 68_519, MAX_ENTRIES_PER_DIR),
@@ -6435,6 +6581,196 @@ mod tests {
         // Windows of 4 over 10 entries: 4, 4, the last 2, then from the top.
         assert_eq!(per_pass, [4, 4, 2, 4]);
         assert_eq!(seen, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_windows_ignore_global_offsets_and_do_not_remember_empty_leaves() {
+        let tmp = TempDir::new().unwrap();
+        for index in 0..5 {
+            fs::create_dir(tmp.path().join(format!("child{index}"))).unwrap();
+        }
+        let first_window: HashSet<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .take(2)
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        oversized_window_starts()
+            .lock()
+            .insert(tmp.path().to_path_buf(), 4);
+        let cursor = Arc::new(parking_lot::Mutex::new(WalkDispatchCursor::new()));
+        let walker =
+            DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only())
+                .without_file_sizes()
+                .with_dir_window(2)
+                .with_dispatch_cursor(Arc::clone(&cursor));
+        let mut stream = walker.stream().unwrap();
+        let visited: HashSet<_> = stream.by_ref().map(|entry| entry.path).collect();
+        assert_eq!(
+            visited, first_window,
+            "an abandoned global window is not admission"
+        );
+        assert_eq!(
+            stream
+                .unfinished_after_cancel(Duration::from_secs(10))
+                .unwrap(),
+            vec![tmp.path().to_path_buf()]
+        );
+        assert_eq!(
+            cursor.lock().snapshot(),
+            vec![WalkDispatchPosition {
+                directory: tmp.path().to_path_buf(),
+                window_start: 2,
+                next_child: None,
+            }],
+            "ordinary empty leaves must not consume bounded cursor history"
+        );
+        assert_eq!(
+            oversized_window_starts().lock().remove(tmp.path()),
+            Some(4),
+            "cursor-backed progress must not mutate volatile global windows"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deep_durable_dispatch_yields_ancestor_frames_to_reach_a_wide_child() {
+        let tmp = TempDir::new().unwrap();
+        // The wide directory is the immediate child of the first narrow
+        // directory that cannot obtain another continuation-frame permit.
+        // Falling back to parallel dispatch there queues the wide child
+        // ahead of the still-pending ancestor frames and starves every pass.
+        let mut wide = tmp.path().to_path_buf();
+        let wide_depth = read_ahead::MAX_DISPATCH_FRAMES + 1;
+        for index in 0..wide_depth {
+            wide.push(format!("level-{index}"));
+            fs::create_dir(&wide).unwrap();
+        }
+        for index in 0..5 {
+            fs::create_dir(wide.join(format!("child-{index}"))).unwrap();
+        }
+        let expected: HashSet<_> = fs::read_dir(&wide)
+            .unwrap()
+            .take(2)
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let cursor = Arc::new(parking_lot::Mutex::new(
+            WalkDispatchCursor::from_positions(vec![WalkDispatchPosition {
+                directory: tmp.path().to_path_buf(),
+                window_start: 0,
+                next_child: Some("level-0".into()),
+            }])
+            .unwrap(),
+        ));
+        let mut config = test_config(tmp.path());
+        config.parallelism = 1;
+        config.max_depth = wide_depth + 2;
+        let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only())
+            .without_file_sizes()
+            .with_dir_window(2)
+            .with_dispatch_cursor(Arc::clone(&cursor));
+        let mut stream = walker.stream().unwrap();
+        let observed: Vec<_> = stream.by_ref().collect();
+        let reached: HashSet<_> = observed
+            .iter()
+            .filter(|entry| entry.path.parent() == Some(wide.as_path()))
+            .map(|entry| {
+                assert_eq!(
+                    entry.depth,
+                    wide_depth + 1,
+                    "releasing continuations must not re-root the current task"
+                );
+                entry.path.clone()
+            })
+            .collect();
+        assert_eq!(
+            reached, expected,
+            "ancestor frames must not permanently consume admission"
+        );
+        let unfinished = stream
+            .unfinished_after_cancel(Duration::from_secs(10))
+            .unwrap();
+        assert!(unfinished.contains(&wide));
+        assert!(
+            unfinished.contains(&tmp.path().to_path_buf()),
+            "discarded ancestor continuations are unfinished, never coverage"
+        );
+        let positions = cursor.lock().snapshot();
+        assert_eq!(
+            positions
+                .iter()
+                .find(|position| position.directory == wide)
+                .unwrap()
+                .window_start,
+            2
+        );
+        assert!(
+            positions
+                .iter()
+                .any(|position| position.directory == tmp.path()),
+            "received deep work must keep its detached ancestor receipt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shrunken_durable_window_resets_and_remains_unfinished_until_revisited() {
+        for old_start in [1, 8] {
+            let tmp = TempDir::new().unwrap();
+            let expected: HashSet<_> = ["first", "second"]
+                .into_iter()
+                .map(|name| {
+                    let path = tmp.path().join(name);
+                    fs::create_dir(&path).unwrap();
+                    path
+                })
+                .collect();
+            let cursor = Arc::new(parking_lot::Mutex::new(
+                WalkDispatchCursor::from_positions(vec![WalkDispatchPosition {
+                    directory: tmp.path().to_path_buf(),
+                    window_start: old_start,
+                    next_child: None,
+                }])
+                .unwrap(),
+            ));
+            let walker =
+                DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only())
+                    .without_file_sizes()
+                    .with_dir_window(4)
+                    .with_dispatch_cursor(Arc::clone(&cursor));
+            let mut stream = walker.stream().unwrap();
+            let seen: HashSet<_> = stream.by_ref().map(|entry| entry.path).collect();
+            assert!(seen.is_subset(&expected));
+            assert!(
+                seen.len() < expected.len(),
+                "the old offset skipped fresh names"
+            );
+            assert_eq!(
+                stream
+                    .unfinished_after_cancel(Duration::from_secs(10))
+                    .unwrap(),
+                vec![tmp.path().to_path_buf()]
+            );
+            assert_eq!(cursor.lock().snapshot()[0].window_start, 0);
+
+            let restored = Arc::new(parking_lot::Mutex::new(
+                WalkDispatchCursor::from_positions(cursor.lock().snapshot()).unwrap(),
+            ));
+            let next =
+                DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only())
+                    .without_file_sizes()
+                    .with_dir_window(4)
+                    .with_dispatch_cursor(restored);
+            let mut stream = next.stream().unwrap();
+            let revisited: HashSet<_> = stream.by_ref().map(|entry| entry.path).collect();
+            assert_eq!(revisited, expected);
+            assert!(
+                stream
+                    .unfinished_after_cancel(Duration::from_secs(10))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     /// Every name is read, so a `.sbh-protect` marker outside the processing

@@ -30,7 +30,7 @@
 //!
 //! Checkpoint I/O is bounded, byte-preserving and crash-consistent. Existing
 //! UTF-8 checkpoints still load; invalid or corrupt checkpoints start over.
-//! The same checkpoint retains recursive child-dispatch priorities separately:
+//! The same checkpoint retains recursive window and child priorities separately:
 //! they select the next fresh traversal, never certify old coverage or safety.
 
 use std::collections::BTreeMap;
@@ -85,7 +85,7 @@ pub struct PrescanCursor {
     /// discovery progress. The checkpoint supplies byte-preserving encoding.
     #[serde(skip)]
     walk_order: PressureOrder,
-    /// Per-directory scheduling hints, independently revalidated by the walker.
+    /// Per-directory window and child priorities, revalidated by the walker.
     /// The checkpoint codec preserves native directory and child-name bytes.
     /// Shallow per-entry rewind snapshots share this immutable history.
     #[serde(skip)]
