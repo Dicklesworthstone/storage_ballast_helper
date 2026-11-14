@@ -530,6 +530,7 @@ impl CompressTier {
     }
 
     /// Start a pass on its own thread when one is due.
+    #[allow(clippy::too_many_lines)]
     pub fn tick(
         &mut self,
         now: Instant,
@@ -1523,7 +1524,7 @@ pub(super) mod tests {
             fs::write(&held, b"held").unwrap();
             filetime::set_file_mtime(&held, filetime::FileTime::from_unix_time(1, 0)).unwrap();
             let permissions = fs::metadata(&unreadable).unwrap().permissions();
-            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0)).unwrap();
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
 
             let mut progress = PassProgress::default();
             let ordered = progress.order(roots.clone());

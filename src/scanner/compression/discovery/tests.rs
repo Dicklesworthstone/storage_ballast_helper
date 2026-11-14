@@ -122,7 +122,7 @@ mod native_tests {
         cold(&held);
         cold(&later);
         let permissions = fs::metadata(&unreadable).unwrap().permissions();
-        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
         let selection = scan(
             std::slice::from_ref(&root),
             &DiscoveryLimits::default(),
@@ -130,7 +130,7 @@ mod native_tests {
         );
         fs::set_permissions(&unreadable, permissions).unwrap();
 
-        assert_eq!(selection.paths(), [later.clone()]);
+        assert_eq!(selection.paths(), std::slice::from_ref(&later));
         assert!(!selection.report().complete);
         assert_eq!(selection.report().skipped.get("unreadable_entry"), Some(&1));
         assert!(selection.report().stop_reason.is_some());
@@ -165,7 +165,7 @@ mod native_tests {
         cold(&root.join("b.bin"));
         cold(&root.join("c.bin"));
         let permissions = fs::metadata(&unreadable).unwrap().permissions();
-        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
         let policy = CompressionPolicy {
             max_files: 1,
             ..policy()
