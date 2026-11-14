@@ -105,6 +105,102 @@ mod native_tests {
     }
 
     #[test]
+    fn an_unreadable_subtree_does_not_starve_later_files_and_is_retried_next_cycle() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Root can read a mode-000 directory, so it cannot reproduce this
+        // non-root observation failure. The fixture changes no safety policy.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let dir = crate::tempdir_outside_git();
+        let root = dir.path().canonicalize().unwrap();
+        let unreadable = root.join("a-unreadable");
+        fs::create_dir(&unreadable).unwrap();
+        let held = unreadable.join("held.bin");
+        let later = root.join("z-cold.bin");
+        cold(&held);
+        cold(&later);
+        let permissions = fs::metadata(&unreadable).unwrap().permissions();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0)).unwrap();
+        let selection = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy(),
+        );
+        fs::set_permissions(&unreadable, permissions).unwrap();
+
+        assert_eq!(selection.paths(), [later.clone()]);
+        assert!(!selection.report().complete);
+        assert_eq!(selection.report().skipped.get("unreadable_entry"), Some(&1));
+        assert!(selection.report().stop_reason.is_some());
+        assert!(selection.report().resume_after_hex.is_none());
+        assert!(selection.traversal_exhausted());
+
+        // A failed subtree is not recorded as permanently traversed. Once
+        // readable, a new cycle observes it through all ordinary checks.
+        let next = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy(),
+        );
+        assert!(next.report().complete, "{:?}", next.report());
+        assert_eq!(next.paths(), [held.clone(), later.clone()]);
+        assert_eq!(fs::read(held).unwrap(), b"cold contents");
+        assert_eq!(fs::read(later).unwrap(), b"cold contents");
+    }
+
+    #[test]
+    fn unreadable_entries_do_not_discard_file_budget_continuations() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let dir = crate::tempdir_outside_git();
+        let root = dir.path().canonicalize().unwrap();
+        let unreadable = root.join("a-unreadable");
+        fs::create_dir(&unreadable).unwrap();
+        cold(&unreadable.join("held.bin"));
+        cold(&root.join("b.bin"));
+        cold(&root.join("c.bin"));
+        let permissions = fs::metadata(&unreadable).unwrap().permissions();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0)).unwrap();
+        let policy = CompressionPolicy {
+            max_files: 1,
+            ..policy()
+        };
+        let first = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy,
+        );
+        // Restore before assertions so a failed regression leaves the fixture
+        // readable to TempDir and does not obscure the assertion with cleanup.
+        fs::set_permissions(&unreadable, permissions).unwrap();
+        assert_eq!(first.paths(), [root.join("b.bin")]);
+        assert!(!first.traversal_exhausted());
+        assert_eq!(first.report().skipped.get("unreadable_entry"), Some(&1));
+        assert_eq!(
+            first.report().stop_reason.as_deref(),
+            Some("discovery file-count budget exhausted")
+        );
+        let after = continuation_path(first.report().resume_after_hex.as_deref().unwrap()).unwrap();
+        assert_eq!(after, root.join("b.bin"));
+        let second = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits {
+                after: Some(after),
+                ..Default::default()
+            },
+            &policy,
+        );
+        assert_eq!(second.paths(), [root.join("c.bin")]);
+        assert!(second.report().complete, "{:?}", second.report());
+        assert!(second.traversal_exhausted());
+    }
+
+    #[test]
     fn a_full_file_budget_has_a_native_continuation_without_duplicates() {
         let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();

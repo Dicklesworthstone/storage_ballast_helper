@@ -35,7 +35,7 @@ use crate::scanner::compression::{
     self, CompressionMode, CompressionObservation, CompressionPolicy, CompressionReport,
     ConcurrencyAcknowledgement, discovery,
 };
-use crate::scanner::walker::identity_for_path;
+use crate::scanner::walker::{FsEntryKind, FsIdentity, identity_for_path};
 use crate::tuning::writeback::human_bytes;
 
 /// A configured root as the monitor sees it this tick.
@@ -66,6 +66,9 @@ struct RootEvidence {
     root: PathBuf,
     stats: Option<FsStats>,
     device_id: Option<u64>,
+    /// Directory observed on both sides of the pressure/topology probe.
+    /// Discovery must still name this object before it can admit a rewrite.
+    identity: Option<FsIdentity>,
     /// The configured monitor covers this mount, even if its first sample
     /// failed. Only the background probe resolves paths and mount topology.
     requires_monitor: bool,
@@ -576,6 +579,15 @@ impl CompressTier {
             .filter(|status| roots.contains(&status.root))
             .filter_map(|status| status.mount_point.clone())
             .collect();
+        let admissions: HashMap<_, _> = roots
+            .iter()
+            .filter_map(|root| {
+                self.evidence
+                    .get(root)
+                    .and_then(|evidence| evidence.identity)
+                    .map(|identity| (root.clone(), identity))
+            })
+            .collect();
         // No pass is running (due_roots checked), so no stop is pending.
         self.stop.store(false, Ordering::Release);
         self.forecast_intervention_started = true;
@@ -625,6 +637,7 @@ impl CompressTier {
                 let _guard = guard;
                 let message = run_pass(
                     &roots,
+                    &admissions,
                     &config,
                     platform.as_ref(),
                     &resume_after,
@@ -683,26 +696,33 @@ fn probe_root(
     cancelled: &AtomicBool,
 ) -> RootEvidence {
     let started = Instant::now();
+    let before = identity_for_path(&root, false)
+        .ok()
+        .filter(|identity| identity.kind == FsEntryKind::Directory);
     let mut stats = platform.fs_stats(&root).ok();
-    let mut device_id = stats
-        .as_ref()
-        .filter(|stats| stats.fs_type == "btrfs")
-        .and_then(|_| identity_for_path(&root, true).ok())
-        .map(|identity| identity.device_id);
     let requires_monitor = stats.as_ref().is_some_and(|stats| {
         monitor_covers_root(&root, stats, monitored_roots, platform, cancelled)
     });
+    let mut identity =
+        before.filter(|before| identity_for_path(&root, false).ok() == Some(*before));
+    let mut device_id = stats
+        .as_ref()
+        .filter(|stats| stats.fs_type == "btrfs")
+        .and(identity)
+        .map(|identity| identity.device_id);
     let completed_at = Instant::now();
     if completed_at.saturating_duration_since(started) >= ROOT_PROBE_MAX_AGE {
         // A fresh completion timestamp cannot refresh an old filesystem
         // reading when a later identity lookup was stuck for a long time.
         stats = None;
         device_id = None;
+        identity = None;
     }
     RootEvidence {
         root,
         stats,
         device_id,
+        identity,
         requires_monitor,
         completed_at,
     }
@@ -886,6 +906,7 @@ struct PendingSelection {
 /// explicit CLI discovery or allow a failed path's parent or symlink target.
 fn discover_roots(
     roots: &[PathBuf],
+    admissions: &HashMap<PathBuf, FsIdentity>,
     config: &Config,
     platform: &dyn Platform,
     progress: &Mutex<PassProgress>,
@@ -893,6 +914,7 @@ fn discover_roots(
     budget: &mut DiscoveryBudget,
 ) -> (Vec<PendingSelection>, Vec<String>) {
     let mut canonical = Vec::new();
+    let mut canonical_admissions = HashMap::new();
     let mut messages = Vec::new();
     for root in roots {
         if stop.load(Ordering::Acquire) || Instant::now() >= budget.deadline {
@@ -901,8 +923,30 @@ fn discover_roots(
             );
             break;
         }
+        let Some(identity) = admissions.get(root) else {
+            messages.push(format!(
+                "compression root has no stable pressure-admission identity: {}",
+                root.display(),
+            ));
+            continue;
+        };
         match discovery::canonical_roots(std::slice::from_ref(root)) {
-            Ok(resolved) => canonical.extend(resolved),
+            Ok(resolved) => {
+                for path in resolved {
+                    // Refuse before spending discovery's work allowance on a
+                    // replacement. The pinned selection is checked again
+                    // below so a swap during discovery cannot evade this gate.
+                    if identity_for_path(&path, false).ok() != Some(*identity) {
+                        messages.push(format!(
+                            "compression root changed after pressure admission: {}",
+                            root.display(),
+                        ));
+                        continue;
+                    }
+                    canonical_admissions.insert(path.clone(), *identity);
+                    canonical.push(path);
+                }
+            }
             Err(error) => messages.push(format!(
                 "compression root resolution failed for {}: {error}",
                 root.display(),
@@ -922,7 +966,14 @@ fn discover_roots(
         messages.push("pass refused: continuation state is poisoned".into());
         return (Vec::new(), messages);
     };
-    let (pending, outcomes) = discover_pass(ordered, config, platform, stop, budget);
+    let (pending, outcomes) = discover_pass(
+        ordered,
+        &canonical_admissions,
+        config,
+        platform,
+        stop,
+        budget,
+    );
     messages.extend(outcomes);
     (pending, messages)
 }
@@ -931,6 +982,7 @@ fn discover_roots(
 /// scheduling interval, while larger roots cannot multiply the pass's budgets.
 fn discover_pass(
     roots: Vec<(PathBuf, RootCursor)>,
+    admissions: &HashMap<PathBuf, FsIdentity>,
     config: &Config,
     platform: &dyn Platform,
     stop: &AtomicBool,
@@ -942,6 +994,13 @@ fn discover_pass(
         if stop.load(Ordering::Acquire) {
             break;
         }
+        let Some(identity) = admissions.get(&root) else {
+            messages.push(format!(
+                "compression root has no stable pressure-admission identity: {}",
+                root.display(),
+            ));
+            continue;
+        };
         let after = if let Ok(after) = cursor.lock() {
             after.clone()
         } else {
@@ -972,6 +1031,13 @@ fn discover_pass(
         };
         let report = selection.report();
         budget.account(report);
+        if let Err(error) = selection.validate_root_identity(&root, *identity) {
+            messages.push(format!(
+                "compression root admission expired for {}: {error}",
+                root.display(),
+            ));
+            continue;
+        }
         let next = match report
             .resume_after_hex
             .as_deref()
@@ -991,7 +1057,7 @@ fn discover_pass(
             // before reaching the old frontier. Only a completed walk resets
             // it; an incomplete empty page may advance, never rewind.
             if let Ok(mut resume) = cursor.lock()
-                && (report.stop_reason.is_none()
+                && (selection.traversal_exhausted()
                     || next
                         .as_ref()
                         .is_some_and(|next| resume.as_ref().is_none_or(|before| next > before)))
@@ -1019,6 +1085,7 @@ fn discover_pass(
 /// the configured work limits and execution deadline across every root.
 fn run_pass(
     roots: &[PathBuf],
+    admissions: &HashMap<PathBuf, FsIdentity>,
     config: &Config,
     platform: &dyn Platform,
     resume_after: &Mutex<PassProgress>,
@@ -1026,8 +1093,15 @@ fn run_pass(
     logger: &ActivityLoggerHandle,
 ) -> String {
     let mut budget = DiscoveryBudget::new(config);
-    let (pending, mut messages) =
-        discover_roots(roots, config, platform, resume_after, stop, &mut budget);
+    let (pending, mut messages) = discover_roots(
+        roots,
+        admissions,
+        config,
+        platform,
+        resume_after,
+        stop,
+        &mut budget,
+    );
     let mode = CompressionMode {
         apply: true,
         allow_zstd_feature: config.compress.allow_zstd_feature,
@@ -1304,6 +1378,17 @@ pub(super) mod tests {
         use crate::scanner::compression::CompressionPolicy;
         use std::fs;
 
+        fn admissions(roots: &[PathBuf]) -> HashMap<PathBuf, FsIdentity> {
+            roots
+                .iter()
+                .filter_map(|root| {
+                    identity_for_path(root, false)
+                        .ok()
+                        .map(|identity| (root.clone(), identity))
+                })
+                .collect()
+        }
+
         fn fixture(sizes: &[usize]) -> (tempfile::TempDir, Vec<PathBuf>, Config) {
             let directory = crate::tempdir_outside_git();
             let base = directory.path().canonicalize().unwrap();
@@ -1337,6 +1422,147 @@ pub(super) mod tests {
         }
 
         #[test]
+        fn replaced_admission_roots_cannot_dispatch_or_advance_their_saved_frontier() {
+            for after_resolution in [false, true] {
+                let (directory, roots, config) = fixture(&[8, 8]);
+                let admitted = admissions(&roots);
+                let progress = Mutex::new(PassProgress::default());
+                let ordered = progress.lock().unwrap().order(roots.clone());
+                let cursor = Arc::clone(&ordered[0].1);
+                let frontier = roots[0].join("0-before.bin");
+                *cursor.lock().unwrap() = Some(frontier.clone());
+
+                fs::rename(&roots[0], directory.path().join("admitted-root-retained")).unwrap();
+                fs::create_dir(&roots[0]).unwrap();
+                let replacement = roots[0].join("cold.bin");
+                fs::write(&replacement, b"replacement").unwrap();
+                filetime::set_file_mtime(&replacement, filetime::FileTime::from_unix_time(1, 0))
+                    .unwrap();
+                let mut budget = DiscoveryBudget::new(&config);
+                // Exercise both races: replacement before canonical root
+                // resolution, and after that early gate but before discovery
+                // pins its own descriptor. Neither may inherit admission.
+                let (pending, messages) = if after_resolution {
+                    discover_pass(
+                        ordered,
+                        &admitted,
+                        &config,
+                        &MockPlatform::healthy(),
+                        &AtomicBool::new(false),
+                        &mut budget,
+                    )
+                } else {
+                    discover_roots(
+                        &roots,
+                        &admitted,
+                        &config,
+                        &MockPlatform::healthy(),
+                        &progress,
+                        &AtomicBool::new(false),
+                        &mut budget,
+                    )
+                };
+                assert!(
+                    messages.iter().any(|message| message.contains("admission")),
+                    "{messages:?}",
+                );
+                let mut dispatched = Vec::new();
+                execute_pending(
+                    pending,
+                    &config.compress.policy,
+                    &AtomicBool::new(false),
+                    |selection, _| {
+                        let paths = selection.paths();
+                        dispatched.extend(paths.iter().cloned());
+                        Ok(execution_report(&paths, &["skipped"]))
+                    },
+                );
+                assert_eq!(
+                    dispatched,
+                    [roots[1].join("cold.bin")],
+                    "unchanged roots still make progress; replacements never reach execution",
+                );
+                assert_eq!(*cursor.lock().unwrap(), Some(frontier));
+                assert_eq!(fs::read(&replacement).unwrap(), b"replacement");
+            }
+        }
+
+        #[test]
+        fn missing_admission_identity_cannot_be_recreated_from_the_current_path() {
+            let (_directory, roots, config) = fixture(&[8]);
+            let progress = Mutex::new(PassProgress::default());
+            let (pending, messages) = discover_roots(
+                &roots,
+                &HashMap::new(),
+                &config,
+                &MockPlatform::healthy(),
+                &progress,
+                &AtomicBool::new(false),
+                &mut DiscoveryBudget::new(&config),
+            );
+            assert!(pending.is_empty());
+            assert!(messages[0].contains("no stable pressure-admission identity"));
+            assert!(progress.lock().unwrap().cursors.is_empty());
+        }
+
+        #[test]
+        fn an_exhausted_unreadable_tail_wraps_without_forgetting_restored_earlier_work() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            if nix::unistd::geteuid().is_root() {
+                return;
+            }
+            let (_directory, roots, config) = fixture(&[8]);
+            let root = &roots[0];
+            let earlier = root.join("a-restored.bin");
+            fs::write(&earlier, b"restored").unwrap();
+            filetime::set_file_mtime(&earlier, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+            let unreadable = root.join("z-unreadable");
+            fs::create_dir(&unreadable).unwrap();
+            let held = unreadable.join("held.bin");
+            fs::write(&held, b"held").unwrap();
+            filetime::set_file_mtime(&held, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+            let permissions = fs::metadata(&unreadable).unwrap().permissions();
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0)).unwrap();
+
+            let mut progress = PassProgress::default();
+            let ordered = progress.order(roots.clone());
+            let cursor = Arc::clone(&ordered[0].1);
+            // Previous work reached cold.bin; an earlier refusal has since
+            // become readable. This pass's only remaining task is unreadable.
+            *cursor.lock().unwrap() = Some(root.join("cold.bin"));
+            let (pending, messages) = discover_pass(
+                ordered,
+                &admissions(&roots),
+                &config,
+                &MockPlatform::healthy(),
+                &AtomicBool::new(false),
+                &mut DiscoveryBudget::new(&config),
+            );
+            fs::set_permissions(&unreadable, permissions).unwrap();
+            assert!(pending.is_empty());
+            assert!(messages.iter().any(|message| message.contains("partial")));
+            assert!(
+                cursor.lock().unwrap().is_none(),
+                "exhausting the traversal must wrap despite an observation failure",
+            );
+
+            let (next, _) = discover_pass(
+                progress.order(roots.clone()),
+                &admissions(&roots),
+                &config,
+                &MockPlatform::healthy(),
+                &AtomicBool::new(false),
+                &mut DiscoveryBudget::new(&config),
+            );
+            assert_eq!(next.len(), 1);
+            assert_eq!(
+                next[0].selection.paths(),
+                [earlier, root.join("cold.bin"), held],
+            );
+        }
+
+        #[test]
         fn an_executor_safety_stop_never_starts_the_next_discovered_root() {
             for (outcome, mutation_attempted, reason) in [
                 ("partial", true, Some("postflight verification incomplete")),
@@ -1353,6 +1579,7 @@ pub(super) mod tests {
                 *ordered[1].1.lock().unwrap() = Some(later_before.clone());
                 let (pending, _) = discover_pass(
                     ordered,
+                    &admissions(&roots),
                     &config,
                     &MockPlatform::healthy(),
                     &AtomicBool::new(false),
@@ -1400,6 +1627,7 @@ pub(super) mod tests {
             let mut progress = PassProgress::default();
             let (pending, _) = discover_pass(
                 progress.order(roots.clone()),
+                &admissions(&roots),
                 &config,
                 &MockPlatform::healthy(),
                 &AtomicBool::new(false),
@@ -1436,6 +1664,7 @@ pub(super) mod tests {
             }
             let (pending, _) = discover_pass(
                 ordered,
+                &admissions(&roots),
                 &config,
                 &MockPlatform::healthy(),
                 &AtomicBool::new(false),
@@ -1477,6 +1706,7 @@ pub(super) mod tests {
                 }
                 let (pending, _) = discover_pass(
                     ordered,
+                    &admissions(&roots),
                     &config,
                     &MockPlatform::healthy(),
                     &AtomicBool::new(false),
@@ -1552,6 +1782,7 @@ pub(super) mod tests {
             let progress = Mutex::new(PassProgress::default());
             let (pending, messages) = discover_roots(
                 &configured,
+                &admissions(&configured),
                 &config,
                 &MockPlatform::healthy(),
                 &progress,
@@ -1607,6 +1838,7 @@ pub(super) mod tests {
 
             let (pending, messages) = discover_roots(
                 &roots,
+                &admissions(&roots),
                 &config,
                 &MockPlatform::healthy(),
                 &progress,
@@ -1621,6 +1853,7 @@ pub(super) mod tests {
             fs::rename(&offline, &roots[1]).unwrap();
             let (recovered, messages) = discover_roots(
                 &roots,
+                &admissions(&roots),
                 &config,
                 &MockPlatform::healthy(),
                 &progress,
@@ -1643,6 +1876,7 @@ pub(super) mod tests {
                 budget.deadline = deadline;
                 let (pending, messages) = discover_roots(
                     &roots,
+                    &admissions(&roots),
                     &config,
                     &MockPlatform::healthy(),
                     &progress,
@@ -1672,6 +1906,7 @@ pub(super) mod tests {
                 }
                 let (pending, _) = discover_pass(
                     progress.order(roots.clone()),
+                    &admissions(&roots),
                     &config,
                     &MockPlatform::healthy(),
                     &AtomicBool::new(false),
@@ -1699,6 +1934,7 @@ pub(super) mod tests {
             let mut progress = PassProgress::default();
             let (first, _) = discover_pass(
                 progress.order(roots.clone()),
+                &admissions(&roots),
                 &config,
                 &MockPlatform::healthy(),
                 &AtomicBool::new(false),
@@ -1720,6 +1956,7 @@ pub(super) mod tests {
 
             let (second, _) = discover_pass(
                 progress.order(roots.clone()),
+                &admissions(&roots),
                 &config,
                 &MockPlatform::healthy(),
                 &AtomicBool::new(false),
@@ -1750,6 +1987,7 @@ pub(super) mod tests {
                 budget.entries = entries;
                 let (pending, messages) = discover_pass(
                     ordered,
+                    &admissions(&roots),
                     &config,
                     &MockPlatform::healthy(),
                     &AtomicBool::new(false),
@@ -1775,6 +2013,7 @@ pub(super) mod tests {
             *ordered[0].1.lock().unwrap() = Some(roots[0].join("cold.bin"));
             let (pending, messages) = discover_pass(
                 ordered,
+                &admissions(&roots),
                 &config,
                 &MockPlatform::healthy(),
                 &AtomicBool::new(false),
@@ -1794,6 +2033,7 @@ pub(super) mod tests {
             *ordered[0].1.lock().unwrap() = Some(before.clone());
             let (pending, _) = discover_pass(
                 ordered,
+                &admissions(&roots),
                 &config,
                 &MockPlatform::healthy(),
                 &AtomicBool::new(true),
@@ -2014,6 +2254,43 @@ pub(super) mod tests {
             assert!(Instant::now() < deadline, "released probe did not finish");
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn root_replacement_during_pressure_probe_cannot_publish_an_admission_identity() {
+        let directory = crate::tempdir_outside_git();
+        let base = directory.path().canonicalize().unwrap();
+        let root = base.join("scratch");
+        std::fs::create_dir(&root).unwrap();
+        let fixture = ProbeFixture::new(vec![volume(base.to_str().unwrap(), "btrfs", 1000, 1)]);
+        let platform = Arc::clone(&fixture.platform);
+        let requested = root.clone();
+        let worker = std::thread::spawn(move || {
+            probe_root(requested, &[], platform.as_ref(), &AtomicBool::new(false))
+        });
+        fixture.requested(&root);
+        std::fs::rename(&root, base.join("old-root-retained")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        fixture.gate.release_all();
+        let expired = worker.join().unwrap();
+        assert!(expired.identity.is_none());
+        assert!(expired.device_id.is_none());
+
+        let fresh = probe_root(
+            root.clone(),
+            &[],
+            fixture.platform.as_ref(),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            fresh.identity,
+            Some(identity_for_path(&root, false).unwrap())
+        );
+        assert_eq!(
+            fresh.device_id,
+            fresh.identity.map(|identity| identity.device_id),
+            "a new unchanged-root observation can admit a later pass",
+        );
     }
 
     /// The monitor owns revocation while this harness retains a real blocked

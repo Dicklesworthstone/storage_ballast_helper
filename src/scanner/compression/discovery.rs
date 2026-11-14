@@ -80,12 +80,14 @@ pub struct DiscoveryReport {
     pub skipped: std::collections::BTreeMap<String, usize>,
     /// False on any budget stop or incomplete read. Never a snapshot guarantee.
     pub complete: bool,
-    /// Why discovery stopped before all requested work was examined.
+    /// Why discovery did not examine all requested work. An unreadable entry
+    /// leaves the report incomplete while independent siblings are still visited.
     pub stop_reason: Option<String>,
     /// Native bytes, as lowercase hex, of the path a stopped walk resumes
     /// after: the last selected file when the file limit stopped it, else the
     /// last path visited to completion when a byte, directory, entry or time
-    /// budget or a failed entry stopped it. Everything sorted before it is done.
+    /// budget stopped it. Unreadable entries are excluded for this traversal
+    /// and retried when the next full traversal starts.
     /// Absent when the walk completed or stopped before visiting anything.
     /// Pass to `--after-hex` to resume.
     pub resume_after_hex: Option<String>,
@@ -95,6 +97,9 @@ pub struct DiscoveryReport {
 #[derive(Debug)]
 pub struct Selection {
     report: DiscoveryReport,
+    /// All scheduled paths were visited or conservatively excluded. This can
+    /// be true despite observation failures, unlike `report.complete`.
+    traversal_exhausted: bool,
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
@@ -107,6 +112,13 @@ impl Selection {
     #[must_use]
     pub fn report(&self) -> &DiscoveryReport {
         &self.report
+    }
+
+    /// Whether a continuation has reached the end of this traversal. An
+    /// unreadable entry must not prevent the next cycle from revisiting an
+    /// earlier subtree, while a budget stop must retain its current position.
+    pub(crate) fn traversal_exhausted(&self) -> bool {
+        self.traversal_exhausted
     }
 
     /// Native paths in deterministic order. These are not an authorization token.
@@ -125,6 +137,57 @@ impl Selection {
         )))]
         {
             Vec::new()
+        }
+    }
+
+    /// Bind a daemon selection to the directory whose filesystem pressure
+    /// admitted the pass. Discovery pins its own root after the admission
+    /// probe; a replacement or remount between them must not inherit that
+    /// earlier filesystem's authority. Explicit CLI selection needs no such
+    /// background-pressure authorization.
+    pub(crate) fn validate_root_identity(
+        &self,
+        path: &Path,
+        expected: crate::scanner::walker::FsIdentity,
+    ) -> io::Result<()> {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let root = self
+                .native
+                .roots
+                .iter()
+                .find(|root| root.path == path)
+                .ok_or_else(|| invalid("admitted root is absent from compression discovery"))?;
+            let pinned = root.file.metadata()?;
+            let current = native::open_root(path)?.metadata()?;
+            if expected.kind != crate::scanner::walker::FsEntryKind::Directory
+                || !pinned.is_dir()
+                || pinned.dev() != expected.device_id
+                || pinned.ino() != expected.inode
+                || current.dev() != expected.device_id
+                || current.ino() != expected.inode
+            {
+                return Err(io::Error::other(
+                    "compression root changed after pressure admission",
+                ));
+            }
+            Ok(())
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            let _ = (path, expected);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native compression discovery is unavailable on this target",
+            ))
         }
     }
 
@@ -302,7 +365,10 @@ pub(crate) fn discover_with_budget(
         let mut report = report;
         report.stop_reason =
             Some("native compression discovery is unavailable on this target".into());
-        Ok(Selection { report })
+        Ok(Selection {
+            report,
+            traversal_exhausted: false,
+        })
     }
 }
 
@@ -392,6 +458,20 @@ mod native {
         depth: usize,
     }
 
+    /// A work limit pauses the ordered traversal; an observation failure only
+    /// excludes the affected entry. Treating both as a pause would retry one
+    /// inaccessible directory forever and starve every later sibling.
+    enum VisitError {
+        Budget(io::Error),
+        Observation(io::Error),
+    }
+
+    impl From<io::Error> for VisitError {
+        fn from(error: io::Error) -> Self {
+            Self::Observation(error)
+        }
+    }
+
     struct Walker<'a> {
         policy: &'a CompressionPolicy,
         selection_bytes: u64,
@@ -419,12 +499,12 @@ mod native {
                 .or_default() += 1;
         }
 
-        fn budget(&self) -> io::Result<()> {
+        fn budget(&self) -> Result<(), VisitError> {
             if Instant::now() >= self.deadline {
-                Err(io::Error::new(
+                Err(VisitError::Budget(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "discovery deadline exhausted",
-                ))
+                )))
             } else {
                 Ok(())
             }
@@ -456,7 +536,7 @@ mod native {
         }
 
         #[allow(clippy::too_many_lines)] // one directory step, in order
-        fn visit(&mut self, task: &Task) -> io::Result<()> {
+        fn visit(&mut self, task: &Task) -> Result<(), VisitError> {
             self.budget()?;
             let root = &self.selection.native.roots[task.root];
             let path = root.path.join(&task.relative);
@@ -491,7 +571,7 @@ mod native {
                     self.skip("symlink_or_mount_boundary");
                     return Ok(());
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(io::Error::from(error).into()),
             };
             let metadata = file.metadata()?;
             if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
@@ -527,7 +607,9 @@ mod native {
                     return Ok(());
                 }
                 if self.selection.report.directories_opened >= self.limits.max_directories {
-                    return Err(io::Error::other("discovery directory budget exhausted"));
+                    return Err(VisitError::Budget(io::Error::other(
+                        "discovery directory budget exhausted",
+                    )));
                 }
                 self.selection.report.directories_opened += 1;
                 // Enumerate the pinned inode, not a pathname that could now
@@ -537,7 +619,9 @@ mod native {
                 for entry in entries {
                     self.budget()?;
                     if self.selection.report.entries_examined >= self.limits.max_entries {
-                        return Err(io::Error::other("discovery entry budget exhausted"));
+                        return Err(VisitError::Budget(io::Error::other(
+                            "discovery entry budget exhausted",
+                        )));
                     }
                     self.selection.report.entries_examined += 1;
                     names.push(entry?.file_name());
@@ -596,7 +680,9 @@ mod native {
                 // than an exclusion. A "complete" scan here would repeatedly
                 // select an earlier prefix even when execution refuses every
                 // file in that prefix. Stop BEFORE advancing last_visited.
-                return Err(io::Error::other("discovery logical-byte budget exhausted"));
+                return Err(VisitError::Budget(io::Error::other(
+                    "discovery logical-byte budget exhausted",
+                )));
             } else if !self.identities.insert((stamp.device, stamp.inode)) {
                 self.skip("duplicate_inode");
             } else {
@@ -623,7 +709,7 @@ mod native {
         relative: &Path,
         expected: FileStamp,
         deadline: Instant,
-    ) -> io::Result<Option<&'static str>> {
+    ) -> Result<Option<&'static str>, VisitError> {
         let exclusion = openat2(
             root,
             relative,
@@ -643,10 +729,10 @@ mod native {
             sbh_btrfs::discovery_exclusion(&file, deadline)
         });
         if Instant::now() >= deadline {
-            return Err(io::Error::new(
+            return Err(VisitError::Budget(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "discovery deadline exhausted",
-            ));
+            )));
         }
         Ok(exclusion.ok().flatten())
     }
@@ -696,6 +782,7 @@ mod native {
             sacred: platform.sacred_paths(),
             selection: Selection {
                 report,
+                traversal_exhausted: true,
                 native: evidence,
             },
             pending,
@@ -704,6 +791,7 @@ mod native {
         };
         while let Some(task) = walker.pending.pop() {
             if walker.selection.report.selected_files >= policy.max_files {
+                walker.selection.traversal_exhausted = false;
                 walker.selection.report.complete = false;
                 walker.selection.report.stop_reason =
                     Some("discovery file-count budget exhausted".into());
@@ -720,13 +808,25 @@ mod native {
                 .join(&task.relative);
             match walker.visit(&task) {
                 Ok(()) => walker.last_visited = Some(path),
-                Err(error) => {
+                Err(VisitError::Observation(error)) => {
+                    // The failed task admits no files and enqueues no children.
+                    // Keep the failure visible without making its unchanging
+                    // pathname a permanent barrier to independent siblings.
+                    walker.selection.report.complete = false;
+                    walker
+                        .selection
+                        .report
+                        .stop_reason
+                        .get_or_insert_with(|| error.to_string());
+                    walker.skip("unreadable_entry");
+                }
+                Err(VisitError::Budget(error)) => {
+                    walker.selection.traversal_exhausted = false;
                     walker.selection.report.complete = false;
                     walker.selection.report.stop_reason = Some(error.to_string());
-                    // Any stop (a budget, or an entry that vanished or could
-                    // not be read) resumes after the last path visited to
-                    // completion: a truncated directory read is never
-                    // claimed, and the failed entry is simply retried.
+                    // A work limit resumes after the last path visited to
+                    // completion: a budget-truncated directory read is never
+                    // claimed. Observation failures are retried next cycle.
                     walker.selection.report.resume_after_hex = walker
                         .last_visited
                         .as_ref()
