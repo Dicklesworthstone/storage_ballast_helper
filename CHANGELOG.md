@@ -6,6 +6,18 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.7.14 **[release]**
+
+Compare: [`v0.7.13...v0.7.14`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.13...v0.7.14)
+
+Fixes from the v0.7.13 fleet rollout and its first native macOS test run.
+Green and Yellow passes no longer delete a build target idle less than 12
+hours (bd-i9uh). A stalled filesystem no longer stalls pressure control, and
+ballast status counts only the reserve observed on disk (#41). Reinstalling
+keeps the operator's configuration (#42), `sbh status` names a service that
+runs a different config (bd-bx6j), and on macOS control-socket replies longer
+than 4 KiB are read in full.
+
 Upgrade note: `scoring.definite_floor_maintenance_idle_hours` is a new key.
 Releases before it reject a config that sets it, so set it only once every
 host runs a version that has it.
@@ -44,6 +56,11 @@ host runs a version that has it.
   across every selected root, including failures after the last selected file.
   Unvisited files and roots keep their continuation, while ordinary checked
   skips and failures before mutation still allow healthy roots to progress.
+  Discovery binds each root's admission to the directory the pressure probe
+  observed: a root replaced or remounted in between gets no admission and
+  cannot move its saved continuation, while unchanged roots proceed. An
+  unreadable entry no longer starves its later siblings, and a traversal
+  that ends on unreadable entries wraps so earlier ones are retried.
 
 - **A Green or Yellow pass no longer deletes a build target in use today
   (bd-i9uh).** The definite-artifact fast lane (`posterior_floor_definite`)
