@@ -94,6 +94,11 @@ pub(super) fn query_output(command: &mut Command) -> io::Result<Output> {
     query_output_with_limits(command, Duration::from_secs(5), 1024 * 1024)
 }
 
+/// How long a query that has exited may keep a writer open before its output
+/// counts as partial (see `query_output_with_limits`).
+#[cfg(unix)]
+const QUERY_EXIT_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
 #[cfg(unix)]
 fn query_output_with_limits(
     command: &mut Command,
@@ -133,15 +138,27 @@ fn query_output_with_limits(
         drain_query_stream(&mut stderr, &mut err, &mut remaining)?;
         if child.has_exited()? {
             // Catch bytes written between the first drain and process exit.
-            // Never block on a descendant that inherited a writer. A partial
-            // response cannot establish that a unit is absent or safe to run.
-            let out_closed = drain_query_stream(&mut stdout, &mut out, &mut remaining)?;
-            let err_closed = drain_query_stream(&mut stderr, &mut err, &mut remaining)?;
-            if !out_closed || !err_closed {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "service query exited without closing its output; refusing a partial response",
-                ));
+            // A writer can outlive the query without being its descendant:
+            // another thread of this process that forks for its own command
+            // holds every descriptor until that child execs and CLOEXEC closes
+            // them. Wait out that window, bounded by the deadline, but never
+            // block on a descendant that kept a writer. A partial response
+            // cannot establish that a unit is absent or safe to run.
+            let grace = QUERY_EXIT_DRAIN_GRACE.min(timeout.saturating_sub(started.elapsed()));
+            let grace_ends = Instant::now() + grace;
+            loop {
+                let out_closed = drain_query_stream(&mut stdout, &mut out, &mut remaining)?;
+                let err_closed = drain_query_stream(&mut stderr, &mut err, &mut remaining)?;
+                if out_closed && err_closed {
+                    break;
+                }
+                if Instant::now() >= grace_ends {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "service query exited without closing its output; refusing a partial response",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
             }
             let status = child.reap()?;
             return Ok(Output {
@@ -531,6 +548,24 @@ mod query_tests {
         std::fs::write(release, b"done").unwrap();
         let error = result.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_writer_closed_shortly_after_exit_still_yields_the_full_response() {
+        // The background subshell keeps both writers for 300 ms after the
+        // query exits, as a thread of this process forking for another command
+        // does until that child execs. Once every writer closes, the output is
+        // complete, so the query succeeds instead of reporting a partial one.
+        let started = Instant::now();
+        let output = query_output_with_limits(
+            &mut shell("(sleep 0.3) & printf 'loaded\\n'; exit 3"),
+            Duration::from_secs(5),
+            1024,
+        )
+        .unwrap();
+        assert_eq!(output.stdout, b"loaded\n");
+        assert_eq!(output.status.code(), Some(3));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

@@ -6,6 +6,17 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+### Fixed
+
+- **Service queries wait briefly for a writer that outlives them.** The
+  bounded `systemctl`/`busctl` queries that `sbh update` and rollback run
+  before restarting the service refused any reply whose output pipe was still
+  open when the query exited. Another thread of the same process that starts a command
+  holds that pipe until its child execs, so a busy process could fail with
+  "refusing a partial response". A query now waits up to one second, within
+  its deadline, for every writer to close; a descendant that keeps the pipe
+  open is still refused.
+
 ## v0.7.14 **[release]**
 
 Compare: [`v0.7.13...v0.7.14`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.13...v0.7.14)
