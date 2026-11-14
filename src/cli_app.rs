@@ -6375,7 +6375,7 @@ fn run_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
             if report.io_error_count > 0 || report.open_file_error_count > 0 {
                 println!();
                 println!(
-                    "  Partial attribution: {} process I/O read errors, {} open-file root errors",
+                    "  Partial attribution: {} unavailable or changed process samples, {} incomplete open-file roots",
                     report.io_error_count, report.open_file_error_count,
                 );
             }
@@ -6434,18 +6434,26 @@ fn collect_blame_report_at(
         collect_blame_open_files(platform, &open_file_roots);
     let mut io_error_count = 0;
     let mut rows = Vec::with_capacity(processes.len());
+    let deadline =
+        std::time::Instant::now() + storage_ballast_helper::platform::types::OPEN_FILES_SCAN_BUDGET;
 
     for process in &processes {
-        let io = platform.process_io(process.pid).unwrap_or_else(|_| {
-            io_error_count += 1;
-            ProcessIo {
-                pid: process.pid,
-                bytes_read_total: 0,
-                bytes_written_total: 0,
-                bytes_read_recent_15m: None,
-                bytes_written_recent_15m: None,
+        // Inventory and open-file sweeps can take long enough for a PID to be
+        // reused. Only attach counters and paths when the identity-bracketed
+        // sample still belongs to the process whose name we are displaying.
+        let io = match platform.process_io_snapshot(process.pid, deadline) {
+            Ok(snapshot)
+                if snapshot.io.pid == process.pid
+                    && Some(snapshot.start_time_unix_ms) == process.start_time_unix_ms
+                    && (0..=collected_at_unix_ms).contains(&snapshot.start_time_unix_ms) =>
+            {
+                snapshot.io
             }
-        });
+            Ok(_) | Err(_) => {
+                io_error_count += 1;
+                continue;
+            }
+        };
         let recent = blame_recent_totals(history, process, &io, since, collected_at_unix_ms);
         let mut open_files = open_files_by_pid
             .get(&process.pid)
@@ -6531,6 +6539,9 @@ fn collect_blame_open_files(
     for root in roots {
         match platform.open_files_under(root) {
             Ok(result) => {
+                if !result.complete {
+                    errors += 1;
+                }
                 for open_file in result.files {
                     by_pid
                         .entry(open_file.pid)
@@ -18841,10 +18852,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use storage_ballast_helper::ballast::coordinator::BallastRefillBlocker;
     use storage_ballast_helper::core::config::SacredConfig;
+    use storage_ballast_helper::core::errors::Result as PalResult;
     use storage_ballast_helper::platform::pal::{FsStats, MockPlatform, MountPoint, PlatformPaths};
     use storage_ballast_helper::platform::types::{
         FullDiskAccessState, FullDiskAccessStatus, OpenFile, OpenFileKind, OpenFileMode,
-        ProcessInfo, ProcessIo, SnapshotThinningEstimate,
+        OpenFilesResult, ProcessInfo, ProcessIo, ProcessIoSnapshot, SnapshotThinningEstimate,
     };
     use tempfile::TempDir;
 
@@ -19289,6 +19301,57 @@ mod tests {
             bytes_written_total,
             bytes_read_recent_15m: None,
             bytes_written_recent_15m: None,
+        }
+    }
+
+    struct BlameSnapshotPlatform {
+        inventory: MockPlatform,
+        current: MockPlatform,
+    }
+
+    impl Platform for BlameSnapshotPlatform {
+        fn fs_stats(&self, path: &Path) -> PalResult<FsStats> {
+            self.inventory.fs_stats(path)
+        }
+
+        fn mount_points(&self) -> PalResult<Vec<MountPoint>> {
+            self.inventory.mount_points()
+        }
+
+        fn is_ram_backed(&self, path: &Path) -> PalResult<bool> {
+            self.inventory.is_ram_backed(path)
+        }
+
+        fn default_paths(&self) -> PlatformPaths {
+            self.inventory.default_paths()
+        }
+
+        fn memory_info(&self) -> PalResult<MemoryInfo> {
+            self.inventory.memory_info()
+        }
+
+        fn service_manager(&self) -> Box<dyn ServiceManager> {
+            self.inventory.service_manager()
+        }
+
+        fn process_list(&self) -> PalResult<Vec<ProcessInfo>> {
+            self.inventory.process_list()
+        }
+
+        fn process_io(&self, _pid: i32) -> PalResult<ProcessIo> {
+            panic!("blame must validate process identity around its counter read");
+        }
+
+        fn process_io_snapshot(
+            &self,
+            pid: i32,
+            deadline: std::time::Instant,
+        ) -> PalResult<ProcessIoSnapshot> {
+            self.current.process_io_snapshot(pid, deadline)
+        }
+
+        fn open_files_under(&self, path: &Path) -> PalResult<OpenFilesResult> {
+            self.inventory.open_files_under(path)
         }
     }
 
@@ -24828,6 +24891,106 @@ mod tests {
         assert_eq!(report.rows[0].pid, 42);
         assert_eq!(report.rows[0].recent_written_bytes, 100_000);
         assert_eq!(report.rows[0].recent_read_bytes, 500);
+        assert_eq!(report.rows[0].open_files, vec![open_path]);
+        assert_eq!(report.io_error_count, 0);
+        assert_eq!(report.open_file_error_count, 0);
+    }
+
+    #[test]
+    fn blame_rejects_reused_exited_and_unidentified_processes() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let now = 1_700_000_000_000;
+        let old_start = Some(now - 3_600_000);
+        let new_start = Some(now - 30_000);
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![root.clone()];
+        let mut history = ProcessIoHistory::new(root.join("io_history.bin"));
+        for pid in [7, 42] {
+            let _ =
+                history.record_process_sample_at(blame_io(pid, 100, 200), old_start, now - 600_000);
+        }
+        let mut inventory = MockPlatform::healthy();
+        for (pid, name, start) in [
+            (7, "stable", old_start),
+            (42, "exited-writer", old_start),
+            (66, "unknown-start", None),
+            (77, "vanished", old_start),
+        ] {
+            inventory = inventory.with_process(blame_process(pid, None, name, vec![name], start));
+        }
+        inventory = inventory.with_open_file(OpenFile {
+            pid: 42,
+            path: root.join("replacement-process-output"),
+            fd: Some(3),
+            kind: OpenFileKind::Regular,
+            mode: OpenFileMode::Write,
+        });
+        let mut current = MockPlatform::healthy();
+        for (pid, start) in [(7, old_start), (42, new_start), (66, old_start)] {
+            current = current
+                .with_process(blame_process(pid, None, "current", vec!["current"], start))
+                .with_process_io(blame_io(pid, 1_000, 100_000));
+        }
+        let report = collect_blame_report_at(
+            &config,
+            &BlameSnapshotPlatform { inventory, current },
+            &history,
+            Duration::from_mins(15),
+            10,
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(report.process_count, 4);
+        assert_eq!(report.io_error_count, 3);
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].pid, 7);
+        assert_eq!(report.rows[0].name, "stable");
+        assert_eq!(report.rows[0].recent_written_bytes, 99_800);
+        assert!(report.rows[0].open_files.is_empty());
+    }
+
+    #[test]
+    fn blame_reports_incomplete_open_file_roots_while_retaining_observed_paths() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let now = 1_700_000_000_000;
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![root.clone()];
+        let history = ProcessIoHistory::new(root.join("io_history.bin"));
+        let open_path = root.join("output");
+        let platform = MockPlatform::healthy()
+            .with_process(blame_process(
+                42,
+                None,
+                "writer",
+                vec!["writer"],
+                Some(now - 30_000),
+            ))
+            .with_process_io(blame_io(42, 100, 200))
+            .with_open_file(OpenFile {
+                pid: 42,
+                path: open_path.clone(),
+                fd: Some(3),
+                kind: OpenFileKind::Regular,
+                mode: OpenFileMode::Write,
+            })
+            .with_open_files_complete(false);
+        let report = collect_blame_report_at(
+            &config,
+            &platform,
+            &history,
+            Duration::from_mins(15),
+            10,
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(report.open_file_error_count, 1);
+        assert_eq!(report.io_error_count, 0);
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].recent_written_bytes, 200);
         assert_eq!(report.rows[0].open_files, vec![open_path]);
     }
 

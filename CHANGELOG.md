@@ -27,6 +27,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **`sbh blame` refuses recycled process identities.** Process counters are
+  now sampled with identity checks around the read and matched to the original
+  process inventory. An exited process cannot inherit its replacement's writes
+  or open files. Unavailable or changed identities and incomplete open-file
+  sweeps are reported as partial attribution.
 - **A routine maintenance pass the CPU budget defers is no longer lost**
   (bd-p18q). The monitor marks the maintenance pass as sent when it queues
   it and sends the next one a whole `maintenance_interval_secs` later. When
