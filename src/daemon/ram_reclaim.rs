@@ -883,6 +883,73 @@ mod tests {
         assert!(candidate.path.join("artifact").exists());
     }
 
+    /// bd-paeg acceptance, with the bead's fixtures: on a tmpfs root with swap
+    /// exhausted, relief removes only the idle, unheld, unprotected artifact;
+    /// one a process holds open and one under a marker stay. With swap free,
+    /// the same batch removes nothing.
+    #[test]
+    fn swap_relief_removes_only_the_idle_unheld_unprotected_artifact() {
+        use crate::platform::types::{OpenFile, OpenFileKind, OpenFileMode};
+        use crate::scanner::deletion::DeletionMode;
+        use std::sync::Arc;
+
+        for (swap_free_bytes, relief_due) in [(1_u64, true), (1000, false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let idle = candidate(temp.path().join("idle"));
+            let held = candidate(temp.path().join("held"));
+            let protected = candidate(temp.path().join("protected"));
+            fs::write(protected.path.join(".sbh-protect"), b"operator work").unwrap();
+            // The target covers all three, so only the rails can keep one.
+            let target = idle.size_bytes + held.size_bytes + protected.size_bytes;
+            let request = RamReclaimRequest::new(
+                temp.path().to_path_buf(),
+                idle.identity.unwrap().device_id,
+                target,
+                &[temp.path().to_path_buf()],
+            );
+            let pal = Arc::new(
+                platform(temp.path(), memory(swap_free_bytes), "tmpfs").with_open_file(OpenFile {
+                    pid: 4242,
+                    path: held.path.join("artifact"),
+                    fd: Some(3),
+                    kind: OpenFileKind::Regular,
+                    mode: OpenFileMode::Read,
+                }),
+            );
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    dry_run: false,
+                    min_score: 0.0,
+                    check_open_files: true,
+                    require_identity: true,
+                    mode: DeletionMode::Unlink,
+                    ..DeletionConfig::default()
+                },
+                None,
+            )
+            .with_platform(pal.clone());
+            let plan = executor.plan(vec![held.clone(), protected.clone(), idle.clone()]);
+            let report = executor.execute_with_hooks(
+                &plan,
+                None,
+                Some(&|candidate| request.authorize(candidate, pal.as_ref())),
+                Some(&|candidate, _| request.record_unlinked(candidate)),
+            );
+
+            assert!(held.path.join("artifact").exists(), "{report:?}");
+            assert!(protected.path.join("artifact").exists(), "{report:?}");
+            if relief_due {
+                assert_eq!(report.deleted_paths, vec![idle.path.clone()], "{report:?}");
+                assert_eq!(report.skipped_by_reason.get("file_open"), Some(&1));
+                assert_eq!(request.remaining_bytes(), target - idle.size_bytes);
+            } else {
+                assert_eq!(report.items_deleted, 0, "{report:?}");
+                assert!(idle.path.join("artifact").exists());
+                assert_eq!(request.remaining_bytes(), target);
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn replacement_and_symlink_do_not_inherit_the_observed_identity() {
