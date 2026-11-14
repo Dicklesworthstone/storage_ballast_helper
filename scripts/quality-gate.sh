@@ -440,7 +440,13 @@ stage_native_ram_scratch() {
       exit 1
     fi
     work="$(native_scratch)" || exit 1
-    trap 'echo "native-ram-scratch: artifacts retained at ${work}"' EXIT
+    # The fixtures are root-owned (the test runs as root and keeps them), so
+    # a plain rm -r of the scratch dir fails: remove them as root on a pass
+    # (a failed removal does not fail the stage), keep them on a failure.
+    trap 'rc=$?
+      if [[ ${rc} -eq 0 ]]; then
+        as_root rm -r "${work}" || echo "native-ram-scratch: could not remove ${work}"
+      else echo "native-ram-scratch: artifacts retained at ${work}"; fi' EXIT
     export CARGO_TARGET_DIR="${work}/target" RCH_CARGO_WRAPPER_BYPASS=1 RCH_REQUIRE_REMOTE=0
     echo "== visible, covered, stacked, replaced and denied tmpfs; library and CLI"
     if ! bin="$(native_test_executable ram_scratch_native --locked --no-default-features --features cli,daemon,sqlite --test ram_scratch_native)"; then
