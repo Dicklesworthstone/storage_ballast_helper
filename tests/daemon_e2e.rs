@@ -1796,6 +1796,16 @@ fn wait_for_pool_history(run: &mut DaemonRun, mount: &Path, available: u64, cred
     .unwrap_or_else(|error| panic!("{error}"));
 }
 
+/// When the release-credit fixtures' injected reading rises by the released
+/// files' worth, standing in for the release itself. Red starts at t=12, and
+/// a release reads its "free before" baseline when it runs, so the step must
+/// come after that reading. At t=13, a loaded host that released at t=13
+/// measured a zero delta, cut the release efficiency to 0.7 and released all
+/// five files instead of three (bd-c0rp). The settle reads at least 5 s after
+/// the release (t >= 17), so it sees a step at t=16 whenever the release runs
+/// within four seconds of Red.
+const RELEASE_EFFECT_SECS: u64 = 16;
+
 #[test]
 fn daemon_restart_retains_observed_credit_and_absent_history_releases_partial_reserve() {
     let dir = scratch();
@@ -1810,7 +1820,7 @@ fn daemon_restart_retains_observed_credit_and_absent_history_releases_partial_re
             1_000_000_000_000,
             500_000_000_000,
             false,
-            &[(12, 80_000_000_000), (13, after_release)],
+            &[(12, 80_000_000_000), (RELEASE_EFFECT_SECS, after_release)],
         ),
         mount_entry(root, total, free, readonly, &[]),
     ]);
@@ -1898,7 +1908,7 @@ fn alias_mount_release_credit_survives_state_writes_and_restart() {
     };
     let [keeper_first, alias_first] = shared(
         500_000_000_000,
-        &[(12, 80_000_000_000), (13, after_release)],
+        &[(12, 80_000_000_000), (RELEASE_EFFECT_SECS, after_release)],
     );
     let first_pressure = table_of(&[
         keeper_first,
