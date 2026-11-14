@@ -5,11 +5,13 @@
 //! including completed pages whose children still need another walk. Cached
 //! names are never completion or deletion evidence; every resumed directory is
 //! revalidated, and current traversal policy applies again at dispatch.
+//! Completed pages keep only names and metadata; only an unfinished enumeration
+//! needs an open directory handle, which would otherwise prevent volume eject.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, Metadata, ReadDir};
+use std::fs::{self, DirEntry, Metadata, ReadDir};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,14 +44,13 @@ pub(super) fn shared() -> Arc<Mutex<ReadAhead>> {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub(super) struct DirectoryRead {
-    pub(super) entries: ReadDir,
+    entries: Option<ReadDir>,
     stamp: Metadata,
     window_start: u32,
     window_size: u32,
     follow_symlinks: bool,
     ticket: Option<u64>,
     pub(super) reused: bool,
-    pub(super) exhausted: bool,
     pub(super) signals: StructuralSignals,
     pub(super) object_count: u32,
     pub(super) total_count: u32,
@@ -73,14 +74,13 @@ impl DirectoryRead {
         follow_symlinks: bool,
     ) -> io::Result<Self> {
         Ok(Self {
-            entries: fs::read_dir(path)?,
+            entries: Some(fs::read_dir(path)?),
             stamp,
             window_start: start,
             window_size: size,
             follow_symlinks,
             ticket: None,
             reused: false,
-            exhausted: false,
             signals: StructuralSignals::default(),
             object_count: 0,
             total_count: 0,
@@ -92,6 +92,21 @@ impl DirectoryRead {
             dispatch_interrupted: Arc::new(AtomicBool::new(false)),
             observed: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Read one name, releasing the directory handle as soon as EOF is seen.
+    /// A budget stop does not call this, so a paused enumeration keeps its
+    /// exact position. Ready pages need only their names and identity stamp.
+    pub(super) fn next_entry(&mut self) -> Option<io::Result<DirEntry>> {
+        let entry = self.entries.as_mut()?.next();
+        if entry.is_none() {
+            self.entries = None;
+        }
+        entry
+    }
+
+    pub(super) fn is_exhausted(&self) -> bool {
+        self.entries.is_none()
     }
 
     fn matches(&self, stamp: &Metadata, start: u32, size: u32, follow_symlinks: bool) -> bool {
@@ -301,10 +316,10 @@ impl ReadAhead {
         }
     }
 
-    /// Drop paused readers and ready pages outside `roots`. Each holds an
-    /// open directory, so after a reload removes a root its volume could not
-    /// be unmounted (EBUSY) until idle expiry an hour later (bd-656i). A
-    /// reader a worker has checked out holds no cached handle; it keeps its
+    /// Drop paused readers and ready pages outside `roots`. Paused readers
+    /// hold open directories, so after a reload removes a root its volume
+    /// could not be unmounted (EBUSY) until idle expiry an hour later (bd-656i).
+    /// A reader a worker has checked out holds no cached handle; it keeps its
     /// reservation and returns through the normal paths.
     pub(super) fn release_outside(&mut self, roots: &[PathBuf]) {
         let kept = |path: &Path| roots.iter().any(|root| path.starts_with(root));
@@ -352,7 +367,7 @@ impl ReadAhead {
 
     pub(super) fn admit(&mut self, path: &Path, read: &mut DirectoryRead) {
         self.expire(Instant::now());
-        if read.exhausted
+        if read.is_exhausted()
             || read.ticket.is_some()
             || self.pending.len() >= MAX_PENDING_READERS
             || self.pending.contains_key(path)
@@ -385,7 +400,7 @@ impl ReadAhead {
     pub(super) fn retain(&mut self, path: &Path, mut read: DirectoryRead) {
         let now = Instant::now();
         self.expire(now);
-        if !read.exhausted {
+        if !read.is_exhausted() {
             if let Some(entry) = self.pending.get_mut(path)
                 && read.ticket == Some(entry.ticket)
             {
@@ -402,8 +417,8 @@ impl ReadAhead {
             return;
         }
         // Never evict an unfinished reader to retain a completed parent.
-        // The separate ready-page allowance bounds both retained handles and
-        // names; these pages are merely a way to reach unfinished descendants.
+        // The separate ready-page allowance bounds retained pages and names;
+        // these pages are merely a way to reach unfinished descendants.
         let children = read.children.len();
         if children > MAX_READY_CHILDREN {
             return;
@@ -479,7 +494,7 @@ mod tests {
         }
         assert_eq!(cache.pending.len(), 4);
         assert!(cache.pending[&paths[0]].read.is_none());
-        running.exhausted = true;
+        assert!(running.next_entry().is_none());
         cache.retain(&paths[0], running);
         let mut fifth = read(&paths[4]);
         cache.admit(&paths[4], &mut fifth);
@@ -490,6 +505,45 @@ mod tests {
         cache.retain(&paths[4], fifth);
         assert_eq!(cache.pending.len(), 4);
         assert!(cache.ready.contains_key(&paths[0]));
+    }
+
+    #[test]
+    fn a_paused_enumeration_keeps_its_position_but_eof_releases_its_reader() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut expected = vec![OsString::from("first"), OsString::from("second")];
+        for name in &expected {
+            fs::create_dir(temp.path().join(name)).unwrap();
+        }
+        let mut cache = ReadAhead::default();
+        let mut reader = read(temp.path());
+        cache.admit(temp.path(), &mut reader);
+        let first = reader.next_entry().unwrap().unwrap().file_name();
+        reader.children.push(first);
+        cache.retain(temp.path(), reader);
+        assert!(cache.pending[temp.path()].read.is_some());
+
+        let stamp = fs::metadata(temp.path()).unwrap();
+        let mut resumed = cache
+            .take(temp.path(), &stamp, 0, MAX_ENTRIES_PER_DIR, false)
+            .unwrap();
+        assert!(resumed.reused);
+        assert!(!resumed.is_exhausted());
+        while let Some(entry) = resumed.next_entry() {
+            resumed.children.push(entry.unwrap().file_name());
+        }
+        assert!(resumed.is_exhausted());
+        assert!(resumed.next_entry().is_none());
+        resumed.children.sort();
+        expected.sort();
+        assert_eq!(resumed.children, expected, "no name is skipped or repeated");
+        cache.retain(temp.path(), resumed);
+        assert!(cache.pending.is_empty());
+
+        let ready = cache
+            .take(temp.path(), &stamp, 0, MAX_ENTRIES_PER_DIR, false)
+            .unwrap();
+        assert!(ready.is_exhausted());
+        assert_eq!(ready.children, expected, "completed names remain reusable");
     }
 
     #[test]
@@ -524,7 +578,7 @@ mod tests {
         let mut reader = read(temp.path());
         cache.admit(temp.path(), &mut reader);
         reader.entries_incomplete = true;
-        reader.exhausted = true;
+        assert!(reader.next_entry().is_none());
         cache.retain(temp.path(), reader);
         assert!(cache.ready.is_empty());
         assert!(cache.pending.is_empty());
@@ -541,7 +595,7 @@ mod tests {
             let path = temp.path().join(format!("parent-{index}"));
             fs::create_dir(&path).unwrap();
             let mut parent = read(&path);
-            parent.exhausted = true;
+            assert!(parent.next_entry().is_none());
             parent.children = vec![OsString::from("child"); MAX_READY_CHILDREN / 3];
             cache.retain(&path, parent);
             assert!(cache.ready.len() <= MAX_READY_PAGES);
@@ -578,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn released_roots_close_paused_and_ready_handles_but_not_checked_out_readers() {
+    fn released_roots_drop_paused_reads_and_cached_names_but_not_checked_out_readers() {
         let temp = tempfile::tempdir().unwrap();
         let kept_root = temp.path().join("kept");
         let removed_root = temp.path().join("removed");
@@ -597,7 +651,7 @@ mod tests {
         cache.admit(&running, &mut checked_out);
         for path in [&done, &kept_done] {
             let mut page = read(path);
-            page.exhausted = true;
+            assert!(page.next_entry().is_none());
             cache.retain(path, page);
         }
         cache.release_outside(std::slice::from_ref(&kept_root));

@@ -27,6 +27,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Completed walker pages release their directory handles immediately.**
+  Cached names and traversal progress remain reusable across finite scan
+  slices, but reaching directory EOF no longer keeps an unnecessary handle
+  open until cache expiry. Partially enumerated directories still retain their
+  readers so the next slice can resume without skipping entries (bd-656i).
 - **`sbh blame` refuses recycled process identities.** Process counters are
   now sampled with identity checks around the read and matched to the original
   process inventory. An exited process cannot inherit its replacement's writes

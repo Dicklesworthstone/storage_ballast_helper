@@ -228,3 +228,67 @@ fn cancellation_during_child_dispatch_does_not_advance_the_window() {
         Some(&512)
     );
 }
+
+#[cfg(target_os = "linux")]
+fn open_handles_below(root: &Path) -> Vec<PathBuf> {
+    let root = root.canonicalize().unwrap();
+    fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| fs::read_link(entry.unwrap().path()).ok())
+        .filter(|path| path.starts_with(&root))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn completed_walks_release_directory_handles_and_reuse_cached_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir_all(root.join("parent/left")).unwrap();
+    fs::create_dir(root.join("parent/right")).unwrap();
+    fs::write(root.join("parent/left/payload"), "preserved").unwrap();
+    let walk = || {
+        let mut paths: Vec<_> =
+            DirectoryWalker::new(config(root), ProtectionRegistry::marker_only())
+                .without_file_sizes()
+                .walk()
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect();
+        paths.sort();
+        paths
+    };
+    let first = walk();
+    assert_eq!(
+        first,
+        [
+            root.join("parent"),
+            root.join("parent/left"),
+            root.join("parent/right"),
+        ]
+    );
+    let handles = open_handles_below(root);
+    assert!(
+        handles.is_empty(),
+        "completed discovery must not keep the volume busy: {handles:?}"
+    );
+
+    // Releasing descriptors must not discard the cached names that let a
+    // later finite slice reach work beyond a large parent directory.
+    let cache = read_ahead::shared();
+    let stamp = fs::metadata(root).unwrap();
+    let retained = cache
+        .lock()
+        .take(root, &stamp, 0, MAX_ENTRIES_PER_DIR, false)
+        .expect("the completed root page stays cached");
+    assert!(retained.reused);
+    cache.lock().retain(root, retained);
+
+    assert_eq!(walk(), first);
+    assert!(open_handles_below(root).is_empty());
+    assert_eq!(
+        fs::read_to_string(root.join("parent/left/payload")).unwrap(),
+        "preserved"
+    );
+}

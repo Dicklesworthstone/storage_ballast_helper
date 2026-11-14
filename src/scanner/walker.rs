@@ -1475,7 +1475,7 @@ fn process_directory(
     };
     let reservation = ReadReservation::new(&windows.reads, dir_path, &read);
     let mut names_this_visit = 0;
-    while !read.exhausted {
+    while !read.is_exhausted() {
         // Large flat directories can take a long time to iterate. Honor
         // cancellation during the hot loop so the daemon can stop promptly
         // when a scan budget expires instead of waiting for the entire
@@ -1520,8 +1520,7 @@ fn process_directory(
             }
             return;
         }
-        let Some(entry_result) = read.entries.next() else {
-            read.exhausted = true;
+        let Some(entry_result) = read.next_entry() else {
             break;
         };
         let Ok(entry) = entry_result else {
