@@ -2544,6 +2544,27 @@ struct MountTickResponse {
     imminent_danger: bool,
     /// The mount's EWMA estimate, for `state.json` (`rates`, `rate_bps`).
     rate: MountRateState,
+    /// Device of this mount's sample. Bind mounts of one filesystem, such as
+    /// a systemd unit's `ReadWritePaths=`, are separate mounts here but share
+    /// one device and one forecast.
+    device_id: Option<u64>,
+}
+
+/// Predictive warning cooldown key: a filesystem, or a mount path when the
+/// sample's device is unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PredictiveWarningKey {
+    Device(u64),
+    Path(PathBuf),
+}
+
+impl PredictiveWarningKey {
+    fn of(tick: &MountTickResponse) -> Self {
+        tick.device_id.map_or_else(
+            || Self::Path(tick.response.causing_mount.clone()),
+            Self::Device,
+        )
+    }
 }
 
 /// A finite, positive prediction or nothing.
@@ -3554,7 +3575,7 @@ pub struct MonitoringDaemon {
     /// pressure loop also suppresses.
     last_special_notify: HashMap<PathBuf, (PressureLevel, Instant)>,
     /// A forecast on one filesystem cannot mute another filesystem's alert.
-    last_predictive_warning: HashMap<PathBuf, (NotificationLevel, Instant)>,
+    last_predictive_warning: HashMap<PredictiveWarningKey, (NotificationLevel, Instant)>,
     last_ewma_confidence: f64,
     predictive_policy: PredictiveActionPolicy,
     last_predictive_action: PredictiveAction,
@@ -8115,6 +8136,7 @@ impl MonitoringDaemon {
                         )
                     }),
                 },
+                device_id: pressure_observation_device_id(&sample, background_observations),
             });
 
             // Track worst response (highest urgency/severity).
@@ -10132,6 +10154,15 @@ impl MonitoringDaemon {
         // the map indefinitely and threshold oscillations cannot cause spam.
         self.last_predictive_warning
             .retain(|_, (_, at)| now.saturating_duration_since(*at) < Duration::from_mins(5));
+        // Aliases of one filesystem (bind mounts) share its forecast: warn
+        // once per filesystem, at the most severe level any alias reached,
+        // naming its shortest mount path.
+        let mut per_filesystem: Vec<(
+            PredictiveWarningKey,
+            NotificationLevel,
+            &Path,
+            NotificationEvent,
+        )> = Vec::new();
         for tick in responses {
             let Some(event) = predictive_warning_event(tick, &self.config.pressure.prediction)
             else {
@@ -10141,10 +10172,27 @@ impl MonitoringDaemon {
             // manager, including its confidence cap, rather than computing a
             // second, potentially inconsistent level for escalation.
             let level = event.level();
-            let mount = &tick.response.causing_mount;
+            let key = PredictiveWarningKey::of(tick);
+            let mount = tick.response.causing_mount.as_path();
+            let rank = |level: NotificationLevel, mount: &Path| {
+                (
+                    std::cmp::Reverse(level),
+                    mount.as_os_str().len(),
+                    mount.to_path_buf(),
+                )
+            };
+            match per_filesystem.iter_mut().find(|entry| entry.0 == key) {
+                Some(entry) if rank(level, mount) < rank(entry.1, entry.2) => {
+                    *entry = (key, level, mount, event);
+                }
+                Some(_) => {}
+                None => per_filesystem.push((key, level, mount, event)),
+            }
+        }
+        for (key, level, _, event) in per_filesystem {
             if self
                 .last_predictive_warning
-                .get(mount)
+                .get(&key)
                 .is_some_and(|(previous, _)| level <= *previous)
             {
                 continue;
@@ -10152,8 +10200,7 @@ impl MonitoringDaemon {
             if self.notification_manager.notify_with_outcome(&event)
                 == NotificationDispatchOutcome::Accepted
             {
-                self.last_predictive_warning
-                    .insert(mount.clone(), (level, now));
+                self.last_predictive_warning.insert(key, (level, now));
             }
             // A throttled or unaccepted attempt stays eligible on the next
             // sampled tick; a full queue must not hide an imminent warning
@@ -19301,6 +19348,7 @@ mod tests {
             predictive_action: PredictiveAction::Clear,
             imminent_danger: false,
             rate: MountRateState::default(),
+            device_id: None,
         }
     }
 
@@ -19745,6 +19793,79 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn predictive_warnings_name_each_filesystem_once_across_bind_mount_aliases() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let notifications = fixture.directory.path().join("predictive-aliases.jsonl");
+        let daemon = &mut fixture.daemon;
+        daemon.notification_manager = NotificationManager::from_config(&NotificationConfig {
+            enabled: true,
+            channels: vec!["file".into()],
+            min_notify_interval_secs: 0,
+            urgent_notify_interval_secs: 0,
+            file: FileConfig {
+                path: notifications.clone(),
+            },
+            ..NotificationConfig::default()
+        });
+        // A sandboxed unit sees its ReadWritePaths as bind mounts: one
+        // filesystem (device 7) under four mount paths, plus another one.
+        let tick = |mount: &str, device: Option<u64>| {
+            let mut tick = predictive_warning_tick(Path::new(mount), 20.0);
+            tick.device_id = device;
+            tick
+        };
+        let aliases = || {
+            vec![
+                tick("/data", Some(7)),
+                tick("/", Some(7)),
+                tick("/root", Some(7)),
+                tick("/home/ubuntu/.cache", Some(7)),
+                tick("/other", Some(9)),
+                tick("/unknown-a", None),
+                tick("/unknown-b", None),
+            ]
+        };
+        let now = Instant::now();
+        daemon.check_predictive_warnings(&aliases(), now);
+        // Same forecast a tick later: every filesystem is in its cooldown.
+        daemon.check_predictive_warnings(&aliases(), now + Duration::from_secs(5));
+        // Escalation on one alias escalates its filesystem once.
+        let mut escalated = aliases();
+        escalated[2].predictive_action = PredictiveAction::ImminentDanger {
+            mount: PathBuf::from("/root"),
+            minutes_remaining: 1.0,
+            critical: true,
+        };
+        daemon.check_predictive_warnings(&escalated, now + Duration::from_secs(10));
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+
+        let warnings: Vec<(String, String)> = std::fs::read_to_string(&notifications)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["type"] == "predictive_warning")
+            .map(|event| {
+                (
+                    event["mount"].as_str().unwrap().to_owned(),
+                    event["level"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        let expected = [
+            ("/", "orange"),
+            ("/other", "orange"),
+            ("/unknown-a", "orange"),
+            ("/unknown-b", "orange"),
+            ("/root", "critical"),
+        ]
+        .map(|(mount, level)| (mount.to_owned(), level.to_owned()));
+        assert_eq!(warnings, expected, "{warnings:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn predictive_warning_cooldown_advances_only_after_queue_acceptance() {
         use crate::daemon::notifications::{FileConfig, NotificationConfig};
 
@@ -19778,7 +19899,10 @@ mod tests {
         let accepted_at = now + Duration::from_secs(1);
         daemon.check_predictive_warnings(std::slice::from_ref(&tick), accepted_at);
         assert_eq!(
-            daemon.last_predictive_warning.get(&mount).copied(),
+            daemon
+                .last_predictive_warning
+                .get(&PredictiveWarningKey::Path(mount.clone()))
+                .copied(),
             Some((NotificationLevel::Critical, accepted_at))
         );
 
@@ -19787,7 +19911,11 @@ mod tests {
         // disagreement must not start another five-minute daemon cooldown.
         let due = accepted_at + Duration::from_mins(5);
         daemon.check_predictive_warnings(std::slice::from_ref(&tick), due);
-        assert!(!daemon.last_predictive_warning.contains_key(&mount));
+        assert!(
+            !daemon
+                .last_predictive_warning
+                .contains_key(&PredictiveWarningKey::Path(mount.clone()))
+        );
 
         config.min_notify_interval_secs = 0;
         config.urgent_notify_interval_secs = 0;
@@ -19795,7 +19923,10 @@ mod tests {
         let retry_at = due + Duration::from_secs(1);
         daemon.check_predictive_warnings(std::slice::from_ref(&tick), retry_at);
         assert_eq!(
-            daemon.last_predictive_warning.get(&mount).copied(),
+            daemon
+                .last_predictive_warning
+                .get(&PredictiveWarningKey::Path(mount))
+                .copied(),
             Some((NotificationLevel::Critical, retry_at))
         );
         daemon.check_predictive_warnings(&[tick], retry_at + Duration::from_secs(1));
