@@ -291,7 +291,16 @@ fn fallback_refuses_mount_crossings_and_noncanonical_relative_paths() {
         let error = probe.open(Path::new("proc"), directory).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
     }
-    for path in ["", ".", "..", "/proc", "tmp/../proc", "tmp/./x", "tmp//x", "tmp/"] {
+    for path in [
+        "",
+        ".",
+        "..",
+        "/proc",
+        "tmp/../proc",
+        "tmp/./x",
+        "tmp//x",
+        "tmp/",
+    ] {
         let error = probe.open(Path::new(path), false).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path}");
     }

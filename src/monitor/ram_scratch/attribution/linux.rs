@@ -89,9 +89,10 @@ impl Probe {
     fn open_fallback(&self, relative: &Path, directory: bool) -> io::Result<File> {
         let bytes = relative.as_os_str().as_bytes();
         // Reject original spellings before Path can normalize dots or slashes.
-        if bytes.split(|byte| *byte == b'/').any(|name| {
-            name.is_empty() || name == b"." || name == b".." || name.contains(&0)
-        }) {
+        if bytes
+            .split(|byte| *byte == b'/')
+            .any(|name| name.is_empty() || name == b"." || name == b".." || name.contains(&0))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "scratch attribution requires normal relative components",
