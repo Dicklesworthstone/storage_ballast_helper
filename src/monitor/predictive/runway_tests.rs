@@ -198,3 +198,67 @@ fn recovery_trace_stops_predictive_cleanup() {
         PredictiveAction::Clear
     );
 }
+
+#[test]
+fn corrected_forecast_cannot_shorten_an_independent_median_baseline() {
+    let mib = 1_u64 << 20;
+    let gib = 1_u64 << 30;
+    // Cover both the detected-burst path and the separate median cross-check.
+    for (probability, free_pct, median_mib) in [(0.6, 12.0, 50.0), (0.3, 30.0, 20.0)] {
+        let mut estimate = forecast(200.0, probability, median_mib * mib as f64);
+        estimate.bytes_per_second = 100.0 * mib as f64;
+        estimate.free_bytes = 200 * gib;
+        // The daemon has already corrected this forecast to one minute.
+        // Its measured baseline still has more than an hour of free space.
+        estimate.seconds_to_exhaustion = 60.0;
+        let expected_minutes = 200.0 * 1024.0 / median_mib / 60.0;
+        assert!((median_runway_minutes(&estimate) - expected_minutes).abs() < 1e-9);
+        assert_eq!(
+            policy().evaluate(&estimate, free_pct, PathBuf::from("/data")),
+            PredictiveAction::Clear,
+            "a corrected forecast cannot corroborate itself: {estimate:?}"
+        );
+    }
+}
+
+#[test]
+fn measured_burst_baseline_preserves_genuine_imminence_and_longer_forecasts() {
+    let mib = 1_u64 << 20;
+    let gib = 1_u64 << 30;
+    for (free_gib, critical) in [(4, true), (8, false)] {
+        let mut estimate = forecast(200.0, 0.6, 50.0 * mib as f64);
+        estimate.bytes_per_second = 100.0 * mib as f64;
+        estimate.free_bytes = free_gib * gib;
+        let expected_minutes = free_gib as f64 * 1024.0 / 50.0 / 60.0;
+        match policy().evaluate(&estimate, 12.0, PathBuf::from("/data")) {
+            PredictiveAction::ImminentDanger {
+                minutes_remaining,
+                critical: actual_critical,
+                ..
+            } => {
+                assert!((minutes_remaining - expected_minutes).abs() < 1e-9);
+                assert_eq!(actual_critical, critical);
+            }
+            other => panic!("measured imminent exhaustion must remain actionable: {other:?}"),
+        }
+
+        // Independent evidence never makes a longer EWMA runway shorter.
+        estimate.seconds_to_exhaustion = 45.0 * 60.0;
+        match policy().evaluate(&estimate, 12.0, PathBuf::from("/data")) {
+            PredictiveAction::EarlyWarning {
+                minutes_remaining, ..
+            } => assert!((minutes_remaining - 45.0).abs() < 1e-9),
+            other => panic!("the longer forecast must win: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn measured_median_runway_refuses_invalid_rates() {
+    for median in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+        assert!(
+            median_runway_minutes(&forecast(0.0, 0.6, median)).is_infinite(),
+            "invalid historical rate {median} must not authorize cleanup"
+        );
+    }
+}

@@ -553,18 +553,19 @@ fn consumption_runway_minutes(estimate: &RateEstimate) -> f64 {
     }
 }
 
-/// Project the forecast's implied free space at the historical median rate.
+/// Project measured free space at the historical median rate.
 ///
-/// The EWMA exhaustion time is linear (distance = v*t), so the runway at the
-/// median rate is that distance over the median. Callers validate inputs;
-/// arithmetic overflow still fails closed instead of authorizing cleanup.
+/// The daemon may shorten the EWMA exhaustion time with a conformal
+/// correction before evaluating policy. Reconstructing distance as v*t
+/// would apply that correction to the independent historical baseline too,
+/// allowing a transient forecast to corroborate itself. Use the original
+/// free-byte observation; invalid or overflowing arithmetic fails closed.
 fn median_runway_minutes(estimate: &RateEstimate) -> f64 {
     let median_rate = estimate.burst_state.median_rate;
-    if median_rate <= 0.0 {
+    if !median_rate.is_finite() || median_rate <= 0.0 {
         return f64::INFINITY;
     }
-    let distance = estimate.bytes_per_second * estimate.seconds_to_exhaustion;
-    let minutes = distance / median_rate / 60.0;
+    let minutes = estimate.free_bytes as f64 / median_rate / 60.0;
     if minutes.is_finite() && minutes >= 0.0 {
         minutes
     } else {
