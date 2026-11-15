@@ -41,6 +41,7 @@ use crate::daemon::control::{
 use crate::daemon::coverage::{UNCOVERED_REFRESH_INTERVAL, uncovered_mount_levels};
 use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD, PassCpuGuard, paced_pct};
 use crate::daemon::discovery::{DiscoverySnapshot, RetainedDiscovery};
+use crate::daemon::filesystem_reclaim::FilesystemReclaimScope;
 use crate::daemon::inode_reclaim::InodeReclaimRequest;
 use crate::daemon::mount_controller::{
     IdleReason, MountController, MountControllerConfig, MountState, MountStateRecord, MountSurface,
@@ -1169,6 +1170,9 @@ pub struct ScanRequest {
     /// Scope and safety settings that admitted this request. Queue waits must
     /// not turn an old root or exclusion policy into current permission.
     pub admitted_scanner: Arc<ScannerConfig>,
+    /// The observed filesystem that this automatic pass is allowed to help.
+    /// Traversal across devices never grants deletion on a different mount.
+    pub filesystem_reclaim: Option<Arc<FilesystemReclaimScope>>,
     pub urgency: f64,
     pub pressure_level: PressureLevel,
     /// Actual free percentage for the mount/root that triggered this scan.
@@ -1210,9 +1214,13 @@ impl ScanRequest {
     }
 
     fn permits_reclaim_path(&self, path: &Path) -> bool {
-        self.ram_reclaim
+        self.filesystem_reclaim
             .as_ref()
-            .is_none_or(|relief| relief.contains_path(path))
+            .is_none_or(|scope| scope.contains_path(path))
+            && self
+                .ram_reclaim
+                .as_ref()
+                .is_none_or(|relief| relief.contains_path(path))
             && self
                 .inode_reclaim
                 .as_ref()
@@ -1224,9 +1232,13 @@ impl ScanRequest {
     }
 
     fn permits_reclaim_candidate(&self, candidate: &CandidacyScore) -> bool {
-        self.ram_reclaim
+        self.filesystem_reclaim
             .as_ref()
-            .is_none_or(|relief| relief.accepts_candidate(candidate))
+            .is_none_or(|scope| scope.accepts_candidate(candidate))
+            && self
+                .ram_reclaim
+                .as_ref()
+                .is_none_or(|relief| relief.accepts_candidate(candidate))
             && self
                 .inode_reclaim
                 .as_ref()
@@ -1687,6 +1699,8 @@ pub struct DeletionBatch {
     /// The scanner admission that produced these candidates, shared by every
     /// batch from the pass and checked before policy and each mutation.
     pub admitted_scanner: Arc<ScannerConfig>,
+    /// Filesystem and root identities captured before the pass was admitted.
+    pub filesystem_reclaim: Option<Arc<FilesystemReclaimScope>>,
     pub pressure_level: PressureLevel,
     pub urgency: f64,
     /// The original operator scope survives queue waits and config reloads.
@@ -4031,6 +4045,7 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 struct EventPassTemplate {
     paths: Vec<PathBuf>,
     admitted_scanner: Arc<ScannerConfig>,
+    filesystem_reclaim: Option<Arc<FilesystemReclaimScope>>,
     event_config: EventSourceConfig,
     pressure_level: PressureLevel,
     free_pct: Option<f64>,
@@ -4042,6 +4057,7 @@ impl EventPassTemplate {
         Self {
             paths: request.paths.clone(),
             admitted_scanner: Arc::clone(&request.admitted_scanner),
+            filesystem_reclaim: request.filesystem_reclaim.clone(),
             event_config: EventSourceConfig::from_scanner_config(&config.root_paths, config),
             pressure_level: request.pressure_level,
             free_pct: request.free_pct,
@@ -4082,10 +4098,18 @@ impl EventPassTemplates {
             // In particular, an older Green parent cannot bypass a newer
             // Orange child merely because their path strings differ.
             self.templates.retain(|template| {
-                !template
-                    .paths
-                    .iter()
-                    .any(|old| old.starts_with(&path) || path.starts_with(old))
+                template
+                    .filesystem_reclaim
+                    .as_ref()
+                    .map(|scope| scope.mount())
+                    != request
+                        .filesystem_reclaim
+                        .as_ref()
+                        .map(|scope| scope.mount())
+                    || !template
+                        .paths
+                        .iter()
+                        .any(|old| old.starts_with(&path) || path.starts_with(old))
             });
             // A fresh backing-pressure observation authorizes only its
             // bounded pass. Do not retain a stale Green template for this
@@ -4148,6 +4172,7 @@ impl EventPassTemplates {
             .then(|| ScanRequest {
                 paths: template.paths.clone(),
                 admitted_scanner: Arc::clone(&template.admitted_scanner),
+                filesystem_reclaim: template.filesystem_reclaim.clone(),
                 urgency: 0.0,
                 pressure_level: template.pressure_level,
                 free_pct: template.free_pct,
@@ -4174,11 +4199,17 @@ impl EventPassTemplates {
     }
 
     fn pass_started(&mut self, request: &ScanRequest) {
-        if let Some(index) = self
-            .templates
-            .iter()
-            .position(|template| template.paths == request.paths)
-            && let Some(template) = self.templates.remove(index)
+        if let Some(index) = self.templates.iter().position(|template| {
+            template.paths == request.paths
+                && template
+                    .filesystem_reclaim
+                    .as_ref()
+                    .map(|scope| scope.mount())
+                    == request
+                        .filesystem_reclaim
+                        .as_ref()
+                        .map(|scope| scope.mount())
+        }) && let Some(template) = self.templates.remove(index)
         {
             self.templates.push_back(template);
         }
@@ -4704,6 +4735,8 @@ fn replaceable_queued_scan(request: &ScanRequest) -> bool {
 fn same_queued_scan_scope(left: &ScanRequest, right: &ScanRequest) -> bool {
     replaceable_queued_scan(left)
         && replaceable_queued_scan(right)
+        && left.filesystem_reclaim.as_ref().map(|scope| scope.mount())
+            == right.filesystem_reclaim.as_ref().map(|scope| scope.mount())
         && left.ram_reclaim.is_some() == right.ram_reclaim.is_some()
         && left.inode_reclaim.is_some() == right.inode_reclaim.is_some()
         && left.maintenance == right.maintenance
@@ -8281,7 +8314,7 @@ impl MonitoringDaemon {
     /// and return the tick the daemon should sleep for.
     ///
     /// `response` is still the worst mount's reading; it gates the Green
-    /// safety net and supplies FallbackSafe recovery scans. Everything per mount
+    /// safety net. Everything per mount, including FallbackSafe recovery scans,
     /// (scan dispatch, ballast release and replenish, observe-only reporting)
     /// comes from `self.mount_responses`. The returned tick is the tightest
     /// cadence among mounts sbh is working on: a pressured mount it cannot
@@ -8798,7 +8831,7 @@ impl MonitoringDaemon {
                     scan_tx,
                     scan_rx,
                     response,
-                    paths,
+                    &paths,
                     ram_reclaim,
                     inode_reclaim,
                 );
@@ -8845,7 +8878,7 @@ impl MonitoringDaemon {
                     scan_tx,
                     scan_rx,
                     response,
-                    paths,
+                    &paths,
                     ram_reclaim,
                     inode_reclaim,
                 );
@@ -8913,6 +8946,7 @@ impl MonitoringDaemon {
                 let request = ScanRequest {
                     paths,
                     admitted_scanner: Arc::new(self.config.scanner.clone()),
+                    filesystem_reclaim: None,
                     urgency: response.urgency.max(0.05),
                     pressure_level: response.level,
                     free_pct: Some(response.free_pct),
@@ -8970,7 +9004,7 @@ impl MonitoringDaemon {
                         .map(|(root, _)| root.clone())
                         .collect();
                     if !paths.is_empty() {
-                        self.send_scan_request(scan_tx, scan_rx, physical, paths, None, None);
+                        self.send_scan_request(scan_tx, scan_rx, physical, &paths, None, None);
                         self.last_tick_cleanup_ran = true;
                     }
                 }
@@ -8978,8 +9012,34 @@ impl MonitoringDaemon {
             // Force periodic scans when stuck in FallbackSafe at green
             // pressure so that guard windows can update and recovery can
             // trigger. Without this, FallbackSafe at green is permanent.
-            if scan_allowed && in_fallback && !observed_root_paths.is_empty() {
-                self.send_scan_request(scan_tx, scan_rx, response, observed_root_paths, None, None);
+            if scan_allowed && in_fallback {
+                let mut recovery_ticks: Vec<_> = responses
+                    .iter()
+                    .filter(|tick| {
+                        tick.response.level == PressureLevel::Green
+                            && tick.filesystem_response.level == PressureLevel::Green
+                    })
+                    .collect();
+                recovery_ticks.sort_by(|left, right| {
+                    scan_mount_dispatch_order(
+                        &left.filesystem_response,
+                        &right.filesystem_response,
+                        &self.last_scan_admission,
+                    )
+                });
+                for tick in recovery_ticks {
+                    let physical = &tick.filesystem_response;
+                    let paths: Vec<_> = root_mounts
+                        .iter()
+                        .filter(|(_, mount)| {
+                            mount.as_deref() == Some(physical.causing_mount.as_path())
+                        })
+                        .map(|(root, _)| root.clone())
+                        .collect();
+                    if !paths.is_empty() {
+                        self.send_scan_request(scan_tx, scan_rx, physical, &paths, None, None);
+                    }
+                }
                 // Preserve intervention censoring when a cleanup forecast
                 // coincides with this recovery pass, even before mode recovery.
                 self.last_tick_cleanup_ran |= predictive_cleanup;
@@ -9682,12 +9742,48 @@ impl MonitoringDaemon {
         }
     }
 
+    /// Admit only roots whose filesystem observations are complete. Native
+    /// work stays on the bounded observation workers in the production loop;
+    /// missing evidence leaves the request due for a later monitor tick.
+    fn filesystem_reclaim_scope(
+        &self,
+        mount: &Path,
+        paths: &[PathBuf],
+        catalog: bool,
+    ) -> Option<Arc<FilesystemReclaimScope>> {
+        let sample = self.fs_collector.collect_admission_sample(mount).ok()?;
+        if sample.mount_owner().path != mount {
+            // A disappeared mount may now resolve to its parent filesystem.
+            // Its old pressure response cannot authorize that parent's data.
+            return None;
+        }
+        let roots: Vec<_> = paths
+            .iter()
+            .chain(
+                self.config
+                    .scanner
+                    .root_paths
+                    .iter()
+                    .filter(|root| paths.iter().any(|path| path.starts_with(root))),
+            )
+            .filter_map(|root| self.fs_collector.collect_admission_sample(root).ok())
+            .collect();
+        FilesystemReclaimScope::from_observed_roots(
+            &sample,
+            paths,
+            &roots,
+            &self.config.scanner,
+            catalog,
+        )
+        .map(Arc::new)
+    }
+
     fn send_scan_request(
         &mut self,
         scan_tx: &Sender<ScanRequest>,
         scan_rx: &Receiver<ScanRequest>,
         response: &crate::monitor::pid::PressureResponse,
-        paths: Vec<PathBuf>,
+        paths: &[PathBuf],
         ram_reclaim: Option<RamReclaimRequest>,
         inode_reclaim: Option<InodeReclaimRequest>,
     ) {
@@ -9697,6 +9793,12 @@ impl MonitoringDaemon {
         if response.level < PressureLevel::Orange && scan_tx.is_full() {
             return;
         }
+        let Some(filesystem_reclaim) =
+            self.filesystem_reclaim_scope(&response.causing_mount, paths, false)
+        else {
+            return;
+        };
+        let paths = filesystem_reclaim.scan_paths();
 
         // W1 planner: the bytes that bring the pressured mount back to
         // Green, so the executor can plan the set that reaches them with the
@@ -9724,6 +9826,7 @@ impl MonitoringDaemon {
         let request = ScanRequest {
             paths,
             admitted_scanner: Arc::new(self.config.scanner.clone()),
+            filesystem_reclaim: Some(filesystem_reclaim),
             urgency: response.urgency,
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
@@ -9826,11 +9929,23 @@ impl MonitoringDaemon {
         scan_tx: &Sender<ScanRequest>,
         scan_rx: &Receiver<ScanRequest>,
         response: &crate::monitor::pid::PressureResponse,
-        catalog_roots: Vec<ExpandedCatalogRoot>,
+        mut catalog_roots: Vec<ExpandedCatalogRoot>,
     ) {
+        let paths = catalog_roots
+            .iter()
+            .map(|root| root.path.clone())
+            .collect::<Vec<_>>();
+        let Some(filesystem_reclaim) =
+            self.filesystem_reclaim_scope(&response.causing_mount, &paths, true)
+        else {
+            return;
+        };
+        let paths = filesystem_reclaim.scan_paths();
+        catalog_roots.retain(|root| paths.contains(&root.path));
         let request = ScanRequest {
-            paths: catalog_roots.iter().map(|root| root.path.clone()).collect(),
+            paths,
             admitted_scanner: Arc::new(self.config.scanner.clone()),
+            filesystem_reclaim: Some(filesystem_reclaim),
             urgency: response.urgency,
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
@@ -9981,6 +10096,7 @@ impl MonitoringDaemon {
         let request = ScanRequest {
             paths: scanner.root_paths.clone(),
             admitted_scanner: Arc::new(scanner.clone()),
+            filesystem_reclaim: None,
             urgency: response.urgency.max(0.5), // at least moderate urgency for forced scans
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
@@ -10205,9 +10321,9 @@ impl MonitoringDaemon {
                 self.last_special_notify
                     .insert(location.path.clone(), (notified, now));
 
-                // Trigger root filesystem scan: special location pressure (e.g. /dev/shm
-                // full) indicates agent swarm activity that is likely also generating root
-                // filesystem artifacts. Proactively scan to clean up before root hits capacity.
+                // Reclaim only on the special location's own filesystem.
+                // A full /dev/shm supplies no authority to delete disk-backed
+                // artifacts, even when both have configured scan roots.
                 //
                 // No ballast is released here. A disk-backed location's own mount
                 // releases on its own pressure level; releasing on this alert bypassed
@@ -10252,10 +10368,16 @@ impl MonitoringDaemon {
                 if scan_paths.is_empty() {
                     continue;
                 }
+                let Some(filesystem_reclaim) =
+                    self.filesystem_reclaim_scope(&stats.mount_point, &scan_paths, false)
+                else {
+                    continue;
+                };
 
                 let request = ScanRequest {
-                    paths: scan_paths,
+                    paths: filesystem_reclaim.scan_paths(),
                     admitted_scanner: Arc::new(self.config.scanner.clone()),
+                    filesystem_reclaim: Some(filesystem_reclaim),
                     urgency,
                     pressure_level,
                     free_pct: Some(stats.free_pct()),
@@ -11167,6 +11289,7 @@ fn dispatch_top_candidates(
     let mut batch = DeletionBatch {
         candidates: Vec::new(),
         admitted_scanner: Arc::clone(&request.admitted_scanner),
+        filesystem_reclaim: request.filesystem_reclaim.clone(),
         pressure_level: request.pressure_level,
         urgency: request.urgency,
         scan_now: request.scan_now.clone(),
@@ -12247,6 +12370,13 @@ fn scanner_thread_main(
             .as_ref()
             .is_some_and(|scope| !scope.authorized(&current_scanner_config))
         {
+            continue;
+        }
+        if let Some(scope) = &request.filesystem_reclaim
+            && scope.authorize_mount(platform.as_ref()).is_err()
+        {
+            // A cached request cannot reacquire a replaced or read-only
+            // mount. Fresh monitor evidence is needed before another pass.
             continue;
         }
         if executor_config
@@ -14651,6 +14781,31 @@ fn authorize_scanner_mutation_scope(
     }
 }
 
+/// A filesystem-specific pass cannot spend policy or Canary allowance on an
+/// indexed, nested-mount or delayed candidate outside its original authority.
+/// This is queue admission only; every mutation renews the same evidence.
+fn retain_filesystem_reclaim_candidates(
+    batch: &mut DeletionBatch,
+    scanner: &crate::core::config::ScannerConfig,
+    platform: &dyn Platform,
+) -> usize {
+    let Some(scope) = &batch.filesystem_reclaim else {
+        return 0;
+    };
+    let before = batch.candidates.len();
+    batch.candidates.retain(|candidate| {
+        scope.accepts_candidate(candidate)
+            && scope
+                .authorize_candidate(candidate, scanner, platform)
+                .is_ok()
+    });
+    before - batch.candidates.len()
+}
+
+#[cfg(all(test, unix))]
+#[path = "filesystem_reclaim/executor_tests.rs"]
+mod filesystem_reclaim_executor_tests;
+
 /// The operator's `protected_paths` as the executor applies them to a batch.
 /// A target-only batch (bd-232u) goes without the patterns that protect its
 /// root as a whole, which is why the tier exists; one naming something inside
@@ -14876,6 +15031,18 @@ fn executor_thread_main(
                 ),
             });
             continue;
+        }
+        let outside_filesystem =
+            retain_filesystem_reclaim_candidates(&mut batch, &scanner_snapshot, platform);
+        if outside_filesystem > 0 {
+            logger.send(ActivityEvent::Info {
+                message: format!(
+                    "dropped {outside_filesystem} queued candidate(s): triggering filesystem or admitted root changed",
+                ),
+            });
+            if batch.candidates.is_empty() {
+                continue;
+            }
         }
         if let Some(relief) = &batch.ram_reclaim {
             if batch.target_only_root.is_some() || batch.inode_reclaim.is_some() {
@@ -15174,6 +15341,7 @@ fn executor_thread_main(
                 // surveyed, whatever the engine.
                 require_identity: batch.target_only_root.is_some()
                     || batch.scan_now.is_some()
+                    || batch.filesystem_reclaim.is_some()
                     || batch.ram_reclaim.is_some()
                     || batch.inode_reclaim.is_some()
                     || matches!(scanner_snapshot.engine, ScannerEngineMode::V2),
@@ -15371,6 +15539,22 @@ fn executor_thread_main(
                         return Err(SkipReason::PolicyChanged);
                     }
                 }
+                let filesystem_reclaim_path = if let Some(scope) = &batch.filesystem_reclaim {
+                    let resolved =
+                        scope.authorize_candidate(candidate, &scanner_snapshot, platform)?;
+                    if should_skip_protected_daemon_candidate(
+                        &mut protection.lock(),
+                        &resolved,
+                        &sacred_paths,
+                        logger,
+                        "filesystem relief preflight",
+                    ) {
+                        return Err(SkipReason::SacredStowaway);
+                    }
+                    Some(resolved)
+                } else {
+                    None
+                };
                 if ordinary_disk_pressure {
                     shared_config.authorize_disk_reclaim_goal(
                         candidate,
@@ -15382,6 +15566,12 @@ fn executor_thread_main(
                     .quarantine_first
                     .authorize(candidate, platform)?;
                 // A pressure probe can block; renew permissions after it.
+                if let Some(scope) = &batch.filesystem_reclaim
+                    && Some(scope.authorize_candidate(candidate, &scanner_snapshot, platform)?)
+                        != filesystem_reclaim_path
+                {
+                    return Err(SkipReason::PolicyChanged);
+                }
                 authorize_scanner_mutation_scope(&batch, shared_scanner_config)?;
                 shared_config.authorize_dispatch(
                     batch.ram_reclaim.is_some(),
@@ -16829,18 +17019,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn background_predictive_and_cross_device_scans_exclude_unobserved_roots() {
         for cross_device in [false, true] {
             let mut fixture = RegretDaemonFixture::new();
             let healthy = fixture.directory.path().join("healthy");
             let blocked = fixture.directory.path().join("blocked");
+            let pressured = healthy.join("pressured");
             std::fs::create_dir(&healthy).unwrap();
             std::fs::create_dir(&blocked).unwrap();
-            let root_free = if cross_device { 1_000 } else { 500_000 };
+            std::fs::create_dir(&pressured).unwrap();
+            let nested_free = if cross_device { 1_000 } else { 500_000 };
             let platform = disk_pressure_platform(vec![
-                disk_pressure_sample("/", 1_000_000, root_free),
+                disk_pressure_sample("/", 1_000_000, 500_000),
                 disk_pressure_sample(&healthy.to_string_lossy(), 1_000_000, 500_000),
                 disk_pressure_sample(&blocked.to_string_lossy(), 1_000_000, 500_000),
+                disk_pressure_sample(&pressured.to_string_lossy(), 1_000_000, nested_free),
             ])
             .with_home(fixture.directory.path());
             let (started_tx, started_rx) = bounded(1);
@@ -16864,11 +17058,40 @@ mod tests {
             );
             daemon.enable_background_filesystem_observations();
             started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if cross_device {
+                // The fixture introduces this nested mount after daemon
+                // discovery. Enroll its observation explicitly without making
+                // it a configured root or fabricating a recovery incident.
+                let _ = daemon.fs_collector.collect_sample(&pressured);
+            }
             let deadline = Instant::now() + Duration::from_secs(2);
             let response = loop {
-                if let Ok(response) = daemon.check_pressure()
+                let response = if cross_device {
+                    let samples = [Path::new("/"), healthy.as_path(), pressured.as_path()]
+                        .into_iter()
+                        .map(|path| {
+                            daemon
+                                .fs_collector
+                                .collect_sample(path)
+                                .map(|sample| (sample.stats.mount_point.clone(), sample))
+                        })
+                        .collect::<Result<HashMap<_, _>>>();
+                    samples.and_then(|samples| {
+                        daemon.evaluate_pressure_samples(samples, Instant::now())
+                    })
+                } else {
+                    daemon.check_pressure()
+                };
+                if let Ok(response) = response
                     && daemon.fs_collector.collect(&healthy).is_ok()
                     && daemon.fs_collector.collect(Path::new("/")).is_ok()
+                    && daemon
+                        .mount_responses
+                        .iter()
+                        .any(|tick| tick.response.causing_mount == healthy)
+                    && (!cross_device
+                        || (response.causing_mount == pressured
+                            && response.level == PressureLevel::Critical))
                 {
                     break response;
                 }
@@ -16901,13 +17124,23 @@ mod tests {
             daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
             let scans: Vec<_> = scan_rx.try_iter().collect();
             assert!(
-                scans.iter().any(|scan| scan.paths.contains(&healthy)),
+                scans
+                    .iter()
+                    .any(|scan| scan.paths.iter().any(|path| path.starts_with(&healthy))),
                 "cross_device={cross_device}"
             );
             assert!(
-                scans.iter().all(|scan| !scan.paths.contains(&blocked)),
+                scans
+                    .iter()
+                    .all(|scan| scan.paths.iter().all(|path| !path.starts_with(&blocked))),
                 "cross_device={cross_device}"
             );
+            let expected_mount = if cross_device { &pressured } else { &healthy };
+            assert!(scans.iter().any(|scan| {
+                scan.filesystem_reclaim
+                    .as_ref()
+                    .is_some_and(|scope| scope.mount() == expected_mount)
+            }));
             release_tx.send(()).unwrap();
         }
     }
@@ -17904,6 +18137,7 @@ mod tests {
                     max_delete_batch: 1,
                     force_full_scan: true,
                     scan_now: None,
+                    filesystem_reclaim: None,
                     inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
@@ -18920,8 +19154,19 @@ mod tests {
         let mount = root.join("nested-mount");
         std::fs::create_dir_all(&mount).unwrap();
         let daemon = &mut fixture.daemon;
-        // MockPlatform resolves the configured root to '/', so this tick has
-        // no roots_here. The existing default pool also belongs only to '/'.
+        daemon.platform = Arc::new(disk_pressure_platform(vec![
+            disk_pressure_sample("/", 1_000_000, 900_000),
+            disk_pressure_sample(
+                &fixture.directory.path().to_string_lossy(),
+                1_000_000,
+                900_000,
+            ),
+            disk_pressure_sample(&mount.to_string_lossy(), 1_000_000, 120_000),
+        ]));
+        daemon.fs_collector = FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::ZERO);
+        // The configured root belongs to the observed outer fixture mount,
+        // so this nested tick has no roots_here. The preexisting pool still
+        // belongs only to '/', and supplies no recovery surface here.
         daemon.config.scanner.root_paths = vec![root.clone()];
         daemon.config.scanner.cross_devices = true;
         daemon.config.scanner.protected_paths.clear();
@@ -18954,7 +19199,10 @@ mod tests {
         let request = scan_rx
             .try_recv()
             .expect("crossed mount must resume its scan");
-        assert_eq!(request.paths, vec![root]);
+        assert_eq!(request.paths, vec![mount.clone()]);
+        let scope = request.filesystem_reclaim.as_ref().unwrap();
+        assert_eq!(scope.mount(), mount);
+        assert_eq!(scope.admitted_paths(), vec![root]);
         assert!(request.catalog_roots.is_empty());
         assert_eq!(std::fs::read_dir(&mount).unwrap().count(), 0);
         assert!(!mount.join(".sbh").exists());
@@ -18968,6 +19216,11 @@ mod tests {
         let cache = mount.join("cache");
         std::fs::create_dir(&cache).unwrap();
         let daemon = &mut fixture.daemon;
+        daemon.platform = Arc::new(disk_pressure_platform(vec![
+            disk_pressure_sample("/", 1_000_000, 900_000),
+            disk_pressure_sample(&mount.to_string_lossy(), 1_000_000, 120_000),
+        ]));
+        daemon.fs_collector = FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::ZERO);
         daemon.config.scanner.root_paths.clear();
         daemon.config.scanner.protected_paths.clear();
         daemon.config.scanner.excluded_paths.clear();
@@ -19012,6 +19265,7 @@ mod tests {
             .try_recv()
             .expect("writable catalog must resume its scan");
         assert_eq!(request.paths, vec![cache.clone()]);
+        assert_eq!(request.filesystem_reclaim.as_ref().unwrap().mount(), mount);
         assert!(
             request
                 .catalog_roots
@@ -19244,7 +19498,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn green_predictive_fallback_keeps_one_complete_recovery_scan() {
+    fn green_predictive_fallback_keeps_one_recovery_scan_per_mount() {
         for predicted in [false, true] {
             let (mut fixture, mounts) = green_predictive_fixture();
             let daemon = &mut fixture.daemon;
@@ -19268,8 +19522,22 @@ mod tests {
             let (del_tx, _del_rx) = bounded(8);
             daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
             let scans: Vec<_> = scan_rx.try_iter().collect();
-            assert_eq!(scans.len(), 1, "predicted={predicted}");
-            assert_eq!(scans[0].paths, daemon.config.scanner.root_paths);
+            assert_eq!(scans.len(), mounts.len(), "predicted={predicted}");
+            for mount in &mounts {
+                let matching: Vec<_> = scans
+                    .iter()
+                    .filter(|scan| {
+                        scan.filesystem_reclaim.as_ref().unwrap().mount() == mount.as_path()
+                    })
+                    .collect();
+                assert_eq!(
+                    matching.len(),
+                    1,
+                    "one recovery pass for {}",
+                    mount.display()
+                );
+                assert_eq!(matching[0].paths, vec![mount.join("project")]);
+            }
             assert_eq!(daemon.shared_executor_config.min_score(), 0.85);
             assert_eq!(daemon.last_tick_cleanup_ran, predicted);
         }
@@ -20519,7 +20787,14 @@ mod tests {
             // its PID may retain a higher level during recovery hysteresis.
             response.level = response.level.max(PressureLevel::Orange);
             let (send, receive) = bounded(2);
-            daemon.send_scan_request(&send, &receive, &response, vec![mount.clone()], None, None);
+            daemon.send_scan_request(
+                &send,
+                &receive,
+                &response,
+                std::slice::from_ref(&mount),
+                None,
+                None,
+            );
             let request = receive.try_recv().expect("pressure scan must be enqueued");
             assert_eq!(request.paths, vec![mount]);
             assert_eq!(request.target_bytes, Some(expected));
@@ -21118,6 +21393,7 @@ mod tests {
             ram_reclaim: None,
             inode_reclaim: None,
             scan_now: None,
+            filesystem_reclaim: None,
         };
         let (send, receive) = bounded(4);
         let mut deferred = None;
@@ -23461,6 +23737,7 @@ mod tests {
 
         struct ProbeAfterEmergency {
             base: Arc<dyn Platform>,
+            mount: PathBuf,
             probe_root: PathBuf,
             scan_root: PathBuf,
             quarantine_first: Arc<QuarantineFirst>,
@@ -23472,7 +23749,7 @@ mod tests {
             fn fs_stats(&self, path: &Path) -> crate::core::errors::Result<FsStats> {
                 if path == self.probe_root.as_path() {
                     assert!(
-                        self.quarantine_first.holds_mount(Path::new("/")),
+                        self.quarantine_first.holds_mount(&self.mount),
                         "emergency quarantine must have its bounded first chance before compression root I/O",
                     );
                     let scan = self
@@ -23489,7 +23766,6 @@ mod tests {
                 stats.total_bytes = 100_000;
                 stats.free_bytes = 1_000;
                 stats.available_bytes = 1_000;
-                stats.fs_type = "ext4".into();
                 Ok(stats)
             }
 
@@ -23529,7 +23805,18 @@ mod tests {
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(4);
         let (del_tx, _del_rx) = bounded::<DeletionBatch>(4);
         let (probes_tx, probes_rx) = bounded(1);
+        let mount = fixture.directory.path().to_path_buf();
         let daemon = &mut fixture.daemon;
+        // The native temporary directory may be on a separate tmpfs. Give
+        // its mocked capacity the same real directory ownership evidence.
+        let platform: Arc<dyn Platform> =
+            Arc::new(disk_pressure_platform(vec![disk_pressure_sample(
+                &mount.to_string_lossy(),
+                100_000,
+                1_000,
+            )]));
+        daemon.platform = Arc::clone(&platform);
+        daemon.fs_collector = FsStatsCollector::new(platform, Duration::ZERO);
         daemon.config.compress.enabled = true;
         daemon.config.compress.start_level = "critical".into();
         daemon.config.compress.roots = vec![probe_root.clone()];
@@ -23545,13 +23832,14 @@ mod tests {
         // probe observes the queue, after ordinary monitor stats collection.
         daemon.platform = Arc::new(ProbeAfterEmergency {
             base: Arc::clone(&daemon.platform),
+            mount: mount.clone(),
             probe_root,
             scan_root: root,
             quarantine_first: Arc::clone(&daemon.shared_executor_config.quarantine_first),
             scans: scan_rx.clone(),
             probes: probes_tx,
         });
-        let tick = quarantine_tick(PressureLevel::Critical, Path::new("/"));
+        let tick = quarantine_tick(PressureLevel::Critical, &mount);
         let response = tick.response.clone();
         daemon.mount_responses = vec![tick];
 
@@ -23636,8 +23924,10 @@ mod tests {
         config.ballast.file_size_bytes = 8192;
         config.notifications.enabled = false;
 
-        // 1 TB volume with 10 GB available: under the special-location floor.
-        let mount = PathBuf::from("/");
+        // Model a mount at the real fixture directory, so the filesystem
+        // evidence agrees with its artifacts even when /tmp is a tmpfs.
+        // 1 TB volume with 10 GB available is under the special-location floor.
+        let mount = root.to_path_buf();
         let stats = FsStats {
             total_bytes: 1_000_000_000_000,
             free_bytes: 10_000_000_000,
@@ -23688,10 +23978,8 @@ mod tests {
                 .pool_for_mount(&mount)
                 .map_or(0, crate::ballast::coordinator::BallastPool::available_count)
         };
-        // The mock mount is "/", and stranded-reserve discovery reads the real
-        // legacy locations (/root, /home/*, /Users/*, /var/lib/sbh) on that
-        // device. A host with a reserve there would put real files in this
-        // pool, and the control below would release them. Skip on such a host.
+        // The control below releases the fixture's whole pool. Retain the
+        // guard against unexpectedly discovered reserves outside this setup.
         let foreign = available(&daemon);
         if foreign > 0 {
             eprintln!(
@@ -23767,8 +24055,17 @@ mod tests {
         use crate::platform::pal::PlatformPaths;
 
         let mut fixture = RegretDaemonFixture::new();
+        let mount = fixture.directory.path().to_path_buf();
         let daemon = &mut fixture.daemon;
         let special = daemon.config.scanner.root_paths[0].clone();
+        daemon.platform = Arc::new(
+            disk_pressure_platform(vec![
+                disk_pressure_sample("/", 1_000_000_000_000, 500_000_000_000),
+                disk_pressure_sample(&mount.to_string_lossy(), 1_000_000_000_000, 500_000_000_000),
+            ])
+            .with_home(&mount),
+        );
+        daemon.fs_collector = FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::ZERO);
         daemon.config.ballast.file_count = 0;
         daemon
             .ballast_coordinator
@@ -23800,21 +24097,21 @@ mod tests {
         let start = Instant::now()
             .checked_sub(Duration::from_secs(30))
             .expect("special-mount prior fixture needs thirty seconds of prior monotonic time");
-        let mut sample = daemon.fs_collector.collect_sample(Path::new("/")).unwrap();
+        let mut sample = daemon.fs_collector.collect_sample(&mount).unwrap();
         for step in 0..=3 {
             sample.collected_at = start + Duration::from_secs(step * 5);
             sample.stats.available_bytes = (900 - step * 100) * 1_000_000_000;
             sample.stats.free_bytes = sample.stats.available_bytes;
             monitor.observe_filesystem(sample.clone(), &daemon.config);
         }
-        daemon.mount_monitors.insert(PathBuf::from("/"), monitor);
+        daemon.mount_monitors.insert(mount.clone(), monitor);
         let (scan_tx, scan_rx) = bounded(8);
         let (del_tx, _del_rx) = bounded(4);
 
         // Follow the production ordering: check_pressure produces the prior,
         // handle_pressure consumes mount_responses, then special locations run.
         let response = daemon.check_pressure().unwrap();
-        assert!(daemon.mount_rates[Path::new("/")] > 500_000_000_000.0 / 1800.0);
+        assert!(daemon.mount_rates[&mount] > 500_000_000_000.0 / 1800.0);
         daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
         assert!(daemon.mount_responses.is_empty());
         assert!(scan_rx.is_empty());
@@ -23905,46 +24202,43 @@ mod tests {
             daemon.check_special_locations(&scan_tx, &scan_rx);
             if step < daemon.config.telemetry.ewma_min_samples {
                 assert!(
-                    scan_rx.is_empty(),
+                    !daemon.last_special_notify.contains_key(&special),
                     "stale main-monitor history is not a prior"
                 );
             }
         }
-        let requests: Vec<_> = scan_rx.try_iter().collect();
-        assert!(
-            !requests.is_empty(),
+        assert_eq!(
+            daemon
+                .last_special_notify
+                .get(&special)
+                .map(|(level, _)| *level),
+            Some(PressureLevel::Red),
             "the learned horizon must reach daemon alert handling"
         );
-        for request in requests {
-            assert!(
-                request.free_pct.unwrap() > 20.0,
-                "fullness alone would not alert"
-            );
-            assert_eq!(request.pressure_level, PressureLevel::Red);
-            // The alert keeps the long-standing special-location scope: an
-            // independent location plus the configured roots
-            // (special_location_scan_roots). Learning a rate adds nothing.
-            let mut existing_scope = special_location_scan_roots(&special, &configured_roots);
-            for root in &configured_roots {
-                push_unique_path(&mut existing_scope, root.clone());
-            }
-            assert_eq!(
-                request.paths, existing_scope,
-                "observation adds no cleanup roots"
-            );
-        }
+        assert!(
+            daemon.fs_collector.collect(&special).unwrap().free_pct() > 20.0,
+            "fullness alone would not alert"
+        );
+        assert!(
+            scan_rx.is_empty(),
+            "learning a special mount's drain rate cannot admit an unconfigured root or borrow a different filesystem's configured roots"
+        );
+        // Reset only notification episode bookkeeping. The learned rate stays
+        // live, so either subsequent false alert would restore this entry.
+        daemon.last_special_notify.remove(&special);
         observe(daemon, 10, "special-device-a");
         daemon.check_special_locations(&scan_tx, &scan_rx);
         assert!(
-            scan_rx.is_empty(),
+            !daemon.last_special_notify.contains_key(&special),
             "recovery must clear the positive trailing rate"
         );
         observe(daemon, 4, "special-device-b");
         daemon.check_special_locations(&scan_tx, &scan_rx);
         assert!(
-            scan_rx.is_empty(),
+            !daemon.last_special_notify.contains_key(&special),
             "a replacement device starts without the old drain rate"
         );
+        assert!(scan_rx.is_empty());
         assert_eq!(daemon.config.scanner.root_paths, configured_roots);
     }
 
@@ -25474,6 +25768,7 @@ mod tests {
                 max_delete_batch: 10,
                 force_full_scan: false,
                 scan_now: None,
+                filesystem_reclaim: None,
                 inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
@@ -25606,6 +25901,7 @@ mod tests {
                     max_delete_batch: 10,
                     force_full_scan: false,
                     scan_now: None,
+                    filesystem_reclaim: None,
                     inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
@@ -25722,6 +26018,7 @@ mod tests {
             max_delete_batch: 4,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -26864,6 +27161,7 @@ mod tests {
             ram_reclaim: None,
             inode_reclaim: None,
             scan_now: None,
+            filesystem_reclaim: None,
             target_only_root: Some(root.clone()),
             target_only_consent: Some(test_target_only_consent(&root, &scanner)),
         };
@@ -27019,6 +27317,7 @@ mod tests {
             ram_reclaim: None,
             inode_reclaim: None,
             scan_now: None,
+            filesystem_reclaim: None,
             target_only_root: target_only.then(|| root.clone()),
             target_only_consent: target_only.then(|| test_target_only_consent(&root, &scanner)),
         };
@@ -27307,6 +27606,7 @@ mod tests {
                 ram_reclaim: None,
                 inode_reclaim: None,
                 scan_now: None,
+                filesystem_reclaim: None,
                 target_only_root: Some(root),
                 target_only_consent: (case != "missing").then_some(consent),
             })
@@ -27440,6 +27740,7 @@ mod tests {
                 ram_reclaim: None,
                 inode_reclaim: None,
                 scan_now: None,
+                filesystem_reclaim: None,
                 target_only_root: target_only_root.map(Path::to_path_buf),
                 target_only_consent: target_only_root
                     .map(|root| test_target_only_consent(root, &scanner)),
@@ -27701,6 +28002,7 @@ mod tests {
             ram_reclaim: None,
             inode_reclaim: None,
             scan_now: None,
+            filesystem_reclaim: None,
             target_only_root: Some(root.clone()),
             target_only_consent: Some(test_target_only_consent(&root, &scanner)),
         };
@@ -27812,6 +28114,7 @@ mod tests {
             ram_reclaim: None,
             inode_reclaim: None,
             scan_now: None,
+            filesystem_reclaim: None,
             target_only_consent: target_only_root
                 .as_deref()
                 .map(|root| test_target_only_consent(root, &scanner)),
@@ -27899,6 +28202,7 @@ mod tests {
                 ram_reclaim: None,
                 inode_reclaim: None,
                 scan_now: None,
+                filesystem_reclaim: None,
                 target_only_root: Some(root),
                 target_only_consent: Some(consent),
             })
@@ -27968,6 +28272,7 @@ mod tests {
                 ram_reclaim: None,
                 inode_reclaim: None,
                 scan_now: None,
+                filesystem_reclaim: None,
                 target_only_root: None,
                 target_only_consent: None,
             })
@@ -28007,6 +28312,7 @@ mod tests {
             ram_reclaim: None,
             inode_reclaim: None,
             scan_now: None,
+            filesystem_reclaim: None,
             target_only_root: None,
             target_only_consent: None,
         };
@@ -28100,6 +28406,7 @@ mod tests {
                 ram_reclaim: request.ram_reclaim.clone(),
                 inode_reclaim: request.inode_reclaim.clone(),
                 scan_now: request.scan_now.clone(),
+                filesystem_reclaim: None,
                 target_only_root: None,
                 target_only_consent: None,
             };
@@ -29208,6 +29515,7 @@ mod tests {
                     max_delete_batch: 0,
                     force_full_scan: false,
                     scan_now: None,
+                    filesystem_reclaim: None,
                     inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
@@ -29300,6 +29608,7 @@ mod tests {
                 max_delete_batch: 10,
                 force_full_scan: false,
                 scan_now: None,
+                filesystem_reclaim: None,
                 inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
@@ -30241,6 +30550,7 @@ mod tests {
             max_delete_batch: 4,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -30534,6 +30844,7 @@ mod tests {
                 max_delete_batch: 10,
                 force_full_scan: false,
                 scan_now: None,
+                filesystem_reclaim: None,
                 inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
@@ -30672,6 +30983,7 @@ mod tests {
                     max_delete_batch: 10,
                     force_full_scan: false,
                     scan_now: None,
+                    filesystem_reclaim: None,
                     inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
@@ -30925,6 +31237,7 @@ mod tests {
                 max_delete_batch: 10,
                 force_full_scan: false,
                 scan_now: None,
+                filesystem_reclaim: None,
                 inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
@@ -31225,6 +31538,7 @@ mod tests {
                 max_delete_batch: 10,
                 force_full_scan: false,
                 scan_now: None,
+                filesystem_reclaim: None,
                 inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
@@ -31471,6 +31785,7 @@ mod tests {
                     max_delete_batch: 10,
                     force_full_scan: false,
                     scan_now: None,
+                    filesystem_reclaim: None,
                     inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
@@ -31618,6 +31933,7 @@ mod tests {
                         max_delete_batch: 10,
                         force_full_scan: false,
                         scan_now: None,
+                        filesystem_reclaim: None,
                         inode_reclaim: None,
                         config_update: None,
                         catalog_roots: Vec::new(),
@@ -31896,6 +32212,7 @@ mod tests {
                 max_delete_batch: 10,
                 force_full_scan: true,
                 scan_now: None,
+                filesystem_reclaim: None,
                 inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
@@ -32666,6 +32983,7 @@ mod tests {
             max_delete_batch: 0,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -32705,6 +33023,7 @@ mod tests {
             max_delete_batch: 1,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -33117,6 +33436,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             urgency: 1.0,
             scan_now: None,
+            filesystem_reclaim: None,
             target_bytes: Some(1),
             ram_reclaim: None,
             inode_reclaim: None,
@@ -33268,6 +33588,7 @@ mod tests {
             max_delete_batch: 10,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -33688,6 +34009,7 @@ mod tests {
             max_delete_batch: 10,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -33751,6 +34073,7 @@ mod tests {
                     max_delete_batch: 1,
                     force_full_scan: true,
                     scan_now: None,
+                    filesystem_reclaim: None,
                     inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
@@ -33939,6 +34262,7 @@ mod tests {
             max_delete_batch: 10,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -33965,6 +34289,7 @@ mod tests {
             ram_reclaim: None,
             inode_reclaim: None,
             scan_now: None,
+            filesystem_reclaim: None,
             target_only_root: None,
             target_only_consent: None,
         };
@@ -34141,6 +34466,7 @@ mod tests {
             max_delete_batch: 4,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -34175,6 +34501,7 @@ mod tests {
             max_delete_batch: 10,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -34214,6 +34541,7 @@ mod tests {
             max_delete_batch: 10,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -35010,6 +35338,7 @@ mod tests {
             max_delete_batch: 10,
             force_full_scan: true,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -35182,6 +35511,7 @@ mod tests {
             max_delete_batch: 10,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -35889,6 +36219,7 @@ mod tests {
             max_delete_batch: 40,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -35922,6 +36253,7 @@ mod tests {
             max_delete_batch: 40,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -36157,15 +36489,23 @@ mod tests {
         use crate::platform::cleanup_catalog::CleanupConfidence;
 
         let mut fixture = RegretDaemonFixture::new();
+        let mount = fixture.directory.path().join("catalog-mount");
+        let cache = mount.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
         let daemon = &mut fixture.daemon;
+        daemon.platform = Arc::new(disk_pressure_platform(vec![
+            disk_pressure_sample("/", 1_000_000, 900_000),
+            disk_pressure_sample(&mount.to_string_lossy(), 1_000_000, 120_000),
+        ]));
+        daemon.fs_collector = FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::ZERO);
         let (tx, rx) = bounded(SCANNER_CHANNEL_CAP);
         tx.send(queued_request("/critical-a", PressureLevel::Critical))
             .unwrap();
         tx.send(queued_request("/critical-b", PressureLevel::Critical))
             .unwrap();
-        let response = quarantine_tick(PressureLevel::Orange, Path::new("/catalog-mount")).response;
+        let response = quarantine_tick(PressureLevel::Orange, &mount).response;
         let catalog = vec![ExpandedCatalogRoot {
-            path: PathBuf::from("/catalog-mount/cache"),
+            path: cache,
             rule: "test-cache",
             confidence: CleanupConfidence::Definite,
             min_age: Duration::from_hours(24),
@@ -36264,6 +36604,7 @@ mod tests {
             max_delete_batch: 40,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -36776,6 +37117,7 @@ mod tests {
             max_delete_batch: 1,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -36816,6 +37158,7 @@ mod tests {
             max_delete_batch: 1,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -36834,6 +37177,7 @@ mod tests {
                 ram_reclaim: None,
                 inode_reclaim: None,
                 scan_now: None,
+                filesystem_reclaim: None,
                 target_only_root: None,
                 target_only_consent: None,
             })
@@ -36888,6 +37232,7 @@ mod tests {
             max_delete_batch: 10,
             force_full_scan: false,
             scan_now: None,
+            filesystem_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),

@@ -43,6 +43,7 @@ impl FsStatsSample {
                     .auxiliary
                     .as_ref()
                     .map(|evidence| evidence.directory_identity)
+            && self.mount_directory() == other.mount_directory()
     }
 
     pub(crate) fn inode_stats(&self) -> Option<InodeStats> {
@@ -90,6 +91,18 @@ impl FsStatsSample {
             .as_ref()
             .and_then(|evidence| evidence.query_directory.as_ref())
     }
+
+    /// The actual mounted directory, including native mount identity when
+    /// available. Capacity alone must not admit a deferred cleanup request.
+    pub(crate) fn mount_directory(&self) -> Option<&ObservedDirectory> {
+        self.auxiliary
+            .as_ref()
+            .and_then(|evidence| evidence.mount_directory.as_ref())
+    }
+
+    pub(crate) fn resolved_mount(&self) -> &Path {
+        &self.binding.resolved
+    }
 }
 
 /// Directory admission evidence which can cross onto the monitoring thread
@@ -100,6 +113,9 @@ pub(crate) struct ObservedDirectory {
     pub original: PathBuf,
     pub resolved: PathBuf,
     pub identity: FsIdentity,
+    /// Linux mount IDs distinguish bind mounts sharing device and inode.
+    /// Other platforms retain their native owner and directory evidence.
+    pub kernel_mount_id: Option<u64>,
 }
 
 impl ObservedDirectory {
@@ -110,11 +126,37 @@ impl ObservedDirectory {
         if identity.kind != FsEntryKind::Directory {
             return None;
         }
+        let kernel_mount_id = kernel_mount_id_for_path(&resolved).ok().flatten();
+        if std::fs::canonicalize(path).ok().as_ref() != Some(&resolved)
+            || identity_for_path(&resolved, false).ok() != Some(identity)
+        {
+            return None;
+        }
         Some(Self {
             original: path.to_path_buf(),
             resolved,
             identity,
+            kernel_mount_id,
         })
+    }
+}
+
+/// Read a mount ID from an immediately dropped descriptor. Retaining the
+/// descriptor in queued work would prevent an unconfigured volume ejecting.
+pub(crate) fn kernel_mount_id_for_path(path: &Path) -> std::io::Result<Option<u64>> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsFd;
+
+        use crate::platform::linux::no_symlinks::{mount_id, open_without_symlinks};
+
+        let descriptor = open_without_symlinks(path, rustix::fs::OFlags::PATH)?;
+        mount_id(descriptor.as_fd()).map(Some)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Ok(None)
     }
 }
 
@@ -125,6 +167,7 @@ struct AuxiliaryEvidence {
     inode_stats: Option<InodeStats>,
     is_ram_backed: bool,
     directory_identity: Option<(u64, u64)>,
+    mount_directory: Option<ObservedDirectory>,
     resolved_query: PathBuf,
     query_directory: Option<ObservedDirectory>,
 }
@@ -337,6 +380,17 @@ impl FsStatsCollector {
                 details: "path does not belong to known mount".to_string(),
             })?;
         self.collect_for_mount(mount, mounts.generation)
+    }
+
+    /// Admission needs coherent root and mount identities as well as counters.
+    /// The daemon's background collector never does native work here; explicit
+    /// synchronous callers collect the same complete frame on their worker.
+    pub(crate) fn collect_admission_sample(&self, path: &Path) -> Result<FsStatsSample> {
+        if self.is_background() {
+            self.collect_sample(path)
+        } else {
+            collect_background_sample(self.platform.as_ref(), path)
+        }
     }
 
     pub fn collect_many(&self, paths: &[PathBuf]) -> Result<HashMap<PathBuf, FsStats>> {
@@ -589,6 +643,7 @@ fn collect_background_sample(platform: &dyn Platform, path: &Path) -> Result<FsS
         return Err(changed_mount(path));
     }
     let directory_identity = mount_directory_identity(&owner.path)?;
+    let mount_directory = ObservedDirectory::collect(&owner.path);
     let stats = platform.observe_fs_stats(&owner.path)?;
     if stats.free_bytes > stats.total_bytes || stats.available_bytes > stats.free_bytes {
         return Err(SbhError::FsStats {
@@ -617,6 +672,7 @@ fn collect_background_sample(platform: &dyn Platform, path: &Path) -> Result<FsS
         || platform.mount_identity(path)? != owner
         || platform.observe_mount_lookup_path(&owner.path)? != resolved_owner
         || mount_directory_identity(&owner.path)? != directory_identity
+        || ObservedDirectory::collect(&owner.path) != mount_directory
         || ObservedDirectory::collect(path) != query_directory
     {
         return Err(changed_mount(path));
@@ -629,6 +685,7 @@ fn collect_background_sample(platform: &dyn Platform, path: &Path) -> Result<FsS
             inode_stats,
             is_ram_backed,
             directory_identity,
+            mount_directory,
             resolved_query,
             query_directory,
         }),
@@ -1015,5 +1072,49 @@ mod tests {
             .expect("symlink path should resolve to mount");
         assert_eq!(observed, stats);
         assert_eq!(platform.fs_stats_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replaced_native_mount_id_breaks_rate_continuity_even_with_same_device_and_inode() {
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().to_path_buf();
+        let platform = Arc::new(CountingPlatform::new(
+            vec![MountPoint {
+                path: mount.clone(),
+                device: "fixture".to_string(),
+                fs_type: "ext4".to_string(),
+                is_ram_backed: false,
+            }],
+            HashMap::from([(
+                mount.clone(),
+                FsStats {
+                    total_bytes: 100,
+                    free_bytes: 20,
+                    available_bytes: 20,
+                    fs_type: "ext4".to_string(),
+                    mount_point: mount.clone(),
+                    is_readonly: false,
+                },
+            )]),
+        ));
+        let collector = FsStatsCollector::new(platform, Duration::ZERO);
+        let original = collector.collect_admission_sample(&mount).unwrap();
+        assert!(original.same_filesystem_as(&original));
+        let mut replacement = original.clone();
+        let directory = replacement
+            .auxiliary
+            .as_mut()
+            .unwrap()
+            .mount_directory
+            .as_mut()
+            .unwrap();
+        directory.kernel_mount_id = Some(directory.kernel_mount_id.unwrap().wrapping_add(1));
+        assert_eq!(
+            original.mount_directory_identity(),
+            replacement.mount_directory_identity()
+        );
+        assert!(!original.same_filesystem_as(&replacement));
+        assert!(!replacement.same_filesystem_as(&original));
     }
 }

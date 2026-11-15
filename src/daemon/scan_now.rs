@@ -553,6 +553,7 @@ impl ScanNowClaim {
         ScanRequest {
             paths: pending.scope.paths(),
             admitted_scanner: Arc::new(pending.scope.scanner.clone()),
+            filesystem_reclaim: None,
             urgency: response.urgency,
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
