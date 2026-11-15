@@ -27,6 +27,14 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Source-install previews no longer build or replace binaries.**
+  `sbh install --from-source --dry-run` now reports the source revision,
+  prerequisites and destination before invoking any tools, including version
+  probes that could cause rustup to download a toolchain. Human and JSON
+  previews work for binary-only, service and automatic installation. Relative
+  `--prefix` values are resolved against the invoking directory before Cargo
+  enters its temporary checkout, so the installed binary survives checkout
+  cleanup.
 - **Green and Yellow passes hold every candidate idle less than 12 hours**
   (bd-i9uh), as v0.7.14 meant to. v0.7.14 withheld only the definite
   posterior floor there, so a candidate whose own posterior cleared the floor

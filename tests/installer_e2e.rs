@@ -1281,6 +1281,205 @@ fn e2e_uninstall_report_golden_with_reclaimed_space() {
 // L: CLI subcommand smoke tests
 // ============================================================================
 
+fn assert_source_install_preview(stdout: &str, binary: &Path, json: bool) {
+    assert!(
+        stdout.contains("tag:v9.9.9"),
+        "missing source revision: {stdout}"
+    );
+    assert!(
+        stdout.contains(&binary.display().to_string()),
+        "missing destination: {stdout}",
+    );
+    if json {
+        let payloads: Vec<serde_json::Value> = stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let plan = payloads
+            .iter()
+            .find_map(|payload| payload.get("source_install"))
+            .expect("JSON must include a structured source-install preview");
+        assert_eq!(plan["dry_run"], true);
+        assert_eq!(plan["checkout"], "tag:v9.9.9");
+        assert_eq!(plan["binary_path"], binary.display().to_string());
+    }
+}
+
+#[test]
+fn e2e_from_source_dry_run_never_executes_tools_or_changes_installation() {
+    for (auto, json, service) in [
+        (false, false, false),
+        (false, true, false),
+        (false, false, true),
+        (false, true, true),
+        (true, false, true),
+        (true, true, true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        std::fs::create_dir_all(config.paths.config_file.parent().unwrap()).unwrap();
+        let original_config = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&config.paths.config_file, &original_config).unwrap();
+        let prefix = tmp.path().join("install prefix");
+        let binary = prefix.join("bin/sbh");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, b"existing installation").unwrap();
+        let tools = tmp.path().join("tools");
+        let build_tmp = tmp.path().join("build-tmp");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&build_tmp).unwrap();
+        let tool_log = tmp.path().join("tools-invoked");
+        for name in ["rustc", "cargo", "git", "curl", "systemctl", "launchctl"] {
+            let path = tools.join(name);
+            // Refuse every invocation, including version probes: a rustup shim
+            // can install a missing toolchain even for `cargo --version`.
+            std::fs::write(
+                &path,
+                "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> \"$SBH_TEST_SOURCE_TOOL_LOG\"\nexit 77\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut command = std::process::Command::new(common::sbh_bin_path());
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(|name| name.starts_with("SBH_")) {
+                command.env_remove(name);
+            }
+        }
+        command
+            .args([
+                "install",
+                "--from-source",
+                "--dry-run",
+                "--no-bootstrap",
+                "--tag",
+                "9.9.9",
+                "--prefix",
+            ])
+            .arg(&prefix)
+            .arg("--config")
+            .arg(&config.paths.config_file)
+            .env("PATH", &tools)
+            .env("HOME", tmp.path().join("home"))
+            .env("XDG_CONFIG_HOME", tmp.path().join("xdg-config"))
+            .env("XDG_DATA_HOME", tmp.path().join("xdg-data"))
+            .env("TMPDIR", &build_tmp)
+            .env("SBH_TEST_SOURCE_TOOL_LOG", &tool_log);
+        if auto {
+            command.arg("--auto");
+        }
+        if json {
+            command.arg("--json");
+        }
+        if service {
+            command.args(["--scope", "user"]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            !tool_log.exists(),
+            "dry run executed a tool (auto={auto}, json={json}, service={service}): {}",
+            std::fs::read_to_string(&tool_log).unwrap_or_default(),
+        );
+        assert!(
+            output.status.success(),
+            "source preview must work without a build toolchain: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_source_install_preview(&String::from_utf8(output.stdout).unwrap(), &binary, json);
+        assert_eq!(std::fs::read(&binary).unwrap(), b"existing installation");
+        assert_eq!(
+            std::fs::read_to_string(&config.paths.config_file).unwrap(),
+            original_config,
+        );
+        assert!(!tmp.path().join("data").exists());
+        assert!(!tmp.path().join("home").exists());
+        assert!(!tmp.path().join("xdg-config").exists());
+        assert!(!tmp.path().join("xdg-data").exists());
+        assert!(!config.paths.ballast_dir.exists());
+        assert_eq!(std::fs::read_dir(build_tmp).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn e2e_from_source_relative_prefix_installs_outside_the_temporary_checkout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path());
+    std::fs::create_dir_all(config.paths.config_file.parent().unwrap()).unwrap();
+    let original_config = toml::to_string_pretty(&config).unwrap();
+    std::fs::write(&config.paths.config_file, &original_config).unwrap();
+    let tools = tmp.path().join("tools");
+    let build_tmp = tmp.path().join("build-tmp");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::create_dir_all(&build_tmp).unwrap();
+    let expected_root = std::fs::canonicalize(tmp.path())
+        .unwrap()
+        .join("relative prefix");
+    let root_log = tmp.path().join("cargo-install-root");
+    for (name, script) in [
+        ("rustc", "#!/bin/sh\nprintf 'rustc 1.100.0\\n'\n"),
+        (
+            "git",
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'git version 2.43.0\\n'; exit 0; fi\nfor arg do destination=$arg; done\n/bin/mkdir -p \"$destination\"\n",
+        ),
+        (
+            "cargo",
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'cargo 1.100.0\\n'; exit 0; fi\nroot=\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --root ]; then shift; root=$1; fi\n  shift\ndone\nprintf '%s\\n' \"$root\" > \"$SBH_TEST_SOURCE_ROOT_LOG\"\n[ \"$root\" = \"$SBH_TEST_SOURCE_EXPECTED_ROOT\" ] || exit 77\n/bin/mkdir -p \"$root/bin\"\nprintf 'source build fixture\\n' > \"$root/bin/sbh\"\n",
+        ),
+    ] {
+        let path = tools.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut command = std::process::Command::new(common::sbh_bin_path());
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(|name| name.starts_with("SBH_")) {
+            command.env_remove(name);
+        }
+    }
+    let output = command
+        .current_dir(tmp.path())
+        .args([
+            "install",
+            "--from-source",
+            "--prefix",
+            "relative prefix",
+            "--no-bootstrap",
+            "--json",
+            "--config",
+        ])
+        .arg(&config.paths.config_file)
+        .env("PATH", &tools)
+        .env("HOME", tmp.path().join("home"))
+        .env("TMPDIR", &build_tmp)
+        .env("SBH_TEST_SOURCE_ROOT_LOG", &root_log)
+        .env("SBH_TEST_SOURCE_EXPECTED_ROOT", &expected_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "source installation failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        std::fs::read_to_string(root_log).unwrap().trim(),
+        expected_root.display().to_string(),
+    );
+    assert_eq!(
+        std::fs::read(expected_root.join("bin/sbh")).unwrap(),
+        b"source build fixture\n",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config.paths.config_file).unwrap(),
+        original_config,
+    );
+    assert!(!tmp.path().join("data").exists());
+    assert!(!config.paths.ballast_dir.exists());
+    assert_eq!(std::fs::read_dir(build_tmp).unwrap().count(), 0);
+}
+
 #[cfg(target_os = "linux")]
 fn run_install_cli_dry_run(config: &Path, tmp: &Path, extra: &[&str]) -> std::process::Output {
     let mut command = std::process::Command::new(common::sbh_bin_path());

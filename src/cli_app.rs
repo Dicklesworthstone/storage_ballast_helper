@@ -3748,8 +3748,12 @@ fn build_install_auto_dry_run_json_payload(
     release_error: Option<&str>,
     install_report: &storage_ballast_helper::cli::install::InstallReport,
     success: bool,
-) -> std::result::Result<Value, serde_json::Error> {
+) -> Result<Value, CliError> {
     let release_payload = release_report.map(serde_json::to_value).transpose()?;
+    let source_plan = args
+        .from_source
+        .then(|| source_install_config(args).map(|config| config.plan()))
+        .transpose()?;
 
     Ok(json!({
         "command": "install",
@@ -3765,9 +3769,81 @@ fn build_install_auto_dry_run_json_payload(
         "wizard": summary,
         "release_install": release_payload,
         "release_error": release_error,
+        "source_install": source_plan,
         "install": install_report,
         "success": success,
     }))
+}
+
+fn source_install_config(
+    args: &InstallArgs,
+) -> Result<storage_ballast_helper::cli::from_source::SourceInstallConfig, CliError> {
+    use storage_ballast_helper::cli::from_source::{SourceCheckout, SourceInstallConfig};
+
+    let checkout = args.tag.as_ref().map_or(SourceCheckout::Head, |tag| {
+        SourceCheckout::Tag(if tag.starts_with('v') {
+            tag.clone()
+        } else {
+            format!("v{tag}")
+        })
+    });
+    let mut config = SourceInstallConfig::new(checkout, args.prefix.clone());
+    // Cargo runs inside a temporary checkout. Resolve the destination now so
+    // a relative prefix refers to the caller's directory in both the preview
+    // and the real build, instead of disappearing with the checkout.
+    config.install_root = std::path::absolute(&config.install_root).map_err(|error| {
+        CliError::Runtime(format!(
+            "cannot resolve source install prefix {}: {error}",
+            config.install_root.display()
+        ))
+    })?;
+    Ok(config)
+}
+
+fn run_source_binary_install(cli: &Cli, args: &InstallArgs) -> Result<Option<PathBuf>, CliError> {
+    use storage_ballast_helper::cli::from_source::{
+        self, all_prerequisites_met, format_plan_human, format_prerequisite_failures,
+        format_result_human,
+    };
+
+    let config = source_install_config(args)?;
+    if args.dry_run {
+        let plan = config.plan();
+        match output_mode(cli) {
+            OutputMode::Human => print!("{}", format_plan_human(&plan)),
+            OutputMode::Json => write_json_line(&json!({
+                "command": "install",
+                "dry_run": true,
+                "source_install": plan,
+            }))?,
+        }
+        return Ok(None);
+    }
+
+    let prereqs = from_source::check_prerequisites();
+    if !all_prerequisites_met(&prereqs) {
+        match output_mode(cli) {
+            OutputMode::Human => eprint!("{}", format_prerequisite_failures(&prereqs)),
+            OutputMode::Json => write_json_line(&serde_json::to_value(&prereqs)?)?,
+        }
+        return Err(CliError::User(
+            "missing prerequisites for --from-source build".to_string(),
+        ));
+    }
+
+    let result = from_source::install_from_source(&config);
+    match output_mode(cli) {
+        OutputMode::Human => print!("{}", format_result_human(&result)),
+        OutputMode::Json => write_json_line(&serde_json::to_value(&result)?)?,
+    }
+    if !result.success {
+        return Err(CliError::Runtime(
+            result
+                .error
+                .unwrap_or_else(|| "from-source build failed".to_string()),
+        ));
+    }
+    Ok(result.binary_path)
 }
 
 fn resolve_uninstall_kind(
@@ -4353,61 +4429,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
 
     // -- from-source build ----------------------------------------------------
     if args.from_source {
-        use storage_ballast_helper::cli::from_source::{
-            self, SourceCheckout, SourceInstallConfig, all_prerequisites_met,
-            format_prerequisite_failures, format_result_human,
-        };
-
-        let checkout = args.tag.as_ref().map_or(SourceCheckout::Head, |tag| {
-            let normalized = if tag.starts_with('v') {
-                tag.clone()
-            } else {
-                format!("v{tag}")
-            };
-            SourceCheckout::Tag(normalized)
-        });
-
-        let config = SourceInstallConfig::new(checkout, args.prefix.clone());
-
-        // Pre-flight prerequisite check with early exit and remediation.
-        let prereqs = from_source::check_prerequisites();
-        if !all_prerequisites_met(&prereqs) {
-            match output_mode(cli) {
-                OutputMode::Human => {
-                    eprint!("{}", format_prerequisite_failures(&prereqs));
-                }
-                OutputMode::Json => {
-                    let payload = serde_json::to_value(&prereqs)?;
-                    write_json_line(&payload)?;
-                }
-            }
-            return Err(CliError::User(
-                "missing prerequisites for --from-source build".to_string(),
-            ));
-        }
-
-        let result = from_source::install_from_source(&config);
-
-        match output_mode(cli) {
-            OutputMode::Human => {
-                print!("{}", format_result_human(&result));
-            }
-            OutputMode::Json => {
-                let payload = serde_json::to_value(&result)?;
-                write_json_line(&payload)?;
-            }
-        }
-
-        if !result.success {
-            return Err(CliError::Runtime(
-                result
-                    .error
-                    .unwrap_or_else(|| "from-source build failed".to_string()),
-            ));
-        }
-        if let Some(binary_path) = result.binary_path {
-            installed_binary_path = Some(binary_path);
-        }
+        installed_binary_path = run_source_binary_install(cli, args)?;
 
         // A binary-only install stops after the build. Guided configuration
         // still needs the orchestrator even when no service was selected.

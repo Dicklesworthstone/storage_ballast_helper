@@ -211,6 +211,21 @@ impl SourceInstallConfig {
     pub fn clone_url(&self) -> String {
         format!("https://github.com/{}.git", self.repository)
     }
+
+    /// Describe the install without probing tools or touching the filesystem.
+    /// Even a Rust version probe can cause rustup to download a toolchain, so
+    /// previewing must not call `check_prerequisites`.
+    #[must_use]
+    pub fn plan(&self) -> SourceInstallPlan {
+        SourceInstallPlan {
+            dry_run: true,
+            repository_url: self.clone_url(),
+            checkout: self.checkout.to_string(),
+            binary_path: self.expected_binary_path(),
+            build_profile: "release".to_string(),
+            required_tools: REQUIRED_PREREQUISITES.to_vec(),
+        }
+    }
 }
 
 fn default_install_root() -> PathBuf {
@@ -218,6 +233,46 @@ fn default_install_root() -> PathBuf {
         || PathBuf::from("/usr/local"),
         |home| PathBuf::from(home).join(".local"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Source install preview
+// ---------------------------------------------------------------------------
+
+/// A read-only preview, distinct from the result of an executed source build.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceInstallPlan {
+    /// Always true: a plan has not executed any installation steps.
+    pub dry_run: bool,
+    /// Repository that would be cloned.
+    pub repository_url: String,
+    /// Revision that would be checked out.
+    pub checkout: String,
+    /// Destination of the binary after building.
+    pub binary_path: PathBuf,
+    /// Cargo build profile that would be used.
+    pub build_profile: String,
+    /// Tools that will be checked when executing, not while previewing.
+    pub required_tools: Vec<Prerequisite>,
+}
+
+/// Render the planned build and destination without implying it has run.
+#[must_use]
+pub fn format_plan_human(plan: &SourceInstallPlan) -> String {
+    let mut out = String::from("From-source install plan (dry run):\n\n");
+    out.push_str("  Check build prerequisites when executing:");
+    for prerequisite in &plan.required_tools {
+        let _ = write!(out, " {prerequisite}");
+    }
+    let _ = writeln!(out, "\n  Clone: {}", plan.repository_url);
+    let _ = writeln!(out, "  Source: {}", plan.checkout);
+    let _ = writeln!(
+        out,
+        "  Build: cargo install --locked ({})",
+        plan.build_profile
+    );
+    let _ = writeln!(out, "  Binary: {}", plan.binary_path.display());
+    out
 }
 
 // ---------------------------------------------------------------------------
