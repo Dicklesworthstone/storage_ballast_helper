@@ -2521,6 +2521,9 @@ struct MountTickResponse {
     inode_reclaim: Option<InodeReclaimRequest>,
     seconds_to_red: Option<f64>,
     prediction_confident: bool,
+    /// This mount's policy decision after every prediction confidence gate.
+    /// Its runway is time to exhaustion, not the controller's time to Red.
+    predictive_action: PredictiveAction,
     /// The predictive policy put this mount itself in imminent danger this
     /// tick (after confidence gating). `last_predictive_action` keeps only
     /// the most severe action across mounts, so it can name one mount only.
@@ -2532,6 +2535,53 @@ struct MountTickResponse {
 /// A finite, positive prediction or nothing.
 fn finite_positive(seconds: f64) -> Option<f64> {
     (seconds.is_finite() && seconds > 0.0).then_some(seconds)
+}
+
+/// A warning uses the same mount, exhaustion horizon and confidence as the
+/// policy that admitted it. A peer's forecast and time-to-Red are not evidence
+/// that this filesystem will be full.
+fn predictive_warning_event(
+    tick: &MountTickResponse,
+    config: &crate::core::config::PredictionConfig,
+) -> Option<NotificationEvent> {
+    // Keep the existing notification suppression at Green/Yellow and the
+    // mount-local dynamic confidence gate used by the predictive policy.
+    if !config.enabled || tick.response.level <= PressureLevel::Yellow || !tick.prediction_confident
+    {
+        return None;
+    }
+    let (mount, minutes_remaining, confidence) = match &tick.predictive_action {
+        PredictiveAction::Clear => return None,
+        PredictiveAction::EarlyWarning {
+            mount,
+            minutes_remaining,
+            confidence,
+            ..
+        }
+        | PredictiveAction::PreemptiveCleanup {
+            mount,
+            minutes_remaining,
+            confidence,
+            ..
+        } => (mount, *minutes_remaining, *confidence),
+        PredictiveAction::ImminentDanger {
+            mount,
+            minutes_remaining,
+            ..
+        } => (mount, *minutes_remaining, tick.rate.confidence),
+    };
+    if mount != &tick.response.causing_mount
+        || !minutes_remaining.is_finite()
+        || !(0.0..=config.warning_horizon_minutes).contains(&minutes_remaining)
+        || !(config.min_confidence..=1.0).contains(&confidence)
+    {
+        return None;
+    }
+    Some(NotificationEvent::PredictiveWarning {
+        mount: mount.to_string_lossy().into_owned(),
+        minutes_remaining,
+        confidence,
+    })
 }
 
 /// Once per `FORECAST_LOG_INTERVAL` per filling mount, the calibration
@@ -3489,8 +3539,8 @@ pub struct MonitoringDaemon {
     /// [`special_episode_over`]; prevents the oscillation spam the main
     /// pressure loop also suppresses.
     last_special_notify: HashMap<PathBuf, (PressureLevel, Instant)>,
-    last_predictive_warning: Option<Instant>,
-    last_predictive_level: Option<NotificationLevel>,
+    /// A forecast on one filesystem cannot mute another filesystem's alert.
+    last_predictive_warning: HashMap<PathBuf, (NotificationLevel, Instant)>,
     last_ewma_confidence: f64,
     predictive_policy: PredictiveActionPolicy,
     last_predictive_action: PredictiveAction,
@@ -5549,8 +5599,7 @@ impl MonitoringDaemon {
             last_pressure_notify_time: None,
             last_special_scan: HashMap::new(),
             last_special_notify: HashMap::new(),
-            last_predictive_warning: None,
-            last_predictive_level: None,
+            last_predictive_warning: HashMap::new(),
             last_ewma_confidence: 0.0,
             predictive_policy: PredictiveActionPolicy::from_config(prediction_config),
             last_predictive_action: PredictiveAction::Clear,
@@ -7991,7 +8040,7 @@ impl MonitoringDaemon {
             }
 
             if pred_action.severity() > self.last_predictive_action.severity() {
-                self.last_predictive_action = pred_action;
+                self.last_predictive_action = pred_action.clone();
             }
 
             // Keep this mount's own reading for the per-mount controllers.
@@ -8018,6 +8067,7 @@ impl MonitoringDaemon {
                 inode_reclaim,
                 seconds_to_red: predicted_seconds,
                 prediction_confident: rate_estimate.confidence >= effective_min_conf,
+                predictive_action: pred_action,
                 imminent_danger,
                 rate: MountRateState {
                     bytes_per_sec: rate_estimate.bytes_per_second,
@@ -8230,8 +8280,8 @@ impl MonitoringDaemon {
     /// Drive every mount from its own reading through its `MountController`
     /// and return the tick the daemon should sleep for.
     ///
-    /// `response` is still the worst mount's reading; it feeds the predictive
-    /// safety net and the Critical emergency event. Everything per mount
+    /// `response` is still the worst mount's reading; it gates the Green
+    /// safety net and supplies FallbackSafe recovery scans. Everything per mount
     /// (scan dispatch, ballast release and replenish, observe-only reporting)
     /// comes from `self.mount_responses`. The returned tick is the tightest
     /// cadence among mounts sbh is working on: a pressured mount it cannot
@@ -8247,11 +8297,10 @@ impl MonitoringDaemon {
     ) -> Duration {
         self.poll_ballast_replenishment();
         self.poll_quarantine_worker();
-        // Reset min_score to config default at the start of each tick;
-        // PreemptiveCleanup may lower it below.
+        // This threshold is shared by every queued batch. A forecast for one
+        // mount must not lower the executor's score floor on another mount.
         self.shared_executor_config
             .set_min_score(self.config.scoring.min_score);
-        self.check_predictive_warning(response);
 
         let behavior = self.behavior_state.mode;
         let scan_allowed = behavior_allows_scan(behavior);
@@ -8286,6 +8335,7 @@ impl MonitoringDaemon {
             self.config.scanner.cross_devices && !observed_root_paths.is_empty();
 
         let mut responses = std::mem::take(&mut self.mount_responses);
+        self.check_predictive_warnings(&responses, now);
         // A wake is held for every controlled mount (and every mount sampled
         // now) until a tick that samples that mount delivers it. A replaced
         // or forgotten controller starts afresh and drops its held wake.
@@ -8884,40 +8934,55 @@ impl MonitoringDaemon {
             }
         }
 
-        // Predictive safety net on the worst mount at Green. The controllers
-        // already escalate a mount whose own horizon is short; this keeps the
-        // policy's min_score recommendation, the ballast release on the mount
-        // it named, and the FallbackSafe recovery scans.
+        // Green predictive work belongs to each mount's current policy action
+        // and physical reading. The worst response and last_predictive_action
+        // may name different mounts; neither grants cleanup on a peer's roots.
         if response.level == PressureLevel::Green {
-            let predictive_min_score = match &self.last_predictive_action {
-                PredictiveAction::PreemptiveCleanup {
-                    recommended_min_score,
-                    ..
-                } => Some(*recommended_min_score),
-                _ => None,
-            };
-            let predictive_ballast_mount = match &self.last_predictive_action {
-                PredictiveAction::ImminentDanger { mount, .. } => Some(mount.clone()),
-                _ => None,
-            };
-            let needs_scan = !matches!(self.last_predictive_action, PredictiveAction::Clear);
-
-            if let Some(min_score) = predictive_min_score {
-                self.shared_executor_config.set_min_score(min_score);
-            }
-            if let Some(ref mount) = predictive_ballast_mount {
-                let _ = self.release_ballast(mount, response);
-                self.last_tick_cleanup_ran = true;
+            let in_fallback = self.policy_engine.lock().mode() == ActiveMode::FallbackSafe;
+            let mut predictive_cleanup = false;
+            for tick in &responses {
+                let mount = match &tick.predictive_action {
+                    PredictiveAction::PreemptiveCleanup { mount, .. }
+                    | PredictiveAction::ImminentDanger { mount, .. } => mount,
+                    PredictiveAction::Clear | PredictiveAction::EarlyWarning { .. } => continue,
+                };
+                let physical = &tick.filesystem_response;
+                if physical.causing_mount != *mount
+                    || tick.response.causing_mount != *mount
+                    || physical.level != PressureLevel::Green
+                    || tick.response.level != PressureLevel::Green
+                    || tick.ram_reclaim.is_some()
+                    || tick.inode_reclaim.is_some()
+                {
+                    continue;
+                }
+                predictive_cleanup = true;
+                if tick.predictive_action.should_release_ballast() && tick.imminent_danger {
+                    let _ = self.release_ballast(mount, physical);
+                    self.last_tick_cleanup_ran = true;
+                }
+                // FallbackSafe retains its existing recovery scan below;
+                // do not enqueue a second predictive pass over the same roots.
+                if scan_allowed && !in_fallback {
+                    let paths: Vec<PathBuf> = root_mounts
+                        .iter()
+                        .filter(|(_, root_mount)| root_mount.as_deref() == Some(mount.as_path()))
+                        .map(|(root, _)| root.clone())
+                        .collect();
+                    if !paths.is_empty() {
+                        self.send_scan_request(scan_tx, scan_rx, physical, paths, None, None);
+                        self.last_tick_cleanup_ran = true;
+                    }
+                }
             }
             // Force periodic scans when stuck in FallbackSafe at green
             // pressure so that guard windows can update and recovery can
             // trigger. Without this, FallbackSafe at green is permanent.
-            let in_fallback = self.policy_engine.lock().mode() == ActiveMode::FallbackSafe;
-            if scan_allowed && !observed_root_paths.is_empty() && (needs_scan || in_fallback) {
+            if scan_allowed && in_fallback && !observed_root_paths.is_empty() {
                 self.send_scan_request(scan_tx, scan_rx, response, observed_root_paths, None, None);
-                if needs_scan {
-                    self.last_tick_cleanup_ran = true;
-                }
+                // Preserve intervention censoring when a cleanup forecast
+                // coincides with this recovery pass, even before mode recovery.
+                self.last_tick_cleanup_ran |= predictive_cleanup;
             }
         }
 
@@ -9943,97 +10008,41 @@ impl MonitoringDaemon {
         }
     }
 
-    fn check_predictive_warning(&mut self, response: &crate::monitor::pid::PressureResponse) {
-        // Suppress prediction notifications at Green and Yellow pressure.
-        //
-        // At Green (>20% free), "disk full in 5m" is clearly an EWMA spike
-        // artifact from compilation bursts — false alarms that desensitize.
-        //
-        // At Yellow (10-20% free), the same EWMA spikes produce false alarms
-        // because burst consumption rates are transiently high. The pressure
-        // system already escalates to Orange+ before real danger, and the
-        // predictive policy's burst detector handles actual threat assessment.
-        // Notification spam at Yellow provides no actionable signal.
-        if response.level <= PressureLevel::Yellow {
-            return;
-        }
+    fn check_predictive_warnings(&mut self, responses: &[MountTickResponse], now: Instant) {
+        use crate::daemon::notifications::NotificationDispatchOutcome;
 
-        // If the predictive policy (with burst/free-space/confidence gates)
-        // already decided Clear, don't emit a raw notification — the policy
-        // has better context than the raw seconds-to-threshold value.
-        if matches!(self.last_predictive_action, PredictiveAction::Clear) {
-            return;
-        }
-
-        let Some(seconds) = response.predicted_seconds else {
-            // Prediction cleared — do NOT reset cooldown state here.
-            // When the disk hovers at the red threshold, predicted_seconds
-            // alternates between Some(tiny) and None on consecutive ticks.
-            // Resetting last_predictive_level/warning on each None tick
-            // defeats the 300-second cooldown, causing every-second CRIT spam.
-            // The cooldown expires naturally (300s) and the level gets updated
-            // when a new notification actually fires.
-            return;
-        };
-
-        // Suppress bogus predictions when confidence is below the configured
-        // minimum (default 70%).  Without this gate the daemon spams
-        // "disk full in N minutes" warnings on healthy disks whenever the
-        // EWMA estimator is in fallback mode or has insufficient data.
-        if self.last_ewma_confidence < self.config.pressure.prediction.min_confidence {
-            return;
-        }
-
-        let warning_horizon_secs = self.config.pressure.prediction.warning_horizon_minutes * 60.0;
-
-        if seconds > warning_horizon_secs {
-            return;
-        }
-
-        let minutes = seconds / 60.0;
-        // Determine severity level to match NotificationEvent::PredictiveWarning::level():
-        //   Critical  < critical_danger_minutes  (default  2 min)
-        //   Red       < imminent_danger_minutes  (default  5 min)
-        //   Orange    < action_horizon_minutes   (default 30 min)
-        //   Warning   everything else within the warning horizon
-        let current_level = if minutes < self.config.pressure.prediction.critical_danger_minutes {
-            NotificationLevel::Critical
-        } else if minutes < self.config.pressure.prediction.imminent_danger_minutes {
-            NotificationLevel::Red
-        } else if minutes < self.config.pressure.prediction.action_horizon_minutes {
-            NotificationLevel::Orange
-        } else {
-            NotificationLevel::Warning
-        };
-
-        let now = Instant::now();
-        let should_notify = match self.last_predictive_level {
-            Some(last_level) => {
-                // Escalate if severity increases (e.g. Warning -> Orange -> Red)
-                // OR if time cooldown (5 mins) expires.
-                if current_level > last_level {
-                    true
-                } else if let Some(last_time) = self.last_predictive_warning {
-                    now.duration_since(last_time) >= Duration::from_mins(5)
-                } else {
-                    true
-                }
+        // A temporarily missing or Clear observation does not reset a live
+        // cooldown. Expire old entries by time, so removed mounts cannot grow
+        // the map indefinitely and threshold oscillations cannot cause spam.
+        self.last_predictive_warning
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < Duration::from_mins(5));
+        for tick in responses {
+            let Some(event) = predictive_warning_event(tick, &self.config.pressure.prediction)
+            else {
+                continue;
+            };
+            // Match the severity actually delivered by the notification
+            // manager, including its confidence cap, rather than computing a
+            // second, potentially inconsistent level for escalation.
+            let level = event.level();
+            let mount = &tick.response.causing_mount;
+            if self
+                .last_predictive_warning
+                .get(mount)
+                .is_some_and(|(previous, _)| level <= *previous)
+            {
+                continue;
             }
-            None => true,
-        };
-
-        if !should_notify {
-            return;
+            if self.notification_manager.notify_with_outcome(&event)
+                == NotificationDispatchOutcome::Accepted
+            {
+                self.last_predictive_warning
+                    .insert(mount.clone(), (level, now));
+            }
+            // A throttled or unaccepted attempt stays eligible on the next
+            // sampled tick; a full queue must not hide an imminent warning
+            // behind the five-minute successful-enqueue cooldown.
         }
-
-        self.last_predictive_warning = Some(now);
-        self.last_predictive_level = Some(current_level);
-        self.notification_manager
-            .notify(&NotificationEvent::PredictiveWarning {
-                mount: response.causing_mount.to_string_lossy().to_string(),
-                minutes_remaining: seconds / 60.0,
-                confidence: self.last_ewma_confidence,
-            });
     }
 
     fn check_swap_thrash(&mut self) {
@@ -16871,7 +16880,7 @@ mod tests {
             };
             if !cross_device {
                 assert_eq!(response.level, PressureLevel::Green);
-                daemon.last_predictive_action = PredictiveAction::PreemptiveCleanup {
+                let action = PredictiveAction::PreemptiveCleanup {
                     mount: healthy.clone(),
                     minutes_remaining: 10.0,
                     confidence: 0.9,
@@ -16879,6 +16888,13 @@ mod tests {
                     recommended_min_score: 0.5,
                     recommended_free_target_pct: 20.0,
                 };
+                daemon
+                    .mount_responses
+                    .iter_mut()
+                    .find(|tick| tick.response.causing_mount == healthy)
+                    .unwrap()
+                    .predictive_action = action.clone();
+                daemon.last_predictive_action = action;
             }
             let (scan_tx, scan_rx) = bounded(4);
             let (del_tx, _del_rx) = bounded(4);
@@ -19028,9 +19044,545 @@ mod tests {
             inode_reclaim: None,
             seconds_to_red: None,
             prediction_confident: false,
+            predictive_action: PredictiveAction::Clear,
             imminent_danger: false,
             rate: MountRateState::default(),
         }
+    }
+
+    #[cfg(unix)]
+    fn predictive_warning_tick(mount: &Path, minutes: f64) -> MountTickResponse {
+        let mut tick = quarantine_tick(PressureLevel::Orange, mount);
+        tick.response.predicted_seconds = Some(60.0);
+        tick.seconds_to_red = Some(60.0);
+        tick.prediction_confident = true;
+        tick.rate.confidence = 0.95;
+        tick.predictive_action = PredictiveAction::PreemptiveCleanup {
+            mount: mount.to_path_buf(),
+            minutes_remaining: minutes,
+            confidence: 0.82,
+            rate_bytes_per_second: 1_000.0,
+            recommended_min_score: 0.5,
+            recommended_free_target_pct: 20.0,
+        };
+        tick
+    }
+
+    /// Three independent mock mounts under one temporary directory. No host
+    /// reserve path resolves to them, and maintenance cannot mask a predictive
+    /// dispatch. Scanner/executor threads are never started.
+    #[cfg(unix)]
+    fn green_predictive_fixture() -> (RegretDaemonFixture, [PathBuf; 3]) {
+        use crate::core::config::PathsConfig;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mounts = ["steady", "filling", "also-filling"].map(|name| directory.path().join(name));
+        for mount in &mounts {
+            std::fs::create_dir_all(mount.join("project")).unwrap();
+        }
+        let mut config = Config::with_paths(PathsConfig {
+            config_file: mounts[0].join("config.toml"),
+            ballast_dir: mounts[0].join("ballast"),
+            state_file: mounts[0].join("state.json"),
+            sqlite_db: mounts[0].join("activity.sqlite3"),
+            jsonl_log: mounts[0].join("activity.jsonl"),
+        });
+        config.scanner.root_paths = mounts.iter().map(|mount| mount.join("project")).collect();
+        config.scanner.catalog_roots_on_pressured_device = false;
+        config.pressure.maintenance_interval_secs = 0;
+        config.ballast.auto_provision = false;
+        config.ballast.file_count = 2;
+        config.ballast.file_size_bytes = 8192;
+        config.notifications.enabled = false;
+        config.scoring.min_score = 0.85;
+        let samples = mounts
+            .iter()
+            .map(|mount| {
+                disk_pressure_sample(&mount.to_string_lossy(), 1_000_000_000_000, 500_000_000_000)
+            })
+            .collect();
+        let mut platform = disk_pressure_platform(samples)
+            .with_home(directory.path())
+            .with_temp_dirs(Vec::new())
+            .with_cache_roots(Vec::new());
+        for pool in [
+            config.paths.ballast_dir.clone(),
+            mounts[1].join(".sbh/ballast"),
+            mounts[2].join(".sbh/ballast"),
+        ] {
+            for index in 1..=2 {
+                platform = platform
+                    .with_block_count(pool.join(format!("SBH_BALLAST_FILE_{index:05}.dat")), 16);
+            }
+        }
+        let mut daemon = MonitoringDaemon::init_with_platform(
+            config,
+            &DaemonArgs::default(),
+            Arc::new(platform),
+        )
+        .unwrap();
+        daemon.behavior_state.mode = mock_behavior_mode(
+            ScanAggressiveness::Normal,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::None,
+            NotificationPriority::Low,
+        );
+        (RegretDaemonFixture { daemon, directory }, mounts)
+    }
+
+    #[cfg(unix)]
+    fn green_predictive_tick(mount: &Path) -> MountTickResponse {
+        let mut tick = quarantine_tick(PressureLevel::Green, mount);
+        tick.response.urgency = 0.2;
+        tick.response.free_pct = 50.0;
+        tick.filesystem_response = tick.response.clone();
+        tick.predictive_action = PredictiveAction::PreemptiveCleanup {
+            mount: mount.to_path_buf(),
+            minutes_remaining: 10.0,
+            confidence: 0.95,
+            rate_bytes_per_second: 1_000.0,
+            recommended_min_score: 0.1,
+            recommended_free_target_pct: 20.0,
+        };
+        tick
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn green_predictive_scans_use_each_mounts_physical_evidence_and_keep_score_floor() {
+        let (mut fixture, [steady, filling, also_filling]) = green_predictive_fixture();
+        let daemon = &mut fixture.daemon;
+        let mut worst = green_predictive_tick(&steady);
+        worst.predictive_action = PredictiveAction::Clear;
+        worst.response.urgency = 0.95;
+        let mut first = green_predictive_tick(&filling);
+        first.filesystem_response.urgency = 0.35;
+        first.filesystem_response.free_pct = 52.0;
+        first.filesystem_response.max_delete_batch = 7;
+        first.response.urgency = 0.8;
+        first.response.free_pct = 11.0;
+        first.response.max_delete_batch = 99;
+        let mut second = green_predictive_tick(&also_filling);
+        second.filesystem_response.urgency = 0.25;
+        second.filesystem_response.free_pct = 63.0;
+        second.filesystem_response.max_delete_batch = 6;
+        // A stale global summary must neither grant authority to the steady
+        // mount nor hide a second mount's current cleanup action.
+        daemon.last_predictive_action = green_predictive_tick(&steady).predictive_action;
+        daemon.mount_responses = vec![worst.clone(), first, second];
+        let (scan_tx, scan_rx) = bounded(8);
+        let (del_tx, _del_rx) = bounded(8);
+        daemon.handle_pressure(&worst.response, &scan_tx, &scan_rx, &del_tx);
+        let scans: Vec<_> = scan_rx.try_iter().collect();
+        assert_eq!(scans.len(), 2);
+        for (mount, urgency, free_pct, limit) in
+            [(&filling, 0.35, 52.0, 7), (&also_filling, 0.25, 63.0, 6)]
+        {
+            let request = scans
+                .iter()
+                .find(|scan| scan.paths == vec![mount.join("project")])
+                .expect("each threatened mount keeps exactly its observed root");
+            assert_eq!(request.pressure_level, PressureLevel::Green);
+            assert_eq!(request.urgency, urgency);
+            assert_eq!(request.free_pct, Some(free_pct));
+            assert_eq!(request.max_delete_batch, limit);
+        }
+        assert_eq!(daemon.shared_executor_config.min_score(), 0.85);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn green_predictive_scans_require_current_cleanup_action_and_observed_scope() {
+        for case in [
+            "early-warning",
+            "missing-tick",
+            "mismatched-mount",
+            "unobserved-roots",
+            "non-green-physical",
+        ] {
+            let (mut fixture, [steady, filling, _]) = green_predictive_fixture();
+            let daemon = &mut fixture.daemon;
+            let mut worst = green_predictive_tick(&steady);
+            worst.predictive_action = PredictiveAction::Clear;
+            let mut tick = green_predictive_tick(&filling);
+            match case {
+                "early-warning" => {
+                    tick.predictive_action = PredictiveAction::EarlyWarning {
+                        mount: filling.clone(),
+                        minutes_remaining: 45.0,
+                        confidence: 0.95,
+                        rate_bytes_per_second: 1_000.0,
+                        trend: crate::monitor::ewma::Trend::Stable,
+                    };
+                }
+                "mismatched-mount" => {
+                    tick.predictive_action = green_predictive_tick(&steady).predictive_action;
+                }
+                "unobserved-roots" => {
+                    daemon.config.scanner.root_paths = vec![steady.join("project")];
+                }
+                "non-green-physical" => {
+                    tick.filesystem_response.level = PressureLevel::Orange;
+                }
+                _ => {}
+            }
+            daemon.last_predictive_action = tick.predictive_action.clone();
+            daemon.mount_responses = vec![worst.clone()];
+            if case != "missing-tick" {
+                daemon.mount_responses.push(tick);
+            }
+            let (scan_tx, scan_rx) = bounded(8);
+            let (del_tx, _del_rx) = bounded(8);
+            daemon.handle_pressure(&worst.response, &scan_tx, &scan_rx, &del_tx);
+            assert!(
+                scan_rx.is_empty(),
+                "{case} cannot authorize predictive scans"
+            );
+            assert_eq!(daemon.shared_executor_config.min_score(), 0.85, "{case}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn green_predictive_fallback_keeps_one_complete_recovery_scan() {
+        for predicted in [false, true] {
+            let (mut fixture, mounts) = green_predictive_fixture();
+            let daemon = &mut fixture.daemon;
+            *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+                initial_mode: ActiveMode::FallbackSafe,
+                ..PolicyConfig::default()
+            });
+            let ticks: Vec<_> = mounts
+                .iter()
+                .map(|mount| {
+                    let mut tick = green_predictive_tick(mount);
+                    if !predicted {
+                        tick.predictive_action = PredictiveAction::Clear;
+                    }
+                    tick
+                })
+                .collect();
+            let response = ticks[0].response.clone();
+            daemon.mount_responses = ticks;
+            let (scan_tx, scan_rx) = bounded(8);
+            let (del_tx, _del_rx) = bounded(8);
+            daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+            let scans: Vec<_> = scan_rx.try_iter().collect();
+            assert_eq!(scans.len(), 1, "predicted={predicted}");
+            assert_eq!(scans[0].paths, daemon.config.scanner.root_paths);
+            assert_eq!(daemon.shared_executor_config.min_score(), 0.85);
+            assert_eq!(daemon.last_tick_cleanup_ran, predicted);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn green_predictive_ballast_requires_matching_current_imminence() {
+        let (mut fixture, [steady, filling, other]) = green_predictive_fixture();
+        let daemon = &mut fixture.daemon;
+        let available = |daemon: &MonitoringDaemon, mount: &Path| {
+            daemon
+                .ballast_coordinator
+                .pool_for_mount(mount)
+                .unwrap()
+                .available_count()
+        };
+        for mount in [&steady, &filling, &other] {
+            assert_eq!(
+                available(daemon, mount),
+                0,
+                "only fixture files may be released"
+            );
+        }
+        daemon.ballast_coordinator.set_provision_floor(0.0);
+        let provisioned = daemon
+            .ballast_coordinator
+            .provision_all(daemon.platform.as_ref())
+            .unwrap();
+        assert_eq!(provisioned.total_files_created(), 6, "{provisioned:?}");
+        let mut worst = green_predictive_tick(&steady);
+        worst.predictive_action = PredictiveAction::Clear;
+        worst.response.urgency = 0.95;
+        let mut threatened = green_predictive_tick(&filling);
+        threatened.predictive_action = PredictiveAction::ImminentDanger {
+            mount: filling.clone(),
+            minutes_remaining: 3.0,
+            critical: false,
+        };
+        threatened.filesystem_response.urgency = 0.35;
+        threatened.filesystem_response.release_ballast_files = 1;
+        threatened.response.urgency = 0.95;
+        let (scan_tx, scan_rx) = bounded(8);
+        let (del_tx, _del_rx) = bounded(8);
+        for case in [
+            "missing-tick",
+            "unconfirmed",
+            "mismatched-mount",
+            "confirmed",
+        ] {
+            let mut tick = threatened.clone();
+            tick.imminent_danger = case != "unconfirmed";
+            if case == "mismatched-mount" {
+                tick.predictive_action = PredictiveAction::ImminentDanger {
+                    mount: steady.clone(),
+                    minutes_remaining: 3.0,
+                    critical: false,
+                };
+            }
+            daemon.last_predictive_action = threatened.predictive_action.clone();
+            daemon.mount_responses = vec![worst.clone()];
+            if case != "missing-tick" {
+                daemon.mount_responses.push(tick);
+            }
+            daemon.handle_pressure(&worst.response, &scan_tx, &scan_rx, &del_tx);
+            assert_eq!(available(daemon, &steady), 2, "{case}: peer keeps reserve");
+            assert_eq!(available(daemon, &other), 2, "{case}: peer keeps reserve");
+            assert_eq!(
+                available(daemon, &filling),
+                if case == "confirmed" { 1 } else { 2 },
+                "{case}: only current matching evidence may release; use its physical urgency"
+            );
+            let _: Vec<_> = scan_rx.try_iter().collect();
+        }
+    }
+
+    /// The worst pressure response may belong to a different filesystem than
+    /// the admitted forecast. Its one-minute time-to-Red is neither the
+    /// threatened mount nor the policy's 24-minute time-to-full.
+    #[cfg(unix)]
+    #[test]
+    fn predictive_warnings_follow_each_mounts_policy_and_full_runway() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let notifications = fixture
+            .directory
+            .path()
+            .join("predictive-notifications.jsonl");
+        let daemon = &mut fixture.daemon;
+        daemon.notification_manager = NotificationManager::from_config(&NotificationConfig {
+            enabled: true,
+            channels: vec!["file".into()],
+            file: FileConfig {
+                path: notifications.clone(),
+            },
+            ..NotificationConfig::default()
+        });
+        daemon.config.scanner.root_paths.clear();
+        daemon.config.scanner.catalog_roots_on_pressured_device = false;
+
+        let mut steady = predictive_warning_tick(Path::new("/steady"), 24.0);
+        steady.response.urgency = 0.9;
+        steady.predictive_action = PredictiveAction::Clear;
+        let filling = predictive_warning_tick(Path::new("/filling"), 24.0);
+        // The old global gate combined this action with `steady.response`
+        // and would announce /steady full in one minute at 99% confidence.
+        daemon.last_predictive_action = filling.predictive_action.clone();
+        daemon.last_ewma_confidence = 0.99;
+        daemon.mount_responses = vec![steady.clone(), filling];
+        let (scan_tx, scan_rx) = bounded(4);
+        let (del_tx, _del_rx) = bounded(4);
+        daemon.handle_pressure(&steady.response, &scan_tx, &scan_rx, &del_tx);
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+
+        let warnings: Vec<Value> = std::fs::read_to_string(&notifications)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["type"] == "predictive_warning")
+            .collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0]["mount"], "/filling");
+        assert_eq!(warnings[0]["minutes_remaining"], 24.0);
+        assert_eq!(warnings[0]["confidence"], 0.82);
+        assert_eq!(warnings[0]["level"], "orange");
+        assert!(
+            warnings[0]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("full on /filling in 24m")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn predictive_warning_cooldowns_are_per_mount_and_survive_clear_ticks() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let notifications = fixture
+            .directory
+            .path()
+            .join("predictive-notifications.jsonl");
+        let daemon = &mut fixture.daemon;
+        // Disable the channel's separate throttle to exercise the daemon's
+        // five-minute episode logic with an injected clock, without sleeps.
+        daemon.notification_manager = NotificationManager::from_config(&NotificationConfig {
+            enabled: true,
+            channels: vec!["file".into()],
+            min_notify_interval_secs: 0,
+            urgent_notify_interval_secs: 0,
+            file: FileConfig {
+                path: notifications.clone(),
+            },
+            ..NotificationConfig::default()
+        });
+        let now = Instant::now();
+        let first = predictive_warning_tick(Path::new("/first"), 20.0);
+        let second = predictive_warning_tick(Path::new("/second"), 20.0);
+        daemon.check_predictive_warnings(std::slice::from_ref(&first), now);
+        daemon.check_predictive_warnings(&[second], now + Duration::from_secs(1));
+        let mut cleared = first.clone();
+        cleared.predictive_action = PredictiveAction::Clear;
+        daemon.check_predictive_warnings(&[cleared], now + Duration::from_secs(2));
+        daemon
+            .check_predictive_warnings(std::slice::from_ref(&first), now + Duration::from_secs(3));
+        let mut urgent = first.clone();
+        urgent.predictive_action = PredictiveAction::ImminentDanger {
+            mount: first.response.causing_mount.clone(),
+            minutes_remaining: 1.0,
+            critical: true,
+        };
+        daemon.check_predictive_warnings(&[urgent], now + Duration::from_secs(4));
+        daemon
+            .check_predictive_warnings(std::slice::from_ref(&first), now + Duration::from_secs(5));
+        daemon.check_predictive_warnings(&[first], now + Duration::from_secs(304));
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+
+        let warnings: Vec<Value> = std::fs::read_to_string(&notifications)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect();
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        let actual: Vec<_> = warnings
+            .iter()
+            .map(|event| {
+                (
+                    event["mount"].as_str().unwrap(),
+                    event["level"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("/first", "orange"),
+                ("/second", "orange"),
+                ("/first", "critical"),
+                ("/first", "orange"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn predictive_warning_cooldown_advances_only_after_queue_acceptance() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let notifications = fixture.directory.path().join("predictive-acceptance.jsonl");
+        let daemon = &mut fixture.daemon;
+        let mut config = NotificationConfig {
+            enabled: false,
+            channels: vec!["file".into()],
+            file: FileConfig {
+                path: notifications.clone(),
+            },
+            ..NotificationConfig::default()
+        };
+        daemon.notification_manager = NotificationManager::from_config(&config);
+        let mount = PathBuf::from("/filling");
+        let mut tick = predictive_warning_tick(&mount, 1.0);
+        tick.predictive_action = PredictiveAction::ImminentDanger {
+            mount: mount.clone(),
+            minutes_remaining: 1.0,
+            critical: true,
+        };
+        let now = Instant::now();
+        daemon.check_predictive_warnings(std::slice::from_ref(&tick), now);
+        assert!(daemon.last_predictive_warning.is_empty());
+
+        // Enabling delivery must admit the still-imminent warning on the
+        // next tick, rather than waiting out an unsent alert's cooldown.
+        config.enabled = true;
+        daemon.notification_manager.update_config(&config);
+        let accepted_at = now + Duration::from_secs(1);
+        daemon.check_predictive_warnings(std::slice::from_ref(&tick), accepted_at);
+        assert_eq!(
+            daemon.last_predictive_warning.get(&mount).copied(),
+            Some((NotificationLevel::Critical, accepted_at))
+        );
+
+        // Expire only the injected daemon clock: the manager's real-time
+        // default urgent throttle still rejects this attempt. Such a gate
+        // disagreement must not start another five-minute daemon cooldown.
+        let due = accepted_at + Duration::from_mins(5);
+        daemon.check_predictive_warnings(std::slice::from_ref(&tick), due);
+        assert!(!daemon.last_predictive_warning.contains_key(&mount));
+
+        config.min_notify_interval_secs = 0;
+        config.urgent_notify_interval_secs = 0;
+        daemon.notification_manager.update_config(&config);
+        let retry_at = due + Duration::from_secs(1);
+        daemon.check_predictive_warnings(std::slice::from_ref(&tick), retry_at);
+        assert_eq!(
+            daemon.last_predictive_warning.get(&mount).copied(),
+            Some((NotificationLevel::Critical, retry_at))
+        );
+        daemon.check_predictive_warnings(&[tick], retry_at + Duration::from_secs(1));
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+
+        let warnings: Vec<Value> = std::fs::read_to_string(&notifications)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|event| { event["mount"] == "/filling" && event["level"] == "critical" })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn predictive_warning_keeps_pressure_confidence_and_horizon_gates() {
+        let config = crate::core::config::PredictionConfig::default();
+        let tick = predictive_warning_tick(Path::new("/filling"), 20.0);
+        assert!(predictive_warning_event(&tick, &config).is_some());
+        for level in [PressureLevel::Green, PressureLevel::Yellow] {
+            let mut suppressed = tick.clone();
+            suppressed.response.level = level;
+            assert!(predictive_warning_event(&suppressed, &config).is_none());
+        }
+        let mut unconfirmed = tick.clone();
+        unconfirmed.prediction_confident = false;
+        assert!(predictive_warning_event(&unconfirmed, &config).is_none());
+        for minutes in [f64::NAN, f64::INFINITY, -1.0, 61.0] {
+            let invalid = predictive_warning_tick(Path::new("/filling"), minutes);
+            assert!(predictive_warning_event(&invalid, &config).is_none());
+        }
+        for confidence in [f64::NAN, f64::INFINITY, -1.0, 0.69, 1.01] {
+            let mut invalid = tick.clone();
+            if let PredictiveAction::PreemptiveCleanup {
+                confidence: admitted,
+                ..
+            } = &mut invalid.predictive_action
+            {
+                *admitted = confidence;
+            }
+            assert!(predictive_warning_event(&invalid, &config).is_none());
+        }
+        let mut peer = tick.clone();
+        peer.response.causing_mount = PathBuf::from("/unrelated");
+        assert!(predictive_warning_event(&peer, &config).is_none());
+        let disabled = crate::core::config::PredictionConfig {
+            enabled: false,
+            ..config
+        };
+        assert!(predictive_warning_event(&tick, &disabled).is_none());
     }
 
     #[cfg(unix)]

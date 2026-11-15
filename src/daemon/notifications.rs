@@ -1092,6 +1092,18 @@ impl ChannelWorker {
     }
 }
 
+/// The synchronous result of trying to enqueue an alert, not its eventual
+/// delivery by a channel worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotificationDispatchOutcome {
+    /// At least one eligible channel accepted the notification.
+    Accepted,
+    /// Existing successful history or a reserve retry interval suppressed it.
+    Throttled,
+    /// Disabled, filtered by every channel, or rejected by every eligible queue.
+    Unavailable,
+}
+
 /// Coordinates dispatching notification events to all enabled channels.
 ///
 /// Calls enqueue without waiting for channel I/O. At most one worker per
@@ -1223,9 +1235,23 @@ impl NotificationManager {
         self.notify_at(event, Instant::now());
     }
 
-    fn notify_at(&mut self, event: &NotificationEvent, now: Instant) {
+    /// Report queue acceptance so callers do not consume their own successful
+    /// alert cooldown after a throttle or a full/unavailable channel queue.
+    #[must_use]
+    pub(crate) fn notify_with_outcome(
+        &mut self,
+        event: &NotificationEvent,
+    ) -> NotificationDispatchOutcome {
+        self.notify_at(event, Instant::now())
+    }
+
+    fn notify_at(
+        &mut self,
+        event: &NotificationEvent,
+        now: Instant,
+    ) -> NotificationDispatchOutcome {
         if !self.enabled {
-            return;
+            return NotificationDispatchOutcome::Unavailable;
         }
 
         // Mounts can disappear or change names. Retain only history that can
@@ -1241,11 +1267,12 @@ impl NotificationManager {
         } else {
             self.min_interval
         };
+        let mut ordinary_key = None;
         let reserve_transition =
             if let NotificationEvent::BallastReserveChanged { mount, reserve, .. } = event {
                 let key = (mount.clone(), reserve.ballast_dir.clone());
                 if self.reserve_states.get(&key) == Some(&reserve.state) {
-                    return;
+                    return NotificationDispatchOutcome::Throttled;
                 }
                 if self
                     .reserve_retries
@@ -1255,21 +1282,22 @@ impl NotificationManager {
                             && now.saturating_duration_since(*attempted) < RESERVE_RETRY_INTERVAL
                     })
                 {
-                    return;
+                    return NotificationDispatchOutcome::Throttled;
                 }
                 Some((key, reserve.state))
             } else {
                 let key = (event.type_key(), event.throttle_scope().to_owned());
-                let history = self.last_send_by_scope.entry(key).or_default();
                 if !interval.is_zero()
-                    && history
-                        .range(level..)
-                        .any(|(_, sent)| now.saturating_duration_since(*sent) < interval)
+                    && self.last_send_by_scope.get(&key).is_some_and(|history| {
+                        history
+                            .range(level..)
+                            .any(|(_, sent)| now.saturating_duration_since(*sent) < interval)
+                    })
                 {
-                    return;
+                    return NotificationDispatchOutcome::Throttled;
                 }
 
-                history.insert(level, now);
+                ordinary_key = Some(key);
                 None
             };
 
@@ -1305,6 +1333,20 @@ impl NotificationManager {
                 // to avoid turning each monitor tick into another drop notice.
                 self.reserve_retries.insert(key, (state, now));
             }
+        }
+        if accepted {
+            if let Some(key) = ordinary_key {
+                // Throttle accepted alerts only. A total queue rejection
+                // must leave a retry eligible when capacity returns, while
+                // preserving any earlier successful alert's history.
+                self.last_send_by_scope
+                    .entry(key)
+                    .or_default()
+                    .insert(level, now);
+            }
+            NotificationDispatchOutcome::Accepted
+        } else {
+            NotificationDispatchOutcome::Unavailable
         }
     }
 
@@ -2368,6 +2410,88 @@ mod tests {
         }
         assert!(manager.drain(Duration::from_secs(5)));
         assert_eq!(delivered.try_iter().collect::<Vec<_>>(), ["/data", "/data"]);
+    }
+
+    #[test]
+    fn predictive_warning_retries_after_full_queue_without_consuming_cooldown() {
+        let (_directory, config, mut manager) = notification_fixture();
+        let (release, wait) = bounded(1);
+        let delivered = install_probe(&mut manager, "file", Some(wait));
+        manager.notify(&pressure_event("/first", NotificationLevel::Critical));
+        assert_eq!(
+            delivered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "/first"
+        );
+        for index in 0..CHANNEL_QUEUE_CAPACITY {
+            manager.notify(&pressure_event(
+                &format!("/queued-{index}"),
+                NotificationLevel::Critical,
+            ));
+        }
+        let event = NotificationEvent::PredictiveWarning {
+            mount: "/filling".into(),
+            minutes_remaining: 1.0,
+            confidence: 0.95,
+        };
+        let now = Instant::now();
+        assert_eq!(
+            manager.notify_at(&event, now),
+            NotificationDispatchOutcome::Unavailable
+        );
+        assert_eq!(manager.dropped_count(), 1);
+        assert!(
+            !manager
+                .last_send_by_scope
+                .contains_key(&("predictive_warning", "/filling".into()))
+        );
+
+        // Release the blocked worker and drain its old backlog. Retry after
+        // one second with the default five-minute urgent throttle intact.
+        drop(release);
+        assert!(manager.drain(Duration::from_secs(5)));
+        assert_eq!(
+            manager.notify_at(&event, now + Duration::from_secs(1)),
+            NotificationDispatchOutcome::Accepted
+        );
+        assert_eq!(
+            manager.notify_at(&event, now + Duration::from_secs(2)),
+            NotificationDispatchOutcome::Throttled
+        );
+        assert!(manager.drain(Duration::from_secs(5)));
+        assert_eq!(manager.dropped_count(), 1);
+        assert_eq!(
+            delivered
+                .try_iter()
+                .filter(|mount| mount == "/filling")
+                .count(),
+            1,
+        );
+        assert!(
+            !config.file.path.exists(),
+            "the in-memory probe handled delivery"
+        );
+    }
+
+    #[test]
+    fn predictive_warning_default_throttle_is_independent_for_each_mount() {
+        let (_directory, config, mut manager) = notification_fixture();
+        let now = Instant::now();
+        for (mount, expected) in [
+            ("/first", NotificationDispatchOutcome::Accepted),
+            ("/second", NotificationDispatchOutcome::Accepted),
+            ("/first", NotificationDispatchOutcome::Throttled),
+        ] {
+            let event = NotificationEvent::PredictiveWarning {
+                mount: mount.into(),
+                minutes_remaining: 1.0,
+                confidence: 0.95,
+            };
+            assert_eq!(manager.notify_at(&event, now), expected);
+        }
+        let records = recorded_notifications(&config, &manager);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["mount"], "/first");
+        assert_eq!(records[1]["mount"], "/second");
     }
 
     #[test]
