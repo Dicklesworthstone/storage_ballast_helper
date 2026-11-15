@@ -2952,9 +2952,12 @@ fn descriptors_under(pid: u32, dir: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-/// bd-656i: a reload that removes a root must release every descriptor the
-/// daemon holds under it, or an unconfigured volume cannot be unmounted
-/// (EBUSY) until the daemon restarts.
+/// bd-656i: a daemon must not keep a volume busy (EBUSY on eject) once it has
+/// walked it. Completed directory pages keep names, not handles, so nothing
+/// under a fully walked root stays open between passes. A reload that removes
+/// the root must not leave any either. A paused partial enumeration under a
+/// removed root is released by the reload: read_ahead's
+/// `released_roots_drop_paused_reads_and_cached_names_but_not_checked_out_readers`.
 #[cfg(target_os = "linux")]
 #[test]
 fn reload_that_removes_a_root_releases_its_descriptors() {
@@ -2984,11 +2987,16 @@ fn reload_that_removes_a_root_releases_its_descriptors() {
         run.events_of("scan_complete").len() >= 2
     })
     .unwrap_or_else(|e| panic!("{e}"));
-    let before = descriptors_under(pid, &root_b);
-    assert!(
-        !before.is_empty(),
-        "the scenario must retain read-ahead under root-b to prove its release"
-    );
+    // A walk in flight holds the directories it is listing. Between passes a
+    // fully walked root holds none: before the read-ahead released completed
+    // pages, up to 16 stayed open for an hour after a walk and the volume
+    // could not be ejected.
+    run.wait_until(
+        "no descriptor under root-b between passes",
+        Duration::from_secs(30),
+        |_| descriptors_under(pid, &root_b).is_empty(),
+    )
+    .unwrap_or_else(|e| panic!("{e}; open: {:?}", descriptors_under(pid, &root_b)));
 
     scenario.root_paths = vec![root_a];
     write_config(dir.path(), &scenario);
