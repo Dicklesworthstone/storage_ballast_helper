@@ -71,6 +71,182 @@ pub fn open_beneath(parent: &File, name: &OsStr, flags: OFlags) -> io::Result<Ow
     }
 }
 
+/// Open an existing relative path for inspection through a pinned root,
+/// refusing symlinks and mount crossings, including same-device bind mounts.
+///
+/// The only accepted spellings are normal relative components or exactly
+/// "." for the root itself. Opens are read-only or metadata-only; creating,
+/// truncating and writable modes are refused before filesystem access.
+/// Metadata-only opens also reject a symlink at the final component.
+///
+/// Without openat2, every opened parent/child binding is checked again before
+/// returning. These observations are not atomic against concurrent renames:
+/// the descriptor supplies inspection evidence, never mutation authority.
+/// A mutator must still validate the configured scope and file identity
+/// immediately before acting, as the compression executor does.
+#[cfg(all(
+    target_os = "linux",
+    any(test, target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub fn open_path_beneath(
+    parent: &File,
+    relative: &std::path::Path,
+    flags: OFlags,
+) -> io::Result<OwnedFd> {
+    use crate::platform::linux::no_symlinks::openat2_existing;
+    use rustix::fs::ResolveFlags;
+
+    validate_path_open(relative, flags)?;
+    let flags = flags | OFlags::CLOEXEC;
+    let fd = resolve_open(
+        openat2_existing(
+            parent,
+            relative,
+            flags,
+            ResolveFlags::BENEATH
+                | ResolveFlags::NO_SYMLINKS
+                | ResolveFlags::NO_MAGICLINKS
+                | ResolveFlags::NO_XDEV,
+        ),
+        || open_path_same_mount(parent, relative, flags),
+    )?;
+    refuse_symlink(fd)
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(test, target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn validate_path_open(relative: &std::path::Path, flags: OFlags) -> io::Result<()> {
+    let bytes = relative.as_os_str().as_encoded_bytes();
+    if bytes.len() >= libc::PATH_MAX as usize {
+        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+    }
+    if bytes != b"."
+        && bytes
+            .split(|byte| *byte == b'/')
+            .any(|name| name.is_empty() || name == b"." || name == b".." || name.contains(&0))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "confined path open requires normal relative components",
+        ));
+    }
+    if !flags.contains(OFlags::NOFOLLOW)
+        || flags.intersects(
+            OFlags::CREATE | OFlags::TRUNC | OFlags::WRONLY | OFlags::RDWR | OFlags::APPEND,
+        )
+        || flags.contains(OFlags::TMPFILE)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "confined path open requires a non-creating read-only or metadata-only mode",
+        ));
+    }
+    Ok(())
+}
+
+/// O_PATH | O_NOFOLLOW can return the symlink itself even with
+/// RESOLVE_NO_SYMLINKS. Both backends reject it rather than handing it to a
+/// caller that expects the named file or directory.
+#[cfg(all(
+    target_os = "linux",
+    any(test, target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn refuse_symlink(fd: OwnedFd) -> io::Result<OwnedFd> {
+    let file = File::from(fd);
+    if file.metadata()?.file_type().is_symlink() {
+        return Err(io::Error::from_raw_os_error(libc::ELOOP));
+    }
+    Ok(file.into())
+}
+
+/// No pathname is re-resolved from the process working directory. Each
+/// parent remains pinned while its child is opened, and every descriptor
+/// must retain the root's mount identity before it can be used.
+#[cfg(all(
+    target_os = "linux",
+    any(test, target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn open_path_same_mount(
+    parent: &File,
+    relative: &std::path::Path,
+    flags: OFlags,
+) -> io::Result<OwnedFd> {
+    open_path_same_mount_with_hook(parent, relative, flags, |_| {})
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(test, target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn open_path_same_mount_with_hook(
+    parent: &File,
+    relative: &std::path::Path,
+    flags: OFlags,
+    mut opened_component: impl FnMut(usize),
+) -> io::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    validate_path_open(relative, flags)?;
+    let root_mount = mount_id(parent.as_fd())?;
+    let mut directory = parent.try_clone()?;
+    let mut bindings = Vec::new();
+    let mut names = relative
+        .as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .peekable();
+    while let Some(name) = names.next() {
+        let opening = if names.peek().is_some() {
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+        } else {
+            flags | OFlags::CLOEXEC
+        };
+        let name = OsStr::from_bytes(name);
+        let fd = rustix::fs::openat(&directory, name, opening, Mode::empty())?;
+        if mount_id(fd.as_fd())? != root_mount {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        let child = File::from(fd);
+        let identity = child.metadata()?;
+        if identity.file_type().is_symlink() {
+            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        opened_component(bindings.len());
+        bindings.push((directory, name.to_os_string(), identity));
+        directory = child;
+    }
+
+    // Mount IDs alone do not catch an ancestor renamed outside the root on
+    // the same mount. Recheck the leaf first, then every binding back to the
+    // pinned root. A removed/replaced link invalidates the whole observation.
+    // Downstream mutation gates still revalidate scope and the complete stamp.
+    for (ancestor, name, expected) in bindings.iter().rev() {
+        let observed = File::from(rustix::fs::openat(
+            ancestor,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        if mount_id(observed.as_fd())? != root_mount {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        let actual = observed.metadata()?;
+        if actual.file_type().is_symlink() {
+            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        if actual.dev() != expected.dev()
+            || actual.ino() != expected.ino()
+            || actual.file_type() != expected.file_type()
+        {
+            return Err(io::Error::from_raw_os_error(libc::ESTALE));
+        }
+    }
+    Ok(directory.into())
+}
+
 /// Unlike `openat2`, `openat(O_NOFOLLOW)` only protects the last component.
 /// Never normalize a caller's path: even `child/` or `child/.` can change
 /// symlink handling. Reject the original bytes, including NUL, before open.
@@ -257,6 +433,243 @@ mod tests {
     }
 
     #[test]
+    fn denied_openat2_keeps_nested_metadata_and_read_opens_confined() {
+        use crate::platform::linux::no_symlinks::with_openat2_denied;
+        use std::os::unix::fs::FileTypeExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("nested/child")).unwrap();
+        fs::write(dir.path().join("nested/child/file"), b"inside").unwrap();
+        nix::unistd::mkfifo(
+            &dir.path().join("nested/pipe"),
+            nix::sys::stat::Mode::S_IRUSR,
+        )
+        .unwrap();
+        let p = parent(dir.path());
+        let metadata = OFlags::PATH | OFlags::NOFOLLOW;
+        let readonly = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+
+        for denial in [rustix::io::Errno::NOSYS, rustix::io::Errno::PERM] {
+            with_openat2_denied(denial, || {
+                let root = File::from(
+                    open_path_beneath(&p, std::path::Path::new("."), metadata).unwrap(),
+                );
+                assert_eq!(root.metadata().unwrap().ino(), p.metadata().unwrap().ino());
+
+                let mut opened = File::from(
+                    open_path_beneath(&p, std::path::Path::new("nested/child/file"), readonly)
+                        .unwrap(),
+                );
+                assert_eq!(opened.metadata().unwrap().len(), 6);
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut opened, &mut text).unwrap();
+                assert_eq!(text, "inside");
+                let child = File::from(
+                    open_path_beneath(
+                        &p,
+                        std::path::Path::new("nested/child"),
+                        readonly | OFlags::DIRECTORY,
+                    )
+                    .unwrap(),
+                );
+                assert!(child.metadata().unwrap().is_dir());
+
+                // O_PATH must inspect a FIFO without opening its payload or
+                // waiting for a writer.
+                let pipe = File::from(
+                    open_path_beneath(&p, std::path::Path::new("nested/pipe"), metadata).unwrap(),
+                );
+                assert!(pipe.metadata().unwrap().file_type().is_fifo());
+            });
+        }
+    }
+
+    #[test]
+    fn denied_openat2_never_follows_a_leaf_or_ancestor_symlink() {
+        use crate::platform::linux::no_symlinks::with_openat2_denied;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("nested")).unwrap();
+        fs::write(outside.path().join("precious"), b"outside").unwrap();
+        symlink(outside.path(), dir.path().join("alias")).unwrap();
+        symlink(
+            outside.path().join("precious"),
+            dir.path().join("nested/link"),
+        )
+        .unwrap();
+        let p = parent(dir.path());
+        for denial in [rustix::io::Errno::NOSYS, rustix::io::Errno::PERM] {
+            with_openat2_denied(denial, || {
+                for flags in [
+                    OFlags::PATH | OFlags::NOFOLLOW,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                ] {
+                    let leaf = open_path_beneath(&p, std::path::Path::new("nested/link"), flags)
+                        .unwrap_err();
+                    assert_eq!(leaf.raw_os_error(), Some(libc::ELOOP));
+                    let ancestor =
+                        open_path_beneath(&p, std::path::Path::new("alias/precious"), flags)
+                            .unwrap_err();
+                    assert_eq!(ancestor.raw_os_error(), Some(libc::ENOTDIR));
+                }
+            });
+        }
+        assert_eq!(fs::read(outside.path().join("precious")).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn confined_path_inputs_are_rejected_before_either_backend() {
+        use crate::platform::linux::no_symlinks::with_openat2_denied;
+        use std::path::Path;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("slot"), b"keep").unwrap();
+        let p = parent(dir.path());
+        let flags = OFlags::PATH | OFlags::NOFOLLOW;
+        let check = || {
+            for path in [
+                "",
+                "..",
+                "/slot",
+                "child/../slot",
+                "child/./slot",
+                "child//slot",
+                "child/",
+                "./slot",
+                "slot\0tail",
+            ] {
+                assert_eq!(
+                    open_path_beneath(&p, Path::new(path), flags)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidInput,
+                    "{path:?}",
+                );
+            }
+            for mode in [
+                OFlags::RDONLY,
+                OFlags::WRONLY | OFlags::NOFOLLOW,
+                OFlags::RDWR | OFlags::NOFOLLOW,
+                flags | OFlags::CREATE,
+                flags | OFlags::TRUNC,
+                flags | OFlags::TMPFILE,
+            ] {
+                assert_eq!(
+                    open_path_beneath(&p, Path::new("slot"), mode)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidInput,
+                );
+            }
+        };
+        check();
+        // A definitive primary denial also proves validation happens before
+        // the primary syscall, not only in the fallback.
+        with_openat2_denied(rustix::io::Errno::ACCESS, check);
+        with_openat2_denied(rustix::io::Errno::NOSYS, check);
+        assert_eq!(fs::read(dir.path().join("slot")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn denied_openat2_preserves_root_pinning_after_a_path_replacement() {
+        use crate::platform::linux::no_symlinks::with_openat2_denied;
+        use std::path::Path;
+
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("root");
+        let moved = dir.path().join("moved");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(original.join("file"), b"inside").unwrap();
+        fs::write(outside.join("file"), b"outside").unwrap();
+        let p = parent(&original);
+        fs::rename(&original, &moved).unwrap();
+        symlink(&outside, &original).unwrap();
+        with_openat2_denied(rustix::io::Errno::NOSYS, || {
+            let opened = File::from(
+                open_path_beneath(&p, Path::new("file"), OFlags::PATH | OFlags::NOFOLLOW)
+                    .unwrap(),
+            );
+            assert_eq!(
+                opened.metadata().unwrap().ino(),
+                fs::metadata(moved.join("file")).unwrap().ino(),
+            );
+            assert_ne!(
+                opened.metadata().unwrap().ino(),
+                fs::metadata(outside.join("file")).unwrap().ino(),
+            );
+        });
+    }
+
+    #[test]
+    fn fallback_rejects_an_ancestor_moved_outside_the_pinned_root() {
+        use std::path::Path;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("moved");
+        fs::create_dir_all(root.join("child")).unwrap();
+        let p = parent(&root);
+        let error = open_path_same_mount_with_hook(
+            &p,
+            Path::new("child/introduced-after-rename"),
+            OFlags::PATH | OFlags::NOFOLLOW,
+            |index| {
+                if index == 0 {
+                    fs::rename(root.join("child"), &outside).unwrap();
+                    fs::write(outside.join("introduced-after-rename"), b"outside").unwrap();
+                    // Replacing the name must not make the old descriptor's
+                    // child look like part of the new authorized directory.
+                    fs::create_dir(root.join("child")).unwrap();
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert_eq!(
+            fs::read(outside.join("introduced-after-rename")).unwrap(),
+            b"outside",
+        );
+    }
+
+    #[test]
+    fn denied_openat2_refuses_a_real_mount_boundary_and_retains_access_errors() {
+        use crate::platform::linux::no_symlinks::with_openat2_denied;
+        use std::path::Path;
+
+        let root = parent(Path::new("/"));
+        let proc = parent(Path::new("/proc"));
+        assert_ne!(
+            mount_id(root.as_fd()).unwrap(),
+            mount_id(proc.as_fd()).unwrap()
+        );
+        for denial in [rustix::io::Errno::NOSYS, rustix::io::Errno::PERM] {
+            with_openat2_denied(denial, || {
+                for path in ["proc", "proc/self"] {
+                    let error = open_path_beneath(
+                        &root,
+                        Path::new(path),
+                        OFlags::PATH | OFlags::NOFOLLOW,
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
+                }
+            });
+        }
+        with_openat2_denied(rustix::io::Errno::ACCESS, || {
+            let error = open_path_beneath(
+                &root,
+                Path::new("."),
+                OFlags::PATH | OFlags::NOFOLLOW,
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        });
+    }
+
+    #[test]
     fn fallback_opens_a_plain_child_directory() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("child")).unwrap();
@@ -334,8 +747,13 @@ mod tests {
             flags,
             proc_mount_id,
         );
+        let path_outcome = open_path_same_mount(
+            &parent(dir.path()),
+            std::path::Path::new("slot"),
+            OFlags::PATH | OFlags::NOFOLLOW,
+        );
         umount2(&slot, MntFlags::MNT_DETACH).unwrap();
-        for result in [outcome, proc_outcome] {
+        for result in [outcome, proc_outcome, path_outcome] {
             let error = result.expect_err("a file bind mount is a mount boundary");
             assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
         }
@@ -374,6 +792,11 @@ mod tests {
             flags,
             proc_mount_id,
         );
+        let path_outcome = open_path_same_mount(
+            &parent(dir.path()),
+            std::path::Path::new("bound/precious"),
+            OFlags::PATH | OFlags::NOFOLLOW,
+        );
         let same_device =
             fs::metadata(&target).map(|m| m.dev() == fs::metadata(dir.path()).unwrap().dev());
         umount2(&target, MntFlags::MNT_DETACH).unwrap();
@@ -381,7 +804,7 @@ mod tests {
             same_device.unwrap(),
             "the bind mount shares the device number"
         );
-        for result in [outcome, proc_outcome] {
+        for result in [outcome, proc_outcome, path_outcome] {
             let error = result.expect_err("a bind mount is a mount boundary");
             assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
         }

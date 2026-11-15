@@ -21,15 +21,80 @@ use rustix::io::Errno;
 pub fn open_without_symlinks(path: &Path, flags: OFlags) -> io::Result<OwnedFd> {
     let flags = flags | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     resolve(
-        openat2(
+        openat2_existing(
             CWD,
             path,
             flags,
-            Mode::empty(),
             ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
         ),
         || walk(path, flags),
     )
+}
+
+/// Open an existing path using the kernel's resolution flags. Keeping this
+/// syscall boundary shared lets tests exercise actual caller workflows under
+/// a denied syscall without installing process-wide seccomp filters.
+pub(crate) fn openat2_existing(
+    parent: impl std::os::fd::AsFd,
+    path: &Path,
+    flags: OFlags,
+    resolve_flags: ResolveFlags,
+) -> rustix::io::Result<OwnedFd> {
+    #[cfg(test)]
+    if let Some(error) = OPENAT2_DENIAL.get() {
+        let index = if !resolve_flags.contains(ResolveFlags::BENEATH) {
+            0
+        } else if flags.contains(OFlags::PATH) {
+            1
+        } else {
+            2
+        };
+        let mut calls = OPENAT2_DENIED_CALLS.get();
+        calls[index] += 1;
+        OPENAT2_DENIED_CALLS.set(calls);
+        return Err(error);
+    }
+    openat2(parent, path, flags, Mode::empty(), resolve_flags)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static OPENAT2_DENIAL: std::cell::Cell<Option<Errno>> = const {
+        std::cell::Cell::new(None)
+    };
+    static OPENAT2_DENIED_CALLS: std::cell::Cell<[usize; 3]> = const {
+        std::cell::Cell::new([0; 3])
+    };
+}
+
+/// Denied absolute, relative metadata and relative data opens in this scope.
+/// Integration tests use these counts to catch callers bypassing the seam.
+#[cfg(test)]
+pub(crate) fn denied_openat2_calls() -> [usize; 3] {
+    OPENAT2_DENIED_CALLS.get()
+}
+
+/// Force a syscall denial on this test thread only, restoring nested scopes
+/// and unwinding automatically. No production override exists.
+#[cfg(test)]
+pub(crate) fn with_openat2_denied<T>(error: Errno, body: impl FnOnce() -> T) -> T {
+    struct Restore {
+        denial: Option<Errno>,
+        calls: [usize; 3],
+    }
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OPENAT2_DENIAL.set(self.denial);
+            OPENAT2_DENIED_CALLS.set(self.calls);
+        }
+    }
+
+    let _restore = Restore {
+        denial: OPENAT2_DENIAL.replace(Some(error)),
+        calls: OPENAT2_DENIED_CALLS.replace([0; 3]),
+    };
+    body()
 }
 
 /// Only an unavailable openat2 falls back. A refused symlink (ELOOP), a
@@ -88,6 +153,47 @@ mod tests {
         let mut text = String::new();
         File::from(fd).read_to_string(&mut text).unwrap();
         text
+    }
+
+    #[test]
+    fn syscall_denial_scope_is_nested_thread_local_and_unwind_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("plain");
+        fs::write(&path, "kept").unwrap();
+        with_openat2_denied(Errno::ACCESS, || {
+            assert_eq!(
+                open_without_symlinks(&path, OFlags::RDONLY)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EACCES),
+            );
+            assert_eq!(denied_openat2_calls(), [1, 0, 0]);
+            with_openat2_denied(Errno::NOSYS, || {
+                assert_eq!(
+                    read(open_without_symlinks(&path, OFlags::RDONLY).unwrap()),
+                    "kept",
+                );
+            });
+            assert_eq!(OPENAT2_DENIAL.get(), Some(Errno::ACCESS));
+
+            assert_eq!(denied_openat2_calls(), [1, 0, 0]);
+            let other_path = path.clone();
+            let other = std::thread::spawn(move || {
+                read(open_without_symlinks(&other_path, OFlags::RDONLY).unwrap())
+            });
+            assert_eq!(other.join().unwrap(), "kept");
+
+            let panicked = std::panic::catch_unwind(|| {
+                with_openat2_denied(Errno::PERM, || panic!("test scope unwind"));
+            });
+            assert!(panicked.is_err());
+            assert_eq!(OPENAT2_DENIAL.get(), Some(Errno::ACCESS));
+        });
+        assert!(OPENAT2_DENIAL.get().is_none());
+        assert_eq!(
+            read(open_without_symlinks(&path, OFlags::RDONLY).unwrap()),
+            "kept",
+        );
     }
 
     #[test]

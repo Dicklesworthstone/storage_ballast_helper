@@ -416,12 +416,14 @@ mod native {
     use std::os::fd::AsRawFd as _;
     use std::time::{Duration, Instant, SystemTime};
 
-    use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
+    use rustix::fs::OFlags;
     use sbh_btrfs::FileStamp;
 
     #[allow(clippy::wildcard_imports)] // the parent module's discovery types
     use super::*;
+    use crate::platform::linux::no_symlinks::open_without_symlinks;
     use crate::scanner::compression::linux::repository;
+    use crate::scanner::quarantine::open_path_beneath;
     use crate::scanner::{active_lease, protection};
 
     #[derive(Debug)]
@@ -443,12 +445,9 @@ mod native {
     }
 
     pub(super) fn open_root(path: &Path) -> io::Result<File> {
-        Ok(File::from(openat2(
-            CWD,
+        Ok(File::from(open_without_symlinks(
             path,
             OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
         )?))
     }
 
@@ -556,22 +555,19 @@ mod native {
             } else {
                 &task.relative
             };
-            let file = match openat2(
+            let file = match open_path_beneath(
                 &root.file,
                 relative,
                 OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-                ResolveFlags::BENEATH
-                    | ResolveFlags::NO_SYMLINKS
-                    | ResolveFlags::NO_MAGICLINKS
-                    | ResolveFlags::NO_XDEV,
             ) {
                 Ok(fd) => File::from(fd),
-                Err(rustix::io::Errno::LOOP | rustix::io::Errno::XDEV) => {
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::EXDEV)) =>
+                {
                     self.skip("symlink_or_mount_boundary");
                     return Ok(());
                 }
-                Err(error) => return Err(io::Error::from(error).into()),
+                Err(error) => return Err(error.into()),
             };
             let metadata = file.metadata()?;
             if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
@@ -710,18 +706,12 @@ mod native {
         expected: FileStamp,
         deadline: Instant,
     ) -> Result<Option<&'static str>, VisitError> {
-        let exclusion = openat2(
+        let exclusion = open_path_beneath(
             root,
             relative,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::BENEATH
-                | ResolveFlags::NO_SYMLINKS
-                | ResolveFlags::NO_MAGICLINKS
-                | ResolveFlags::NO_XDEV,
         )
         .map(File::from)
-        .map_err(io::Error::from)
         .and_then(|file| {
             if FileStamp::read(&file)? != expected {
                 return Err(io::Error::other("file changed before discovery probing"));
@@ -845,3 +835,78 @@ mod native {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod sandbox_tests {
+    use super::*;
+    use crate::platform::linux::no_symlinks::{
+        denied_openat2_calls, with_openat2_denied,
+    };
+    use crate::platform::pal::MockPlatform;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    fn cold(path: &Path) {
+        fs::write(path, b"cold contents").unwrap();
+        filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+    }
+
+    #[test]
+    fn discovery_survives_syscall_filters_without_admitting_excluded_paths() {
+        let temp = crate::tempdir_outside_git();
+        let root = temp.path().canonicalize().unwrap();
+        let outside = crate::tempdir_outside_git();
+        let outside_file = outside.path().join("outside.bin");
+        cold(&outside_file);
+        fs::create_dir_all(root.join("nested/deeper")).unwrap();
+        let eligible = root.join("nested/deeper/cold.bin");
+        cold(&eligible);
+        fs::create_dir(root.join("protected")).unwrap();
+        fs::write(root.join("protected/.sbh-protect"), b"").unwrap();
+        let protected = root.join("protected/precious.bin");
+        cold(&protected);
+        fs::write(root.join("recent.bin"), b"new contents").unwrap();
+        symlink(outside.path(), root.join("linked-directory")).unwrap();
+        symlink(&outside_file, root.join("linked-file.bin")).unwrap();
+        let policy = CompressionPolicy {
+            min_size_bytes: 1,
+            min_age_secs: 3600,
+            ..Default::default()
+        };
+
+        for denial in [rustix::io::Errno::NOSYS, rustix::io::Errno::PERM] {
+            let selection = with_openat2_denied(denial, || {
+                let selection = discover(
+                    std::slice::from_ref(&root),
+                    &policy,
+                    &DiscoveryLimits::default(),
+                    &Config::default(),
+                    &MockPlatform::healthy(),
+                )
+                .unwrap();
+                // Prove that the fixture exercises root, metadata and data
+                // opens through the denied syscall, not an untested bypass.
+                assert!(denied_openat2_calls().into_iter().all(|calls| calls > 0));
+                selection
+            });
+            assert!(selection.report().complete, "{:?}", selection.report());
+            assert_eq!(selection.paths(), vec![eligible.clone()]);
+            assert_eq!(selection.report().selected_bytes, 13);
+            for path in [&eligible, &protected, &outside_file] {
+                assert_eq!(fs::read(path).unwrap(), b"cold contents");
+            }
+            for name in ["linked-directory", "linked-file.bin"] {
+                assert!(
+                    fs::symlink_metadata(root.join(name))
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
+                );
+            }
+        }
+    }
+}

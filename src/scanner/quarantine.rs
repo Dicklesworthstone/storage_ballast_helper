@@ -36,6 +36,11 @@ pub use budget::DEFAULT_DRAIN_WORK;
 use budget::PurgeBudget;
 #[cfg(target_os = "linux")]
 pub(crate) use safety::mount_id as descriptor_mount_id;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) use safety::open_path_beneath;
 #[cfg(unix)]
 pub(crate) use safety::open_beneath;
 pub(crate) use safety::remove_direct;

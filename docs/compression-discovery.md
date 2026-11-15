@@ -11,8 +11,15 @@ This is **metadata discovery**, not a compression-ratio estimate or permission
 to rewrite every reported file. Alone it never calls the compression mutation
 backend, creates a journal, deletes files, changes service policy, or enables
 automatic compression. `--discover` conflicts with `--recover-journal`. Native
-discovery currently requires Linux x86-64/AArch64 with `openat2`; unsupported
-targets report an unsupported no-op.
+discovery supports Linux x86-64/AArch64; unsupported targets report an unsupported
+no-op. Confined opens prefer `openat2`. When the syscall is unavailable or blocked
+by a service sandbox such as systemd's `RestrictSUIDSGID`, descriptor-relative
+opens still refuse symlinks and descendant mount boundaries, including bind
+mounts of the same filesystem. Missing mount-identity evidence fails closed.
+The fallback rechecks each pinned parent/child binding before returning, but
+these observations are not atomic against concurrent renames. Discovery remains
+an observation; execution must still revalidate scope and file identity before
+mutation and between chunks.
 
 ## Compress what discovery selected
 
