@@ -27,6 +27,18 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Green and Yellow passes hold every candidate idle less than 12 hours**
+  (bd-i9uh), as v0.7.14 meant to. v0.7.14 withheld only the definite
+  posterior floor there, so a candidate whose own posterior cleared the floor
+  was still deleted: in a Yellow pass the controller's urgency can be near 1,
+  and the pressure multiplier then saturates the posterior at the pattern's
+  confidence. One host deleted over 1,200 targets idle under 12 hours in a
+  day that way, among them a pooled rch target it rebuilt and deleted again.
+  Below Orange, a candidate idle less than
+  `scoring.definite_floor_maintenance_idle_hours` is now at most Review,
+  whatever its posterior, and the decision ledger says
+  `maintenance_idle_wait`. Orange and above, `sbh scan` and `sbh clean` are
+  unchanged.
 - **Live Cargo builds no longer hold every deletion under a hardened
   systemd unit** (Linux, bd-mun4). The Cargo configuration reader opened
   files only with `openat2(RESOLVE_NO_SYMLINKS)`. systemd's

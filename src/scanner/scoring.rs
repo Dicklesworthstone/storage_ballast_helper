@@ -414,8 +414,9 @@ pub struct ScoringEngine {
     false_negative_loss: f64,
     calibration_floor: f64,
     posterior_floor_definite: f64,
-    /// Idle time a `Definite` candidate needs for the posterior floor in a
-    /// Green or Yellow daemon pass (`scoring.definite_floor_maintenance_idle_hours`).
+    /// Idle time a candidate needs before a Green or Yellow daemon pass may
+    /// delete it, and a `Definite` one the posterior floor there
+    /// (`scoring.definite_floor_maintenance_idle_hours`).
     definite_floor_maintenance_idle: Duration,
     /// Whether this engine scores a Green or Yellow daemon pass; see
     /// [`Self::set_maintenance_pass`]. Off for every other caller.
@@ -432,10 +433,10 @@ pub struct ScoringEngine {
 
 impl ScoringEngine {
     /// Mark the pass this engine scores as a Green or Yellow daemon pass
-    /// (bd-i9uh). There the definite fast lane waits until a candidate has
-    /// been idle for `scoring.definite_floor_maintenance_idle_hours`: nothing
-    /// is worth a cold rebuild of a target in use today on a disk with room
-    /// to spare. trj decided DELETE at Green on a 76 GB shared cargo target
+    /// (bd-i9uh). There nothing is deleted, and the definite fast lane does
+    /// not apply, until a candidate has been idle for
+    /// `scoring.definite_floor_maintenance_idle_hours`: nothing is worth a
+    /// cold rebuild of a target in use today on a disk with room to spare. trj decided DELETE at Green on a 76 GB shared cargo target
     /// written 45 minutes earlier; csd deleted a shared `cargo-target` at 35
     /// minutes idle on two days running, rebuilt each time. Orange and above,
     /// and an operator's own `sbh scan` or `sbh clean`, keep the floor at any
@@ -563,11 +564,13 @@ impl ScoringEngine {
         // changes the prior fed into the expected-loss decision, never a veto.
         let certainty = classify_certainty(&input.classification, input.signals, factors.location);
         let raw_posterior = posterior_from_score(total, input.classification.combined_confidence);
-        // In a Green or Yellow daemon pass the fast lane waits for a
-        // half-day-idle candidate (bd-i9uh; see `set_maintenance_pass`).
+        // In a Green or Yellow daemon pass nothing younger than the
+        // maintenance idle wait is deleted, and the fast lane waits for it
+        // too (bd-i9uh; see `set_maintenance_pass`).
+        let maintenance_idle_wait =
+            self.maintenance_pass && input.age < self.definite_floor_maintenance_idle;
         let posterior_floor_withheld = certainty == ArtifactCertainty::Definite
-            && self.maintenance_pass
-            && input.age < self.definite_floor_maintenance_idle
+            && maintenance_idle_wait
             && raw_posterior < self.posterior_floor_definite;
         let posterior_floor_applied = certainty == ArtifactCertainty::Definite
             && !posterior_floor_withheld
@@ -626,6 +629,20 @@ impl ScoringEngine {
         } else {
             action
         };
+        // Withholding the floor does not hold a young candidate whose own
+        // posterior clears it. The controller's urgency can be near 1 in a
+        // Yellow pass, and the pressure multiplier's cap (3.0) saturates the
+        // posterior at the pattern's confidence: one host deleted a
+        // 2-hour-idle rch pool target at Yellow that way (posterior 0.93, no
+        // floor), the same target it had deleted at 80 minutes idle that
+        // morning. The level decides, so the wait caps the verdict itself at
+        // Review.
+        let maintenance_idle_held = maintenance_idle_wait && action == DecisionAction::Delete;
+        let action = if maintenance_idle_held {
+            DecisionAction::Review
+        } else {
+            action
+        };
 
         let mut ledger = build_ledger(
             factors,
@@ -645,6 +662,14 @@ impl ScoringEngine {
             let _ = write!(
                 ledger.summary,
                 "; posterior_floor_withheld=idle {}m below {}h in a Green/Yellow pass",
+                input.age.as_secs() / 60,
+                self.definite_floor_maintenance_idle.as_secs() / 3600
+            );
+        }
+        if maintenance_idle_held {
+            let _ = write!(
+                ledger.summary,
+                "; maintenance_idle_wait=Delete held: idle {}m below {}h in a Green/Yellow pass",
                 input.age.as_secs() / 60,
                 self.definite_floor_maintenance_idle.as_secs() / 3600
             );
@@ -3359,6 +3384,84 @@ mod tests {
             "{}",
             score.ledger.summary
         );
+    }
+
+    /// bd-i9uh under v0.7.14 in the field: in Yellow passes whose controller
+    /// urgency was near 1, one host deleted 1,204 cargo targets idle under 12 h,
+    /// among them a 2-hour-idle rch pool target it had deleted at 80 minutes
+    /// idle that morning. The pressure multiplier (2.9992 in the records)
+    /// saturated the posterior at the pattern's confidence (0.932), above the
+    /// 0.85 floor, so withholding the floor changed nothing. One record's
+    /// inputs, replayed: a 30-minute-idle target under `/data/tmp`.
+    #[test]
+    fn a_maintenance_pass_holds_a_young_target_whose_own_posterior_clears_the_floor() {
+        let mut field = stale_definite_target("/data/tmp/.tmpiSp7tU/root/proj-0070/target");
+        field.age = Duration::from_secs(1835);
+        field.size_bytes = 204_800;
+        field.classification.name_confidence = 0.93;
+        field.classification.structural_confidence = 1.0;
+        field.classification.combined_confidence = 0.93;
+        let urgency = 0.9999;
+
+        // Outside a maintenance pass the verdict is the field's: Delete on
+        // the candidate's own posterior, no floor involved.
+        let score = default_engine().score_candidate(&field, urgency);
+        assert!(
+            !score.decision.posterior_floor_applied,
+            "{}",
+            score.ledger.summary
+        );
+        assert!(
+            score.decision.posterior_abandoned > 0.85,
+            "{}",
+            score.ledger.summary
+        );
+        assert_eq!(
+            score.decision.action,
+            DecisionAction::Delete,
+            "{}",
+            score.ledger.summary
+        );
+
+        // A Yellow pass holds it, whatever the urgency: the level decides.
+        let mut maintenance = default_engine();
+        maintenance.set_maintenance_pass(true);
+        for urgency in [urgency, 0.75, 0.5] {
+            let score = maintenance.score_candidate(&field, urgency);
+            assert!(!score.vetoed, "urgency={urgency}: {:?}", score.veto_reason);
+            assert_eq!(
+                score.decision.action,
+                DecisionAction::Review,
+                "urgency={urgency}: {}",
+                score.ledger.summary
+            );
+            assert!(
+                score
+                    .ledger
+                    .summary
+                    .contains("maintenance_idle_wait=Delete held: idle 30m below 12h"),
+                "urgency={urgency}: {}",
+                score.ledger.summary
+            );
+        }
+        let held = maintenance.score_candidate(&field, urgency);
+        assert!(
+            held.decision.posterior_abandoned > 0.85,
+            "same evidence: {}",
+            held.ledger.summary
+        );
+        assert!(!held.ledger.summary.contains("posterior_floor_withheld"));
+
+        // Half a day idle, the same pass deletes it, with no hold noted.
+        field.age = Duration::from_hours(12);
+        let score = maintenance.score_candidate(&field, urgency);
+        assert_eq!(
+            score.decision.action,
+            DecisionAction::Delete,
+            "{}",
+            score.ledger.summary
+        );
+        assert!(!score.ledger.summary.contains("maintenance_idle_wait"));
     }
 
     /// A browser's per-launch app clone sits in the temp location band and is

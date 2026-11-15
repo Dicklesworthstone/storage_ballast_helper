@@ -690,7 +690,7 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | scoring | `false_negative_loss` | `30` | Loss of keeping an artifact | `src/core/config.rs` |
 | scoring | `calibration_floor` | `0.4` | Calibration needed for adaptive actions | `src/core/config.rs` |
 | scoring | `posterior_floor_definite` | `0.85` | Posterior needed for a definite label | `src/core/config.rs` |
-| scoring | `definite_floor_maintenance_idle_hours` | `12` | Idle hours before that floor applies at Green or Yellow | `src/core/config.rs` |
+| scoring | `definite_floor_maintenance_idle_hours` | `12` | Idle hours before a Green or Yellow pass deletes anything (or applies that floor) | `src/core/config.rs` |
 | scoring | `regret_window_minutes` | `30` | Window in which a recreated path counts as regret | `src/core/config.rs` |
 | scoring | `regret_alpha_definite` | `0.02` | Regret rate tolerated for definite deletions | `src/core/config.rs` |
 | scoring | `regret_alpha_likely` | `0.005` | Regret rate tolerated for likely deletions | `src/core/config.rs` |

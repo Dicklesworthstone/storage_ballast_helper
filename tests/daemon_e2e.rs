@@ -491,10 +491,21 @@ impl DaemonRun {
             .parent()
             .and_then(Path::file_name)
             .map_or_else(|| "run".to_string(), |n| n.to_string_lossy().into_owned());
-        let dir = scratch_base()
-            .join("sbh-e2e-failures")
-            .join(format!("{name}-{}", self.child.id()));
+        let kept = scratch_base().join("sbh-e2e-failures");
+        let dir = kept.join(format!("{name}-{}", self.child.id()));
         let _ = fs::create_dir_all(&dir);
+        // The host's own sbh scans this scratch base too, and a kept
+        // `.tmpXXXX-<pid>` dir reads as an abandoned temp dir: a worker at
+        // Red deleted kept outputs before anyone read them. Only these
+        // copies are protected, never a live fixture.
+        let marker = kept.join(".sbh-protect");
+        if !marker.exists() {
+            let _ = fs::write(
+                &marker,
+                "reason = \"sbh e2e failure outputs kept for post-mortems; remove by hand\"\n\
+                 added_by = \"tests/daemon_e2e.rs\"\n",
+            );
+        }
         for (from, to) in [
             (self.stderr_path.clone(), "daemon.stderr"),
             (self.data_dir.join("activity.jsonl"), "activity.jsonl"),

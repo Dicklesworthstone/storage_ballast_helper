@@ -744,13 +744,14 @@ pub struct ScoringConfig {
     /// caches). The floor changes only the prior fed into the expected-loss
     /// decision; every veto still runs first. Default 0.85.
     pub posterior_floor_definite: f64,
-    /// Hours a `Definite` candidate must have been idle before
-    /// `posterior_floor_definite` applies in a Green or Yellow daemon pass
+    /// Hours a candidate must have been idle before a Green or Yellow daemon
+    /// pass deletes it, and before `posterior_floor_definite` applies there
     /// (bd-i9uh). Without it a definite cargo target 30 minutes idle was
     /// deleted on a disk with room to spare and rebuilt the same day. Orange
-    /// and above, and an operator's own `sbh scan` or `sbh clean`, apply the
-    /// floor at any age past `scanner.min_file_age_minutes`. 0 turns the
-    /// requirement off. Default 12, rch's own idle floor for a per-job target.
+    /// and above, and an operator's own `sbh scan` or `sbh clean`, delete
+    /// and apply the floor at any age past `scanner.min_file_age_minutes`.
+    /// 0 turns the requirement off. Default 12, rch's own idle floor for a
+    /// per-job target.
     pub definite_floor_maintenance_idle_hours: u64,
     /// Regret labels (Q4): a deletion recreated within this many minutes
     /// while a process uses the parent directory is a regret.

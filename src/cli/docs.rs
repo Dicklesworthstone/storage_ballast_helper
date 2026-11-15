@@ -1376,7 +1376,7 @@ pub fn constants() -> Vec<ConstantDoc> {
             "scoring",
             "definite_floor_maintenance_idle_hours",
             scoring.definite_floor_maintenance_idle_hours,
-            "Idle hours before that floor applies at Green or Yellow",
+            "Idle hours before a Green or Yellow pass deletes anything (or applies that floor)",
             CONFIG,
         ),
         constant(
