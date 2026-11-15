@@ -27,6 +27,16 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Lossless Btrfs compression works when a service blocks `openat2`.**
+  Explicit file inspection, recursive discovery and eligibility probes now
+  share the verified descriptor-based fallback used for confined opens.
+  Every relative component must remain on the pinned root's mount, including
+  same-device bind mounts; symlinks are never followed. Discovery and RAM-scratch
+  attribution share per-root capability caches and check deadlines between
+  component opens. Ancestor bindings are rechecked before returning
+  a descriptor, and multi-component paths cannot request writable handles.
+  Existing protection, active-reference, inode-identity and compression
+  journal checks still gate mutation.
 - **Source-install previews no longer build or replace binaries.**
   `sbh install --from-source --dry-run` now reports the source revision,
   prerequisites and destination before invoking any tools, including version

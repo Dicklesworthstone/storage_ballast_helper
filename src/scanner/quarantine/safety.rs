@@ -29,13 +29,8 @@ mod confined_purge;
 #[path = "transaction.rs"]
 mod transaction;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(test, feature = "daemon")))]
 pub use beneath::mount_id;
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-pub use beneath::open_path_beneath;
 #[cfg(unix)]
 pub use beneath::open_beneath;
 pub use confined_purge::remove_direct;

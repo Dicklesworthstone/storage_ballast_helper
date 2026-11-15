@@ -818,9 +818,7 @@ mod control_path_tests {
 #[cfg(test)]
 mod sandbox_tests {
     use super::*;
-    use crate::platform::linux::no_symlinks::{
-        denied_openat2_calls, with_openat2_denied,
-    };
+    use crate::platform::linux::no_symlinks::{denied_openat2_calls, with_openat2_denied};
     use crate::platform::pal::{FsStats, MockPlatform, MountPoint, PlatformPaths};
     use rustix::io::Errno;
     use std::collections::HashMap;

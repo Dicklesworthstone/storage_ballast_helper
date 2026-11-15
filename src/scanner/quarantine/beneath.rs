@@ -26,9 +26,14 @@ use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsFd, BorrowedFd};
+use std::path::Path;
 
-use rustix::fs::{Mode, OFlags};
+#[cfg(not(target_os = "linux"))]
+use rustix::fs::Mode;
+use rustix::fs::OFlags;
+
+#[cfg(all(target_os = "linux", any(test, feature = "daemon")))]
+pub use crate::platform::linux::no_symlinks::mount_id;
 
 /// Open the directory `name` (one normal path component)
 /// beneath `parent`, refusing a symlink or a mount boundary.
@@ -50,201 +55,16 @@ pub fn open_beneath(parent: &File, name: &OsStr, flags: OFlags) -> io::Result<Ow
     validate_open(name, flags)?;
     #[cfg(target_os = "linux")]
     {
-        use rustix::fs::{ResolveFlags, openat2};
-        resolve_open(
-            openat2(
-                parent,
-                name,
-                flags,
-                Mode::empty(),
-                ResolveFlags::BENEATH
-                    | ResolveFlags::NO_SYMLINKS
-                    | ResolveFlags::NO_MAGICLINKS
-                    | ResolveFlags::NO_XDEV,
-            ),
-            || open_beneath_same_mount(parent, name, flags),
+        crate::platform::linux::no_symlinks::open_beneath_no_symlinks(
+            parent,
+            Path::new(name),
+            flags,
         )
     }
     #[cfg(not(target_os = "linux"))]
     {
         Ok(rustix::fs::openat(parent, name, flags, Mode::empty())?)
     }
-}
-
-/// Open an existing relative path for inspection through a pinned root,
-/// refusing symlinks and mount crossings, including same-device bind mounts.
-///
-/// The only accepted spellings are normal relative components or exactly
-/// "." for the root itself. Opens are read-only or metadata-only; creating,
-/// truncating and writable modes are refused before filesystem access.
-/// Metadata-only opens also reject a symlink at the final component.
-///
-/// Without openat2, every opened parent/child binding is checked again before
-/// returning. These observations are not atomic against concurrent renames:
-/// the descriptor supplies inspection evidence, never mutation authority.
-/// A mutator must still validate the configured scope and file identity
-/// immediately before acting, as the compression executor does.
-#[cfg(all(
-    target_os = "linux",
-    any(test, target_arch = "x86_64", target_arch = "aarch64")
-))]
-pub fn open_path_beneath(
-    parent: &File,
-    relative: &std::path::Path,
-    flags: OFlags,
-) -> io::Result<OwnedFd> {
-    use crate::platform::linux::no_symlinks::openat2_existing;
-    use rustix::fs::ResolveFlags;
-
-    validate_path_open(relative, flags)?;
-    let flags = flags | OFlags::CLOEXEC;
-    let fd = resolve_open(
-        openat2_existing(
-            parent,
-            relative,
-            flags,
-            ResolveFlags::BENEATH
-                | ResolveFlags::NO_SYMLINKS
-                | ResolveFlags::NO_MAGICLINKS
-                | ResolveFlags::NO_XDEV,
-        ),
-        || open_path_same_mount(parent, relative, flags),
-    )?;
-    refuse_symlink(fd)
-}
-
-#[cfg(all(
-    target_os = "linux",
-    any(test, target_arch = "x86_64", target_arch = "aarch64")
-))]
-fn validate_path_open(relative: &std::path::Path, flags: OFlags) -> io::Result<()> {
-    let bytes = relative.as_os_str().as_encoded_bytes();
-    if bytes.len() >= libc::PATH_MAX as usize {
-        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
-    }
-    if bytes != b"."
-        && bytes
-            .split(|byte| *byte == b'/')
-            .any(|name| name.is_empty() || name == b"." || name == b".." || name.contains(&0))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "confined path open requires normal relative components",
-        ));
-    }
-    if !flags.contains(OFlags::NOFOLLOW)
-        || flags.intersects(
-            OFlags::CREATE | OFlags::TRUNC | OFlags::WRONLY | OFlags::RDWR | OFlags::APPEND,
-        )
-        || flags.contains(OFlags::TMPFILE)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "confined path open requires a non-creating read-only or metadata-only mode",
-        ));
-    }
-    Ok(())
-}
-
-/// O_PATH | O_NOFOLLOW can return the symlink itself even with
-/// RESOLVE_NO_SYMLINKS. Both backends reject it rather than handing it to a
-/// caller that expects the named file or directory.
-#[cfg(all(
-    target_os = "linux",
-    any(test, target_arch = "x86_64", target_arch = "aarch64")
-))]
-fn refuse_symlink(fd: OwnedFd) -> io::Result<OwnedFd> {
-    let file = File::from(fd);
-    if file.metadata()?.file_type().is_symlink() {
-        return Err(io::Error::from_raw_os_error(libc::ELOOP));
-    }
-    Ok(file.into())
-}
-
-/// No pathname is re-resolved from the process working directory. Each
-/// parent remains pinned while its child is opened, and every descriptor
-/// must retain the root's mount identity before it can be used.
-#[cfg(all(
-    target_os = "linux",
-    any(test, target_arch = "x86_64", target_arch = "aarch64")
-))]
-fn open_path_same_mount(
-    parent: &File,
-    relative: &std::path::Path,
-    flags: OFlags,
-) -> io::Result<OwnedFd> {
-    open_path_same_mount_with_hook(parent, relative, flags, |_| {})
-}
-
-#[cfg(all(
-    target_os = "linux",
-    any(test, target_arch = "x86_64", target_arch = "aarch64")
-))]
-fn open_path_same_mount_with_hook(
-    parent: &File,
-    relative: &std::path::Path,
-    flags: OFlags,
-    mut opened_component: impl FnMut(usize),
-) -> io::Result<OwnedFd> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
-
-    validate_path_open(relative, flags)?;
-    let root_mount = mount_id(parent.as_fd())?;
-    let mut directory = parent.try_clone()?;
-    let mut bindings = Vec::new();
-    let mut names = relative
-        .as_os_str()
-        .as_bytes()
-        .split(|byte| *byte == b'/')
-        .peekable();
-    while let Some(name) = names.next() {
-        let opening = if names.peek().is_some() {
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
-        } else {
-            flags | OFlags::CLOEXEC
-        };
-        let name = OsStr::from_bytes(name);
-        let fd = rustix::fs::openat(&directory, name, opening, Mode::empty())?;
-        if mount_id(fd.as_fd())? != root_mount {
-            return Err(io::Error::from_raw_os_error(libc::EXDEV));
-        }
-        let child = File::from(fd);
-        let identity = child.metadata()?;
-        if identity.file_type().is_symlink() {
-            return Err(io::Error::from_raw_os_error(libc::ELOOP));
-        }
-        opened_component(bindings.len());
-        bindings.push((directory, name.to_os_string(), identity));
-        directory = child;
-    }
-
-    // Mount IDs alone do not catch an ancestor renamed outside the root on
-    // the same mount. Recheck the leaf first, then every binding back to the
-    // pinned root. A removed/replaced link invalidates the whole observation.
-    // Downstream mutation gates still revalidate scope and the complete stamp.
-    for (ancestor, name, expected) in bindings.iter().rev() {
-        let observed = File::from(rustix::fs::openat(
-            ancestor,
-            name,
-            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?);
-        if mount_id(observed.as_fd())? != root_mount {
-            return Err(io::Error::from_raw_os_error(libc::EXDEV));
-        }
-        let actual = observed.metadata()?;
-        if actual.file_type().is_symlink() {
-            return Err(io::Error::from_raw_os_error(libc::ELOOP));
-        }
-        if actual.dev() != expected.dev()
-            || actual.ino() != expected.ino()
-            || actual.file_type() != expected.file_type()
-        {
-            return Err(io::Error::from_raw_os_error(libc::ESTALE));
-        }
-    }
-    Ok(directory.into())
 }
 
 /// Unlike `openat2`, `openat(O_NOFOLLOW)` only protects the last component.
@@ -282,151 +102,31 @@ fn validate_open(name: &OsStr, flags: OFlags) -> io::Result<()> {
     Ok(())
 }
 
-/// Seccomp profiles report either NOSYS or PERM for unavailable openat2.
-/// The fallback repeats pathname, no-follow and mount checks; do not retry
-/// actual resolution failures (XDEV/LOOP), access denial or arbitrary I/O.
-#[cfg(target_os = "linux")]
-fn resolve_open(
-    primary: rustix::io::Result<OwnedFd>,
-    fallback: impl FnOnce() -> io::Result<OwnedFd>,
-) -> io::Result<OwnedFd> {
-    match primary {
-        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::PERM) => fallback(),
-        result => result.map_err(Into::into),
-    }
-}
-
-/// The `openat2`-less path: open without following, then require the
-/// parent's mount ID.
-#[cfg(target_os = "linux")]
-fn open_beneath_same_mount(parent: &File, name: &OsStr, flags: OFlags) -> io::Result<OwnedFd> {
-    open_beneath_with_mount_id(parent, name, flags, mount_id)
-}
-
-#[cfg(target_os = "linux")]
-fn open_beneath_with_mount_id(
-    parent: &File,
-    name: &OsStr,
-    flags: OFlags,
-    lookup: fn(BorrowedFd<'_>) -> io::Result<u64>,
-) -> io::Result<OwnedFd> {
-    validate_open(name, flags)?;
-    let parent_mount = lookup(parent.as_fd())?;
-    let fd = rustix::fs::openat(parent, name, flags, Mode::empty())?;
-    if lookup(fd.as_fd())? != parent_mount {
-        return Err(io::Error::from_raw_os_error(libc::EXDEV));
-    }
-    Ok(fd)
-}
-
-#[cfg(target_os = "linux")]
-/// Read a pinned descriptor's mount identity using verified kernel evidence.
-pub fn mount_id(fd: BorrowedFd<'_>) -> io::Result<u64> {
-    use rustix::fs::{AtFlags, StatxFlags, statx};
-    let primary = statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
-        .map(|stat| (stat.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stat.stx_mnt_id))
-        .map_err(Into::into);
-    resolve_mount_id(primary, || proc_mount_id(fd))
-}
-
-/// Do not turn arbitrary I/O failures into a successful compatibility probe.
-/// An absent statx field and syscall/feature-denial errors are the only cases
-/// where another kernel interface may establish the missing mount identity.
-#[cfg(target_os = "linux")]
-fn resolve_mount_id(
-    primary: io::Result<Option<u64>>,
-    fallback: impl FnOnce() -> io::Result<u64>,
-) -> io::Result<u64> {
-    match primary {
-        Ok(Some(id)) => Ok(id),
-        Ok(None) => fallback(),
-        Err(error)
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM | libc::EACCES)
-            ) =>
-        {
-            fallback()
-        }
-        Err(error) => Err(error),
-    }
-}
-
-/// fdinfo's mnt_id is the ordinary mount ID, matching STATX_MNT_ID (not
-/// STATX_MNT_ID_UNIQUE). Borrowing the descriptor pins its lifetime while the
-/// kernel is queried; do not resolve the entry's pathname again. thread-self
-/// also selects the calling thread's descriptor table after unshare(CLONE_FILES).
-#[cfg(target_os = "linux")]
-fn proc_mount_id(fd: BorrowedFd<'_>) -> io::Result<u64> {
-    use std::os::fd::AsRawFd;
-
-    let path = format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd());
-    let info = File::from(rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?);
-    read_proc_mount_id(info)
-}
-
-#[cfg(target_os = "linux")]
-fn read_proc_mount_id(info: File) -> io::Result<u64> {
-    use rustix::fs::{PROC_SUPER_MAGIC, fstatfs};
-    use std::io::Read;
-
-    const MAX_FDINFO_BYTES: usize = 16_384;
-
-    // A replaced/masked /proc must not supply an ordinary file as evidence.
-    // Check the opened handle, not a pathname that could change before read.
-    if fstatfs(&info)?.f_type != PROC_SUPER_MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "mount-ID evidence is not from procfs",
-        ));
-    }
-    let mut contents = String::new();
-    info.take(MAX_FDINFO_BYTES as u64 + 1)
-        .read_to_string(&mut contents)?;
-    if contents.len() > MAX_FDINFO_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "mount-ID evidence exceeds the fdinfo read budget",
-        ));
-    }
-    parse_proc_mount_id(&contents)
-}
-
-#[cfg(target_os = "linux")]
-fn parse_proc_mount_id(contents: &str) -> io::Result<u64> {
-    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid fdinfo mount ID");
-    if !contents.ends_with('\n') {
-        return Err(invalid());
-    }
-    let mut result = None;
-    for line in contents.lines() {
-        let Some(value) = line.strip_prefix("mnt_id:") else {
-            continue;
-        };
-        let value = value.trim();
-        if result.is_some() || value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err(invalid());
-        }
-        let id = value.parse::<u64>().map_err(|_| invalid())?;
-        if id == 0 {
-            return Err(invalid());
-        }
-        result = Some(id);
-    }
-    result.ok_or_else(invalid)
-}
-
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::platform::linux::no_symlinks::{
+        open_beneath_no_symlinks, proc_mount_id, resolve as resolve_open,
+        walk_beneath_with_mount_id,
+    };
     use nix::mount::{MntFlags, MsFlags, mount, umount2};
     use std::fs;
+    use std::os::fd::{AsFd, BorrowedFd};
     use std::os::unix::fs::{MetadataExt, symlink};
+
+    fn open_beneath_same_mount(parent: &File, name: &OsStr, flags: OFlags) -> io::Result<OwnedFd> {
+        open_beneath_with_mount_id(parent, name, flags, mount_id)
+    }
+
+    fn open_beneath_with_mount_id(
+        parent: &File,
+        name: &OsStr,
+        flags: OFlags,
+        lookup: fn(BorrowedFd<'_>) -> io::Result<u64>,
+    ) -> io::Result<OwnedFd> {
+        validate_open(name, flags)?;
+        walk_beneath_with_mount_id(parent, Path::new(name), flags, lookup)
+    }
 
     fn parent(dir: &std::path::Path) -> File {
         File::open(dir).unwrap()
@@ -452,20 +152,24 @@ mod tests {
         for denial in [rustix::io::Errno::NOSYS, rustix::io::Errno::PERM] {
             with_openat2_denied(denial, || {
                 let root = File::from(
-                    open_path_beneath(&p, std::path::Path::new("."), metadata).unwrap(),
+                    open_beneath_no_symlinks(&p, std::path::Path::new("."), metadata).unwrap(),
                 );
                 assert_eq!(root.metadata().unwrap().ino(), p.metadata().unwrap().ino());
 
                 let mut opened = File::from(
-                    open_path_beneath(&p, std::path::Path::new("nested/child/file"), readonly)
-                        .unwrap(),
+                    open_beneath_no_symlinks(
+                        &p,
+                        std::path::Path::new("nested/child/file"),
+                        readonly,
+                    )
+                    .unwrap(),
                 );
                 assert_eq!(opened.metadata().unwrap().len(), 6);
                 let mut text = String::new();
                 std::io::Read::read_to_string(&mut opened, &mut text).unwrap();
                 assert_eq!(text, "inside");
                 let child = File::from(
-                    open_path_beneath(
+                    open_beneath_no_symlinks(
                         &p,
                         std::path::Path::new("nested/child"),
                         readonly | OFlags::DIRECTORY,
@@ -477,7 +181,8 @@ mod tests {
                 // O_PATH must inspect a FIFO without opening its payload or
                 // waiting for a writer.
                 let pipe = File::from(
-                    open_path_beneath(&p, std::path::Path::new("nested/pipe"), metadata).unwrap(),
+                    open_beneath_no_symlinks(&p, std::path::Path::new("nested/pipe"), metadata)
+                        .unwrap(),
                 );
                 assert!(pipe.metadata().unwrap().file_type().is_fifo());
             });
@@ -501,21 +206,35 @@ mod tests {
         let p = parent(dir.path());
         for denial in [rustix::io::Errno::NOSYS, rustix::io::Errno::PERM] {
             with_openat2_denied(denial, || {
+                // The shared metadata API may observe the final symlink
+                // itself, but it must neither follow nor read its target.
+                let leaf = File::from(
+                    open_beneath_no_symlinks(&p, std::path::Path::new("nested/link"), OFlags::PATH)
+                        .unwrap(),
+                );
+                assert!(leaf.metadata().unwrap().file_type().is_symlink());
+                let leaf = open_beneath_no_symlinks(
+                    &p,
+                    std::path::Path::new("nested/link"),
+                    OFlags::RDONLY | OFlags::NONBLOCK,
+                )
+                .unwrap_err();
+                assert_eq!(leaf.raw_os_error(), Some(libc::ELOOP));
                 for flags in [
                     OFlags::PATH | OFlags::NOFOLLOW,
                     OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
                 ] {
-                    let leaf = open_path_beneath(&p, std::path::Path::new("nested/link"), flags)
-                        .unwrap_err();
-                    assert_eq!(leaf.raw_os_error(), Some(libc::ELOOP));
                     let ancestor =
-                        open_path_beneath(&p, std::path::Path::new("alias/precious"), flags)
+                        open_beneath_no_symlinks(&p, std::path::Path::new("alias/precious"), flags)
                             .unwrap_err();
                     assert_eq!(ancestor.raw_os_error(), Some(libc::ENOTDIR));
                 }
             });
         }
-        assert_eq!(fs::read(outside.path().join("precious")).unwrap(), b"outside");
+        assert_eq!(
+            fs::read(outside.path().join("precious")).unwrap(),
+            b"outside"
+        );
     }
 
     #[test]
@@ -540,7 +259,7 @@ mod tests {
                 "slot\0tail",
             ] {
                 assert_eq!(
-                    open_path_beneath(&p, Path::new(path), flags)
+                    open_beneath_no_symlinks(&p, Path::new(path), flags)
                         .unwrap_err()
                         .kind(),
                     io::ErrorKind::InvalidInput,
@@ -548,15 +267,22 @@ mod tests {
                 );
             }
             for mode in [
-                OFlags::RDONLY,
-                OFlags::WRONLY | OFlags::NOFOLLOW,
-                OFlags::RDWR | OFlags::NOFOLLOW,
                 flags | OFlags::CREATE,
                 flags | OFlags::TRUNC,
                 flags | OFlags::TMPFILE,
             ] {
                 assert_eq!(
-                    open_path_beneath(&p, Path::new("slot"), mode)
+                    open_beneath_no_symlinks(&p, Path::new("slot"), mode)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidInput,
+                );
+            }
+            // Quarantine/repair intentionally permits a writable handle to
+            // one authorized child, but multi-component inspection cannot.
+            for mode in [OFlags::WRONLY, OFlags::RDWR] {
+                assert_eq!(
+                    open_beneath_no_symlinks(&p, Path::new("child/slot"), mode)
                         .unwrap_err()
                         .kind(),
                     io::ErrorKind::InvalidInput,
@@ -589,7 +315,7 @@ mod tests {
         symlink(&outside, &original).unwrap();
         with_openat2_denied(rustix::io::Errno::NOSYS, || {
             let opened = File::from(
-                open_path_beneath(&p, Path::new("file"), OFlags::PATH | OFlags::NOFOLLOW)
+                open_beneath_no_symlinks(&p, Path::new("file"), OFlags::PATH | OFlags::NOFOLLOW)
                     .unwrap(),
             );
             assert_eq!(
@@ -605,29 +331,52 @@ mod tests {
 
     #[test]
     fn fallback_rejects_an_ancestor_moved_outside_the_pinned_root() {
+        use std::cell::RefCell;
         use std::path::Path;
+
+        thread_local! {
+            static MOVE: RefCell<Option<(u64, std::path::PathBuf, std::path::PathBuf)>> =
+                const { RefCell::new(None) };
+        }
+        fn move_after_lookup(fd: BorrowedFd<'_>) -> io::Result<u64> {
+            let mount = mount_id(fd)?;
+            let inode = rustix::fs::fstat(fd)?.st_ino;
+            MOVE.with_borrow_mut(|pending| {
+                if pending
+                    .as_ref()
+                    .is_some_and(|(expected, _, _)| *expected == inode)
+                {
+                    let (_, original, outside) = pending.take().unwrap();
+                    fs::rename(&original, &outside)?;
+                    fs::write(outside.join("introduced-after-rename"), b"outside")?;
+                    // Replacing the name must not make the old descriptor's
+                    // child look like part of the new authorized directory.
+                    fs::create_dir(original)?;
+                }
+                Ok::<_, io::Error>(())
+            })?;
+            Ok(mount)
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         let outside = dir.path().join("moved");
         fs::create_dir_all(root.join("child")).unwrap();
         let p = parent(&root);
-        let error = open_path_same_mount_with_hook(
+        MOVE.set(Some((
+            fs::metadata(root.join("child")).unwrap().ino(),
+            root.join("child"),
+            outside.clone(),
+        )));
+        let error = walk_beneath_with_mount_id(
             &p,
             Path::new("child/introduced-after-rename"),
             OFlags::PATH | OFlags::NOFOLLOW,
-            |index| {
-                if index == 0 {
-                    fs::rename(root.join("child"), &outside).unwrap();
-                    fs::write(outside.join("introduced-after-rename"), b"outside").unwrap();
-                    // Replacing the name must not make the old descriptor's
-                    // child look like part of the new authorized directory.
-                    fs::create_dir(root.join("child")).unwrap();
-                }
-            },
+            move_after_lookup,
         )
         .unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert!(MOVE.with_borrow(Option::is_none), "rename hook did not run");
+        assert_eq!(error.raw_os_error(), Some(libc::EAGAIN));
         assert_eq!(
             fs::read(outside.join("introduced-after-rename")).unwrap(),
             b"outside",
@@ -648,7 +397,7 @@ mod tests {
         for denial in [rustix::io::Errno::NOSYS, rustix::io::Errno::PERM] {
             with_openat2_denied(denial, || {
                 for path in ["proc", "proc/self"] {
-                    let error = open_path_beneath(
+                    let error = open_beneath_no_symlinks(
                         &root,
                         Path::new(path),
                         OFlags::PATH | OFlags::NOFOLLOW,
@@ -659,12 +408,9 @@ mod tests {
             });
         }
         with_openat2_denied(rustix::io::Errno::ACCESS, || {
-            let error = open_path_beneath(
-                &root,
-                Path::new("."),
-                OFlags::PATH | OFlags::NOFOLLOW,
-            )
-            .unwrap_err();
+            let error =
+                open_beneath_no_symlinks(&root, Path::new("."), OFlags::PATH | OFlags::NOFOLLOW)
+                    .unwrap_err();
             assert_eq!(error.raw_os_error(), Some(libc::EACCES));
         });
     }
@@ -747,10 +493,11 @@ mod tests {
             flags,
             proc_mount_id,
         );
-        let path_outcome = open_path_same_mount(
+        let path_outcome = walk_beneath_with_mount_id(
             &parent(dir.path()),
             std::path::Path::new("slot"),
             OFlags::PATH | OFlags::NOFOLLOW,
+            mount_id,
         );
         umount2(&slot, MntFlags::MNT_DETACH).unwrap();
         for result in [outcome, proc_outcome, path_outcome] {
@@ -792,10 +539,11 @@ mod tests {
             flags,
             proc_mount_id,
         );
-        let path_outcome = open_path_same_mount(
+        let path_outcome = walk_beneath_with_mount_id(
             &parent(dir.path()),
             std::path::Path::new("bound/precious"),
             OFlags::PATH | OFlags::NOFOLLOW,
+            mount_id,
         );
         let same_device =
             fs::metadata(&target).map(|m| m.dev() == fs::metadata(dir.path()).unwrap().dev());
@@ -809,116 +557,6 @@ mod tests {
             assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
         }
         assert_eq!(fs::read(source.join("precious")).unwrap(), b"outside");
-    }
-
-    #[test]
-    fn proc_mount_id_accepts_complete_kernel_records() {
-        for contents in [
-            "pos:\t0\nflags:\t0100002\nmnt_id:\t19\n",
-            "mnt_id: 19\nino: 63107\nlock: ignored future metadata\n",
-            "pos: 0\nmnt_id:\t  19  \n",
-        ] {
-            assert_eq!(parse_proc_mount_id(contents).unwrap(), 19);
-        }
-    }
-
-    #[test]
-    fn proc_mount_id_rejects_missing_ambiguous_and_malformed_evidence() {
-        for contents in [
-            "",
-            "pos: 0\nflags: 0100002\n",
-            "mnt_id: 19",
-            "mnt_id:\n",
-            "mnt_id: 0\n",
-            "mnt_id: -19\n",
-            "mnt_id: +19\n",
-            "mnt_id: 19x\n",
-            "mnt_id: 19 20\n",
-            "mnt_id: 18446744073709551616\n",
-            "mnt_id: 19\nmnt_id: 19\n",
-            "mnt_id: 19\nmnt_id: 20\n",
-        ] {
-            assert_eq!(
-                parse_proc_mount_id(contents).unwrap_err().kind(),
-                io::ErrorKind::InvalidData,
-                "accepted {contents:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn available_statx_evidence_does_not_read_proc() {
-        assert_eq!(
-            resolve_mount_id(Ok(Some(19)), || panic!("proc must not be consulted")).unwrap(),
-            19
-        );
-    }
-
-    #[test]
-    fn missing_statx_field_or_blocked_syscall_uses_proc() {
-        assert_eq!(resolve_mount_id(Ok(None), || Ok(19)).unwrap(), 19);
-        for errno in [
-            libc::ENOSYS,
-            libc::EINVAL,
-            libc::EOPNOTSUPP,
-            libc::EPERM,
-            libc::EACCES,
-        ] {
-            assert_eq!(
-                resolve_mount_id(Err(io::Error::from_raw_os_error(errno)), || Ok(19)).unwrap(),
-                19
-            );
-        }
-    }
-
-    #[test]
-    fn definitive_statx_errors_are_not_hidden_by_proc() {
-        for errno in [
-            libc::EBADF,
-            libc::EIO,
-            libc::ENOMEM,
-            libc::EFAULT,
-            libc::ENOENT,
-        ] {
-            let error = resolve_mount_id(Err(io::Error::from_raw_os_error(errno)), || {
-                panic!("definitive errors must not fall back")
-            })
-            .unwrap_err();
-            assert_eq!(error.raw_os_error(), Some(errno));
-        }
-    }
-
-    #[test]
-    fn unavailable_proc_evidence_still_fails_closed() {
-        let error = resolve_mount_id(Ok(None), || Err(io::Error::from_raw_os_error(libc::EACCES)))
-            .unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
-    }
-
-    #[test]
-    fn ordinary_files_cannot_masquerade_as_proc_evidence() {
-        let dir = tempfile::tempdir().unwrap();
-        let fake = dir.path().join("fdinfo");
-        fs::write(&fake, "pos: 0\nflags: 0100002\nmnt_id: 19\n").unwrap();
-        assert_eq!(
-            read_proc_mount_id(File::open(fake).unwrap())
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-    }
-
-    #[test]
-    fn real_proc_mount_id_agrees_with_statx_and_survives_unlink() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("slot");
-        fs::write(&path, b"ballast").unwrap();
-        let file = File::open(&path).unwrap();
-        let id = proc_mount_id(file.as_fd()).unwrap();
-        assert_eq!(mount_id(file.as_fd()).unwrap(), id);
-        fs::remove_file(&path).unwrap();
-        assert_eq!(proc_mount_id(file.as_fd()).unwrap(), id);
-        assert_eq!(proc_mount_id(parent(dir.path()).as_fd()).unwrap(), id);
     }
 
     #[test]

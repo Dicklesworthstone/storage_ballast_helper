@@ -163,7 +163,7 @@ impl Selection {
                 .iter()
                 .find(|root| root.path == path)
                 .ok_or_else(|| invalid("admitted root is absent from compression discovery"))?;
-            let pinned = root.file.metadata()?;
+            let pinned = root.file.file().metadata()?;
             let current = native::open_root(path)?.metadata()?;
             if expected.kind != crate::scanner::walker::FsEntryKind::Directory
                 || !pinned.is_dir()
@@ -232,7 +232,7 @@ impl Selection {
         }
         let current = native::open_root(&root.path)?;
         let current = current.metadata()?;
-        let pinned = root.file.metadata()?;
+        let pinned = root.file.file().metadata()?;
         if current.dev() != pinned.dev() || current.ino() != pinned.ino() {
             return Err(io::Error::other("compression discovery root was replaced"));
         }
@@ -421,15 +421,14 @@ mod native {
 
     #[allow(clippy::wildcard_imports)] // the parent module's discovery types
     use super::*;
-    use crate::platform::linux::no_symlinks::open_without_symlinks;
+    use crate::platform::linux::no_symlinks::{BeneathDirectory, open_without_symlinks};
     use crate::scanner::compression::linux::repository;
-    use crate::scanner::quarantine::open_path_beneath;
     use crate::scanner::{active_lease, protection};
 
     #[derive(Debug)]
     pub(super) struct Root {
         pub path: PathBuf,
-        pub file: File,
+        pub file: BeneathDirectory,
     }
 
     #[derive(Debug)]
@@ -471,6 +470,17 @@ mod native {
         }
     }
 
+    fn check_deadline(deadline: Instant) -> io::Result<()> {
+        if Instant::now() >= deadline {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "discovery deadline exhausted",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     struct Walker<'a> {
         policy: &'a CompressionPolicy,
         selection_bytes: u64,
@@ -499,14 +509,7 @@ mod native {
         }
 
         fn budget(&self) -> Result<(), VisitError> {
-            if Instant::now() >= self.deadline {
-                Err(VisitError::Budget(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "discovery deadline exhausted",
-                )))
-            } else {
-                Ok(())
-            }
+            check_deadline(self.deadline).map_err(VisitError::Budget)
         }
 
         fn protected(&mut self, path: &Path, directory: bool) -> io::Result<bool> {
@@ -555,15 +558,17 @@ mod native {
             } else {
                 &task.relative
             };
-            let file = match open_path_beneath(
-                &root.file,
+            let opened = root.file.open_checked(
                 relative,
                 OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            ) {
+                || check_deadline(self.deadline),
+            );
+            // A resolver deadline is a work-budget pause, not an unreadable
+            // entry. Keep this path unvisited so a continuation retries it.
+            self.budget()?;
+            let file = match opened {
                 Ok(fd) => File::from(fd),
-                Err(error)
-                    if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::EXDEV)) =>
-                {
+                Err(error) if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::EXDEV)) => {
                     self.skip("symlink_or_mount_boundary");
                     return Ok(());
                 }
@@ -701,29 +706,25 @@ mod native {
     /// Discovery's own deadline, including time spent probing, still stops the
     /// page rather than admitting more work after an uncertain late result.
     fn native_exclusion(
-        root: &File,
+        root: &BeneathDirectory,
         relative: &Path,
         expected: FileStamp,
         deadline: Instant,
     ) -> Result<Option<&'static str>, VisitError> {
-        let exclusion = open_path_beneath(
-            root,
-            relative,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        )
-        .map(File::from)
-        .and_then(|file| {
-            if FileStamp::read(&file)? != expected {
-                return Err(io::Error::other("file changed before discovery probing"));
-            }
-            sbh_btrfs::discovery_exclusion(&file, deadline)
-        });
-        if Instant::now() >= deadline {
-            return Err(VisitError::Budget(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "discovery deadline exhausted",
-            )));
-        }
+        let exclusion = root
+            .open_checked(
+                relative,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                || check_deadline(deadline),
+            )
+            .map(File::from)
+            .and_then(|file| {
+                if FileStamp::read(&file)? != expected {
+                    return Err(io::Error::other("file changed before discovery probing"));
+                }
+                sbh_btrfs::discovery_exclusion(&file, deadline)
+            });
+        check_deadline(deadline).map_err(VisitError::Budget)?;
         Ok(exclusion.ok().flatten())
     }
 
@@ -741,7 +742,10 @@ mod native {
         for path in canonical_roots(roots)? {
             let file = open_root(&path)?;
             report.roots.push(path.to_string_lossy().into_owned());
-            evidence.roots.push(Root { path, file });
+            evidence.roots.push(Root {
+                path,
+                file: BeneathDirectory::new(file),
+            });
         }
         if limits.after.as_ref().is_some_and(|after| {
             !evidence
@@ -843,9 +847,7 @@ mod tests;
 ))]
 mod sandbox_tests {
     use super::*;
-    use crate::platform::linux::no_symlinks::{
-        denied_openat2_calls, with_openat2_denied,
-    };
+    use crate::platform::linux::no_symlinks::{denied_openat2_calls, with_openat2_denied};
     use crate::platform::pal::MockPlatform;
     use std::fs;
     use std::os::unix::fs::symlink;
@@ -888,9 +890,12 @@ mod sandbox_tests {
                     &MockPlatform::healthy(),
                 )
                 .unwrap();
-                // Prove that the fixture exercises root, metadata and data
-                // opens through the denied syscall, not an untested bypass.
-                assert!(denied_openat2_calls().into_iter().all(|calls| calls > 0));
+                // Root pinning exercises the denied absolute syscall. One
+                // metadata denial teaches the retained root to use the
+                // fallback for later metadata and candidate-data probes.
+                let denied = denied_openat2_calls();
+                assert!(denied[0] > 0);
+                assert_eq!(&denied[1..], &[1, 0]);
                 selection
             });
             assert!(selection.report().complete, "{:?}", selection.report());

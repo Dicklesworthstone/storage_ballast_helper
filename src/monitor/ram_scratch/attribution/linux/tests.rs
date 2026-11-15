@@ -59,6 +59,69 @@ fn symlink_targets_are_never_traversed_or_counted() {
 }
 
 #[test]
+fn unavailable_openat2_keeps_attribution_metadata_only_and_confined() {
+    use crate::platform::linux::no_symlinks::with_openat2_error;
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+    use rustix::io::Errno;
+
+    for errno in [Errno::NOSYS, Errno::PERM] {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let child = root.join("agent/build");
+        fs::create_dir_all(&child).unwrap();
+        let payload = child.join("output");
+        fs::write(&payload, vec![7_u8; 8192]).unwrap();
+        let expected = [&root.join("agent"), &child, &payload]
+            .into_iter()
+            .map(|path| fs::metadata(path).unwrap().blocks() * 512)
+            .sum::<u64>();
+
+        // No syscall support must not make a normal nested tree disappear.
+        let report = with_openat2_error(errno, || {
+            inspect(&mount(&root), AttributionLimits::default(), 100, deadline())
+        });
+        assert!(report.complete, "{errno}: {report:?}");
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].observed_allocated_bytes, expected);
+
+        fs::write(outside.path().join("private"), vec![9_u8; 32_768]).unwrap();
+        symlink(outside.path(), root.join("alias")).unwrap();
+        // Opening a FIFO for reading would block forever without a writer.
+        // O_PATH must stay a metadata-only probe under the fallback as well.
+        mkfifo(&root.join("fifo"), Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let report = with_openat2_error(errno, || {
+            inspect(&mount(&root), AttributionLimits::default(), 100, deadline())
+        });
+        assert!(
+            !report.complete,
+            "a skipped alias leaves incomplete history"
+        );
+        assert_eq!(report.symlinks_skipped, 1, "{errno}: {report:?}");
+        assert!(report.issues.is_empty(), "{errno}: {report:?}");
+        let alias = report
+            .entries
+            .iter()
+            .find(|entry| entry.path.ends_with("/alias"))
+            .unwrap();
+        assert_eq!(alias.observed_allocated_bytes, 0);
+        assert!(alias.idle_hours.is_none());
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.path.ends_with("/fifo"))
+        );
+        assert_eq!(fs::read(&payload).unwrap(), vec![7_u8; 8192]);
+        assert_eq!(
+            fs::read(outside.path().join("private")).unwrap(),
+            vec![9_u8; 32_768],
+        );
+    }
+}
+
+#[test]
 fn budgets_leave_age_unknown_and_never_claim_complete_coverage() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
@@ -206,11 +269,21 @@ fn an_exhausted_entry_budget_is_reported_once() {
 }
 
 fn fallback_probe(root: &Path) -> Probe {
+    use crate::platform::linux::no_symlinks::with_openat2_error;
+
+    let root = BeneathDirectory::new(File::from(
+        open_without_symlinks(root, OFlags::RDONLY | OFlags::DIRECTORY).unwrap(),
+    ));
+    // Learn actual unavailability through the common resolver rather than
+    // setting private capability state. The retained root remembers it.
+    with_openat2_error(rustix::io::Errno::NOSYS, || {
+        root.open_checked(Path::new("."), OFlags::PATH, || Ok(()))
+            .unwrap()
+    });
+    let device = root.file().metadata().unwrap().dev();
     Probe {
-        root: File::from(open_without_symlinks(root, OFlags::RDONLY | OFlags::DIRECTORY).unwrap()),
-        device: fs::metadata(root).unwrap().dev(),
-        openat2_available: Cell::new(false),
-        fallback_mount: Cell::new(None),
+        root,
+        device,
         maximum: 100,
         examined: 0,
         deadline: deadline(),
@@ -279,12 +352,16 @@ fn fallback_observes_symlinks_but_never_follows_them() {
 
 #[test]
 fn fallback_refuses_mount_crossings_and_noncanonical_relative_paths() {
+    use std::os::fd::AsFd;
+
+    use crate::scanner::quarantine::descriptor_mount_id;
+
     // /proc is a real mount boundary, available without mounting a fixture.
     // Its inode must never enter the root filesystem's attribution report.
     let probe = fallback_probe(Path::new("/"));
     let proc = File::open("/proc").unwrap();
     assert_ne!(
-        descriptor_mount_id(probe.root.as_fd()).unwrap(),
+        descriptor_mount_id(probe.root.file().as_fd()).unwrap(),
         descriptor_mount_id(proc.as_fd()).unwrap()
     );
     for directory in [false, true] {

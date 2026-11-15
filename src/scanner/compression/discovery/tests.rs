@@ -105,6 +105,75 @@ mod native_tests {
     }
 
     #[test]
+    fn seccomp_denied_openat2_keeps_discovery_confined_and_metadata_only() {
+        use crate::platform::linux::no_symlinks::with_openat2_error;
+        use nix::sys::stat::Mode;
+        use rustix::io::Errno;
+        use std::os::unix::net::UnixListener;
+
+        for errno in [Errno::NOSYS, Errno::PERM] {
+            let dir = crate::tempdir_outside_git();
+            let root = dir.path().canonicalize().unwrap();
+            let outside = crate::tempdir_outside_git();
+            let external = outside.path().join("external.bin");
+            cold(&external);
+            fs::create_dir_all(root.join("nested/deep")).unwrap();
+            let selected = root.join("nested/deep/cold.bin");
+            cold(&selected);
+            fs::create_dir_all(root.join("repository/.git")).unwrap();
+            cold(&root.join("repository/keep.bin"));
+            fs::create_dir(root.join("protected")).unwrap();
+            fs::write(root.join("protected/.sbh-protect"), b"").unwrap();
+            cold(&root.join("protected/keep.bin"));
+            symlink(outside.path(), root.join("directory-alias")).unwrap();
+            symlink(&external, root.join("file-alias")).unwrap();
+            nix::unistd::mkfifo(&root.join("pipe"), Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+            let _socket = UnixListener::bind(root.join("socket")).unwrap();
+
+            // All resolver calls fail as they do under RestrictSUIDSGID. The
+            // fallback must still enumerate nested directories, skip symlinks,
+            // and inspect special entries without opening their contents.
+            let selection = with_openat2_error(errno, || {
+                scan(
+                    std::slice::from_ref(&root),
+                    &DiscoveryLimits::default(),
+                    &policy(),
+                )
+            });
+            assert!(
+                selection.report().complete,
+                "{errno:?}: {:?}",
+                selection.report()
+            );
+            assert_eq!(
+                selection.paths().as_slice(),
+                std::slice::from_ref(&selected)
+            );
+            assert_eq!(selection.report().selected_bytes, 13);
+            assert_eq!(selection.report().directories_opened, 3);
+            assert_eq!(selection.report().skipped.get("git_repository"), Some(&1));
+            assert_eq!(
+                selection.report().skipped.get("protected_or_leased"),
+                Some(&1)
+            );
+            assert_eq!(
+                selection.report().skipped.get("symlink_or_special_file"),
+                Some(&4)
+            );
+            assert_eq!(fs::read(&selected).unwrap(), b"cold contents");
+            assert_eq!(fs::read(&external).unwrap(), b"cold contents");
+            assert_eq!(
+                fs::read(root.join("repository/keep.bin")).unwrap(),
+                b"cold contents"
+            );
+            assert_eq!(
+                fs::read(root.join("protected/keep.bin")).unwrap(),
+                b"cold contents"
+            );
+        }
+    }
+
+    #[test]
     fn an_unreadable_subtree_does_not_starve_later_files_and_is_retried_next_cycle() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -505,6 +574,46 @@ mod native_tests {
     }
 
     #[test]
+    fn seccomp_fallback_revalidation_refuses_a_replaced_discovery_root() {
+        use crate::platform::linux::no_symlinks::with_openat2_error;
+        use rustix::io::Errno;
+
+        for errno in [Errno::NOSYS, Errno::PERM] {
+            with_openat2_error(errno, || {
+                let dir = crate::tempdir_outside_git();
+                let parent = dir.path().canonicalize().unwrap();
+                let root = parent.join("root");
+                fs::create_dir(&root).unwrap();
+                let path = root.join("cold.bin");
+                cold(&path);
+                let selection = scan(
+                    std::slice::from_ref(&root),
+                    &DiscoveryLimits::default(),
+                    &policy(),
+                );
+                let file = fs::File::open(&path).unwrap();
+                let stamp = sbh_btrfs::FileStamp::read(&file).unwrap();
+                selection.validate_file(&path, stamp).unwrap();
+                fs::rename(&root, parent.join("retained")).unwrap();
+                fs::create_dir(&root).unwrap();
+                cold(&path);
+
+                let error = selection.validate_scope(&path).unwrap_err();
+                assert!(
+                    error.to_string().contains("root was replaced"),
+                    "{errno:?}: {error}"
+                );
+                assert!(selection.validate_file(&path, stamp).is_err());
+                assert_eq!(fs::read(&path).unwrap(), b"cold contents");
+                assert_eq!(
+                    fs::read(parent.join("retained/cold.bin")).unwrap(),
+                    b"cold contents"
+                );
+            });
+        }
+    }
+
+    #[test]
     fn protected_roots_overlapping_roots_and_hardlinks_do_not_expand_scope() {
         let dir = crate::tempdir_outside_git();
         let root = dir.path().canonicalize().unwrap();
@@ -727,6 +836,53 @@ mod native_tests {
             &mut |_| {},
         )
         .unwrap()
+    }
+
+    #[test]
+    fn seccomp_fallback_execution_keeps_fresh_reference_vetoes_before_mutation() {
+        use crate::platform::linux::no_symlinks::with_openat2_error;
+        use crate::scanner::compression::{CompressionMode, run};
+        use rustix::io::Errno;
+
+        for errno in [Errno::NOSYS, Errno::PERM] {
+            with_openat2_error(errno, || {
+                let dir = crate::tempdir_outside_git();
+                let root = dir.path().canonicalize().unwrap();
+                let path = root.join("cold.bin");
+                cold(&path);
+                let selection = scan(
+                    std::slice::from_ref(&root),
+                    &DiscoveryLimits::default(),
+                    &policy(),
+                );
+                let platform = btrfs_platform().with_open_files_complete(false);
+                let explicit = run(
+                    std::slice::from_ref(&path),
+                    &policy(),
+                    CompressionMode::default(),
+                    &Config::default(),
+                    &platform,
+                )
+                .unwrap();
+                let discovered = run_selected(&selection, &platform);
+                for report in [explicit, discovered] {
+                    assert_eq!(report.files.len(), 1);
+                    let file = &report.files[0];
+                    assert_eq!(file.outcome, "failed", "{errno:?}: {file:?}");
+                    // The real file has been pinned and identity checked by
+                    // this point. A blocked openat2 must not short-circuit the
+                    // operation, and its fallback must not bypass this veto.
+                    assert_eq!(file.detail, "open-file inspection was incomplete");
+                    assert!(!file.mutation_attempted);
+                    assert!(file.sha256_before.is_none());
+                    assert!(file.operation_id.is_none());
+                    assert!(report.journal_path.is_none());
+                    assert_eq!(report.unvisited_files, 0);
+                }
+                assert_eq!(fs::read(&path).unwrap(), b"cold contents");
+                assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+            });
+        }
     }
 
     #[test]
