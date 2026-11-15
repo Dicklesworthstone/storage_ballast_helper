@@ -14,10 +14,12 @@ To select cold files beneath directories instead of naming them, use
 (`compression-discovery.md`).
 
 The native backend supports Linux x86-64 and AArch64 on Btrfs. Other filesystems
-are skipped and other operating systems report an unsupported no-op. Linux
-`openat2` support and sufficient privileges for Btrfs tree inspection are
-required; denied or incomplete inspection fails closed. Directories and
-symlink inputs are not recursively followed.
+are skipped and other operating systems report an unsupported no-op. Sufficient
+privileges for Btrfs tree inspection are required; denied or incomplete inspection
+fails closed. Pinned opens prefer `openat2` and use descriptor-relative,
+no-symlink opens when the syscall is unavailable or blocked by the service
+sandbox. Discovery also verifies mount identity to refuse descendant mount
+crossings. Directories and symlink inputs are not recursively followed.
 
 ## Apply deliberately
 

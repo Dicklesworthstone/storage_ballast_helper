@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use nix::sys::statvfs::{FsFlags, fstatvfs};
-use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
+use rustix::fs::OFlags;
 use sbh_btrfs::{FileStamp, IdleIoPriority, MAX_CHUNK_BYTES, ZstdConsent};
 
 use super::discovery::Selection;
@@ -21,6 +21,7 @@ use super::{
     CompressionReclaimReport, CompressionReport, already_compressed, cold_enough,
 };
 use crate::core::config::Config;
+use crate::platform::linux::no_symlinks::open_without_symlinks;
 use crate::platform::pal::Platform;
 use crate::scanner::{active_lease, protection};
 
@@ -305,8 +306,9 @@ fn process_file(
         return Ok(());
     }
     check_protection(&canonical, config, platform)?;
-    // Resolve every component without symlinks in one kernel operation. There
-    // is no fallback to a pathname-following open on unsupported kernels.
+    // Resolve every component without symlinks. When the service sandbox
+    // blocks openat2, the shared helper walks pinned parent descriptors with
+    // O_NOFOLLOW; it never falls back to a pathname-following open.
     // Read-only even to apply: BTRFS_IOC_DEFRAG_RANGE needs write permission
     // on the inode (or CAP_SYS_ADMIN), not a writable descriptor, on every
     // kernel with openat2. A writable one would make running the file fail
@@ -315,13 +317,7 @@ fn process_file(
     // watchers and sync tools read as a modification.
     let flags =
         OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOATIME | OFlags::RDONLY;
-    let file = File::from(openat2(
-        CWD,
-        &canonical,
-        flags,
-        Mode::empty(),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-    )?);
+    let file = File::from(open_without_symlinks(&canonical, flags)?);
     let stamp = FileStamp::read(&file)?;
     if stamp.device != metadata.dev()
         || stamp.inode != metadata.ino()
@@ -816,5 +812,102 @@ mod control_path_tests {
         config.paths.jsonl_log = alias;
         assert!(check_control_paths(&unrelated, &config).is_err());
         assert_eq!(fs::read(&old_run).unwrap(), b"durable history");
+    }
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+    use crate::platform::linux::no_symlinks::{
+        denied_openat2_calls, with_openat2_denied,
+    };
+    use crate::platform::pal::{FsStats, MockPlatform, MountPoint, PlatformPaths};
+    use rustix::io::Errno;
+    use std::collections::HashMap;
+
+    #[test]
+    fn unavailable_openat2_still_requires_complete_fresh_process_evidence() {
+        let temp = crate::tempdir_outside_git();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("cold.bin");
+        fs::write(&path, b"preserve this cold file").unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        let stats = FsStats {
+            total_bytes: 16 * 1024 * 1024 * 1024,
+            free_bytes: 8 * 1024 * 1024 * 1024,
+            available_bytes: 8 * 1024 * 1024 * 1024,
+            fs_type: "btrfs".into(),
+            mount_point: root.clone(),
+            is_readonly: false,
+        };
+        // Reach descriptor admission on any test filesystem. Fresh process
+        // evidence must stop execution before the first Btrfs ioctl.
+        let platform = MockPlatform::new(
+            vec![MountPoint {
+                path: root.clone(),
+                device: "fixture".into(),
+                fs_type: "btrfs".into(),
+                is_ram_backed: false,
+            }],
+            HashMap::from([(root.clone(), stats)]),
+            MockPlatform::healthy().memory_info().unwrap(),
+            PlatformPaths::default(),
+        )
+        .with_open_files_complete(false);
+        let policy = CompressionPolicy {
+            min_size_bytes: 1,
+            min_age_secs: 3600,
+            max_bytes: 1024,
+            ..Default::default()
+        };
+        for denied in [Errno::NOSYS, Errno::PERM] {
+            for apply in [false, true] {
+                let mut item = CompressionFileReport::new(&path);
+                let mut audit = AuditSession::new(root.join("journal"), 1, &policy);
+                let mut bytes = 0;
+                let mut identities = BTreeSet::new();
+                let error = with_openat2_denied(denied, || {
+                    let result = process_file(
+                        &path,
+                        None,
+                        &mut item,
+                        &policy,
+                        CompressionMode {
+                            apply,
+                            allow_zstd_feature: true,
+                            acknowledgement:
+                                crate::scanner::compression::ConcurrencyAcknowledgement::Quiescent,
+                        },
+                        &Config::default(),
+                        &platform,
+                        &PassControl {
+                            deadline: Instant::now() + Duration::from_secs(30),
+                            stop: None,
+                        },
+                        &mut bytes,
+                        &mut identities,
+                        &mut audit,
+                    );
+                    assert!(
+                        denied_openat2_calls()[0] > 0,
+                        "execution must exercise the denied absolute open"
+                    );
+                    result
+                })
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "open-file inspection was incomplete",
+                    "{denied:?}, apply={apply}"
+                );
+                assert!(!item.mutation_attempted);
+                assert!(item.sha256_before.is_none());
+                assert!(item.operation_id.is_none());
+                assert!(audit.path().is_none());
+                assert_eq!(bytes, 0);
+                assert!(!root.join("journal").exists());
+                assert_eq!(fs::read(&path).unwrap(), b"preserve this cold file");
+            }
+        }
     }
 }
