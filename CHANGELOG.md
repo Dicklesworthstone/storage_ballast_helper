@@ -6,6 +6,24 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.7.15 **[release]**
+
+Compare: [`v0.7.14...v0.7.15`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.14...v0.7.15)
+
+Fixes from the v0.7.14 rollout. Under a systemd unit with
+`RestrictSUIDSGID=`, a live Cargo build no longer holds every deletion
+(bd-mun4); one host at Red had deleted nothing for a day. Lossless
+btrfs compression and RAM-scratch attribution work under that filter
+too. Green and Yellow passes now hold every candidate idle less than 12
+hours, as v0.7.14 meant to (bd-i9uh). Predictive alerts, cleanup and
+ballast release act per mount, on that mount's own forecast. A
+budget-stopped scan of a huge tree keeps its progress across passes,
+reloads and restarts (bd-kf7k), a reload that removes a root releases
+its directory handles (bd-656i), and btrfs compression no longer
+rewrites a file with one raw block left on every pass (bd-rxq5). On
+macOS the desktop notification channel is on by default, at Critical
+only (bd-z1nm).
+
 ### Changed
 
 - **An incomplete active-reference sweep names itself.** A candidate held
@@ -213,6 +231,47 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   the block, and journaled a run that saved nothing. Only raw allocations
   larger than one sector now count. A one-block reference into a larger raw
   allocation still counts, because it keeps the whole allocation alive.
+- **A reload that changes what may be walked reopens discovery.**
+  Barren-directory hints recorded under the old roots, exclusions,
+  protections, depth limit, filesystem-boundary setting or scanner engine are
+  dropped, so a target the old policy hid is found on the next pass. A reload
+  that changes only scheduling keeps the hints and their original lifetime.
+  An explicitly requested full scan ignores the hints; automatic RAM and
+  inode relief keeps its bounded progress.
+- **Work queued before a reload acts only under the policy that admitted it.**
+  Each scan request carries the scanner policy it was admitted under through
+  dispatch and deletion. A request or candidate batch that a reload made
+  obsolete is dropped before policy evaluation instead of acting under rules
+  that no longer hold, and the admission is checked again around the
+  pre-deletion probes. Reloads that change only scheduling keep queued work.
+- **Finishing one scope no longer erases another root's discovery progress**
+  (bd-kf7k). Barren hints were retired whenever a pass completed. Now only a
+  scope with proven recursive coverage retires them, so a small root, a
+  catalog probe or a byte-target pass that finishes no longer restarts a large
+  root's unfinished walk.
+- **RAM-scratch attribution works under `RestrictSUIDSGID=`** (Linux,
+  bd-mun4 follow-up). The report-only attribution of tmpfs scratch opened
+  every entry with `openat2` and had no fallback, so under that filter it
+  attributed nothing. It now falls back, on ENOSYS or EPERM, to opening one
+  component at a time with `O_NOFOLLOW`, and refuses any step that leaves the
+  root's mount, bind mounts of the same device included. Metadata opens stay
+  `O_PATH`, so a FIFO or a symlink is observed but never read or followed.
+- **Predictive alerts and cleanup act per mount, on that mount's own
+  forecast.** An alert now reports the mount's own time to full and
+  confidence. Before, it printed the worst filesystem's time to Red as "disk
+  full", so a host sitting at the Red line logged "Predicted disk full in 0m"
+  at Critical with tens of GB free. Cooldown and escalation are kept per
+  mount, and an alert that no channel accepted is retried on the next tick
+  instead of waiting out the five-minute cooldown. A Green predictive scan
+  needs a cleanup-authorizing action with current evidence on its mount and
+  scans only that mount's roots; an early warning no longer authorizes one.
+  Ballast is released only for that mount's current imminent danger, and the
+  shared score floor is no longer relaxed for unrelated queued batches.
+- **The median runway cross-check uses measured free space.** It was rebuilt
+  from the conformally shortened EWMA forecast, so a transient burst could
+  corroborate itself: 200 GiB at a 50 MiB/s median read as two-minute
+  imminent danger against a 68-minute baseline. It now divides the observed
+  free bytes by the median rate.
 
 ## v0.7.14 **[release]**
 
