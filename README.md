@@ -491,6 +491,7 @@ sbh --json lease renew --extend 30m
 | --- | --- |
 | `sbh stats` | Time-window activity/deletion statistics |
 | `sbh blame` | Attribute artifact pressure by process/agent |
+| `sbh blame --deleted-open [--top N] [--timeout-secs N]` | Report allocated space held by deleted, still-open files and their process holders (Linux, read-only) |
 | `sbh dashboard` | Real-time TUI dashboard |
 | `sbh doctor --pal` | Validate platform integration and macOS runtime prerequisites |
 | `sbh doctor --system` | Check host kernel tuning (writeback / dirty-page limits), whether each ballast pool covers the reserve its observed write bursts require, and that the daemon's own files do not live on a volume it reclaims |
@@ -2183,6 +2184,44 @@ Every significant event is logged to two independent backends: SQLite for querya
 The SQLite logger operates in WAL (Write-Ahead Logging) mode with `synchronous=NORMAL`, trading some crash durability for write throughput. It stores structured rows for pressure changes, artifact deletions, ballast operations, errors, and policy transitions.
 
 The stats engine queries this data for `sbh stats` reports: time-window aggregation, top-N deleted patterns, deletion success rates, and pressure-level distribution over time. The `sbh blame` command combines live process observations with recent I/O history from `io_history.bin` beside the daemon's state file. The daemon loads, samples, and saves this optional history on one background worker, so a slow process probe or snapshot write cannot delay pressure handling. A blocked operation retains its worker slot; shutdown stops further probes and prevents a new snapshot from starting.
+
+**Deleted files that still occupy space.** On Linux, a process can keep a file's
+allocated blocks after its last directory link is removed. Directory scans
+cannot attribute that allocation. Inspect these holders without a running
+daemon or a readable configuration file:
+
+```sh
+sbh blame --deleted-open
+sudo sbh --json blame --deleted-open --top 50 --timeout-secs 30
+```
+
+The report ranks unique `(device, inode)` observations by allocated bytes and
+lists their process holders, representative descriptors, logical lengths and
+observed mount identities. Duplicated descriptors and files shared by several
+processes contribute only once to the allocation total. `--top` limits displayed
+files; totals still include every verified file in the bounded inventory.
+`--since` and `--tree` belong to ordinary I/O blame and cannot be combined with
+this mode.
+
+Inspection reads metadata, process identities and descriptor links; it never
+reads file contents, signals a process or truncates a descriptor. The default
+cooperative deadline is 10 seconds (`--timeout-secs` accepts 1–60), with caps of
+50,000 processes, 250,000 descriptors, 4,096 distinct files and 16,384
+process/file holders. Kernel I/O already in progress can overrun the deadline.
+Permission failures, changed identities, unknown mount attribution and exhausted
+budgets remain explicit coverage issues. Partial inspection exits 4 and retains
+the observed allocations. An unsupported platform reports `supported: false`
+with a null byte total and exits 0.
+
+JSON uses `sbh.deleted_open.v1`, with `observed_allocated_bytes`,
+`observed_unique_files`, `files`, `files_omitted`, `complete` and `issues`.
+Descriptor targets and mount paths also have byte-preserving hexadecimal
+fields. Scope is the file descriptors visible in the caller's process
+namespace: memory-map-only references and processes hidden in other namespaces
+are excluded. RAM-backed files can appear too. Observations are not an atomic
+snapshot, and shared extents or snapshots may retain blocks after a holder
+closes them. Review the owning application's close/reopen operation or a graceful
+service restart; deleting the former pathname again cannot free these blocks.
 
 Automatic retention pruning removes rows older than 30 days, triggered every 3600 events (approximately hourly at typical event rates).
 

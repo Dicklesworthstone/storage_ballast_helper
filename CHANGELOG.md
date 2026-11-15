@@ -6,6 +6,31 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+### Added
+
+- **Diagnose deleted files that still occupy disk space.** On Linux,
+  `sbh blame --deleted-open` inventories unlinked regular files retained by
+  visible process file descriptors, without requiring daemon history or a
+  working configuration. It reports allocated blocks separately from logical
+  length, deduplicates shared inodes, and identifies holding processes and
+  their observed mounts. JSON preserves native pathname bytes and explicitly
+  marks incomplete inspection, unsupported platforms, and unknown totals.
+  Inspection is bounded by time and inventory limits; it never signals a
+  process or truncates a descriptor. These observations are not a promise of
+  reclaimable space and exclude mmap-only references and hidden namespaces.
+
+### Fixed
+
+- **Interactive cleanup renews safety checks after each answer.** Both
+  `clean` and `emergency` now send accepted candidates through the full
+  executor, including fresh pressure and active-reference checks, protection
+  and identity validation, receipts, and batch failure limits. Disk recovery
+  while a confirmation prompt is open can therefore stop the removal.
+  Interactive reports preserve observed byte accounting, quarantine outcomes,
+  and deletion failures; failed work returns partial-success status instead
+  of silently succeeding. An input or output failure retains the report of
+  work already completed, and EOF or quitting keeps unconfirmed items.
+
 ## v0.7.15 **[release]**
 
 Compare: [`v0.7.14...v0.7.15`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.14...v0.7.15)

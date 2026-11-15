@@ -72,8 +72,8 @@ use storage_ballast_helper::scanner::active_lease::{
     self, ACTIVE_LEASE_TARGET_ENV, ACTIVE_LEASE_TOKEN_ENV, ActiveLease, LeasePolicy,
 };
 use storage_ballast_helper::scanner::deletion::{
-    DeletionConfig, DeletionError, DeletionExecutor, DeletionMode, DeletionPlan, DeletionReport,
-    SkipCheck, SkipReason,
+    DeletionConfig, DeletionConfirmation, DeletionConfirmationError, DeletionError,
+    DeletionExecutor, DeletionMode, DeletionPlan, DeletionReport, SkipCheck, SkipReason,
 };
 use storage_ballast_helper::scanner::engine::{ScannerEngine, SelectedScannerEngine};
 use storage_ballast_helper::scanner::patterns::{
@@ -945,6 +945,13 @@ struct BlameArgs {
     /// Render parent-child process tree in human output.
     #[arg(long)]
     tree: bool,
+    /// Report deleted files whose allocated blocks are still held by open
+    /// process file descriptors (Linux, read-only; no daemon required).
+    #[arg(long, conflicts_with_all = ["since", "tree"])]
+    deleted_open: bool,
+    /// Cooperative time budget for --deleted-open (default: 10 seconds).
+    #[arg(long, requires = "deleted_open", value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..=60))]
+    timeout_secs: Option<u64>,
 }
 
 impl Default for BlameArgs {
@@ -953,6 +960,8 @@ impl Default for BlameArgs {
             top: 25,
             since: "15m".to_string(),
             tree: false,
+            deleted_open: false,
+            timeout_secs: None,
         }
     }
 }
@@ -6361,6 +6370,9 @@ struct BlameRow {
 }
 
 fn run_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
+    if args.deleted_open {
+        return run_deleted_open_blame(cli, args);
+    }
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
     let since = parse_window_duration(&args.since)?;
@@ -6438,6 +6450,130 @@ fn run_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// Deleted-open allocations are independent of write-rate history and cleanup
+/// roots. Keep this read-only diagnosis usable even when the daemon's config or
+/// state is unavailable on a full volume.
+fn run_deleted_open_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
+    use storage_ballast_helper::platform::types::DeletedOpenFilesLimits;
+
+    let platform = detect_platform().map_err(|error| CliError::Runtime(error.to_string()))?;
+    let started = std::time::Instant::now();
+    let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(10));
+    let report = platform
+        .deleted_open_files(started + timeout, DeletedOpenFilesLimits::default())
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    match output_mode(cli) {
+        OutputMode::Human => print_deleted_open_blame(&report, args.top),
+        OutputMode::Json => {
+            write_json_line(&deleted_open_blame_json(
+                &report,
+                args.top,
+                started.elapsed(),
+            ))?;
+        }
+    }
+    if report.supported && !report.complete {
+        return Err(CliError::Partial(
+            "deleted-open inspection is incomplete; uninspected descriptors may retain additional allocation"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+const DELETED_OPEN_SCOPE: &str = "Regular files with zero links held by file descriptors visible in the caller's process namespace; excludes mmap-only references and processes hidden by other namespaces. Observations are not an atomic snapshot or a promise of reclaimable space.";
+const DELETED_OPEN_RECOVERY: &str = "Ask the owning application or service to close or reopen the file; review a graceful service restart if necessary. Removing its former pathname again cannot release these blocks. sbh does not signal processes or truncate their descriptors.";
+
+fn deleted_open_blame_json(
+    report: &storage_ballast_helper::platform::types::DeletedOpenFilesReport,
+    top: usize,
+    elapsed: Duration,
+) -> Value {
+    let shown = report.files.len().min(top);
+    json!({
+        "schema": "sbh.deleted_open.v1",
+        "command": "blame",
+        "mode": "deleted_open",
+        "read_only": true,
+        "supported": report.supported,
+        "complete": report.complete,
+        "status": if !report.supported { "unsupported" } else if report.complete { "observed" } else { "incomplete" },
+        "observed_allocated_bytes": report.observed_allocated_bytes,
+        "observed_unique_files": report.files.len(),
+        "files": &report.files[..shown],
+        "files_shown": shown,
+        "files_omitted": report.files.len() - shown,
+        "processes_scanned": report.processes_scanned,
+        "descriptors_scanned": report.descriptors_scanned,
+        "issues": report.issues,
+        "scope": DELETED_OPEN_SCOPE,
+        "recovery": DELETED_OPEN_RECOVERY,
+        "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        "exit_code": if report.supported && !report.complete { 4 } else { 0 },
+    })
+}
+
+fn print_deleted_open_blame(
+    report: &storage_ballast_helper::platform::types::DeletedOpenFilesReport,
+    top: usize,
+) {
+    if !report.supported {
+        println!("Deleted-open file inspection is unsupported on this platform (Linux only).");
+        return;
+    }
+    println!("Deleted files still held open:");
+    println!(
+        "  {} observed in {} unique file(s); {} processes and {} descriptors inspected{}",
+        report
+            .observed_allocated_bytes
+            .map_or_else(|| "unknown allocation".to_string(), format_bytes),
+        report.files.len(),
+        report.processes_scanned,
+        report.descriptors_scanned,
+        if report.complete { "" } else { " (partial)" },
+    );
+    println!("  {DELETED_OPEN_SCOPE}");
+    for file in report.files.iter().take(top) {
+        println!(
+            "\n  {} allocated; {} logical; device={} inode={}",
+            format_bytes(file.allocated_bytes),
+            format_bytes(file.logical_bytes),
+            file.device_id,
+            file.inode,
+        );
+        for holder in &file.holders {
+            println!(
+                "    PID {} ({:?}), fd {} ({} descriptor(s)): {:?}",
+                holder.pid, holder.name, holder.fd, holder.descriptor_count, holder.fd_target,
+            );
+            if let Some(mount) = &holder.mount_point {
+                println!(
+                    "      mount: {mount:?} ({})",
+                    holder.filesystem_type.as_deref().unwrap_or("unknown"),
+                );
+            }
+        }
+    }
+    let omitted = report.files.len().saturating_sub(top);
+    if omitted > 0 {
+        println!("\n  {omitted} more observed file(s) omitted by --top; totals include them.");
+    }
+    if !report.issues.is_empty() {
+        println!("\n  Coverage issues:");
+        for (reason, count) in &report.issues {
+            println!("    {reason}: {count}");
+        }
+    }
+    if !report.complete {
+        println!(
+            "  Uninspected descriptors may retain additional allocation. Root privileges may improve visibility; namespaces and kernel restrictions can still hide holders."
+        );
+    }
+    if !report.files.is_empty() {
+        println!("\n  {DELETED_OPEN_RECOVERY}");
+    }
 }
 
 fn collect_blame_report_at(
@@ -15486,7 +15622,11 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
 
     // Display the plan.
     if output_mode(cli) == OutputMode::Human {
-        println!("The following items will be deleted:\n");
+        let operation = match plan.mode {
+            DeletionMode::Unlink => "deletion",
+            DeletionMode::Quarantine => "quarantine (no space freed until purge)",
+        };
+        println!("Candidates for {operation}:\n");
         print_deletion_plan(&plan);
         println!(
             "\nTotal: {} items, {}",
@@ -15507,8 +15647,12 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
         let report = executor.execute(&plan, None);
         match output_mode(cli) {
             OutputMode::Human => {
+                let operation = match plan.mode {
+                    DeletionMode::Unlink => "freed",
+                    DeletionMode::Quarantine => "quarantined (no space freed until purge)",
+                };
                 println!(
-                    "Dry run complete: {} items ({}) would be freed.",
+                    "Dry run complete: {} items ({}) would be {operation}.",
                     report.items_would_delete,
                     format_bytes(report.bytes_would_free),
                 );
@@ -15567,15 +15711,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                 )?;
             }
         }
-        // C-EXIT: failed deletions are a partial success (4), reported after
-        // the summary so the operator sees what did and did not happen.
-        if report.items_failed > 0 {
-            return Err(CliError::Partial(format!(
-                "{} of {} deletion(s) failed",
-                report.items_failed,
-                report.items_failed + report.items_deleted
-            )));
-        }
+        clean_completion_result(&report)?;
     } else {
         // Interactive mode.
         run_interactive_clean(
@@ -15583,7 +15719,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
             &executor,
             &plan,
             args,
-            &root_paths,
+            &batch_plan,
             dir_count,
             scan_elapsed,
             protected_count,
@@ -15943,186 +16079,146 @@ fn open_status_for_candidate(
 }
 
 /// Interactive clean: prompt user for each candidate.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn run_interactive_clean(
     cli: &Cli,
     executor: &DeletionExecutor,
     plan: &DeletionPlan,
     args: &CleanArgs,
-    _root_paths: &[PathBuf],
+    batch_plan: &CliCleanupPlan,
     dir_count: usize,
     scan_elapsed: std::time::Duration,
     protected_count: usize,
 ) -> Result<(), CliError> {
-    let stdin = io::stdin();
-    let mut input = String::new();
-    let mut items_deleted: usize = 0;
-    let mut skips = InteractiveSkips::default();
-    let mut bytes_freed: u64 = 0;
-    let mut bytes_quarantined: u64 = 0;
-    let mut delete_all = false;
-
     let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
-    // Interactive mode is slow enough that we can use short TTL or no cache,
-    // but FsStatsCollector handles mount resolution which is what we need.
-    let collector = std::sync::Arc::new(FsStatsCollector::new(
-        platform,
-        std::time::Duration::from_millis(500),
-    ));
-
-    println!("Proceed with deletion? [y/N/a(ll)/s(kip)/q(uit)]");
-    println!("  y - delete this item    a - delete all remaining");
-    println!("  n - skip this item      s - skip all remaining");
-    println!("  q - quit\n");
-
-    for (i, candidate) in plan.candidates.iter().enumerate() {
-        // Check target_free skip condition.
-        if let Some(target) = args.target_free
-            && let Some(reason) = target_free_skip(&collector, &candidate.path, target)
-        {
-            println!(
-                "  Skipping {}: {}.",
-                candidate.path.display(),
-                reason.explanation()
-            );
-            skips.record(reason);
-            continue;
-        }
-
-        let action = if delete_all {
-            'y'
-        } else {
-            let path_str = truncate_path(&candidate.path, 60);
-            let size_str = format_bytes(candidate.size_bytes);
-            print!(
-                "  [{}/{}] {} ({}, score {:.2})? ",
-                i + 1,
-                plan.candidates.len(),
-                path_str,
-                size_str,
-                candidate.total_score,
-            );
-            io::stdout().flush()?;
-
-            input.clear();
-            stdin
-                .read_line(&mut input)
-                .map_err(|e| CliError::Runtime(e.to_string()))?;
-            match input.trim().to_lowercase().as_str() {
-                "y" | "yes" => 'y',
-                "a" | "all" => {
-                    delete_all = true;
-                    'y'
-                }
-                "s" | "skip" => {
-                    println!("  Skipping all remaining items.");
-                    break;
-                }
-                "q" | "quit" => {
-                    println!("  Quitting without further deletions.");
-                    break;
-                }
-                _ => 'n', // Default to skip.
-            }
-        };
-
-        if action == 'y' {
-            // Collect a fresh open-file index for this candidate, then route
-            // through the executor's full pre-flight veto stack. A "y" (or
-            // "a") answer is consent, not a bypass: every safety rail that
-            // protects the --yes batch path applies here too.
-            let (fresh_open_paths, complete) =
-                collect_open_path_ancestors(std::slice::from_ref(&candidate.path));
-            // clippy::if_not_else is deliberately allowed here. The negative-first
-            // form is load-bearing: it puts the fail-safe (skip) branch ahead of the
-            // destructive branch (delete), so the guard is visible before the action
-            // when auditing this path. Inverting it to satisfy the lint would bury
-            // the safety rail below the deletion it protects.
-            #[allow(clippy::if_not_else)]
-            if !complete {
-                // Fail safe, mirroring the batch executor: if we cannot see
-                // which paths are open we cannot prove this one is closed.
-                eprintln!(
-                    "    Skipped (open-file scan incomplete): {}",
-                    candidate.path.display()
-                );
-                skips.record(storage_ballast_helper::scanner::deletion::SkipReason::FileOpen);
-            } else {
-                match executor.delete_candidate_checked(candidate, Some(&fresh_open_paths)) {
-                    Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Deleted) => {
-                        items_deleted += 1;
-                        bytes_freed += candidate.size_bytes;
-                        if !delete_all {
-                            println!("    Deleted.");
-                        }
-                    }
-                    Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Quarantined) => {
-                        items_deleted += 1;
-                        bytes_quarantined += candidate.size_bytes;
-                        if !delete_all {
-                            println!("    Quarantined (restore with `sbh undo`).");
-                        }
-                    }
-                    Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Skipped(
-                        skip,
-                    )) => {
-                        eprintln!(
-                            "    Skipped ({}): {}",
-                            skip.explanation(),
-                            candidate.path.display()
-                        );
-                        skips.record(skip);
-                    }
-                    Err(e) => {
-                        eprintln!("    Failed to delete {}: {e}", candidate.path.display());
-                    }
-                }
-            }
-        } else {
-            skips.record(storage_ballast_helper::scanner::deletion::SkipReason::UserDeclined);
-        }
-    }
+    // A target met while the user considers a prompt must take effect before
+    // mutation. Do not reuse a pre-prompt capacity reading, even briefly.
+    let collector = FsStatsCollector::new(platform, Duration::ZERO);
+    let (report, confirmation_error) = match run_confirmed_cleanup(
+        executor,
+        plan,
+        args.target_free,
+        &collector,
+        &mut io::stdin().lock(),
+        &mut io::stderr().lock(),
+    ) {
+        Ok(report) => (report, None),
+        Err(failure) => (*failure.report, Some(failure.error)),
+    };
 
     match output_mode(cli) {
-        OutputMode::Human => {
-            println!("\nCleanup complete:");
-            println!(
-                "  Deleted: {items_deleted} items, {} freed",
-                format_bytes(bytes_freed)
-            );
-            if skips.total > 0 {
-                println!("  Skipped: {} items", skips.total);
-            }
-        }
-        OutputMode::Json => {
-            let payload = json!({
-                "command": "clean",
-                "scanned_directories": dir_count,
-                "elapsed_seconds": scan_elapsed.as_secs_f64(),
-                "candidates_count": plan.estimated_items,
-                "items_deleted": items_deleted,
-                "bytes_quarantined": bytes_quarantined,
-                "items_skipped": skips.total,
-                "skipped_by_reason": skips_json(&skips.by_reason),
-                // Mirrors DeletionReport::stalled(): work was queued, nothing freed.
-                "stalled": items_deleted == 0 && bytes_freed == 0 && skips.total > 0,
-                "bytes_freed": bytes_freed,
-                "dry_run": false,
-                "protected_count": protected_count,
-            });
-            write_json_line(&payload)?;
-        }
+        OutputMode::Human => print_clean_summary(&report),
+        OutputMode::Json => emit_filesystem_clean_report_json(
+            plan,
+            &report,
+            dir_count,
+            scan_elapsed,
+            protected_count,
+            batch_plan,
+        )?,
     }
+    if let Some(error) = confirmation_error {
+        return Err(cleanup_confirmation_error(
+            error,
+            report.items_deleted,
+            report.items_failed,
+        ));
+    }
+    clean_completion_result(&report)
+}
 
+/// C-EXIT applies equally to --yes and per-item confirmation. Emit the full
+/// report before returning the partial-success error to the CLI dispatcher.
+fn clean_completion_result(report: &DeletionReport) -> Result<(), CliError> {
+    if report.items_failed > 0 {
+        return Err(CliError::Partial(format!(
+            "{} of {} deletion(s) failed",
+            report.items_failed,
+            report.items_failed.saturating_add(report.items_deleted)
+        )));
+    }
     Ok(())
+}
+
+fn cleanup_confirmation_error(error: CliError, completed: usize, failed: usize) -> CliError {
+    if completed > 0 || failed > 0 {
+        CliError::Partial(format!(
+            "cleanup confirmation stopped after {completed} completed and {failed} failed item(s): {error}"
+        ))
+    } else {
+        error
+    }
+}
+
+/// Both interactive commands share consent and the full execution path. Only
+/// the operator's answer is retained; pressure and safety evidence are renewed
+/// after every answer, including each remaining item authorized by "all".
+fn run_confirmed_cleanup(
+    executor: &DeletionExecutor,
+    plan: &DeletionPlan,
+    target_free: Option<f64>,
+    collector: &FsStatsCollector,
+    input: &mut impl io::BufRead,
+    output: &mut impl Write,
+) -> Result<DeletionReport, DeletionConfirmationError<CliError>> {
+    let mut answer = String::new();
+    let mut accept_remaining = false;
+    let mut introduced = false;
+    let pressure_check =
+        |path: &Path| target_free.and_then(|target| target_free_skip(collector, path, target));
+    executor.execute_confirmed(plan, Some(&pressure_check), |index, candidate| {
+        if accept_remaining {
+            return Ok(DeletionConfirmation::Accept);
+        }
+        if !introduced {
+            writeln!(output, "Proceed with cleanup? [y/N/a(ll)/s(kip)/q(uit)]")?;
+            writeln!(
+                output,
+                "  y - accept this item    a - accept all remaining\n  n - skip this item      s/q - stop without further cleanup\n"
+            )?;
+            introduced = true;
+        }
+        let operation = match plan.mode {
+            DeletionMode::Unlink => "delete",
+            DeletionMode::Quarantine => "quarantine",
+        };
+        write!(
+            output,
+            "  [{}/{}] {operation} {} ({}, score {:.2})? ",
+            index + 1,
+            plan.candidates.len(),
+            truncate_path(&candidate.path, 60),
+            format_bytes(candidate.size_bytes),
+            candidate.total_score,
+        )?;
+        output.flush()?;
+        answer.clear();
+        let read = input.read_line(&mut answer).map_err(|error| {
+            CliError::Runtime(format!("failed to read cleanup confirmation: {error}"))
+        })?;
+        if read == 0 {
+            writeln!(output, "No further confirmation; keeping remaining items.")?;
+            return Ok(DeletionConfirmation::Stop);
+        }
+        Ok(match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => DeletionConfirmation::Accept,
+            "a" | "all" => {
+                accept_remaining = true;
+                DeletionConfirmation::Accept
+            }
+            "s" | "skip" | "q" | "quit" => {
+                writeln!(output, "Keeping all remaining items.")?;
+                DeletionConfirmation::Stop
+            }
+            _ => DeletionConfirmation::Decline,
+        })
+    })
 }
 
 /// Interactive skip bookkeeping.
 ///
-/// The interactive flows do not go through `DeletionExecutor::execute`, so they
-/// keep their own counters. They still owe the same `skipped_by_reason` /
-/// `stalled` JSON contract as the batch paths, and this keeps the count and the
-/// histogram incremented together at one place.
+/// Quarantine recovery confirms groups of already-held entries outside the
+/// candidate executor. Keep its count and histogram incremented together.
 #[derive(Default)]
 struct InteractiveSkips {
     total: usize,
@@ -16170,13 +16266,15 @@ fn print_clean_summary(report: &storage_ballast_helper::scanner::deletion::Delet
         println!("Cleanup complete:");
         println!(
             "  Deleted: {} items, {} freed in {:.1}s",
-            report.items_deleted,
+            report
+                .items_deleted
+                .saturating_sub(report.items_quarantined),
             format_bytes(report.bytes_freed),
             report.duration.as_secs_f64(),
         );
         if report.items_quarantined > 0 {
             println!(
-                "  Quarantined: {} of those ({}) held under .sbh/quarantine, restorable with `sbh undo <decision-id>` (`sbh undo --list`)",
+                "  Quarantined: {} items ({}) held under .sbh/quarantine, restorable with `sbh undo <decision-id>` (`sbh undo --list`)",
                 report.items_quarantined,
                 format_bytes(report.bytes_quarantined),
             );
@@ -17803,11 +17901,18 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         println!();
     }
 
-    let report = if args.yes {
+    let (report, confirmation_error) = if args.yes {
         let pressure_check = build_pressure_check(Some(args.target_free), collector);
-        executor.execute(&plan, pressure_check.as_ref().map(|f| f as SkipCheck))
+        (
+            executor.execute(&plan, pressure_check.as_ref().map(|f| f as SkipCheck)),
+            None,
+        )
     } else {
-        run_interactive_emergency(&executor, &plan, args, &collector, &mut io::stdin().lock())?
+        match run_interactive_emergency(&executor, &plan, args, &collector, &mut io::stdin().lock())
+        {
+            Ok(report) => (report, None),
+            Err(failure) => (*failure.report, Some(failure.error)),
+        }
     };
     if output_mode(cli) == OutputMode::Human {
         eprintln!(
@@ -17815,160 +17920,39 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             ongoing_protection_install_hint()
         );
     }
-    finish_emergency_report(cli, &plan, report, &quarantine, dir_count, scan_elapsed)
+    let confirmation_error = confirmation_error.map(|error| {
+        cleanup_confirmation_error(
+            error,
+            report
+                .items_deleted
+                .saturating_add(quarantine.removals.len()),
+            report.items_failed.saturating_add(quarantine.errors.len()),
+        )
+    });
+    let result = finish_emergency_report(cli, &plan, report, &quarantine, dir_count, scan_elapsed);
+    confirmation_error.map_or(result, Err)
 }
 
 fn ongoing_protection_install_hint() -> &'static str {
     "sbh install --auto"
 }
 
-/// Interactive emergency cleanup — like interactive clean but with emergency messaging.
-#[allow(clippy::too_many_lines)]
+/// Emergency cleanup uses the same consent and live execution checks as clean.
 fn run_interactive_emergency(
     executor: &DeletionExecutor,
     plan: &DeletionPlan,
     args: &EmergencyArgs,
     collector: &FsStatsCollector,
     input: &mut impl io::BufRead,
-) -> Result<DeletionReport, CliError> {
-    let mut answer = String::new();
-    let mut report = empty_emergency_report();
-    let mut skips = InteractiveSkips::default();
-    let mut delete_all = false;
-    let started = std::time::Instant::now();
-
-    eprintln!("Proceed with deletion? [y/N/a(ll)/s(kip)/q(uit)]");
-
-    for (i, candidate) in plan.candidates.iter().enumerate() {
-        // One satisfied filesystem must not suppress later pressured mounts.
-        if let Some(reason) = target_free_skip(collector, &candidate.path, args.target_free) {
-            eprintln!(
-                "  Skipping {}: {}.",
-                candidate.path.display(),
-                reason.explanation(),
-            );
-            skips.record(reason);
-            continue;
-        }
-
-        let action = if delete_all {
-            'y'
-        } else {
-            let path_str = truncate_path(&candidate.path, 60);
-            let size_str = format_bytes(candidate.size_bytes);
-            eprint!(
-                "  [{}/{}] {} ({}, score {:.2})? ",
-                i + 1,
-                plan.candidates.len(),
-                path_str,
-                size_str,
-                candidate.total_score,
-            );
-            io::stderr().flush()?;
-
-            answer.clear();
-            input
-                .read_line(&mut answer)
-                .map_err(|e| CliError::Runtime(e.to_string()))?;
-            match answer.trim().to_lowercase().as_str() {
-                "y" | "yes" => 'y',
-                "a" | "all" => {
-                    delete_all = true;
-                    'y'
-                }
-                "s" | "skip" => {
-                    eprintln!("  Skipping all remaining items.");
-                    for _ in i..plan.candidates.len() {
-                        skips.record(SkipReason::UserDeclined);
-                    }
-                    break;
-                }
-                "q" | "quit" => {
-                    eprintln!("  Quitting.");
-                    for _ in i..plan.candidates.len() {
-                        skips.record(SkipReason::UserDeclined);
-                    }
-                    break;
-                }
-                _ => 'n',
-            }
-        };
-
-        if action == 'y' {
-            // Route through the executor's full pre-flight veto stack, exactly
-            // like the --yes batch path. Emergency escalation (#18) makes
-            // Review-classified candidates *eligible*; it promises that every
-            // hard safety rail still applies, and this is where the interactive
-            // path keeps that promise (source-tree floor, active leases,
-            // .git/manifest/source markers, identity, open files).
-            let (fresh_open_paths, complete) =
-                collect_open_path_ancestors(std::slice::from_ref(&candidate.path));
-            // clippy::if_not_else is deliberately allowed here. The negative-first
-            // form is load-bearing: it puts the fail-safe (skip) branch ahead of the
-            // destructive branch (delete), so the guard is visible before the action
-            // when auditing this path. Inverting it to satisfy the lint would bury
-            // the safety rail below the deletion it protects.
-            #[allow(clippy::if_not_else)]
-            if !complete {
-                // Fail safe, mirroring the batch executor: if we cannot see
-                // which paths are open we cannot prove this one is closed.
-                eprintln!(
-                    "    Skipped (open-file scan incomplete): {}",
-                    candidate.path.display()
-                );
-                skips.record(storage_ballast_helper::scanner::deletion::SkipReason::FileOpen);
-            } else {
-                match executor.delete_candidate_checked(candidate, Some(&fresh_open_paths)) {
-                    Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Deleted) => {
-                        report.items_deleted += 1;
-                        report.bytes_freed =
-                            report.bytes_freed.saturating_add(candidate.size_bytes);
-                        report.bytes_freed_observed = None;
-                        if !delete_all {
-                            eprintln!("    Deleted.");
-                        }
-                    }
-                    Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Quarantined) => {
-                        report.items_deleted += 1;
-                        report.items_quarantined += 1;
-                        report.bytes_quarantined = report
-                            .bytes_quarantined
-                            .saturating_add(candidate.size_bytes);
-                        if !delete_all {
-                            eprintln!("    Quarantined (restore with `sbh undo`).");
-                        }
-                    }
-                    Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Skipped(
-                        skip,
-                    )) => {
-                        eprintln!(
-                            "    Skipped ({}): {}",
-                            skip.explanation(),
-                            candidate.path.display()
-                        );
-                        skips.record(skip);
-                    }
-                    Err(e) => {
-                        eprintln!("    Failed: {e}");
-                        report.items_failed += 1;
-                        report.errors.push(DeletionError {
-                            path: candidate.path.clone(),
-                            error: e.to_string(),
-                            error_code: e.code().to_string(),
-                            recoverable: e.is_retryable(),
-                        });
-                    }
-                }
-            }
-        } else {
-            skips.record(storage_ballast_helper::scanner::deletion::SkipReason::UserDeclined);
-        }
-    }
-
-    report.items_skipped = skips.total;
-    report.skipped_by_reason = skips.by_reason;
-    report.duration = started.elapsed();
-    Ok(report)
+) -> Result<DeletionReport, DeletionConfirmationError<CliError>> {
+    run_confirmed_cleanup(
+        executor,
+        plan,
+        Some(args.target_free),
+        collector,
+        input,
+        &mut io::stderr().lock(),
+    )
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -21666,6 +21650,170 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn interactive_cleanup_preserves_decline_all_quit_and_eof() {
+        for (answers, deleted, declined, prompts) in [
+            ("n\ny\nq\n", 1, 2, 3),
+            ("all\n", 3, 0, 1),
+            ("skip\ny\n", 0, 3, 1),
+            ("", 0, 3, 1),
+        ] {
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let mut candidates = Vec::new();
+            for name in ["first.o", "second.o", "third.o"] {
+                let target = root.join(name);
+                std::fs::write(&target, "obj").unwrap();
+                candidates.push(clean_receipt_candidate(&target));
+            }
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    check_open_files: false,
+                    require_identity: true,
+                    ..DeletionConfig::default()
+                },
+                None,
+            );
+            let plan = executor.plan(candidates);
+            let collector = emergency_test_collector(&[(&root, 50)]);
+            let mut output = Vec::new();
+            let report = run_confirmed_cleanup(
+                &executor,
+                &plan,
+                None,
+                &collector,
+                &mut io::Cursor::new(answers),
+                &mut output,
+            )
+            .unwrap();
+
+            assert_eq!(report.items_deleted, deleted, "{answers:?}");
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.items_skipped, declined);
+            assert_eq!(
+                report
+                    .skipped_by_reason
+                    .get("user_declined")
+                    .copied()
+                    .unwrap_or(0),
+                declined,
+            );
+            assert_eq!(
+                plan.candidates
+                    .iter()
+                    .filter(|candidate| candidate.path.exists())
+                    .count(),
+                declined,
+            );
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(output.matches("score 0.90").count(), prompts, "{output}");
+            assert!(clean_completion_result(&report).is_ok());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interactive_cleanup_failure_reports_errors_and_partial_exit() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join(".sbh")).unwrap();
+        std::fs::write(root.join(".sbh/quarantine"), "not a directory").unwrap();
+        let mut candidates = Vec::new();
+        for name in ["first.o", "second.o"] {
+            let target = root.join(name);
+            std::fs::write(&target, "obj").unwrap();
+            candidates.push(clean_receipt_candidate(&target));
+        }
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                require_identity: true,
+                mode: DeletionMode::Quarantine,
+                quarantine_roots: vec![root.clone()],
+                ..DeletionConfig::default()
+            },
+            None,
+        );
+        let plan = executor.plan(candidates);
+        let report = run_confirmed_cleanup(
+            &executor,
+            &plan,
+            None,
+            &emergency_test_collector(&[(&root, 50)]),
+            &mut io::Cursor::new("all\n"),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(clean_completion_result(&report).unwrap_err().exit_code(), 4);
+        let payload = clean_report_payload(&plan, &report, 2, Duration::ZERO, 0, "clean", None);
+        assert_eq!(payload["items_failed"], 2);
+        assert_eq!(payload["errors"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["items_deleted"], 0);
+        assert_eq!(payload["bytes_freed"], 0);
+        assert_eq!(payload["items_quarantined"], 0);
+        assert_eq!(payload["quarantine_unavailable"], 2);
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|candidate| candidate.path.exists())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interactive_cleanup_keeps_completed_work_after_input_disconnects() {
+        struct BrokenInput;
+        impl io::Read for BrokenInput {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("input disconnected"))
+            }
+        }
+
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let first = root.join("first.o");
+        let second = root.join("second.o");
+        std::fs::write(&first, "obj").unwrap();
+        std::fs::write(&second, "obj").unwrap();
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                ..DeletionConfig::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![
+            clean_receipt_candidate(&first),
+            clean_receipt_candidate(&second),
+        ]);
+        let mut input = io::BufReader::new(io::Read::chain(io::Cursor::new("y\n"), BrokenInput));
+        let failure = run_confirmed_cleanup(
+            &executor,
+            &plan,
+            None,
+            &emergency_test_collector(&[(&root, 50)]),
+            &mut input,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.report.items_deleted, 1);
+        assert_eq!(failure.report.bytes_freed, 3);
+        assert!(!first.exists());
+        assert_eq!(std::fs::read(second).unwrap(), b"obj");
+        let error = cleanup_confirmation_error(
+            failure.error,
+            failure.report.items_deleted,
+            failure.report.items_failed,
+        );
+        assert_eq!(error.exit_code(), 4);
+        assert!(error.to_string().contains("input disconnected"));
+        let error = cleanup_confirmation_error(CliError::Io(io::Error::other("input")), 0, 0);
+        assert_eq!(error.exit_code(), 2, "no work completed is an I/O failure");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn emergency_quarantine_requires_consent_and_preserves_declined_undo_copies() {
         assert!(require_emergency_authorization(false, false).is_err());
         for answer in ["", "\n", "no\n", "quit\n"] {
@@ -24853,6 +25001,109 @@ mod tests {
         assert_eq!(args.top, 5);
         assert_eq!(args.since, "1h");
         assert!(args.tree);
+    }
+
+    #[test]
+    fn deleted_open_blame_parses_bounded_standalone_options() {
+        let parsed = Cli::try_parse_from([
+            "sbh",
+            "--json",
+            "blame",
+            "--deleted-open",
+            "--top",
+            "5",
+            "--timeout-secs",
+            "30",
+        ])
+        .unwrap();
+        let Command::Blame(args) = parsed.command else {
+            panic!("expected blame command");
+        };
+        assert!(args.deleted_open);
+        assert_eq!(args.top, 5);
+        assert_eq!(args.timeout_secs, Some(30));
+        assert!(Cli::try_parse_from(["sbh", "blame", "--deleted-open"]).is_ok());
+        for flags in [
+            vec!["--deleted-open", "--since", "1h"],
+            vec!["--deleted-open", "--tree"],
+            vec!["--timeout-secs", "10"],
+            vec!["--deleted-open", "--timeout-secs", "0"],
+            vec!["--deleted-open", "--timeout-secs", "61"],
+        ] {
+            let argv = [vec!["sbh", "blame"], flags].concat();
+            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn deleted_open_blame_truncates_display_without_losing_allocation_totals() {
+        use storage_ballast_helper::platform::types::{DeletedOpenFile, DeletedOpenFilesReport};
+        let report = DeletedOpenFilesReport {
+            supported: true,
+            complete: true,
+            observed_allocated_bytes: Some(12_288),
+            processes_scanned: 3,
+            descriptors_scanned: 9,
+            issues: BTreeMap::new(),
+            files: vec![
+                DeletedOpenFile {
+                    device_id: 5,
+                    inode: 7,
+                    allocated_bytes: 8_192,
+                    logical_bytes: 4_096,
+                    holders: Vec::new(),
+                },
+                DeletedOpenFile {
+                    device_id: 5,
+                    inode: 8,
+                    allocated_bytes: 4_096,
+                    logical_bytes: 8_192,
+                    holders: Vec::new(),
+                },
+            ],
+        };
+        let value = deleted_open_blame_json(&report, 1, Duration::from_millis(25));
+        assert_eq!(value["schema"], "sbh.deleted_open.v1");
+        assert_eq!(value["files"].as_array().unwrap().len(), 1);
+        assert_eq!(value["files"][0]["inode"], 7);
+        assert_eq!(value["files_omitted"], 1);
+        assert_eq!(value["observed_unique_files"], 2);
+        assert_eq!(value["observed_allocated_bytes"], 12_288);
+        assert_eq!(value["complete"], true);
+        assert_eq!(value["exit_code"], 0);
+        let totals_only = deleted_open_blame_json(&report, 0, Duration::ZERO);
+        assert!(totals_only["files"].as_array().unwrap().is_empty());
+        assert_eq!(totals_only["files_omitted"], 2);
+        assert_eq!(totals_only["observed_allocated_bytes"], 12_288);
+    }
+
+    #[test]
+    fn deleted_open_blame_distinguishes_partial_and_unsupported_from_zero() {
+        use storage_ballast_helper::platform::types::DeletedOpenFilesReport;
+
+        let mut report = DeletedOpenFilesReport {
+            supported: true,
+            complete: false,
+            observed_allocated_bytes: Some(0),
+            processes_scanned: 2,
+            descriptors_scanned: 0,
+            issues: BTreeMap::from([("permission_denied".to_string(), 2)]),
+            files: Vec::new(),
+        };
+        let partial = deleted_open_blame_json(&report, 25, Duration::ZERO);
+        assert_eq!(partial["status"], "incomplete");
+        assert_eq!(partial["exit_code"], 4);
+        assert_eq!(partial["issues"]["permission_denied"], 2);
+        assert!(partial["scope"].as_str().unwrap().contains("mmap-only"));
+
+        report.supported = false;
+        report.observed_allocated_bytes = None;
+        report.issues = BTreeMap::from([("unsupported_platform".to_string(), 1)]);
+        let unsupported = deleted_open_blame_json(&report, 25, Duration::ZERO);
+        assert_eq!(unsupported["status"], "unsupported");
+        assert_eq!(unsupported["complete"], false);
+        assert!(unsupported["observed_allocated_bytes"].is_null());
+        assert_eq!(unsupported["exit_code"], 0);
     }
 
     #[test]

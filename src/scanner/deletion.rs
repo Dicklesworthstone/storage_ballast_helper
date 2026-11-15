@@ -511,6 +511,77 @@ impl DeletionReport {
         *self.skipped_by_reason.entry(reason.as_str()).or_insert(0) += 1;
     }
 
+    /// Accumulate disjoint executions from the same executor. Exhaustively
+    /// destructure the report so a new accounting field cannot silently vanish
+    /// from an interactive session. One unmeasured unlink makes the whole
+    /// observed-byte total unknown, just as it does within a single batch.
+    fn append(&mut self, other: Self) {
+        let Self {
+            items_deleted,
+            items_failed,
+            items_skipped,
+            items_would_delete,
+            bytes_freed,
+            bytes_freed_observed,
+            bytes_freed_at_commit,
+            bytes_freed_at_commit_observed,
+            freed_at_commit_on_btrfs,
+            bytes_would_free,
+            duration,
+            errors,
+            dry_run,
+            circuit_breaker_tripped,
+            deleted_paths,
+            not_writable_paths,
+            backoff_candidates,
+            skipped_by_reason,
+            sacred_scans,
+            sacred_scan_ms,
+            read_only_paths,
+            no_space_paths,
+            items_quarantined,
+            bytes_quarantined,
+            quarantine_unavailable,
+        } = other;
+        debug_assert_eq!(self.dry_run, dry_run);
+        self.items_deleted = self.items_deleted.saturating_add(items_deleted);
+        self.items_failed = self.items_failed.saturating_add(items_failed);
+        self.items_skipped = self.items_skipped.saturating_add(items_skipped);
+        self.items_would_delete = self.items_would_delete.saturating_add(items_would_delete);
+        self.bytes_freed = self.bytes_freed.saturating_add(bytes_freed);
+        self.bytes_freed_observed = self
+            .bytes_freed_observed
+            .zip(bytes_freed_observed)
+            .map(|(left, right)| left.saturating_add(right));
+        self.bytes_freed_at_commit = self
+            .bytes_freed_at_commit
+            .saturating_add(bytes_freed_at_commit);
+        self.bytes_freed_at_commit_observed = self
+            .bytes_freed_at_commit_observed
+            .saturating_add(bytes_freed_at_commit_observed);
+        self.freed_at_commit_on_btrfs |= freed_at_commit_on_btrfs;
+        self.bytes_would_free = self.bytes_would_free.saturating_add(bytes_would_free);
+        self.duration = self.duration.saturating_add(duration);
+        self.errors.extend(errors);
+        self.circuit_breaker_tripped |= circuit_breaker_tripped;
+        self.deleted_paths.extend(deleted_paths);
+        self.not_writable_paths.extend(not_writable_paths);
+        self.backoff_candidates.extend(backoff_candidates);
+        for (reason, count) in skipped_by_reason {
+            let total = self.skipped_by_reason.entry(reason).or_insert(0);
+            *total = total.saturating_add(count);
+        }
+        self.sacred_scans = self.sacred_scans.saturating_add(sacred_scans);
+        self.sacred_scan_ms = self.sacred_scan_ms.saturating_add(sacred_scan_ms);
+        self.read_only_paths.extend(read_only_paths);
+        self.no_space_paths.extend(no_space_paths);
+        self.items_quarantined = self.items_quarantined.saturating_add(items_quarantined);
+        self.bytes_quarantined = self.bytes_quarantined.saturating_add(bytes_quarantined);
+        self.quarantine_unavailable = self
+            .quarantine_unavailable
+            .saturating_add(quarantine_unavailable);
+    }
+
     /// True when the executor had work queued but removed nothing at all.
     ///
     /// This is the signature of the "sbh looks broken" report: candidates were
@@ -542,6 +613,26 @@ pub struct DeletionError {
     pub error: String,
     pub error_code: String,
     pub recoverable: bool,
+}
+
+/// Consent for one item in an interactive cleanup. Acceptance never bypasses
+/// current pressure, identity, protection, lease or active-reference checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionConfirmation {
+    /// Execute this candidate after refreshing every safety check.
+    Accept,
+    /// Retain this candidate and ask about the next one.
+    Decline,
+    /// Retain this candidate and every remaining item without further prompts.
+    Stop,
+}
+
+/// A confirmation failure with the completed work preserved for reporting.
+/// The unconfirmed candidate and all later candidates remain untouched.
+#[derive(Debug)]
+pub struct DeletionConfirmationError<E> {
+    pub error: E,
+    pub report: Box<DeletionReport>,
 }
 
 /// Reason a candidate was skipped during pre-flight checks.
@@ -955,6 +1046,101 @@ impl DeletionExecutor {
         self.execute_with_guard(plan, should_skip, None)
     }
 
+    /// Execute a plan with per-item consent and fresh post-confirmation checks.
+    ///
+    /// Each accepted item uses the full batch executor, including a new open
+    /// reference sweep, live pressure renewal, receipts and byte accounting.
+    /// Human think time therefore cannot lend stale negative evidence to a
+    /// later deletion. The original plan's mode, item limit and consecutive
+    /// failure limit remain in force across individual answers.
+    ///
+    /// `confirm` receives the zero-based position in the original plan. A
+    /// refusal or stop is reported as `UserDeclined`. Dry runs never prompt.
+    /// A callback error stops execution immediately and returns the accumulated
+    /// report alongside the error. Receipts for completed mutations have already
+    /// been emitted; callers can still report those outcomes to the operator.
+    pub fn execute_confirmed<E>(
+        &self,
+        plan: &DeletionPlan,
+        should_skip: Option<SkipCheck<'_>>,
+        mut confirm: impl FnMut(usize, &CandidacyScore) -> std::result::Result<DeletionConfirmation, E>,
+    ) -> std::result::Result<DeletionReport, DeletionConfirmationError<E>> {
+        if self.config.dry_run {
+            return Ok(self.execute(plan, should_skip));
+        }
+        let started = Instant::now();
+        let empty = DeletionPlan {
+            candidates: Vec::new(),
+            total_reclaimable_bytes: 0,
+            estimated_items: 0,
+            mode: plan.mode,
+            refused: plan.refused.clone(),
+        };
+        let mut report = self.execute(&empty, None);
+        let limit = plan.candidates.len().min(self.config.max_batch_size);
+        let mut consecutive_failures: u32 = 0;
+        for (index, candidate) in plan.candidates.iter().take(limit).enumerate() {
+            if consecutive_failures >= self.config.circuit_breaker_threshold {
+                report.circuit_breaker_tripped = true;
+                self.log_event(ActivityEvent::Error {
+                    code: "SBH-2003".to_string(),
+                    message: format!(
+                        "circuit breaker tripped after {consecutive_failures} consecutive failures, halting interactive cleanup"
+                    ),
+                });
+                break;
+            }
+            // Avoid asking for work already unnecessary or unobservable. The
+            // executor checks again after the answer and before mutation.
+            if let Some(reason) = should_skip.and_then(|skip| skip(&candidate.path)) {
+                report.record_skip(reason);
+                if should_backoff_skip(reason) {
+                    report.backoff_candidates.push(candidate.clone());
+                }
+                continue;
+            }
+            let confirmation = match confirm(index, candidate) {
+                Ok(confirmation) => confirmation,
+                Err(error) => {
+                    report.duration = started.elapsed();
+                    return Err(DeletionConfirmationError {
+                        error,
+                        report: Box::new(report),
+                    });
+                }
+            };
+            match confirmation {
+                DeletionConfirmation::Decline => {
+                    report.record_skip(SkipReason::UserDeclined);
+                    continue;
+                }
+                DeletionConfirmation::Stop => {
+                    for _ in index..limit {
+                        report.record_skip(SkipReason::UserDeclined);
+                    }
+                    break;
+                }
+                DeletionConfirmation::Accept => {}
+            }
+            let one = DeletionPlan {
+                candidates: vec![candidate.clone()],
+                total_reclaimable_bytes: candidate.size_bytes,
+                estimated_items: 1,
+                mode: plan.mode,
+                refused: Vec::new(),
+            };
+            let outcome = self.execute(&one, should_skip);
+            consecutive_failures = if outcome.items_failed > 0 {
+                consecutive_failures.saturating_add(1)
+            } else {
+                0
+            };
+            report.append(outcome);
+        }
+        report.duration = started.elapsed();
+        Ok(report)
+    }
+
     /// Execute with a live per-candidate authorization check. The guard runs
     /// after expensive preflight and free-space observations, before either
     /// mutation backend or dry-run admission. It may refuse an otherwise
@@ -1029,6 +1215,10 @@ impl DeletionExecutor {
         let mut consecutive_failures: u32 = 0;
         let mut sacred = SacredScanStats::default();
         let limit = plan.candidates.len().min(self.config.max_batch_size);
+        if limit == 0 {
+            report.duration = start.elapsed();
+            return report;
+        }
         // Build an open-path ancestor index once per mutating batch to avoid
         // deep per-candidate inode-tree scans on large artifact directories.
         // Dry-run never mutates, so it must not pay a global process-fd scan
@@ -1317,11 +1507,9 @@ impl DeletionExecutor {
     /// open-file index) followed by fresh content, lease/symlink/identity
     /// and live configured-root rechecks at the mutation point.
     ///
-    /// Interactive flows MUST route accepted candidates through this instead
-    /// of deleting directly: operator confirmation widens *consent*, never the
-    /// safety rails. Emergency escalation (#18) explicitly promises that every
-    /// hard veto still applies to Review-classified candidates, and this is
-    /// the method that keeps that promise on the per-item paths.
+    /// This low-level entry point keeps the same immutable safety rails.
+    /// Prompt-driven cleanup should use [`Self::execute_confirmed`] to retain
+    /// live pressure checks, complete accounting and the batch failure limit.
     ///
     /// `open_paths` carries a fresh, complete open-file ancestor index for the
     /// open-file veto. Missing evidence is refused when `check_open_files` is
@@ -2833,6 +3021,256 @@ mod tests {
         let mut candidate = make_candidate(path, size, score);
         candidate.identity = Some(walker::identity_for_path(path, false).unwrap());
         candidate
+    }
+
+    #[test]
+    fn confirmed_execution_renews_pressure_after_the_answer() {
+        for reason in [
+            SkipReason::TargetFreeReached,
+            SkipReason::PressureUnavailable,
+        ] {
+            let dir = scratch_dir();
+            let target = dir.path().join("target");
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("a.o"), "obj").unwrap();
+            let executor = DeletionExecutor::new(offline_config(), None);
+            let plan = executor.plan(vec![make_identity_candidate(&target, 3, 0.9)]);
+            let answered = std::cell::Cell::new(false);
+            let pressure = |_: &Path| answered.get().then_some(reason);
+
+            let report = executor
+                .execute_confirmed(&plan, Some(&pressure), |_, _| {
+                    answered.set(true);
+                    Ok::<_, ()>(DeletionConfirmation::Accept)
+                })
+                .unwrap();
+
+            assert!(answered.get(), "the first reading permits a prompt");
+            assert_eq!(report.items_deleted, 0);
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.bytes_freed, 0);
+            assert_eq!(report.skipped_by_reason.get(reason.as_str()), Some(&1));
+            assert_eq!(fs::read(target.join("a.o")).unwrap(), b"obj");
+        }
+    }
+
+    #[test]
+    fn confirmed_execution_keeps_fresh_protection_and_open_scan_vetoes() {
+        for incomplete_open_scan in [false, true] {
+            let dir = scratch_dir();
+            let target = dir.path().join("target");
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("a.o"), "obj").unwrap();
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    check_open_files: incomplete_open_scan,
+                    ..offline_config()
+                },
+                None,
+            )
+            .with_platform(Arc::new(
+                crate::platform::pal::MockPlatform::healthy().with_open_files_complete(false),
+            ));
+            let plan = executor.plan(vec![make_identity_candidate(&target, 3, 0.9)]);
+
+            let report = executor
+                .execute_confirmed(&plan, None, |_, _| {
+                    if !incomplete_open_scan {
+                        fs::write(target.join(protection::MARKER_FILENAME), "protected").unwrap();
+                    }
+                    Ok::<_, ()>(DeletionConfirmation::Accept)
+                })
+                .unwrap();
+
+            let reason = if incomplete_open_scan {
+                "open_scan_incomplete"
+            } else {
+                "sacred_stowaway"
+            };
+            assert_eq!(report.items_deleted, 0);
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.skipped_by_reason.get(reason), Some(&1));
+            assert_eq!(fs::read(target.join("a.o")).unwrap(), b"obj");
+        }
+    }
+
+    #[test]
+    fn confirmed_execution_accumulates_failures_and_trips_the_breaker() {
+        let dir = scratch_dir();
+        let root = dir.path().join("project");
+        fs::create_dir_all(root.join(".sbh")).unwrap();
+        fs::write(root.join(".sbh/quarantine"), "not a directory").unwrap();
+        let mut candidates = Vec::new();
+        for (name, score) in [("first", 0.99), ("second", 0.98), ("third", 0.97)] {
+            let target = root.join(name).join("target");
+            fs::create_dir_all(&target).unwrap();
+            fs::write(target.join("a.o"), "obj").unwrap();
+            candidates.push(make_identity_candidate(&target, 3, score));
+        }
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                mode: DeletionMode::Quarantine,
+                quarantine_roots: vec![root],
+                circuit_breaker_threshold: 2,
+                ..offline_config()
+            },
+            None,
+        );
+        let plan = executor.plan(candidates);
+        let mut prompts = 0;
+
+        let report = executor
+            .execute_confirmed(&plan, None, |_, _| {
+                prompts += 1;
+                Ok::<_, ()>(DeletionConfirmation::Accept)
+            })
+            .unwrap();
+
+        assert_eq!(prompts, 2, "do not prompt after the failure limit");
+        assert!(report.circuit_breaker_tripped);
+        assert_eq!(report.items_failed, 2);
+        assert_eq!(report.errors.len(), 2);
+        assert_eq!(report.quarantine_unavailable, 2);
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.bytes_freed, 0);
+        for candidate in &plan.candidates {
+            assert_eq!(fs::read(candidate.path.join("a.o")).unwrap(), b"obj");
+        }
+    }
+
+    #[test]
+    fn confirmed_execution_preserves_completed_report_on_prompt_error() {
+        let dir = scratch_dir();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        fs::write(&first, "obj").unwrap();
+        fs::write(&second, "obj").unwrap();
+        let executor = DeletionExecutor::new(offline_config(), None);
+        let plan = executor.plan(vec![
+            make_identity_candidate(&first, 3, 0.99),
+            make_identity_candidate(&second, 3, 0.98),
+        ]);
+        let failure = executor
+            .execute_confirmed(&plan, None, |index, _| {
+                if index == 0 {
+                    Ok(DeletionConfirmation::Accept)
+                } else {
+                    Err("input disconnected")
+                }
+            })
+            .unwrap_err();
+
+        assert_eq!(failure.error, "input disconnected");
+        assert_eq!(failure.report.items_deleted, 1);
+        assert_eq!(failure.report.bytes_freed, 3);
+        assert_eq!(failure.report.deleted_paths, vec![first.clone()]);
+        assert!(!first.exists());
+        assert_eq!(fs::read(second).unwrap(), b"obj");
+    }
+
+    #[test]
+    fn confirmed_execution_preserves_quarantine_accounting_and_receipts() {
+        let dir = scratch_dir();
+        let root = dir.path().join("project");
+        let mut candidates = Vec::new();
+        for (name, score) in [("first", 0.99), ("second", 0.98)] {
+            let target = root.join(name).join("target");
+            fs::create_dir_all(&target).unwrap();
+            fs::write(target.join("a.o"), "obj").unwrap();
+            candidates.push(make_identity_candidate(&target, 3, score));
+        }
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                mode: DeletionMode::Quarantine,
+                quarantine_roots: vec![root.clone()],
+                ..offline_config()
+            },
+            None,
+        )
+        .with_activity_observer(move |event| captured.lock().push(event.clone()));
+        let plan = executor.plan(candidates);
+        let report = executor
+            .execute_confirmed(&plan, None, |_, _| {
+                Ok::<_, ()>(DeletionConfirmation::Accept)
+            })
+            .unwrap();
+
+        assert_eq!(report.items_deleted, 2);
+        assert_eq!(report.items_quarantined, 2);
+        assert_eq!(report.bytes_quarantined, 6);
+        assert_eq!(report.bytes_freed, 0);
+        assert_eq!(report.bytes_freed_observed, Some(0));
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.deleted_paths.len(), 2);
+        assert!(report.sacred_scans > 0);
+        let store = QuarantineStore::under(&root);
+        for candidate in &plan.candidates {
+            assert!(!candidate.path.exists());
+            let id = crate::scanner::decision_record::stable_decision_id(
+                &candidate.path,
+                candidate.identity,
+                candidate.size_bytes,
+            );
+            let record = store.record(&id).unwrap().unwrap();
+            assert_eq!(
+                fs::read(record.quarantine_path.join("a.o")).unwrap(),
+                b"obj"
+            );
+        }
+        let events = events.lock();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| matches!(
+            event,
+            ActivityEvent::ArtifactDeleted {
+                quarantined: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn confirmed_execution_preserves_plan_limits_refusals_and_dry_run() {
+        for dry_run in [false, true] {
+            let dir = scratch_dir();
+            let first = dir.path().join("first");
+            let second = dir.path().join("second");
+            let refused = dir.path().join("refused");
+            for path in [&first, &second, &refused] {
+                fs::write(path, "obj").unwrap();
+            }
+            let mut vetoed = make_identity_candidate(&refused, 3, 0.97);
+            vetoed.vetoed = true;
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    dry_run,
+                    max_batch_size: 1,
+                    ..offline_config()
+                },
+                None,
+            );
+            let plan = executor.plan(vec![
+                make_identity_candidate(&first, 3, 0.99),
+                make_identity_candidate(&second, 3, 0.98),
+                vetoed,
+            ]);
+            let mut prompts = 0;
+            let report = executor
+                .execute_confirmed(&plan, None, |_, _| {
+                    prompts += 1;
+                    Ok::<_, ()>(DeletionConfirmation::Accept)
+                })
+                .unwrap();
+
+            assert_eq!(prompts, usize::from(!dry_run));
+            assert_eq!(report.items_deleted, usize::from(!dry_run));
+            assert_eq!(report.items_would_delete, usize::from(dry_run));
+            assert_eq!(report.skipped_by_reason.get("vetoed"), Some(&1));
+            assert_eq!(first.exists(), dry_run);
+            assert!(second.exists());
+            assert!(refused.exists());
+        }
     }
 
     #[test]

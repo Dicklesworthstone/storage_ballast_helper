@@ -144,6 +144,77 @@ fn subcommand_help_flags_work() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn deleted_open_blame_finds_anonymous_allocations_without_daemon_config() {
+    use std::io::Write as _;
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let mut held = tempfile::tempfile_in(fixture.path()).unwrap();
+    held.write_all(&[0x5a; 16_384]).unwrap();
+    held.sync_all().unwrap();
+    let duplicate = held.try_clone().unwrap();
+    let before = held.metadata().unwrap();
+    assert_eq!(before.nlink(), 0);
+    assert!(before.blocks() > 0);
+    let missing_config = fixture.path().join("missing-config.toml");
+
+    let result = common::run_cli_case(
+        "deleted_open_blame_finds_anonymous_allocations_without_daemon_config",
+        &[
+            "--config",
+            missing_config.to_str().unwrap(),
+            "--json",
+            "blame",
+            "--deleted-open",
+            "--top",
+            "4096",
+            "--timeout-secs",
+            "30",
+        ],
+    );
+    assert!(
+        matches!(result.status.code(), Some(0 | 4)),
+        "stdout={} stderr={}",
+        result.stdout,
+        result.stderr,
+    );
+    let report: Value = serde_json::from_str(&result.stdout).unwrap();
+    assert_eq!(report["schema"], "sbh.deleted_open.v1");
+    assert_eq!(report["read_only"], true);
+    assert_eq!(report["supported"], true);
+    assert_eq!(report["exit_code"], result.status.code().unwrap());
+    let matching: Vec<_> = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|file| file["device_id"] == before.dev() && file["inode"] == before.ino())
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "one allocation despite duplicate FDs: {report}"
+    );
+    assert_eq!(matching[0]["allocated_bytes"], before.blocks() * 512);
+    assert_eq!(matching[0]["logical_bytes"], before.len());
+    let holder = matching[0]["holders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|holder| holder["pid"] == std::process::id())
+        .expect("the test process still holds the unlinked file");
+    assert!(holder["descriptor_count"].as_u64().unwrap() >= 2);
+    assert!(!holder["fd_target_bytes_hex"].as_str().unwrap().is_empty());
+    assert!(!missing_config.exists());
+    let after = duplicate.metadata().unwrap();
+    assert_eq!(after.len(), before.len());
+    assert_eq!(after.blocks(), before.blocks());
+    let mut contents = [0; 16_384];
+    duplicate.read_exact_at(&mut contents, 0).unwrap();
+    assert_eq!(contents, [0x5a; 16_384]);
+}
+
 #[cfg(unix)]
 mod protect_cli_regressions {
     use super::{common, toml_path};
