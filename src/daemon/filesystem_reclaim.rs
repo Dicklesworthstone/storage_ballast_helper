@@ -120,6 +120,14 @@ impl FilesystemReclaimScope {
         &self.owner.path
     }
 
+    /// A forecast must belong to the same sampled mount incarnation as the
+    /// scope it will authorize, even if a replacement reuses the pathname.
+    pub(crate) fn matches_sample(&self, sample: &FsStatsSample) -> bool {
+        sample.mount_owner() == self.owner
+            && sample.mount_directory() == Some(&self.mount_directory)
+            && sample.resolved_mount() == self.mount_lookup
+    }
+
     /// Pure monitor-side selection; never resolve a path on the control loop.
     #[must_use]
     pub fn admitted_paths(&self) -> Vec<PathBuf> {

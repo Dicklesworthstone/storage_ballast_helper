@@ -1691,6 +1691,7 @@ fn run_root(
         candidates: selection.candidates,
         admitted_scanner: Arc::new(config.scanner.clone()),
         filesystem_reclaim: None,
+        predictive_reclaim: None,
         pressure_level: current.level,
         urgency: current.urgency,
         target_bytes: None,

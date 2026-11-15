@@ -29,7 +29,9 @@ use serde_json::{Value, json};
 
 use crate::ballast::coordinator::{BallastPoolCoordinator, BallastRefillBlocker};
 use crate::ballast::release::BallastReleaseController;
-use crate::core::config::{Config, InodePressureConfig, ScannerConfig, ScannerEngineMode};
+use crate::core::config::{
+    Config, InodePressureConfig, PredictionConfig, ScannerConfig, ScannerEngineMode, ScoringConfig,
+};
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::ballast_replenish::BallastReplenisher;
 use crate::daemon::ballast_reserve::BallastReserveMonitor;
@@ -51,6 +53,9 @@ use crate::daemon::notifications::{NotificationEvent, NotificationLevel, Notific
 use crate::daemon::policy::{
     ActiveMode, BallastAction, BehaviorDispatchTable, BehaviorMode, BehaviorPressureLevel,
     CleanupAction, NotificationPriority, PolicyEngine, ScanAggressiveness,
+};
+use crate::daemon::predictive_reclaim::{
+    PredictiveObservation, PredictiveReclaimPolicy, PredictiveScanAdmission,
 };
 use crate::daemon::process_io_history::{ProcessIoHistory, ProcessIoSampler};
 use crate::daemon::ram_reclaim::RamReclaimRequest;
@@ -237,6 +242,9 @@ struct SharedExecutorConfig {
     max_batch_size: AtomicUsize,
     /// f64 stored as u64 bits (to_bits/from_bits).
     min_score_bits: AtomicU64,
+    /// Forecast permissions retain their exact scoring policy and can be
+    /// withdrawn from queued requests without changing the shared score floor.
+    predictive_reclaim: RwLock<PredictiveReclaimPolicy>,
     repeat_base_cooldown_secs: AtomicU64,
     repeat_max_cooldown_secs: AtomicU64,
     /// Minimum [`ArtifactCertainty`] rank the current behavior cell dispatches
@@ -285,6 +293,13 @@ impl SharedExecutorConfig {
             dry_run: AtomicBool::new(dry_run),
             max_batch_size: AtomicUsize::new(max_batch_size),
             min_score_bits: AtomicU64::new(min_score.to_bits()),
+            predictive_reclaim: RwLock::new(PredictiveReclaimPolicy::new(
+                &PredictionConfig::default(),
+                &ScoringConfig {
+                    min_score,
+                    ..ScoringConfig::default()
+                },
+            )),
             repeat_base_cooldown_secs: AtomicU64::new(repeat_base_cooldown),
             repeat_max_cooldown_secs: AtomicU64::new(repeat_max_cooldown),
             min_certainty_rank: AtomicU8::new(ArtifactCertainty::Unclear.rank()),
@@ -1173,6 +1188,8 @@ pub struct ScanRequest {
     /// The observed filesystem that this automatic pass is allowed to help.
     /// Traversal across devices never grants deletion on a different mount.
     pub filesystem_reclaim: Option<Arc<FilesystemReclaimScope>>,
+    /// A short-lived forecast may lower only this pass's score threshold.
+    pub predictive_reclaim: Option<PredictiveScanAdmission>,
     pub urgency: f64,
     pub pressure_level: PressureLevel,
     /// Actual free percentage for the mount/root that triggered this scan.
@@ -1209,6 +1226,49 @@ pub struct ScanRequest {
 }
 
 impl ScanRequest {
+    fn authorize_predictive(
+        &self,
+        shared: &SharedExecutorConfig,
+        now: Instant,
+    ) -> std::result::Result<(), SkipReason> {
+        let Some(admission) = &self.predictive_reclaim else {
+            return Ok(());
+        };
+        if self.pressure_level != PressureLevel::Green
+            || self.has_resource_reclaim()
+            || self.scan_now.is_some()
+            || self.force_full_scan
+            || self.maintenance
+            || self.config_update.is_some()
+            || !self.catalog_roots.is_empty()
+            || self
+                .filesystem_reclaim
+                .as_ref()
+                .is_none_or(|scope| scope.mount() != admission.mount())
+        {
+            return Err(SkipReason::PolicyChanged);
+        }
+        shared.predictive_reclaim.read().authorize(admission, now)
+    }
+
+    fn scoring_config(
+        &self,
+        configured: &ScoringConfig,
+        shared: &SharedExecutorConfig,
+        now: Instant,
+    ) -> std::result::Result<ScoringConfig, SkipReason> {
+        self.authorize_predictive(shared, now)?;
+        self.predictive_reclaim.as_ref().map_or_else(
+            || Ok(configured.clone()),
+            |admission| {
+                shared
+                    .predictive_reclaim
+                    .read()
+                    .scoring_config(admission, configured, now)
+            },
+        )
+    }
+
     fn has_resource_reclaim(&self) -> bool {
         self.ram_reclaim.is_some() || self.inode_reclaim.is_some()
     }
@@ -1701,6 +1761,8 @@ pub struct DeletionBatch {
     pub admitted_scanner: Arc<ScannerConfig>,
     /// Filesystem and root identities captured before the pass was admitted.
     pub filesystem_reclaim: Option<Arc<FilesystemReclaimScope>>,
+    /// The original forecast permission, renewed before policy and mutation.
+    pub predictive_reclaim: Option<PredictiveScanAdmission>,
     pub pressure_level: PressureLevel,
     pub urgency: f64,
     /// The original operator scope survives queue waits and config reloads.
@@ -1724,6 +1786,30 @@ pub struct DeletionBatch {
 }
 
 impl DeletionBatch {
+    fn min_score(
+        &self,
+        shared: &SharedExecutorConfig,
+        now: Instant,
+    ) -> std::result::Result<f64, SkipReason> {
+        let Some(admission) = &self.predictive_reclaim else {
+            return Ok(shared.min_score());
+        };
+        if self.pressure_level != PressureLevel::Green
+            || self.ram_reclaim.is_some()
+            || self.inode_reclaim.is_some()
+            || self.scan_now.is_some()
+            || self.target_only_root.is_some()
+            || self
+                .filesystem_reclaim
+                .as_ref()
+                .is_none_or(|scope| scope.mount() != admission.mount())
+        {
+            return Err(SkipReason::PolicyChanged);
+        }
+        shared.predictive_reclaim.read().authorize(admission, now)?;
+        Ok(admission.min_score())
+    }
+
     /// Both dispatch selection and execution use the same objective and live
     /// risk table. Resource allowances are read here and charged only after
     /// successful mutations, never when candidates are queued.
@@ -2570,6 +2656,23 @@ impl PredictiveWarningKey {
 /// A finite, positive prediction or nothing.
 fn finite_positive(seconds: f64) -> Option<f64> {
     (seconds.is_finite() && seconds > 0.0).then_some(seconds)
+}
+
+/// Only this mount's current, physically Green cleanup action may relax a
+/// pass's score. Swap/inode relief and a peer's forecast grant no exception.
+fn predictive_cleanup_mount(tick: &MountTickResponse) -> Option<&Path> {
+    let mount = match &tick.predictive_action {
+        PredictiveAction::PreemptiveCleanup { mount, .. }
+        | PredictiveAction::ImminentDanger { mount, .. } => mount,
+        PredictiveAction::Clear | PredictiveAction::EarlyWarning { .. } => return None,
+    };
+    (tick.filesystem_response.causing_mount == *mount
+        && tick.response.causing_mount == *mount
+        && tick.filesystem_response.level == PressureLevel::Green
+        && tick.response.level == PressureLevel::Green
+        && tick.ram_reclaim.is_none()
+        && tick.inode_reclaim.is_none())
+    .then_some(mount.as_path())
 }
 
 /// A warning uses the same mount, exhaustion horizon and confidence as the
@@ -4135,7 +4238,7 @@ impl EventPassTemplates {
             // A fresh backing-pressure observation authorizes only its
             // bounded pass. Do not retain a stale Green template for this
             // scope or turn this request into unbounded idle event work.
-            if request.has_resource_reclaim() {
+            if request.has_resource_reclaim() || request.predictive_reclaim.is_some() {
                 continue;
             }
             if let Some(root) = configured
@@ -4194,6 +4297,7 @@ impl EventPassTemplates {
                 paths: template.paths.clone(),
                 admitted_scanner: Arc::clone(&template.admitted_scanner),
                 filesystem_reclaim: template.filesystem_reclaim.clone(),
+                predictive_reclaim: None,
                 urgency: 0.0,
                 pressure_level: template.pressure_level,
                 free_pct: template.free_pct,
@@ -4418,7 +4522,11 @@ fn v2_active_scan_paths(
     // A catalog request is an explicit bounded probe of whole candidate
     // units. Their device can differ from a configured ancestor's device,
     // so ordinary event coverage does not establish that they were probed.
-    if request.force_full_scan || request.maintenance || !request.catalog_roots.is_empty() {
+    if request.force_full_scan
+        || request.maintenance
+        || request.predictive_reclaim.is_some()
+        || !request.catalog_roots.is_empty()
+    {
         return None;
     }
     match request.pressure_level {
@@ -4500,6 +4608,8 @@ enum PassStop {
     Wall,
     /// A live scan posture leaves broader discovery for a later pass.
     ScanPosture,
+    /// The forecast that admitted this pass expired or was withdrawn.
+    PolicyChanged,
     /// The daemon's measured CPU allowance for this pass (Q7).
     Cpu,
 }
@@ -4512,6 +4622,7 @@ impl PassStop {
             Self::PrescanCpuShare => "prescan cpu share",
             Self::Wall => "scan wall budget",
             Self::ScanPosture => "restricted scan posture",
+            Self::PolicyChanged => "withdrawn predictive permission",
             Self::Cpu => "daemon cpu budget",
         }
     }
@@ -4519,7 +4630,10 @@ impl PassStop {
     /// Whether this stop ends the whole pass (as opposed to just the
     /// priority pre-scan phase).
     const fn ends_pass(self) -> bool {
-        matches!(self, Self::Wall | Self::Cpu | Self::ScanPosture)
+        matches!(
+            self,
+            Self::Wall | Self::Cpu | Self::ScanPosture | Self::PolicyChanged
+        )
     }
 }
 
@@ -4545,6 +4659,8 @@ struct PassLimits {
     cpu: PassCpuGuard,
     history: Option<Arc<SharedRegret>>,
     history_poll_at: Instant,
+    predictive_authority: Option<(ScanRequest, Arc<SharedExecutorConfig>)>,
+    policy_changed: bool,
 }
 
 impl PassLimits {
@@ -4567,12 +4683,35 @@ impl PassLimits {
             cpu,
             history: None,
             history_poll_at: scan_start,
+            predictive_authority: None,
+            policy_changed: false,
         }
     }
 
     fn with_history(mut self, history: Arc<SharedRegret>) -> Self {
         self.history = Some(history);
         self
+    }
+
+    fn with_predictive_authority(
+        mut self,
+        request: &ScanRequest,
+        config: &Arc<SharedExecutorConfig>,
+    ) -> Self {
+        if request.predictive_reclaim.is_some() {
+            self.predictive_authority = Some((request.clone(), Arc::clone(config)));
+        }
+        self
+    }
+
+    /// Withdrawal stays latched for this pass. A fresh forecast belongs to a
+    /// later request; it cannot turn interrupted work into a complete survey.
+    fn policy_changed_at(&mut self, now: Instant) -> bool {
+        self.policy_changed |= self
+            .predictive_authority
+            .as_ref()
+            .is_some_and(|(request, config)| request.authorize_predictive(config, now).is_err());
+        self.policy_changed
     }
 
     /// These budget checkpoints run on the scanner, including idle walker
@@ -4595,7 +4734,13 @@ impl PassLimits {
     /// Whether the priority pre-scan must stop now, and which limit says so.
     /// The pass-ending limits are checked first so their verdict wins.
     fn prescan_stop(&mut self) -> Option<PassStop> {
+        if self.policy_changed_at(Instant::now()) {
+            return Some(PassStop::PolicyChanged);
+        }
         let now = self.refresh_history(Instant::now());
+        if self.policy_changed_at(now) {
+            return Some(PassStop::PolicyChanged);
+        }
         if now >= self.deadline {
             return Some(PassStop::Wall);
         }
@@ -4630,7 +4775,13 @@ impl PassLimits {
 
     /// Whether the general walk must stop now, and which limit says so.
     fn walk_stop(&mut self) -> Option<PassStop> {
+        if self.policy_changed_at(Instant::now()) {
+            return Some(PassStop::PolicyChanged);
+        }
         let now = self.refresh_history(Instant::now());
+        if self.policy_changed_at(now) {
+            return Some(PassStop::PolicyChanged);
+        }
         if now >= self.deadline {
             return Some(PassStop::Wall);
         }
@@ -4641,6 +4792,52 @@ impl PassLimits {
     fn elapsed(&self) -> Duration {
         self.scan_start.elapsed()
     }
+}
+
+/// Commit an EOF receipt only while the permission used by the pass remains
+/// current. The final dispatch can outlive a forecast, so neither event
+/// acknowledgement nor full-scan scheduler feedback may precede this gate.
+fn finish_authorized_scanner_walk(
+    limits: &mut PassLimits,
+    pending: &mut PendingScannerEvents,
+    active_paths: &[PathBuf],
+    root_stats: &mut HashMap<PathBuf, RootScanResult>,
+    completed_walk: Option<&[PathBuf]>,
+    now: Instant,
+) -> Option<PassStop> {
+    if limits.policy_changed_at(now) {
+        return Some(PassStop::PolicyChanged);
+    }
+    if let Some(unfinished) = completed_walk {
+        pending.acknowledge_walk(active_paths, Some(unfinished));
+        for stat in root_stats.values_mut() {
+            stat.finish_recursive_walk(Some(unfinished));
+        }
+    }
+    None
+}
+
+/// Confirm actual reclaim before judging a previous dispatch as empty.
+/// `None` means its forecast was withdrawn while queued: lack of mutation
+/// cannot establish that the filesystem had no useful cleanup work.
+fn confirm_scanner_dispatch(
+    reclaim_before: u64,
+    prediction: Option<&PredictiveScanAdmission>,
+    config: &SharedExecutorConfig,
+    now: Instant,
+) -> Option<bool> {
+    if config.reclaim_events() != reclaim_before {
+        return Some(true);
+    }
+    prediction
+        .is_none_or(|admission| {
+            config
+                .predictive_reclaim
+                .read()
+                .authorize(admission, now)
+                .is_ok()
+        })
+        .then_some(false)
 }
 
 /// Share of a pass's CPU allowance the priority pre-scan may spend before the
@@ -4760,6 +4957,7 @@ fn same_queued_scan_scope(left: &ScanRequest, right: &ScanRequest) -> bool {
             == right.filesystem_reclaim.as_ref().map(|scope| scope.mount())
         && left.ram_reclaim.is_some() == right.ram_reclaim.is_some()
         && left.inode_reclaim.is_some() == right.inode_reclaim.is_some()
+        && left.predictive_reclaim.is_some() == right.predictive_reclaim.is_some()
         && left.maintenance == right.maintenance
         && left.target_bytes.is_some() == right.target_bytes.is_some()
         && left.paths.len() == right.paths.len()
@@ -5521,6 +5719,10 @@ impl MonitoringDaemon {
             config.scoring.batch_risk_budget_by_level,
             config.scoring.false_positive_loss,
         );
+        shared_executor_config
+            .predictive_reclaim
+            .write()
+            .update(&config.pressure.prediction, &config.scoring);
         *shared_executor_config.inode_pressure.write() = config.pressure.inodes.clone();
         *shared_executor_config.disk_pressure.write() = PidConfig::from(&config.pressure);
         let compress_tier =
@@ -7595,6 +7797,10 @@ impl MonitoringDaemon {
     /// A later successful sample must admit fresh work; it cannot revive a
     /// cancelled staging pass, compression probe or target-only batch.
     fn withdraw_pressure_authority(&mut self) {
+        self.shared_executor_config
+            .predictive_reclaim
+            .write()
+            .revoke_all();
         self.recovery_probes.cancel_all();
         self.invalidate_logging_ram_observations();
         self.ballast_replenisher.cancel();
@@ -7733,6 +7939,10 @@ impl MonitoringDaemon {
         // reliable mount provenance, never counted as a successful forecast.
         for (mount, monitor) in &mut self.mount_monitors {
             if !stats_by_mount.contains_key(mount) {
+                self.shared_executor_config
+                    .predictive_reclaim
+                    .write()
+                    .revoke_mount(mount);
                 monitor.prediction_scorecard.discard_pending();
             } else if self.last_tick_cleanup_ran {
                 monitor.prediction_scorecard.censor_pending();
@@ -7803,6 +8013,10 @@ impl MonitoringDaemon {
             } = observation;
             let stats = &sample.stats;
             if filesystem_changed {
+                self.shared_executor_config
+                    .predictive_reclaim
+                    .write()
+                    .revoke_mount(&mount_path);
                 // A reused mount path does not inherit a former filesystem's
                 // exhausted-surface backoff, reserve growth or release result.
                 self.mount_controllers.remove(&mount_path);
@@ -8356,6 +8570,10 @@ impl MonitoringDaemon {
         // mount must not lower the executor's score floor on another mount.
         self.shared_executor_config
             .set_min_score(self.config.scoring.min_score);
+        self.shared_executor_config
+            .predictive_reclaim
+            .write()
+            .update(&self.config.pressure.prediction, &self.config.scoring);
 
         let behavior = self.behavior_state.mode;
         let scan_allowed = behavior_allows_scan(behavior);
@@ -8390,6 +8608,27 @@ impl MonitoringDaemon {
             self.config.scanner.cross_devices && !observed_root_paths.is_empty();
 
         let mut responses = std::mem::take(&mut self.mount_responses);
+        let predictive_observations: Vec<_> = responses
+            .iter()
+            .filter_map(|tick| {
+                let mount = predictive_cleanup_mount(tick)?;
+                let sample = &self
+                    .mount_monitors
+                    .get(mount)?
+                    .last_observation
+                    .as_ref()?
+                    .sample;
+                (sample.mount_owner().path == mount).then(|| PredictiveObservation {
+                    action: tick.predictive_action.clone(),
+                    collected_at: sample.collected_at,
+                    max_age: Self::filesystem_observation_max_age(&self.config),
+                })
+            })
+            .collect();
+        self.shared_executor_config
+            .predictive_reclaim
+            .write()
+            .observe_samples(&predictive_observations, now);
         self.check_predictive_warnings(&responses, now);
         // A wake is held for every controlled mount (and every mount sampled
         // now) until a tick that samples that mount delivers it. A replaced
@@ -8969,6 +9208,7 @@ impl MonitoringDaemon {
                     paths,
                     admitted_scanner: Arc::new(self.config.scanner.clone()),
                     filesystem_reclaim: None,
+                    predictive_reclaim: None,
                     urgency: response.urgency.max(0.05),
                     pressure_level: response.level,
                     free_pct: Some(response.free_pct),
@@ -8997,21 +9237,10 @@ impl MonitoringDaemon {
             let in_fallback = self.policy_engine.lock().mode() == ActiveMode::FallbackSafe;
             let mut predictive_cleanup = false;
             for tick in &responses {
-                let mount = match &tick.predictive_action {
-                    PredictiveAction::PreemptiveCleanup { mount, .. }
-                    | PredictiveAction::ImminentDanger { mount, .. } => mount,
-                    PredictiveAction::Clear | PredictiveAction::EarlyWarning { .. } => continue,
+                let Some(mount) = predictive_cleanup_mount(tick) else {
+                    continue;
                 };
                 let physical = &tick.filesystem_response;
-                if physical.causing_mount != *mount
-                    || tick.response.causing_mount != *mount
-                    || physical.level != PressureLevel::Green
-                    || tick.response.level != PressureLevel::Green
-                    || tick.ram_reclaim.is_some()
-                    || tick.inode_reclaim.is_some()
-                {
-                    continue;
-                }
                 predictive_cleanup = true;
                 if tick.predictive_action.should_release_ballast() && tick.imminent_danger {
                     let _ = self.release_ballast(mount, physical);
@@ -9022,12 +9251,12 @@ impl MonitoringDaemon {
                 if scan_allowed && !in_fallback {
                     let paths: Vec<PathBuf> = root_mounts
                         .iter()
-                        .filter(|(_, root_mount)| root_mount.as_deref() == Some(mount.as_path()))
+                        .filter(|(_, root_mount)| root_mount.as_deref() == Some(mount))
                         .map(|(root, _)| root.clone())
                         .collect();
                     if !paths.is_empty() {
-                        self.send_scan_request(scan_tx, scan_rx, physical, &paths, None, None);
-                        self.last_tick_cleanup_ran = true;
+                        self.last_tick_cleanup_ran |=
+                            self.send_predictive_scan_request(scan_tx, scan_rx, tick, &paths);
                     }
                 }
             }
@@ -9815,11 +10044,22 @@ impl MonitoringDaemon {
         if response.level < PressureLevel::Orange && scan_tx.is_full() {
             return;
         }
-        let Some(filesystem_reclaim) =
-            self.filesystem_reclaim_scope(&response.causing_mount, paths, false)
+        let Some(request) = self.prepare_scan_request(response, paths, ram_reclaim, inode_reclaim)
         else {
             return;
         };
+        self.enqueue_scan_logged(scan_tx, scan_rx, response, request);
+    }
+
+    fn prepare_scan_request(
+        &self,
+        response: &PressureResponse,
+        paths: &[PathBuf],
+        ram_reclaim: Option<RamReclaimRequest>,
+        inode_reclaim: Option<InodeReclaimRequest>,
+    ) -> Option<ScanRequest> {
+        let filesystem_reclaim =
+            self.filesystem_reclaim_scope(&response.causing_mount, paths, false)?;
         let paths = filesystem_reclaim.scan_paths();
 
         // W1 planner: the bytes that bring the pressured mount back to
@@ -9845,10 +10085,11 @@ impl MonitoringDaemon {
                         wanted.saturating_sub(stats.available_bytes)
                     })
             });
-        let request = ScanRequest {
+        Some(ScanRequest {
             paths,
             admitted_scanner: Arc::new(self.config.scanner.clone()),
             filesystem_reclaim: Some(filesystem_reclaim),
+            predictive_reclaim: None,
             urgency: response.urgency,
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
@@ -9864,8 +10105,60 @@ impl MonitoringDaemon {
             target_bytes,
             ram_reclaim,
             inode_reclaim,
+        })
+    }
+
+    fn send_predictive_scan_request(
+        &mut self,
+        scan_tx: &Sender<ScanRequest>,
+        scan_rx: &Receiver<ScanRequest>,
+        tick: &MountTickResponse,
+        paths: &[PathBuf],
+    ) -> bool {
+        if scan_tx.is_full() {
+            return false;
+        }
+        let Some(mount) = predictive_cleanup_mount(tick) else {
+            return false;
         };
-        self.enqueue_scan_logged(scan_tx, scan_rx, response, request);
+        let Some(observation) = self
+            .mount_monitors
+            .get(mount)
+            .and_then(|monitor| monitor.last_observation.as_ref())
+            .filter(|observation| observation.sample.mount_owner().path == mount)
+        else {
+            return false;
+        };
+        let Some(mut request) =
+            self.prepare_scan_request(&tick.filesystem_response, paths, None, None)
+        else {
+            return false;
+        };
+        if !request
+            .filesystem_reclaim
+            .as_ref()
+            .is_some_and(|scope| scope.matches_sample(&observation.sample))
+        {
+            return false;
+        }
+        let Some(admission) = self
+            .shared_executor_config
+            .predictive_reclaim
+            .write()
+            .admit(
+                &tick.predictive_action,
+                observation.sample.collected_at,
+                Self::filesystem_observation_max_age(&self.config),
+                Instant::now(),
+            )
+        else {
+            return false;
+        };
+        request.predictive_reclaim = Some(admission);
+        matches!(
+            self.enqueue_scan_logged(scan_tx, scan_rx, &tick.filesystem_response, request),
+            ScanEnqueueStatus::Queued | ScanEnqueueStatus::ReplacedStale
+        )
     }
 
     /// Catalog roots for `mount` (W1 catalog roots), derived from the
@@ -9968,6 +10261,7 @@ impl MonitoringDaemon {
             paths,
             admitted_scanner: Arc::new(self.config.scanner.clone()),
             filesystem_reclaim: Some(filesystem_reclaim),
+            predictive_reclaim: None,
             urgency: response.urgency,
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
@@ -10119,6 +10413,7 @@ impl MonitoringDaemon {
             paths: scanner.root_paths.clone(),
             admitted_scanner: Arc::new(scanner.clone()),
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             urgency: response.urgency.max(0.5), // at least moderate urgency for forced scans
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
@@ -10425,6 +10720,7 @@ impl MonitoringDaemon {
                     paths: filesystem_reclaim.scan_paths(),
                     admitted_scanner: Arc::new(self.config.scanner.clone()),
                     filesystem_reclaim: Some(filesystem_reclaim),
+                    predictive_reclaim: None,
                     urgency,
                     pressure_level,
                     free_pct: Some(stats.free_pct()),
@@ -10673,6 +10969,10 @@ impl MonitoringDaemon {
                         .store(new_config.scanner.max_delete_batch, Ordering::Relaxed);
                     self.shared_executor_config
                         .set_min_score(new_config.scoring.min_score);
+                    self.shared_executor_config
+                        .predictive_reclaim
+                        .write()
+                        .update(&new_config.pressure.prediction, &new_config.scoring);
                     self.shared_executor_config.repeat_base_cooldown_secs.store(
                         new_config.scanner.repeat_deletion_base_cooldown_secs,
                         Ordering::Relaxed,
@@ -11299,6 +11599,15 @@ fn dispatch_top_candidates(
     dispatched: &mut PassDispatch,
     executor_config: &SharedExecutorConfig,
 ) -> bool {
+    if request
+        .authorize_predictive(executor_config, Instant::now())
+        .is_err()
+    {
+        // An expired/withdrawn forecast contributes neither queue work nor
+        // reclaimed-byte progress. A fresh pass must score these artifacts.
+        scored.clear();
+        return true;
+    }
     // Neither a path under a dispatched tree nor one containing it: deleting
     // an ancestor would take a subtree rebuilt since its own deletion. The
     // ancestor waits for the next pass.
@@ -11317,6 +11626,9 @@ fn dispatch_top_candidates(
                 .as_ref()
                 .is_some_and(|relief| relief.accepts_candidate(candidate)))
             && request.permits_reclaim_candidate(candidate)
+            && request.predictive_reclaim.as_ref().is_none_or(|admission| {
+                candidate.total_score.is_finite() && candidate.total_score >= admission.min_score()
+            })
             && !dispatched
                 .paths
                 .iter()
@@ -11337,6 +11649,7 @@ fn dispatch_top_candidates(
         candidates: Vec::new(),
         admitted_scanner: Arc::clone(&request.admitted_scanner),
         filesystem_reclaim: request.filesystem_reclaim.clone(),
+        predictive_reclaim: request.predictive_reclaim.clone(),
         pressure_level: request.pressure_level,
         urgency: request.urgency,
         scan_now: request.scan_now.clone(),
@@ -12271,7 +12584,7 @@ fn scanner_thread_main(
     // counter has not moved, those dispatches reclaimed nothing (dry-run,
     // observe mode, every candidate dampened or failed) and the pass is paced
     // like an empty one instead of rescanning every tick.
-    let mut unconfirmed_dispatch: Option<u64> = None;
+    let mut unconfirmed_dispatch: Option<(u64, Option<PredictiveScanAdmission>)> = None;
     // Whether the last confirmed dispatch reclaimed nothing (#36). Kept across
     // requests: the request that notices arms the cooldown and is itself
     // skipped, so the verdict must reach the pass that eventually runs.
@@ -12381,7 +12694,13 @@ fn scanner_thread_main(
         }
 
         // Read latest config at the start of each scan.
-        let current_scoring_config = shared_scoring_config.read().clone();
+        let configured_scoring = shared_scoring_config.read().clone();
+        let Ok(current_scoring_config) =
+            request.scoring_config(&configured_scoring, executor_config, Instant::now())
+        else {
+            heartbeat.beat();
+            continue;
+        };
         let current_scanner_config = shared_scanner_config.read().clone();
         if !scanner_mutation_scope_matches(
             &request.admitted_scanner,
@@ -12479,10 +12798,19 @@ fn scanner_thread_main(
         }
 
         let mut dispatch_confirmed_empty = false;
-        if let Some(reclaim_before) = unconfirmed_dispatch.take() {
-            dispatch_confirmed_empty = executor_config.reclaim_events() == reclaim_before;
+        if let Some((reclaim_before, prediction)) = unconfirmed_dispatch.take() {
+            let outcome = confirm_scanner_dispatch(
+                reclaim_before,
+                prediction.as_ref(),
+                executor_config,
+                Instant::now(),
+            );
+            // A batch withdrawn while queued proves nothing about whether
+            // its roots contain reclaimable work. Only confirmed permission
+            // can turn the lack of executor progress into an empty result.
+            dispatch_confirmed_empty = outcome == Some(false);
             last_dispatch_reclaimed_nothing = dispatch_confirmed_empty;
-            if !dispatch_confirmed_empty {
+            if outcome == Some(true) {
                 // A confirmed reclaim ends the streak that earlier fruitless
                 // dispatches built; the empty passes that follow it start
                 // from the base interval again.
@@ -12933,7 +13261,8 @@ fn scanner_thread_main(
             Duration::from_secs(current_scanner_config.prescan_time_budget_secs),
             PassCpuGuard::new(budget_allowance, scan_start, current_scan_cpu_secs),
         )
-        .with_history(Arc::clone(regret));
+        .with_history(Arc::clone(regret))
+        .with_predictive_authority(&request, executor_config);
 
         // Track total candidates found (priority pre-scan + general walker).
         let mut candidates_found = 0;
@@ -13149,6 +13478,7 @@ fn scanner_thread_main(
                 v2_candidate_bytes_seen = dispatched_this_pass.bytes;
                 deferred_candidates.append(&mut indexed_candidates);
                 if v2_candidate_byte_target.is_some_and(|target| v2_candidate_bytes_seen >= target)
+                    && !limits.policy_changed_at(Instant::now())
                 {
                     logger.send(ActivityEvent::ScanCompleted {
                         paths_scanned: 0,
@@ -13179,7 +13509,8 @@ fn scanner_thread_main(
                             ),
                         });
                     }
-                    unconfirmed_dispatch = Some(reclaim_at_pass_start);
+                    unconfirmed_dispatch =
+                        Some((reclaim_at_pass_start, request.predictive_reclaim.clone()));
                     continue;
                 }
             }
@@ -13669,6 +14000,9 @@ fn scanner_thread_main(
         if scanner_should_exit {
             break;
         }
+        if limits.policy_changed_at(Instant::now()) {
+            prescan_stop = Some(PassStop::PolicyChanged);
+        }
         if let Some(stop) = prescan_stop {
             if stop.ends_pass() {
                 scan_timed_out = true;
@@ -13679,7 +14013,9 @@ fn scanner_thread_main(
                 stop.label(),
                 limits.elapsed().as_secs_f64(),
             );
-            if claim_budget_warning(&mut last_budget_warning, Instant::now()) {
+            if stop != PassStop::PolicyChanged
+                && claim_budget_warning(&mut last_budget_warning, Instant::now())
+            {
                 logger.send(ActivityEvent::Warning {
                     code: "SBH-2007".to_string(),
                     message: format!(
@@ -13761,6 +14097,8 @@ fn scanner_thread_main(
         if scanner_should_exit {
             break;
         }
+        let permission_withdrawn = limits.policy_changed_at(Instant::now());
+        scan_timed_out |= permission_withdrawn;
         if scan_timed_out {
             let duration = scan_start.elapsed();
             let root_stats = root_stats_map.into_values().collect();
@@ -13807,22 +14145,30 @@ fn scanner_thread_main(
             // was rescanned every ~20 s at the CPU-budget ceiling for as long
             // as anything under it changed (mac-studio: 36 of the daemon's 60
             // CPU-minutes in 6.4 h, nothing to reclaim).
-            if dispatched_this_pass.count == 0 {
-                record_empty_pass(
-                    &mut consecutive_empty_passes,
-                    &mut inconclusive_empty_passes,
-                    true,
-                );
-                last_empty_pass_at = Some(Instant::now());
-                note_empty_pass_level(&mut empty_level_peak, request_level, Instant::now());
-            } else {
-                record_dispatching_pass(
-                    last_dispatch_reclaimed_nothing,
-                    &mut consecutive_empty_passes,
-                    &mut inconclusive_empty_passes,
-                    &mut last_empty_pass_at,
-                );
-                unconfirmed_dispatch = Some(reclaim_at_pass_start);
+            if !permission_withdrawn {
+                if dispatched_this_pass.count == 0 {
+                    record_empty_pass(
+                        &mut consecutive_empty_passes,
+                        &mut inconclusive_empty_passes,
+                        true,
+                    );
+                    last_empty_pass_at = Some(Instant::now());
+                    note_empty_pass_level(&mut empty_level_peak, request_level, Instant::now());
+                } else {
+                    record_dispatching_pass(
+                        last_dispatch_reclaimed_nothing,
+                        &mut consecutive_empty_passes,
+                        &mut inconclusive_empty_passes,
+                        &mut last_empty_pass_at,
+                    );
+                    unconfirmed_dispatch =
+                        Some((reclaim_at_pass_start, request.predictive_reclaim.clone()));
+                }
+            } else if dispatched_this_pass.count > 0 {
+                // Earlier authorized mutations still count; withdrawal only
+                // makes an unchanged reclaim counter inconclusive.
+                unconfirmed_dispatch =
+                    Some((reclaim_at_pass_start, request.predictive_reclaim.clone()));
             }
             last_pass_duration = pass_started_at.elapsed();
             last_pass_finished_at = Some(Instant::now());
@@ -13831,6 +14177,7 @@ fn scanner_thread_main(
         }
         if let Some(target_bytes) = v2_candidate_byte_target
             && v2_candidate_bytes_seen >= target_bytes
+            && !limits.policy_changed_at(Instant::now())
         {
             let duration = scan_start.elapsed();
             if scanner_index_enabled && let Some(index) = scanner_index.as_mut() {
@@ -13881,7 +14228,8 @@ fn scanner_thread_main(
                 &mut inconclusive_empty_passes,
                 &mut last_empty_pass_at,
             );
-            unconfirmed_dispatch = Some(reclaim_at_pass_start);
+            unconfirmed_dispatch =
+                Some((reclaim_at_pass_start, request.predictive_reclaim.clone()));
             last_pass_duration = pass_started_at.elapsed();
             last_pass_finished_at = Some(Instant::now());
             last_pass_level = Some(request_level);
@@ -14021,6 +14369,11 @@ fn scanner_thread_main(
         let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
         let mut non_barren_dirs: HashSet<PathBuf> = HashSet::new();
         let mut dispatch_pacer = ScannerDispatchPacer::new(request.max_delete_batch, scan_start);
+        let entry_wait = if request.predictive_reclaim.is_some() {
+            WORKER_SHUTDOWN_POLL_INTERVAL
+        } else {
+            Duration::from_secs(2)
+        };
 
         // Process entries with timeout to handle walker deadlocks.
         // The walker can deadlock when both worker threads block on a full work queue
@@ -14032,13 +14385,19 @@ fn scanner_thread_main(
                 scanner_should_exit = true;
                 break;
             }
+            if limits.policy_changed_at(Instant::now()) {
+                cancel_token.store(true, Ordering::Relaxed);
+                scan_timed_out = true;
+                walk_stop = Some(PassStop::PolicyChanged);
+                break;
+            }
             if executor_config.holds_recursive_scan(&request) {
                 cancel_token.store(true, Ordering::Relaxed);
                 scan_timed_out = true;
                 walk_stop = Some(PassStop::ScanPosture);
                 break;
             }
-            let mut entry = match rx.recv_timeout(Duration::from_secs(2)) {
+            let mut entry = match rx.recv_timeout(entry_wait) {
                 Ok(entry) => entry,
                 Err(RecvTimeoutError::Timeout) => {
                     if shutdown.load(Ordering::Relaxed) {
@@ -14046,7 +14405,8 @@ fn scanner_thread_main(
                         scanner_should_exit = true;
                         break;
                     }
-                    // No entries for 2 seconds — check if budget is exhausted.
+                    // A quiet stream still renews forecast permission and
+                    // checks its budget, without waiting for a candidate.
                     if let Some(stop) = limits.walk_stop() {
                         cancel_token.store(true, Ordering::Relaxed);
                         scan_timed_out = true;
@@ -14406,7 +14766,13 @@ fn scanner_thread_main(
         // at or above that ground may be cached as barren (bd-y70k). If the
         // walker threads do not stop in time, what they left is unknown, and
         // the pass caches nothing new.
+        if limits.policy_changed_at(Instant::now()) {
+            cancel_token.store(true, Ordering::Relaxed);
+            scan_timed_out = true;
+            walk_stop = Some(PassStop::PolicyChanged);
+        }
         let mut walk_stopped = false;
+        let mut completed_walk = None;
         if walk_exhausted
             && request.catalog_roots.is_empty()
             && !scan_timed_out
@@ -14419,10 +14785,7 @@ fn scanner_thread_main(
             // recorded unfinished subtree still keeps the event work pending.
             let unfinished = rx.unfinished_after_cancel(Duration::ZERO);
             walk_stopped = unfinished.is_some();
-            pending_event_invalidation.acknowledge_walk(&active_scan_paths, unfinished.as_deref());
-            for stat in root_stats_map.values_mut() {
-                stat.finish_recursive_walk(unfinished.as_deref());
-            }
+            completed_walk = unfinished;
         } else if scan_timed_out || uses_dispatch_cursor {
             // Byte-target and shutdown stops also owe final consumer
             // receipts before their dispatch priority can be checkpointed.
@@ -14458,6 +14821,21 @@ fn scanner_thread_main(
             scanner_should_exit = true;
         }
         v2_candidate_bytes_seen = dispatched_this_pass.bytes;
+        let permission_withdrawn = finish_authorized_scanner_walk(
+            &mut limits,
+            &mut pending_event_invalidation,
+            &active_scan_paths,
+            &mut root_stats_map,
+            completed_walk.as_deref(),
+            Instant::now(),
+        ) == Some(PassStop::PolicyChanged);
+        if permission_withdrawn {
+            scan_timed_out = true;
+            walk_stop = Some(PassStop::PolicyChanged);
+            // Root/dispatch order still retains the finite walk's progress;
+            // its interrupted scoring policy cannot certify barren entries.
+            visited_dirs.clear();
+        }
 
         // Only proven root coverage trains full-scan cost estimates. The
         // walker interleaves roots, so completed passes divide their cost;
@@ -14491,6 +14869,11 @@ fn scanner_thread_main(
             if walk_stop == Some(PassStop::ScanPosture) {
                 logger.send(ActivityEvent::Info {
                     message: "scanner posture deferred recursive discovery; unfinished roots remain pending"
+                        .to_string(),
+                });
+            } else if walk_stop == Some(PassStop::PolicyChanged) {
+                logger.send(ActivityEvent::Info {
+                    message: "predictive cleanup permission changed; unfinished roots remain pending without empty-pass backoff"
                         .to_string(),
                 });
             } else if claim_budget_warning(&mut last_budget_warning, Instant::now()) {
@@ -14620,32 +15003,40 @@ fn scanner_thread_main(
                 ),
             });
         }
-        if dispatched_this_pass.count == 0 {
-            record_empty_pass(
-                &mut consecutive_empty_passes,
-                &mut inconclusive_empty_passes,
-                scan_timed_out,
-            );
-            last_empty_pass_at = Some(Instant::now());
-            note_empty_pass_level(&mut empty_level_peak, request_level, Instant::now());
-            let next_secs = effective_empty_pass_cooldown(
-                current_scanner_config.min_rescan_interval_secs,
-                consecutive_empty_passes,
-            )
-            .as_secs();
-            if next_secs > 0 {
-                eprintln!(
-                    "[SBH-SCANNER] no reclaimable progress this pass ({candidates_found} candidates, {held_by_certainty} held below {pass_min_certainty}, 0 dispatched, timed_out={scan_timed_out}); backing off rescans (consecutive={consecutive_empty_passes}, next pressure-driven scan in ≥{next_secs}s)"
+        if !permission_withdrawn {
+            if dispatched_this_pass.count == 0 {
+                record_empty_pass(
+                    &mut consecutive_empty_passes,
+                    &mut inconclusive_empty_passes,
+                    scan_timed_out,
                 );
+                last_empty_pass_at = Some(Instant::now());
+                note_empty_pass_level(&mut empty_level_peak, request_level, Instant::now());
+                let next_secs = effective_empty_pass_cooldown(
+                    current_scanner_config.min_rescan_interval_secs,
+                    consecutive_empty_passes,
+                )
+                .as_secs();
+                if next_secs > 0 {
+                    eprintln!(
+                        "[SBH-SCANNER] no reclaimable progress this pass ({candidates_found} candidates, {held_by_certainty} held below {pass_min_certainty}, 0 dispatched, timed_out={scan_timed_out}); backing off rescans (consecutive={consecutive_empty_passes}, next pressure-driven scan in ≥{next_secs}s)"
+                    );
+                }
+            } else {
+                record_dispatching_pass(
+                    last_dispatch_reclaimed_nothing,
+                    &mut consecutive_empty_passes,
+                    &mut inconclusive_empty_passes,
+                    &mut last_empty_pass_at,
+                );
+                unconfirmed_dispatch =
+                    Some((reclaim_at_pass_start, request.predictive_reclaim.clone()));
             }
-        } else {
-            record_dispatching_pass(
-                last_dispatch_reclaimed_nothing,
-                &mut consecutive_empty_passes,
-                &mut inconclusive_empty_passes,
-                &mut last_empty_pass_at,
-            );
-            unconfirmed_dispatch = Some(reclaim_at_pass_start);
+        } else if dispatched_this_pass.count > 0 {
+            // Keep confirmation of earlier mutations without classifying
+            // this interrupted pass as empty or complete.
+            unconfirmed_dispatch =
+                Some((reclaim_at_pass_start, request.predictive_reclaim.clone()));
         }
 
         // #15: record this pass's cost so the next pressure-driven pass owes
@@ -14852,6 +15243,10 @@ fn retain_filesystem_reclaim_candidates(
 #[cfg(all(test, unix))]
 #[path = "filesystem_reclaim/executor_tests.rs"]
 mod filesystem_reclaim_executor_tests;
+
+#[cfg(all(test, unix))]
+#[path = "predictive_reclaim/integration_tests.rs"]
+mod predictive_reclaim_integration_tests;
 
 /// The operator's `protected_paths` as the executor applies them to a batch.
 /// A target-only batch (bd-232u) goes without the patterns that protect its
@@ -15208,6 +15603,19 @@ fn executor_thread_main(
             continue;
         }
 
+        // Forecast permission can expire or be withdrawn while filesystem
+        // checks run. Refuse it before policy evaluation consumes a Canary
+        // slot or records a new approval for this queued batch.
+        if batch.min_score(shared_config, Instant::now()).is_err() {
+            logger.send(ActivityEvent::Info {
+                message: format!(
+                    "dropped {} queued candidate(s): predictive cleanup permission is no longer current",
+                    batch.candidates.len(),
+                ),
+            });
+            continue;
+        }
+
         // Gate candidates through the policy engine. The lock is held only for
         // the duration of evaluate() (pure computation, no I/O).
         let decision = {
@@ -15286,7 +15694,9 @@ fn executor_thread_main(
         // Read latest config from shared atomics (updated by config reload).
         let dry_run = shared_config.dry_run.load(Ordering::Relaxed);
         let max_batch_size = shared_config.max_batch_size.load(Ordering::Relaxed);
-        let min_score = shared_config.min_score();
+        let Ok(min_score) = batch.min_score(shared_config, Instant::now()) else {
+            continue;
+        };
         // RAM/inode relief renews its own resource authority; explicit
         // scan-now already checks current pressure and its selected mount.
         // Green maintenance retains its existing quarantine admission.
@@ -15629,7 +16039,17 @@ fn executor_thread_main(
                     shared_config.authorize_compression_first(candidate, batch.pressure_level)?;
                 }
             }
-            regret.authorize_deletion(candidate, logger)
+            regret.authorize_deletion(candidate, logger)?;
+            // This is the last live gate, including the executor's renewal
+            // after recursive inspection. A previously configured lower
+            // score floor cannot survive revocation, expiry or policy reload.
+            let current_min_score = batch.min_score(shared_config, Instant::now())?;
+            if batch.predictive_reclaim.is_some()
+                && (!candidate.total_score.is_finite() || candidate.total_score < current_min_score)
+            {
+                return Err(SkipReason::PolicyChanged);
+            }
+            Ok(())
         };
         let on_unlinked = |candidate: &CandidacyScore, completed_at: Instant| {
             if let Some(relief) = &batch.ram_reclaim {
@@ -18185,6 +18605,7 @@ mod tests {
                     force_full_scan: true,
                     scan_now: None,
                     filesystem_reclaim: None,
+                    predictive_reclaim: None,
                     inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
@@ -19423,6 +19844,18 @@ mod tests {
             Arc::new(platform),
         )
         .unwrap();
+        let observations = mounts
+            .iter()
+            .map(|mount| {
+                (
+                    mount.clone(),
+                    daemon.fs_collector.collect_admission_sample(mount).unwrap(),
+                )
+            })
+            .collect();
+        daemon
+            .evaluate_pressure_samples(observations, Instant::now())
+            .unwrap();
         daemon.behavior_state.mode = mock_behavior_mode(
             ScanAggressiveness::Normal,
             CleanupAction::AnyDefiniteCandidate,
@@ -19451,7 +19884,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn green_predictive_scans_use_each_mounts_physical_evidence_and_keep_score_floor() {
+    fn green_predictive_scans_use_each_mounts_physical_evidence_and_own_score_floor() {
         let (mut fixture, [steady, filling, also_filling]) = green_predictive_fixture();
         let daemon = &mut fixture.daemon;
         let mut worst = green_predictive_tick(&steady);
@@ -19488,6 +19921,19 @@ mod tests {
             assert_eq!(request.urgency, urgency);
             assert_eq!(request.free_pct, Some(free_pct));
             assert_eq!(request.max_delete_batch, limit);
+            let admission = request.predictive_reclaim.as_ref().unwrap();
+            assert_eq!(admission.mount(), mount.as_path());
+            assert_eq!(admission.min_score(), 0.1);
+            let effective = request
+                .scoring_config(
+                    &daemon.config.scoring,
+                    &daemon.shared_executor_config,
+                    Instant::now(),
+                )
+                .unwrap();
+            let mut expected = daemon.config.scoring.clone();
+            expected.min_score = 0.1;
+            assert_eq!(effective, expected);
         }
         assert_eq!(daemon.shared_executor_config.min_score(), 0.85);
     }
@@ -19501,6 +19947,9 @@ mod tests {
             "mismatched-mount",
             "unobserved-roots",
             "non-green-physical",
+            "missing-observation",
+            "stale-observation",
+            "replaced-mount-directory",
         ] {
             let (mut fixture, [steady, filling, _]) = green_predictive_fixture();
             let daemon = &mut fixture.daemon;
@@ -19526,6 +19975,31 @@ mod tests {
                 "non-green-physical" => {
                     tick.filesystem_response.level = PressureLevel::Orange;
                 }
+                "missing-observation" => {
+                    daemon
+                        .mount_monitors
+                        .get_mut(&filling)
+                        .unwrap()
+                        .last_observation = None;
+                }
+                "stale-observation" => {
+                    let max_age = MonitoringDaemon::filesystem_observation_max_age(&daemon.config);
+                    daemon
+                        .mount_monitors
+                        .get_mut(&filling)
+                        .unwrap()
+                        .last_observation
+                        .as_mut()
+                        .unwrap()
+                        .sample
+                        .collected_at = Instant::now()
+                        .checked_sub(max_age + Duration::from_secs(1))
+                        .expect("the expired observation timestamp is representable");
+                }
+                "replaced-mount-directory" => {
+                    std::fs::rename(&filling, filling.with_extension("retired")).unwrap();
+                    std::fs::create_dir_all(filling.join("project")).unwrap();
+                }
                 _ => {}
             }
             daemon.last_predictive_action = tick.predictive_action.clone();
@@ -19541,6 +20015,126 @@ mod tests {
                 "{case} cannot authorize predictive scans"
             );
             assert_eq!(daemon.shared_executor_config.min_score(), 0.85, "{case}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn green_predictive_monitor_withdraws_queued_authority_per_mount() {
+        for case in ["clear", "missing", "replaced"] {
+            let (mut fixture, [steady, filling, peer]) = green_predictive_fixture();
+            let daemon = &mut fixture.daemon;
+            let mut worst = green_predictive_tick(&steady);
+            worst.predictive_action = PredictiveAction::Clear;
+            daemon.mount_responses = vec![
+                worst.clone(),
+                green_predictive_tick(&filling),
+                green_predictive_tick(&peer),
+            ];
+            let (scan_tx, scan_rx) = bounded(8);
+            let (del_tx, _del_rx) = bounded(8);
+            daemon.handle_pressure(&worst.response, &scan_tx, &scan_rx, &del_tx);
+            let scans: Vec<_> = scan_rx.try_iter().collect();
+            assert_eq!(scans.len(), 2, "{case}");
+            let withdrawn = scans
+                .iter()
+                .find(|scan| scan.predictive_reclaim.as_ref().unwrap().mount() == filling.as_path())
+                .unwrap();
+            let independent = scans
+                .iter()
+                .find(|scan| scan.predictive_reclaim.as_ref().unwrap().mount() == peer.as_path())
+                .unwrap();
+
+            if case == "clear" {
+                let mut cleared = green_predictive_tick(&filling);
+                cleared.predictive_action = PredictiveAction::Clear;
+                daemon.mount_responses = vec![worst.clone(), cleared, green_predictive_tick(&peer)];
+                daemon.handle_pressure(&worst.response, &scan_tx, &scan_rx, &del_tx);
+            } else {
+                let mut observations: HashMap<_, _> = daemon
+                    .mount_monitors
+                    .iter()
+                    .filter_map(|(mount, monitor)| {
+                        Some((
+                            mount.clone(),
+                            monitor.last_observation.as_ref()?.sample.clone(),
+                        ))
+                    })
+                    .collect();
+                if case == "missing" {
+                    observations.remove(&filling);
+                } else {
+                    std::fs::rename(&filling, filling.with_extension("retired")).unwrap();
+                    std::fs::create_dir_all(filling.join("project")).unwrap();
+                    observations.insert(
+                        filling.clone(),
+                        daemon
+                            .fs_collector
+                            .collect_admission_sample(&filling)
+                            .unwrap(),
+                    );
+                }
+                // Sampling itself must withdraw authority; an error or a
+                // later handler must not leave the old queued work live.
+                daemon
+                    .evaluate_pressure_samples(observations, Instant::now())
+                    .unwrap();
+            }
+            assert_eq!(
+                withdrawn.authorize_predictive(&daemon.shared_executor_config, Instant::now()),
+                Err(SkipReason::PolicyChanged),
+                "{case}"
+            );
+            assert!(
+                independent
+                    .authorize_predictive(&daemon.shared_executor_config, Instant::now())
+                    .is_ok(),
+                "{case}: another filesystem keeps its own current forecast"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn green_predictive_reload_round_trip_cannot_revive_queued_permission() {
+        for change_scoring in [false, true] {
+            let (mut fixture, [_, filling, _]) = green_predictive_fixture();
+            let daemon = &mut fixture.daemon;
+            let tick = green_predictive_tick(&filling);
+            let paths = vec![filling.join("project")];
+            let (scan_tx, scan_rx) = bounded(8);
+            assert!(daemon.send_predictive_scan_request(&scan_tx, &scan_rx, &tick, &paths));
+            let old_request = scan_rx.try_recv().unwrap();
+            let original = daemon.config.clone();
+            daemon.apply_config_reload(Ok(original.clone()));
+            assert!(
+                old_request
+                    .authorize_predictive(&daemon.shared_executor_config, Instant::now())
+                    .is_ok(),
+                "an unchanged reload does not revoke the pass"
+            );
+            let mut replacement = original.clone();
+            if change_scoring {
+                replacement.scoring.min_score = 0.95;
+            } else {
+                replacement.pressure.prediction.enabled = false;
+            }
+            daemon.apply_config_reload(Ok(replacement));
+            // No worker checks the intermediate configuration. Restoring its
+            // exact previous value still cannot revive previously queued work.
+            daemon.apply_config_reload(Ok(original));
+            assert_eq!(
+                old_request.authorize_predictive(&daemon.shared_executor_config, Instant::now()),
+                Err(SkipReason::PolicyChanged)
+            );
+            assert!(daemon.send_predictive_scan_request(&scan_tx, &scan_rx, &tick, &paths));
+            let new_request = scan_rx.try_recv().unwrap();
+            assert!(
+                new_request
+                    .authorize_predictive(&daemon.shared_executor_config, Instant::now())
+                    .is_ok(),
+                "a fresh admission can use the restored policy"
+            );
         }
     }
 
@@ -21525,6 +22119,7 @@ mod tests {
             inode_reclaim: None,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
         };
         let (send, receive) = bounded(4);
         let mut deferred = None;
@@ -25900,6 +26495,7 @@ mod tests {
                 force_full_scan: false,
                 scan_now: None,
                 filesystem_reclaim: None,
+                predictive_reclaim: None,
                 inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
@@ -26033,6 +26629,7 @@ mod tests {
                     force_full_scan: false,
                     scan_now: None,
                     filesystem_reclaim: None,
+                    predictive_reclaim: None,
                     inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
@@ -26150,6 +26747,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -27293,6 +27891,7 @@ mod tests {
             inode_reclaim: None,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             target_only_root: Some(root.clone()),
             target_only_consent: Some(test_target_only_consent(&root, &scanner)),
         };
@@ -27449,6 +28048,7 @@ mod tests {
             inode_reclaim: None,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             target_only_root: target_only.then(|| root.clone()),
             target_only_consent: target_only.then(|| test_target_only_consent(&root, &scanner)),
         };
@@ -27738,6 +28338,7 @@ mod tests {
                 inode_reclaim: None,
                 scan_now: None,
                 filesystem_reclaim: None,
+                predictive_reclaim: None,
                 target_only_root: Some(root),
                 target_only_consent: (case != "missing").then_some(consent),
             })
@@ -27872,6 +28473,7 @@ mod tests {
                 inode_reclaim: None,
                 scan_now: None,
                 filesystem_reclaim: None,
+                predictive_reclaim: None,
                 target_only_root: target_only_root.map(Path::to_path_buf),
                 target_only_consent: target_only_root
                     .map(|root| test_target_only_consent(root, &scanner)),
@@ -28134,6 +28736,7 @@ mod tests {
             inode_reclaim: None,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             target_only_root: Some(root.clone()),
             target_only_consent: Some(test_target_only_consent(&root, &scanner)),
         };
@@ -28246,6 +28849,7 @@ mod tests {
             inode_reclaim: None,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             target_only_consent: target_only_root
                 .as_deref()
                 .map(|root| test_target_only_consent(root, &scanner)),
@@ -28334,6 +28938,7 @@ mod tests {
                 inode_reclaim: None,
                 scan_now: None,
                 filesystem_reclaim: None,
+                predictive_reclaim: None,
                 target_only_root: Some(root),
                 target_only_consent: Some(consent),
             })
@@ -28404,6 +29009,7 @@ mod tests {
                 inode_reclaim: None,
                 scan_now: None,
                 filesystem_reclaim: None,
+                predictive_reclaim: None,
                 target_only_root: None,
                 target_only_consent: None,
             })
@@ -28444,6 +29050,7 @@ mod tests {
             inode_reclaim: None,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             target_only_root: None,
             target_only_consent: None,
         };
@@ -28538,6 +29145,7 @@ mod tests {
                 inode_reclaim: request.inode_reclaim.clone(),
                 scan_now: request.scan_now.clone(),
                 filesystem_reclaim: None,
+                predictive_reclaim: None,
                 target_only_root: None,
                 target_only_consent: None,
             };
@@ -29647,6 +30255,7 @@ mod tests {
                     force_full_scan: false,
                     scan_now: None,
                     filesystem_reclaim: None,
+                    predictive_reclaim: None,
                     inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
@@ -29740,6 +30349,7 @@ mod tests {
                 force_full_scan: false,
                 scan_now: None,
                 filesystem_reclaim: None,
+                predictive_reclaim: None,
                 inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
@@ -30682,6 +31292,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -30976,6 +31587,7 @@ mod tests {
                 force_full_scan: false,
                 scan_now: None,
                 filesystem_reclaim: None,
+                predictive_reclaim: None,
                 inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
@@ -31115,6 +31727,7 @@ mod tests {
                     force_full_scan: false,
                     scan_now: None,
                     filesystem_reclaim: None,
+                    predictive_reclaim: None,
                     inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
@@ -31369,6 +31982,7 @@ mod tests {
                 force_full_scan: false,
                 scan_now: None,
                 filesystem_reclaim: None,
+                predictive_reclaim: None,
                 inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
@@ -31670,6 +32284,7 @@ mod tests {
                 force_full_scan: false,
                 scan_now: None,
                 filesystem_reclaim: None,
+                predictive_reclaim: None,
                 inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
@@ -31917,6 +32532,7 @@ mod tests {
                     force_full_scan: false,
                     scan_now: None,
                     filesystem_reclaim: None,
+                    predictive_reclaim: None,
                     inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
@@ -32065,6 +32681,7 @@ mod tests {
                         force_full_scan: false,
                         scan_now: None,
                         filesystem_reclaim: None,
+                        predictive_reclaim: None,
                         inode_reclaim: None,
                         config_update: None,
                         catalog_roots: Vec::new(),
@@ -32344,6 +32961,7 @@ mod tests {
                 force_full_scan: true,
                 scan_now: None,
                 filesystem_reclaim: None,
+                predictive_reclaim: None,
                 inode_reclaim: None,
                 config_update: None,
                 catalog_roots: Vec::new(),
@@ -33115,6 +33733,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -33155,6 +33774,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -33568,6 +34188,7 @@ mod tests {
             urgency: 1.0,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             target_bytes: Some(1),
             ram_reclaim: None,
             inode_reclaim: None,
@@ -33720,6 +34341,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -34141,6 +34763,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -34205,6 +34828,7 @@ mod tests {
                     force_full_scan: true,
                     scan_now: None,
                     filesystem_reclaim: None,
+                    predictive_reclaim: None,
                     inode_reclaim: None,
                     config_update: None,
                     catalog_roots: Vec::new(),
@@ -34394,6 +35018,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -34421,6 +35046,7 @@ mod tests {
             inode_reclaim: None,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             target_only_root: None,
             target_only_consent: None,
         };
@@ -34598,6 +35224,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -34633,6 +35260,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -34673,6 +35301,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -35470,6 +36099,7 @@ mod tests {
             force_full_scan: true,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -35643,6 +36273,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -36351,6 +36982,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -36385,6 +37017,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -36736,6 +37369,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -37249,6 +37883,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -37290,6 +37925,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
@@ -37309,6 +37945,7 @@ mod tests {
                 inode_reclaim: None,
                 scan_now: None,
                 filesystem_reclaim: None,
+                predictive_reclaim: None,
                 target_only_root: None,
                 target_only_consent: None,
             })
@@ -37364,6 +38001,7 @@ mod tests {
             force_full_scan: false,
             scan_now: None,
             filesystem_reclaim: None,
+            predictive_reclaim: None,
             inode_reclaim: None,
             config_update: None,
             catalog_roots: Vec::new(),
