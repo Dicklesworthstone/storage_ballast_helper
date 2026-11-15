@@ -98,13 +98,12 @@ impl Probe {
                 "scratch attribution requires normal relative components",
             ));
         }
-        let root_mount = match self.fallback_mount.get() {
-            Some(mount) => mount,
-            None => {
-                let mount = descriptor_mount_id(self.root.as_fd())?;
-                self.fallback_mount.set(Some(mount));
-                mount
-            }
+        let root_mount = if let Some(mount) = self.fallback_mount.get() {
+            mount
+        } else {
+            let mount = descriptor_mount_id(self.root.as_fd())?;
+            self.fallback_mount.set(Some(mount));
+            mount
         };
         let mut parent = self.root.try_clone()?;
         let mut names = bytes.split(|byte| *byte == b'/').peekable();
