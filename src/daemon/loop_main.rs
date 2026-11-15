@@ -28201,6 +28201,10 @@ mod tests {
         config.scanner.scan_time_budget_secs = 30;
         config.scanner.log_truncation.enabled = false;
         config.scoring.min_score = 0.0;
+        // Every fixture here is born now, and the Green passes are what
+        // must recover the deferred subtree: the maintenance idle wait
+        // (bd-i9uh) is off, as in daemon_e2e.
+        config.scoring.definite_floor_maintenance_idle_hours = 0;
 
         let log_path = temp.path().join("activity.jsonl");
         let (logger, logger_join) = spawn_logger(DualLoggerConfig {
