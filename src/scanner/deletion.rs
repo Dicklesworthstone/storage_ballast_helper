@@ -1149,6 +1149,8 @@ impl DeletionExecutor {
     /// A refusal is a typed skip, never a failed deletion or reclaimed bytes.
     /// Authorization is renewed after recursive content inspection, followed
     /// by the final source-root, direct-protection, lease and identity checks.
+    /// Quarantine renews it again after durable store preparation and before
+    /// moving the source, so a slow fsync cannot extend queued permission.
     /// Guards may run more than once and must not consume quotas. An
     /// already-started removal is not cancelled.
     pub fn execute_with_guard(
@@ -1398,16 +1400,23 @@ impl DeletionExecutor {
             // Actual deletion, or quarantine (Layer 7). Quarantine has no
             // successful-unlink outcome: failure cannot widen this plan.
             let outcome = match plan.mode {
-                DeletionMode::Unlink => {
-                    Self::delete_after_check(candidate, &metadata).map(|()| false)
+                DeletionMode::Unlink => Self::delete_after_check(candidate, &metadata)
+                    .map(|()| CheckedDeletion::Deleted),
+                DeletionMode::Quarantine => {
+                    self.quarantine_after_check(candidate, &metadata, Some(&renew_authority))
                 }
-                DeletionMode::Quarantine => self
-                    .quarantine_after_check(candidate, &metadata)
-                    .map(|()| true),
             };
             let completed_at = Instant::now();
             match outcome {
-                Ok(quarantined) => {
+                Ok(CheckedDeletion::Skipped(reason)) => {
+                    report.record_skip(reason);
+                    consecutive_failures = 0;
+                    if should_backoff_skip(reason) {
+                        report.backoff_candidates.push(candidate.clone());
+                    }
+                }
+                Ok(outcome) => {
+                    let quarantined = outcome == CheckedDeletion::Quarantined;
                     #[allow(clippy::cast_possible_truncation)]
                     let duration_ms = completed_at.duration_since(del_start).as_millis() as u64;
                     // Record the successful mutation before observers or a
@@ -1849,14 +1858,21 @@ impl DeletionExecutor {
     /// silently turn a recoverable cleanup into permanent data loss.
     fn quarantine_path(&self, candidate: &CandidacyScore) -> Result<()> {
         let metadata = self.recheck_before_mutation(candidate)?;
-        self.quarantine_after_check(candidate, &metadata)
+        match self.quarantine_after_check(candidate, &metadata, None)? {
+            CheckedDeletion::Skipped(reason) => Err(SbhError::SafetyVeto {
+                path: candidate.path.clone(),
+                reason: reason.explanation().to_string(),
+            }),
+            CheckedDeletion::Deleted | CheckedDeletion::Quarantined => Ok(()),
+        }
     }
 
     fn quarantine_after_check(
         &self,
         candidate: &CandidacyScore,
         metadata: &fs::Metadata,
-    ) -> Result<()> {
+        authorize: Option<AuthorizationCheck<'_>>,
+    ) -> Result<CheckedDeletion> {
         let path = &candidate.path;
         let store = QuarantineStore::for_root(&quarantine::quarantine_root_for(
             path,
@@ -1867,6 +1883,7 @@ impl DeletionExecutor {
             candidate.identity,
             candidate.size_bytes,
         );
+        let renew_authority = || authorize.map_or(Ok(()), |authorize| authorize(candidate));
         match store.quarantine_checked(
             path,
             metadata,
@@ -1880,6 +1897,7 @@ impl DeletionExecutor {
                 "certainty": format!("{:?}", candidate.decision.certainty),
                 "score": candidate.total_score,
             })),
+            Some(&renew_authority),
         ) {
             Ok(record) => {
                 eprintln!(
@@ -1887,7 +1905,10 @@ impl DeletionExecutor {
                     path.display(),
                     record.quarantine_path.display()
                 );
-                Ok(())
+                Ok(CheckedDeletion::Quarantined)
+            }
+            Err(QuarantineUnavailable::AuthorizationDenied(reason)) => {
+                Ok(CheckedDeletion::Skipped(reason))
             }
             Err(reason) => {
                 let detail = match &reason {
@@ -3228,6 +3249,7 @@ mod tests {
                 ..
             }
         )));
+        drop(events);
     }
 
     #[test]
@@ -4337,6 +4359,103 @@ mod tests {
                         fs::read(records[0].quarantine_path.join("deps/artifact.o")).unwrap(),
                         b"artifact"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quarantine_renews_live_authority_after_preparing_the_durable_store() {
+        for use_skip in [false, true] {
+            for withdraw in [false, true] {
+                let dir = scratch_dir();
+                let root = dir.path().join("scan-root");
+                let target = root.join("target");
+                let payload = target.join("deps/artifact.o");
+                fs::create_dir_all(payload.parent().unwrap()).unwrap();
+                fs::write(&payload, b"preserve until authorized").unwrap();
+                let candidate = make_identity_candidate(&target, 25, 0.95);
+                let id = crate::scanner::decision_record::stable_decision_id(
+                    &candidate.path,
+                    candidate.identity,
+                    candidate.size_bytes,
+                );
+                let store = QuarantineStore::under(&root);
+                let pending = store.root().join(format!("{id}.pending"));
+                let prepared_seen = std::cell::Cell::new(false);
+                let after_preparation = || {
+                    let prepared = pending.is_file();
+                    if prepared {
+                        prepared_seen.set(true);
+                        assert!(store.root().join(format!("{id}.intact")).is_file());
+                        assert!(store.root().join(&id).is_dir());
+                        assert_eq!(fs::read(&payload).unwrap(), b"preserve until authorized");
+                    }
+                    prepared && withdraw
+                };
+                let should_skip = |_: &Path| {
+                    (use_skip && after_preparation()).then_some(SkipReason::PolicyChanged)
+                };
+                let authorize = |_: &CandidacyScore| {
+                    if !use_skip && after_preparation() {
+                        Err(SkipReason::PolicyChanged)
+                    } else {
+                        Ok(())
+                    }
+                };
+                let executor = DeletionExecutor::new(
+                    DeletionConfig {
+                        require_identity: true,
+                        mode: DeletionMode::Quarantine,
+                        quarantine_roots: vec![root],
+                        ..offline_config()
+                    },
+                    None,
+                );
+                let plan = executor.plan(vec![candidate.clone()]);
+                assert_eq!(plan.candidates.len(), 1);
+                let report = executor.execute_with_hooks(
+                    &plan,
+                    Some(&should_skip),
+                    Some(&authorize),
+                    Some(&|_, _| panic!("quarantine must not publish permanent-unlink success")),
+                );
+                assert!(
+                    prepared_seen.get(),
+                    "authority must be renewed after preparation"
+                );
+                assert_eq!(report.items_failed, 0, "{report:?}");
+                assert_eq!(report.quarantine_unavailable, 0, "{report:?}");
+                assert_eq!(report.bytes_freed, 0);
+                assert!(report.errors.is_empty());
+                assert!(report.backoff_candidates.is_empty());
+                if withdraw {
+                    assert_eq!(report.items_deleted, 0);
+                    assert_eq!(report.items_quarantined, 0);
+                    assert_eq!(report.bytes_quarantined, 0);
+                    assert_eq!(report.skipped_by_reason.get("policy_changed"), Some(&1));
+                    assert_eq!(fs::read(&payload).unwrap(), b"preserve until authorized");
+                    assert_eq!(
+                        walker::identity_for_path(&target, false).ok(),
+                        candidate.identity
+                    );
+                    assert!(store.records().unwrap().is_empty());
+                    assert!(!pending.exists());
+                    assert!(!store.root().join(&id).exists());
+                    assert!(!store.root().join(format!("{id}.intact")).exists());
+                } else {
+                    assert_eq!(report.items_deleted, 1);
+                    assert_eq!(report.items_quarantined, 1);
+                    assert_eq!(report.bytes_quarantined, 25);
+                    assert_eq!(report.items_skipped, 0);
+                    assert!(!target.exists());
+                    let record = store.record(&id).unwrap().unwrap();
+                    assert_eq!(
+                        fs::read(record.quarantine_path.join("deps/artifact.o")).unwrap(),
+                        b"preserve until authorized"
+                    );
+                    store.restore(&id, false).unwrap();
+                    assert_eq!(fs::read(&payload).unwrap(), b"preserve until authorized");
                 }
             }
         }

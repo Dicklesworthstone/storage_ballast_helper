@@ -301,7 +301,14 @@ pub enum QuarantineUnavailable {
     CrossDevice,
     /// The rename itself failed.
     RenameFailed(String),
+    /// Live authority expired after the store was prepared. The original
+    /// remains in place; this is a policy skip, not an unavailable store.
+    AuthorizationDenied(crate::scanner::deletion::SkipReason),
 }
+
+/// Read-only live permission renewed after durable preparation, before rename.
+pub(crate) type TransferAuthorization<'a> =
+    &'a dyn Fn() -> std::result::Result<(), crate::scanner::deletion::SkipReason>;
 
 impl std::fmt::Display for QuarantineUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -309,6 +316,13 @@ impl std::fmt::Display for QuarantineUnavailable {
             Self::RootUnavailable(detail) => write!(f, "quarantine root unavailable: {detail}"),
             Self::CrossDevice => f.write_str("candidate is on a different filesystem"),
             Self::RenameFailed(detail) => write!(f, "rename into quarantine failed: {detail}"),
+            Self::AuthorizationDenied(reason) => {
+                write!(
+                    f,
+                    "quarantine authorization withdrawn: {}",
+                    reason.explanation()
+                )
+            }
         }
     }
 }
@@ -582,12 +596,23 @@ impl QuarantineStore {
         // object that later appears at the same pathname.
         let expected = fs::symlink_metadata(path)
             .map_err(|error| QuarantineUnavailable::RootUnavailable(error.to_string()))?;
-        self.quarantine_checked(path, &expected, decision_id, size_bytes, ttl, decision)
+        self.quarantine_checked(
+            path,
+            &expected,
+            decision_id,
+            size_bytes,
+            ttl,
+            decision,
+            None,
+        )
     }
 
     /// Carry the caller's admitted source identity through store preparation
     /// and the descriptor-relative transfer. A replacement is never adopted
     /// as the source of an already-approved quarantine operation.
+    /// Renew optional live authority after store preparation and fsync; only
+    /// a still-authorized source may enter the descriptor-relative rename.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn quarantine_checked(
         &self,
         path: &Path,
@@ -596,10 +621,20 @@ impl QuarantineStore {
         size_bytes: u64,
         ttl: Duration,
         decision: Option<serde_json::Value>,
+        authorize: Option<TransferAuthorization<'_>>,
     ) -> std::result::Result<QuarantineRecord, QuarantineUnavailable> {
         placement::validate(path, self.root())
             .map_err(|error| QuarantineUnavailable::RootUnavailable(error.to_string()))?;
-        safety::quarantine(self, path, expected, decision_id, size_bytes, ttl, decision)
+        safety::quarantine(
+            self,
+            path,
+            expected,
+            decision_id,
+            size_bytes,
+            ttl,
+            decision,
+            authorize,
+        )
     }
 
     /// Every valid record in the store, oldest first. Completed moves with

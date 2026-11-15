@@ -17,7 +17,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::budget::PurgeBudget;
 use super::{
     QuarantineCompletion, QuarantineRecord, QuarantineStore, QuarantineUnavailable, RecoveryState,
-    RestoreOutcome, now_secs,
+    RestoreOutcome, TransferAuthorization, now_secs,
 };
 use crate::core::errors::{Result, SbhError};
 
@@ -338,6 +338,7 @@ enum TransactionStep {
     Moved,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn quarantine(
     store: &QuarantineStore,
     path: &Path,
@@ -346,6 +347,7 @@ pub(super) fn quarantine(
     size_bytes: u64,
     ttl: Duration,
     decision: Option<serde_json::Value>,
+    authorize: Option<TransferAuthorization<'_>>,
 ) -> std::result::Result<QuarantineRecord, QuarantineUnavailable> {
     quarantine_with_hook(
         store,
@@ -355,6 +357,7 @@ pub(super) fn quarantine(
         size_bytes,
         ttl,
         decision,
+        authorize,
         &mut |_| {},
     )
 }
@@ -368,6 +371,7 @@ fn quarantine_with_hook(
     size_bytes: u64,
     ttl: Duration,
     decision: Option<serde_json::Value>,
+    authorize: Option<TransferAuthorization<'_>>,
     hook: &mut impl FnMut(TransactionStep),
 ) -> std::result::Result<QuarantineRecord, QuarantineUnavailable> {
     let unavailable = |e: io::Error| QuarantineUnavailable::RootUnavailable(e.to_string());
@@ -431,6 +435,15 @@ fn quarantine_with_hook(
         return Err(unavailable(e));
     }
     hook(TransactionStep::Prepared);
+    if let Some(authorize) = authorize
+        && let Err(reason) = authorize()
+    {
+        // Preparing durable metadata can block long enough to exhaust a
+        // forecast, recover pressure or revoke operator consent. No payload
+        // has moved yet; discard only this exact unmoved reservation.
+        discard_unmoved_reservation(&root, &entry, &source, &record);
+        return Err(QuarantineUnavailable::AuthorizationDenied(reason));
+    }
     let transfer = || -> io::Result<()> {
         root.require_path(store.root())?;
         entry.require_path(&dir)?;

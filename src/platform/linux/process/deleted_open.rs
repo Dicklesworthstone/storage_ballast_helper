@@ -36,6 +36,12 @@ struct MountRecord {
     filesystem_type: String,
 }
 
+enum MountTableCache {
+    Unread,
+    Unavailable,
+    Ready(MountTable),
+}
+
 struct Observation {
     allocated_bytes: u64,
     logical_bytes: u64,
@@ -173,17 +179,14 @@ impl Sweep {
         let mut new_files = 0;
         // Only a process with a discovered unlinked regular file needs its
         // mount table. A failed table is not repeatedly retried for every FD.
-        let mut mounts: Option<Option<MountTable>> = None;
+        let mut mounts = MountTableCache::Unread;
         for entry in descriptors {
             if self.expired() {
                 break;
             }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => {
-                    self.issue("descriptor_inventory_unreadable");
-                    break;
-                }
+            let Ok(entry) = entry else {
+                self.issue("descriptor_inventory_unreadable");
+                break;
             };
             let Some(fd) =
                 decimal(entry.file_name().as_bytes()).and_then(|n| u32::try_from(n).ok())
@@ -256,7 +259,7 @@ impl Sweep {
         fd: u32,
         identity: &ProcessIdentity,
         before: &fs::Metadata,
-        mounts: &mut Option<Option<MountTable>>,
+        mounts: &mut MountTableCache,
         before_verification: &mut impl FnMut(i32, Option<u32>),
     ) -> Option<Observation> {
         if self.expired() {
@@ -272,22 +275,19 @@ impl Sweep {
         if self.expired() {
             return None;
         }
-        let mount_id = match read_bounded(
+        let mount_id = if let Ok(raw) = read_bounded(
             &directory.join("fdinfo").join(fd.to_string()),
             MAX_FDINFO_BYTES,
             self.deadline,
         ) {
-            Ok(raw) => match parse_fdinfo(&raw, before.ino()) {
-                Ok(mount_id) => Some(mount_id),
-                Err(_) => {
-                    self.issue("descriptor_metadata_changed");
-                    return None;
-                }
-            },
-            Err(_) => {
-                self.issue("descriptor_mount_unavailable");
-                None
-            }
+            let Ok(mount_id) = parse_fdinfo(&raw, before.ino()) else {
+                self.issue("descriptor_metadata_changed");
+                return None;
+            };
+            Some(mount_id)
+        } else {
+            self.issue("descriptor_mount_unavailable");
+            None
         };
         if self.expired() {
             return None;
@@ -339,22 +339,27 @@ impl Sweep {
         directory: &Path,
         mount_id: Option<u64>,
         device: u64,
-        mounts: &'a mut Option<Option<MountTable>>,
+        mounts: &'a mut MountTableCache,
     ) -> Option<&'a MountRecord> {
         let mount_id = mount_id?;
-        if mounts.is_none() {
+        if matches!(mounts, MountTableCache::Unread) {
             let table = read_bounded(
                 &directory.join("mountinfo"),
                 MAX_MOUNTINFO_BYTES,
                 self.deadline,
             )
             .and_then(|raw| parse_mountinfo(&raw, self.deadline));
-            if table.is_err() {
-                self.issue("mount_table_unavailable");
-            }
-            *mounts = Some(table.ok());
+            *mounts = table.map_or_else(
+                |_| {
+                    self.issue("mount_table_unavailable");
+                    MountTableCache::Unavailable
+                },
+                MountTableCache::Ready,
+            );
         }
-        let table = mounts.as_ref()?.as_ref()?;
+        let MountTableCache::Ready(table) = mounts else {
+            return None;
+        };
         match table.get(&mount_id) {
             Some(mount) if mount.device == device => Some(mount),
             Some(_) => {
@@ -416,12 +421,9 @@ fn collect_with(
         if sweep.stopped || sweep.expired() {
             break;
         }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                sweep.issue("process_inventory_unreadable");
-                break;
-            }
+        let Ok(entry) = entry else {
+            sweep.issue("process_inventory_unreadable");
+            break;
         };
         let Some(pid) = decimal(entry.file_name().as_bytes())
             .and_then(|pid| i32::try_from(pid).ok())
@@ -956,7 +958,7 @@ mod tests {
         let directory = process(root.path(), 41);
         let file = anonymous_file();
         add_fd(&directory, 3, &file);
-        fs::set_permissions(directory.join("fd"), fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(directory.join("fd"), fs::Permissions::from_mode(0o000)).unwrap();
         let report = scan(root.path());
         fs::set_permissions(directory.join("fd"), fs::Permissions::from_mode(0o700)).unwrap();
         assert!(!report.complete);

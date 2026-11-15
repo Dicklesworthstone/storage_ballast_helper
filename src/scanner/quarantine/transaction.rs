@@ -561,7 +561,7 @@ mod tests {
             let replacement = write_source(&source, directory, b"unscanned replacement");
 
             let error = store
-                .quarantine_checked(&source, &expected, "move", 15, Duration::ZERO, None)
+                .quarantine_checked(&source, &expected, "move", 15, Duration::ZERO, None, None)
                 .unwrap_err();
 
             assert!(
@@ -600,6 +600,7 @@ mod tests {
                 "move",
                 15,
                 Duration::ZERO,
+                None,
                 None,
                 &mut |step| {
                     if step == TransactionStep::SourcePinned {
@@ -773,6 +774,7 @@ mod tests {
             15,
             Duration::ZERO,
             None,
+            None,
             &mut |step| {
                 if step == TransactionStep::Prepared {
                     fs::rename(store.root(), &saved).unwrap();
@@ -815,6 +817,7 @@ mod tests {
             "move",
             9,
             Duration::ZERO,
+            None,
             None,
             &mut |step| {
                 if step == TransactionStep::Moved {
@@ -860,6 +863,7 @@ mod tests {
             "move",
             15,
             Duration::ZERO,
+            None,
             None,
             &mut |step| {
                 if step == TransactionStep::Prepared {

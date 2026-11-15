@@ -16094,14 +16094,15 @@ fn run_interactive_clean(
     // A target met while the user considers a prompt must take effect before
     // mutation. Do not reuse a pre-prompt capacity reading, even briefly.
     let collector = FsStatsCollector::new(platform, Duration::ZERO);
-    let (report, confirmation_error) = match run_confirmed_cleanup(
+    let result = run_confirmed_cleanup(
         executor,
         plan,
         args.target_free,
         &collector,
         &mut io::stdin().lock(),
         &mut io::stderr().lock(),
-    ) {
+    );
+    let (report, confirmation_error) = match result {
         Ok(report) => (report, None),
         Err(failure) => (*failure.report, Some(failure.error)),
     };
@@ -17908,8 +17909,9 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             None,
         )
     } else {
-        match run_interactive_emergency(&executor, &plan, args, &collector, &mut io::stdin().lock())
-        {
+        let result =
+            run_interactive_emergency(&executor, &plan, args, &collector, &mut io::stdin().lock());
+        match result {
             Ok(report) => (report, None),
             Err(failure) => (*failure.report, Some(failure.error)),
         }
@@ -25030,8 +25032,11 @@ mod tests {
             vec!["--deleted-open", "--timeout-secs", "0"],
             vec!["--deleted-open", "--timeout-secs", "61"],
         ] {
-            let argv = [vec!["sbh", "blame"], flags].concat();
-            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?}");
+            let command_line = [vec!["sbh", "blame"], flags].concat();
+            assert!(
+                Cli::try_parse_from(&command_line).is_err(),
+                "{command_line:?}"
+            );
         }
     }
 
