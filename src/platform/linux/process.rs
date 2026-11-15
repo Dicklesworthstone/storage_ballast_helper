@@ -12,8 +12,9 @@ use crate::core::errors::{Result, SbhError};
 use crate::core::paths::resolve_absolute_path;
 use crate::platform::pal::{check_process_sampling_deadline, sample_process_io_with_identity};
 use crate::platform::types::{
-    ExecutablesResult, MappedRegion, OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET, OpenFileKind,
-    OpenFileMode, OpenFilesResult, PalError, ProcessInfo, ProcessIo, ProcessIoSnapshot, SelfStats,
+    DeletedOpenFilesLimits, DeletedOpenFilesReport, ExecutablesResult, MappedRegion,
+    OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET, OpenFileKind, OpenFileMode, OpenFilesResult,
+    PalError, ProcessInfo, ProcessIo, ProcessIoSnapshot, SelfStats,
 };
 
 const PROC_SELF_STATUS: &str = "/proc/self/status";
@@ -22,6 +23,7 @@ const PROC_SELF_IO: &str = "/proc/self/io";
 const PROC_ROOT: &str = "/proc";
 const PROC_STAT: &str = "/proc/stat";
 
+mod deleted_open;
 mod mmap_scan;
 mod reference_scan;
 
@@ -59,6 +61,13 @@ pub(super) struct ProcessClockCache {
 
 pub(super) fn read_process_list() -> Result<Vec<ProcessInfo>> {
     read_processes(true)
+}
+
+pub(super) fn read_deleted_open_files(
+    deadline: Instant,
+    limits: DeletedOpenFilesLimits,
+) -> Result<DeletedOpenFilesReport> {
+    deleted_open::collect(Path::new(PROC_ROOT), deadline, limits)
 }
 
 /// Enumerate PID names without reading stat, cwd, executable or argv data.

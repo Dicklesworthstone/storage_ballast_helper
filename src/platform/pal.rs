@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use crate::core::config::PathsConfig;
 use crate::core::errors::{Result, SbhError};
 use crate::platform::types::{
-    Capacity, ExecutablesResult, FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion,
-    MemoryPressure, MemoryPressureCallback, MemoryPressureLevel, MountInfo, OpenFile,
-    OpenFilesResult, PalError, ProcessInfo, ProcessIo, ProcessIoSnapshot, SacredPath, SelfStats,
-    ServiceKind, SubscriptionHandle,
+    Capacity, DeletedOpenFilesLimits, DeletedOpenFilesReport, ExecutablesResult,
+    FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion, MemoryPressure, MemoryPressureCallback,
+    MemoryPressureLevel, MountInfo, OpenFile, OpenFilesResult, PalError, ProcessInfo, ProcessIo,
+    ProcessIoSnapshot, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
 };
 
 /// Filesystem statistics for a path/mount.
@@ -563,6 +563,18 @@ pub trait Platform: Send + Sync {
 
     fn process_io(&self, _pid: i32) -> Result<ProcessIo> {
         pal_not_implemented(self.name(), "process_io")
+    }
+
+    /// Observe allocations retained by unlinked regular files without opening
+    /// their contents or taking action on their owners. Deadlines are checked
+    /// between native operations; an already-blocked syscall is not preempted.
+    /// This optional diagnostic never substitutes for deletion-safety evidence.
+    fn deleted_open_files(
+        &self,
+        _deadline: Instant,
+        _limits: DeletedOpenFilesLimits,
+    ) -> Result<DeletedOpenFilesReport> {
+        Ok(DeletedOpenFilesReport::unsupported())
     }
 
     fn open_files_under(&self, _path: &Path) -> Result<OpenFilesResult> {

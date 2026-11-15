@@ -31,9 +31,10 @@ use crate::platform::pal::{
     PlatformPaths, ServiceManager,
 };
 use crate::platform::types::{
-    Capacity, ExecutablesResult, FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion,
-    MemoryPressure, MemoryPressureCallback, MountInfo, OpenFilesResult, ProcessInfo, ProcessIo,
-    ProcessIoSnapshot, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
+    Capacity, DeletedOpenFilesLimits, DeletedOpenFilesReport, ExecutablesResult,
+    FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion, MemoryPressure, MemoryPressureCallback,
+    MountInfo, OpenFilesResult, ProcessInfo, ProcessIo, ProcessIoSnapshot, SacredPath, SelfStats,
+    ServiceKind, SubscriptionHandle,
 };
 use crate::tuning::writeback::WritebackState;
 
@@ -430,6 +431,14 @@ impl Platform for TestOverlayPlatform {
 
     fn process_io(&self, pid: i32) -> Result<ProcessIo> {
         self.inner.process_io(pid)
+    }
+
+    fn deleted_open_files(
+        &self,
+        deadline: Instant,
+        limits: DeletedOpenFilesLimits,
+    ) -> Result<DeletedOpenFilesReport> {
+        self.inner.deleted_open_files(deadline, limits)
     }
 
     fn open_files_under(&self, path: &Path) -> Result<OpenFilesResult> {

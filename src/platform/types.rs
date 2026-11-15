@@ -356,6 +356,99 @@ pub struct ProcessIoSnapshot {
     pub start_time_unix_ms: i64,
 }
 
+/// Resource limits for a read-only inventory of unlinked regular files.
+///
+/// These bound work and retained observations independently of the caller's
+/// deadline. The inventory covers visible file descriptors only, not mappings
+/// without descriptors or processes hidden from the caller's PID namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeletedOpenFilesLimits {
+    pub max_processes: usize,
+    pub max_descriptors: usize,
+    pub max_files: usize,
+    pub max_holders: usize,
+}
+
+impl Default for DeletedOpenFilesLimits {
+    fn default() -> Self {
+        Self {
+            max_processes: 50_000,
+            max_descriptors: 250_000,
+            max_files: 4_096,
+            max_holders: 16_384,
+        }
+    }
+}
+
+/// A verified process holding one or more descriptors to an unlinked file.
+///
+/// The kernel's fd target is display evidence, not an existing or restorable
+/// pathname. Its ambiguous ` (deleted)` suffix is retained, and the hex field
+/// preserves native pathname bytes even when the display text is lossy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeletedOpenFileHolder {
+    pub pid: i32,
+    pub start_time_ticks: u64,
+    pub name: String,
+    /// One representative descriptor, not a stable handle for later action.
+    pub fd: u32,
+    pub descriptor_count: usize,
+    pub fd_target: String,
+    pub fd_target_bytes_hex: String,
+    /// Mount identity and spelling in this process's observed namespace.
+    pub mount_id: Option<u64>,
+    pub mount_point: Option<String>,
+    pub mount_point_bytes_hex: Option<String>,
+    pub filesystem_type: Option<String>,
+}
+
+/// One distinct observed `(device_id, inode)` with no remaining directory link.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeletedOpenFile {
+    pub device_id: u64,
+    pub inode: u64,
+    /// Allocated blocks in bytes, not the logical file length or a promise of
+    /// recoverable space. Reflinks, snapshots and other references may retain it.
+    pub allocated_bytes: u64,
+    pub logical_bytes: u64,
+    pub holders: Vec<DeletedOpenFileHolder>,
+}
+
+/// Bounded, read-only evidence of space held by unlinked open files.
+///
+/// Even a complete result is a sequence of observations of visible descriptors,
+/// not an atomic host snapshot. Shared files contribute allocation only once.
+/// A partial result retains verified observations and names every coverage gap
+/// with a bounded reason-code map rather than silently claiming an empty host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeletedOpenFilesReport {
+    pub supported: bool,
+    pub complete: bool,
+    /// Sum over unique observed files; `None` when unsupported or unrepresentable.
+    pub observed_allocated_bytes: Option<u64>,
+    /// Visible PIDs attempted, including those that could not be inspected.
+    pub processes_scanned: usize,
+    pub descriptors_scanned: usize,
+    pub issues: std::collections::BTreeMap<String, u64>,
+    pub files: Vec<DeletedOpenFile>,
+}
+
+impl DeletedOpenFilesReport {
+    /// Unimplemented platforms must not return a misleading zero-byte result.
+    #[must_use]
+    pub fn unsupported() -> Self {
+        Self {
+            supported: false,
+            complete: false,
+            observed_allocated_bytes: None,
+            processes_scanned: 0,
+            descriptors_scanned: 0,
+            issues: std::collections::BTreeMap::from([("unsupported_platform".to_string(), 1)]),
+            files: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OpenFileKind {
     Regular,

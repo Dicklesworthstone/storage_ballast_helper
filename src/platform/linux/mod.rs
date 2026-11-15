@@ -25,9 +25,9 @@ use crate::platform::pal::{
 use crate::platform::sacred_catalog::cross_platform_sacred_paths;
 #[cfg(target_os = "linux")]
 use crate::platform::types::{
-    ExecutablesResult, MemoryPressure, MemoryPressureCallback, OpenFilesResult, PalError,
-    ProcessInfo, ProcessIo, ProcessIoSnapshot, SacredPath, SelfStats, ServiceKind,
-    SubscriptionHandle,
+    DeletedOpenFilesLimits, DeletedOpenFilesReport, ExecutablesResult, MemoryPressure,
+    MemoryPressureCallback, OpenFilesResult, PalError, ProcessInfo, ProcessIo, ProcessIoSnapshot,
+    SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
 };
 
 #[cfg(target_os = "linux")]
@@ -225,6 +225,14 @@ impl Platform for LinuxPal {
 
     fn process_io(&self, pid: i32) -> Result<ProcessIo> {
         process::read_process_io(pid)
+    }
+
+    fn deleted_open_files(
+        &self,
+        deadline: Instant,
+        limits: DeletedOpenFilesLimits,
+    ) -> Result<DeletedOpenFilesReport> {
+        process::read_deleted_open_files(deadline, limits)
     }
 
     fn open_files_under(&self, path: &Path) -> Result<OpenFilesResult> {
