@@ -29,7 +29,7 @@ mod confined_purge;
 #[path = "transaction.rs"]
 mod transaction;
 
-#[cfg(all(target_os = "linux", feature = "daemon"))]
+#[cfg(target_os = "linux")]
 pub use beneath::mount_id;
 #[cfg(unix)]
 pub use beneath::open_beneath;

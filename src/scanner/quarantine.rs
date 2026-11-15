@@ -34,7 +34,7 @@ mod safety;
 
 pub use budget::DEFAULT_DRAIN_WORK;
 use budget::PurgeBudget;
-#[cfg(all(target_os = "linux", feature = "daemon"))]
+#[cfg(target_os = "linux")]
 pub(crate) use safety::mount_id as descriptor_mount_id;
 #[cfg(unix)]
 pub(crate) use safety::open_beneath;

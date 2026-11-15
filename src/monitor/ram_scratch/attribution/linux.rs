@@ -1,23 +1,30 @@
 //! Descriptor-relative metadata traversal for report-only scratch attribution.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata};
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
+use rustix::fs::{Mode, OFlags, ResolveFlags, openat, openat2};
+use rustix::io::Errno;
 
 use super::{AttributionLimits, MountAttribution, ScratchEntry, ScratchMount, unavailable};
+use crate::platform::linux::no_symlinks::open_without_symlinks;
+use crate::scanner::quarantine::descriptor_mount_id;
 
 const MAX_ISSUES: usize = 8;
 
 struct Probe {
     root: File,
     device: u64,
+    openat2_available: Cell<bool>,
+    fallback_mount: Cell<Option<u64>>,
     maximum: usize,
     examined: usize,
     deadline: Instant,
@@ -55,16 +62,74 @@ impl Probe {
         } else {
             OFlags::PATH
         };
-        Ok(File::from(openat2(
-            &self.root,
-            relative,
-            flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::BENEATH
-                | ResolveFlags::NO_SYMLINKS
-                | ResolveFlags::NO_MAGICLINKS
-                | ResolveFlags::NO_XDEV,
-        )?))
+        if self.openat2_available.get() {
+            match openat2(
+                &self.root,
+                relative,
+                flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::BENEATH
+                    | ResolveFlags::NO_SYMLINKS
+                    | ResolveFlags::NO_MAGICLINKS
+                    | ResolveFlags::NO_XDEV,
+            ) {
+                Ok(fd) => return Ok(File::from(fd)),
+                // RestrictSUIDSGID filters openat2's opaque open_how. Once
+                // unavailable, do not repeat the rejected syscall per inode.
+                Err(Errno::NOSYS | Errno::PERM) => self.openat2_available.set(false),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.open_fallback(relative, directory)
+    }
+
+    /// Metadata-only fallback for kernels and sandboxes without openat2.
+    /// Each component is pinned without following links and must remain on
+    /// the root's mount ID, including bind mounts of the same device.
+    fn open_fallback(&self, relative: &Path, directory: bool) -> io::Result<File> {
+        let bytes = relative.as_os_str().as_bytes();
+        // Reject original spellings before Path can normalize dots or slashes.
+        if bytes.split(|byte| *byte == b'/').any(|name| {
+            name.is_empty() || name == b"." || name == b".." || name.contains(&0)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scratch attribution requires normal relative components",
+            ));
+        }
+        let root_mount = match self.fallback_mount.get() {
+            Some(mount) => mount,
+            None => {
+                let mount = descriptor_mount_id(self.root.as_fd())?;
+                self.fallback_mount.set(Some(mount));
+                mount
+            }
+        };
+        let mut parent = self.root.try_clone()?;
+        let mut names = bytes.split(|byte| *byte == b'/').peekable();
+        while let Some(name) = names.next() {
+            self.budget()?;
+            let flags = if names.peek().is_some() {
+                OFlags::PATH | OFlags::DIRECTORY
+            } else if directory {
+                OFlags::RDONLY | OFlags::DIRECTORY
+            } else {
+                // O_PATH observes even a FIFO or a symlink itself without
+                // reading payloads, blocking on writers or following targets.
+                OFlags::PATH
+            };
+            let fd = openat(
+                &parent,
+                OsStr::from_bytes(name),
+                flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            if descriptor_mount_id(fd.as_fd())? != root_mount {
+                return Err(io::Error::from_raw_os_error(libc::EXDEV));
+            }
+            parent = File::from(fd);
+        }
+        Ok(parent)
     }
 
     // Every name consumes the shared work budget, including later exclusions.
@@ -261,13 +326,7 @@ pub(super) fn inspect(
             "mount path is not an unambiguous absolute native spelling",
         );
     }
-    let root = match openat2(
-        CWD,
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-    ) {
+    let root = match open_without_symlinks(path, OFlags::RDONLY | OFlags::DIRECTORY) {
         Ok(fd) => File::from(fd),
         Err(error) => return unavailable(mount, &format!("cannot pin mount: {error}")),
     };
@@ -278,6 +337,8 @@ pub(super) fn inspect(
     let mut probe = Probe {
         root,
         device: mount.filesystem_id,
+        openat2_available: Cell::new(true),
+        fallback_mount: Cell::new(None),
         maximum,
         examined: 0,
         deadline,

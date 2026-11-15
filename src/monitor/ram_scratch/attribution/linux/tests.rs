@@ -204,3 +204,95 @@ fn an_exhausted_entry_budget_is_reported_once() {
         .count();
     assert_eq!(exhausted, 1, "{:?}", report.issues);
 }
+
+fn fallback_probe(root: &Path) -> Probe {
+    Probe {
+        root: File::from(open_without_symlinks(root, OFlags::RDONLY | OFlags::DIRECTORY).unwrap()),
+        device: fs::metadata(root).unwrap().dev(),
+        openat2_available: Cell::new(false),
+        fallback_mount: Cell::new(None),
+        maximum: 100,
+        examined: 0,
+        deadline: deadline(),
+        max_depth: AttributionLimits::default().max_depth,
+        seen: BTreeSet::new(),
+        mount_boundaries: 0,
+        symlinks: 0,
+        issues: Vec::new(),
+    }
+}
+
+#[test]
+fn fallback_attributes_nested_files_and_fifos_without_reading_payloads() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let child = root.join("agent");
+    fs::create_dir(&child).unwrap();
+    let file = child.join("output");
+    fs::write(&file, vec![7_u8; 8192]).unwrap();
+    let fifo = child.join("pipe");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
+    let expected = [&child, &file, &fifo]
+        .into_iter()
+        .map(|path| fs::metadata(path).unwrap().blocks() * 512)
+        .sum::<u64>();
+
+    let mut probe = fallback_probe(&root);
+    let relative = Path::new("agent");
+    let metadata = probe.open(relative, false).unwrap().metadata().unwrap();
+    let (bytes, complete, idle) = probe.entry(relative, &metadata);
+    assert!(complete, "{:?}", probe.issues);
+    assert_eq!(bytes, expected);
+    assert_eq!(idle, Some(0));
+    assert_eq!(probe.examined, 2);
+    assert_eq!(fs::read(file).unwrap(), vec![7_u8; 8192]);
+}
+
+#[test]
+fn fallback_observes_symlinks_but_never_follows_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let child = root.join("agent");
+    fs::create_dir(&child).unwrap();
+    fs::write(outside.path().join("private"), vec![9_u8; 32_768]).unwrap();
+    symlink(outside.path(), child.join("alias")).unwrap();
+
+    let mut probe = fallback_probe(&root);
+    let relative = Path::new("agent");
+    let metadata = probe.open(relative, false).unwrap().metadata().unwrap();
+    let (bytes, complete, idle) = probe.entry(relative, &metadata);
+    assert!(!complete);
+    assert!(idle.is_none());
+    assert_eq!(bytes, fs::metadata(&child).unwrap().blocks() * 512);
+    assert_eq!(probe.symlinks, 1);
+    assert!(probe.open(Path::new("agent/alias"), true).is_err());
+    let error = probe
+        .open(Path::new("agent/alias/private"), false)
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+    assert_eq!(
+        fs::read(outside.path().join("private")).unwrap(),
+        vec![9_u8; 32_768]
+    );
+}
+
+#[test]
+fn fallback_refuses_mount_crossings_and_noncanonical_relative_paths() {
+    // /proc is a real mount boundary, available without mounting a fixture.
+    // Its inode must never enter the root filesystem's attribution report.
+    let probe = fallback_probe(Path::new("/"));
+    let proc = File::open("/proc").unwrap();
+    assert_ne!(
+        descriptor_mount_id(probe.root.as_fd()).unwrap(),
+        descriptor_mount_id(proc.as_fd()).unwrap()
+    );
+    for directory in [false, true] {
+        let error = probe.open(Path::new("proc"), directory).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
+    }
+    for path in ["", ".", "..", "/proc", "tmp/../proc", "tmp/./x", "tmp//x", "tmp/"] {
+        let error = probe.open(Path::new(path), false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path}");
+    }
+}
