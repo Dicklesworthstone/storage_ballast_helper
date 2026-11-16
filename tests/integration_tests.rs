@@ -461,7 +461,7 @@ fn spawn_deleted_open_mapping_holder(
     let result = Command::new("python3")
         .args([
             "-c",
-            r#"
+            r"
 import ctypes
 import os
 import sys
@@ -495,14 +495,14 @@ try:
     check_contents()
     page_size = os.sysconf('SC_PAGE_SIZE')
     end = address + ((length + page_size - 1) // page_size) * page_size
-    announce(ready, f'{address:x}-{end:x}')
+    announce(ready, format(address, 'x') + '-' + format(end, 'x'))
     assert sys.stdin.buffer.read(1) == b'v'
     check_contents()
     announce(verified, 'unchanged')
     sys.stdin.buffer.read(1)
 finally:
     assert libc.munmap(address, length) == 0
-"#,
+",
         ])
         .arg(data_path)
         .arg(ready_path)

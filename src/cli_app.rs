@@ -19412,7 +19412,7 @@ mod tests {
         let inventory = discover_undo_entries(std::slice::from_ref(&known), None);
         assert_eq!(inventory.held.len(), 1);
         assert!(inventory.require_complete().is_err());
-        let (_, config) = undo_test_config(&root, vec![known.clone()]);
+        let (_, config) = undo_test_config(&root, vec![known]);
         let absent = Cli::try_parse_from([
             "sbh",
             "--config",

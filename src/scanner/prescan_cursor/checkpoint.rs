@@ -1075,88 +1075,88 @@ mod tests {
         assert_eq!(read(&path).unwrap(), good);
     }
 
+    fn escaped_root(index: usize, bytes: usize) -> PathBuf {
+        let prefix = format!("/{index}/");
+        PathBuf::from(format!("{prefix}{}", "\u{1}".repeat(bytes - prefix.len())))
+    }
+
+    fn fill_discovery_budgets(state: &mut PrescanCursor) {
+        let mut remaining = MAX_RAW_PATH_BYTES;
+        let mut index = 0;
+        while remaining > 0 {
+            let row_bytes = remaining.min(2 * MAX_PATH_BYTES - 2);
+            let root = escaped_root(index, (row_bytes - 2) / 2);
+            let after = root.join("\u{2}");
+            assert_eq!(root.as_os_str().len() + after.as_os_str().len(), row_bytes);
+            state.continuations.insert(root, after);
+            remaining -= row_bytes;
+            index += 1;
+        }
+        assert_eq!(
+            state
+                .continuations
+                .iter()
+                .map(|(root, after)| root.as_os_str().len() + after.as_os_str().len())
+                .sum::<usize>(),
+            MAX_RAW_PATH_BYTES,
+        );
+
+        remaining = MAX_SHALLOW_BYTES;
+        index = 0;
+        while remaining > 0 {
+            // A full depth-three position has seven paths. With one-byte
+            // children, their suffixes contribute another 24 raw bytes.
+            let row_bytes = remaining.min(7 * (MAX_PATH_BYTES - 6) + 24);
+            let root = escaped_root(index, (row_bytes - 24) / 7);
+            let entry = root.join("\u{2}");
+            let directory = entry.join("\u{3}");
+            let position = ShallowPosition {
+                entry: entry.clone(),
+                pending: Some(directory.join("\u{5}".repeat(1 + (row_bytes - 24) % 7))),
+                frames: vec![
+                    ShallowFrame {
+                        directory: entry.clone(),
+                        after: Some(entry.join("\u{2}")),
+                    },
+                    ShallowFrame {
+                        directory: directory.clone(),
+                        after: Some(directory.join("\u{4}")),
+                    },
+                ],
+            };
+            assert_eq!(
+                root.as_os_str().len()
+                    + position
+                        .paths()
+                        .map(|path| path.as_os_str().len())
+                        .sum::<usize>(),
+                row_bytes,
+            );
+            state.shallow.insert(root, position);
+            remaining -= row_bytes;
+            index += 1;
+        }
+        assert_eq!(
+            state
+                .shallow
+                .iter()
+                .map(|(root, position)| {
+                    root.as_os_str().len()
+                        + position
+                            .paths()
+                            .map(|path| path.as_os_str().len())
+                            .sum::<usize>()
+                })
+                .sum::<usize>(),
+            MAX_SHALLOW_BYTES,
+        );
+    }
+
     #[test]
     fn all_bounded_histories_fit_with_maximum_json_path_escaping() {
         use std::ffi::OsStr;
 
         use crate::scanner::walker::MAX_DISPATCH_CURSOR_PATH_BYTES;
-
-        fn escaped_root(index: usize, bytes: usize) -> PathBuf {
-            let prefix = format!("/{index}/");
-            PathBuf::from(format!("{prefix}{}", "\u{1}".repeat(bytes - prefix.len())))
-        }
-
-        fn fill_discovery_budgets(state: &mut PrescanCursor) {
-            let mut remaining = MAX_RAW_PATH_BYTES;
-            let mut index = 0;
-            while remaining > 0 {
-                let row_bytes = remaining.min(2 * MAX_PATH_BYTES - 2);
-                let root = escaped_root(index, (row_bytes - 2) / 2);
-                let after = root.join("\u{2}");
-                assert_eq!(root.as_os_str().len() + after.as_os_str().len(), row_bytes);
-                state.continuations.insert(root, after);
-                remaining -= row_bytes;
-                index += 1;
-            }
-            assert_eq!(
-                state
-                    .continuations
-                    .iter()
-                    .map(|(root, after)| root.as_os_str().len() + after.as_os_str().len())
-                    .sum::<usize>(),
-                MAX_RAW_PATH_BYTES,
-            );
-
-            remaining = MAX_SHALLOW_BYTES;
-            index = 0;
-            while remaining > 0 {
-                // A full depth-three position has seven paths. With one-byte
-                // children, their suffixes contribute another 24 raw bytes.
-                let row_bytes = remaining.min(7 * (MAX_PATH_BYTES - 6) + 24);
-                let root = escaped_root(index, (row_bytes - 24) / 7);
-                let entry = root.join("\u{2}");
-                let directory = entry.join("\u{3}");
-                let position = ShallowPosition {
-                    entry: entry.clone(),
-                    pending: Some(directory.join("\u{5}".repeat(1 + (row_bytes - 24) % 7))),
-                    frames: vec![
-                        ShallowFrame {
-                            directory: entry.clone(),
-                            after: Some(entry.join("\u{2}")),
-                        },
-                        ShallowFrame {
-                            directory: directory.clone(),
-                            after: Some(directory.join("\u{4}")),
-                        },
-                    ],
-                };
-                assert_eq!(
-                    root.as_os_str().len()
-                        + position
-                            .paths()
-                            .map(|path| path.as_os_str().len())
-                            .sum::<usize>(),
-                    row_bytes,
-                );
-                state.shallow.insert(root, position);
-                remaining -= row_bytes;
-                index += 1;
-            }
-            assert_eq!(
-                state
-                    .shallow
-                    .iter()
-                    .map(|(root, position)| {
-                        root.as_os_str().len()
-                            + position
-                                .paths()
-                                .map(|path| path.as_os_str().len())
-                                .sum::<usize>()
-                    })
-                    .sum::<usize>(),
-                MAX_SHALLOW_BYTES,
-            );
-        }
 
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("cursor.json");

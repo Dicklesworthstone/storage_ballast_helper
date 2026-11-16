@@ -1210,12 +1210,8 @@ mod tests {
         // Reproduce the original failure: every outer admission is occupied
         // by a completed page before any nested reader is requested.
         for root in &roots {
-            assert!(
-                cursor
-                    .poll_entries_to_visit(root, || true)
-                    .unwrap()
-                    .is_some()
-            );
+            let page = cursor.poll_entries_to_visit(root, || true).unwrap();
+            assert!(page.is_some());
         }
         let mut completed = std::collections::BTreeSet::new();
         let mut seen = std::collections::BTreeSet::new();
