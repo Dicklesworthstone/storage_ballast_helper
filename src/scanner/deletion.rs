@@ -2048,6 +2048,14 @@ fn is_resolved_absolute(path: &Path) -> bool {
             .any(|part| part == std::path::Component::ParentDir)
 }
 
+/// The attachment of one mount in a namespace. A covered mount remains in
+/// mountinfo, so pathname depth and record order cannot establish visibility.
+struct MountWriteRecord {
+    parent: u64,
+    mount_point: PathBuf,
+    state: MountWriteState,
+}
+
 /// Parsed once per admission group. Ancestor lookups avoid re-parsing and
 /// unescaping a potentially large container namespace for every candidate.
 struct MountTable {
@@ -2061,14 +2069,16 @@ impl MountTable {
             let rw = options.split(',').any(|option| option == "rw");
             (ro != rw).then_some(ro)
         };
-        let mut mounts = BTreeMap::new();
+        let mut records = BTreeMap::new();
         for line in mountinfo.lines() {
             if line.trim().is_empty() {
                 continue;
             }
             let (mount_fields, super_fields) = line.split_once(" - ")?;
             let mut fields = mount_fields.split_whitespace();
-            let mount_point = fields.nth(4)?;
+            let id = fields.next()?.parse::<u64>().ok()?;
+            let parent = fields.next()?.parse::<u64>().ok()?;
+            let mount_point = fields.nth(2)?;
             let mount_options = fields.next()?;
             let super_options = super_fields.split_whitespace().nth(2)?;
             let mount_point =
@@ -2085,8 +2095,88 @@ impl MountTable {
             } else {
                 MountWriteState::Writable
             };
-            // A later mount at the same point covers the earlier one.
-            mounts.insert(mount_point, state);
+            let record = MountWriteRecord {
+                parent,
+                mount_point,
+                state,
+            };
+            if records.insert(id, record).is_some() {
+                return None;
+            }
+        }
+        Self::from_records(&records)
+    }
+
+    fn from_records(records: &BTreeMap<u64, MountWriteRecord>) -> Option<Self> {
+        let mut root = None;
+        let mut children = BTreeMap::<u64, BTreeMap<&Path, u64>>::new();
+        for (&id, record) in records {
+            if record.parent == id || !records.contains_key(&record.parent) {
+                // The process root may have an unlisted parent (chroot), or
+                // name itself. A missing non-root parent is incomplete evidence.
+                if record.mount_point != Path::new("/") || root.replace(id).is_some() {
+                    return None;
+                }
+                continue;
+            }
+            let parent = records.get(&record.parent)?;
+            if !record.mount_point.starts_with(&parent.mount_point)
+                || children
+                    .entry(record.parent)
+                    .or_default()
+                    .insert(record.mount_point.as_path(), id)
+                    .is_some()
+            {
+                // Equal-point stacks must form a parent chain. Siblings at
+                // the same point do not say which mount lookup would reach.
+                return None;
+            }
+        }
+        let root = root?;
+
+        // Every node has one parent, so a disconnected parent cycle cannot
+        // be reached from this root. Validate hidden nodes too: unknown
+        // topology must not turn into a positive planning denial.
+        let mut pending = vec![root];
+        let mut reached = 0;
+        while let Some(id) = pending.pop() {
+            reached += 1;
+            if let Some(attached) = children.get(&id) {
+                pending.extend(attached.values().copied());
+            }
+        }
+        if reached != records.len() {
+            return None;
+        }
+
+        let mut mounts = BTreeMap::new();
+        pending.push(root);
+        while let Some(id) = pending.pop() {
+            let record = records.get(&id)?;
+            let attached = children.get(&id);
+            if let Some(cover) =
+                attached.and_then(|entries| entries.get(record.mount_point.as_path()))
+            {
+                // A mount stacked directly on this one hides both it and
+                // all other submounts attached to it, regardless of line order.
+                pending.push(*cover);
+                continue;
+            }
+            mounts.insert(record.mount_point.clone(), record.state);
+            if let Some(attached) = attached {
+                for (&point, &child) in attached {
+                    // A sibling mounted at a strict ancestor covers this
+                    // older attachment and its entire subtree. Follow only
+                    // the mounts reached through the visible parent.
+                    if !point
+                        .ancestors()
+                        .skip(1)
+                        .any(|ancestor| attached.contains_key(ancestor))
+                    {
+                        pending.push(child);
+                    }
+                }
+            }
         }
         Some(Self { mounts })
     }
@@ -4962,6 +5052,152 @@ mod tests {
                 "{malformed}"
             );
         }
+    }
+
+    #[test]
+    fn mount_write_state_follows_visible_topology_in_any_record_order() {
+        let rows = [
+            "1 0 0:1 / / rw - ext4 /dev/root rw",
+            "2 1 0:1 / /covered/old ro - ext4 /dev/root rw",
+            "3 1 0:2 / /covered rw - ext4 /dev/cover rw",
+            "4 2 0:3 / /covered/old/deeper ro - ext4 /dev/hidden ro",
+            "5 3 0:2 / /covered/new ro - ext4 /dev/cover rw",
+            "6 5 0:2 / /covered/new/allowed rw - ext4 /dev/cover rw",
+            "7 1 0:1 / /stack ro - ext4 /dev/root rw",
+            "8 7 0:1 / /stack/below rw - ext4 /dev/root rw",
+            "9 7 0:4 / /stack ro - ext4 /dev/broken ro",
+            "10 9 0:5 / /stack/rescue rw - ext4 /dev/rescue rw",
+        ];
+        let orders = [
+            rows.join("\n"),
+            rows.iter().rev().copied().collect::<Vec<_>>().join("\n"),
+            rows[4..]
+                .iter()
+                .chain(&rows[..4])
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ];
+        for mountinfo in orders {
+            let table = MountTable::parse(&mountinfo).unwrap();
+            for (path, expected) in [
+                ("/covered/old/target", MountWriteState::Writable),
+                ("/covered/old/deeper/target", MountWriteState::Writable),
+                ("/covered/new/target", MountWriteState::NamespaceReadOnly),
+                ("/covered/new/allowed/target", MountWriteState::Writable),
+                ("/stack/below/target", MountWriteState::FilesystemReadOnly),
+                ("/stack/rescue/target", MountWriteState::Writable),
+                ("/stack-other/target", MountWriteState::Writable),
+            ] {
+                assert_eq!(
+                    table.state_for(Path::new(path)),
+                    Some(expected),
+                    "{path}\n{mountinfo}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mount_write_state_handles_stacked_and_self_parented_namespace_roots() {
+        let stacked = "\
+1 99 0:1 / / ro - ext4 /dev/old rw
+2 1 0:2 / / rw - ext4 /dev/current rw
+3 1 0:1 / /hidden ro - ext4 /dev/old rw
+4 2 0:2 / /visible ro - ext4 /dev/current rw
+";
+        assert_eq!(
+            mount_write_state_in(stacked, Path::new("/hidden/target")),
+            Some(MountWriteState::Writable)
+        );
+        assert_eq!(
+            mount_write_state_in(stacked, Path::new("/visible/target")),
+            Some(MountWriteState::NamespaceReadOnly)
+        );
+        assert_eq!(
+            mount_write_state_in(
+                "1 1 0:1 / / rw - ext4 /dev/root rw\n",
+                Path::new("/target")
+            ),
+            Some(MountWriteState::Writable)
+        );
+    }
+
+    #[test]
+    fn mount_write_state_rejects_ambiguous_and_disconnected_topology() {
+        let root = "1 0 0:1 / / rw - ext4 /dev/root rw\n";
+        for malformed in [
+            "1 0 0:2 / / rw - ext4 /dev/duplicate rw\n",
+            "invalid 1 0:1 / /target rw - ext4 /dev/root rw\n",
+            "2 invalid 0:1 / /target rw - ext4 /dev/root rw\n",
+            "2 99 0:1 / /orphan rw - ext4 /dev/root rw\n",
+            "2 2 0:1 / /loop rw - ext4 /dev/root rw\n",
+            "2 99 0:2 / / rw - ext4 /dev/other-root rw\n",
+            "2 3 0:1 / /cycle rw - ext4 /dev/root rw\n\
+             3 2 0:1 / /cycle rw - ext4 /dev/root rw\n",
+            "2 1 0:1 / /parent rw - ext4 /dev/root rw\n\
+             3 2 0:1 / /outside rw - ext4 /dev/root rw\n",
+            "2 1 0:1 / /same rw - ext4 /dev/root rw\n\
+             3 1 0:1 / /same ro - ext4 /dev/root rw\n",
+        ] {
+            assert!(
+                MountTable::parse(&format!("{root}{malformed}")).is_none(),
+                "{malformed}"
+            );
+        }
+        assert!(
+            MountTable::parse("2 99 0:1 / /orphan rw - ext4 /dev/root rw\n").is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planning_write_access_ignores_covered_denials_but_keeps_real_mount_incidents() {
+        let temp = scratch_dir();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let writable = root.join("covered/old/target");
+        let denied = root.join("sandbox/target");
+        let broken = root.join("broken/target");
+        for path in [&writable, &denied, &broken] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let escaped = |path: &Path| {
+            path.to_string_lossy()
+                .replace('\\', "\\134")
+                .replace(' ', "\\040")
+                .replace('\t', "\\011")
+                .replace('\n', "\\012")
+        };
+        let mountinfo = format!(
+            "1 0 0:1 / / rw - ext4 /dev/root rw\n\
+2 1 0:1 / {} ro - ext4 /dev/root rw\n\
+3 1 0:2 / {} rw - ext4 /dev/cover rw\n\
+4 1 0:1 / {} ro - ext4 /dev/root rw\n\
+5 1 0:1 / {} ro - ext4 /dev/root rw\n\
+6 1 0:3 / {} ro - ext4 /dev/broken ro\n",
+            escaped(writable.parent().unwrap()),
+            escaped(&root.join("covered")),
+            escaped(denied.parent().unwrap()),
+            escaped(&broken),
+            escaped(broken.parent().unwrap()),
+        );
+        let allowed = make_candidate(&writable, 64, 0.9);
+        let incident = make_candidate(&broken, 128, 0.9);
+        let mut candidates = vec![
+            allowed.clone(),
+            make_candidate(&denied, 1_000_000, 0.99),
+            incident.clone(),
+        ];
+        let refused = retain_planning_write_access_in(&mut candidates, Some(&mountinfo));
+        assert_eq!(refused.namespace_read_only, 1);
+        assert_eq!(refused.permissions, 0);
+        assert_eq!(refused.first.as_deref(), Some(denied.as_path()));
+        assert_eq!(candidates, vec![allowed, incident]);
+        assert_eq!(
+            mount_write_state_in(&mountinfo, &broken),
+            Some(MountWriteState::FilesystemReadOnly)
+        );
+        assert!(writable.is_dir() && denied.is_dir() && broken.is_dir());
     }
 
     #[cfg(unix)]
