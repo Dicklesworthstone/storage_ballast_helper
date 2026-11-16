@@ -592,14 +592,8 @@ fn logger_thread_main(
         // Only an acknowledged SQLite record can suppress a later observation.
         // JSONL-only traffic must still reach the periodic SQLite recovery path.
         #[cfg(feature = "sqlite")]
-        if sqlite.is_some()
-            && match &event {
-                ActivityEvent::DecisionRecorded(record) => !decisions.should_record(record, now),
-                ActivityEvent::DecisionExecuted(record) => {
-                    !decisions.should_record_executed(record)
-                }
-                _ => false,
-            }
+        if let Some(db) = &sqlite
+            && !should_record_decision(&mut decisions, db, &event, now)
         {
             // Duplicate traffic can prevent both ordinary writes and the
             // receive timeout from servicing the JSONL durability timer.
@@ -631,11 +625,7 @@ fn logger_thread_main(
                 let decision_ok = match &event {
                     ActivityEvent::DecisionRecorded(record)
                     | ActivityEvent::DecisionExecuted(record) => {
-                        let ok = db.log_decision(record).is_ok();
-                        if ok {
-                            decisions.acknowledge(record, Instant::now());
-                        }
-                        Some(ok)
+                        Some(persist_decision(db, &mut decisions, record))
                     }
                     ActivityEvent::DecisionOutcome(outcome) => {
                         Some(db.log_outcome_for_run(outcome, run_id.as_deref()).is_ok())
@@ -706,6 +696,44 @@ fn logger_thread_main(
     // Final flush.
     jsonl.flush();
     jsonl.fsync();
+}
+
+/// Both cache hits and overflow reads describe acknowledged SQLite evidence.
+#[cfg(feature = "sqlite")]
+fn should_record_decision(
+    decisions: &mut crate::logger::decision_dedupe::DecisionDedupe,
+    db: &SqliteLogger,
+    event: &ActivityEvent,
+    now: Instant,
+) -> bool {
+    match event {
+        ActivityEvent::DecisionRecorded(record) => {
+            decisions.should_record_with_history(record, now, SystemTime::now(), || {
+                db.latest_decision_for_path(&record.path).ok().flatten()
+            })
+        }
+        ActivityEvent::DecisionExecuted(record) => decisions.should_record_executed(record),
+        _ => true,
+    }
+}
+
+/// Capture the inserted decision's identity before the next backend write.
+#[cfg(feature = "sqlite")]
+fn persist_decision(
+    db: &SqliteLogger,
+    decisions: &mut crate::logger::decision_dedupe::DecisionDedupe,
+    record: &DecisionRecord,
+) -> bool {
+    match db.log_decision_with_id(record) {
+        Ok(row_id) => {
+            decisions.acknowledge_persisted(record, Instant::now(), row_id);
+            true
+        }
+        Err(_) => {
+            decisions.persistence_failed();
+            false
+        }
+    }
 }
 
 // ──────────────────── event conversion ────────────────────
@@ -1701,6 +1729,148 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn cache_test_record(index: u64) -> DecisionRecord {
+        use crate::scanner::decision_record::{PolicyMode, sample_record_for_tests};
+        use crate::scanner::scoring::DecisionAction;
+
+        let mut record = sample_record_for_tests(PolicyMode::Live, Some(DecisionAction::Keep));
+        record.id = format!("{index:012x}");
+        record.path = PathBuf::from(format!("/cache/candidate-{index}"));
+        record.timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        record
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn record_if_needed(
+        db: &SqliteLogger,
+        decisions: &mut crate::logger::decision_dedupe::DecisionDedupe,
+        record: &DecisionRecord,
+    ) -> bool {
+        let event = ActivityEvent::DecisionRecorded(Box::new(record.clone()));
+        if !should_record_decision(decisions, db, &event, Instant::now()) {
+            return false;
+        }
+        assert!(persist_decision(db, decisions, record));
+        true
+    }
+
+    /// A larger stable working set must not reset the cache or thrash the ledger.
+    /// These are the same admission and persistence functions used by logger_loop.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn decision_cache_overflow_uses_persisted_verdicts() {
+        use crate::logger::decision_dedupe::DecisionDedupe;
+        use crate::scanner::decision_record::ActionRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteLogger::open(&dir.path().join("test.db")).unwrap();
+        let mut decisions = DecisionDedupe::with_capacity_for_test(4);
+        let mut writes = Vec::new();
+        for pass in 0..4_u64 {
+            let mut written = 0;
+            for artifact in 0..9_u64 {
+                let mut record = cache_test_record(artifact);
+                record.decision_id = 100 + pass * 9 + artifact;
+                written += usize::from(record_if_needed(&db, &mut decisions, &record));
+            }
+            writes.push(written);
+            assert_eq!(decisions.len(), 4);
+        }
+        assert_eq!(writes, vec![9, 0, 0, 0]);
+        assert_eq!(db.recent_decisions(100).unwrap().len(), 9);
+
+        let original = cache_test_record(8);
+        let mut replaced = original.clone();
+        replaced.id = "ffffffffffff".to_string();
+        assert!(record_if_needed(&db, &mut decisions, &replaced));
+        let mut changed = replaced.clone();
+        changed.effective_action = Some(ActionRecord::Review);
+        assert!(record_if_needed(&db, &mut decisions, &changed));
+        // The latest row is for a different version; the older matching ID
+        // must not be found by searching historical rows for that artifact.
+        assert!(record_if_needed(&db, &mut decisions, &original));
+        assert_eq!(db.recent_decisions(100).unwrap().len(), 12);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn overflow_retry_is_not_hidden_by_an_older_sqlite_verdict() {
+        use crate::logger::decision_dedupe::DecisionDedupe;
+        use crate::scanner::decision_record::ActionRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteLogger::open(&dir.path().join("test.db")).unwrap();
+        let mut decisions = DecisionDedupe::with_capacity_for_test(1);
+        let resident = cache_test_record(0);
+        let overflow = cache_test_record(1);
+        assert!(record_if_needed(&db, &mut decisions, &resident));
+        assert!(record_if_needed(&db, &mut decisions, &overflow));
+        db.connection()
+            .execute_batch(
+                "CREATE TRIGGER reject_changed_verdict BEFORE INSERT ON decision_log
+                 WHEN NEW.decision_id = '000000000001' AND NEW.effective_action = 'REVIEW'
+                 BEGIN SELECT RAISE(FAIL, 'injected changed-verdict failure'); END;",
+            )
+            .unwrap();
+        let mut changed = overflow.clone();
+        changed.effective_action = Some(ActionRecord::Review);
+        let event = ActivityEvent::DecisionRecorded(Box::new(changed.clone()));
+        assert!(should_record_decision(
+            &mut decisions,
+            &db,
+            &event,
+            Instant::now(),
+        ));
+        assert!(!persist_decision(&db, &mut decisions, &changed));
+        assert!(!record_if_needed(&db, &mut decisions, &resident));
+
+        // A successful unrelated decision re-enables overflow reads, but rows
+        // from before that insert cannot acknowledge the failed artifact.
+        assert!(record_if_needed(&db, &mut decisions, &cache_test_record(2)));
+        assert!(record_if_needed(&db, &mut decisions, &overflow));
+        assert!(!record_if_needed(&db, &mut decisions, &overflow));
+        assert_eq!(
+            db.decisions_for_path(overflow.path.to_str().unwrap(), 10)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn overflow_execution_preserves_the_executed_record() {
+        use crate::logger::decision_dedupe::DecisionDedupe;
+        use crate::scanner::decision_record::ActionRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteLogger::open(&dir.path().join("test.db")).unwrap();
+        let mut decisions = DecisionDedupe::with_capacity_for_test(1);
+        assert!(record_if_needed(&db, &mut decisions, &cache_test_record(0)));
+        let mut record = cache_test_record(1);
+        record.effective_action = Some(ActionRecord::Delete);
+        assert!(record_if_needed(&db, &mut decisions, &record));
+        assert!(!record_if_needed(&db, &mut decisions, &record));
+
+        // Numeric IDs can repeat across daemon runs. Even with the same ID,
+        // uncached execution evidence must not be suppressed by a database read.
+        record.trace_id = "execution-from-another-run".to_string();
+        let event = ActivityEvent::DecisionExecuted(Box::new(record.clone()));
+        assert!(should_record_decision(
+            &mut decisions,
+            &db,
+            &event,
+            Instant::now(),
+        ));
+        assert!(persist_decision(&db, &mut decisions, &record));
+        let stored = db
+            .decisions_for_path(record.path.to_str().unwrap(), 10)
+            .unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].trace_id, record.trace_id);
     }
 
     #[cfg(feature = "sqlite")]

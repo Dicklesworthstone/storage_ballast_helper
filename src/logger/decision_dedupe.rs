@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::scanner::decision_record::DecisionRecord;
 
@@ -29,19 +29,100 @@ use crate::scanner::decision_record::DecisionRecord;
 /// again.
 pub const DECISION_REFRESH: Duration = Duration::from_hours(24);
 
-/// Artifacts remembered at most. Past it, entries older than the refresh are
-/// dropped first, then everything: the cost is one repeated record each.
+/// Artifacts remembered in memory at most. Overflow observations consult the
+/// indexed persisted ledger; live cache entries are never cleared for admission.
 const MAX_REMEMBERED: usize = 1 << 18;
+/// A full cache is swept at most once a minute, not once per overflow artifact.
+const CACHE_PRUNE_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Remembers the last acknowledged verdict per artifact version.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DecisionDedupe {
     /// Artifact key -> (verdict key, when acknowledged, that record's
     /// per-run `decision_id`).
     last: HashMap<u64, (u64, Instant, u64)>,
+    capacity: usize,
+    overflowed: bool,
+    last_prune: Option<Instant>,
+    /// Only rows after this decision_log ID may satisfy an overflow lookup.
+    persisted_after: i64,
+    /// Startup, recovery and a failed write require a new successful insert
+    /// before any persisted record can suppress an observation.
+    persisted_lookup_blocked: bool,
+}
+
+impl Default for DecisionDedupe {
+    fn default() -> Self {
+        Self {
+            last: HashMap::new(),
+            capacity: MAX_REMEMBERED,
+            overflowed: false,
+            last_prune: None,
+            persisted_after: 0,
+            persisted_lookup_blocked: true,
+        }
+    }
 }
 
 impl DecisionDedupe {
+    /// Check overflow observations against the newest persisted row for their
+    /// path. The lookup must be read-only and return None on unavailable or
+    /// malformed evidence. Cached observations need no database query.
+    ///
+    /// Execution events deliberately do not use this path: a per-run numeric
+    /// decision ID from a previous daemon must never suppress execution evidence.
+    pub fn should_record_with_history(
+        &mut self,
+        record: &DecisionRecord,
+        now: Instant,
+        wall_time: SystemTime,
+        lookup: impl FnOnce() -> Option<(i64, DecisionRecord)>,
+    ) -> bool {
+        if self.overflowed
+            && !self.persisted_lookup_blocked
+            && !self.last.contains_key(&artifact_key(record))
+            && let Some((row_id, persisted)) = lookup()
+            && row_id > self.persisted_after
+            && persisted.id == record.id
+            && persisted.path == record.path
+            && verdict_key(&persisted) == verdict_key(record)
+            && chrono::DateTime::parse_from_rfc3339(&persisted.timestamp)
+                .ok()
+                .and_then(|timestamp| wall_time.duration_since(SystemTime::from(timestamp)).ok())
+                .is_some_and(|age| age < DECISION_REFRESH)
+        {
+            return false;
+        }
+        self.should_record(record, now)
+    }
+
+    /// Fence off older persisted verdicts after a write failure. Otherwise a
+    /// changed verdict written only to JSONL could make its previous SQLite row
+    /// incorrectly suppress the next retry. Unaffected cached entries stay valid.
+    pub fn persistence_failed(&mut self) {
+        self.persisted_lookup_blocked = true;
+    }
+
+    /// Acknowledge the exact decision_log insert, including its row ID.
+    /// After a failure this conservatively makes older overflow rows repeat once;
+    /// no per-artifact failure set can grow beyond the cache's memory bound.
+    pub fn acknowledge_persisted(&mut self, record: &DecisionRecord, now: Instant, row_id: i64) {
+        if self.persisted_lookup_blocked {
+            self.persisted_after = self.persisted_after.max(row_id.saturating_sub(1));
+            self.persisted_lookup_blocked = false;
+        }
+        self.acknowledge(record, now);
+    }
+
+    /// Exercise the production admission path with a small memory bound.
+    #[cfg(test)]
+    pub(crate) fn with_capacity_for_test(capacity: usize) -> Self {
+        Self {
+            capacity,
+            ..Self::default()
+        }
+    }
+
     /// Whether `record` must be written to the evidence ledger at `now`.
     /// Admission invalidates the previous verdict; only `acknowledge` can
     /// suppress later observations after a successful persistence attempt.
@@ -82,17 +163,24 @@ impl DecisionDedupe {
     /// Buffered JSONL output and producer admission are not acknowledgements.
     pub fn acknowledge(&mut self, record: &DecisionRecord, now: Instant) {
         let artifact = artifact_key(record);
-        if self.last.len() >= MAX_REMEMBERED {
+        if self.last.len() >= self.capacity
+            && !self.last.contains_key(&artifact)
+            && self.last_prune.is_none_or(|at| {
+                now.saturating_duration_since(at) >= CACHE_PRUNE_INTERVAL
+            })
+        {
+            self.last_prune = Some(now);
             self.last.retain(|_, (_, at, _)| {
                 now.checked_duration_since(*at)
                     .is_some_and(|age| age < DECISION_REFRESH)
             });
-            if self.last.len() >= MAX_REMEMBERED {
-                self.last.clear();
-            }
         }
-        self.last
-            .insert(artifact, (verdict_key(record), now, record.decision_id));
+        if self.last.len() < self.capacity || self.last.contains_key(&artifact) {
+            self.last
+                .insert(artifact, (verdict_key(record), now, record.decision_id));
+        } else {
+            self.overflowed = true;
+        }
     }
 
     /// Artifacts currently remembered.
@@ -152,6 +240,74 @@ mod tests {
 
     fn kept(id: &str) -> DecisionRecord {
         record(id, Some(DecisionAction::Keep), PolicyMode::Live)
+    }
+
+    #[test]
+    fn a_full_cache_keeps_live_entries_and_bounds_expiry_sweeps() {
+        let mut dedupe = DecisionDedupe::with_capacity_for_test(4);
+        let now = Instant::now();
+        for index in 0..4 {
+            dedupe.acknowledge(&kept(&format!("{index:012x}")), now);
+        }
+        for index in 4..12 {
+            dedupe.acknowledge(
+                &kept(&format!("{index:012x}")),
+                now + Duration::from_secs(index - 4),
+            );
+            assert_eq!(dedupe.len(), 4);
+            assert_eq!(dedupe.last_prune, Some(now));
+        }
+        assert!(dedupe.overflowed);
+        assert!(!dedupe.should_record(&kept("000000000000"), now));
+        dedupe.acknowledge(&kept("ffffffffffff"), now + CACHE_PRUNE_INTERVAL);
+        assert_eq!(dedupe.last_prune, Some(now + CACHE_PRUNE_INTERVAL));
+        assert_eq!(dedupe.len(), 4);
+        dedupe.acknowledge(&kept("eeeeeeeeeeee"), now + DECISION_REFRESH);
+        assert_eq!(dedupe.len(), 1, "expired slots can be reused");
+    }
+
+    #[test]
+    fn overflow_history_requires_current_matching_acknowledged_evidence() {
+        let mut dedupe = DecisionDedupe::with_capacity_for_test(1);
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let stamp = |time: SystemTime| {
+            chrono::DateTime::<chrono::Utc>::from(time)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        let resident = kept("aaaaaaaaaaaa");
+        let mut overflow = kept("bbbbbbbbbbbb");
+        overflow.timestamp = stamp(wall);
+        dedupe.acknowledge_persisted(&resident, now, 1);
+        dedupe.acknowledge_persisted(&overflow, now, 2);
+        assert!(!dedupe.should_record_with_history(&resident, now, wall, || {
+            panic!("resident decisions must not read SQLite")
+        }));
+        assert!(!dedupe.should_record_with_history(&overflow, now, wall, || {
+            Some((2, overflow.clone()))
+        }));
+
+        let mut stale = overflow.clone();
+        stale.timestamp = stamp(wall - DECISION_REFRESH);
+        let mut future = overflow.clone();
+        future.timestamp = stamp(wall + Duration::from_secs(1));
+        let mut invalid = overflow.clone();
+        invalid.timestamp = "invalid".to_string();
+        let mut replaced = overflow.clone();
+        replaced.id = "cccccccccccc".to_string();
+        let mut other_path = overflow.clone();
+        other_path.path = other_path.path.join("other");
+        let mut changed = overflow.clone();
+        changed.effective_action = Some(ActionRecord::Review);
+        for evidence in [stale, future, invalid, replaced, other_path, changed] {
+            assert!(dedupe.should_record_with_history(&overflow, now, wall, || {
+                Some((2, evidence))
+            }));
+        }
+        dedupe.persistence_failed();
+        assert!(dedupe.should_record_with_history(&overflow, now, wall, || {
+            panic!("failed persistence must block overflow reads")
+        }));
     }
 
     /// The bead's acceptance: re-evaluating an unchanged kept artifact N times

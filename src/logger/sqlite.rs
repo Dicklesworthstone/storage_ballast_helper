@@ -738,6 +738,13 @@ impl SqliteLogger {
     /// Indexed columns are denormalized for querying; `record` holds the
     /// full JSON so `sbh explain` can render every level from one row.
     pub fn log_decision(&self, record: &DecisionRecord) -> Result<()> {
+        self.log_decision_with_id(record).map(|_| ())
+    }
+
+    /// Append a decision and return that insert's decision_log row ID. Capture it
+    /// here, before unrelated activity or pressure inserts can change SQLite's
+    /// connection-local last_insert_rowid.
+    pub(crate) fn log_decision_with_id(&self, record: &DecisionRecord) -> Result<i64> {
         let payload = serde_json::to_string(record).map_err(|e| SbhError::Serialization {
             context: "decision record",
             details: e.to_string(),
@@ -765,7 +772,30 @@ impl SqliteLogger {
                 record.veto_reason,
                 payload,
             ])?;
-        Ok(())
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The newest decision for an exact path, with its persistence identity.
+    /// Uses one indexed seek, without a COUNT or a historical artifact-ID search:
+    /// a newer artifact or verdict must invalidate an older observation.
+    pub(crate) fn latest_decision_for_path(
+        &self,
+        path: &Path,
+    ) -> Result<Option<(i64, DecisionRecord)>> {
+        let row: Option<(i64, String)> = self
+            .conn
+            .prepare_cached(
+                "SELECT id, record FROM decision_log WHERE path = ?1 ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row(params![path.to_string_lossy().as_ref()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?;
+        Ok(row.and_then(|(row_id, payload)| {
+            serde_json::from_str(&payload)
+                .ok()
+                .map(|record| (row_id, record))
+        }))
     }
 
     /// Record a regret label without claiming a daemon run.
