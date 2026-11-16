@@ -308,6 +308,11 @@ pub struct ForecastSnapshot {
     pub tte_point_s: Option<f64>,
     /// The conformal lower bound (seconds); the point while warming.
     pub tte_lo_s: Option<f64>,
+    /// The lower bound collapsed to zero despite a positive point forecast.
+    /// Zero still drives conservative control, but supplies no measured or
+    /// predicted time at which the filesystem reaches the threshold.
+    #[serde(default)]
+    pub runway_unknown: bool,
     /// The configured coverage target of the bound.
     pub coverage_target: f64,
     /// Fraction of resolved predictions the bound covered.
@@ -331,6 +336,7 @@ impl ForecastSnapshot {
         Self {
             tte_point_s: finite(interval.point_secs),
             tte_lo_s: finite(interval.lo_secs),
+            runway_unknown: interval.runway_unknown(),
             coverage_target,
             coverage_empirical: interval.coverage_empirical,
             alpha: interval.alpha,

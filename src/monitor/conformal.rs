@@ -100,6 +100,17 @@ pub struct TteInterval {
     pub coverage_empirical: Option<f64>,
 }
 
+impl TteInterval {
+    /// A zero lower bound for a positive point forecast cannot establish a
+    /// safe runway. It does not mean the filesystem has reached the boundary.
+    /// Controllers may still use that bound conservatively, but reports must
+    /// not turn it into a prediction of immediate exhaustion.
+    #[must_use]
+    pub fn runway_unknown(&self) -> bool {
+        self.point_secs.is_finite() && self.point_secs > 0.0 && self.lo_secs == 0.0
+    }
+}
+
 /// What one `observe` call resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ResolvedBatch {
@@ -507,6 +518,12 @@ mod tests {
         // the five scores: the unseen tail requires a zero lower bound.
         assert_eq!(interval.lo_secs, 0.0);
         assert_eq!(interval.samples, 5);
+        assert!(interval.runway_unknown());
+        // The same calibrated model can describe an already reached
+        // threshold; that real zero must not be relabelled as uncertainty.
+        let reached = calibrator.lower_bound(0.0);
+        assert_eq!(reached.lo_secs, 0.0);
+        assert!(!reached.runway_unknown());
     }
 
     #[test]

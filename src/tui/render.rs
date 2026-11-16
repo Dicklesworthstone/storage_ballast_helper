@@ -642,7 +642,16 @@ fn mount_is_unprotected(state: &DaemonState, mount: &str) -> bool {
 
 /// Present this mount's published time to Red. Free percentages and rates
 /// alone cannot establish a horizon without the actual filesystem capacity.
-fn mount_red_horizon(state: &DaemonState, mount: &str) -> String {
+fn mount_red_horizon(model: &DashboardModel, mount: &str) -> String {
+    if model.degraded {
+        return "red runway unknown (stale state)".into();
+    }
+    let Some(state) = &model.daemon_state else {
+        return "red runway unknown (no daemon state)".into();
+    };
+    if state.stopped_at.is_some() {
+        return "red runway unknown (daemon stopped)".into();
+    }
     let Some(rate) = state.rates.get(mount) else {
         return "red runway unknown (no forecast)".to_string();
     };
@@ -655,6 +664,23 @@ fn mount_red_horizon(state: &DaemonState, mount: &str) -> String {
     let lower = forecast
         .and_then(|forecast| forecast.tte_lo_s)
         .filter(valid_seconds);
+    // A reached boundary is an observation, independent of whether the
+    // current fill trend can support a prediction of a future crossing.
+    if point == Some(0.0) {
+        return "red in 0s".into();
+    }
+    if !rate.bytes_per_sec.is_finite()
+        || !rate.confidence.is_finite()
+        || !(0.0..=1.0).contains(&rate.confidence)
+    {
+        return "red runway unknown (invalid forecast)".into();
+    }
+    if rate.confidence == 0.0 {
+        return "red runway unknown (warming)".into();
+    }
+    if rate.bytes_per_sec <= 0.0 {
+        return "not filling".into();
+    }
     match (lower, point) {
         (Some(0.0), Some(point)) if point > 0.0 => {
             format!("red runway unknown (point {})", eta_label(point))
@@ -676,7 +702,7 @@ fn styled_forecast_horizon<'a>(model: &'a DashboardModel, theme: &'a Theme) -> V
             .min_by(|a, b| a.free_pct.total_cmp(&b.free_pct));
         if let Some(worst) = worst {
             let level_color = theme.palette.pressure_color(&worst.level);
-            let horizon = mount_red_horizon(state, &worst.path);
+            let horizon = mount_red_horizon(model, &worst.path);
             let urgency_color = if worst.free_pct < 10.0 {
                 theme.palette.danger_color()
             } else if worst.free_pct < 25.0 {
@@ -4252,7 +4278,7 @@ fn render_forecast_horizon(model: &DashboardModel, theme: &Theme) -> String {
             .iter()
             .min_by(|a, b| a.free_pct.total_cmp(&b.free_pct));
         if let Some(worst) = worst {
-            let horizon = mount_red_horizon(state, &worst.path);
+            let horizon = mount_red_horizon(model, &worst.path);
             let badge = status_badge(
                 &worst.level.to_ascii_uppercase(),
                 theme.palette.for_pressure_level(&worst.level),
@@ -6094,6 +6120,7 @@ mod tests {
                 Duration::from_secs(1),
                 (160, 45),
             );
+            model.degraded = false;
             model.daemon_state = Some(state);
             for text in [
                 render_forecast_horizon(&model, &theme),
@@ -6149,6 +6176,7 @@ mod tests {
                 Duration::from_secs(1),
                 (80, 24),
             );
+            model.degraded = false;
             model.daemon_state = Some(state);
             for text in [
                 render_forecast_horizon(&model, &theme),
@@ -6191,6 +6219,91 @@ mod tests {
             ] {
                 assert!(text.contains("red runway unknown (no forecast)"), "{text}");
             }
+        }
+    }
+
+    #[test]
+    fn forecast_horizon_refuses_stale_stopped_and_unusable_trends() {
+        use crate::daemon::self_monitor::MountRateState;
+
+        let theme = Theme::for_terminal(160, AccessibilityProfile::default());
+        for (case, expected) in [
+            ("stale", "red runway unknown (stale state)"),
+            ("stopped", "red runway unknown (daemon stopped)"),
+            ("invalid_rate", "red runway unknown (invalid forecast)"),
+            (
+                "invalid_confidence",
+                "red runway unknown (invalid forecast)",
+            ),
+            ("out_of_range", "red runway unknown (invalid forecast)"),
+            ("warming", "red runway unknown (warming)"),
+            ("recovering", "not filling"),
+            ("steady", "not filling"),
+        ] {
+            let mut model = DashboardModel::new(
+                PathBuf::from("/tmp/state.json"),
+                vec![],
+                Duration::from_secs(1),
+                (160, 45),
+            );
+            model.degraded = case == "stale";
+            let mut state = sample_state("yellow", 15.0);
+            let mut rate = MountRateState {
+                bytes_per_sec: 1_538_757.0,
+                confidence: 0.71,
+                seconds_to_red: Some(3600.0),
+                ..Default::default()
+            };
+            match case {
+                "stopped" => state.stopped_at = Some(state.last_updated.clone()),
+                "invalid_rate" => rate.bytes_per_sec = f64::NAN,
+                "invalid_confidence" => rate.confidence = f64::NAN,
+                "out_of_range" => rate.confidence = 1.1,
+                "warming" => rate.confidence = 0.0,
+                "recovering" => rate.bytes_per_sec = -1.0,
+                "steady" => rate.bytes_per_sec = 0.0,
+                _ => {}
+            }
+            state.rates.insert("/".into(), rate);
+            model.daemon_state = Some(state);
+            for text in [
+                render_forecast_horizon(&model, &theme),
+                Text::from_lines(styled_forecast_horizon(&model, &theme)).to_plain_text(),
+            ] {
+                assert!(text.contains(expected), "{case}: {text}");
+                assert!(!text.contains("red in "), "{case}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn forecast_horizon_keeps_a_reached_boundary_without_a_filling_trend() {
+        use crate::daemon::self_monitor::MountRateState;
+
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (160, 45),
+        );
+        model.degraded = false;
+        let mut state = sample_state("red", 5.0);
+        state.rates.insert(
+            "/".into(),
+            MountRateState {
+                bytes_per_sec: -1.0,
+                confidence: 0.0,
+                seconds_to_red: Some(0.0),
+                ..Default::default()
+            },
+        );
+        model.daemon_state = Some(state);
+        let theme = Theme::for_terminal(160, AccessibilityProfile::default());
+        for text in [
+            render_forecast_horizon(&model, &theme),
+            Text::from_lines(styled_forecast_horizon(&model, &theme)).to_plain_text(),
+        ] {
+            assert!(text.contains("red in 0s"), "{text}");
         }
     }
 

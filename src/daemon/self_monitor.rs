@@ -916,7 +916,10 @@ pub struct MountRateState {
     pub accel: f64,
     /// Estimator confidence (0.0–1.0).
     pub confidence: f64,
-    /// Predicted seconds until the red threshold, if the mount is filling.
+    /// Predicted seconds until the red threshold, if the mount is filling
+    /// and calibration supplies an informative bound. A collapsed bound is
+    /// retained in `forecast`, with `runway_unknown`, rather than reported as
+    /// immediate exhaustion here.
     pub seconds_to_red: Option<f64>,
     /// Predicted seconds until the mount is full, if it is filling.
     pub seconds_to_full: Option<f64>,

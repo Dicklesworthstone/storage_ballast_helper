@@ -17009,44 +17009,54 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                     && seconds_left < window_secs
                 {
                     let runway_unknown = forecast.runway_unknown();
-                    let minutes_left = seconds_left / 60.0;
+                    let reported_seconds = (!runway_unknown).then_some(seconds_left);
+                    let minutes_left = reported_seconds.map(|seconds| seconds / 60.0);
                     match output_mode(cli) {
                         OutputMode::Human => {
-                            let prediction = if runway_unknown {
-                                "red runway unknown: calibration cannot establish headroom"
-                                    .to_string()
+                            if runway_unknown {
+                                println!(
+                                    "sbh: {} has {} free but {}; cannot establish the requested {} min runway",
+                                    capacity.mount_point.display(),
+                                    format_bytes(capacity.available_bytes),
+                                    forecast.red_horizon_description(),
+                                    predict_minutes,
+                                );
                             } else {
-                                format!("predicted red in {}", format_eta(seconds_left))
-                            };
-                            println!(
-                                "sbh: {} has {} free but {} (need {} min; rate {}/s, confidence {:.2}{})",
-                                capacity.mount_point.display(),
-                                format_bytes(capacity.available_bytes),
-                                prediction,
-                                predict_minutes,
-                                format_bytes(forecast.bytes_per_sec.max(0.0) as u64),
-                                forecast.confidence,
-                                if forecast.warming(min_confidence) {
-                                    ", warming"
-                                } else {
-                                    ""
-                                },
-                            );
+                                println!(
+                                    "sbh: {} has {} free but predicted red in {} (need {} min; rate {}/s, confidence {:.2}{})",
+                                    capacity.mount_point.display(),
+                                    format_bytes(capacity.available_bytes),
+                                    format_eta(seconds_left),
+                                    predict_minutes,
+                                    format_bytes(forecast.bytes_per_sec.max(0.0) as u64),
+                                    forecast.confidence,
+                                    if forecast.warming(min_confidence) {
+                                        ", warming"
+                                    } else {
+                                        ""
+                                    },
+                                );
+                            }
                         }
                         OutputMode::Json => {
                             let payload = json!({
                                 "command": "check",
                                 "schema_version": 2,
                                 "status": "warning",
+                                "reason": if runway_unknown {
+                                    "forecast_runway_unknown"
+                                } else {
+                                    "predicted_red_within_window"
+                                },
                                 "path": check_path.to_string_lossy(),
                                 "mount_point": capacity.mount_point.to_string_lossy(),
                                 "free_bytes": capacity.available_bytes,
                                 "total_bytes": capacity.total_bytes,
                                 "free_pct": free_pct,
                                 "rate_bytes_per_sec": forecast.bytes_per_sec,
-                                "seconds_to_red": (!runway_unknown).then_some(seconds_left),
+                                "seconds_to_red": reported_seconds,
                                 "seconds_to_red_lower_bound": forecast.tte_lo,
-                                "minutes_until_red": (!runway_unknown).then_some(minutes_left),
+                                "minutes_until_red": minutes_left,
                                 "runway_unknown": runway_unknown,
                                 "predict_minutes": predict_minutes,
                                 "forecast": forecast_json,
@@ -17398,8 +17408,8 @@ impl MountForecast {
         self.tte_lo.or(self.seconds_to_red)
     }
 
-    /// The unshrunk point forecast, separate from the conservative control
-    /// horizon stored in `seconds_to_red` by current daemons.
+    /// The unadjusted estimate remains useful evidence when calibration
+    /// cannot establish a positive lower bound.
     fn point_seconds_to_red(&self) -> Option<f64> {
         self.forecast
             .as_ref()
@@ -17418,6 +17428,30 @@ impl MountForecast {
                 .is_some_and(|point| point.is_finite() && point > 0.0)
     }
 
+    fn red_horizon_description(&self) -> String {
+        let point = self.point_seconds_to_red();
+        if self.runway_unknown() {
+            let point = point.map_or_else(|| "unknown".into(), format_eta);
+            let coverage = self
+                .forecast
+                .as_ref()
+                .and_then(|forecast| forecast.get("coverage_empirical"))
+                .and_then(Value::as_f64)
+                .filter(|coverage| (0.0..=1.0).contains(coverage))
+                .map_or_else(String::new, |coverage| {
+                    format!("; forecast coverage {:.0}%", coverage * 100.0)
+                });
+            return format!("red runway unknown (point {point}{coverage})");
+        }
+        match (self.tte_lo, point) {
+            (Some(lo), Some(point)) if lo.is_finite() && point.is_finite() && lo < point => {
+                format!("red in >={} (point {})", format_eta(lo), format_eta(point))
+            }
+            (_, Some(secs)) if secs.is_finite() => format!("red in {}", format_eta(secs)),
+            _ => "no red horizon".to_string(),
+        }
+    }
+
     /// Below the configured confidence the estimator is still warming up:
     /// the numbers are shown but not acted on.
     fn warming(&self, min_confidence: f64) -> bool {
@@ -17425,15 +17459,17 @@ impl MountForecast {
     }
 
     fn to_json(&self, min_confidence: f64) -> Value {
+        let runway_unknown = self.runway_unknown();
         json!({
             "bytes_per_sec": self.bytes_per_sec,
             "accel": self.accel,
             "confidence": self.confidence,
-            "seconds_to_red": self.seconds_to_red,
+            "seconds_to_red": self.seconds_to_red.filter(|_| !runway_unknown),
+            "seconds_to_red_point": self.point_seconds_to_red(),
             "seconds_to_red_lo": self.tte_lo,
             "forecast": self.forecast,
-            "seconds_to_full": self.seconds_to_full,
-            "runway_unknown": self.runway_unknown(),
+            "seconds_to_full": self.seconds_to_full.filter(|_| !runway_unknown),
+            "runway_unknown": runway_unknown,
             "warming": self.warming(min_confidence),
         })
     }
@@ -17521,16 +17557,7 @@ fn rate_line(mount: &str, forecast: &MountForecast, min_confidence: f64) -> Stri
     } else {
         "0 B/s\u{b2}".to_string()
     };
-    let horizon = match (forecast.tte_lo, forecast.point_seconds_to_red()) {
-        (_, Some(point)) if forecast.runway_unknown() => {
-            format!("red runway unknown (point {})", format_eta(point))
-        }
-        (Some(lo), Some(point)) if lo.is_finite() && point.is_finite() && lo < point => {
-            format!("red in >={} (point {})", format_eta(lo), format_eta(point))
-        }
-        (_, Some(secs)) if secs.is_finite() => format!("red in {}", format_eta(secs)),
-        _ => "no red horizon".to_string(),
-    };
+    let horizon = forecast.red_horizon_description();
     let status = if forecast.warming(min_confidence) {
         format!(
             "warming (confidence {:.2} < {min_confidence:.2})",
@@ -23317,15 +23344,20 @@ mod tests {
     #[test]
     fn rate_line_distinguishes_unknown_runway_from_observed_zero_and_positive_bounds() {
         for (point, lower, expected, unknown) in [
-            (5182.0, 0.0, "red runway unknown (point 1h 26m)", true),
+            (
+                5182.0,
+                0.0,
+                "red runway unknown (point 1h 26m; forecast coverage 28%)",
+                true,
+            ),
             (5182.0, 60.0, "red in >=1m (point 1h 26m)", false),
             (0.0, 0.0, "red in 0s", false),
         ] {
             let rate = json!({
                 "bytes_per_sec": 1_538_757.0,
                 "confidence": 0.71,
-                // This is the current daemon contract: the control horizon,
-                // not the separately published unshrunk point estimate.
+                // Older daemons publish the control horizon here. Reading
+                // their snapshots must still distinguish it from a countdown.
                 "seconds_to_red": lower,
                 "seconds_to_full": null,
                 "forecast": {
@@ -23338,8 +23370,15 @@ mod tests {
             let line = rate_line("/data", &forecast, 0.7);
             assert!(line.contains(expected), "{line}");
             assert_eq!(forecast.runway_unknown(), unknown);
-            assert_eq!(forecast.to_json(0.7)["runway_unknown"], unknown);
             assert_eq!(forecast.acting_seconds_to_red(), Some(lower));
+            let payload = forecast.to_json(0.7);
+            assert_eq!(payload["runway_unknown"], unknown);
+            assert_eq!(
+                payload["seconds_to_red"].as_f64(),
+                (!unknown).then_some(lower)
+            );
+            assert_eq!(payload["seconds_to_red_point"], point);
+            assert_eq!(payload["seconds_to_red_lo"], lower);
             if unknown {
                 assert!(!line.contains("red in 0s"), "{line}");
             }

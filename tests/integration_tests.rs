@@ -186,15 +186,16 @@ fn check_predict_keeps_collapsed_bounds_conservative_without_claiming_zero_runwa
             .output()
             .unwrap()
     };
-    for (point, lower, unknown) in [
-        (5182.0, 0.0, true),
-        (5182.0, 60.0, false),
-        (0.0, 0.0, false),
+    for (point, lower, reported, unknown) in [
+        (5182.0, 0.0, Some(0.0), true),
+        (5182.0, 0.0, None, true),
+        (5182.0, 60.0, Some(60.0), false),
+        (0.0, 0.0, Some(0.0), false),
     ] {
         let rate = serde_json::json!({
             "bytes_per_sec": 1_538_757.0,
             "confidence": 0.71,
-            "seconds_to_red": lower,
+            "seconds_to_red": reported,
             "seconds_to_full": null,
             "forecast": {
                 "tte_point_s": point,
@@ -223,7 +224,16 @@ fn check_predict_keeps_collapsed_bounds_conservative_without_claiming_zero_runwa
         assert_eq!(payload["runway_unknown"], unknown, "{payload}");
         assert_eq!(payload["forecast"]["runway_unknown"], unknown, "{payload}");
         assert_eq!(payload["seconds_to_red_lower_bound"], lower, "{payload}");
-        assert_eq!(payload["forecast"]["seconds_to_red"], lower, "{payload}");
+        assert_eq!(
+            payload["forecast"]["seconds_to_red"].as_f64(),
+            (!unknown).then_some(lower),
+            "{payload}",
+        );
+        assert_eq!(
+            payload["forecast"]["seconds_to_red_point"], point,
+            "{payload}"
+        );
+        assert_eq!(payload["forecast"]["seconds_to_red_lo"], lower, "{payload}");
         assert_eq!(
             payload["seconds_to_red"].as_f64(),
             (!unknown).then_some(lower),

@@ -2166,15 +2166,21 @@ alpha_t+1 = alpha_t + 0.01 * ((1 - coverage_target) - err_t)
 
 The controllers act on `tte_lo`: it is the PID feedforward input, the mount controller's seconds-to-red, and the predictive policy's estimate (the time to exhaustion is shrunk by the same factor). Below 30 resolved samples the bound is the point estimate and the state is `warming`. `pressure.prediction.coverage_target` (0.90) sets the guarantee; `sbh status` shows `red in >=<lo> (point <estimate>)`, `sbh check --predict` uses the bound, `state.json` carries `rates.<mount>.forecast`, decision records carry the bound and coverage at decision time, and the daemon logs a `forecast mount=.. tte_point=.. tte_lo=.. alpha=.. coverage=.. samples=..` line per filling mount per minute that `sbh stats --json` aggregates as `forecast.coverage_by_day`.
 
-If the lower bound collapses to zero while the point estimate remains positive,
-calibration cannot establish runway. Status reports `red runway unknown` and
-the daemon suppresses a numeric exhaustion notification. Controllers still act
-conservatively on the zero bound, and `check --predict` still exits 1 because
-the requested headroom window is unproven. Its warning JSON sets
-`runway_unknown: true`, leaves the literal `seconds_to_red` and
-`minutes_until_red` null, and preserves zero in `seconds_to_red_lower_bound` and
-the nested forecast. A zero point estimate at the actual boundary remains a
-zero-time forecast.
+If calibration collapses the bound to zero while the point estimate is still
+positive, there is no reliable positive runway. `sbh status` reports
+`red runway unknown` with the point estimate and observed coverage. Numerical
+"disk full in 0m" notifications are suppressed for that case; measured pressure
+alerts and conservative controller actions still apply. The forecast object
+sets `runway_unknown: true` and retains both `tte_point_s` and `tte_lo_s`, while
+the reported `seconds_to_red` and `seconds_to_full` are null. `sbh check --predict`
+still exits 1 because it cannot establish the requested safe window, with
+`reason: "forecast_runway_unknown"`, null deadline fields, and zero preserved in
+`seconds_to_red_lower_bound` and the nested forecast. A reached red threshold
+keeps its measured zero and normal warning behavior.
+The dashboard shows the same mount's published time to red, distinguishing the
+point estimate from its conservative bound. Missing, stopped, stale or invalid
+forecasts remain unknown; a trend without a forecast never substitutes an
+invented filesystem capacity. The horizon stays visible in compact overview cards.
 
 #### E-Process Drift Detection
 

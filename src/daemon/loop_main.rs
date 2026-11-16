@@ -2688,16 +2688,15 @@ fn predictive_warning_event(
     {
         return None;
     }
-    // A zero lower bound with a positive point forecast says that calibration
-    // cannot establish any runway. It is still a conservative control input,
-    // but it is not evidence that this filesystem will be full in zero minutes.
-    // A real zero point forecast (the boundary was reached) remains distinct.
-    if tick.rate.forecast.as_ref().is_some_and(|forecast| {
-        forecast.tte_lo_s == Some(0.0)
-            && forecast
-                .tte_point_s
-                .is_some_and(|point| point.is_finite() && point > 0.0)
-    }) {
+    // A collapsed conformal bound is uncertainty, not a forecast of zero
+    // time to exhaustion. Keep control conservative, but let the measured
+    // pressure notification report risk without inventing a deadline.
+    if tick
+        .rate
+        .forecast
+        .as_ref()
+        .is_some_and(|forecast| forecast.runway_unknown)
+    {
         return None;
     }
     let (mount, minutes_remaining, confidence) = match &tick.predictive_action {
@@ -8119,10 +8118,10 @@ impl MonitoringDaemon {
             let guard_diag = monitor.guard.diagnostics();
 
             // Predicted time to red threshold: the point estimate, and the
-            // conformal lower bound the controllers act on. A zero point means
-            // the boundary has been reached; a zero bound with a positive point
-            // means calibration cannot establish runway. Both remain urgent
-            // control inputs, but only the first is a literal time forecast.
+            // conformal lower bound the controllers act on. A zero point
+            // means the boundary has been reached; a positive point with a
+            // collapsed zero bound keeps control conservative but supplies
+            // no reportable runway.
             let predicted_point = if rate_estimate.seconds_to_threshold.is_finite()
                 && rate_estimate.seconds_to_threshold >= 0.0
             {
@@ -8131,6 +8130,7 @@ impl MonitoringDaemon {
                 None
             };
             let interval = predicted_point.map(|point| monitor.forecast_interval(point));
+            let runway_unknown = interval.as_ref().is_some_and(TteInterval::runway_unknown);
             let predicted_seconds = interval
                 .as_ref()
                 .map(|i| i.lo_secs)
@@ -8398,7 +8398,9 @@ impl MonitoringDaemon {
                     bytes_per_sec: rate_estimate.bytes_per_second,
                     accel: rate_estimate.acceleration,
                     confidence: rate_estimate.confidence,
-                    seconds_to_red: predicted_seconds,
+                    // Preserve the control bound in `forecast`, including
+                    // zero, without publishing uncertainty as a time left.
+                    seconds_to_red: predicted_seconds.filter(|_| !runway_unknown),
                     seconds_to_full: finite_positive(rate_estimate.seconds_to_exhaustion),
                     forecast: interval.as_ref().map(|i| {
                         ForecastSnapshot::from_interval(
@@ -20636,10 +20638,17 @@ mod tests {
         let tick = daemon.mount_responses.first().unwrap();
         let forecast = tick.rate.forecast.as_ref().unwrap();
         assert!(sample.stats.available_bytes > 11 * GIB);
+        assert!(forecast.runway_unknown);
         assert!(forecast.tte_point_s.unwrap() > 1800.0);
         assert_eq!(forecast.tte_lo_s, Some(0.0));
         assert_eq!(response.predicted_seconds, Some(0.0));
-        assert_eq!(tick.rate.seconds_to_red, Some(0.0));
+        assert_eq!(tick.seconds_to_red, Some(0.0));
+        assert!(tick.prediction_confident);
+        assert_eq!(tick.rate.seconds_to_red, None);
+        assert_eq!(tick.rate.seconds_to_full, None);
+        let serialized = serde_json::to_value(&tick.rate).unwrap();
+        assert_eq!(serialized["forecast"]["runway_unknown"], true);
+        assert!(serialized["seconds_to_red"].is_null());
         assert!(
             daemon.mount_monitors[&mount]
                 .pressure_controller
