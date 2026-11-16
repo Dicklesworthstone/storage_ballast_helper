@@ -29,7 +29,7 @@ use crate::daemon::mount_controller::unprotected_pressure;
 use crate::daemon::self_monitor::DaemonState;
 use crate::tui::telemetry::{DataSource, DecisionEvidence, TimelineEvent};
 
-use ftui::core::geometry::Rect;
+use ftui::core::geometry::{Rect, Sides};
 use ftui::layout::{Constraint, Flex};
 use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
@@ -461,6 +461,9 @@ fn frame_render_overview_card(
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .title(overview_pane_title(pane))
+        // Compact overview cards are three rows high. Borders leave one
+        // content row; the block's default vertical padding would erase it.
+        .padding(Sides::horizontal(1))
         .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(theme.palette.panel_bg()));
     let inner = block.inner(area);
@@ -637,6 +640,33 @@ fn mount_is_unprotected(state: &DaemonState, mount: &str) -> bool {
         .any(|record| record.mount == mount && unprotected_pressure(record))
 }
 
+/// Present this mount's published time to Red. Free percentages and rates
+/// alone cannot establish a horizon without the actual filesystem capacity.
+fn mount_red_horizon(state: &DaemonState, mount: &str) -> String {
+    let Some(rate) = state.rates.get(mount) else {
+        return "red runway unknown (no forecast)".to_string();
+    };
+    let valid_seconds = |seconds: &f64| seconds.is_finite() && *seconds >= 0.0;
+    let forecast = rate.forecast.as_ref();
+    let point = forecast
+        .and_then(|forecast| forecast.tte_point_s)
+        .or(rate.seconds_to_red)
+        .filter(valid_seconds);
+    let lower = forecast
+        .and_then(|forecast| forecast.tte_lo_s)
+        .filter(valid_seconds);
+    match (lower, point) {
+        (Some(0.0), Some(point)) if point > 0.0 => {
+            format!("red runway unknown (point {})", eta_label(point))
+        }
+        (Some(lower), Some(point)) if lower < point => {
+            format!("red in >={} (point {})", eta_label(lower), eta_label(point))
+        }
+        (_, Some(point)) => format!("red in {}", eta_label(point)),
+        _ => "red runway unknown (no forecast)".to_string(),
+    }
+}
+
 fn styled_forecast_horizon<'a>(model: &'a DashboardModel, theme: &'a Theme) -> Vec<Line<'a>> {
     if let Some(ref state) = model.daemon_state {
         let worst = state
@@ -646,15 +676,7 @@ fn styled_forecast_horizon<'a>(model: &'a DashboardModel, theme: &'a Theme) -> V
             .min_by(|a, b| a.free_pct.total_cmp(&b.free_pct));
         if let Some(worst) = worst {
             let level_color = theme.palette.pressure_color(&worst.level);
-            let eta = worst.rate_bps.and_then(|rate| {
-                if rate <= 0.0 || worst.free_pct <= 0.0 {
-                    None
-                } else {
-                    let bytes_left = (worst.free_pct / 100.0) * 100.0 * 1024.0 * 1024.0 * 1024.0;
-                    Some((bytes_left / rate).max(0.0))
-                }
-            });
-            let eta_str = eta.map_or_else(|| "N/A".to_string(), eta_label);
+            let horizon = mount_red_horizon(state, &worst.path);
             let urgency_color = if worst.free_pct < 10.0 {
                 theme.palette.danger_color()
             } else if worst.free_pct < 25.0 {
@@ -670,6 +692,12 @@ fn styled_forecast_horizon<'a>(model: &'a DashboardModel, theme: &'a Theme) -> V
                         Style::default().fg(theme.palette.text_secondary()),
                     ),
                     styled_badge(&worst.level.to_ascii_uppercase(), level_color),
+                    // Compact cards have one inner row. Keep the actionable
+                    // horizon on that row instead of clipping it below detail.
+                    Span::styled(
+                        format!("  {horizon}"),
+                        Style::default().fg(urgency_color).bold(),
+                    ),
                 ]),
                 Line::from_spans([
                     Span::styled(
@@ -681,16 +709,10 @@ fn styled_forecast_horizon<'a>(model: &'a DashboardModel, theme: &'a Theme) -> V
                         Style::default().fg(theme.palette.text_primary()),
                     ),
                 ]),
-                Line::from_spans([
-                    Span::styled(
-                        format!("  free={:.1}%", worst.free_pct),
-                        Style::default().fg(urgency_color),
-                    ),
-                    Span::styled(
-                        format!("  eta\u{2248}{eta_str}"),
-                        Style::default().fg(urgency_color).bold(),
-                    ),
-                ]),
+                Line::from(Span::styled(
+                    format!("  free={:.1}%", worst.free_pct),
+                    Style::default().fg(urgency_color),
+                )),
             ];
         }
     }
@@ -4230,23 +4252,14 @@ fn render_forecast_horizon(model: &DashboardModel, theme: &Theme) -> String {
             .iter()
             .min_by(|a, b| a.free_pct.total_cmp(&b.free_pct));
         if let Some(worst) = worst {
-            let eta = worst.rate_bps.and_then(|rate| {
-                if rate <= 0.0 || worst.free_pct <= 0.0 {
-                    None
-                } else {
-                    // Rough forecast: assume 100GiB * free% remaining.
-                    let bytes_left = (worst.free_pct / 100.0) * 100.0 * 1024.0 * 1024.0 * 1024.0;
-                    Some((bytes_left / rate).max(0.0))
-                }
-            });
-            let eta_label = eta.map_or_else(|| "insufficient trend data".to_string(), eta_label);
+            let horizon = mount_red_horizon(state, &worst.path);
             let badge = status_badge(
                 &worst.level.to_ascii_uppercase(),
                 theme.palette.for_pressure_level(&worst.level),
                 theme.accessibility,
             );
             return format!(
-                "forecast {badge} worst={} free={:.1}% eta≈{eta_label}",
+                "forecast {badge} worst={} free={:.1}% {horizon}",
                 worst.path, worst.free_pct
             );
         }
@@ -6032,6 +6045,153 @@ mod tests {
         // Per-mount gauge present.
         assert!(frame.contains("22.5% free"));
         assert!(frame.contains("8.3% free"));
+    }
+
+    #[test]
+    fn forecast_horizon_uses_observed_capacity_and_matches_the_selected_mount() {
+        use crate::daemon::self_monitor::MountRateState;
+        use crate::monitor::ewma::DiskRateEstimator;
+
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let start = std::time::Instant::now();
+        let theme = Theme::for_terminal(160, AccessibilityProfile::default());
+        for (mount, total, expected) in [
+            ("/small", 10 * GIB, "red in 17.1m"),
+            ("/large", 1000 * GIB, "red in 1.2d"),
+        ] {
+            // Equal free percentages and fill rates on differently sized
+            // filesystems must not produce the same invented 100 GiB ETA.
+            let available = total / 5;
+            let threshold = total / 10;
+            let mut estimator = DiskRateEstimator::new(1.0, 1.0, 1.0, 1);
+            let _ = estimator.update(available + 60 * MIB, start, threshold);
+            let estimate = estimator.update(available, start + Duration::from_secs(60), threshold);
+            let mut state = sample_state("green", 20.0);
+            state.pressure.mounts[0].path = mount.into();
+            state.pressure.mounts[0].rate_bps = Some(estimate.bytes_per_second);
+            state.rates.insert(
+                "/decoy".into(),
+                MountRateState {
+                    seconds_to_red: Some(1.0),
+                    ..Default::default()
+                },
+            );
+            state.rates.insert(
+                mount.into(),
+                MountRateState {
+                    bytes_per_sec: estimate.bytes_per_second,
+                    accel: estimate.acceleration,
+                    confidence: estimate.confidence,
+                    seconds_to_red: Some(estimate.seconds_to_threshold),
+                    seconds_to_full: Some(estimate.seconds_to_exhaustion),
+                    forecast: None,
+                },
+            );
+            let mut model = DashboardModel::new(
+                PathBuf::from("/tmp/state.json"),
+                vec![],
+                Duration::from_secs(1),
+                (160, 45),
+            );
+            model.daemon_state = Some(state);
+            for text in [
+                render_forecast_horizon(&model, &theme),
+                Text::from_lines(styled_forecast_horizon(&model, &theme)).to_plain_text(),
+            ] {
+                assert!(text.contains(expected), "{mount}: {text}");
+                assert!(!text.contains("red in 1s"), "{text}");
+                assert!(!text.contains("eta≈"), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn forecast_horizon_distinguishes_collapsed_reached_and_missing_runway() {
+        use crate::daemon::self_monitor::MountRateState;
+        use crate::monitor::conformal::{CoverageState, TteInterval};
+        use crate::monitor::guardrails::ForecastSnapshot;
+
+        let theme = Theme::for_terminal(160, AccessibilityProfile::default());
+        for (point, lower, expected) in [
+            (Some(5182.0), Some(0.0), "red runway unknown (point 1.4h)"),
+            (Some(5182.0), Some(60.0), "red in >=1.0m (point 1.4h)"),
+            (Some(0.0), Some(0.0), "red in 0s"),
+            (None, None, "red runway unknown (no forecast)"),
+        ] {
+            let mut state = sample_state("yellow", 15.0);
+            state.pressure.mounts[0].rate_bps = Some(1_538_757.0);
+            state.rates.insert(
+                "/".into(),
+                MountRateState {
+                    bytes_per_sec: 1_538_757.0,
+                    confidence: 0.71,
+                    seconds_to_red: lower,
+                    forecast: point.zip(lower).map(|(point, lower)| {
+                        ForecastSnapshot::from_interval(
+                            &TteInterval {
+                                point_secs: point,
+                                lo_secs: lower,
+                                alpha: -0.417,
+                                coverage_state: CoverageState::Calibrated,
+                                samples: 83,
+                                coverage_empirical: Some(0.277),
+                            },
+                            0.9,
+                        )
+                    }),
+                    ..Default::default()
+                },
+            );
+            let mut model = DashboardModel::new(
+                PathBuf::from("/tmp/state.json"),
+                vec![],
+                Duration::from_secs(1),
+                (80, 24),
+            );
+            model.daemon_state = Some(state);
+            for text in [
+                render_forecast_horizon(&model, &theme),
+                Text::from_lines(styled_forecast_horizon(&model, &theme)).to_plain_text(),
+            ] {
+                assert!(text.contains(expected), "{text}");
+                if expected.contains("unknown") {
+                    assert!(!text.contains("red in 0s"), "{text}");
+                }
+            }
+            // Exercise the production widgets and actual cell clipping. At
+            // 80x24 the forecast card has only one inner row, so checking the
+            // unbounded styled text alone would miss a hidden runway message.
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = Frame::new(80, 24, &mut pool);
+            render_frame(&model, &mut frame);
+            let visible = (0..24)
+                .map(|y| {
+                    (0..80)
+                        .map(|x| {
+                            frame
+                                .buffer
+                                .get(x, y)
+                                .and_then(|cell| cell.content.as_char())
+                                .unwrap_or(' ')
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(visible.contains(expected), "{visible}");
+            // A current trend alone, or another mount's complete forecast,
+            // must not replace the missing forecast for this mount.
+            let state = model.daemon_state.as_mut().unwrap();
+            let rate = state.rates.remove("/").unwrap();
+            state.rates.insert("/peer".into(), rate);
+            for text in [
+                render_forecast_horizon(&model, &theme),
+                Text::from_lines(styled_forecast_horizon(&model, &theme)).to_plain_text(),
+            ] {
+                assert!(text.contains("red runway unknown (no forecast)"), "{text}");
+            }
+        }
     }
 
     #[test]
