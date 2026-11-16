@@ -2688,17 +2688,6 @@ fn predictive_warning_event(
     {
         return None;
     }
-    // A collapsed conformal bound is uncertainty, not a forecast of zero
-    // time to exhaustion. Keep control conservative, but let the measured
-    // pressure notification report risk without inventing a deadline.
-    if tick
-        .rate
-        .forecast
-        .as_ref()
-        .is_some_and(|forecast| forecast.runway_unknown)
-    {
-        return None;
-    }
     let (mount, minutes_remaining, confidence) = match &tick.predictive_action {
         PredictiveAction::Clear => return None,
         PredictiveAction::EarlyWarning {
@@ -2719,6 +2708,19 @@ fn predictive_warning_event(
             ..
         } => (mount, *minutes_remaining, tick.rate.confidence),
     };
+    // A collapsed bound cannot substantiate an immediate-exhaustion notice.
+    // The policy can still supply a positive runway independently from its
+    // historical rate baseline, and that warning must remain deliverable.
+    // Actual zero-point exhaustion remains distinct from unknown runway.
+    if minutes_remaining <= 0.0
+        && tick
+            .rate
+            .forecast
+            .as_ref()
+            .is_some_and(|forecast| forecast.runway_unknown)
+    {
+        return None;
+    }
     if mount != &tick.response.causing_mount
         || !minutes_remaining.is_finite()
         || !(0.0..=config.warning_horizon_minutes).contains(&minutes_remaining)
@@ -20564,6 +20566,7 @@ mod tests {
         let mount = Path::new("/filling");
         for (point, lower, minutes, should_warn) in [
             (5182.0, 0.0, 0.0, false),
+            (5182.0, 0.0, 1.5, true),
             (5182.0, 60.0, 1.0, true),
             (0.0, 0.0, 0.0, true),
         ] {
@@ -20680,6 +20683,110 @@ mod tests {
             raw.seconds_to_exhaustion / 2.0
         );
         assert_eq!(calibrated.free_bytes, raw.free_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn collapsed_conformal_runway_does_not_consume_notification_cooldown() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+
+        const TOTAL: u64 = 1_000_000_000_000;
+        const FREE: u64 = 62_000_000_000;
+        let mut fixture = RegretDaemonFixture::new();
+        let mount = install_disk_pressure_probe(&mut fixture, TOTAL, FREE, false);
+        let notifications = fixture.directory.path().join("collapsed-runway.jsonl");
+        let daemon = &mut fixture.daemon;
+        daemon.notification_manager = NotificationManager::from_config(&NotificationConfig {
+            enabled: true,
+            channels: vec!["file".into()],
+            file: FileConfig {
+                path: notifications.clone(),
+            },
+            ..NotificationConfig::default()
+        });
+        let now = Instant::now();
+        let start = now.checked_sub(Duration::from_secs(200)).unwrap();
+        let mut sample = native_pressure_sample(&mount, "disk-a", TOTAL, FREE, start);
+        let mut monitor = MountMonitor::new(&daemon.config);
+        monitor.rate_estimator = DiskRateEstimator::new(1.0, 1.0, 1.0, 3);
+        for step in 0_u64..=20 {
+            sample.collected_at = start + Duration::from_secs(step * 10);
+            sample.stats.available_bytes = FREE + (20 - step) * 10_000_000;
+            sample.stats.free_bytes = sample.stats.available_bytes;
+            monitor.observe_filesystem(sample.clone(), &daemon.config);
+        }
+        let point = monitor
+            .last_observation
+            .as_ref()
+            .unwrap()
+            .rate
+            .seconds_to_threshold;
+        assert!(point > 1_000.0);
+        for _ in 0..monitor.conformal.config().warmup {
+            assert_eq!(monitor.conformal.record(point, 1.0, point), Some(false));
+        }
+        assert!(monitor.conformal.alpha() < 0.0);
+        daemon.mount_monitors.insert(mount.clone(), monitor);
+
+        let response = daemon
+            .evaluate_pressure_samples(HashMap::from([(mount.clone(), sample.clone())]), now)
+            .unwrap();
+        let tick = daemon.mount_responses[0].clone();
+        let forecast = tick.rate.forecast.as_ref().unwrap();
+        assert_eq!(forecast.tte_point_s, Some(point));
+        assert_eq!(forecast.tte_lo_s, Some(0.0));
+        assert_eq!(response.predicted_seconds, Some(0.0));
+        assert!(tick.response.level > PressureLevel::Yellow);
+        assert!(tick.prediction_confident);
+        assert!(tick.imminent_danger, "{:#?}", tick.predictive_action);
+        assert!(tick.predictive_action.should_cleanup());
+        assert!(tick.predictive_action.should_release_ballast());
+        assert!(tick.rate.seconds_to_full.is_none());
+        daemon.check_predictive_warnings(&[tick], now);
+        assert!(
+            daemon.last_predictive_warning.is_empty(),
+            "an unsupported numerical warning must not spend the cooldown"
+        );
+
+        // A positive forecast is deliverable immediately after the unknown
+        // one. Two steady samples remove rate-change uncertainty.
+        daemon
+            .mount_monitors
+            .get_mut(&mount)
+            .unwrap()
+            .conformal
+            .reset();
+        for step in 1_u64..=2 {
+            sample.collected_at = now + Duration::from_secs(step * 10);
+            sample.stats.available_bytes = FREE - step * 500_000_000;
+            sample.stats.free_bytes = sample.stats.available_bytes;
+            daemon
+                .evaluate_pressure_samples(
+                    HashMap::from([(mount.clone(), sample.clone())]),
+                    sample.collected_at,
+                )
+                .unwrap();
+        }
+        let recovered = daemon.mount_responses[0].clone();
+        assert!(
+            recovered
+                .rate
+                .seconds_to_full
+                .is_some_and(|full| full > 0.0)
+        );
+        assert!(recovered.predictive_action.should_cleanup());
+        daemon.check_predictive_warnings(&[recovered], sample.collected_at);
+        assert_eq!(daemon.last_predictive_warning.len(), 1);
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        let warnings: Vec<Value> = std::fs::read_to_string(&notifications)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0]["type"], "predictive_warning");
+        assert!(warnings[0]["minutes_remaining"].as_f64().unwrap() > 0.0);
     }
 
     #[cfg(unix)]
