@@ -471,9 +471,11 @@ impl PrescanCursor {
                 },
             })
         });
-        nested
+        let result = nested
             .pages
-            .poll_with_links(directory, after, follow_symlinks, keep_reading)
+            .poll_with_links(directory, after, follow_symlinks, keep_reading);
+        drop(cache);
+        result
     }
 
     pub(super) fn discard_shallow_enumeration(
@@ -498,6 +500,7 @@ impl PrescanCursor {
                 session.nested = None;
             }
         }
+        drop(cache);
     }
 
     pub(super) fn read_entries(&self, root: &Path) -> io::Result<Vec<PathBuf>> {

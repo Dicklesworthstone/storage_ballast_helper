@@ -15347,17 +15347,15 @@ fn discover_undo_entries(roots: &[PathBuf], exact_hint: Option<&Path>) -> UndoIn
         };
         // Preserve both spellings: manifests retain the configured store
         // path, while CLI clean canonicalizes its roots before placement.
-        for spelling in [
-            std::path::absolute(path).unwrap_or_else(|_| resolved.clone()),
-            resolved.clone(),
-        ] {
+        let lexical = std::path::absolute(path).unwrap_or_else(|_| resolved.clone());
+        for spelling in [lexical.clone(), resolved.clone()] {
             // A payload cannot hold its own quarantine store. In particular,
             // do not probe through a rebuilt symlink at an exact destination.
             for ancestor in spelling.ancestors().skip(usize::from(exact)) {
                 stores.insert(QuarantineStore::under(ancestor).root().to_path_buf());
             }
         }
-        scopes.push((resolved, exact));
+        scopes.push((resolved, lexical, exact));
     }
     let mut seen = BTreeSet::new();
     for path in stores {
@@ -15389,11 +15387,16 @@ fn discover_undo_entries(roots: &[PathBuf], exact_hint: Option<&Path>) -> UndoIn
             let original = match resolve_undo_origin(&record.original_path) {
                 Ok(original) => original,
                 Err(error) => {
-                    if scopes.iter().any(|(scope, exact)| {
+                    // A broken descendant of an aliased root may prevent
+                    // canonicalization. Keep that scope's original spelling
+                    // for error reporting; it grants no restore authority.
+                    let original = std::path::absolute(&record.original_path)
+                        .unwrap_or_else(|_| record.original_path.clone());
+                    if scopes.iter().any(|(scope, lexical, exact)| {
                         if *exact {
-                            record.original_path == *scope
+                            original == *scope || original == *lexical
                         } else {
-                            record.original_path.starts_with(scope)
+                            original.starts_with(scope) || original.starts_with(lexical)
                         }
                     }) {
                         inventory
@@ -15403,7 +15406,7 @@ fn discover_undo_entries(roots: &[PathBuf], exact_hint: Option<&Path>) -> UndoIn
                     continue;
                 }
             };
-            if scopes.iter().any(|(scope, exact)| {
+            if scopes.iter().any(|(scope, _, exact)| {
                 if *exact {
                     original == *scope
                 } else {
@@ -15436,7 +15439,9 @@ fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
     let selected_path = args.path.as_deref().map(resolve_undo_origin).transpose()?;
     let selected_id = args.id.as_ref().map(|id| id.trim().to_ascii_lowercase());
     let exact_hint = if args.roots.is_empty() {
-        selected_path.clone().or_else(|| {
+        // Matching uses the normalized origin, but discovery also needs the
+        // supplied spelling when a store's manifests retain a root alias.
+        args.path.clone().or_else(|| {
             let id = selected_id.as_deref()?;
             Some(
                 SqliteLogger::open_read_only(&config.paths.sqlite_db)
@@ -19265,45 +19270,58 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn undo_path_finds_custom_store_without_a_ledger_and_honors_explicit_scope() {
-        let directory = tempfile::tempdir_in("/tmp").unwrap();
-        let root = directory.path().canonicalize().unwrap();
-        let configured = root.join("configured");
-        let custom = root.join("custom");
-        std::fs::create_dir(&configured).unwrap();
-        std::fs::create_dir(&custom).unwrap();
-        let (store, target) = undo_fixture(&custom, "wanted", RecoveryState::Intact);
-        undo_fixture(&custom, "unrelated", RecoveryState::Intact);
-        let (config, config_path) = undo_test_config(&root, vec![configured.clone()]);
-        let inventory = discover_undo_entries(&config.scanner.root_paths, Some(&target));
-        assert_eq!(inventory.held.len(), 1);
-        assert_eq!(inventory.held[0].1.decision_id, "wanted");
-        assert!(!config.paths.sqlite_db.exists());
-        let constrained = Cli::try_parse_from([
-            "sbh",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--json",
-            "undo",
-            "--path",
-            target.to_str().unwrap(),
-            "--root",
-            configured.to_str().unwrap(),
-        ])
-        .unwrap();
-        assert!(matches!(run(&constrained), Err(CliError::User(_))));
-        let restore = Cli::try_parse_from([
-            "sbh",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--json",
-            "undo",
-            "--path",
-            target.to_str().unwrap(),
-        ])
-        .unwrap();
-        run(&restore).unwrap();
-        assert_eq!(std::fs::read(target.join("a.o")).unwrap(), b"obj");
-        assert!(store.record("unrelated").unwrap().is_some());
+        use std::os::unix::fs::symlink;
+
+        for through_alias in [false, true] {
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let configured = root.join("configured");
+            let custom = root.join("custom");
+            std::fs::create_dir(&configured).unwrap();
+            std::fs::create_dir(&custom).unwrap();
+            let custom = if through_alias {
+                let alias = root.join("custom-alias");
+                symlink(&custom, &alias).unwrap();
+                alias
+            } else {
+                custom
+            };
+            let (store, target) = undo_fixture(&custom, "wanted", RecoveryState::Intact);
+            undo_fixture(&custom, "unrelated", RecoveryState::Intact);
+            let (config, config_path) = undo_test_config(&root, vec![configured.clone()]);
+            let inventory = discover_undo_entries(&config.scanner.root_paths, Some(&target));
+            assert_eq!(inventory.held.len(), 1);
+            assert_eq!(inventory.held[0].1.decision_id, "wanted");
+            assert!(!config.paths.sqlite_db.exists());
+            let constrained = Cli::try_parse_from([
+                "sbh",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--json",
+                "undo",
+                "--path",
+                target.to_str().unwrap(),
+                "--root",
+                configured.to_str().unwrap(),
+            ])
+            .unwrap();
+            assert!(matches!(run(&constrained), Err(CliError::User(_))));
+            assert!(store.record("wanted").unwrap().is_some());
+            let restore = Cli::try_parse_from([
+                "sbh",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--json",
+                "undo",
+                "--path",
+                target.to_str().unwrap(),
+            ])
+            .unwrap();
+            run(&restore).unwrap();
+            assert_eq!(std::fs::read(target.join("a.o")).unwrap(), b"obj");
+            assert!(store.record("wanted").unwrap().is_none());
+            assert!(store.record("unrelated").unwrap().is_some());
+        }
     }
 
     #[cfg(unix)]
@@ -19365,6 +19383,68 @@ mod tests {
             assert!(inventory.require_complete().is_err());
         }
         assert!(store.record("held").unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_reports_unresolvable_originals_under_aliased_scopes() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let real = root.join("real");
+        let project = real.join("authorized/project");
+        let sibling = real.join("sibling");
+        for target in [project.join("target"), sibling.clone()] {
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::write(target.join("a.o"), b"obj").unwrap();
+        }
+        let alias = root.join("alias");
+        symlink(&real, &alias).unwrap();
+        let scope = alias.join("authorized");
+        let original = scope.join("project/target");
+        let store = QuarantineStore::under(&alias);
+        store
+            .quarantine(&original, "aliased-entry", 3, Duration::ZERO, None)
+            .unwrap();
+        store
+            .quarantine(
+                &alias.join("sibling"),
+                "sibling-entry",
+                3,
+                Duration::ZERO,
+                None,
+            )
+            .unwrap();
+
+        // The scope alias remains valid, but the selected origin's parent
+        // no longer resolves. Its lexical spelling must still identify the
+        // relevant search failure without admitting the sibling record.
+        std::fs::rename(&project, real.join("old-project")).unwrap();
+        symlink(real.join("missing-project"), &project).unwrap();
+        let inventory = discover_undo_entries(std::slice::from_ref(&scope), None);
+        assert!(inventory.held.is_empty());
+        assert!(inventory.errors.iter().any(|(path, _)| path == &original));
+        assert!(inventory.require_complete().is_err());
+
+        let (_, config_path) = undo_test_config(&root, vec![scope]);
+        for selector in ["--list", "aliased-entry"] {
+            let cli = Cli::try_parse_from([
+                "sbh",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--json",
+                "undo",
+                selector,
+            ])
+            .unwrap();
+            assert!(
+                matches!(run(&cli), Err(CliError::Runtime(message)) if message.contains("quarantine search incomplete"))
+            );
+        }
+        assert!(store.record("aliased-entry").unwrap().is_some());
+        assert!(store.record("sibling-entry").unwrap().is_some());
+        assert!(!sibling.exists());
     }
 
     #[cfg(unix)]

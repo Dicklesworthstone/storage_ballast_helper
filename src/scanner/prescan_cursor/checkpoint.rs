@@ -17,15 +17,19 @@ use sha2::{Digest, Sha256};
 
 use super::shallow::{MAX_SHALLOW_BYTES, MAX_SHALLOW_ROOTS, ShallowFrame, ShallowPosition};
 use super::{PrescanCursor, PressureOrder, WalkDispatchCursor, WalkDispatchPosition};
-use crate::scanner::walker::MAX_DISPATCH_CURSOR_ROWS;
+use crate::scanner::walker::{MAX_DISPATCH_CURSOR_BYTES, MAX_DISPATCH_CURSOR_ROWS};
 
 const VERSION: u32 = 5;
-// The existing pre-scan allowance and recursive dispatch allowance each retain
-// their own 512 KiB of native names. JSON escaping can expand a byte sixfold.
-const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ROOTS: usize = 8192;
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const MAX_RAW_PATH_BYTES: usize = 512 * 1024;
+// Main and event-scoped discovery each retain independent continuation and
+// shallow allowances; recursive dispatch adds a fifth native-name allowance.
+// JSON escaping can expand every byte sixfold. The additional 2 MiB covers
+// per-row fields and Unix byte-array wrappers at the existing row limits.
+const MAX_CHECKPOINT_BYTES: usize = 6
+    * (2 * MAX_RAW_PATH_BYTES + MAX_DISPATCH_CURSOR_BYTES + 2 * MAX_SHALLOW_BYTES)
+    + 2 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1072,30 +1076,124 @@ mod tests {
     }
 
     #[test]
-    fn both_bounded_histories_fit_even_when_native_names_need_json_escaping() {
+    fn all_bounded_histories_fit_with_maximum_json_path_escaping() {
+        use std::ffi::OsStr;
+
+        use crate::scanner::walker::MAX_DISPATCH_CURSOR_PATH_BYTES;
+
+        fn escaped_root(index: usize, bytes: usize) -> PathBuf {
+            let prefix = format!("/{index}/");
+            PathBuf::from(format!("{prefix}{}", "\u{1}".repeat(bytes - prefix.len())))
+        }
+
+        fn fill_discovery_budgets(state: &mut PrescanCursor) {
+            let mut remaining = MAX_RAW_PATH_BYTES;
+            let mut index = 0;
+            while remaining > 0 {
+                let row_bytes = remaining.min(2 * MAX_PATH_BYTES - 2);
+                let root = escaped_root(index, (row_bytes - 2) / 2);
+                let after = root.join("\u{2}");
+                assert_eq!(root.as_os_str().len() + after.as_os_str().len(), row_bytes);
+                state.continuations.insert(root, after);
+                remaining -= row_bytes;
+                index += 1;
+            }
+            assert_eq!(
+                state
+                    .continuations
+                    .iter()
+                    .map(|(root, after)| root.as_os_str().len() + after.as_os_str().len())
+                    .sum::<usize>(),
+                MAX_RAW_PATH_BYTES,
+            );
+
+            remaining = MAX_SHALLOW_BYTES;
+            index = 0;
+            while remaining > 0 {
+                // A full depth-three position has seven paths. With one-byte
+                // children, their suffixes contribute another 24 raw bytes.
+                let row_bytes = remaining.min(7 * (MAX_PATH_BYTES - 6) + 24);
+                let root = escaped_root(index, (row_bytes - 24) / 7);
+                let entry = root.join("\u{2}");
+                let directory = entry.join("\u{3}");
+                let position = ShallowPosition {
+                    entry: entry.clone(),
+                    pending: Some(directory.join("\u{5}".repeat(1 + (row_bytes - 24) % 7))),
+                    frames: vec![
+                        ShallowFrame {
+                            directory: entry.clone(),
+                            after: Some(entry.join("\u{2}")),
+                        },
+                        ShallowFrame {
+                            directory: directory.clone(),
+                            after: Some(directory.join("\u{4}")),
+                        },
+                    ],
+                };
+                assert_eq!(
+                    root.as_os_str().len()
+                        + position
+                            .paths()
+                            .map(|path| path.as_os_str().len())
+                            .sum::<usize>(),
+                    row_bytes,
+                );
+                state.shallow.insert(root, position);
+                remaining -= row_bytes;
+                index += 1;
+            }
+            assert_eq!(
+                state
+                    .shallow
+                    .iter()
+                    .map(|(root, position)| {
+                        root.as_os_str().len()
+                            + position
+                                .paths()
+                                .map(|path| path.as_os_str().len())
+                                .sum::<usize>()
+                    })
+                    .sum::<usize>(),
+                MAX_SHALLOW_BYTES,
+            );
+        }
+
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("cursor.json");
-        let mut state = cursor("/root", "a");
-        // Two nearly-full independent native-name budgets must not starve
-        // each other's checkpoint writes when JSON expands control bytes.
-        for index in 0..16 {
-            let root = PathBuf::from(format!("/{}{index}", "\u{1}".repeat(15_000)));
-            state.continuations.insert(root.clone(), root.join("after"));
-        }
+        let mut state = PrescanCursor::new();
+        fill_discovery_budgets(&mut state);
+        let mut scoped = PrescanCursor::new();
+        fill_discovery_budgets(&mut scoped);
+        state.scoped = Some(Box::new(scoped));
         let dispatch = WalkDispatchCursor::from_positions(
-            (0..32)
+            (0..MAX_DISPATCH_CURSOR_BYTES / (2 * MAX_DISPATCH_CURSOR_PATH_BYTES))
                 .map(|index| WalkDispatchPosition {
-                    directory: PathBuf::from(format!("/{}{index}", "\u{2}".repeat(15_000))),
-                    window_start: 0,
-                    next_child: Some(OsString::from("next")),
+                    directory: escaped_root(index, MAX_DISPATCH_CURSOR_PATH_BYTES),
+                    window_start: u32::MAX,
+                    next_child: Some(OsString::from(
+                        "\u{6}".repeat(MAX_DISPATCH_CURSOR_PATH_BYTES),
+                    )),
                 })
                 .collect(),
         )
         .unwrap();
-        state.remember_walk_dispatch(&dispatch);
+        assert!(state.remember_walk_dispatch(&dispatch));
+        assert_eq!(
+            state
+                .walk_dispatch
+                .iter()
+                .map(|position| {
+                    position.directory.as_os_str().len()
+                        + position.next_child.as_deref().map_or(0, OsStr::len)
+                })
+                .sum::<usize>(),
+            MAX_DISPATCH_CURSOR_BYTES,
+        );
+        // All five independent allowances are full, including both scoped
+        // histories. The v4 8 MiB envelope cannot hold this valid v5 state.
         save(&state, &path).unwrap();
         let encoded_len = fs::metadata(&path).unwrap().len();
-        assert!(encoded_len > 4 * 1024 * 1024);
+        assert!(encoded_len > 14 * 1024 * 1024);
         assert!(encoded_len < MAX_CHECKPOINT_BYTES as u64);
         assert_eq!(read(&path).unwrap(), state);
     }

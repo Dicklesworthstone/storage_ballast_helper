@@ -8,7 +8,7 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use super::PrescanCursor;
+use super::{PrescanCursor, PressureOrder};
 
 pub(super) const MAX_SHALLOW_ROOTS: usize = 128;
 pub(super) const MAX_SHALLOW_BYTES: usize = 512 * 1024;
@@ -329,8 +329,8 @@ impl PrescanCursor {
     /// withdrawn roots. This never moves the configured sweep's root/entry.
     pub fn remember_scoped(&mut self, mut scoped: Self, roots: &[PathBuf]) {
         scoped.scoped = None;
-        scoped.walk_order = Default::default();
-        scoped.walk_dispatch = Default::default();
+        scoped.walk_order = PressureOrder::default();
+        scoped.walk_dispatch = std::sync::Arc::default();
         let in_scope = |path: &Path| roots.iter().any(|root| path.starts_with(root));
         scoped.continuations.retain(|root, _| in_scope(root));
         let withdrawn: Vec<_> = scoped
@@ -351,12 +351,7 @@ impl PrescanCursor {
                 .root
                 .iter()
                 .chain(&scoped.after)
-                .chain(
-                    scoped
-                        .continuations
-                        .iter()
-                        .flat_map(|(root, after)| [root, after]),
-                )
+                .chain(scoped.continuations.iter().flat_map(<[_; 2]>::from))
                 .map(|path| path.as_os_str().len())
                 .sum();
             if scoped.continuations.len() <= MAX_SHALLOW_ROOTS && bytes <= MAX_SHALLOW_BYTES {
