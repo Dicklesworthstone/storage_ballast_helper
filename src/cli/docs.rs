@@ -650,6 +650,75 @@ pub struct ConstantDoc {
     pub source: &'static str,
 }
 
+/// `sbh blame --deleted-open`'s deadline and inventory caps.
+fn deleted_open_constants() -> Vec<ConstantDoc> {
+    use crate::platform::types::{
+        DELETED_OPEN_DEFAULT_TIMEOUT_SECS, DELETED_OPEN_MAX_TIMEOUT_SECS,
+        DELETED_OPEN_MIN_TIMEOUT_SECS, DeletedOpenFilesLimits,
+    };
+
+    const SOURCE: &str = "src/platform/types.rs";
+    let limits = DeletedOpenFilesLimits::default();
+    vec![
+        constant(
+            "deleted_open",
+            "DELETED_OPEN_DEFAULT_TIMEOUT_SECS",
+            DELETED_OPEN_DEFAULT_TIMEOUT_SECS,
+            "blame --deleted-open deadline (seconds) without --timeout-secs",
+            SOURCE,
+        ),
+        constant(
+            "deleted_open",
+            "DELETED_OPEN_MIN_TIMEOUT_SECS",
+            DELETED_OPEN_MIN_TIMEOUT_SECS,
+            "Smallest --timeout-secs blame --deleted-open accepts",
+            SOURCE,
+        ),
+        constant(
+            "deleted_open",
+            "DELETED_OPEN_MAX_TIMEOUT_SECS",
+            DELETED_OPEN_MAX_TIMEOUT_SECS,
+            "Largest --timeout-secs blame --deleted-open accepts",
+            SOURCE,
+        ),
+        constant(
+            "deleted_open",
+            "max_processes",
+            limits.max_processes,
+            "Processes one deleted-open inventory inspects",
+            SOURCE,
+        ),
+        constant(
+            "deleted_open",
+            "max_descriptors",
+            limits.max_descriptors,
+            "Descriptors one deleted-open inventory inspects",
+            SOURCE,
+        ),
+        constant(
+            "deleted_open",
+            "max_mappings",
+            limits.max_mappings,
+            "Memory mappings one deleted-open inventory inspects",
+            SOURCE,
+        ),
+        constant(
+            "deleted_open",
+            "max_files",
+            limits.max_files,
+            "Distinct verified unlinked files one inventory retains",
+            SOURCE,
+        ),
+        constant(
+            "deleted_open",
+            "max_holders",
+            limits.max_holders,
+            "Holders (including unverified mapping records) one inventory retains",
+            SOURCE,
+        ),
+    ]
+}
+
 /// The bare number behind a rendered value: `fmt_bytes`/`fmt_duration`
 /// only emit exact multiples, so "4 KiB" is 4096 and "250 ms" is 250.
 fn raw_of(value: &str) -> String {
@@ -1719,6 +1788,7 @@ pub fn constants() -> Vec<ConstantDoc> {
         ),
     ];
     rows.extend(daemon_constants());
+    rows.extend(deleted_open_constants());
     #[cfg(unix)]
     rows.push(constant(
         "agent_scratch",

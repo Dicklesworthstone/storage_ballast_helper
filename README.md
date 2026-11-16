@@ -2234,14 +2234,17 @@ this mode.
 
 Inspection reads metadata, process identities and kernel reference links; it never
 reads file contents, signals a process or truncates a descriptor. The default
-cooperative deadline is 10 seconds (`--timeout-secs` accepts 1–60), with caps of
-50,000 processes, 250,000 descriptors, 250,000 mappings, 4,096 distinct verified
-files and 16,384 holders (including unverified mapping records). Kernel I/O
+cooperative deadline is <!-- claim:constants.deleted_open.DELETED_OPEN_DEFAULT_TIMEOUT_SECS -->10<!-- /claim --> seconds (`--timeout-secs` accepts
+<!-- claim:constants.deleted_open.DELETED_OPEN_MIN_TIMEOUT_SECS -->1<!-- /claim -->–<!-- claim:constants.deleted_open.DELETED_OPEN_MAX_TIMEOUT_SECS -->60<!-- /claim -->), with caps of
+<!-- claim:constants.deleted_open.max_processes -->50000<!-- /claim --> processes, <!-- claim:constants.deleted_open.max_descriptors -->250000<!-- /claim --> descriptors,
+<!-- claim:constants.deleted_open.max_mappings -->250000<!-- /claim --> mappings, <!-- claim:constants.deleted_open.max_files -->4096<!-- /claim --> distinct verified
+files and <!-- claim:constants.deleted_open.max_holders -->16384<!-- /claim --> holders (including unverified mapping records). Kernel I/O
 already in progress can overrun the deadline.
 Permission failures, changed identities, unknown mount attribution and exhausted
-budgets remain explicit coverage issues. Partial inspection exits 4 and retains
+budgets remain explicit coverage issues. Partial inspection exits `4`
+(<!-- claim:exit.4 -->partial success<!-- /claim -->) and retains
 the observed allocations. An unsupported platform reports `supported: false`
-with a null byte total and exits 0.
+with a null byte total and exits `0` (<!-- claim:exit.0 -->ok<!-- /claim -->).
 
 JSON uses `sbh.deleted_open.v2`, with `observed_allocated_bytes`,
 `observed_unique_files`, `files`, `files_omitted`, `complete` and `issues`.

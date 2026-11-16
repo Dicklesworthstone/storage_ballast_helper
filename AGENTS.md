@@ -761,6 +761,14 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | daemon | `RCH_STAGING_RED_IDLE_HOURS` | `48` | Idle hours before the rch staging tier prunes a tree at Red | `src/daemon/rch_staging.rs` |
 | daemon | `RCH_STAGING_CRITICAL_IDLE_HOURS` | `24` | Idle hours before the rch staging tier prunes a tree at Critical | `src/daemon/rch_staging.rs` |
 | daemon | `COMPRESS_ROOT_PROBE_SECS` | `60` | Seconds a compression root's admission probe stays fresh | `src/daemon/compress_tier.rs` |
+| deleted_open | `DELETED_OPEN_DEFAULT_TIMEOUT_SECS` | `10` | blame --deleted-open deadline (seconds) without --timeout-secs | `src/platform/types.rs` |
+| deleted_open | `DELETED_OPEN_MIN_TIMEOUT_SECS` | `1` | Smallest --timeout-secs blame --deleted-open accepts | `src/platform/types.rs` |
+| deleted_open | `DELETED_OPEN_MAX_TIMEOUT_SECS` | `60` | Largest --timeout-secs blame --deleted-open accepts | `src/platform/types.rs` |
+| deleted_open | `max_processes` | `50000` | Processes one deleted-open inventory inspects | `src/platform/types.rs` |
+| deleted_open | `max_descriptors` | `250000` | Descriptors one deleted-open inventory inspects | `src/platform/types.rs` |
+| deleted_open | `max_mappings` | `250000` | Memory mappings one deleted-open inventory inspects | `src/platform/types.rs` |
+| deleted_open | `max_files` | `4096` | Distinct verified unlinked files one inventory retains | `src/platform/types.rs` |
+| deleted_open | `max_holders` | `16384` | Holders (including unverified mapping records) one inventory retains | `src/platform/types.rs` |
 | agent_scratch | `DEFAULT_MIN_IDLE_DAYS` | `7` | Days a session tree and transcript must be unchanged before check --agent-scratch calls it idle | `src/monitor/agent_scratch.rs` |
 <!-- sbh-docs:end -->
 

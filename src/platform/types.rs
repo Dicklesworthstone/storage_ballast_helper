@@ -382,6 +382,14 @@ impl Default for DeletedOpenFilesLimits {
     }
 }
 
+/// `sbh blame --deleted-open` cooperative deadline when `--timeout-secs` is
+/// not given, in seconds.
+pub const DELETED_OPEN_DEFAULT_TIMEOUT_SECS: u64 = 10;
+/// Smallest `--timeout-secs` that `sbh blame --deleted-open` accepts.
+pub const DELETED_OPEN_MIN_TIMEOUT_SECS: u64 = 1;
+/// Largest `--timeout-secs` that `sbh blame --deleted-open` accepts.
+pub const DELETED_OPEN_MAX_TIMEOUT_SECS: u64 = 60;
+
 /// A verified process retaining an unlinked file through descriptors or memory.
 ///
 /// The kernel's link target is display evidence, not an existing or restorable

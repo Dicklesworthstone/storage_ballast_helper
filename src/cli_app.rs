@@ -64,8 +64,9 @@ use storage_ballast_helper::platform::pal::{
     BlockDeviceInfo, FsStats, InodeStats, MemoryInfo, Platform, ServiceManager, detect_platform,
 };
 use storage_ballast_helper::platform::types::{
-    Capacity, FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
-    ProcessInfo, ProcessIo, ServiceKind,
+    Capacity, DELETED_OPEN_DEFAULT_TIMEOUT_SECS, DELETED_OPEN_MAX_TIMEOUT_SECS,
+    DELETED_OPEN_MIN_TIMEOUT_SECS, FullDiskAccessState, FullDiskAccessStatus, MemoryPressure,
+    MemoryPressureLevel, ProcessInfo, ProcessIo, ServiceKind,
 };
 #[cfg(unix)]
 use storage_ballast_helper::scanner::active_lease::{
@@ -951,7 +952,7 @@ struct BlameArgs {
     #[arg(long, conflicts_with_all = ["since", "tree"])]
     deleted_open: bool,
     /// Cooperative time budget for --deleted-open (default: 10 seconds).
-    #[arg(long, requires = "deleted_open", value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..=60))]
+    #[arg(long, requires = "deleted_open", value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(DELETED_OPEN_MIN_TIMEOUT_SECS..=DELETED_OPEN_MAX_TIMEOUT_SECS))]
     timeout_secs: Option<u64>,
 }
 
@@ -6461,7 +6462,10 @@ fn run_deleted_open_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
 
     let platform = detect_platform().map_err(|error| CliError::Runtime(error.to_string()))?;
     let started = std::time::Instant::now();
-    let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(10));
+    let timeout = Duration::from_secs(
+        args.timeout_secs
+            .unwrap_or(DELETED_OPEN_DEFAULT_TIMEOUT_SECS),
+    );
     let report = platform
         .deleted_open_files(started + timeout, DeletedOpenFilesLimits::default())
         .map_err(|error| CliError::Runtime(error.to_string()))?;
