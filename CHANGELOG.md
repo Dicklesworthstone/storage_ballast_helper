@@ -6,6 +6,22 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.7.16 **[release]**
+
+Compare: [`v0.7.15...v0.7.16`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.15...v0.7.16)
+
+Fixes from the v0.7.15 rollout. In its first 24 hours, v0.7.15 sent 338
+"Predicted disk full in 0m" notices across the fleet, 154 of them at CRIT
+on one host with 60-87 GB free. A forecast whose conformal lower bound has
+collapsed now reports its runway as unknown (bd-hosd). A sandboxed service
+no longer repeats each predictive warning once per `ReadWritePaths=` entry
+(bd-6brv). Budgeted scans of very large directories reach the deep
+candidates they used to time out before (bd-kf7k). Automatic cleanup is
+bound to the filesystem that asked for it, and a Green pass may start
+cleanup early on a filesystem whose own forecast says it will reach Red.
+New: `sbh blame --deleted-open` finds deleted files that still hold disk
+space.
+
 ### Added
 
 - **Diagnose deleted files that still occupy disk space.** On Linux,
@@ -21,9 +37,78 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   Inspection is bounded by time and inventory limits; it never signals a
   process or truncates a descriptor. These observations are not a promise of
   reclaimable space and exclude processes hidden from the caller's namespace.
+- **Predictive cleanup at Green.** When a filesystem's own forecast says it
+  will reach Red, a Green daemon pass may start cleanup there early. The
+  request carries the forecast's filesystem observation and its scoring
+  snapshot through the scan and deletion queues. Queued work is revoked if
+  the forecast, the filesystem's identity, the scoring policy or the
+  freshness of the observation changes. Permission is checked again before
+  policy evaluation and at the deletion boundary. Green's other rules still
+  apply, including the 12-hour idle hold.
+
+### Changed
+
+- **Automatic cleanup stays on the filesystem that triggered it.** Pressure
+  requests, event templates, index replay, pre-scan and deletion batches
+  carry the sampled mount and root identities. Ownership is renewed before
+  policy admission and after the final inspection, for both unlink and
+  quarantine. On Linux, native mount IDs reject a same-device bind mount
+  substituted for the observed one. Cross-device walks only lead to the
+  triggering mount. Special-location alerts cannot authorize cleanup on
+  another filesystem. Fallback recovery runs one scoped pass per observed
+  mount.
 
 ### Fixed
 
+- **No "disk full in 0m" from a collapsed forecast bound** (bd-hosd). The
+  forecast's lower bound can collapse to 0 while its point estimate is
+  positive, after a run of badly missed predictions. Notifications,
+  `sbh status`, `sbh check --predict` and the dashboard now report that
+  runway as unknown instead of "0 minutes". Control stays conservative,
+  and a warning the historical consumption rate corroborates is still sent.
+  The dashboard reads the selected mount's published Red horizon instead of
+  assuming a 100 GiB filesystem. It also refuses stale, stopped, invalid and
+  zero-confidence projections, and shows each compact overview card's
+  content again.
+- **One predictive warning per filesystem** (bd-6brv). Under systemd each
+  `ReadWritePaths=` entry is its own bind mount of the same filesystem, and
+  v0.7.15 sent every predictive warning once per entry: 6 times on one host.
+  Warnings are now keyed by device and name the shortest path, at the most
+  severe level.
+- **Budgeted scans reach deep work in very large directories** (bd-kf7k).
+  A scan now keeps and checkpoints its depth-first position inside oversized
+  entries across slices and restarts. It scores what it finds before
+  acknowledging it, and starts child continuation at once instead of
+  spending the pass on breadth-first siblings. Each root admitted to a scan
+  keeps two nested reader slots. Every resumed position is checked again
+  for scope, exclusions, protection and symlinks. Checkpoints move to
+  format v5, sized for all five bounded path histories.
+- **Quarantine checks live authorization again just before the move.** After
+  quarantine preparation and fsync, both live guard channels are renewed
+  immediately before the descriptor-relative move. A refusal leaves the
+  source in place and rolls back only the unchanged reservation.
+- **Cleanup targets and undo.** A non-finite free-space target is rejected,
+  and capacity is renewed before mutation. `sbh undo` finds fallback
+  quarantine stores within the requested scope, including aliased spellings
+  of an explicit path. It binds the restore to the reviewed manifest and
+  reports an incomplete search instead of a partial list.
+- **Sandbox write admission reads the visible mount topology.** Mounts
+  covered by other mounts remain in mountinfo. Pathname depth or record
+  order used to veto writable candidates, or report a real read-only
+  incident as a sandbox denial. The visible mount map is now built from
+  mount IDs and parent links. Malformed or ambiguous topology counts as
+  unknown, and the executor's fresh checks still decide.
+- **Decision-log deduplication holds past its cache.** A stable scan of more
+  than 262,144 artifact versions used to clear the cache and rewrite every
+  verdict on every pass. Uncached observations are now resolved with one
+  indexed SQLite lookup of the path's latest record.
+- **Configuration writes are staged, validated and backed up.** `install`,
+  the wizard, `config set`/`reset`, `tune --apply` and policy promotion or
+  demotion publish config.toml through one writer. It creates an exclusive
+  staging file beside the destination and validates it against that
+  destination's defaults before an atomic rename. Each write keeps its own
+  synced backup and preserves Unix ownership, permissions and a valid
+  config symlink. A dangling or non-file destination is refused.
 - **Interactive cleanup renews safety checks after each answer.** Both
   `clean` and `emergency` now send accepted candidates through the full
   executor, including fresh pressure and active-reference checks, protection
