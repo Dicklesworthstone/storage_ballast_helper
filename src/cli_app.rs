@@ -639,7 +639,7 @@ struct CleanArgs {
     #[arg(long, value_name = "MOUNT")]
     local_snapshot_mount: Option<PathBuf>,
     /// Target free percentage to recover.
-    #[arg(long, value_name = "PERCENT")]
+    #[arg(long, value_name = "PERCENT", value_parser = parse_free_percentage)]
     target_free: Option<f64>,
     /// Minimum score to include in deletion candidates.
     #[arg(long, default_value_t = 0.7, value_name = "SCORE")]
@@ -700,7 +700,8 @@ struct UndoArgs {
     /// `<name>.restored-<decision-id>` instead of refusing.
     #[arg(long)]
     force_suffix: bool,
-    /// Scan roots whose quarantine to search (default: scanner.root_paths).
+    /// Original-path scopes to recover (default: scanner.root_paths).
+    /// Also checks ancestor quarantine stores without including sibling entries.
     #[arg(long = "root", value_name = "PATH")]
     roots: Vec<PathBuf>,
 }
@@ -788,7 +789,7 @@ struct EmergencyArgs {
     #[arg(value_name = "PATH")]
     paths: Vec<PathBuf>,
     /// Target free percentage to recover immediately.
-    #[arg(long, default_value_t = 10.0, value_name = "PERCENT")]
+    #[arg(long, default_value_t = 10.0, value_name = "PERCENT", value_parser = parse_free_percentage)]
     target_free: f64,
     /// Skip confirmation prompt.
     #[arg(long)]
@@ -918,7 +919,7 @@ struct CheckArgs {
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
     /// Desired minimum free percentage.
-    #[arg(long, value_name = "PERCENT")]
+    #[arg(long, value_name = "PERCENT", value_parser = parse_free_percentage)]
     target_free: Option<f64>,
     /// Minimum required free space. Accepts bytes or K/M/G/T suffixes, e.g. 5G.
     /// Linux RAM-backed paths also require this much observed memory headroom.
@@ -15222,6 +15223,206 @@ fn undo_restore_report(restored: &[RestoreOutcome], failed: &[(String, String)])
     })
 }
 
+/// Quarantining a scan root removes the very path used to find its store.
+/// Resolve the nearest existing ancestor without following a dangling link
+/// or interpreting `..` across a missing component as an authorization.
+fn resolve_undo_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    for ancestor in absolute.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let tail = absolute.strip_prefix(ancestor).map_err(io::Error::other)?;
+                if tail.components().any(|part| {
+                    !matches!(
+                        part,
+                        std::path::Component::Normal(_) | std::path::Component::CurDir
+                    )
+                }) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "cannot resolve parent traversal through a missing original path",
+                    ));
+                }
+                return Ok(ancestor.canonicalize()?.join(tail));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "original path has no accessible ancestor",
+    ))
+}
+
+/// The old leaf may have been rebuilt as a symlink. Restoration addresses
+/// its parent and basename and never follows that replacement; matching a
+/// --path selector or scope must use the same destination semantics.
+fn resolve_undo_origin(path: &Path) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let name = absolute.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "original path has no basename")
+    })?;
+    let parent = absolute.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "original path has no parent")
+    })?;
+    Ok(resolve_undo_path(parent)?.join(name))
+}
+
+#[derive(Default)]
+struct UndoInventory {
+    held: Vec<(QuarantineStore, QuarantineRecord)>,
+    errors: Vec<(PathBuf, String)>,
+}
+
+impl UndoInventory {
+    fn require_complete(&self) -> Result<(), CliError> {
+        if self.errors.is_empty() {
+            return Ok(());
+        }
+        Err(CliError::Runtime(format!(
+            "quarantine search incomplete: {}; use --root to select an accessible store scope",
+            self.errors
+                .iter()
+                .map(|(path, error)| format!("{}: {error}", path.display()))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )))
+    }
+}
+
+fn accessible_undo_store(path: &Path) -> io::Result<bool> {
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+    for directory in [parent, path] {
+        match std::fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not a real quarantine directory", directory.display()),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+/// Inspect known store locations only, never recurse through user data.
+/// Stores may be beneath a former scan root or its same-filesystem fallback
+/// mount. Ancestor stores can hold other roots' entries, so every returned
+/// manifest must match an authorized original-path scope. A ledger path is
+/// only an exact discovery hint; the store still validates its own manifest.
+fn discover_undo_entries(roots: &[PathBuf], exact_hint: Option<&Path>) -> UndoInventory {
+    let mut inventory = UndoInventory::default();
+    let mut scopes = Vec::new();
+    let mut stores = BTreeSet::new();
+    for (path, exact) in roots
+        .iter()
+        .map(|path| (path.as_path(), false))
+        .chain(exact_hint.map(|path| (path, true)))
+    {
+        let resolved = match if exact {
+            resolve_undo_origin(path)
+        } else {
+            resolve_undo_path(path)
+        } {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                inventory
+                    .errors
+                    .push((path.to_path_buf(), error.to_string()));
+                continue;
+            }
+        };
+        // Preserve both spellings: manifests retain the configured store
+        // path, while CLI clean canonicalizes its roots before placement.
+        for spelling in [
+            std::path::absolute(path).unwrap_or_else(|_| resolved.clone()),
+            resolved.clone(),
+        ] {
+            // A payload cannot hold its own quarantine store. In particular,
+            // do not probe through a rebuilt symlink at an exact destination.
+            for ancestor in spelling.ancestors().skip(usize::from(exact)) {
+                stores.insert(QuarantineStore::under(ancestor).root().to_path_buf());
+            }
+        }
+        scopes.push((resolved, exact));
+    }
+    let mut seen = BTreeSet::new();
+    for path in stores {
+        // An alias in an ordinary scan root is fine; a store symlink is not.
+        // Do not follow a .sbh redirect while probing broader ancestors.
+        match accessible_undo_store(&path) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                inventory.errors.push((path, error.to_string()));
+                continue;
+            }
+        }
+        let store = QuarantineStore::at(path.clone());
+        let records = match store.records() {
+            Ok(records) => records,
+            Err(error) => {
+                inventory.errors.push((path, error.to_string()));
+                continue;
+            }
+        };
+        let Ok(canonical_store) = store.root().canonicalize() else {
+            inventory
+                .errors
+                .push((path, "quarantine location changed during search".into()));
+            continue;
+        };
+        for record in records {
+            let original = match resolve_undo_origin(&record.original_path) {
+                Ok(original) => original,
+                Err(error) => {
+                    if scopes.iter().any(|(scope, exact)| {
+                        if *exact {
+                            record.original_path == *scope
+                        } else {
+                            record.original_path.starts_with(scope)
+                        }
+                    }) {
+                        inventory
+                            .errors
+                            .push((record.original_path, error.to_string()));
+                    }
+                    continue;
+                }
+            };
+            if scopes.iter().any(|(scope, exact)| {
+                if *exact {
+                    original == *scope
+                } else {
+                    original.starts_with(scope)
+                }
+            }) && seen.insert((canonical_store.clone(), record.decision_id.clone()))
+            {
+                inventory.held.push((store.clone(), record));
+            }
+        }
+    }
+    inventory.held.sort_by(|a, b| {
+        a.1.quarantined_at
+            .cmp(&b.1.quarantined_at)
+            .then_with(|| a.1.decision_id.cmp(&b.1.decision_id))
+    });
+    inventory
+}
+
 /// `sbh undo`: put the remaining quarantined payloads back (Layer 7).
 #[allow(clippy::too_many_lines)]
 fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
@@ -15232,20 +15433,25 @@ fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
     } else {
         args.roots.clone()
     };
-    // Every held record across the roots' stores, oldest first.
-    let mut held: Vec<(QuarantineStore, QuarantineRecord)> = Vec::new();
-    for root in &roots {
-        let store = QuarantineStore::under(root);
-        let records = store
-            .records()
-            .map_err(|e| CliError::Runtime(e.to_string()))?;
-        held.extend(records.into_iter().map(|record| (store.clone(), record)));
-    }
-    held.sort_by(|a, b| {
-        a.1.quarantined_at
-            .cmp(&b.1.quarantined_at)
-            .then_with(|| a.1.decision_id.cmp(&b.1.decision_id))
-    });
+    let selected_path = args.path.as_deref().map(resolve_undo_origin).transpose()?;
+    let selected_id = args.id.as_ref().map(|id| id.trim().to_ascii_lowercase());
+    let exact_hint = if args.roots.is_empty() {
+        selected_path.clone().or_else(|| {
+            let id = selected_id.as_deref()?;
+            Some(
+                SqliteLogger::open_read_only(&config.paths.sqlite_db)
+                    .ok()?
+                    .decision_by_id(id)
+                    .ok()??
+                    .0
+                    .path,
+            )
+        })
+    } else {
+        None
+    };
+    let inventory = discover_undo_entries(&roots, exact_hint.as_deref());
+    let held = &inventory.held;
     let (held_bytes, uncertain_held) = undo_recovery_totals(
         held.iter()
             .map(|(_, record)| (record.recovery_state, Some(record.size_bytes))),
@@ -15255,8 +15461,9 @@ fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
         .map_or(0, |d| d.as_secs());
 
     if args.list {
+        inventory.require_complete()?;
         match output_mode(cli) {
-            OutputMode::Json => write_json_line(&undo_list_report(&roots, &held))?,
+            OutputMode::Json => write_json_line(&undo_list_report(&roots, held))?,
             OutputMode::Human => {
                 if held.is_empty() {
                     println!(
@@ -15269,7 +15476,7 @@ fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
                         "Quarantined entries ({} estimated in intact entries; {uncertain_held} uncertain; restore with `sbh undo <decision-id>`):",
                         format_bytes(held_bytes),
                     );
-                    for (_, record) in &held {
+                    for (_, record) in held {
                         let left = record.expires_at.saturating_sub(now_unix);
                         println!(
                             "  {}  {}  ({}; original estimate {}; expires in {})",
@@ -15286,19 +15493,16 @@ fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
         return Ok(());
     }
 
-    let selected: Vec<&(QuarantineStore, QuarantineRecord)> = if let Some(id) = &args.id {
-        let id = id.trim().to_ascii_lowercase();
-        held.iter().filter(|(_, r)| r.decision_id == id).collect()
-    } else if let Some(path) = &args.path {
-        let path = if path.is_absolute() {
-            path.clone()
-        } else {
-            std::env::current_dir().map_or_else(|_| path.clone(), |cwd| cwd.join(path))
-        };
+    let selected: Vec<&(QuarantineStore, QuarantineRecord)> = if let Some(id) = &selected_id {
+        held.iter().filter(|(_, r)| &r.decision_id == id).collect()
+    } else if let Some(path) = &selected_path {
         held.iter()
-            .filter(|(_, r)| r.original_path == path)
+            .filter(|(_, r)| {
+                resolve_undo_origin(&r.original_path).is_ok_and(|original| &original == path)
+            })
             .collect()
     } else if let Some(window) = &args.all_since {
+        inventory.require_complete()?;
         let since = parse_window_duration(window)?;
         let cutoff = now_unix.saturating_sub(since.as_secs());
         held.iter()
@@ -15310,6 +15514,7 @@ fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
         ));
     };
     if selected.is_empty() {
+        inventory.require_complete()?;
         return Err(CliError::User(format!(
             "no quarantined entry matches ({} held under {} root{}; see `sbh undo --list`)",
             held.len(),
@@ -15322,7 +15527,7 @@ fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
     let mut restored = Vec::new();
     let mut failed = Vec::new();
     for (store, record) in selected {
-        match store.restore(&record.decision_id, args.force_suffix) {
+        match store.restore_reviewed(record, args.force_suffix) {
             Ok(outcome) => {
                 let estimate = outcome
                     .size_bytes
@@ -15981,6 +16186,13 @@ fn build_pressure_check(
 }
 
 fn target_free_skip(collector: &FsStatsCollector, path: &Path, target: f64) -> Option<SkipReason> {
+    if !target.is_finite() || !(0.0..=100.0).contains(&target) {
+        return Some(SkipReason::PressureUnavailable);
+    }
+    // This is mutation authority, not a display refresh. The preceding
+    // removal (or another process) can meet the target inside even a short
+    // cache TTL, and a lost mount must not inherit its last low-space sample.
+    collector.invalidate_observations();
     match collector.collect(path) {
         Ok(stats) if stats.total_bytes > 0 => {
             (stats.free_pct() >= target).then_some(SkipReason::TargetFreeReached)
@@ -16791,14 +17003,21 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                 if let Some(seconds_left) = seconds_left
                     && seconds_left < window_secs
                 {
+                    let runway_unknown = forecast.runway_unknown();
                     let minutes_left = seconds_left / 60.0;
                     match output_mode(cli) {
                         OutputMode::Human => {
+                            let prediction = if runway_unknown {
+                                "red runway unknown: calibration cannot establish headroom"
+                                    .to_string()
+                            } else {
+                                format!("predicted red in {}", format_eta(seconds_left))
+                            };
                             println!(
-                                "sbh: {} has {} free but predicted red in {} (need {} min; rate {}/s, confidence {:.2}{})",
+                                "sbh: {} has {} free but {} (need {} min; rate {}/s, confidence {:.2}{})",
                                 capacity.mount_point.display(),
                                 format_bytes(capacity.available_bytes),
-                                format_eta(seconds_left),
+                                prediction,
                                 predict_minutes,
                                 format_bytes(forecast.bytes_per_sec.max(0.0) as u64),
                                 forecast.confidence,
@@ -16820,8 +17039,10 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                                 "total_bytes": capacity.total_bytes,
                                 "free_pct": free_pct,
                                 "rate_bytes_per_sec": forecast.bytes_per_sec,
-                                "seconds_to_red": seconds_left,
-                                "minutes_until_red": minutes_left,
+                                "seconds_to_red": (!runway_unknown).then_some(seconds_left),
+                                "seconds_to_red_lower_bound": forecast.tte_lo,
+                                "minutes_until_red": (!runway_unknown).then_some(minutes_left),
+                                "runway_unknown": runway_unknown,
                                 "predict_minutes": predict_minutes,
                                 "forecast": forecast_json,
                                 "inodes": inodes,
@@ -16841,7 +17062,12 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                         }
                     }
                     return Err(CliError::User(
-                        "predicted disk full within window".to_string(),
+                        if runway_unknown {
+                            "forecast cannot establish the requested headroom window"
+                        } else {
+                            "predicted red within window"
+                        }
+                        .to_string(),
                     ));
                 }
             }
@@ -17167,6 +17393,26 @@ impl MountForecast {
         self.tte_lo.or(self.seconds_to_red)
     }
 
+    /// The unshrunk point forecast, separate from the conservative control
+    /// horizon stored in `seconds_to_red` by current daemons.
+    fn point_seconds_to_red(&self) -> Option<f64> {
+        self.forecast
+            .as_ref()
+            .and_then(|forecast| forecast.get("tte_point_s"))
+            .and_then(Value::as_f64)
+            .or(self.seconds_to_red)
+    }
+
+    /// Calibration may collapse its bound without observing the red boundary.
+    /// That zero still refuses a promised headroom window, but cannot be shown
+    /// as a prediction that the disk reaches the boundary in zero seconds.
+    fn runway_unknown(&self) -> bool {
+        self.tte_lo == Some(0.0)
+            && self
+                .point_seconds_to_red()
+                .is_some_and(|point| point.is_finite() && point > 0.0)
+    }
+
     /// Below the configured confidence the estimator is still warming up:
     /// the numbers are shown but not acted on.
     fn warming(&self, min_confidence: f64) -> bool {
@@ -17182,6 +17428,7 @@ impl MountForecast {
             "seconds_to_red_lo": self.tte_lo,
             "forecast": self.forecast,
             "seconds_to_full": self.seconds_to_full,
+            "runway_unknown": self.runway_unknown(),
             "warming": self.warming(min_confidence),
         })
     }
@@ -17269,7 +17516,10 @@ fn rate_line(mount: &str, forecast: &MountForecast, min_confidence: f64) -> Stri
     } else {
         "0 B/s\u{b2}".to_string()
     };
-    let horizon = match (forecast.tte_lo, forecast.seconds_to_red) {
+    let horizon = match (forecast.tte_lo, forecast.point_seconds_to_red()) {
+        (_, Some(point)) if forecast.runway_unknown() => {
+            format!("red runway unknown (point {})", format_eta(point))
+        }
         (Some(lo), Some(point)) if lo.is_finite() && point.is_finite() && lo < point => {
             format!("red in >={} (point {})", format_eta(lo), format_eta(point))
         }
@@ -17326,6 +17576,16 @@ fn parse_lease_duration_seconds(raw: &str) -> std::result::Result<u64, String> {
     value
         .checked_mul(multiplier)
         .ok_or_else(|| "lease duration is too large".to_string())
+}
+
+fn parse_free_percentage(raw: &str) -> std::result::Result<f64, String> {
+    let value = raw
+        .parse::<f64>()
+        .map_err(|_| "free percentage must be a number between 0 and 100".to_string())?;
+    if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+        return Err("free percentage must be finite and between 0 and 100".to_string());
+    }
+    Ok(value)
 }
 
 fn parse_byte_count(raw: &str) -> std::result::Result<u64, String> {
@@ -18907,6 +19167,249 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn undo_test_config(root: &Path, roots: Vec<PathBuf>) -> (Config, PathBuf) {
+        let mut config = Config::default();
+        config.scanner.root_paths = roots;
+        config.paths.sqlite_db = root.join("activity.sqlite3");
+        let path = root.join("config.toml");
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        (config, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_finds_missing_root_in_ancestor_store_without_restoring_siblings() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (store, selected) = undo_fixture(&root, "selected", RecoveryState::Intact);
+        let (_, sibling) = undo_fixture(&root, "sibling", RecoveryState::Intact);
+        let alias = root.join("alias");
+        symlink(&root, &alias).unwrap();
+        let scopes = vec![selected.clone(), alias.join("selected")];
+        let inventory = discover_undo_entries(&scopes, None);
+        assert_eq!(inventory.held.len(), 1, "aliases must not repeat a restore");
+        assert_eq!(inventory.held[0].1.original_path, selected);
+        let (_, config) = undo_test_config(&root, scopes);
+        let cli = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config.to_str().unwrap(),
+            "--json",
+            "undo",
+            "--all-since",
+            "1h",
+        ])
+        .unwrap();
+        run(&cli).unwrap();
+        assert_eq!(std::fs::read(selected.join("a.o")).unwrap(), b"obj");
+        assert!(!sibling.exists());
+        assert!(store.record("sibling").unwrap().is_some());
+        assert!(store.record("selected").unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_uses_exact_ledger_hint_without_broadening_explicit_roots() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let configured = root.join("configured");
+        let custom = root.join("custom");
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::create_dir(&custom).unwrap();
+        let target = custom.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("a.o"), b"obj").unwrap();
+        let candidate = clean_receipt_candidate(&target);
+        let id = candidate_decision_id(&candidate);
+        let (config, config_path) = undo_test_config(&root, vec![configured.clone()]);
+        let command = Cli::try_parse_from(["sbh", "scan"]).unwrap();
+        assert_eq!(
+            record_cli_decisions(&command, &config, &[candidate], false),
+            1
+        );
+        let store = QuarantineStore::under(&custom);
+        store
+            .quarantine(&target, &id, 3, Duration::ZERO, None)
+            .unwrap();
+        let constrained = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "undo",
+            &id,
+            "--root",
+            configured.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(matches!(run(&constrained), Err(CliError::User(_))));
+        assert!(store.record(&id).unwrap().is_some());
+        assert!(!target.exists());
+
+        let restore = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "undo",
+            &id,
+        ])
+        .unwrap();
+        run(&restore).unwrap();
+        assert_eq!(std::fs::read(target.join("a.o")).unwrap(), b"obj");
+        assert!(store.record(&id).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_path_finds_custom_store_without_a_ledger_and_honors_explicit_scope() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let configured = root.join("configured");
+        let custom = root.join("custom");
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::create_dir(&custom).unwrap();
+        let (store, target) = undo_fixture(&custom, "wanted", RecoveryState::Intact);
+        undo_fixture(&custom, "unrelated", RecoveryState::Intact);
+        let (config, config_path) = undo_test_config(&root, vec![configured.clone()]);
+        let inventory = discover_undo_entries(&config.scanner.root_paths, Some(&target));
+        assert_eq!(inventory.held.len(), 1);
+        assert_eq!(inventory.held[0].1.decision_id, "wanted");
+        assert!(!config.paths.sqlite_db.exists());
+        let constrained = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "undo",
+            "--path",
+            target.to_str().unwrap(),
+            "--root",
+            configured.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(matches!(run(&constrained), Err(CliError::User(_))));
+        let restore = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "undo",
+            "--path",
+            target.to_str().unwrap(),
+        ])
+        .unwrap();
+        run(&restore).unwrap();
+        assert_eq!(std::fs::read(target.join("a.o")).unwrap(), b"obj");
+        assert!(store.record("unrelated").unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_reports_inaccessible_search_without_blocking_a_known_exact_entry() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let known = root.join("known");
+        let unrelated = root.join("unrelated");
+        std::fs::create_dir(&known).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        symlink(&unrelated, root.join(".sbh")).unwrap();
+        let (_, target) = undo_fixture(&known, "known-entry", RecoveryState::Intact);
+        let inventory = discover_undo_entries(std::slice::from_ref(&known), None);
+        assert_eq!(inventory.held.len(), 1);
+        assert!(inventory.require_complete().is_err());
+        let (_, config) = undo_test_config(&root, vec![known.clone()]);
+        let absent = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config.to_str().unwrap(),
+            "--json",
+            "undo",
+            "missing-entry",
+        ])
+        .unwrap();
+        assert!(
+            matches!(run(&absent), Err(CliError::Runtime(message)) if message.contains("search incomplete"))
+        );
+        let restore = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config.to_str().unwrap(),
+            "--json",
+            "undo",
+            "known-entry",
+        ])
+        .unwrap();
+        run(&restore).unwrap();
+        assert_eq!(std::fs::read(target.join("a.o")).unwrap(), b"obj");
+        assert!(std::fs::read_dir(unrelated).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_discovery_refuses_ambiguous_missing_paths_and_dangling_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (store, _) = undo_fixture(&root, "held", RecoveryState::Intact);
+        let dangling = root.join("dangling");
+        symlink(root.join("absent"), &dangling).unwrap();
+        for path in [root.join("missing/../held"), dangling.join("held")] {
+            let inventory = discover_undo_entries(&[path], None);
+            assert!(inventory.held.is_empty());
+            assert!(inventory.require_complete().is_err());
+        }
+        assert!(store.record("held").unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_path_matches_the_original_basename_without_following_a_rebuilt_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (store, original) = undo_fixture(&root, "replaced", RecoveryState::Intact);
+        let unrelated = root.join("other");
+        std::fs::create_dir(&unrelated).unwrap();
+        std::fs::write(unrelated.join("a.o"), b"keep rebuilt reference").unwrap();
+        symlink(&unrelated, &original).unwrap();
+        let (_, config) = undo_test_config(&root, vec![root.clone()]);
+        let restore = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config.to_str().unwrap(),
+            "--json",
+            "undo",
+            "--path",
+            original.to_str().unwrap(),
+            "--force-suffix",
+        ])
+        .unwrap();
+        run(&restore).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&original)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(unrelated.join("a.o")).unwrap(),
+            b"keep rebuilt reference"
+        );
+        assert_eq!(
+            std::fs::read(root.join("replaced.restored-replaced/a.o")).unwrap(),
+            b"obj"
+        );
+        assert!(store.record("replaced").unwrap().is_none());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn undo_reports_only_intact_estimates_after_partial_purge_and_legacy_recovery() {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
@@ -19406,6 +19909,25 @@ mod tests {
 
         let after = Cli::try_parse_from(["sbh", "status", "--json", "--no-color", "-v"]);
         assert!(after.is_ok());
+    }
+
+    #[test]
+    fn target_free_rejects_nonfinite_and_out_of_range_cli_values() {
+        for command in ["clean", "emergency", "check"] {
+            for invalid in ["NaN", "nan", "inf", "-inf", "1e400", "100.1", "-0.1"] {
+                let flag = format!("--target-free={invalid}");
+                let error = Cli::try_parse_from(["sbh", command, &flag]).unwrap_err();
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+                assert!(error.to_string().contains("between 0 and 100"));
+            }
+            for valid in ["0", "0.5", "20", "100"] {
+                let flag = format!("--target-free={valid}");
+                assert!(
+                    Cli::try_parse_from(["sbh", command, &flag]).is_ok(),
+                    "{command} must accept {valid}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -21651,6 +22173,114 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct CleanupCapacityPlatform {
+        inventory: MockPlatform,
+        available: AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    impl Platform for CleanupCapacityPlatform {
+        fn fs_stats(&self, path: &Path) -> PalResult<FsStats> {
+            let available = self.available.load(Ordering::SeqCst);
+            if available == usize::MAX {
+                return Err(storage_ballast_helper::core::errors::SbhError::FsStats {
+                    path: path.to_path_buf(),
+                    details: "capacity observation unavailable".into(),
+                });
+            }
+            let mut stats = self.inventory.fs_stats(path)?;
+            stats.total_bytes = 1000;
+            stats.available_bytes = available as u64;
+            stats.free_bytes = available as u64;
+            Ok(stats)
+        }
+
+        fn mount_points(&self) -> PalResult<Vec<MountPoint>> {
+            self.inventory.mount_points()
+        }
+
+        fn is_ram_backed(&self, path: &Path) -> PalResult<bool> {
+            self.inventory.is_ram_backed(path)
+        }
+
+        fn default_paths(&self) -> PlatformPaths {
+            self.inventory.default_paths()
+        }
+
+        fn memory_info(&self) -> PalResult<MemoryInfo> {
+            self.inventory.memory_info()
+        }
+
+        fn service_manager(&self) -> Box<dyn ServiceManager> {
+            self.inventory.service_manager()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_cleanup_stops_when_capacity_recovers_inside_the_cache_ttl() {
+        for remaining in [500, usize::MAX] {
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let first = directory.path().join("first-target");
+            let second = directory.path().join("second-target");
+            for target in [&first, &second] {
+                std::fs::create_dir(target).unwrap();
+                std::fs::write(target.join("a.o"), b"obj").unwrap();
+            }
+            let platform = std::sync::Arc::new(CleanupCapacityPlatform {
+                inventory: MockPlatform::healthy(),
+                available: AtomicUsize::new(50),
+            });
+            let after_removal = std::sync::Arc::clone(&platform);
+            let collector =
+                std::sync::Arc::new(FsStatsCollector::new(platform, Duration::from_hours(1)));
+            let pressure = build_pressure_check(Some(10.0), collector).unwrap();
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    check_open_files: false,
+                    ..DeletionConfig::default()
+                },
+                None,
+            )
+            .with_activity_observer(move |event| {
+                if matches!(event, ActivityEvent::ArtifactDeleted { .. }) {
+                    after_removal.available.store(remaining, Ordering::SeqCst);
+                }
+            });
+            let mut plan = executor.plan(vec![
+                clean_receipt_candidate(&first),
+                clean_receipt_candidate(&second),
+            ]);
+            plan.candidates
+                .sort_by_key(|candidate| candidate.path != first);
+            assert_eq!(plan.candidates.len(), 2);
+            let report = executor.execute(&plan, Some(pressure.as_ref()));
+            assert_eq!(report.items_deleted, 1);
+            assert_eq!(report.items_failed, 0);
+            let reason = if remaining == usize::MAX {
+                "pressure_unavailable"
+            } else {
+                "target_free_reached"
+            };
+            assert_eq!(report.skipped_by_reason.get(reason), Some(&1));
+            assert!(!first.exists());
+            assert_eq!(std::fs::read(second.join("a.o")).unwrap(), b"obj");
+        }
+    }
+
+    #[test]
+    fn invalid_target_free_cannot_authorize_internal_cleanup() {
+        let collector =
+            FsStatsCollector::new(std::sync::Arc::new(MockPlatform::healthy()), Duration::ZERO);
+        for target in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 101.0] {
+            assert_eq!(
+                target_free_skip(&collector, Path::new("/"), target),
+                Some(SkipReason::PressureUnavailable)
+            );
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn interactive_cleanup_preserves_decline_all_quit_and_eof() {
         for (answers, deleted, declined, prompts) in [
@@ -22602,6 +23232,38 @@ mod tests {
         assert_eq!(format_eta(42.0), "42s");
         assert_eq!(format_eta(3_900.0), "1h 5m");
         assert_eq!(format_eta(200_000.0), "2d 7h");
+    }
+
+    #[test]
+    fn rate_line_distinguishes_unknown_runway_from_observed_zero_and_positive_bounds() {
+        for (point, lower, expected, unknown) in [
+            (5182.0, 0.0, "red runway unknown (point 1h 26m)", true),
+            (5182.0, 60.0, "red in >=1m (point 1h 26m)", false),
+            (0.0, 0.0, "red in 0s", false),
+        ] {
+            let rate = json!({
+                "bytes_per_sec": 1_538_757.0,
+                "confidence": 0.71,
+                // This is the current daemon contract: the control horizon,
+                // not the separately published unshrunk point estimate.
+                "seconds_to_red": lower,
+                "seconds_to_full": null,
+                "forecast": {
+                    "tte_point_s": point,
+                    "tte_lo_s": lower,
+                    "coverage_empirical": 0.277,
+                },
+            });
+            let forecast = MountForecast::from_rate(&rate).unwrap();
+            let line = rate_line("/data", &forecast, 0.7);
+            assert!(line.contains(expected), "{line}");
+            assert_eq!(forecast.runway_unknown(), unknown);
+            assert_eq!(forecast.to_json(0.7)["runway_unknown"], unknown);
+            assert_eq!(forecast.acting_seconds_to_red(), Some(lower));
+            if unknown {
+                assert!(!line.contains("red in 0s"), "{line}");
+            }
+        }
     }
 
     #[test]

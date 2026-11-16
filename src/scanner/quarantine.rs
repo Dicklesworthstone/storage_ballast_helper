@@ -969,7 +969,18 @@ impl QuarantineStore {
     /// `<original>.restored-<decision-id>` instead. After a partial purge,
     /// only the payload's remaining contents can be restored.
     pub fn restore(&self, decision_id: &str, force_suffix: bool) -> Result<RestoreOutcome> {
-        safety::restore(self, decision_id, force_suffix)
+        safety::restore(self, decision_id, force_suffix, None)
+    }
+
+    /// Restore only the entry selected from a previous inventory. Re-read its
+    /// manifest under the store lock and refuse changed origins, identities
+    /// or recovery evidence rather than granting a reused ID the old scope.
+    pub fn restore_reviewed(
+        &self,
+        reviewed: &QuarantineRecord,
+        force_suffix: bool,
+    ) -> Result<RestoreOutcome> {
+        safety::restore(self, &reviewed.decision_id, force_suffix, Some(reviewed))
     }
 
     /// The record whose original path is `path`, if held.

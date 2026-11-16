@@ -892,7 +892,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (store, record) = held(temp.path());
         let saved = temp.path().join("retained-decision");
-        let result = restore_with_hook(&store, "held", false, &mut |step| {
+        let result = restore_with_hook(&store, "held", false, None, &mut |step| {
             if step == TransactionStep::Prepared {
                 fs::rename(store.root().join("held"), &saved).unwrap();
                 fs::create_dir(store.root().join("held")).unwrap();
@@ -924,7 +924,7 @@ mod tests {
         let record = store
             .quarantine(&project.join("artifact"), "held", 9, Duration::ZERO, None)
             .unwrap();
-        let result = restore_with_hook(&store, "held", true, &mut |step| {
+        let result = restore_with_hook(&store, "held", true, None, &mut |step| {
             if step == TransactionStep::Prepared {
                 fs::rename(&project, &saved).unwrap();
                 symlink(&outside, &project).unwrap();
@@ -946,7 +946,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (store, record) = held(temp.path());
         let saved = temp.path().join("restored-store");
-        let outcome = restore_with_hook(&store, "held", false, &mut |step| {
+        let outcome = restore_with_hook(&store, "held", false, None, &mut |step| {
             if step == TransactionStep::Moved {
                 fs::rename(store.root(), &saved).unwrap();
                 fs::create_dir_all(store.root().join("held")).unwrap();

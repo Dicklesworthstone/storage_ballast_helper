@@ -144,6 +144,113 @@ fn subcommand_help_flags_work() {
     }
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn check_predict_keeps_collapsed_bounds_conservative_without_claiming_zero_runway() {
+    use storage_ballast_helper::core::config::PathsConfig;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let mount = fs::canonicalize(fixture.path()).unwrap();
+    let mount_key = mount.to_string_lossy().into_owned();
+    let config = Config::with_paths(PathsConfig {
+        config_file: mount.join("config.toml"),
+        ballast_dir: mount.join("ballast"),
+        state_file: mount.join("state.json"),
+        sqlite_db: mount.join("activity.sqlite3"),
+        jsonl_log: mount.join("activity.jsonl"),
+    });
+    fs::write(&config.paths.config_file, toml::to_string(&config).unwrap()).unwrap();
+    let table = serde_json::json!({
+        "mounts": [{
+            "path": &mount,
+            "fs_type": "ext4",
+            "total": 100_000_000_000_u64,
+            "free": 80_000_000_000_u64,
+        }],
+    })
+    .to_string();
+    let run = |json: bool| {
+        let mut command = Command::new(common::sbh_bin_path());
+        command
+            .arg("--config")
+            .arg(&config.paths.config_file)
+            .env("SBH_TEST_MODE", "1")
+            .env("SBH_TEST_FS_STATS", &table)
+            .env("SBH_OUTPUT_FORMAT", "human");
+        if json {
+            command.arg("--json");
+        }
+        command
+            .args(["check", "--predict", "30", "--target-free", "0"])
+            .arg(&mount)
+            .output()
+            .unwrap()
+    };
+    for (point, lower, unknown) in [
+        (5182.0, 0.0, true),
+        (5182.0, 60.0, false),
+        (0.0, 0.0, false),
+    ] {
+        let rate = serde_json::json!({
+            "bytes_per_sec": 1_538_757.0,
+            "confidence": 0.71,
+            "seconds_to_red": lower,
+            "seconds_to_full": null,
+            "forecast": {
+                "tte_point_s": point,
+                "tte_lo_s": lower,
+                "coverage_empirical": 0.277,
+            },
+        });
+        let rates = serde_json::Map::from_iter([(mount_key.clone(), rate)]);
+        fs::write(
+            &config.paths.state_file,
+            serde_json::to_vec(&serde_json::json!({ "schema_version": 2, "rates": rates }))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let json = run(true);
+        let payload: Value = serde_json::from_slice(&json.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{error}: stdout={} stderr={}",
+                String::from_utf8_lossy(&json.stdout),
+                String::from_utf8_lossy(&json.stderr),
+            )
+        });
+        assert_eq!(json.status.code(), Some(1), "{payload}");
+        assert_eq!(payload["status"], "warning", "{payload}");
+        assert_eq!(payload["runway_unknown"], unknown, "{payload}");
+        assert_eq!(payload["forecast"]["runway_unknown"], unknown, "{payload}");
+        assert_eq!(payload["seconds_to_red_lower_bound"], lower, "{payload}");
+        assert_eq!(payload["forecast"]["seconds_to_red"], lower, "{payload}");
+        assert_eq!(
+            payload["seconds_to_red"].as_f64(),
+            (!unknown).then_some(lower),
+            "{payload}",
+        );
+        assert_eq!(
+            payload["minutes_until_red"].as_f64(),
+            (!unknown).then_some(lower / 60.0),
+            "{payload}",
+        );
+
+        let human = run(false);
+        let stdout = String::from_utf8_lossy(&human.stdout);
+        assert_eq!(human.status.code(), Some(1), "{stdout}");
+        if unknown {
+            assert!(stdout.contains("red runway unknown"), "{stdout}");
+            assert!(!stdout.contains("predicted red in 0s"), "{stdout}");
+            assert!(
+                String::from_utf8_lossy(&human.stderr)
+                    .contains("cannot establish the requested headroom window"),
+            );
+        } else {
+            assert!(stdout.contains("predicted red in"), "{stdout}");
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn deleted_open_blame_finds_anonymous_allocations_without_daemon_config() {

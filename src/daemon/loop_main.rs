@@ -2688,6 +2688,18 @@ fn predictive_warning_event(
     {
         return None;
     }
+    // A zero lower bound with a positive point forecast says that calibration
+    // cannot establish any runway. It is still a conservative control input,
+    // but it is not evidence that this filesystem will be full in zero minutes.
+    // A real zero point forecast (the boundary was reached) remains distinct.
+    if tick.rate.forecast.as_ref().is_some_and(|forecast| {
+        forecast.tte_lo_s == Some(0.0)
+            && forecast
+                .tte_point_s
+                .is_some_and(|point| point.is_finite() && point > 0.0)
+    }) {
+        return None;
+    }
     let (mount, minutes_remaining, confidence) = match &tick.predictive_action {
         PredictiveAction::Clear => return None,
         PredictiveAction::EarlyWarning {
@@ -8064,8 +8076,10 @@ impl MonitoringDaemon {
             let guard_diag = monitor.guard.diagnostics();
 
             // Predicted time to red threshold: the point estimate, and the
-            // conformal lower bound the controllers act on. Zero means the
-            // boundary has been reached, not that the forecast is unavailable.
+            // conformal lower bound the controllers act on. A zero point means
+            // the boundary has been reached; a zero bound with a positive point
+            // means calibration cannot establish runway. Both remain urgent
+            // control inputs, but only the first is a literal time forecast.
             let predicted_point = if rate_estimate.seconds_to_threshold.is_finite()
                 && rate_estimate.seconds_to_threshold >= 0.0
             {
@@ -20576,6 +20590,126 @@ mod tests {
             ..config
         };
         assert!(predictive_warning_event(&tick, &disabled).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn predictive_warning_distinguishes_collapsed_bounds_from_actual_zero_runway() {
+        use crate::monitor::conformal::CoverageState;
+
+        let config = crate::core::config::PredictionConfig::default();
+        let mount = Path::new("/filling");
+        for (point, lower, minutes, should_warn) in [
+            (5182.0, 0.0, 0.0, false),
+            (5182.0, 60.0, 1.0, true),
+            (0.0, 0.0, 0.0, true),
+        ] {
+            let mut tick = predictive_warning_tick(mount, minutes);
+            tick.predictive_action = PredictiveAction::ImminentDanger {
+                mount: mount.to_path_buf(),
+                minutes_remaining: minutes,
+                critical: true,
+            };
+            tick.rate.forecast = Some(ForecastSnapshot::from_interval(
+                &TteInterval {
+                    point_secs: point,
+                    lo_secs: lower,
+                    alpha: -0.417,
+                    coverage_state: CoverageState::Calibrated,
+                    samples: 83,
+                    coverage_empirical: Some(0.277),
+                },
+                config.coverage_target,
+            ));
+            assert_eq!(
+                predictive_warning_event(&tick, &config).is_some(),
+                should_warn,
+                "point={point}, lower={lower}",
+            );
+            assert!(tick.predictive_action.should_release_ballast());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collapsed_forecast_preserves_urgent_control_without_claiming_exhaustion() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let mut fixture = RegretDaemonFixture::new();
+        let mount = install_disk_pressure_probe(&mut fixture, 100 * GIB, 12 * GIB, false);
+        let daemon = &mut fixture.daemon;
+        daemon.config.telemetry.ewma_base_alpha = 1.0;
+        daemon.config.telemetry.ewma_min_alpha = 1.0;
+        daemon.config.telemetry.ewma_max_alpha = 1.0;
+        let start = Instant::now();
+        let mut sample = native_pressure_sample(&mount, "disk-a", 100 * GIB, 12 * GIB, start);
+        for step in 0..=10 {
+            sample.collected_at = start + Duration::from_secs(step);
+            sample.stats.available_bytes = 12 * GIB - step * 2 * MIB;
+            sample.stats.free_bytes = sample.stats.available_bytes;
+            daemon
+                .evaluate_pressure_samples(
+                    HashMap::from([(mount.clone(), sample.clone())]),
+                    sample.collected_at,
+                )
+                .unwrap();
+        }
+        assert_eq!(daemon.last_predictive_action, PredictiveAction::Clear);
+
+        let monitor = daemon.mount_monitors.get_mut(&mount).unwrap();
+        for _ in 0..83 {
+            // Severe historical misses drive ACI beyond its empirical ranks.
+            // Its support-endpoint answer is no positive lower bound, not an
+            // observation that this currently nonempty filesystem is full.
+            assert_eq!(monitor.conformal.record(6000.0, 1.0, 6000.0), Some(false));
+        }
+        sample.collected_at += Duration::from_secs(1);
+        sample.stats.available_bytes -= 2 * MIB;
+        sample.stats.free_bytes = sample.stats.available_bytes;
+        let response = daemon
+            .evaluate_pressure_samples(
+                HashMap::from([(mount.clone(), sample.clone())]),
+                sample.collected_at,
+            )
+            .unwrap();
+        let tick = daemon.mount_responses.first().unwrap();
+        let forecast = tick.rate.forecast.as_ref().unwrap();
+        assert!(sample.stats.available_bytes > 11 * GIB);
+        assert!(forecast.tte_point_s.unwrap() > 1800.0);
+        assert_eq!(forecast.tte_lo_s, Some(0.0));
+        assert_eq!(response.predicted_seconds, Some(0.0));
+        assert_eq!(tick.rate.seconds_to_red, Some(0.0));
+        assert!(
+            daemon.mount_monitors[&mount]
+                .pressure_controller
+                .last_feedforward()
+                > 0.0,
+        );
+        assert!(tick.imminent_danger);
+        assert!(tick.predictive_action.should_cleanup());
+        assert!(tick.predictive_action.should_release_ballast());
+        assert!(predictive_warning_event(tick, &daemon.config.pressure.prediction).is_none());
+
+        // Ordinary positive calibration continues to shrink both controller
+        // and exhaustion horizons without changing the independent byte input.
+        let raw = &daemon.mount_monitors[&mount]
+            .last_observation
+            .as_ref()
+            .unwrap()
+            .rate;
+        let mut interval =
+            daemon.mount_monitors[&mount].forecast_interval(raw.seconds_to_threshold);
+        interval.lo_secs = interval.point_secs / 2.0;
+        let calibrated = calibrated_estimate(raw, Some(&interval));
+        assert_eq!(
+            calibrated.seconds_to_threshold,
+            raw.seconds_to_threshold / 2.0
+        );
+        assert_eq!(
+            calibrated.seconds_to_exhaustion,
+            raw.seconds_to_exhaustion / 2.0
+        );
+        assert_eq!(calibrated.free_bytes, raw.free_bytes);
     }
 
     #[cfg(unix)]

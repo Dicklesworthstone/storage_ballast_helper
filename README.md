@@ -1647,6 +1647,17 @@ or `sbh undo --all-since 2h`. Restore renames the remaining payload back. It
 refuses when the original path exists again unless `--force-suffix`, which
 restores beside it as `<name>.restored-<decision-id>`.
 
+Undo also checks quarantine stores along the original path's ancestors, so
+an entry held at its filesystem's fallback store remains discoverable after
+its entire scan root was moved. `--root` limits recovered entries to original
+paths in that scope; it never includes siblings just because they share a
+store. Aliases of a store are deduplicated. For a manual clean outside the
+configured roots, `--path <original>` supplies an exact search scope, and a
+requested decision ID can use its existing read-only decision ledger as a
+location hint. Explicit `--root` constraints always take precedence. The
+manifest is checked again under the store lock before restoration, so a
+changed origin or reused decision ID must be reviewed again.
+
 Recovery completeness survives daemon restarts. New entries start with a
 durable intact witness; before a purge may unlink anything, the store records
 that purging has started. A bounded or interrupted purge can therefore leave
@@ -2154,6 +2165,16 @@ alpha_t+1 = alpha_t + 0.01 * ((1 - coverage_target) - err_t)
 ```
 
 The controllers act on `tte_lo`: it is the PID feedforward input, the mount controller's seconds-to-red, and the predictive policy's estimate (the time to exhaustion is shrunk by the same factor). Below 30 resolved samples the bound is the point estimate and the state is `warming`. `pressure.prediction.coverage_target` (0.90) sets the guarantee; `sbh status` shows `red in >=<lo> (point <estimate>)`, `sbh check --predict` uses the bound, `state.json` carries `rates.<mount>.forecast`, decision records carry the bound and coverage at decision time, and the daemon logs a `forecast mount=.. tte_point=.. tte_lo=.. alpha=.. coverage=.. samples=..` line per filling mount per minute that `sbh stats --json` aggregates as `forecast.coverage_by_day`.
+
+If the lower bound collapses to zero while the point estimate remains positive,
+calibration cannot establish runway. Status reports `red runway unknown` and
+the daemon suppresses a numeric exhaustion notification. Controllers still act
+conservatively on the zero bound, and `check --predict` still exits 1 because
+the requested headroom window is unproven. Its warning JSON sets
+`runway_unknown: true`, leaves the literal `seconds_to_red` and
+`minutes_until_red` null, and preserves zero in `seconds_to_red_lower_bound` and
+the nested forecast. A zero point estimate at the actual boundary remains a
+zero-time forecast.
 
 #### E-Process Drift Detection
 

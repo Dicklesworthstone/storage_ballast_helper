@@ -714,14 +714,16 @@ pub(super) fn restore(
     store: &QuarantineStore,
     id: &str,
     force_suffix: bool,
+    reviewed: Option<&QuarantineRecord>,
 ) -> Result<RestoreOutcome> {
-    restore_with_hook(store, id, force_suffix, &mut |_| {})
+    restore_with_hook(store, id, force_suffix, reviewed, &mut |_| {})
 }
 
 fn restore_with_hook(
     store: &QuarantineStore,
     id: &str,
     force_suffix: bool,
+    reviewed: Option<&QuarantineRecord>,
     hook: &mut impl FnMut(TransactionStep),
 ) -> Result<RestoreOutcome> {
     validate_id(id).map_err(|e| SbhError::io(store.root(), e))?;
@@ -736,6 +738,13 @@ fn restore_with_hook(
             details: format!("no quarantined entry for decision {id}"),
         });
     };
+    if reviewed.is_some_and(|reviewed| reviewed != &record) {
+        return Err(SbhError::SafetyVeto {
+            path: record.original_path,
+            reason: "quarantine entry changed since selection; inspect it again before restoring"
+                .to_string(),
+        });
+    }
     let Some(source) =
         payload_at(&root, &record).map_err(|e| SbhError::io(&record.quarantine_path, e))?
     else {
@@ -1616,6 +1625,50 @@ mod tests {
         // A fresh forced selection may reclaim the newly held entry, not the original.
         assert_eq!(store.drain_all().unwrap().counts(), (1, 200));
         assert_eq!(fs::read(selected.original_path).unwrap(), b"original bytes");
+    }
+
+    #[test]
+    fn reviewed_restore_refuses_an_id_reused_for_a_different_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, selected) = held(dir.path(), "restore-reused");
+        store.restore("restore-reused", false).unwrap();
+        let other = dir.path().join("other-payload");
+        fs::write(&other, b"not selected by undo").unwrap();
+        let fresh = store
+            .quarantine(&other, "restore-reused", 20, Duration::ZERO, None)
+            .unwrap();
+        let error = store.restore_reviewed(&selected, true).unwrap_err();
+        assert!(matches!(error, SbhError::SafetyVeto { .. }));
+        assert!(!other.exists());
+        assert_eq!(
+            fs::read(&fresh.quarantine_path).unwrap(),
+            b"not selected by undo"
+        );
+        assert_eq!(
+            fs::read(&selected.original_path).unwrap(),
+            b"original bytes"
+        );
+        store.restore_reviewed(&fresh, false).unwrap();
+        assert_eq!(fs::read(other).unwrap(), b"not selected by undo");
+    }
+
+    #[test]
+    fn reviewed_restore_rechecks_manifest_before_creating_destination_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, selected) = held(dir.path(), "restore-retargeted");
+        let outside = dir.path().join("outside-selection/new-parent");
+        let mut changed = selected.clone();
+        changed.original_path = outside.join(selected.original_path.file_name().unwrap());
+        write_json(&store.record_path("restore-retargeted"), &changed).unwrap();
+        let error = store.restore_reviewed(&selected, false).unwrap_err();
+        assert!(matches!(error, SbhError::SafetyVeto { .. }));
+        assert!(!outside.exists());
+        assert!(!selected.original_path.exists());
+        assert_eq!(
+            fs::read(&selected.quarantine_path).unwrap(),
+            b"original bytes"
+        );
+        assert!(store.record("restore-retargeted").unwrap().is_some());
     }
 
     #[test]
