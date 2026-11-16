@@ -7686,8 +7686,9 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
     // a tuning run that writes a file the daemon ignores is worse than no
     // tuning run, because it reports success.
     let config_path = Config::resolve_config_write_path(cli.config.as_deref()).path;
-    let mut config_backup_path = None;
-    if !config_recs.is_empty() {
+    let config_backup_path = if config_recs.is_empty() {
+        None
+    } else {
         let mut toml_value: toml::Value = if config_path.exists() {
             let raw = std::fs::read_to_string(&config_path)
                 .map_err(|e| CliError::Runtime(format!("read config: {e}")))?;
@@ -7700,7 +7701,7 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
         }
         let toml_str = toml::to_string_pretty(&toml_value)
             .map_err(|e| CliError::Runtime(format!("serialize config: {e}")))?;
-        config_backup_path = storage_ballast_helper::core::config::write_config_atomic(
+        storage_ballast_helper::core::config::write_config_atomic(
             &config_path,
             &toml_str,
             |staged| {
@@ -7710,8 +7711,8 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
             },
         )
-        .map_err(|e| CliError::Runtime(format!("write config: {e}")))?;
-    }
+        .map_err(|e| CliError::Runtime(format!("write config: {e}")))?
+    };
 
     // Apply kernel-writeback tuning (root-gated; never touches config.toml).
     let mut writeback_report: Option<WritebackApplyReport> = None;

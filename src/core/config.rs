@@ -3664,10 +3664,9 @@ impl ConfigWriteFile {
     }
 
     fn is_bound(&self) -> bool {
-        self.file.metadata().ok().is_some_and(|opened| {
+        self.file.metadata().is_ok_and(|opened| {
             fs::symlink_metadata(&self.path)
-                .ok()
-                .is_some_and(|named| named.is_file() && same_config_file(&opened, &named))
+                .is_ok_and(|named| named.is_file() && same_config_file(&opened, &named))
         })
     }
 }
@@ -3929,6 +3928,9 @@ mod tests {
         let barrier = Arc::new(Barrier::new(2));
         let staged_paths = Arc::new(Mutex::new(Vec::new()));
         let outcomes = std::thread::scope(|scope| {
+            // Both writers must be spawned before either is joined: each waits
+            // at a two-party barrier, so joining lazily would deadlock.
+            #[allow(clippy::needless_collect)]
             let handles: Vec<_> = ["first candidate", "second candidate"]
                 .into_iter()
                 .map(|contents| {
@@ -3950,7 +3952,7 @@ mod tests {
                 .map(|handle| handle.join().unwrap())
                 .collect::<Vec<_>>()
         });
-        let paths = staged_paths.lock().unwrap();
+        let paths = staged_paths.lock().unwrap().clone();
         assert_eq!(paths.len(), 2);
         assert_ne!(paths[0], paths[1]);
         assert!(outcomes.iter().any(Result::is_ok));

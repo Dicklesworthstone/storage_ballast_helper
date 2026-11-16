@@ -724,15 +724,12 @@ fn persist_decision(
     decisions: &mut crate::logger::decision_dedupe::DecisionDedupe,
     record: &DecisionRecord,
 ) -> bool {
-    match db.log_decision_with_id(record) {
-        Ok(row_id) => {
-            decisions.acknowledge_persisted(record, Instant::now(), row_id);
-            true
-        }
-        Err(_) => {
-            decisions.persistence_failed();
-            false
-        }
+    if let Ok(row_id) = db.log_decision_with_id(record) {
+        decisions.acknowledge_persisted(record, Instant::now(), row_id);
+        true
+    } else {
+        decisions.persistence_failed();
+        false
     }
 }
 
