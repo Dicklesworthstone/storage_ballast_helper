@@ -715,7 +715,11 @@ fn cold_cursor_walks_reach_deep_work_before_spending_the_slice_on_siblings() {
             "a scheduling priority must not widen the configured scope"
         );
         seen.extend(leaves);
-        assert_eq!(seen.len(), pass + 1, "each slice must reach fresh deep work");
+        assert_eq!(
+            seen.len(),
+            pass + 1,
+            "each slice must reach fresh deep work"
+        );
         assert!(observed.saved_positions > 0, "{observed:?}");
         if pass > 0 {
             assert!(observed.restored_positions > 0, "{observed:?}");
@@ -735,7 +739,10 @@ fn cold_cursor_walks_reach_deep_work_before_spending_the_slice_on_siblings() {
     assert_eq!(complete.received.len(), actual.len());
     assert_eq!(actual, expected);
     for leaf in actual.iter().filter(|path| path.ends_with("leaf")) {
-        assert_eq!(fs::read(leaf.join("payload")).unwrap(), b"retained deep work");
+        assert_eq!(
+            fs::read(leaf.join("payload")).unwrap(),
+            b"retained deep work"
+        );
     }
 }
 

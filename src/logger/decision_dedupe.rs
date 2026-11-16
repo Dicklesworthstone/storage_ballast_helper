@@ -165,9 +165,9 @@ impl DecisionDedupe {
         let artifact = artifact_key(record);
         if self.last.len() >= self.capacity
             && !self.last.contains_key(&artifact)
-            && self.last_prune.is_none_or(|at| {
-                now.saturating_duration_since(at) >= CACHE_PRUNE_INTERVAL
-            })
+            && self
+                .last_prune
+                .is_none_or(|at| now.saturating_duration_since(at) >= CACHE_PRUNE_INTERVAL)
         {
             self.last_prune = Some(now);
             self.last.retain(|_, (_, at, _)| {
@@ -280,12 +280,16 @@ mod tests {
         overflow.timestamp = stamp(wall);
         dedupe.acknowledge_persisted(&resident, now, 1);
         dedupe.acknowledge_persisted(&overflow, now, 2);
-        assert!(!dedupe.should_record_with_history(&resident, now, wall, || {
-            panic!("resident decisions must not read SQLite")
-        }));
-        assert!(!dedupe.should_record_with_history(&overflow, now, wall, || {
-            Some((2, overflow.clone()))
-        }));
+        assert!(
+            !dedupe.should_record_with_history(&resident, now, wall, || {
+                panic!("resident decisions must not read SQLite")
+            })
+        );
+        assert!(
+            !dedupe.should_record_with_history(&overflow, now, wall, || {
+                Some((2, overflow.clone()))
+            })
+        );
 
         let mut stale = overflow.clone();
         stale.timestamp = stamp(wall - DECISION_REFRESH);
@@ -300,9 +304,9 @@ mod tests {
         let mut changed = overflow.clone();
         changed.effective_action = Some(ActionRecord::Review);
         for evidence in [stale, future, invalid, replaced, other_path, changed] {
-            assert!(dedupe.should_record_with_history(&overflow, now, wall, || {
-                Some((2, evidence))
-            }));
+            assert!(
+                dedupe.should_record_with_history(&overflow, now, wall, || { Some((2, evidence)) })
+            );
         }
         dedupe.persistence_failed();
         assert!(dedupe.should_record_with_history(&overflow, now, wall, || {

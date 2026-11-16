@@ -2342,12 +2342,12 @@ impl Config {
 
         let raw = match candidate {
             Some(raw) => Some(raw.to_string()),
-            None if effective_path.exists() => {
-                Some(fs::read_to_string(&effective_path).map_err(|source| SbhError::Io {
+            None if effective_path.exists() => Some(fs::read_to_string(&effective_path).map_err(
+                |source| SbhError::Io {
                     path: effective_path.clone(),
                     source,
-                })?)
-            }
+                },
+            )?),
             None => None,
         };
         let mut cfg = if let Some(raw) = raw {
@@ -3453,8 +3453,7 @@ where
     // Catch a replaced staging pathname before publishing anything. This also
     // refuses validators that replace the staged file rather than inspecting it.
     if !staged.is_bound()
-        || config_file_snapshot(&staged.path)?
-            .is_none_or(|(_, bytes)| bytes != contents.as_bytes())
+        || config_file_snapshot(&staged.path)?.is_none_or(|(_, bytes)| bytes != contents.as_bytes())
     {
         return Err(std::io::Error::other(
             "staged configuration changed before publication",
@@ -3465,9 +3464,7 @@ where
     let current = config_file_snapshot(&destination)?;
     let unchanged = match (&original, &current) {
         (None, None) => true,
-        (Some((before, old)), Some((after, new))) => {
-            same_config_file(before, after) && old == new
-        }
+        (Some((before, old)), Some((after, new))) => same_config_file(before, after) && old == new,
         _ => false,
     };
     if !unchanged || config_write_destination(path)? != destination {
@@ -3491,9 +3488,11 @@ where
     };
 
     #[cfg(unix)]
-    let directory = fs::File::open(destination.parent().ok_or_else(|| {
-        std::io::Error::other("configuration has no parent directory")
-    })?)?;
+    let directory = fs::File::open(
+        destination
+            .parent()
+            .ok_or_else(|| std::io::Error::other("configuration has no parent directory"))?,
+    )?;
     #[cfg(unix)]
     directory.sync_all()?;
 
@@ -4014,7 +4013,10 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "through link");
-        assert_eq!(std::fs::read_to_string(linked_backup).unwrap(), "replacement");
+        assert_eq!(
+            std::fs::read_to_string(linked_backup).unwrap(),
+            "replacement"
+        );
     }
 
     #[cfg(unix)]

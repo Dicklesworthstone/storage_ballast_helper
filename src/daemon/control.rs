@@ -1118,7 +1118,10 @@ mod tests {
         std::os::unix::fs::symlink(&unrelated, &legacy_temp).unwrap();
 
         let backup = persist_policy_mode(&config, "canary").unwrap().unwrap();
-        assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "keep this data");
+        assert_eq!(
+            std::fs::read_to_string(&unrelated).unwrap(),
+            "keep this data"
+        );
         assert!(
             std::fs::symlink_metadata(&legacy_temp)
                 .unwrap()

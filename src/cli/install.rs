@@ -207,7 +207,10 @@ pub fn run_install_sequence_with_bundle(
         }
     } else if opts.dry_run {
         if std::fs::symlink_metadata(config_path).is_ok() {
-            report.step_plan(format!("Back up existing config: {}", config_path.display()));
+            report.step_plan(format!(
+                "Back up existing config: {}",
+                config_path.display()
+            ));
         }
         report.step_plan(format!("Write config: {}", config_path.display()));
     } else {

@@ -5115,10 +5115,7 @@ mod tests {
             Some(MountWriteState::NamespaceReadOnly)
         );
         assert_eq!(
-            mount_write_state_in(
-                "1 1 0:1 / / rw - ext4 /dev/root rw\n",
-                Path::new("/target"),
-            ),
+            mount_write_state_in("1 1 0:1 / / rw - ext4 /dev/root rw\n", Path::new("/target"),),
             Some(MountWriteState::Writable)
         );
     }
