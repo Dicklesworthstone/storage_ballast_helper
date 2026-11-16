@@ -1037,6 +1037,10 @@ impl Platform for MockPlatform {
         Ok(self.mounts.clone())
     }
 
+    fn mount_lookup_path(&self, path: &Path) -> Result<PathBuf> {
+        Ok(mock_mount_lookup_path(path))
+    }
+
     fn local_time_machine_snapshots(&self, mount: &Path) -> Result<Vec<LocalSnapshotInfo>> {
         Ok(self.local_snapshots.get(mount).cloned().unwrap_or_default())
     }
@@ -1339,6 +1343,23 @@ fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'a MountPoin
         .iter()
         .filter(|mount| path.starts_with(&mount.path))
         .max_by_key(|mount| mount.path.as_os_str().len())
+}
+
+/// The mock's lookup spelling, in the native platform's namespace. On macOS
+/// the native platform resolves APFS firmlinks (`/private/tmp/x` ->
+/// `/System/Volumes/Data/private/tmp/x`), and filesystem-reclaim scopes
+/// resolve candidates the same way. A lookup that skipped that step would
+/// never contain a candidate, so every macOS fixture would refuse it.
+fn mock_mount_lookup_path(path: &Path) -> PathBuf {
+    let resolved = crate::core::paths::resolve_absolute_path(path);
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::macos::sys::resolve_firmlinked_path(&resolved).unwrap_or(resolved)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        resolved
+    }
 }
 
 #[cfg(test)]
