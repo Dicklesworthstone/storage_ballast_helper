@@ -42,7 +42,8 @@ const STATFS_STRUCT_SIZE_BYTES: usize = core::mem::size_of::<libc::statfs>();
 const STATFS_MOUNT_NAME_BYTES: usize = core::mem::size_of::<[libc::c_char; 1024]>();
 const STATFS_TYPE_NAME_BYTES: usize = core::mem::size_of::<[libc::c_char; 16]>();
 const IMPORTANT_USAGE_AVAILABLE_KEY: &str = "NSURLVolumeAvailableCapacityForImportantUsageKey";
-const FIRMLINK_DATA_ROOT: &str = "/System/Volumes/Data";
+/// Where the writable APFS Data volume is mounted (the firmlink target).
+pub(crate) const FIRMLINK_DATA_ROOT: &str = "/System/Volumes/Data";
 
 const _: [(); 2168] = [(); STATFS_STRUCT_SIZE_BYTES];
 const _: [(); 1024] = [(); STATFS_MOUNT_NAME_BYTES];

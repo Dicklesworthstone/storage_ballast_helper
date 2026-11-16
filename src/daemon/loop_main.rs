@@ -4693,6 +4693,27 @@ impl PassStop {
     }
 }
 
+/// The path whose filesystem the daemon always observes, whatever
+/// `scanner.root_paths` says.
+///
+/// On macOS `/` is the sealed, read-only system volume. It reports its APFS
+/// container's free space, the same space the writable Data volume reports,
+/// and nothing sbh can reach writes to it. Observing it as a filesystem of
+/// its own sent a second predictive warning for the same space and, because
+/// no root can cover a read-only volume, a "nothing sbh can reclaim on /"
+/// alert every alert interval while the container was full. The Data volume
+/// stands for the system root there.
+fn system_root_observation_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let data = Path::new(crate::platform::macos::sys::FIRMLINK_DATA_ROOT);
+        if data.is_dir() {
+            return data.to_path_buf();
+        }
+    }
+    PathBuf::from("/")
+}
+
 /// The limits one scan pass runs under.
 ///
 /// Before 0.6.2 there was a single `scan_deadline`, and the daemon-wide CPU
@@ -7877,19 +7898,21 @@ impl MonitoringDaemon {
     }
 
     fn check_pressure(&mut self) -> Result<crate::monitor::pid::PressureResponse> {
-        // Collect stats for all root paths PLUS "/". Always monitoring "/"
-        // is defensive: if a user configures scanner.root_paths to specific
-        // subdirs, the root mount may still fill from non-monitored sources
-        // (logs, packages, agent worktrees) and we'd miss the pressure
-        // entirely. Per-mount dedup below means this is essentially free
-        // when "/" is already implied by the configured paths.
-        let mut paths = vec![PathBuf::from("/")];
+        // Collect stats for all root paths PLUS the system root. Always
+        // monitoring it is defensive: if a user configures
+        // scanner.root_paths to specific subdirs, the root mount may still
+        // fill from non-monitored sources (logs, packages, agent worktrees)
+        // and we'd miss the pressure entirely. Per-mount dedup below means
+        // this is essentially free when the root is already implied by the
+        // configured paths.
+        let system_root = system_root_observation_path();
+        let mut paths = vec![system_root.clone()];
         paths.extend(
             self.config
                 .scanner
                 .root_paths
                 .iter()
-                .filter(|path| path.as_path() != Path::new("/"))
+                .filter(|path| **path != system_root)
                 .cloned(),
         );
         // A failed nested filesystem can be outside the ordinary observation
@@ -19774,6 +19797,60 @@ mod tests {
     /// reserve path resolves to them, and maintenance cannot mask a predictive
     /// dispatch. Scanner/executor threads are never started.
     #[cfg(unix)]
+    /// One APFS container is one pressured filesystem. On macOS the sealed
+    /// `/` reports the same free space as the Data volume, so observing both
+    /// sent two predictive warnings for one container and, because no root
+    /// can cover a read-only volume, a recurring "nothing sbh can reclaim on
+    /// /" alert. The system root is observed through the Data volume there.
+    #[cfg(unix)]
+    #[test]
+    fn system_root_is_observed_once_through_the_writable_data_volume() {
+        use crate::core::config::PathsConfig;
+
+        const GIB: u64 = 1 << 30;
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut config = Config::with_paths(PathsConfig {
+            config_file: directory.path().join("config.toml"),
+            ballast_dir: directory.path().join("ballast"),
+            state_file: directory.path().join("state.json"),
+            sqlite_db: directory.path().join("activity.sqlite3"),
+            jsonl_log: directory.path().join("activity.jsonl"),
+        });
+        config.scanner.root_paths = vec![project];
+        config.ballast.auto_provision = false;
+        config.notifications.enabled = false;
+        let platform = disk_pressure_platform(vec![
+            disk_pressure_sample("/", 460 * GIB, 18 * GIB),
+            disk_pressure_sample("/System/Volumes/Data", 460 * GIB, 18 * GIB),
+        ])
+        .with_home(directory.path())
+        .with_temp_dirs(Vec::new())
+        .with_cache_roots(Vec::new());
+        let mut daemon = MonitoringDaemon::init_with_platform(
+            config,
+            &DaemonArgs::default(),
+            Arc::new(platform),
+        )
+        .unwrap();
+
+        daemon.check_pressure().unwrap();
+
+        let observed: Vec<PathBuf> = daemon
+            .mount_responses
+            .iter()
+            .map(|tick| tick.response.causing_mount.clone())
+            .collect();
+        let expected = if cfg!(target_os = "macos") && Path::new("/System/Volumes/Data").is_dir() {
+            PathBuf::from("/System/Volumes/Data")
+        } else {
+            PathBuf::from("/")
+        };
+        assert_eq!(system_root_observation_path(), expected);
+        assert_eq!(observed, vec![expected]);
+    }
+
     fn green_predictive_fixture() -> (RegretDaemonFixture, [PathBuf; 3]) {
         use crate::core::config::PathsConfig;
 
