@@ -22,7 +22,12 @@ use super::{PageProof, PrescanCursor, ROOT_ENTRY_CAP};
 // Splitting the existing path allowance lets alternating mount requests keep
 // independent preparation work without multiplying the memory bound by roots.
 const MAX_LIVE_ROOTS: usize = 4;
-const PAGE_ENTRIES: usize = ROOT_ENTRY_CAP / MAX_LIVE_ROOTS;
+const MAX_NESTED_READERS: usize = 2;
+// Each admitted outer root owns two nested slots. Ready outer pages cannot
+// consume that reservation, and alternating roots cannot each hold a parent
+// while preventing the other from opening its last shallow level. Twelve
+// handles share the original aggregate name allowance; it does not grow.
+const PAGE_ENTRIES: usize = ROOT_ENTRY_CAP / (MAX_LIVE_ROOTS * (1 + MAX_NESTED_READERS));
 const READ_CHUNK_ENTRIES: usize = 256;
 const READ_POLL_CHUNKS: usize = 16;
 const READ_POLL_TIME: Duration = Duration::from_millis(50);
@@ -198,6 +203,13 @@ struct Session {
     // release their directory handle while still carrying its identity.
     selection: Selection<DirectoryPaths>,
     prepared: Option<PreparedPage>,
+    nested: Option<Box<NestedReadAhead>>,
+}
+
+#[derive(Debug)]
+struct NestedReadAhead {
+    entry: PathBuf,
+    pages: EnumerationCache,
 }
 
 impl Session {
@@ -256,15 +268,31 @@ fn same_directory(left: &Metadata, right: &Metadata) -> bool {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct EnumerationCache {
     clock: u64,
     sessions: BTreeMap<PathBuf, Session>,
+    session_limit: usize,
+}
+
+impl Default for EnumerationCache {
+    fn default() -> Self {
+        Self {
+            clock: 0,
+            sessions: BTreeMap::new(),
+            session_limit: MAX_LIVE_ROOTS,
+        }
+    }
 }
 
 impl EnumerationCache {
-    fn metadata(&mut self, root: &Path) -> io::Result<Metadata> {
-        match fs::metadata(root) {
+    fn metadata(&mut self, root: &Path, follow_symlinks: bool) -> io::Result<Metadata> {
+        let metadata = if follow_symlinks {
+            fs::metadata(root)
+        } else {
+            fs::symlink_metadata(root)
+        };
+        match metadata {
             Ok(metadata) if metadata.is_dir() => Ok(metadata),
             Ok(_) => {
                 self.sessions.remove(root);
@@ -277,12 +305,19 @@ impl EnumerationCache {
         }
     }
 
-    fn prepare(&mut self, root: &Path, after: Option<&Path>) -> io::Result<()> {
-        self.prepare_at(root, after, Instant::now())
+    #[cfg(test)]
+    fn prepare_at(&mut self, root: &Path, after: Option<&Path>, now: Instant) -> io::Result<()> {
+        self.prepare_with_links(root, after, now, true)
     }
 
-    fn prepare_at(&mut self, root: &Path, after: Option<&Path>, now: Instant) -> io::Result<()> {
-        let identity = self.metadata(root)?;
+    fn prepare_with_links(
+        &mut self,
+        root: &Path,
+        after: Option<&Path>,
+        now: Instant,
+        follow_symlinks: bool,
+    ) -> io::Result<()> {
+        let identity = self.metadata(root, follow_symlinks)?;
         self.clock = self.clock.saturating_add(1);
         if let Some(session) = self.sessions.get_mut(root)
             && session.matches(&identity, after)
@@ -294,7 +329,7 @@ impl EnumerationCache {
         // Incompatible identity/resume state is not usable read-ahead. Dropping
         // it closes only our directory handle; no filesystem entry is removed.
         self.sessions.remove(root);
-        if self.sessions.len() >= MAX_LIVE_ROOTS {
+        if self.sessions.len() >= self.session_limit {
             // LRU eviction on every miss causes permanent thrashing for a
             // cyclic request with five large roots and four reader slots:
             // every read is evicted before its second chunk. Keep active
@@ -325,6 +360,7 @@ impl EnumerationCache {
                 last_requested: now,
                 selection: Selection::new(entries, after, PAGE_ENTRIES),
                 prepared: None,
+                nested: None,
             },
         );
         Ok(())
@@ -336,10 +372,20 @@ impl EnumerationCache {
         after: Option<&Path>,
         keep_reading: &mut impl FnMut() -> bool,
     ) -> io::Result<Option<RootPage>> {
+        self.poll_with_links(root, after, true, keep_reading)
+    }
+
+    fn poll_with_links(
+        &mut self,
+        root: &Path,
+        after: Option<&Path>,
+        follow_symlinks: bool,
+        keep_reading: &mut impl FnMut() -> bool,
+    ) -> io::Result<Option<RootPage>> {
         if !keep_reading() {
             return Ok(None);
         }
-        self.prepare(root, after)?;
+        self.prepare_with_links(root, after, Instant::now(), follow_symlinks)?;
         let result = self
             .sessions
             .get_mut(root)
@@ -360,7 +406,7 @@ impl EnumerationCache {
         }
         // Check again before handing out a completed page. Preparation may
         // span several passes while a mount or directory is replaced.
-        let current = self.metadata(root)?;
+        let current = self.metadata(root, follow_symlinks)?;
         let session = self
             .sessions
             .get(root)
@@ -386,6 +432,74 @@ impl EnumerationCache {
 }
 
 impl PrescanCursor {
+    /// An admitted root's two reserved nested readers are independent of the
+    /// other three roots. The page sizes preserve the aggregate name bound.
+    /// Dropping or evicting the outer session also releases its nested readers.
+    pub(super) fn poll_shallow_entries(
+        &self,
+        root: &Path,
+        entry: &Path,
+        directory: &Path,
+        after: Option<&Path>,
+        follow_symlinks: bool,
+        keep_reading: &mut impl FnMut() -> bool,
+    ) -> io::Result<Option<RootPage>> {
+        if !keep_reading() {
+            return Ok(None);
+        }
+        let mut cache = self
+            .enumeration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Direct users of the shallow API reserve the same outer admission
+        // as a normal root-page caller, rather than allocating another pool.
+        cache.prepare_with_links(root, self.resume_after(root), Instant::now(), true)?;
+        let session = cache.sessions.get_mut(root).expect("admitted shallow root");
+        if session
+            .nested
+            .as_ref()
+            .is_some_and(|nested| nested.entry != entry)
+        {
+            session.nested = None;
+        }
+        let nested = session.nested.get_or_insert_with(|| {
+            Box::new(NestedReadAhead {
+                entry: entry.to_path_buf(),
+                pages: EnumerationCache {
+                    session_limit: MAX_NESTED_READERS,
+                    ..EnumerationCache::default()
+                },
+            })
+        });
+        nested
+            .pages
+            .poll_with_links(directory, after, follow_symlinks, keep_reading)
+    }
+
+    pub(super) fn discard_shallow_enumeration(
+        &self,
+        root: &Path,
+        entry: &Path,
+        directory: Option<&Path>,
+    ) {
+        let mut cache = self
+            .enumeration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(session) = cache.sessions.get_mut(root) else {
+            return;
+        };
+        if let Some(nested) = session.nested.as_mut()
+            && nested.entry == entry
+        {
+            if let Some(directory) = directory {
+                nested.pages.sessions.remove(directory);
+            } else {
+                session.nested = None;
+            }
+        }
+    }
+
     pub(super) fn read_entries(&self, root: &Path) -> io::Result<Vec<PathBuf>> {
         let started = Instant::now();
         let mut checks = 0;
@@ -430,8 +544,9 @@ impl PrescanCursor {
     /// `Ok(None)` means preparation yielded, not EOF or an unreadable root.
     /// Neither reading names nor yielding changes durable cursor progress.
     ///
-    /// Up to four roots retain preparation concurrently. Each retains at most
-    /// one quarter of `ROOT_ENTRY_CAP` names. When readers are occupied,
+    /// Up to four roots retain preparation concurrently. Each root page and
+    /// each of its two reserved shallow pages retains at most one twelfth of
+    /// `ROOT_ENTRY_CAP` names. When outer readers are occupied,
     /// `WouldBlock` defers admission without evicting active preparation.
     /// A reader unrequested for an hour may be reclaimed; only read-ahead is
     /// lost. Completed pages remain cached through budget stops and rewind
@@ -483,6 +598,7 @@ impl PrescanCursor {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{ShallowDisposition, ShallowPoll};
     use super::*;
     use std::cell::Cell;
 
@@ -713,6 +829,7 @@ mod tests {
                 last_requested: Instant::now(),
                 selection: Selection::new(DirectoryPaths(fs::read_dir(&root).unwrap()), None, 2),
                 prepared: None,
+                nested: None,
             },
         );
         let first = cursor
@@ -1056,5 +1173,176 @@ mod tests {
         for root in &roots {
             assert!(root.join("item-0000").is_dir());
         }
+    }
+
+    fn shallow_inspection(path: &Path, depth: usize) -> ShallowDisposition {
+        if !path.is_dir() {
+            ShallowDisposition::Skip
+        } else if path.file_name().is_some_and(|name| name == "target") {
+            ShallowDisposition::Candidate
+        } else if depth < 3 {
+            ShallowDisposition::Descend
+        } else {
+            ShallowDisposition::Skip
+        }
+    }
+
+    #[test]
+    fn four_ready_outer_pages_cannot_starve_alternating_depth_three_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots: Vec<_> = (0..MAX_LIVE_ROOTS)
+            .map(|index| {
+                let root = temp.path().join(format!("root-{index}"));
+                for branch in ["a", "b"] {
+                    let directory = root.join("repo").join(branch);
+                    fs::create_dir_all(directory.join("target")).unwrap();
+                    for entry in 0..300 {
+                        fs::write(directory.join(format!("noise-{entry:04}")), []).unwrap();
+                    }
+                }
+                root
+            })
+            .collect();
+        let mut cursor = PrescanCursor::new();
+        // Reproduce the original failure: every outer admission is occupied
+        // by a completed page before any nested reader is requested.
+        for root in &roots {
+            assert!(
+                cursor
+                    .poll_entries_to_visit(root, || true)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let mut completed = std::collections::BTreeSet::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut maximum_handles = 0;
+        let mut saw_pending_nested_read = false;
+        for _ in 0..1024 {
+            for root in &roots {
+                if completed.contains(root) {
+                    continue;
+                }
+                let mut checks = 0;
+                match cursor
+                    .poll_shallow(
+                        root,
+                        &root.join("repo"),
+                        false,
+                        || {
+                            checks += 1;
+                            checks <= 12
+                        },
+                        shallow_inspection,
+                    )
+                    .expect("an admitted root owns its two nested slots")
+                {
+                    ShallowPoll::Candidate(candidate) => {
+                        assert!(seen.insert(candidate.path.clone()));
+                        cursor.acknowledge_shallow(root, &candidate);
+                    }
+                    ShallowPoll::Complete => {
+                        completed.insert(root.clone());
+                    }
+                    ShallowPoll::Pending => {}
+                }
+                let cache = cursor.enumeration.lock().unwrap();
+                let handles = cache.sessions.len()
+                    + cache
+                        .sessions
+                        .values()
+                        .filter_map(|session| session.nested.as_ref())
+                        .map(|nested| nested.pages.sessions.len())
+                        .sum::<usize>();
+                maximum_handles = maximum_handles.max(handles);
+                assert!(handles <= MAX_LIVE_ROOTS * (1 + MAX_NESTED_READERS));
+                assert!(handles * PAGE_ENTRIES <= ROOT_ENTRY_CAP);
+                saw_pending_nested_read |= cache
+                    .sessions
+                    .values()
+                    .filter_map(|session| session.nested.as_ref())
+                    .any(|nested| {
+                        nested
+                            .pages
+                            .sessions
+                            .values()
+                            .any(|session| session.prepared.is_none())
+                    });
+            }
+            if completed.len() == roots.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            completed.len(),
+            roots.len(),
+            "alternating roots must all finish"
+        );
+        assert_eq!(seen.len(), MAX_LIVE_ROOTS * 2);
+        assert!(
+            saw_pending_nested_read,
+            "the fixture must span partial nested reads"
+        );
+        assert_eq!(maximum_handles, MAX_LIVE_ROOTS * (1 + MAX_NESTED_READERS));
+        assert!(
+            cursor
+                .enumeration
+                .lock()
+                .unwrap()
+                .sessions
+                .values()
+                .all(|session| session.nested.is_none())
+        );
+    }
+
+    #[test]
+    fn withdrawing_a_root_releases_its_nested_readers_without_waiting_for_the_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("withdrawn");
+        let entry = root.join("repo");
+        let retained = temp.path().join("retained");
+        fs::create_dir_all(entry.join("branch/target")).unwrap();
+        fs::create_dir_all(retained.join("repo/branch/target")).unwrap();
+        let mut cursor = PrescanCursor::new();
+        let ShallowPoll::Candidate(_) = cursor
+            .poll_shallow(&root, &entry, false, || true, shallow_inspection)
+            .unwrap()
+        else {
+            panic!("pending nominee")
+        };
+        assert_eq!(
+            cursor.enumeration.lock().unwrap().sessions[&root]
+                .nested
+                .as_ref()
+                .unwrap()
+                .pages
+                .sessions
+                .len(),
+            2
+        );
+        let before = cursor.clone();
+        cursor.release_read_ahead_outside(std::slice::from_ref(&retained));
+        assert!(cursor.enumeration.lock().unwrap().sessions.is_empty());
+        assert_eq!(
+            cursor, before,
+            "releasing readers does not certify completed work"
+        );
+        assert!(matches!(
+            cursor
+                .poll_shallow(
+                    &retained,
+                    &retained.join("repo"),
+                    false,
+                    || true,
+                    shallow_inspection
+                )
+                .unwrap(),
+            ShallowPoll::Candidate(_)
+        ));
+        cursor.reset();
+        assert!(
+            cursor.enumeration.lock().unwrap().sessions.is_empty(),
+            "operator reset also releases nested ownership"
+        );
     }
 }

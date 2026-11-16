@@ -15,10 +15,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::shallow::{MAX_SHALLOW_BYTES, MAX_SHALLOW_ROOTS, ShallowFrame, ShallowPosition};
 use super::{PrescanCursor, PressureOrder, WalkDispatchCursor, WalkDispatchPosition};
 use crate::scanner::walker::MAX_DISPATCH_CURSOR_ROWS;
 
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 // The existing pre-scan allowance and recursive dispatch allowance each retain
 // their own 512 KiB of native names. JSON escaping can expand a byte sixfold.
 const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
@@ -48,6 +49,18 @@ struct Progress {
     // Empty dispatch history must not alter original v1/v2 checksum bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     walk_dispatch: Vec<StoredDispatch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    shallow: Vec<(StoredPath, StoredShallow)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scoped: Option<Box<Self>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredShallow {
+    entry: StoredPath,
+    pending: Option<StoredPath>,
+    frames: Vec<(StoredPath, Option<StoredPath>)>,
 }
 
 /// Preserve a v3 row's exact encoding until its checksum has been verified.
@@ -124,6 +137,28 @@ impl TryFrom<StoredPath> for PathBuf {
 }
 
 fn validate(cursor: &PrescanCursor) -> io::Result<()> {
+    if let Some(scoped) = cursor.scoped.as_deref() {
+        if scoped.scoped.is_some()
+            || !scoped.walk_dispatch.is_empty()
+            || scoped.walk_order.opportunities().next().is_some()
+        {
+            return Err(invalid("invalid nested scoped pre-scan progress"));
+        }
+        validate(scoped)?;
+    }
+    if cursor.shallow.len() > MAX_SHALLOW_ROOTS {
+        return Err(invalid("shallow pre-scan root count exceeds the limit"));
+    }
+    let mut shallow_bytes = 0usize;
+    for (root, position) in &cursor.shallow {
+        position.validate(root)?;
+        for path in std::iter::once(root.as_path()).chain(position.paths()) {
+            shallow_bytes = shallow_bytes
+                .checked_add(path.as_os_str().len())
+                .filter(|total| *total <= MAX_SHALLOW_BYTES)
+                .ok_or_else(|| invalid("shallow pre-scan path storage exceeds the limit"))?;
+        }
+    }
     if cursor.continuations.len() > MAX_ROOTS {
         return Err(invalid("pre-scan continuation count exceeds the limit"));
     }
@@ -160,7 +195,7 @@ fn validate(cursor: &PrescanCursor) -> io::Result<()> {
         .chain(cursor.walk_order.opportunities().map(|(path, _, _)| path))
     {
         let bytes = path.as_os_str().as_encoded_bytes();
-        if bytes.is_empty() || bytes.len() > MAX_PATH_BYTES || bytes.contains(&0) {
+        if !super::shallow::valid_path(path) || bytes.len() > MAX_PATH_BYTES {
             return Err(invalid("invalid or oversized pre-scan path"));
         }
         raw_bytes = raw_bytes
@@ -174,9 +209,8 @@ fn validate(cursor: &PrescanCursor) -> io::Result<()> {
 fn direct_child(root: &Path, after: &Path) -> bool {
     after.parent() == Some(root)
         && after.file_name().is_some()
-        && !after
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
+        && super::shallow::valid_path(root)
+        && super::shallow::valid_path(after)
 }
 
 impl Progress {
@@ -226,10 +260,84 @@ impl Progress {
                     }))
                 })
                 .collect::<io::Result<_>>()?,
+            shallow: cursor
+                .shallow
+                .iter()
+                .map(|(root, position)| {
+                    Ok((
+                        StoredPath::try_from(root.as_path())?,
+                        StoredShallow {
+                            entry: StoredPath::try_from(position.entry.as_path())?,
+                            pending: position
+                                .pending
+                                .as_deref()
+                                .map(StoredPath::try_from)
+                                .transpose()?,
+                            frames: position
+                                .frames
+                                .iter()
+                                .map(|frame| {
+                                    Ok((
+                                        StoredPath::try_from(frame.directory.as_path())?,
+                                        frame
+                                            .after
+                                            .as_deref()
+                                            .map(StoredPath::try_from)
+                                            .transpose()?,
+                                    ))
+                                })
+                                .collect::<io::Result<_>>()?,
+                        },
+                    ))
+                })
+                .collect::<io::Result<_>>()?,
+            scoped: cursor
+                .scoped
+                .as_deref()
+                .map(Self::from_cursor)
+                .transpose()?
+                .map(Box::new),
         })
     }
 
     fn into_cursor(self) -> io::Result<PrescanCursor> {
+        if self.shallow.len() > MAX_SHALLOW_ROOTS
+            || self.scoped.as_deref().is_some_and(|scoped| {
+                scoped.scoped.is_some()
+                    || !scoped.walk_order.is_empty()
+                    || !scoped.walk_dispatch.is_empty()
+            })
+        {
+            return Err(invalid("invalid scoped or shallow pre-scan progress"));
+        }
+        let mut shallow = BTreeMap::new();
+        for (root, position) in self.shallow {
+            if position.frames.len() > 2 {
+                return Err(invalid("shallow pre-scan depth exceeds the limit"));
+            }
+            let position = ShallowPosition {
+                entry: PathBuf::try_from(position.entry)?,
+                pending: position.pending.map(PathBuf::try_from).transpose()?,
+                frames: position
+                    .frames
+                    .into_iter()
+                    .map(|(directory, after)| {
+                        Ok(ShallowFrame {
+                            directory: PathBuf::try_from(directory)?,
+                            after: after.map(PathBuf::try_from).transpose()?,
+                        })
+                    })
+                    .collect::<io::Result<_>>()?,
+            };
+            if shallow.insert(PathBuf::try_from(root)?, position).is_some() {
+                return Err(invalid("duplicate shallow pre-scan root"));
+            }
+        }
+        let scoped = self
+            .scoped
+            .map(|scoped| scoped.into_cursor())
+            .transpose()?
+            .map(Box::new);
         if self.continuations.len() > MAX_ROOTS {
             return Err(invalid("pre-scan continuation count exceeds the limit"));
         }
@@ -282,6 +390,8 @@ impl Progress {
             root: self.root.map(PathBuf::try_from).transpose()?,
             after: self.after.map(PathBuf::try_from).transpose()?,
             continuations,
+            shallow,
+            scoped,
             walk_order: PressureOrder::from_opportunities(opportunities),
             walk_dispatch: Arc::new(walk_dispatch),
             ..PrescanCursor::default()
@@ -336,6 +446,9 @@ fn decode(bytes: &[u8]) -> io::Result<PrescanCursor> {
         // Never reinterpret a damaged/newer envelope as an empty legacy cursor.
         let checkpoint: Checkpoint = serde_json::from_value(value).map_err(io::Error::other)?;
         if !matches!(checkpoint.version, 1..=VERSION)
+            || (checkpoint.version < 5
+                && (!checkpoint.progress.shallow.is_empty()
+                    || checkpoint.progress.scoped.is_some()))
             || (checkpoint.version < 3 && !checkpoint.progress.walk_dispatch.is_empty())
             || (checkpoint.version < 4
                 && checkpoint
@@ -1085,6 +1198,8 @@ mod tests {
             after: None,
             walk_order: Vec::new(),
             walk_dispatch: Vec::new(),
+            shallow: Vec::new(),
+            scoped: None,
             continuations: vec![
                 (
                     StoredPath::Text("/r".into()),
@@ -1097,6 +1212,85 @@ mod tests {
             ],
         };
         assert!(duplicate.into_cursor().is_err());
+    }
+
+    #[test]
+    fn shallow_checkpoint_paths_are_validated_even_with_a_matching_checksum() {
+        let original = serde_json::json!({
+            "root": "/root", "after": null, "continuations": [],
+            "shallow": [["/root", {
+                "entry": "/root/repo", "pending": "/root/repo/branch/target",
+                "frames": [["/root/repo", null], ["/root/repo/branch", null]],
+            }]],
+        });
+        let encode_progress = |value: serde_json::Value, version: u32| {
+            let progress: Progress = serde_json::from_value(value).unwrap();
+            encode(&Checkpoint {
+                version,
+                checksum: checksum(version, &progress).unwrap(),
+                progress,
+            })
+            .unwrap()
+        };
+        assert!(decode(&encode_progress(original.clone(), VERSION)).is_ok());
+        assert!(
+            decode(&encode_progress(original.clone(), 4)).is_err(),
+            "new traversal state requires the new version"
+        );
+        for bad in [
+            "/root/repo/branch/../target",
+            "/root/repo/branch/./target",
+            "/outside/target",
+            "/root/repo/other/target",
+            "/root/repo/branch/target/.",
+        ] {
+            let mut value = original.clone();
+            value["shallow"][0][1]["pending"] = serde_json::json!(bad);
+            assert!(decode(&encode_progress(value, VERSION)).is_err(), "{bad}");
+        }
+        let mut invalid_root = original.clone();
+        invalid_root["shallow"][0][0] = serde_json::json!("/root/.");
+        assert!(decode(&encode_progress(invalid_root, VERSION)).is_err());
+        let mut nested = original.clone();
+        nested["scoped"] = original.clone();
+        nested["scoped"]["scoped"] = original;
+        assert!(
+            decode(&encode_progress(nested, VERSION)).is_err(),
+            "scoped progress cannot recurse"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shallow_and_scoped_non_utf8_paths_round_trip_exactly() {
+        use std::os::unix::ffi::OsStringExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = PathBuf::from("/root").join(OsString::from_vec(b"scope-\xff".to_vec()));
+        let entry = root.join(OsString::from_vec(b"repo-\xfe".to_vec()));
+        let mut configured = PrescanCursor::new();
+        let mut scoped = configured.scoped_resume();
+        assert!(matches!(
+            scoped
+                .poll_shallow(
+                    &root,
+                    &entry,
+                    false,
+                    || false,
+                    |_, _| super::super::ShallowDisposition::Skip,
+                )
+                .unwrap(),
+            super::super::ShallowPoll::Pending
+        ));
+        configured.remember_scoped(scoped, &[PathBuf::from("/root")]);
+        let path = temp.path().join("cursor.json");
+        save(&configured, &path).unwrap();
+        assert_eq!(read(&path).unwrap(), configured);
+        assert_eq!(
+            read(&path).unwrap().scoped_resume().shallow[&root]
+                .pending
+                .as_ref(),
+            Some(&entry)
+        );
     }
 
     #[test]

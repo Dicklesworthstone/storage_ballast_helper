@@ -49,13 +49,16 @@ use crate::scanner::walker::{WalkDispatchCursor, WalkDispatchPosition};
 
 mod checkpoint;
 mod enumeration;
+mod shallow;
 
 pub use enumeration::{RootPage, RootPageIter};
+pub use shallow::{ShallowCandidate, ShallowDisposition, ShallowPoll};
 
 /// Aggregate name allowance for cached depth-1 enumeration on one scanner thread.
 ///
-/// Four live roots share this allowance. Selection retains the smallest names
-/// after the resume point; a sorted page still requires observing directory EOF.
+/// Four live roots, each with two reserved shallow readers, share this allowance.
+/// Selection retains the smallest names after the resume point; a sorted page
+/// still requires observing directory EOF.
 pub const ROOT_ENTRY_CAP: usize = 200_000;
 
 /// Evidence about the most recently selected page. This is not durable work:
@@ -81,6 +84,14 @@ pub struct PrescanCursor {
     /// Resume points survive rotation through a different request's mounts.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     continuations: BTreeMap<PathBuf, PathBuf>,
+    /// Unfinished depth-1 entries retain their depth-first child positions.
+    /// The checkpoint codec validates and byte-encodes every path separately.
+    #[serde(skip)]
+    shallow: BTreeMap<PathBuf, shallow::ShallowPosition>,
+    /// Event scopes own independent completion positions. Moving one must not
+    /// change which configured root leads the next full sweep.
+    #[serde(skip)]
+    scoped: Option<Box<Self>>,
     /// Actual recursive leading-root opportunities survive restart alongside
     /// discovery progress. The checkpoint supplies byte-preserving encoding.
     #[serde(skip)]
@@ -107,6 +118,8 @@ impl Default for PrescanCursor {
             root: None,
             after: None,
             continuations: BTreeMap::new(),
+            shallow: BTreeMap::new(),
+            scoped: None,
             walk_order: PressureOrder::default(),
             walk_dispatch: Arc::default(),
             page: Mutex::new(None),
@@ -121,6 +134,8 @@ impl Clone for PrescanCursor {
             root: self.root.clone(),
             after: self.after.clone(),
             continuations: self.continuations.clone(),
+            shallow: self.shallow.clone(),
+            scoped: self.scoped.clone(),
             walk_order: self.walk_order.clone(),
             walk_dispatch: Arc::clone(&self.walk_dispatch),
             page: Mutex::new(self.page_proof().clone()),
@@ -136,6 +151,8 @@ impl PartialEq for PrescanCursor {
         self.root == other.root
             && self.after == other.after
             && self.continuations == other.continuations
+            && self.shallow == other.shallow
+            && self.scoped == other.scoped
             && self.walk_order == other.walk_order
             && self.walk_dispatch == other.walk_dispatch
     }
@@ -290,6 +307,7 @@ impl PrescanCursor {
 
     /// Record that `entry` (a depth-1 child of `root`) was fully examined.
     pub fn advance(&mut self, root: &Path, entry: &Path) {
+        self.forget_shallow(root);
         self.remember_current();
         self.root = Some(root.to_path_buf());
         self.after = Some(entry.to_path_buf());
@@ -316,6 +334,7 @@ impl PrescanCursor {
         self.remember_current();
         if !retain {
             self.continuations.remove(root);
+            self.forget_shallow(root);
             self.discard_enumeration(root);
         }
         if roots.is_empty() {

@@ -119,7 +119,7 @@ use crate::scanner::patterns::{
 use crate::scanner::planner::{
     PlanObjective, PlanRequest, RiskBudgetByLevel, partition_batch, plan_batch,
 };
-use crate::scanner::prescan_cursor::{PrescanCursor, RootPage};
+use crate::scanner::prescan_cursor::{PrescanCursor, RootPage, ShallowDisposition, ShallowPoll};
 use crate::scanner::protection::{self, ProtectionRegistry};
 use crate::scanner::quarantine::{
     QuarantineRecord, QuarantineStore, SweepMode as QuarantineSweepMode,
@@ -3061,6 +3061,49 @@ fn prescan_is_dir(path: &Path, follow_symlinks: bool) -> bool {
         path.is_dir()
     } else {
         std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+    }
+}
+
+/// Fresh admission for both new entries and the ancestors of resumed work.
+/// Only depth-1 project roots may be traversed despite a `.git` directory;
+/// their contents can contain disposable targets, but the project is never
+/// itself nominated. Every resumed path passes these same checks again.
+fn prescan_disposition(
+    path: &Path,
+    depth: usize,
+    request: &ScanRequest,
+    config: &ScannerConfig,
+    protection: &mut ProtectionRegistry,
+    known_git_dirs: &mut HashSet<PathBuf>,
+    patterns: &ArtifactPatternRegistry,
+) -> ShallowDisposition {
+    if !request.permits_reclaim_path(path)
+        || !prescan_is_dir(path, config.follow_symlinks)
+        || crate::daemon::target_tier::is_excluded(path, &config.excluded_paths)
+    {
+        return ShallowDisposition::Skip;
+    }
+    let _ = protection.discover_ancestor_markers(path);
+    if protection.is_protected(path) {
+        return ShallowDisposition::Skip;
+    }
+    if known_git_dirs.contains(path) || path.join(".git").exists() {
+        known_git_dirs.insert(path.to_path_buf());
+        return if depth == 1 {
+            ShallowDisposition::Descend
+        } else {
+            ShallowDisposition::Skip
+        };
+    }
+    let recognized = patterns
+        .classify(path, StructuralSignals::default())
+        .category
+        != crate::scanner::patterns::ArtifactCategory::Unknown;
+    match (depth, recognized) {
+        (1, true) => ShallowDisposition::CandidateAndDescend,
+        (_, true) => ShallowDisposition::Candidate,
+        (1 | 2, false) => ShallowDisposition::Descend,
+        _ => ShallowDisposition::Skip,
     }
 }
 
@@ -13581,10 +13624,15 @@ fn scanner_thread_main(
         // A pass the v2 engine scoped to the dirty project directories covers
         // those roots, not the configured ones. Letting it move the resume
         // point would send the *full* sweep back to the start on every Green
-        // file-change event, so a scoped pass gets a throwaway cursor.
+        // file-change event. Automatic scopes retain their own bounded progress;
+        // only an explicit operator scan starts those scopes from the beginning.
         let prescan_uses_cursor = request.scan_now.is_none() && active_scan_paths == request.paths;
         let prescan_cursor_before = prescan_cursor.clone();
-        let mut scratch_cursor = prescan_cursor.scoped_read_ahead();
+        let mut scratch_cursor = if request.scan_now.is_some() {
+            prescan_cursor.scoped_read_ahead()
+        } else {
+            prescan_cursor.scoped_resume()
+        };
         let prescan_resume;
         {
             let cursor: &mut PrescanCursor = if prescan_uses_cursor {
@@ -13646,363 +13694,274 @@ fn scanner_thread_main(
                         break 'priority_roots;
                     }
                     prescan_entries += 1;
-                    // Record the entry as covered up front rather than at
-                    // each of the body's many early exits (`continue` on a
-                    // protected path, a git repo, a non-directory, ...), all
-                    // of which mean "nothing more to do here". A budget that
-                    // trips inside the depth-2/3 sweep rewinds to
-                    // `cursor_before_entry` so the entry is retried whole.
-                    let cursor_before_entry = cursor.clone();
-                    cursor.advance(root, &path);
-                    if !prescan_is_dir(&path, current_scanner_config.follow_symlinks)
-                        || !request.permits_reclaim_path(&path)
-                    {
-                        continue;
-                    }
-                    let _ = protection.discover_ancestor_markers(&path);
-                    if protection.is_protected(&path) {
-                        continue;
-                    }
-                    // Track whether depth-1 dir is a git repo (project root).
-                    // Project roots themselves must never be deletion candidates,
-                    // but we still need to check their children for artifacts
-                    // like `target/` and `node_modules/`.
-                    let is_git_repo = known_git_dirs.contains(&path) || path.join(".git").exists();
-                    if is_git_repo {
-                        known_git_dirs.insert(path.clone());
-                    }
-                    let classification =
-                        pattern_registry.classify(&path, StructuralSignals::default());
-                    let depth1_is_artifact = !is_git_repo
-                        && classification.category
-                            != crate::scanner::patterns::ArtifactCategory::Unknown;
-                    // Start with depth-1 dir only if it is itself an artifact
-                    // (not a git repo).
-                    let mut to_score = if depth1_is_artifact {
-                        vec![path.clone()]
-                    } else {
-                        Vec::new()
-                    };
-                    // Always check depth-2 children for nested targets
-                    // (e.g., /data/projects/myproject/target).
-                    if let Ok(sub_entries) = std::fs::read_dir(&path) {
-                        for sub_entry in sub_entries.flatten() {
-                            if shutdown.load(Ordering::Relaxed) {
-                                scanner_should_exit = true;
+                    // Score nominees as they arrive, before acknowledging
+                    // their names. A finite slice retains the exact shallow
+                    // branch instead of dropping `to_score` or skipping the
+                    // first oversized repository to escape a repeated prefix.
+                    loop {
+                        let polled = cursor.poll_shallow(
+                            root,
+                            &path,
+                            current_scanner_config.follow_symlinks,
+                            || {
+                                heartbeat.beat();
+                                !shutdown.load(Ordering::Relaxed) && limits.prescan_stop().is_none()
+                            },
+                            |candidate, depth| {
+                                prescan_disposition(
+                                    candidate,
+                                    depth,
+                                    &request,
+                                    &current_scanner_config,
+                                    &mut protection,
+                                    &mut known_git_dirs,
+                                    &pattern_registry,
+                                )
+                            },
+                        );
+                        let candidate = match polled {
+                            Ok(ShallowPoll::Candidate(candidate)) => candidate,
+                            Ok(ShallowPoll::Complete) => {
+                                cursor.advance(root, &path);
+                                break;
+                            }
+                            Ok(ShallowPoll::Pending) => {
+                                scanner_should_exit = shutdown.load(Ordering::Relaxed);
+                                prescan_stop = limits.prescan_stop();
+                                cursor.complete_root(&active_scan_paths, root);
                                 break 'priority_roots;
                             }
-                            if let Some(stop) = limits.prescan_stop() {
-                                prescan_stop = Some(stop);
-                                // Stopped part-way through this entry:
-                                // retry it next pass rather than record
-                                // it as covered. The exception is the
-                                // pass's first entry — rewinding there
-                                // would repeat it forever.
-                                if prescan_entries > 1 {
-                                    *cursor = cursor_before_entry.clone();
-                                }
-                                break 'priority_roots;
+                            Err(_) => {
+                                // Preserve this unfinished branch on a read or
+                                // reader-admission error while other roots get
+                                // a turn; it has not earned an EOF receipt.
+                                cursor.complete_root(&active_scan_paths, root);
+                                continue 'priority_roots;
                             }
-                            let sub_path = sub_entry.path();
-                            if !request.permits_reclaim_path(&sub_path) {
-                                continue;
-                            }
-                            if prescan_is_dir(&sub_path, current_scanner_config.follow_symlinks) {
-                                let _ = protection.discover_ancestor_markers(&sub_path);
-                                if protection.is_protected(&sub_path) {
-                                    continue;
-                                }
-                                if known_git_dirs.contains(&sub_path)
-                                    || sub_path.join(".git").exists()
-                                {
-                                    known_git_dirs.insert(sub_path);
-                                    continue;
-                                }
-                                let sub_class = pattern_registry
-                                    .classify(&sub_path, StructuralSignals::default());
-                                if sub_class.category
-                                    == crate::scanner::patterns::ArtifactCategory::Unknown
-                                {
-                                    // Depth 3: check children of Unknown depth-2 dirs
-                                    // (catches workspace patterns like crates/foo/target).
-                                    if let Ok(d3_entries) = std::fs::read_dir(&sub_path) {
-                                        for d3_entry in d3_entries.flatten() {
-                                            if shutdown.load(Ordering::Relaxed) {
-                                                scanner_should_exit = true;
-                                                break 'priority_roots;
-                                            }
-                                            if let Some(stop) = limits.prescan_stop() {
-                                                prescan_stop = Some(stop);
-                                                if prescan_entries > 1 {
-                                                    *cursor = cursor_before_entry.clone();
-                                                }
-                                                break 'priority_roots;
-                                            }
-                                            let d3_path = d3_entry.path();
-                                            if !request.permits_reclaim_path(&d3_path) {
-                                                continue;
-                                            }
-                                            if prescan_is_dir(
-                                                &d3_path,
-                                                current_scanner_config.follow_symlinks,
-                                            ) {
-                                                let _ =
-                                                    protection.discover_ancestor_markers(&d3_path);
-                                                if protection.is_protected(&d3_path) {
-                                                    continue;
-                                                }
-                                                if known_git_dirs.contains(&d3_path)
-                                                    || d3_path.join(".git").exists()
-                                                {
-                                                    known_git_dirs.insert(d3_path);
-                                                    continue;
-                                                }
-                                                let d3_class = pattern_registry.classify(
-                                                    &d3_path,
-                                                    StructuralSignals::default(),
-                                                );
-                                                if d3_class.category
-                                                    != crate::scanner::patterns::ArtifactCategory::Unknown
-                                                {
-                                                    to_score.push(d3_path);
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    to_score.push(sub_path);
-                                }
-                            }
-                        }
-                    }
-
-                    if to_score.is_empty() {
-                        continue;
-                    }
-
-                    for candidate_path in to_score {
-                        // Each candidate's protection check can walk its tree
-                        // for sacred markers; one entry with dozens of
-                        // candidates (a repo's `.rch-tmp/.tmp*` dirs on fmd,
-                        // 2026-09-28) held a pass for 16+ minutes past its
-                        // budget. Stop like the sub-entry loops do: the entry
-                        // is retried next pass (unless it is the first), and
-                        // candidates already proved protected are cached.
+                        };
+                        let candidate_path = candidate.path.clone();
                         if let Some(stop) = limits.prescan_stop() {
                             prescan_stop = Some(stop);
-                            if prescan_entries > 1 {
-                                *cursor = cursor_before_entry.clone();
-                            }
                             break 'priority_roots;
                         }
-                        if should_skip_protected_daemon_candidate(
-                            &mut protection,
-                            &candidate_path,
-                            &sacred_paths,
-                            logger,
-                            "priority pre-scan",
-                        ) {
-                            continue;
-                        }
-                        // One read_dir of the candidate gives the pre-scan
-                        // the walk's structural evidence (CACHEDIR.TAG,
-                        // deps/, incremental/), so its certainty is the
-                        // walk's: a definite target is dispatched here
-                        // instead of being held as `unclear` (which, at
-                        // Orange and above, held everything the pre-scan
-                        // nominated and left the dispatch to the walk).
-                        let candidate_signals =
-                            crate::scanner::walker::structural_signals_for_path(&candidate_path);
-                        // As the walk would classify it (bd-10yj): the
-                        // walker's opaque verdict first, so a tree it only
-                        // descends into or protects is not nominated here on
-                        // its name (a plain `target` inside an hfdt store).
-                        let Some(candidate_class) = crate::scanner::walker::classify_dir_as_walked(
-                            &pattern_registry,
-                            &candidate_path,
-                            candidate_signals,
-                        ) else {
-                            continue;
-                        };
-                        if candidate_class.category
-                            == crate::scanner::patterns::ArtifactCategory::Unknown
-                        {
-                            continue;
-                        }
-                        let age = prescan_age(&candidate_path);
-                        // For directories, metadata().len() only returns the
-                        // dir entry size (~4KB), not the recursive contents.
-                        // Use a heuristic floor: known artifact dirs (target/,
-                        // node_modules/) are typically 100MB+, so using 100MB
-                        // prevents the size factor from penalizing them.
-                        // The general walker will compute precise recursive
-                        // sizes if these candidates survive to that stage.
-                        let raw_size = candidate_path.metadata().map_or(0, |m| m.len());
-                        let size = if candidate_path.is_dir() {
-                            raw_size.max(DIR_SIZE_FLOOR)
-                        } else {
-                            raw_size
-                        };
-                        let mut input = crate::scanner::scoring::CandidateInput {
-                            path: candidate_path.clone(),
-                            size_bytes: size,
-                            age: adjusted_candidate_age(
-                                age,
-                                current_scanner_config.min_file_age_minutes,
-                                request.pressure_level,
-                                &candidate_path,
-                                &candidate_class,
-                            ),
-                            classification: candidate_class,
-                            signals: candidate_signals,
-                            active_references: ActiveReferenceSummary::default(),
-                            is_open: false,
-                            excluded: false,
-                        };
-                        mark_visibility_gap(&mut input, visibility_gap);
-                        let mut score = prescan_engine.score_candidate(&input, request.urgency);
-                        // Nomination keeps the floor in the size factor; only a
-                        // directory that would be deleted pays for a real size
-                        // probe, and that measured size is what the planner
-                        // ranks and the executor reports.
-                        let measured_size = (score.decision.action
-                            == crate::scanner::scoring::DecisionAction::Delete
-                            && !score.vetoed
-                            && candidate_path.is_dir())
-                        .then(|| {
-                            prescan_dir_size(
-                                &candidate_path,
-                                current_scanner_config.cross_devices
-                                    && !request.has_resource_reclaim()
-                                    && request.scan_now.is_none(),
-                                shutdown,
-                            )
-                        });
-                        if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
-                            && !score.vetoed
-                            && active_reference_scan
-                                .should_probe_candidate(size, score.classification.category)
-                        {
-                            if has_active_reference_scan_budget(
-                                scan_deadline,
-                                active_reference_probe_budget,
-                            ) {
-                                let open_files = open_files_joined.get_or_insert_with(|| {
-                                    collect_open_path_ancestors_cached(
-                                        &active_scan_paths,
-                                        active_reference_scan.cache_ttl,
-                                    )
-                                    .0
-                                });
-                                let active_references =
-                                    active_reference_joined.get_or_insert_with(|| {
-                                        collect_active_references_for_scan(
-                                            platform.as_ref(),
-                                            &active_scan_paths,
-                                            active_reference_scan,
-                                            logger,
-                                        )
-                                    });
-                                if let Ok(identity) = crate::scanner::walker::identity_for_path(
-                                    &candidate_path,
-                                    current_scanner_config.follow_symlinks,
-                                ) {
-                                    input.active_references =
-                                        active_references.summary_for_identity(identity);
-                                }
-                                input.is_open = !input.active_references.is_empty()
-                                    || crate::scanner::walker::is_path_open_by_ancestor(
-                                        &candidate_path,
-                                        open_files,
-                                    );
-                            } else {
-                                mark_active_reference_budget_incomplete(&mut input);
-                            }
-                            score = prescan_engine.score_candidate(&input, request.urgency);
-                        }
-                        if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
-                            && !score.vetoed
-                        {
-                            let sacred_overlaps = match protection::find_sacred_overlaps(
+                        'score_candidate: {
+                            if should_skip_protected_daemon_candidate(
+                                &mut protection,
                                 &candidate_path,
                                 &sacred_paths,
+                                logger,
+                                "priority pre-scan",
                             ) {
-                                Ok(overlaps) => overlaps,
-                                Err(err) => {
-                                    logger.send(ActivityEvent::Error {
-                                        code: err.code().to_string(),
-                                        message: format!(
-                                            "sacred overlap check failed for {}: {err}",
-                                            candidate_path.display()
-                                        ),
-                                    });
-                                    continue;
-                                }
+                                break 'score_candidate;
+                            }
+                            // One read_dir of the candidate gives the pre-scan
+                            // the walk's structural evidence (CACHEDIR.TAG,
+                            // deps/, incremental/), so its certainty is the
+                            // walk's: a definite target is dispatched here
+                            // instead of being held as `unclear` (which, at
+                            // Orange and above, held everything the pre-scan
+                            // nominated and left the dispatch to the walk).
+                            let candidate_signals =
+                                crate::scanner::walker::structural_signals_for_path(
+                                    &candidate_path,
+                                );
+                            // As the walk would classify it (bd-10yj): the
+                            // walker's opaque verdict first, so a tree it only
+                            // descends into or protects is not nominated here on
+                            // its name (a plain `target` inside an hfdt store).
+                            let Some(candidate_class) =
+                                crate::scanner::walker::classify_dir_as_walked(
+                                    &pattern_registry,
+                                    &candidate_path,
+                                    candidate_signals,
+                                )
+                            else {
+                                break 'score_candidate;
                             };
-                            score = prescan_engine.score_candidate_with_sacred_overlaps(
-                                &input,
-                                request.urgency,
-                                &sacred_overlaps,
-                            );
-                        }
-                        if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
-                        {
-                            score.identity = crate::scanner::walker::identity_for_path(
-                                &candidate_path,
-                                current_scanner_config.follow_symlinks,
-                            )
-                            .ok();
-                            // Before the index record is made: the record's
-                            // size is what every later replay dispatches and
-                            // reports. Recording the 100 MiB nomination floor
-                            // made fmd log 73 GB "freed" for a few MB of tiny
-                            // node_modules (2026-09-29), and the byte target
-                            // counted that fiction as progress.
-                            if let Some(measured) = measured_size {
-                                score.size_bytes = measured;
-                            }
-                            let mut scanner_index_backoff_active = false;
-                            if scanner_index_enabled {
-                                match CandidateIndexRecord::from_candidate_score(
-                                    &score,
-                                    None,
-                                    input.signals,
-                                    scanner_index_event_generation,
-                                ) {
-                                    Ok(Some(record)) => {
-                                        scanner_index_backoff_active =
-                                            scanner_index.as_ref().is_some_and(|index| {
-                                                index.candidate_in_cooldown(
-                                                    &record,
-                                                    SystemTime::now(),
-                                                )
-                                            });
-                                        scanner_index_records.push(record);
-                                    }
-                                    Ok(None) => {}
-                                    Err(err) => logger.send(ActivityEvent::Error {
-                                        code: err.code().to_string(),
-                                        message: format!(
-                                            "scanner_index: failed to record {}: {err}",
-                                            candidate_path.display()
-                                        ),
-                                    }),
-                                }
-                            }
-                            if score.decision.certainty < pass_min_certainty
-                                || !request.permits_reclaim_candidate(&score)
+                            if candidate_class.category
+                                == crate::scanner::patterns::ArtifactCategory::Unknown
                             {
-                                // bd-8aeq: same gate as the walk below.
-                                if held_paths.insert(candidate_path.clone()) {
-                                    held_by_certainty += 1;
+                                break 'score_candidate;
+                            }
+                            let age = prescan_age(&candidate_path);
+                            // For directories, metadata().len() only returns the
+                            // dir entry size (~4KB), not the recursive contents.
+                            // Use a heuristic floor: known artifact dirs (target/,
+                            // node_modules/) are typically 100MB+, so using 100MB
+                            // prevents the size factor from penalizing them.
+                            // The general walker will compute precise recursive
+                            // sizes if these candidates survive to that stage.
+                            let raw_size = candidate_path.metadata().map_or(0, |m| m.len());
+                            let size = if candidate_path.is_dir() {
+                                raw_size.max(DIR_SIZE_FLOOR)
+                            } else {
+                                raw_size
+                            };
+                            let mut input = crate::scanner::scoring::CandidateInput {
+                                path: candidate_path.clone(),
+                                size_bytes: size,
+                                age: adjusted_candidate_age(
+                                    age,
+                                    current_scanner_config.min_file_age_minutes,
+                                    request.pressure_level,
+                                    &candidate_path,
+                                    &candidate_class,
+                                ),
+                                classification: candidate_class,
+                                signals: candidate_signals,
+                                active_references: ActiveReferenceSummary::default(),
+                                is_open: false,
+                                excluded: false,
+                            };
+                            mark_visibility_gap(&mut input, visibility_gap);
+                            let mut score = prescan_engine.score_candidate(&input, request.urgency);
+                            // Nomination keeps the floor in the size factor; only a
+                            // directory that would be deleted pays for a real size
+                            // probe, and that measured size is what the planner
+                            // ranks and the executor reports.
+                            let measured_size = (score.decision.action
+                                == crate::scanner::scoring::DecisionAction::Delete
+                                && !score.vetoed
+                                && candidate_path.is_dir())
+                            .then(|| {
+                                prescan_dir_size(
+                                    &candidate_path,
+                                    current_scanner_config.cross_devices
+                                        && !request.has_resource_reclaim()
+                                        && request.scan_now.is_none(),
+                                    shutdown,
+                                )
+                            });
+                            if score.decision.action
+                                == crate::scanner::scoring::DecisionAction::Delete
+                                && !score.vetoed
+                                && active_reference_scan
+                                    .should_probe_candidate(size, score.classification.category)
+                            {
+                                if has_active_reference_scan_budget(
+                                    scan_deadline,
+                                    active_reference_probe_budget,
+                                ) {
+                                    let open_files = open_files_joined.get_or_insert_with(|| {
+                                        collect_open_path_ancestors_cached(
+                                            &active_scan_paths,
+                                            active_reference_scan.cache_ttl,
+                                        )
+                                        .0
+                                    });
+                                    let active_references = active_reference_joined
+                                        .get_or_insert_with(|| {
+                                            collect_active_references_for_scan(
+                                                platform.as_ref(),
+                                                &active_scan_paths,
+                                                active_reference_scan,
+                                                logger,
+                                            )
+                                        });
+                                    if let Ok(identity) = crate::scanner::walker::identity_for_path(
+                                        &candidate_path,
+                                        current_scanner_config.follow_symlinks,
+                                    ) {
+                                        input.active_references =
+                                            active_references.summary_for_identity(identity);
+                                    }
+                                    input.is_open = !input.active_references.is_empty()
+                                        || crate::scanner::walker::is_path_open_by_ancestor(
+                                            &candidate_path,
+                                            open_files,
+                                        );
+                                } else {
+                                    mark_active_reference_budget_incomplete(&mut input);
                                 }
-                            } else if !scanner_index_backoff_active {
+                                score = prescan_engine.score_candidate(&input, request.urgency);
+                            }
+                            if score.decision.action
+                                == crate::scanner::scoring::DecisionAction::Delete
+                                && !score.vetoed
+                            {
+                                let sacred_overlaps = match protection::find_sacred_overlaps(
+                                    &candidate_path,
+                                    &sacred_paths,
+                                ) {
+                                    Ok(overlaps) => overlaps,
+                                    Err(err) => {
+                                        logger.send(ActivityEvent::Error {
+                                            code: err.code().to_string(),
+                                            message: format!(
+                                                "sacred overlap check failed for {}: {err}",
+                                                candidate_path.display()
+                                            ),
+                                        });
+                                        break 'score_candidate;
+                                    }
+                                };
+                                score = prescan_engine.score_candidate_with_sacred_overlaps(
+                                    &input,
+                                    request.urgency,
+                                    &sacred_overlaps,
+                                );
+                            }
+                            if score.decision.action
+                                == crate::scanner::scoring::DecisionAction::Delete
+                            {
+                                score.identity = crate::scanner::walker::identity_for_path(
+                                    &candidate_path,
+                                    current_scanner_config.follow_symlinks,
+                                )
+                                .ok();
+                                // Before the index record is made: the record's
+                                // size is what every later replay dispatches and
+                                // reports. Recording the 100 MiB nomination floor
+                                // made fmd log 73 GB "freed" for a few MB of tiny
+                                // node_modules (2026-09-29), and the byte target
+                                // counted that fiction as progress.
                                 if let Some(measured) = measured_size {
                                     score.size_bytes = measured;
                                 }
-                                priority_candidates.push(score);
+                                let mut scanner_index_backoff_active = false;
+                                if scanner_index_enabled {
+                                    match CandidateIndexRecord::from_candidate_score(
+                                        &score,
+                                        None,
+                                        input.signals,
+                                        scanner_index_event_generation,
+                                    ) {
+                                        Ok(Some(record)) => {
+                                            scanner_index_backoff_active =
+                                                scanner_index.as_ref().is_some_and(|index| {
+                                                    index.candidate_in_cooldown(
+                                                        &record,
+                                                        SystemTime::now(),
+                                                    )
+                                                });
+                                            scanner_index_records.push(record);
+                                        }
+                                        Ok(None) => {}
+                                        Err(err) => logger.send(ActivityEvent::Error {
+                                            code: err.code().to_string(),
+                                            message: format!(
+                                                "scanner_index: failed to record {}: {err}",
+                                                candidate_path.display()
+                                            ),
+                                        }),
+                                    }
+                                }
+                                if score.decision.certainty < pass_min_certainty
+                                    || !request.permits_reclaim_candidate(&score)
+                                {
+                                    // bd-8aeq: same gate as the walk below.
+                                    if held_paths.insert(candidate_path.clone()) {
+                                        held_by_certainty += 1;
+                                    }
+                                } else if !scanner_index_backoff_active {
+                                    if let Some(measured) = measured_size {
+                                        score.size_bytes = measured;
+                                    }
+                                    priority_candidates.push(score);
+                                }
                             }
                         }
+                        cursor.acknowledge_shallow(root, &candidate);
                     }
                 }
                 // Enumerated to the end: the next pass starts at the next
@@ -14041,10 +14000,12 @@ fn scanner_thread_main(
                 });
             }
         }
-        // Only a pass over the configured roots owns the resume point, and
-        // only a moved cursor is worth a write: this daemon exists to keep
-        // disks quiet.
-        if prescan_uses_cursor && prescan_cursor != prescan_cursor_before {
+        if !prescan_uses_cursor && request.scan_now.is_none() {
+            prescan_cursor.remember_scoped(scratch_cursor, &current_scanner_config.root_paths);
+        }
+        // Both discovery tracks persist through restart, but neither grants
+        // old safety evidence or recursive coverage. Write only moved progress.
+        if prescan_cursor != prescan_cursor_before {
             persist_prescan_cursor(&prescan_cursor, prescan_cursor_path, logger);
         }
 
@@ -30871,6 +30832,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prescan_default_root_exclusion_preserves_explicit_safe_roots() {
+        let temp = temp_root_scratch_dir();
+        let root = temp.path().join("scan-root");
+        let target = root.join("project/target");
+        std::fs::create_dir_all(&target).unwrap();
+        let mut config = ScannerConfig {
+            root_paths: vec![root.clone()],
+            ..ScannerConfig::default()
+        };
+        assert!(config.excluded_paths.contains(&PathBuf::from("/")));
+        let request = event_test_request_for_config(vec![root], &config);
+        let mut protection = ProtectionRegistry::marker_only();
+        let mut known_git_dirs = HashSet::new();
+        let patterns = ArtifactPatternRegistry::default();
+        assert_eq!(
+            prescan_disposition(
+                &target,
+                2,
+                &request,
+                &config,
+                &mut protection,
+                &mut known_git_dirs,
+                &patterns,
+            ),
+            ShallowDisposition::Candidate,
+            "default exclusion of / must not disable all configured discovery",
+        );
+        config
+            .excluded_paths
+            .push(target.parent().unwrap().to_path_buf());
+        assert_eq!(
+            prescan_disposition(
+                &target,
+                2,
+                &request,
+                &config,
+                &mut protection,
+                &mut known_git_dirs,
+                &patterns,
+            ),
+            ShallowDisposition::Skip,
+            "an explicitly excluded non-root ancestor still protects its subtree",
+        );
+    }
+
     /// A pre-scan phase that runs out of *its own* wall budget must hand the
     /// pass over to the general walker, not end it.
     ///
@@ -31004,6 +31011,171 @@ mod tests {
             return;
         }
         panic!("finite pre-scan slices failed to complete directory preparation");
+    }
+
+    /// Exercise the production allowance, real nomination/scoring and the
+    /// DefiniteOnly path that has no recursive walker to rescue lost work.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn definite_only_resumes_inside_a_repository_after_a_funded_slice_and_restart() {
+        let temp = temp_root_scratch_dir();
+        let root = temp.path().join("scan-root");
+        let project = root.join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        for index in 0..20 {
+            let branch = project.join(format!("branch-{index:03}"));
+            let target = branch.join("target");
+            std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+            std::fs::write(branch.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+            std::fs::write(target.join("debug/artifact.o"), [0xA5_u8; 8192]).unwrap();
+            write_cargo_cachedir_tag(&target);
+        }
+        let mut config = Config::default();
+        config.scanner.engine = ScannerEngineMode::V1;
+        config.scanner.root_paths = vec![root.clone()];
+        config.scanner.parallelism = 1;
+        config.scanner.min_file_age_minutes = 0;
+        config.scanner.active_reference_min_size_bytes = u64::MAX;
+        config.scanner.scan_time_budget_secs = 30;
+        config.scanner.log_truncation.enabled = false;
+        config.scoring.min_score = 0.0;
+        let mut request = event_test_request_for_config(vec![root.clone()], &config.scanner);
+        request.pressure_level = PressureLevel::Orange;
+        request.urgency = 0.9;
+        request.free_pct = Some(9.0);
+        let executor_config = Arc::new(SharedExecutorConfig::new(
+            false, 10, 0.0, 60, 3600, false, 0,
+        ));
+        executor_config.set_min_certainty(ArtifactCertainty::Definite);
+        executor_config.set_scan_posture(ScanAggressiveness::DefiniteOnly);
+        assert!(executor_config.holds_recursive_scan(&request));
+
+        let start = Instant::now();
+        let allowance = CpuBudget::new(10, start, 0.0).pass_cpu_allowance(PressureLevel::Critical);
+        assert_eq!(allowance, Some(crate::daemon::cpu_budget::BURST_SECS));
+        let samples = Arc::new(AtomicU64::new(0));
+        let sample = Arc::clone(&samples);
+        let guard = PassCpuGuard::new(allowance, start, move || {
+            Some(sample.fetch_add(1, Ordering::Relaxed) as f64 / 40.0)
+        })
+        .with_sample_interval(Duration::ZERO);
+        let mut limits = PassLimits::new(
+            start,
+            start + Duration::from_mins(15),
+            Duration::from_secs(60),
+            guard,
+        );
+        let mut cursor = PrescanCursor::new();
+        let mut protection = ProtectionRegistry::marker_only();
+        let mut known_git_dirs = HashSet::new();
+        let patterns = ArtifactPatternRegistry::default();
+        let mut completed = HashSet::new();
+        loop {
+            match cursor
+                .poll_shallow(
+                    &root,
+                    &project,
+                    false,
+                    || limits.prescan_stop().is_none(),
+                    |path, depth| {
+                        prescan_disposition(
+                            path,
+                            depth,
+                            &request,
+                            &config.scanner,
+                            &mut protection,
+                            &mut known_git_dirs,
+                            &patterns,
+                        )
+                    },
+                )
+                .unwrap()
+            {
+                ShallowPoll::Candidate(candidate) => {
+                    completed.insert(candidate.path.clone());
+                    cursor.acknowledge_shallow(&root, &candidate);
+                }
+                ShallowPoll::Pending => break,
+                ShallowPoll::Complete => panic!("the repository must exceed this funded slice"),
+            }
+        }
+        assert!(
+            !completed.is_empty(),
+            "a nominee must arrive before the entire repository is enumerated"
+        );
+        assert!(completed.len() < 20);
+        assert_eq!(limits.prescan_stop(), Some(PassStop::PrescanCpuShare));
+        assert_eq!(
+            cursor.position().1,
+            None,
+            "the depth-1 entry remains unfinished"
+        );
+        let (index_path, cursor_path) = scanner_state_paths(temp.path());
+        cursor.save(&cursor_path).unwrap();
+        drop(cursor);
+
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: temp.path().join("activity.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 64,
+            run_id: None,
+        })
+        .unwrap();
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(16);
+        let (report_tx, report_rx) = bounded::<WorkerReport>(4);
+        let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        scan_tx.send(request).unwrap();
+        drop(scan_tx);
+        scanner_thread_main(
+            &scan_rx,
+            &del_tx,
+            &logger,
+            &Arc::new(RwLock::new(config.scoring.clone())),
+            &Arc::new(RwLock::new(config.scanner.clone())),
+            &(Arc::new(MockPlatform::healthy()) as Arc<dyn Platform>),
+            &ThreadHeartbeat::new("shallow-resume-definite-only"),
+            &report_tx,
+            &Arc::new(AtomicBool::new(false)),
+            &index_path,
+            &cursor_path,
+            &feedback_rx,
+            &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+            &executor_config,
+            &Arc::new(SharedRegret::new(&config)),
+            None,
+            &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
+        );
+        logger.shutdown();
+        logger_join.join().unwrap();
+        let dispatched: Vec<_> = del_rx
+            .try_iter()
+            .flat_map(|batch| batch.candidates.into_iter().map(|candidate| candidate.path))
+            .collect();
+        assert!(
+            !dispatched.is_empty(),
+            "DefiniteOnly must find the unexamined repository suffix"
+        );
+        assert!(
+            dispatched.iter().all(|path| !completed.contains(path)),
+            "completed nominees must not be repeated: {dispatched:?}"
+        );
+        assert!(
+            report_rx.try_iter().any(|report| matches!(
+                report,
+                WorkerReport::ScanCompleted {
+                    timed_out: true,
+                    ..
+                }
+            )),
+            "holding the broad walk must not claim recursive coverage"
+        );
     }
 
     #[test]
