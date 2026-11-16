@@ -981,7 +981,7 @@ fn old_checkpoint_checksums_and_root_opportunities_survive_public_api_upgrade() 
         assert_eq!(PrescanCursor::load(&path), restored);
         let upgraded: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(upgraded["version"], 4);
+        assert_eq!(upgraded["version"], 5);
         assert_eq!(
             upgraded["progress"]["continuations"],
             envelope["progress"]["continuations"]
