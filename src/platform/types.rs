@@ -359,12 +359,13 @@ pub struct ProcessIoSnapshot {
 /// Resource limits for a read-only inventory of unlinked regular files.
 ///
 /// These bound work and retained observations independently of the caller's
-/// deadline. The inventory covers visible file descriptors only, not mappings
-/// without descriptors or processes hidden from the caller's PID namespace.
+/// deadline. The inventory covers visible descriptors, executable references
+/// and file-backed mappings, not processes hidden from the caller's PID namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeletedOpenFilesLimits {
     pub max_processes: usize,
     pub max_descriptors: usize,
+    pub max_mappings: usize,
     pub max_files: usize,
     pub max_holders: usize,
 }
@@ -374,15 +375,16 @@ impl Default for DeletedOpenFilesLimits {
         Self {
             max_processes: 50_000,
             max_descriptors: 250_000,
+            max_mappings: 250_000,
             max_files: 4_096,
             max_holders: 16_384,
         }
     }
 }
 
-/// A verified process holding one or more descriptors to an unlinked file.
+/// A verified process retaining an unlinked file through descriptors or memory.
 ///
-/// The kernel's fd target is display evidence, not an existing or restorable
+/// The kernel's link target is display evidence, not an existing or restorable
 /// pathname. Its ambiguous ` (deleted)` suffix is retained, and the hex field
 /// preserves native pathname bytes even when the display text is lossy.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -391,15 +393,36 @@ pub struct DeletedOpenFileHolder {
     pub start_time_ticks: u64,
     pub name: String,
     /// One representative descriptor, not a stable handle for later action.
-    pub fd: u32,
+    pub fd: Option<u32>,
     pub descriptor_count: usize,
-    pub fd_target: String,
-    pub fd_target_bytes_hex: String,
+    pub mapping_count: usize,
+    /// One observed virtual address range, not a handle for later action.
+    pub representative_mapping: Option<String>,
+    /// The process's executable link was verified to retain this file.
+    pub executable: bool,
+    pub reference_target: String,
+    pub reference_target_bytes_hex: String,
     /// Mount identity and spelling in this process's observed namespace.
     pub mount_id: Option<u64>,
     pub mount_point: Option<String>,
     pub mount_point_bytes_hex: Option<String>,
     pub filesystem_type: Option<String>,
+}
+
+/// A deleted-looking mapping whose allocation could not be verified.
+///
+/// A kernel pathname ending in ` (deleted)` does not prove zero links: another
+/// hardlink may remain, or those bytes may be part of the literal filename.
+/// These records never contribute to verified file counts or byte totals.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnverifiedDeletedMapping {
+    pub pid: i32,
+    pub start_time_ticks: u64,
+    pub name: String,
+    pub mapping_range: String,
+    pub target: String,
+    pub target_bytes_hex: String,
+    pub reason: String,
 }
 
 /// One distinct observed `(device_id, inode)` with no remaining directory link.
@@ -416,7 +439,7 @@ pub struct DeletedOpenFile {
 
 /// Bounded, read-only evidence of space held by unlinked open files.
 ///
-/// Even a complete result is a sequence of observations of visible descriptors,
+/// Even a complete result is a sequence of observations of visible references,
 /// not an atomic host snapshot. Shared files contribute allocation only once.
 /// A partial result retains verified observations and names every coverage gap
 /// with a bounded reason-code map rather than silently claiming an empty host.
@@ -429,8 +452,10 @@ pub struct DeletedOpenFilesReport {
     /// Visible PIDs attempted, including those that could not be inspected.
     pub processes_scanned: usize,
     pub descriptors_scanned: usize,
+    pub mappings_scanned: usize,
     pub issues: std::collections::BTreeMap<String, u64>,
     pub files: Vec<DeletedOpenFile>,
+    pub unverified_mappings: Vec<UnverifiedDeletedMapping>,
 }
 
 impl DeletedOpenFilesReport {
@@ -443,8 +468,10 @@ impl DeletedOpenFilesReport {
             observed_allocated_bytes: None,
             processes_scanned: 0,
             descriptors_scanned: 0,
+            mappings_scanned: 0,
             issues: std::collections::BTreeMap::from([("unsupported_platform".to_string(), 1)]),
             files: Vec::new(),
+            unverified_mappings: Vec::new(),
         }
     }
 }

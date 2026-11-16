@@ -10,14 +10,17 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 - **Diagnose deleted files that still occupy disk space.** On Linux,
   `sbh blame --deleted-open` inventories unlinked regular files retained by
-  visible process file descriptors, without requiring daemon history or a
-  working configuration. It reports allocated blocks separately from logical
-  length, deduplicates shared inodes, and identifies holding processes and
-  their observed mounts. JSON preserves native pathname bytes and explicitly
-  marks incomplete inspection, unsupported platforms, and unknown totals.
+  visible process file descriptors, executables, and memory mappings, without
+  requiring daemon history or a working configuration. It reports allocated
+  blocks separately from logical length, deduplicates shared inodes, and
+  identifies holding processes and their observed mounts. JSON schema
+  `sbh.deleted_open.v2` preserves native pathname bytes and explicitly marks
+  incomplete inspection, unsupported platforms, and unknown totals. Deleted-looking
+  mappings whose allocation cannot be verified remain separate evidence,
+  excluded from byte totals, and make the report incomplete.
   Inspection is bounded by time and inventory limits; it never signals a
   process or truncates a descriptor. These observations are not a promise of
-  reclaimable space and exclude mmap-only references and hidden namespaces.
+  reclaimable space and exclude processes hidden from the caller's namespace.
 
 ### Fixed
 

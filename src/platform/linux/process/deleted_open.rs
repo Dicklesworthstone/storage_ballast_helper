@@ -1,7 +1,7 @@
-//! Read-only allocation evidence for unlinked files retained by visible FDs.
+//! Read-only allocation evidence for unlinked files retained by visible processes.
 //!
 //! Only procfs metadata (`stat`, `fdinfo`, `mountinfo`) is opened for reading.
-//! The descriptor targets themselves are never opened, truncated or signalled.
+//! Descriptor, executable and mapping targets are never opened or modified.
 //! PID start ticks bracket each process sweep and inode identity brackets each
 //! descriptor observation. This is diagnostic evidence, never deletion consent.
 
@@ -16,11 +16,17 @@ use std::time::Instant;
 use crate::core::errors::{Result, SbhError};
 use crate::platform::types::{
     DeletedOpenFile, DeletedOpenFileHolder, DeletedOpenFilesLimits, DeletedOpenFilesReport,
+    UnverifiedDeletedMapping,
 };
 
 const MAX_STAT_BYTES: u64 = 16 * 1024;
 const MAX_FDINFO_BYTES: u64 = 16 * 1024;
 const MAX_MOUNTINFO_BYTES: u64 = 4 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static MAPPING_METADATA_ERROR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
 
 type FileKey = (u64, u64);
 type MountTable = BTreeMap<u64, MountRecord>;
@@ -28,6 +34,7 @@ type MountTable = BTreeMap<u64, MountRecord>;
 struct ProcessIdentity {
     start_ticks: u64,
     name: String,
+    no_executable: bool,
 }
 
 struct MountRecord {
@@ -46,6 +53,21 @@ struct Observation {
     allocated_bytes: u64,
     logical_bytes: u64,
     holder: DeletedOpenFileHolder,
+}
+
+#[derive(Default)]
+struct ProcessObservations {
+    files: BTreeMap<FileKey, Observation>,
+    unverified_mappings: Vec<UnverifiedDeletedMapping>,
+    new_files: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerificationPoint<'a> {
+    Descriptor(u32),
+    Executable,
+    Mapping(&'a str),
+    Process,
 }
 
 struct Sweep {
@@ -68,8 +90,10 @@ impl Sweep {
                 observed_allocated_bytes: Some(0),
                 processes_scanned: 0,
                 descriptors_scanned: 0,
+                mappings_scanned: 0,
                 issues: BTreeMap::new(),
                 files: Vec::new(),
+                unverified_mappings: Vec::new(),
             },
             files: BTreeMap::new(),
             holders: 0,
@@ -102,7 +126,7 @@ impl Sweep {
         &mut self,
         directory: &Path,
         pid: i32,
-        before_verification: &mut impl FnMut(i32, Option<u32>),
+        before_verification: &mut impl FnMut(i32, VerificationPoint<'_>),
     ) {
         if self.expired() {
             return;
@@ -116,13 +140,42 @@ impl Sweep {
                 return;
             }
         };
-        let observations = self.descriptors(directory, pid, &before, before_verification);
+        let mut observations = ProcessObservations::default();
+        let mut mounts = MountTableCache::Unread;
+        self.descriptors(
+            directory,
+            pid,
+            &before,
+            &mut observations,
+            &mut mounts,
+            before_verification,
+        );
+        if !self.stopped {
+            self.executable(
+                directory,
+                pid,
+                &before,
+                &mut observations,
+                &mut mounts,
+                before_verification,
+            );
+        }
+        if !self.stopped {
+            self.mappings(
+                directory,
+                pid,
+                &before,
+                &mut observations,
+                &mut mounts,
+                before_verification,
+            );
+        }
         // No unverified partial process may survive a deadline, exit or PID
         // reuse. Earlier independently verified processes remain reportable.
         if self.expired() {
             return;
         }
-        before_verification(pid, None);
+        before_verification(pid, VerificationPoint::Process);
         let after = match read_identity(directory, pid, self.deadline) {
             Ok(identity) => identity,
             Err(error) => {
@@ -135,7 +188,7 @@ impl Sweep {
             self.issue("process_identity_changed");
             return;
         }
-        for ((device_id, inode), mut observation) in observations {
+        for ((device_id, inode), mut observation) in observations.files {
             // comm can change across exec without recycling the process. Its
             // final name describes the identity that still held these FDs.
             observation.holder.name.clone_from(&after.name);
@@ -156,30 +209,92 @@ impl Sweep {
             file.holders.push(observation.holder);
             self.holders += 1;
         }
+        for mut mapping in observations.unverified_mappings {
+            mapping.name.clone_from(&after.name);
+            self.report.unverified_mappings.push(mapping);
+            self.holders += 1;
+        }
     }
 
+    /// Unverified mappings share the holder budget; repeated verified
+    /// references to the same process/file pair consume only one slot.
+    fn admit(&mut self, key: Option<FileKey>, observations: &ProcessObservations) -> bool {
+        if key.is_some_and(|key| observations.files.contains_key(&key)) {
+            return true;
+        }
+        if self.holders + observations.files.len() + observations.unverified_mappings.len()
+            >= self.limits.max_holders
+        {
+            self.stop("holder_limit_reached");
+            return false;
+        }
+        if key.is_some_and(|key| !self.files.contains_key(&key))
+            && self.files.len() + observations.new_files >= self.limits.max_files
+        {
+            self.stop("file_limit_reached");
+            return false;
+        }
+        true
+    }
+
+    fn record(
+        &self,
+        key: FileKey,
+        observation: Observation,
+        observations: &mut ProcessObservations,
+    ) {
+        if let Some(existing) = observations.files.get_mut(&key) {
+            existing.allocated_bytes = observation.allocated_bytes;
+            existing.logical_bytes = observation.logical_bytes;
+            let descriptor_count =
+                existing.holder.descriptor_count + observation.holder.descriptor_count;
+            let mapping_count = existing.holder.mapping_count + observation.holder.mapping_count;
+            let executable = existing.holder.executable || observation.holder.executable;
+            let mapping = existing
+                .holder
+                .representative_mapping
+                .clone()
+                .or_else(|| observation.holder.representative_mapping.clone());
+            // Prefer the lowest FD's spelling and exact fdinfo mount evidence,
+            // then an executable link, then a representative mapping.
+            if observation
+                .holder
+                .fd
+                .is_some_and(|fd| existing.holder.fd.is_none_or(|old| fd < old))
+                || (existing.holder.fd.is_none() && observation.holder.executable)
+            {
+                existing.holder = observation.holder;
+            }
+            existing.holder.descriptor_count = descriptor_count;
+            existing.holder.mapping_count = mapping_count;
+            existing.holder.executable = executable;
+            existing.holder.representative_mapping = mapping;
+        } else {
+            observations.new_files += usize::from(!self.files.contains_key(&key));
+            observations.files.insert(key, observation);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn descriptors(
         &mut self,
         directory: &Path,
         pid: i32,
         identity: &ProcessIdentity,
-        before_verification: &mut impl FnMut(i32, Option<u32>),
-    ) -> BTreeMap<FileKey, Observation> {
-        let mut observations: BTreeMap<FileKey, Observation> = BTreeMap::new();
+        observations: &mut ProcessObservations,
+        mounts: &mut MountTableCache,
+        before_verification: &mut impl FnMut(i32, VerificationPoint<'_>),
+    ) {
         if self.expired() {
-            return observations;
+            return;
         }
         let descriptors = match fs::read_dir(directory.join("fd")) {
             Ok(entries) => entries,
             Err(error) => {
                 self.issue(process_read_issue(&error));
-                return observations;
+                return;
             }
         };
-        let mut new_files = 0;
-        // Only a process with a discovered unlinked regular file needs its
-        // mount table. A failed table is not repeatedly retried for every FD.
-        let mut mounts = MountTableCache::Unread;
         for entry in descriptors {
             if self.expired() {
                 break;
@@ -210,17 +325,8 @@ impl Sweep {
                 continue;
             }
             let key = (before_meta.dev(), before_meta.ino());
-            if !observations.contains_key(&key) {
-                if self.holders + observations.len() >= self.limits.max_holders {
-                    self.stop("holder_limit_reached");
-                    break;
-                }
-                if !self.files.contains_key(&key)
-                    && self.files.len() + new_files >= self.limits.max_files
-                {
-                    self.stop("file_limit_reached");
-                    break;
-                }
+            if !self.admit(Some(key), observations) {
+                break;
             }
             let Some(observation) = self.descriptor(
                 directory,
@@ -229,25 +335,13 @@ impl Sweep {
                 fd,
                 identity,
                 &before_meta,
-                &mut mounts,
+                mounts,
                 before_verification,
             ) else {
                 continue;
             };
-            if let Some(existing) = observations.get_mut(&key) {
-                existing.allocated_bytes = observation.allocated_bytes;
-                existing.logical_bytes = observation.logical_bytes;
-                let count = existing.holder.descriptor_count + 1;
-                if observation.holder.fd < existing.holder.fd {
-                    existing.holder = observation.holder;
-                }
-                existing.holder.descriptor_count = count;
-            } else {
-                new_files += usize::from(!self.files.contains_key(&key));
-                observations.insert(key, observation);
-            }
+            self.record(key, observation, observations);
         }
-        observations
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -260,7 +354,7 @@ impl Sweep {
         identity: &ProcessIdentity,
         before: &fs::Metadata,
         mounts: &mut MountTableCache,
-        before_verification: &mut impl FnMut(i32, Option<u32>),
+        before_verification: &mut impl FnMut(i32, VerificationPoint<'_>),
     ) -> Option<Observation> {
         if self.expired() {
             return None;
@@ -296,7 +390,7 @@ impl Sweep {
         if self.expired() {
             return None;
         }
-        before_verification(pid, Some(fd));
+        before_verification(pid, VerificationPoint::Descriptor(fd));
         let after = match fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -322,10 +416,274 @@ impl Sweep {
                 pid,
                 start_time_ticks: identity.start_ticks,
                 name: identity.name.clone(),
-                fd,
+                fd: Some(fd),
                 descriptor_count: 1,
-                fd_target: target.to_string_lossy().into_owned(),
-                fd_target_bytes_hex: crate::core::hex_lower(target.as_os_str().as_bytes()),
+                mapping_count: 0,
+                representative_mapping: None,
+                executable: false,
+                reference_target: target.to_string_lossy().into_owned(),
+                reference_target_bytes_hex: crate::core::hex_lower(target.as_os_str().as_bytes()),
+                mount_id,
+                mount_point: mount.map(|mount| String::from_utf8_lossy(&mount.point).into_owned()),
+                mount_point_bytes_hex: mount.map(|mount| crate::core::hex_lower(&mount.point)),
+                filesystem_type: mount.map(|mount| mount.filesystem_type.clone()),
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn executable(
+        &mut self,
+        directory: &Path,
+        pid: i32,
+        identity: &ProcessIdentity,
+        observations: &mut ProcessObservations,
+        mounts: &mut MountTableCache,
+        before_verification: &mut impl FnMut(i32, VerificationPoint<'_>),
+    ) {
+        if self.expired() {
+            return;
+        }
+        let path = directory.join("exe");
+        let before = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                // A zombie with surviving threads can still have mappings,
+                // although the leader's exe link is no longer readable.
+                if error.kind() != io::ErrorKind::NotFound || !identity.no_executable {
+                    self.issue(reference_read_issue(&error, false));
+                }
+                return;
+            }
+        };
+        if !unlinked_regular(&before) || self.expired() {
+            return;
+        }
+        let key = (before.dev(), before.ino());
+        if !self.admit(Some(key), observations) {
+            return;
+        }
+        let target = match fs::read_link(&path) {
+            Ok(target) => target,
+            Err(error) => {
+                self.issue(reference_read_issue(&error, false));
+                return;
+            }
+        };
+        if let Some(observation) = self.memory_reference(
+            directory,
+            &path,
+            &target,
+            pid,
+            identity,
+            &before,
+            VerificationPoint::Executable,
+            mounts,
+            before_verification,
+        ) {
+            self.record(key, observation, observations);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mappings(
+        &mut self,
+        directory: &Path,
+        pid: i32,
+        identity: &ProcessIdentity,
+        observations: &mut ProcessObservations,
+        mounts: &mut MountTableCache,
+        before_verification: &mut impl FnMut(i32, VerificationPoint<'_>),
+    ) {
+        if self.expired() {
+            return;
+        }
+        let entries = match fs::read_dir(directory.join("map_files")) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.issue(reference_read_issue(&error, true));
+                return;
+            }
+        };
+        for entry in entries {
+            if self.expired() {
+                break;
+            }
+            let Ok(entry) = entry else {
+                self.issue("mapping_inventory_unreadable");
+                break;
+            };
+            if self.report.mappings_scanned >= self.limits.max_mappings {
+                self.stop("mapping_limit_reached");
+                break;
+            }
+            self.report.mappings_scanned += 1;
+            let name = entry.file_name();
+            let Some(range) = name.to_str().filter(|range| valid_mapping_range(range)) else {
+                self.issue("mapping_metadata_invalid");
+                continue;
+            };
+            let path = entry.path();
+            let target = match fs::read_link(&path) {
+                Ok(target) => target,
+                Err(error) => {
+                    self.issue(reference_read_issue(&error, true));
+                    continue;
+                }
+            };
+            // A linked target has no lost pathname to diagnose. Avoid a
+            // privileged stat for every ordinary library mapping. The suffix
+            // is only a shortlist: metadata must still prove zero links.
+            if !target.as_os_str().as_bytes().ends_with(b" (deleted)") {
+                continue;
+            }
+            if self.expired() {
+                break;
+            }
+            let before = match mapping_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    let reason = reference_read_issue(&error, true);
+                    self.issue(reason);
+                    if error.kind() == io::ErrorKind::NotFound {
+                        continue;
+                    }
+                    if !self.admit(None, observations) {
+                        break;
+                    }
+                    // Following map_files links requires capabilities that
+                    // readlink does not. Preserve useful process/path clues,
+                    // explicitly without inode, zero-link or allocation proof.
+                    before_verification(pid, VerificationPoint::Mapping(range));
+                    if fs::read_link(&path).is_ok_and(|current| current == target) {
+                        observations
+                            .unverified_mappings
+                            .push(UnverifiedDeletedMapping {
+                                pid,
+                                start_time_ticks: identity.start_ticks,
+                                name: identity.name.clone(),
+                                mapping_range: range.to_string(),
+                                target: target.to_string_lossy().into_owned(),
+                                target_bytes_hex: crate::core::hex_lower(
+                                    target.as_os_str().as_bytes(),
+                                ),
+                                reason: reason.to_string(),
+                            });
+                    } else {
+                        self.issue("mapping_identity_changed");
+                    }
+                    continue;
+                }
+            };
+            if !unlinked_regular(&before) {
+                continue;
+            }
+            let key = (before.dev(), before.ino());
+            if !self.admit(Some(key), observations) {
+                break;
+            }
+            if let Some(observation) = self.memory_reference(
+                directory,
+                &path,
+                &target,
+                pid,
+                identity,
+                &before,
+                VerificationPoint::Mapping(range),
+                mounts,
+                before_verification,
+            ) {
+                self.record(key, observation, observations);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn memory_reference(
+        &mut self,
+        directory: &Path,
+        path: &Path,
+        target: &Path,
+        pid: i32,
+        identity: &ProcessIdentity,
+        before: &fs::Metadata,
+        source: VerificationPoint<'_>,
+        mounts: &mut MountTableCache,
+        before_verification: &mut impl FnMut(i32, VerificationPoint<'_>),
+    ) -> Option<Observation> {
+        if self.expired() {
+            return None;
+        }
+        let mapping = matches!(source, VerificationPoint::Mapping(_));
+        let mount_id = match reference_mount_id(path, before) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                if error.kind() == io::ErrorKind::InvalidData {
+                    self.issue(if mapping {
+                        "mapping_identity_changed"
+                    } else {
+                        "executable_identity_changed"
+                    });
+                    return None;
+                }
+                self.issue(if mapping {
+                    "mapping_mount_unavailable"
+                } else {
+                    "executable_mount_unavailable"
+                });
+                None
+            }
+        };
+        if self.expired() {
+            return None;
+        }
+        let mount = self.mount(directory, mount_id, before.dev(), mounts);
+        if self.expired() {
+            return None;
+        }
+        before_verification(pid, source);
+        let after = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.issue(reference_read_issue(&error, mapping));
+                return None;
+            }
+        };
+        if self.expired() {
+            return None;
+        }
+        if !unlinked_regular(&after)
+            || (before.dev(), before.ino()) != (after.dev(), after.ino())
+            || !fs::read_link(path).is_ok_and(|current| current == target)
+        {
+            self.issue(if mapping {
+                "mapping_identity_changed"
+            } else {
+                "executable_identity_changed"
+            });
+            return None;
+        }
+        let Some(allocated_bytes) = after.blocks().checked_mul(512) else {
+            self.issue("allocated_bytes_overflow");
+            return None;
+        };
+        Some(Observation {
+            allocated_bytes,
+            logical_bytes: after.len(),
+            holder: DeletedOpenFileHolder {
+                pid,
+                start_time_ticks: identity.start_ticks,
+                name: identity.name.clone(),
+                fd: None,
+                descriptor_count: 0,
+                mapping_count: usize::from(mapping),
+                representative_mapping: match source {
+                    VerificationPoint::Mapping(range) => Some(range.to_string()),
+                    _ => None,
+                },
+                executable: source == VerificationPoint::Executable,
+                reference_target: target.to_string_lossy().into_owned(),
+                reference_target_bytes_hex: crate::core::hex_lower(target.as_os_str().as_bytes()),
                 mount_id,
                 mount_point: mount.map(|mount| String::from_utf8_lossy(&mount.point).into_owned()),
                 mount_point_bytes_hex: mount.map(|mount| crate::core::hex_lower(&mount.point)),
@@ -410,7 +768,7 @@ fn collect_with(
     proc_root: &Path,
     deadline: Instant,
     limits: DeletedOpenFilesLimits,
-    before_verification: &mut impl FnMut(i32, Option<u32>),
+    before_verification: &mut impl FnMut(i32, VerificationPoint<'_>),
 ) -> Result<DeletedOpenFilesReport> {
     let mut sweep = Sweep::new(deadline, limits);
     if sweep.expired() {
@@ -445,6 +803,14 @@ fn unlinked_regular(metadata: &fs::Metadata) -> bool {
     metadata.is_file() && metadata.nlink() == 0
 }
 
+fn mapping_metadata(path: &Path) -> io::Result<fs::Metadata> {
+    #[cfg(test)]
+    if let Some(errno) = MAPPING_METADATA_ERROR.get() {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    fs::metadata(path)
+}
+
 fn process_read_issue(error: &io::Error) -> &'static str {
     match error.kind() {
         io::ErrorKind::NotFound => "process_disappeared",
@@ -459,6 +825,60 @@ fn descriptor_read_issue(error: &io::Error) -> &'static str {
         io::ErrorKind::PermissionDenied => "descriptor_inaccessible",
         _ => "descriptor_unreadable",
     }
+}
+
+fn reference_read_issue(error: &io::Error, mapping: bool) -> &'static str {
+    match (mapping, error.kind()) {
+        (true, io::ErrorKind::NotFound) => "mapping_disappeared",
+        (true, io::ErrorKind::PermissionDenied) => "mapping_inaccessible",
+        (true, _) => "mapping_unreadable",
+        (false, io::ErrorKind::NotFound) => "executable_unavailable",
+        (false, io::ErrorKind::PermissionDenied) => "executable_inaccessible",
+        (false, _) => "executable_unreadable",
+    }
+}
+
+fn valid_mapping_range(range: &str) -> bool {
+    let Some((start, end)) = range.split_once('-') else {
+        return false;
+    };
+    if start.is_empty()
+        || end.is_empty()
+        || start.len() > 16
+        || end.len() > 16
+        || !start
+            .bytes()
+            .chain(end.bytes())
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    match (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16)) {
+        (Ok(start), Ok(end)) => start < end,
+        _ => false,
+    }
+}
+
+/// The mount ID comes from the same kernel reference, never an ambiguous
+/// device/path match. Older kernels can still report the verified allocation
+/// when they cannot supply this additional attribution evidence.
+fn reference_mount_id(path: &Path, expected: &fs::Metadata) -> io::Result<u64> {
+    use rustix::fs::{AtFlags, CWD, StatxFlags, statx};
+
+    let requested = StatxFlags::INO | StatxFlags::MNT_ID;
+    let observed = statx(CWD, path, AtFlags::empty(), requested)?;
+    if observed.stx_mask & requested.bits() != requested.bits() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "mount identity unavailable",
+        ));
+    }
+    if observed.stx_ino != expected.ino()
+        || libc::makedev(observed.stx_dev_major, observed.stx_dev_minor) != expected.dev()
+    {
+        return Err(invalid_metadata());
+    }
+    Ok(observed.stx_mnt_id)
 }
 
 fn check_deadline(deadline: Instant) -> io::Result<()> {
@@ -497,15 +917,21 @@ fn read_identity(directory: &Path, pid: i32, deadline: Instant) -> io::Result<Pr
     if close <= open || decimal(raw[..open].trim_ascii()) != u64::try_from(pid).ok() {
         return Err(invalid_metadata());
     }
-    let start_ticks = raw[close + 1..]
+    let mut fields = raw[close + 1..]
         .split(u8::is_ascii_whitespace)
-        .filter(|field| !field.is_empty())
-        .nth(19)
-        .and_then(decimal)
-        .ok_or_else(invalid_metadata)?;
+        .filter(|field| !field.is_empty());
+    let fields: [Option<&[u8]>; 20] = std::array::from_fn(|_| fields.next());
+    let start_ticks = fields[19].and_then(decimal).ok_or_else(invalid_metadata)?;
+    let flags = fields[6].and_then(decimal).ok_or_else(invalid_metadata)?;
+    let threads = fields[17].and_then(decimal).ok_or_else(invalid_metadata)?;
+    // Linux include/linux/sched.h PF_KTHREAD. An exited leader is not proof
+    // that its surviving threads have released their address space.
+    let no_executable = flags & 0x0020_0000 != 0
+        || (fields[0].is_some_and(|state| matches!(state, b"Z" | b"X")) && threads <= 1);
     Ok(ProcessIdentity {
         start_ticks,
         name: String::from_utf8_lossy(&raw[open + 1..close]).into_owned(),
+        no_executable,
     })
 }
 
@@ -643,8 +1069,14 @@ mod tests {
     }
 
     fn stat(directory: &Path, pid: i32, ticks: u64) {
+        stat_details(directory, pid, ticks, "S", 0, 1);
+    }
+
+    fn stat_details(directory: &Path, pid: i32, ticks: u64, state: &str, flags: u64, threads: u64) {
         let mut fields = vec!["0".to_string(); 20];
-        fields[0] = "S".to_string();
+        fields[0] = state.to_string();
+        fields[6] = flags.to_string();
+        fields[17] = threads.to_string();
         fields[19] = ticks.to_string();
         fs::write(
             directory.join("stat"),
@@ -657,8 +1089,36 @@ mod tests {
         let directory = root.join(pid.to_string());
         fs::create_dir_all(directory.join("fd")).unwrap();
         fs::create_dir_all(directory.join("fdinfo")).unwrap();
+        fs::create_dir_all(directory.join("map_files")).unwrap();
+        let executable = directory.join("current-executable");
+        fs::write(&executable, b"linked executable fixture").unwrap();
+        symlink(executable, directory.join("exe")).unwrap();
         stat(&directory, pid, 123);
         directory
+    }
+
+    fn mountinfo(directory: &Path, file: &fs::File) -> Option<u64> {
+        use std::fmt::Write as _;
+
+        let source = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let meta = file.metadata().unwrap();
+        let mount = reference_mount_id(&source, &meta).ok();
+        let mut records = format!(
+            "7 1 {}:{} / /fixture\\040mount rw - ext4 fixture rw\n",
+            libc::major(meta.dev()),
+            libc::minor(meta.dev())
+        );
+        if let Some(mount) = mount.filter(|mount| *mount != 7) {
+            writeln!(
+                records,
+                "{mount} 1 {}:{} / /reference\\040mount rw - ext4 fixture rw",
+                libc::major(meta.dev()),
+                libc::minor(meta.dev())
+            )
+            .unwrap();
+        }
+        fs::write(directory.join("mountinfo"), records).unwrap();
+        mount
     }
 
     fn add_fd(directory: &Path, descriptor: u32, file: &fs::File) {
@@ -673,15 +1133,22 @@ mod tests {
             ),
         )
         .unwrap();
-        fs::write(
-            directory.join("mountinfo"),
-            format!(
-                "7 1 {}:{} / /fixture\\040mount rw - ext4 fixture rw\n",
-                libc::major(meta.dev()),
-                libc::minor(meta.dev())
-            ),
-        )
-        .unwrap();
+        mountinfo(directory, file);
+    }
+
+    fn add_mapping(directory: &Path, range: &str, file: &fs::File) -> PathBuf {
+        let alias = directory.join(format!("mapped-{range} (deleted)"));
+        symlink(format!("/proc/self/fd/{}", file.as_raw_fd()), &alias).unwrap();
+        symlink(&alias, directory.join("map_files").join(range)).unwrap();
+        mountinfo(directory, file);
+        alias
+    }
+
+    fn set_executable(directory: &Path, file: &fs::File) {
+        let pending = directory.join("next-exe");
+        symlink(format!("/proc/self/fd/{}", file.as_raw_fd()), &pending).unwrap();
+        fs::rename(pending, directory.join("exe")).unwrap();
+        mountinfo(directory, file);
     }
 
     fn anonymous_file() -> fs::File {
@@ -694,6 +1161,17 @@ mod tests {
 
     fn scan(root: &Path) -> DeletedOpenFilesReport {
         collect(root, deadline(), DeletedOpenFilesLimits::default()).unwrap()
+    }
+
+    fn with_mapping_error<T>(errno: i32, inspect: impl FnOnce() -> T) -> T {
+        struct Reset(Option<i32>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                MAPPING_METADATA_ERROR.with(|slot| slot.set(self.0));
+            }
+        }
+        let _reset = Reset(MAPPING_METADATA_ERROR.with(|slot| slot.replace(Some(errno))));
+        inspect()
     }
 
     #[test]
@@ -724,7 +1202,7 @@ mod tests {
         );
         assert_eq!(observed.holders.len(), 2);
         assert_eq!(observed.holders[0].pid, 41);
-        assert_eq!(observed.holders[0].fd, 3);
+        assert_eq!(observed.holders[0].fd, Some(3));
         assert_eq!(observed.holders[0].descriptor_count, 2);
         assert_eq!(observed.holders[1].descriptor_count, 1);
         assert_eq!(observed.holders[0].start_time_ticks, 123);
@@ -751,11 +1229,430 @@ mod tests {
         let mut file = fs::File::create(root.path().join("still here (deleted)")).unwrap();
         file.write_all(&[0; 4096]).unwrap();
         add_fd(&directory, 3, &file);
+        add_mapping(&directory, "1000-2000", &file);
+        set_executable(&directory, &file);
         let report = scan(root.path());
         assert!(report.complete);
         assert_eq!(report.observed_allocated_bytes, Some(0));
         assert!(report.files.is_empty());
         assert_eq!(file.metadata().unwrap().nlink(), 1);
+    }
+
+    #[test]
+    fn descriptors_mappings_and_executable_share_one_holder_and_allocation() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = process(root.path(), 41);
+        let file = anonymous_file();
+        add_fd(&directory, 7, &file);
+        add_fd(&directory, 3, &file);
+        add_mapping(&directory, "1000-2000", &file);
+        add_mapping(&directory, "3000-5000", &file);
+        set_executable(&directory, &file);
+        let has_mount_id = mountinfo(&directory, &file).is_some();
+        let report = collect(
+            root.path(),
+            deadline(),
+            DeletedOpenFilesLimits {
+                max_holders: 1,
+                max_files: 1,
+                ..DeletedOpenFilesLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.complete, has_mount_id, "{:?}", report.issues);
+        if !has_mount_id {
+            assert_eq!(
+                report.issues,
+                BTreeMap::from([
+                    ("executable_mount_unavailable".to_string(), 1),
+                    ("mapping_mount_unavailable".to_string(), 2),
+                ])
+            );
+        }
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(
+            report.observed_allocated_bytes,
+            Some(file.metadata().unwrap().blocks() * 512)
+        );
+        let observed = &report.files[0];
+        assert_eq!(observed.holders.len(), 1);
+        let holder = &observed.holders[0];
+        assert_eq!(holder.fd, Some(3));
+        assert_eq!(holder.descriptor_count, 2);
+        assert_eq!(holder.mapping_count, 2);
+        assert!(holder.executable);
+        assert!(matches!(
+            holder.representative_mapping.as_deref(),
+            Some("1000-2000" | "3000-5000")
+        ));
+        assert_eq!(
+            holder.mount_id,
+            Some(7),
+            "fdinfo remains the representative mount evidence"
+        );
+        assert!(report.unverified_mappings.is_empty());
+    }
+
+    #[test]
+    fn mappings_and_executables_are_reported_without_any_descriptor() {
+        for executable in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = process(root.path(), 41);
+            let file = anonymous_file();
+            if executable {
+                set_executable(&directory, &file);
+            } else {
+                add_mapping(&directory, "1000-2000", &file);
+            }
+            let expected_mount = mountinfo(&directory, &file);
+            let report = scan(root.path());
+            assert_eq!(
+                report.complete,
+                expected_mount.is_some(),
+                "{:?}",
+                report.issues
+            );
+            if expected_mount.is_none() {
+                let reason = if executable {
+                    "executable_mount_unavailable"
+                } else {
+                    "mapping_mount_unavailable"
+                };
+                assert_eq!(report.issues, BTreeMap::from([(reason.to_string(), 1)]));
+            }
+            assert_eq!(report.descriptors_scanned, 0);
+            assert_eq!(report.files.len(), 1);
+            assert_eq!(
+                report.observed_allocated_bytes,
+                Some(file.metadata().unwrap().blocks() * 512)
+            );
+            let holder = &report.files[0].holders[0];
+            assert_eq!(holder.fd, None);
+            assert_eq!(holder.descriptor_count, 0);
+            assert_eq!(holder.mapping_count, usize::from(!executable));
+            assert_eq!(holder.executable, executable);
+            assert_eq!(holder.mount_id, expected_mount);
+            assert_eq!(holder.mount_point.is_some(), expected_mount.is_some());
+        }
+    }
+
+    #[test]
+    fn memory_reference_replacement_is_not_attributed_to_the_original_inode() {
+        for executable in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = process(root.path(), 41);
+            let original = anonymous_file();
+            let replacement = anonymous_file();
+            let alias = if executable {
+                set_executable(&directory, &original);
+                directory.join("exe")
+            } else {
+                add_mapping(&directory, "1000-2000", &original)
+            };
+            let report = collect_with(
+                root.path(),
+                deadline(),
+                DeletedOpenFilesLimits::default(),
+                &mut |_, point| {
+                    if point
+                        == if executable {
+                            VerificationPoint::Executable
+                        } else {
+                            VerificationPoint::Mapping("1000-2000")
+                        }
+                    {
+                        let next = directory.join("replacement-link");
+                        symlink(format!("/proc/self/fd/{}", replacement.as_raw_fd()), &next)
+                            .unwrap();
+                        fs::rename(next, &alias).unwrap();
+                    }
+                },
+            )
+            .unwrap();
+            assert!(!report.complete);
+            assert!(report.files.is_empty());
+            assert_eq!(report.observed_allocated_bytes, Some(0));
+            let reason = if executable {
+                "executable_identity_changed"
+            } else {
+                "mapping_identity_changed"
+            };
+            assert_eq!(report.issues[reason], 1);
+            assert_eq!(original.metadata().unwrap().len(), 8192);
+            assert_eq!(replacement.metadata().unwrap().len(), 8192);
+        }
+    }
+
+    #[test]
+    fn changed_mapping_spelling_is_rejected_even_when_inode_is_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = process(root.path(), 41);
+        let file = anonymous_file();
+        add_mapping(&directory, "1000-2000", &file);
+        let alias = directory.join("different spelling (deleted)");
+        symlink(format!("/proc/self/fd/{}", file.as_raw_fd()), &alias).unwrap();
+        let report = collect_with(
+            root.path(),
+            deadline(),
+            DeletedOpenFilesLimits::default(),
+            &mut |_, point| {
+                if point == VerificationPoint::Mapping("1000-2000") {
+                    let next = directory.join("next-mapping");
+                    symlink(&alias, &next).unwrap();
+                    fs::rename(next, directory.join("map_files/1000-2000")).unwrap();
+                }
+            },
+        )
+        .unwrap();
+        assert!(report.files.is_empty());
+        assert_eq!(report.issues["mapping_identity_changed"], 1);
+    }
+
+    #[test]
+    fn memory_mount_identity_never_uses_another_alias_of_the_device() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = process(root.path(), 41);
+        let file = anonymous_file();
+        add_mapping(&directory, "1000-2000", &file);
+        let actual_mount = mountinfo(&directory, &file);
+        let meta = file.metadata().unwrap();
+        fs::write(
+            directory.join("mountinfo"),
+            format!(
+                "{} 1 {}:{} / /wrong-alias rw - ext4 fixture rw\n",
+                actual_mount.map_or(7, |mount| mount + 1),
+                libc::major(meta.dev()),
+                libc::minor(meta.dev())
+            ),
+        )
+        .unwrap();
+        let report = scan(root.path());
+        assert!(!report.complete);
+        let reason = if actual_mount.is_some() {
+            "mount_not_visible"
+        } else {
+            "mapping_mount_unavailable"
+        };
+        assert_eq!(report.issues, BTreeMap::from([(reason.to_string(), 1)]));
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].device_id, meta.dev());
+        assert_eq!(report.files[0].inode, meta.ino());
+        assert_eq!(report.files[0].holders[0].mount_id, actual_mount);
+        assert_eq!(report.files[0].holders[0].mount_point, None);
+        assert_eq!(report.observed_allocated_bytes, Some(meta.blocks() * 512));
+        let other = anonymous_file();
+        let source = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let mismatch = reference_mount_id(&source, &other.metadata().unwrap()).unwrap_err();
+        if actual_mount.is_some() {
+            assert_eq!(mismatch.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn denied_mapping_metadata_keeps_native_clues_separate_from_verified_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = process(root.path(), 41);
+        let held = anonymous_file();
+        let mapped = anonymous_file();
+        add_fd(&directory, 3, &held);
+        let alias = directory.join(std::ffi::OsString::from_vec(
+            b"mapped-\xff (deleted)".to_vec(),
+        ));
+        symlink(format!("/proc/self/fd/{}", mapped.as_raw_fd()), &alias).unwrap();
+        symlink(&alias, directory.join("map_files/1000-2000")).unwrap();
+        let report = with_mapping_error(libc::EPERM, || scan(root.path()));
+        assert!(!report.complete);
+        assert_eq!(report.issues["mapping_inaccessible"], 1);
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(
+            report.observed_allocated_bytes,
+            Some(held.metadata().unwrap().blocks() * 512)
+        );
+        assert_eq!(report.unverified_mappings.len(), 1);
+        let unknown = &report.unverified_mappings[0];
+        assert_eq!(unknown.pid, 41);
+        assert_eq!(unknown.start_time_ticks, 123);
+        assert_eq!(unknown.mapping_range, "1000-2000");
+        assert_eq!(unknown.reason, "mapping_inaccessible");
+        assert_eq!(
+            unknown.target_bytes_hex,
+            crate::core::hex_lower(alias.as_os_str().as_bytes())
+        );
+        let json = serde_json::to_value(unknown).unwrap();
+        assert!(json.get("allocated_bytes").is_none());
+        assert!(json.get("inode").is_none());
+        assert_eq!(mapped.metadata().unwrap().len(), 8192);
+    }
+
+    #[test]
+    fn denied_literal_deleted_suffix_never_claims_an_unlinked_file() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = process(root.path(), 41);
+        let named = root.path().join("literal (deleted)");
+        fs::write(&named, b"still has a pathname").unwrap();
+        symlink(named, directory.join("map_files/1000-2000")).unwrap();
+        let report = with_mapping_error(libc::EPERM, || scan(root.path()));
+        assert!(!report.complete);
+        assert_eq!(report.observed_allocated_bytes, Some(0));
+        assert!(report.files.is_empty());
+        assert_eq!(report.unverified_mappings.len(), 1);
+    }
+
+    #[test]
+    fn pid_reuse_discards_both_verified_and_denied_mapping_observations() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = process(root.path(), 41);
+        let file = anonymous_file();
+        add_fd(&directory, 3, &file);
+        set_executable(&directory, &file);
+        add_mapping(&directory, "1000-2000", &file);
+        let report = with_mapping_error(libc::EPERM, || {
+            collect_with(
+                root.path(),
+                deadline(),
+                DeletedOpenFilesLimits::default(),
+                &mut |pid, point| {
+                    if point == VerificationPoint::Process {
+                        stat(&directory, pid, 124);
+                    }
+                },
+            )
+            .unwrap()
+        });
+        assert!(!report.complete);
+        assert_eq!(report.issues["process_identity_changed"], 1);
+        assert!(report.files.is_empty());
+        assert!(report.unverified_mappings.is_empty());
+        assert_eq!(report.observed_allocated_bytes, Some(0));
+    }
+
+    #[test]
+    fn unverified_mapping_target_must_still_match_its_initial_link() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = process(root.path(), 41);
+        let file = anonymous_file();
+        add_mapping(&directory, "1000-2000", &file);
+        let report = with_mapping_error(libc::EPERM, || {
+            collect_with(
+                root.path(),
+                deadline(),
+                DeletedOpenFilesLimits::default(),
+                &mut |_, point| {
+                    if point == VerificationPoint::Mapping("1000-2000") {
+                        let next = directory.join("next-link");
+                        symlink("/different (deleted)", &next).unwrap();
+                        fs::rename(next, directory.join("map_files/1000-2000")).unwrap();
+                    }
+                },
+            )
+            .unwrap()
+        });
+        assert!(!report.complete);
+        assert_eq!(report.issues["mapping_identity_changed"], 1);
+        assert!(report.unverified_mappings.is_empty());
+        assert!(report.files.is_empty());
+    }
+
+    #[test]
+    fn mapping_and_holder_limits_bound_unverified_evidence_too() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = process(root.path(), 41);
+        let held = anonymous_file();
+        let mapped = anonymous_file();
+        add_fd(&directory, 3, &held);
+        for range in ["1000-2000", "3000-4000", "5000-6000"] {
+            add_mapping(&directory, range, &mapped);
+        }
+        for (reason, limits) in [
+            (
+                "mapping_limit_reached",
+                DeletedOpenFilesLimits {
+                    max_mappings: 1,
+                    ..DeletedOpenFilesLimits::default()
+                },
+            ),
+            (
+                "holder_limit_reached",
+                DeletedOpenFilesLimits {
+                    max_holders: 2,
+                    ..DeletedOpenFilesLimits::default()
+                },
+            ),
+        ] {
+            let report = with_mapping_error(libc::EPERM, || {
+                collect(root.path(), deadline(), limits).unwrap()
+            });
+            assert!(!report.complete);
+            assert_eq!(report.issues[reason], 1);
+            assert_eq!(report.files.len(), 1);
+            assert_eq!(report.unverified_mappings.len(), 1);
+            assert!(report.mappings_scanned <= limits.max_mappings);
+            assert_eq!(
+                report.observed_allocated_bytes,
+                Some(held.metadata().unwrap().blocks() * 512)
+            );
+        }
+    }
+
+    #[test]
+    fn mapping_ranges_reject_ambiguous_or_unbounded_names() {
+        for valid in ["0-1", "00001000-00002000", "ABCDEF-FFFFFFFFFFFFFFFF"] {
+            assert!(valid_mapping_range(valid), "{valid}");
+        }
+        for invalid in [
+            "0-0",
+            "2-1",
+            "-2",
+            "1-",
+            "1-2-3",
+            "+1-2",
+            "g-ff",
+            "00000000000000000-1",
+        ] {
+            assert!(!valid_mapping_range(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn missing_executable_is_expected_only_for_kernel_tasks_and_finished_processes() {
+        for (state, flags, threads, complete) in [
+            ("S", 0, 1, false),
+            ("S", 0x0020_0000, 1, true),
+            ("Z", 0, 1, true),
+            ("X", 0, 1, true),
+            ("Z", 0, 2, false),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = process(root.path(), 41);
+            stat_details(&directory, 41, 123, state, flags, threads);
+            fs::rename(directory.join("exe"), directory.join("retired-exe")).unwrap();
+            let report = scan(root.path());
+            assert_eq!(
+                report.complete, complete,
+                "state={state} flags={flags} threads={threads}: {:?}",
+                report.issues
+            );
+            assert_eq!(
+                report.issues.contains_key("executable_unavailable"),
+                !complete
+            );
+            assert!(report.files.is_empty());
+        }
+    }
+
+    #[test]
+    fn unavailable_mapping_inventory_is_not_complete_zero_retention() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = process(root.path(), 41);
+        fs::rename(
+            directory.join("map_files"),
+            directory.join("retired-mappings"),
+        )
+        .unwrap();
+        let report = scan(root.path());
+        assert!(!report.complete);
+        assert_eq!(report.issues["mapping_disappeared"], 1);
+        assert!(report.files.is_empty());
     }
 
     #[test]
@@ -782,7 +1679,7 @@ mod tests {
         );
         assert!(observed.allocated_bytes < observed.logical_bytes);
         assert_eq!(
-            observed.holders[0].fd_target_bytes_hex,
+            observed.holders[0].reference_target_bytes_hex,
             crate::core::hex_lower(alias.as_os_str().as_bytes())
         );
         serde_json::to_string(&report).expect("native bytes never make JSON serialization fail");
@@ -798,8 +1695,8 @@ mod tests {
             root.path(),
             deadline(),
             DeletedOpenFilesLimits::default(),
-            &mut |pid, fd| {
-                if fd.is_none() {
+            &mut |pid, point| {
+                if point == VerificationPoint::Process {
                     stat(&directory, pid, 124);
                 }
             },
@@ -821,8 +1718,8 @@ mod tests {
             root.path(),
             deadline(),
             DeletedOpenFilesLimits::default(),
-            &mut |_, fd| {
-                if fd == Some(3) {
+            &mut |_, point| {
+                if point == VerificationPoint::Descriptor(3) {
                     fs::rename(directory.join("fd/3"), directory.join("retired-fd")).unwrap();
                     symlink(
                         format!("/proc/self/fd/{}", replacement.as_raw_fd()),

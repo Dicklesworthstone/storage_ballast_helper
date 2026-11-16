@@ -2223,32 +2223,44 @@ sudo sbh --json blame --deleted-open --top 50 --timeout-secs 30
 ```
 
 The report ranks unique `(device, inode)` observations by allocated bytes and
-lists their process holders, representative descriptors, logical lengths and
-observed mount identities. Duplicated descriptors and files shared by several
-processes contribute only once to the allocation total. `--top` limits displayed
-files; totals still include every verified file in the bounded inventory.
+lists their process holders, descriptors, running executables, file-backed
+memory mappings, logical lengths and observed mount identities. It finds
+unlinked executable images and mapped files even after their descriptors close.
+Repeated descriptors, mappings and files shared by several processes contribute
+only once to the allocation total. `--top` limits each displayed list; totals
+still include every verified file in the bounded inventory.
 `--since` and `--tree` belong to ordinary I/O blame and cannot be combined with
 this mode.
 
-Inspection reads metadata, process identities and descriptor links; it never
+Inspection reads metadata, process identities and kernel reference links; it never
 reads file contents, signals a process or truncates a descriptor. The default
 cooperative deadline is 10 seconds (`--timeout-secs` accepts 1–60), with caps of
-50,000 processes, 250,000 descriptors, 4,096 distinct files and 16,384
-process/file holders. Kernel I/O already in progress can overrun the deadline.
+50,000 processes, 250,000 descriptors, 250,000 mappings, 4,096 distinct verified
+files and 16,384 holders (including unverified mapping records). Kernel I/O
+already in progress can overrun the deadline.
 Permission failures, changed identities, unknown mount attribution and exhausted
 budgets remain explicit coverage issues. Partial inspection exits 4 and retains
 the observed allocations. An unsupported platform reports `supported: false`
 with a null byte total and exits 0.
 
-JSON uses `sbh.deleted_open.v1`, with `observed_allocated_bytes`,
+JSON uses `sbh.deleted_open.v2`, with `observed_allocated_bytes`,
 `observed_unique_files`, `files`, `files_omitted`, `complete` and `issues`.
-Descriptor targets and mount paths also have byte-preserving hexadecimal
-fields. Scope is the file descriptors visible in the caller's process
-namespace: memory-map-only references and processes hidden in other namespaces
+Each holder has a nullable `fd`, `descriptor_count`, `mapping_count`,
+`representative_mapping` and `executable` flag. `reference_target` and mount
+paths also have byte-preserving hexadecimal fields. Scope is the references
+visible in the caller's process namespace; processes hidden in other namespaces
 are excluded. RAM-backed files can appear too. Observations are not an atomic
 snapshot, and shared extents or snapshots may retain blocks after a holder
 closes them. Review the owning application's close/reopen operation or a graceful
 service restart; deleting the former pathname again cannot free these blocks.
+
+Linux may allow reading a mapping's target name while denying the metadata
+needed to measure its allocation, even for root in a restricted container.
+Such deleted-looking mappings appear in `unverified_mappings`, with their PID,
+address range, native target bytes and reason. They make the result incomplete
+and contribute **no bytes** to `observed_allocated_bytes`. A ` (deleted)` suffix
+alone does not prove that no hardlink remains, and can be part of a literal
+filename. Mapped lengths and RSS are never substituted for filesystem allocation.
 
 Automatic retention pruning removes rows older than 30 days, triggered every 3600 events (approximately hourly at typical event rates).
 

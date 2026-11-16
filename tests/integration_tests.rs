@@ -298,7 +298,7 @@ fn deleted_open_blame_finds_anonymous_allocations_without_daemon_config() {
         result.stderr,
     );
     let report: Value = serde_json::from_str(&result.stdout).unwrap();
-    assert_eq!(report["schema"], "sbh.deleted_open.v1");
+    assert_eq!(report["schema"], "sbh.deleted_open.v2");
     assert_eq!(report["read_only"], true);
     assert_eq!(report["supported"], true);
     assert_eq!(report["exit_code"], result.status.code().unwrap());
@@ -322,7 +322,12 @@ fn deleted_open_blame_finds_anonymous_allocations_without_daemon_config() {
         .find(|holder| holder["pid"] == std::process::id())
         .expect("the test process still holds the unlinked file");
     assert!(holder["descriptor_count"].as_u64().unwrap() >= 2);
-    assert!(!holder["fd_target_bytes_hex"].as_str().unwrap().is_empty());
+    assert!(
+        !holder["reference_target_bytes_hex"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
     assert!(!missing_config.exists());
     let after = duplicate.metadata().unwrap();
     assert_eq!(after.len(), before.len());
@@ -330,6 +335,336 @@ fn deleted_open_blame_finds_anonymous_allocations_without_daemon_config() {
     let mut contents = [0; 16_384];
     duplicate.read_exact_at(&mut contents, 0).unwrap();
     assert_eq!(contents, [0x5a; 16_384]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "subprocess fixture for deleted_open_blame_finds_an_unlinked_executable"]
+fn deleted_open_executable_holder() {
+    use std::io::Read as _;
+
+    let Some(ready) = std::env::var_os("SBH_DELETED_EXECUTABLE_READY") else {
+        return;
+    };
+    fs::write(ready, b"ready").unwrap();
+    // The parent owns the other end of this pipe and a ChildGuard. No timer
+    // can expire while a slow inspection is still observing the executable.
+    let _ = std::io::stdin().read_exact(&mut [0]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn deleted_open_blame_finds_an_unlinked_executable() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let executable = fixture.path().join("retained-executable");
+    fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+    let ready = fixture.path().join("ready");
+    let mut child = ChildGuard::new(
+        Command::new(&executable)
+            .args(["--ignored", "--exact", "deleted_open_executable_holder"])
+            .env("SBH_DELETED_EXECUTABLE_READY", &ready)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_file(&ready, Duration::from_secs(30), || {
+        assert!(child.child.try_wait().unwrap().is_none());
+    });
+    let executable_reference = PathBuf::from(format!("/proc/{}/exe", child.child.id()));
+    let before = fs::metadata(&executable).unwrap();
+    let running = fs::metadata(&executable_reference).unwrap();
+    assert_eq!((running.dev(), running.ino()), (before.dev(), before.ino()));
+    assert!(before.nlink() > 0);
+    assert!(before.blocks() > 0);
+    let inspect = |name| {
+        let result = common::run_cli_case(
+            name,
+            &[
+                "--json",
+                "blame",
+                "--deleted-open",
+                "--top",
+                "4096",
+                "--timeout-secs",
+                "30",
+            ],
+        );
+        assert!(
+            matches!(result.status.code(), Some(0 | 4)),
+            "stdout={} stderr={}",
+            result.stdout,
+            result.stderr,
+        );
+        serde_json::from_str::<Value>(&result.stdout).unwrap()
+    };
+    let linked = inspect("deleted_open_executable_before_unlink");
+    assert!(
+        linked["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| { file["device_id"] != before.dev() || file["inode"] != before.ino() })
+    );
+    fs::remove_file(&executable).unwrap();
+    let report = inspect("deleted_open_blame_finds_an_unlinked_executable");
+    assert_eq!(report["schema"], "sbh.deleted_open.v2");
+    assert_eq!(report["read_only"], true);
+    let matching: Vec<_> = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|file| file["device_id"] == before.dev() && file["inode"] == before.ino())
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "one retained executable allocation: {report}"
+    );
+    assert_eq!(matching[0]["allocated_bytes"], before.blocks() * 512);
+    assert_eq!(matching[0]["logical_bytes"], before.len());
+    let holder = matching[0]["holders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|holder| holder["pid"] == child.child.id())
+        .expect("the child keeps its executable without an open descriptor");
+    assert!(holder["fd"].is_null());
+    assert_eq!(holder["descriptor_count"], 0);
+    assert_eq!(holder["executable"], true);
+    assert!(
+        !holder["reference_target_bytes_hex"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+    let after = fs::metadata(executable_reference).unwrap();
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+    assert_eq!(after.nlink(), 0);
+    assert_eq!(after.len(), before.len());
+    assert_eq!(after.blocks(), before.blocks());
+    assert!(child.child.try_wait().unwrap().is_none());
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_deleted_open_mapping_holder(
+    data_path: &Path,
+    ready_path: &Path,
+    verified_path: &Path,
+) -> Option<Child> {
+    // Like the installer fixtures, use Python's standard library outside the
+    // unsafe-free Rust crate. Calling libc directly avoids mmap.mmap's hidden
+    // duplicate descriptor, which would let an FD-only collector pass.
+    let result = Command::new("python3")
+        .args([
+            "-c",
+            r#"
+import ctypes
+import os
+import sys
+
+path, ready, verified = sys.argv[1:]
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                      ctypes.c_int, ctypes.c_int, ctypes.c_long]
+libc.mmap.restype = ctypes.c_void_p
+libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+libc.munmap.restype = ctypes.c_int
+length = os.stat(path).st_size
+fd = os.open(path, os.O_RDONLY)
+try:
+    address = libc.mmap(None, length, 1, 2, fd, 0)  # PROT_READ, MAP_PRIVATE
+    mapping_errno = ctypes.get_errno()
+finally:
+    os.close(fd)
+if address == ctypes.c_void_p(-1).value:
+    raise OSError(mapping_errno, os.strerror(mapping_errno))
+
+def check_contents():
+    assert ctypes.string_at(address, length) == b'\x5a' * length
+
+def announce(destination, text):
+    with open(destination + '.pending', 'w') as stream:
+        stream.write(text)
+    os.replace(destination + '.pending', destination)
+
+try:
+    check_contents()
+    page_size = os.sysconf('SC_PAGE_SIZE')
+    end = address + ((length + page_size - 1) // page_size) * page_size
+    announce(ready, f'{address:x}-{end:x}')
+    assert sys.stdin.buffer.read(1) == b'v'
+    check_contents()
+    announce(verified, 'unchanged')
+    sys.stdin.buffer.read(1)
+finally:
+    assert libc.munmap(address, length) == 0
+"#,
+        ])
+        .arg(data_path)
+        .arg(ready_path)
+        .arg(verified_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn();
+    match result {
+        Ok(child) => Some(child),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("SKIP: python3 is unavailable for the native mmap-only fixture");
+            None
+        }
+        Err(error) => panic!("spawn native mmap-only fixture: {error}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_no_descriptor_for_inode(pid: u32, expected: &fs::Metadata) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    for entry in fs::read_dir(format!("/proc/{pid}/fd")).unwrap() {
+        match fs::metadata(entry.unwrap().path()) {
+            Ok(metadata) => assert_ne!(
+                (metadata.dev(), metadata.ino()),
+                (expected.dev(), expected.ino()),
+                "the fixture must retain this allocation through memory alone"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("inspect fixture descriptor: {error}"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn deleted_open_blame_reports_an_unlinked_mapping_without_descriptors() {
+    use std::io::Write as _;
+    use std::os::unix::{ffi::OsStrExt as _, fs::MetadataExt as _};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let data_path = fixture.path().join("retained-mapping");
+    let ready = fixture.path().join("ready");
+    let verified = fixture.path().join("verified");
+    let before = {
+        let mut file = fs::File::create(&data_path).unwrap();
+        file.write_all(&[0x5a; 16_384]).unwrap();
+        file.sync_all().unwrap();
+        file.metadata().unwrap()
+    };
+    assert!(before.blocks() > 0);
+    let Some(child) = spawn_deleted_open_mapping_holder(&data_path, &ready, &verified) else {
+        return;
+    };
+    let mut child = ChildGuard::new(child);
+    wait_for_file(&ready, Duration::from_secs(30), || {
+        assert!(child.child.try_wait().unwrap().is_none());
+    });
+    let pid = child.child.id();
+    assert_no_descriptor_for_inode(pid, &before);
+    let range = fs::read_to_string(&ready).unwrap();
+    let reference = PathBuf::from(format!("/proc/{pid}/map_files/{range}"));
+    assert_eq!(fs::read_link(&reference).unwrap(), data_path);
+    fs::remove_file(&data_path).unwrap();
+    let target = fs::read_link(&reference).unwrap();
+    let can_measure = match fs::metadata(&reference) {
+        Ok(metadata) => {
+            assert_eq!(
+                (metadata.dev(), metadata.ino()),
+                (before.dev(), before.ino())
+            );
+            assert_eq!(metadata.nlink(), 0);
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => false,
+        Err(error) => panic!("inspect live mmap-only reference: {error}"),
+    };
+    let result = common::run_cli_case(
+        "deleted_open_blame_reports_an_unlinked_mapping_without_descriptors",
+        &[
+            "--json",
+            "blame",
+            "--deleted-open",
+            "--top",
+            "16384",
+            "--timeout-secs",
+            "30",
+        ],
+    );
+    assert!(
+        matches!(result.status.code(), Some(0 | 4)),
+        "stdout={} stderr={}",
+        result.stdout,
+        result.stderr,
+    );
+    let report: Value = serde_json::from_str(&result.stdout).unwrap();
+    assert_eq!(report["schema"], "sbh.deleted_open.v2");
+    assert_eq!(report["read_only"], true);
+    assert_eq!(report["files_omitted"], 0);
+    assert_eq!(report["unverified_mappings_omitted"], 0);
+    let files = report["files"].as_array().unwrap();
+    let matching: Vec<_> = files
+        .iter()
+        .filter(|file| file["device_id"] == before.dev() && file["inode"] == before.ino())
+        .collect();
+    let unverified: Vec<_> = report["unverified_mappings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|mapping| mapping["pid"] == pid && mapping["mapping_range"] == range)
+        .collect();
+    if can_measure {
+        assert_eq!(matching.len(), 1, "one mmap-only allocation: {report}");
+        assert_eq!(matching[0]["allocated_bytes"], before.blocks() * 512);
+        assert_eq!(matching[0]["logical_bytes"], before.len());
+        let holders = matching[0]["holders"].as_array().unwrap();
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0]["pid"], pid);
+        assert!(holders[0]["fd"].is_null());
+        assert_eq!(holders[0]["descriptor_count"], 0);
+        assert!(holders[0]["mapping_count"].as_u64().unwrap() > 0);
+        assert_eq!(holders[0]["executable"], false);
+        assert_eq!(holders[0]["representative_mapping"], range);
+        assert!(unverified.is_empty());
+    } else {
+        assert!(
+            matching.is_empty(),
+            "unverified mappings have no measured allocation"
+        );
+        assert_eq!(
+            unverified.len(),
+            1,
+            "denied mapping must remain visible: {report}"
+        );
+        assert_eq!(unverified[0]["reason"], "mapping_inaccessible");
+        assert_eq!(
+            unverified[0]["target_bytes_hex"],
+            hex_lower(target.as_os_str().as_bytes())
+        );
+        assert!(unverified[0].get("allocated_bytes").is_none());
+        assert!(unverified[0].get("inode").is_none());
+        assert_eq!(report["complete"], false);
+        assert_eq!(result.status.code(), Some(4));
+    }
+    assert_eq!(
+        report["observed_allocated_bytes"],
+        files
+            .iter()
+            .map(|file| file["allocated_bytes"].as_u64().unwrap())
+            .sum::<u64>(),
+        "only verified files contribute to allocation totals"
+    );
+    child.child.stdin.as_mut().unwrap().write_all(b"v").unwrap();
+    wait_for_file(&verified, Duration::from_secs(30), || {
+        assert!(child.child.try_wait().unwrap().is_none());
+    });
+    assert_eq!(fs::read_to_string(&verified).unwrap(), "unchanged");
+    assert_eq!(fs::read_link(&reference).unwrap(), target);
+    assert_no_descriptor_for_inode(pid, &before);
+    assert!(child.child.try_wait().unwrap().is_none());
 }
 
 #[cfg(unix)]

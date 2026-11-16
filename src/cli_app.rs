@@ -947,7 +947,7 @@ struct BlameArgs {
     #[arg(long)]
     tree: bool,
     /// Report deleted files whose allocated blocks are still held by open
-    /// process file descriptors (Linux, read-only; no daemon required).
+    /// descriptors, memory mappings or executables (Linux, read-only).
     #[arg(long, conflicts_with_all = ["since", "tree"])]
     deleted_open: bool,
     /// Cooperative time budget for --deleted-open (default: 10 seconds).
@@ -6477,15 +6477,15 @@ fn run_deleted_open_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
     }
     if report.supported && !report.complete {
         return Err(CliError::Partial(
-            "deleted-open inspection is incomplete; uninspected descriptors may retain additional allocation"
+            "deleted-open inspection is incomplete; unverified or uninspected references may retain additional allocation"
                 .to_string(),
         ));
     }
     Ok(())
 }
 
-const DELETED_OPEN_SCOPE: &str = "Regular files with zero links held by file descriptors visible in the caller's process namespace; excludes mmap-only references and processes hidden by other namespaces. Observations are not an atomic snapshot or a promise of reclaimable space.";
-const DELETED_OPEN_RECOVERY: &str = "Ask the owning application or service to close or reopen the file; review a graceful service restart if necessary. Removing its former pathname again cannot release these blocks. sbh does not signal processes or truncate their descriptors.";
+const DELETED_OPEN_SCOPE: &str = "Verified regular files with zero links retained by descriptors, executable links or file-backed memory mappings visible in the caller's process namespace. Unverified deleted-looking mappings are listed separately and excluded from allocation totals; processes hidden by other namespaces are not covered. Observations are not an atomic snapshot or a promise of reclaimable space.";
+const DELETED_OPEN_RECOVERY: &str = "Ask the owning application or service to close or reopen the file or release its mapping; review a graceful service restart if necessary. Removing its former pathname again cannot release these blocks. sbh does not signal processes, open their file contents or truncate their references.";
 
 fn deleted_open_blame_json(
     report: &storage_ballast_helper::platform::types::DeletedOpenFilesReport,
@@ -6493,8 +6493,9 @@ fn deleted_open_blame_json(
     elapsed: Duration,
 ) -> Value {
     let shown = report.files.len().min(top);
+    let mappings_shown = report.unverified_mappings.len().min(top);
     json!({
-        "schema": "sbh.deleted_open.v1",
+        "schema": "sbh.deleted_open.v2",
         "command": "blame",
         "mode": "deleted_open",
         "read_only": true,
@@ -6508,6 +6509,10 @@ fn deleted_open_blame_json(
         "files_omitted": report.files.len() - shown,
         "processes_scanned": report.processes_scanned,
         "descriptors_scanned": report.descriptors_scanned,
+        "mappings_scanned": report.mappings_scanned,
+        "unverified_mappings": &report.unverified_mappings[..mappings_shown],
+        "unverified_mapping_count": report.unverified_mappings.len(),
+        "unverified_mappings_omitted": report.unverified_mappings.len() - mappings_shown,
         "issues": report.issues,
         "scope": DELETED_OPEN_SCOPE,
         "recovery": DELETED_OPEN_RECOVERY,
@@ -6526,13 +6531,14 @@ fn print_deleted_open_blame(
     }
     println!("Deleted files still held open:");
     println!(
-        "  {} observed in {} unique file(s); {} processes and {} descriptors inspected{}",
+        "  {} observed in {} unique file(s); {} processes, {} descriptors and {} mappings inspected{}",
         report
             .observed_allocated_bytes
             .map_or_else(|| "unknown allocation".to_string(), format_bytes),
         report.files.len(),
         report.processes_scanned,
         report.descriptors_scanned,
+        report.mappings_scanned,
         if report.complete { "" } else { " (partial)" },
     );
     println!("  {DELETED_OPEN_SCOPE}");
@@ -6545,9 +6551,32 @@ fn print_deleted_open_blame(
             file.inode,
         );
         for holder in &file.holders {
+            let mut references = Vec::new();
+            if let Some(fd) = holder.fd {
+                references.push(format!(
+                    "fd {fd} ({} descriptor(s))",
+                    holder.descriptor_count
+                ));
+            }
+            if holder.executable {
+                references.push("running executable".to_string());
+            }
+            if holder.mapping_count > 0 {
+                references.push(format!(
+                    "{} mapping(s), example {}",
+                    holder.mapping_count,
+                    holder
+                        .representative_mapping
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                ));
+            }
             println!(
-                "    PID {} ({:?}), fd {} ({} descriptor(s)): {:?}",
-                holder.pid, holder.name, holder.fd, holder.descriptor_count, holder.fd_target,
+                "    PID {} ({:?}), {}: {:?}",
+                holder.pid,
+                holder.name,
+                references.join(", "),
+                holder.reference_target,
             );
             if let Some(mount) = &holder.mount_point {
                 println!(
@@ -6561,6 +6590,22 @@ fn print_deleted_open_blame(
     if omitted > 0 {
         println!("\n  {omitted} more observed file(s) omitted by --top; totals include them.");
     }
+    if !report.unverified_mappings.is_empty() {
+        println!("\n  Deleted-looking mappings with unverified allocation (excluded from totals):");
+        for mapping in report.unverified_mappings.iter().take(top) {
+            println!(
+                "    PID {} ({:?}), mapping {}: {:?} ({})",
+                mapping.pid, mapping.name, mapping.mapping_range, mapping.target, mapping.reason,
+            );
+        }
+        let omitted = report.unverified_mappings.len().saturating_sub(top);
+        if omitted > 0 {
+            println!("    {omitted} more unverified mapping(s) omitted by --top.");
+        }
+        println!(
+            "    A deleted-looking name alone cannot prove zero links, file type or allocated bytes."
+        );
+    }
     if !report.issues.is_empty() {
         println!("\n  Coverage issues:");
         for (reason, count) in &report.issues {
@@ -6569,10 +6614,10 @@ fn print_deleted_open_blame(
     }
     if !report.complete {
         println!(
-            "  Uninspected descriptors may retain additional allocation. Root privileges may improve visibility; namespaces and kernel restrictions can still hide holders."
+            "  Unverified or uninspected references may retain additional allocation. Root privileges may improve visibility; namespaces and kernel capability restrictions can still hide holders."
         );
     }
-    if !report.files.is_empty() {
+    if !report.files.is_empty() || !report.unverified_mappings.is_empty() {
         println!("\n  {DELETED_OPEN_RECOVERY}");
     }
 }
@@ -25830,7 +25875,9 @@ mod tests {
             observed_allocated_bytes: Some(12_288),
             processes_scanned: 3,
             descriptors_scanned: 9,
+            mappings_scanned: 12,
             issues: BTreeMap::new(),
+            unverified_mappings: Vec::new(),
             files: vec![
                 DeletedOpenFile {
                     device_id: 5,
@@ -25849,7 +25896,7 @@ mod tests {
             ],
         };
         let value = deleted_open_blame_json(&report, 1, Duration::from_millis(25));
-        assert_eq!(value["schema"], "sbh.deleted_open.v1");
+        assert_eq!(value["schema"], "sbh.deleted_open.v2");
         assert_eq!(value["files"].as_array().unwrap().len(), 1);
         assert_eq!(value["files"][0]["inode"], 7);
         assert_eq!(value["files_omitted"], 1);
@@ -25873,14 +25920,21 @@ mod tests {
             observed_allocated_bytes: Some(0),
             processes_scanned: 2,
             descriptors_scanned: 0,
+            mappings_scanned: 0,
             issues: BTreeMap::from([("permission_denied".to_string(), 2)]),
             files: Vec::new(),
+            unverified_mappings: Vec::new(),
         };
         let partial = deleted_open_blame_json(&report, 25, Duration::ZERO);
         assert_eq!(partial["status"], "incomplete");
         assert_eq!(partial["exit_code"], 4);
         assert_eq!(partial["issues"]["permission_denied"], 2);
-        assert!(partial["scope"].as_str().unwrap().contains("mmap-only"));
+        assert!(
+            partial["scope"]
+                .as_str()
+                .unwrap()
+                .contains("memory mappings")
+        );
 
         report.supported = false;
         report.observed_allocated_bytes = None;
@@ -25890,6 +25944,55 @@ mod tests {
         assert_eq!(unsupported["complete"], false);
         assert!(unsupported["observed_allocated_bytes"].is_null());
         assert_eq!(unsupported["exit_code"], 0);
+    }
+
+    #[test]
+    fn deleted_open_blame_keeps_unverified_mapping_evidence_outside_measured_totals() {
+        use storage_ballast_helper::platform::types::{
+            DeletedOpenFilesReport, UnverifiedDeletedMapping,
+        };
+
+        let mut report = DeletedOpenFilesReport::unsupported();
+        report.supported = true;
+        report.observed_allocated_bytes = Some(0);
+        report.mappings_scanned = 1;
+        report.issues = BTreeMap::from([("mapping_inaccessible".into(), 1)]);
+        report.unverified_mappings.push(UnverifiedDeletedMapping {
+            pid: 42,
+            start_time_ticks: 900,
+            name: "worker".into(),
+            mapping_range: "1000-2000".into(),
+            target: "/tmp/cache (deleted)".into(),
+            target_bytes_hex: "2f746d702f6361636865202864656c6574656429".into(),
+            reason: "mapping_inaccessible".into(),
+        });
+        let value = deleted_open_blame_json(&report, 1, Duration::ZERO);
+        assert_eq!(value["status"], "incomplete");
+        assert_eq!(value["exit_code"], 4);
+        assert_eq!(value["observed_unique_files"], 0);
+        assert_eq!(value["observed_allocated_bytes"], 0);
+        assert_eq!(value["unverified_mapping_count"], 1);
+        assert_eq!(value["unverified_mappings"][0]["pid"], 42);
+        assert_eq!(
+            value["unverified_mappings"][0]["reason"],
+            "mapping_inaccessible"
+        );
+        assert!(
+            value["unverified_mappings"][0]
+                .get("allocated_bytes")
+                .is_none()
+        );
+        let totals_only = deleted_open_blame_json(&report, 0, Duration::ZERO);
+        assert!(totals_only["files"].as_array().unwrap().is_empty());
+        assert!(
+            totals_only["unverified_mappings"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(totals_only["unverified_mapping_count"], 1);
+        assert_eq!(totals_only["unverified_mappings_omitted"], 1);
+        assert_eq!(totals_only["observed_allocated_bytes"], 0);
     }
 
     #[test]
