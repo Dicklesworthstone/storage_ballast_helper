@@ -771,11 +771,14 @@ fn apfs_inventory_from_memory(
     cache: &RwLock<Option<(Instant, ApfsInventory)>>,
     now: Instant,
 ) -> Option<ApfsInventory> {
-    let cached = cache.try_read()?;
-    let (collected_at, inventory) = cached.as_ref()?;
-    now.checked_duration_since(*collected_at)
-        .filter(|age| *age < APFS_CACHE_TTL)
-        .map(|_| inventory.clone())
+    cache
+        .try_read()?
+        .as_ref()
+        .filter(|(collected_at, _)| {
+            now.checked_duration_since(*collected_at)
+                .is_some_and(|age| age < APFS_CACHE_TTL)
+        })
+        .map(|(_, inventory)| inventory.clone())
 }
 
 pub fn apfs_inventory() -> io::Result<ApfsInventory> {

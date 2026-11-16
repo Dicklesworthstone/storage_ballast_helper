@@ -168,7 +168,9 @@ fn filesystem_free_pct(path: &Path, opened: Option<&fs::File>) -> Option<f64> {
         {
             return None;
         }
-        #[allow(clippy::cast_precision_loss)]
+        // statvfs counts are u32 on macOS and u64 on Linux; `f64::from`
+        // does not cover both.
+        #[allow(clippy::cast_precision_loss, clippy::cast_lossless)]
         Some(available as f64 / total as f64 * 100.0)
     }
     #[cfg(not(unix))]

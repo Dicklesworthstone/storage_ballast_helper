@@ -11357,7 +11357,7 @@ impl MonitoringDaemon {
     /// quarantine as through the fresh-candidate executor. A held decision
     /// cannot widen a RAM/inode pass to uncertain artifacts, excluded original
     /// paths or a category suspended since that decision was made.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn authorize_quarantine_resource_record(
         &self,
         tick: &MountTickResponse,

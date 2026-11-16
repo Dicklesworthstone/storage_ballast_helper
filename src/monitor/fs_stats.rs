@@ -143,6 +143,7 @@ impl ObservedDirectory {
 
 /// Read a mount ID from an immediately dropped descriptor. Retaining the
 /// descriptor in queued work would prevent an unconfigured volume ejecting.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
 pub(crate) fn kernel_mount_id_for_path(path: &Path) -> std::io::Result<Option<u64>> {
     #[cfg(target_os = "linux")]
     {

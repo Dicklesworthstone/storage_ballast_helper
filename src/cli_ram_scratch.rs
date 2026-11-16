@@ -63,6 +63,8 @@ struct Report {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum HeadroomSource {
+    // Only the Linux write admission compares host RAM with the boundary.
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     HostAvailable,
     ProcessBoundary,
 }

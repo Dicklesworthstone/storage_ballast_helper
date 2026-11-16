@@ -145,6 +145,13 @@ impl Selection {
     /// probe; a replacement or remount between them must not inherit that
     /// earlier filesystem's authority. Explicit CLI selection needs no such
     /// background-pressure authorization.
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(clippy::unused_self)
+    )]
     pub(crate) fn validate_root_identity(
         &self,
         path: &Path,
