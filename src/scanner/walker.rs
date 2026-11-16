@@ -1821,16 +1821,19 @@ fn process_directory(
         read.dispatch_started = true;
     }
 
-    // Keep ordinary parallel dispatch for small fresh pages. Interrupted
-    // pages and durable oversized windows use child/parent turns, so a queued
-    // boundary child cannot move the window before its result is received.
-    // Admission also bounds pages waiting in the work queue.
-    let serial_window = read.priority.is_some() && next_start.is_some();
+    // A finite, cursor-backed walk must reach a descendant before filling
+    // its work queue with siblings. Waiting for the first cancellation to
+    // switch to child/parent turns repeatedly spends a cold slice on the
+    // breadth-first prefix, and wide pages can evict each other's read-ahead
+    // before any useful deep result reaches the collector. Start those
+    // bounded continuations immediately. Roots and devices still interleave;
+    // a one-shot walk without a cursor retains parallel sibling dispatch.
+    let serial_dispatch = read.priority.is_some();
     if dispatch.is_none()
         && retain_reads
         && depth < config.max_depth
         && !read.children.is_empty()
-        && (serial_window
+        && (serial_dispatch
             || read.dispatch_interrupted.load(Ordering::Relaxed)
             || completion.parent.is_some())
     {
@@ -1855,9 +1858,10 @@ fn process_directory(
                 permit,
                 unfinished: Arc::clone(&windows.unfinished),
             }));
-        } else if serial_window {
-            // Parallel fallback could receive the boundary while earlier
-            // siblings remain queued. Keep this window for another slice.
+        } else if serial_dispatch {
+            // Parallel fallback would reintroduce the unbounded sibling
+            // queue and could receive a window boundary before its earlier
+            // siblings. Keep this page for another finite opportunity.
             results.mark_unfinished(dir_path);
             completion.interrupted = true;
             read.dispatch_interrupted.store(true, Ordering::Relaxed);

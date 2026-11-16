@@ -669,6 +669,77 @@ fn received_leaves(observation: &RestartObservation) -> BTreeSet<PathBuf> {
 }
 
 #[test]
+fn cold_cursor_walks_reach_deep_work_before_spending_the_slice_on_siblings() {
+    const TEST: &str = "cold_cursor_walks_reach_deep_work_before_spending_the_slice_on_siblings";
+    if restart_child_if_requested(TEST) {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let control = base.join("control");
+    let resumed = base.join("resumed");
+    let mut expected = BTreeSet::new();
+    for root in [&control, &resumed] {
+        for index in 0..256 {
+            let branch = root.join(format!("branch-{index:04}"));
+            let group = branch.join("group");
+            let leaf = group.join("leaf");
+            fs::create_dir_all(&leaf).unwrap();
+            fs::write(leaf.join("payload"), b"retained deep work").unwrap();
+            if root == &resumed {
+                expected.extend([branch, group, leaf]);
+            }
+        }
+    }
+
+    // The same finite-work slice on a fresh uncursored walk is spent on
+    // sibling directories before any deep result reaches the collector.
+    // This control and the resumed path use the real production walker.
+    let (breadth_first, unfinished) =
+        finite_slice(slice_config(vec![control]), 24, |entry| entry.depth == 3);
+    assert!(breadth_first.iter().all(|entry| entry.depth < 3));
+    assert!(!unfinished.is_empty());
+
+    let mut request = RestartRequest::new(TEST, &base, vec![resumed]);
+    request.allowance = Some(24);
+    let mut seen = BTreeSet::new();
+    for pass in 0..4 {
+        // Each invocation starts a new process, so no retained name page or
+        // open reader can hide repeated breadth-first work after a restart.
+        let observed = request.run();
+        assert!(!observed.unfinished.is_empty(), "{observed:?}");
+        let leaves = received_leaves(&observed);
+        assert_eq!(leaves.len(), 1, "{observed:?}");
+        assert!(
+            leaves.iter().all(|leaf| expected.contains(leaf)),
+            "a scheduling priority must not widen the configured scope"
+        );
+        seen.extend(leaves);
+        assert_eq!(seen.len(), pass + 1, "each slice must reach fresh deep work");
+        assert!(observed.saved_positions > 0, "{observed:?}");
+        if pass > 0 {
+            assert!(observed.restored_positions > 0, "{observed:?}");
+        }
+    }
+
+    // The scheduling choice changes neither a complete walk's path set
+    // nor its one-result-per-directory contract.
+    request.allowance = None;
+    let complete = request.run();
+    let actual: BTreeSet<_> = complete
+        .received
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect();
+    assert!(complete.unfinished.is_empty(), "{complete:?}");
+    assert_eq!(complete.received.len(), actual.len());
+    assert_eq!(actual, expected);
+    for leaf in actual.iter().filter(|path| path.ends_with("leaf")) {
+        assert_eq!(fs::read(leaf.join("payload")).unwrap(), b"retained deep work");
+    }
+}
+
+#[test]
 fn finite_recursive_dispatch_reaches_deep_targets_across_process_restarts() {
     const TEST: &str = "finite_recursive_dispatch_reaches_deep_targets_across_process_restarts";
     if restart_child_if_requested(TEST) {
