@@ -5117,7 +5117,7 @@ mod tests {
         assert_eq!(
             mount_write_state_in(
                 "1 1 0:1 / / rw - ext4 /dev/root rw\n",
-                Path::new("/target")
+                Path::new("/target"),
             ),
             Some(MountWriteState::Writable)
         );
@@ -5145,9 +5145,7 @@ mod tests {
                 "{malformed}"
             );
         }
-        assert!(
-            MountTable::parse("2 99 0:1 / /orphan rw - ext4 /dev/root rw\n").is_none()
-        );
+        assert!(MountTable::parse("2 99 0:1 / /orphan rw - ext4 /dev/root rw\n").is_none());
     }
 
     #[cfg(unix)]

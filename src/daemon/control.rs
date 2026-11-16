@@ -795,32 +795,22 @@ pub fn request(
 
 /// Persist `[policy] initial_mode = <mode>` so a promotion survives restarts.
 ///
-/// The existing file is copied to `<config>.bak-<stamp>` first, the
-/// rewritten file must still load, and the backup path comes back (`None`
-/// when no config file existed yet).
+/// The rewritten file must still load before publication. A unique backup
+/// preserves the existing file, and its path comes back (`None` when no
+/// config file existed yet).
 pub fn persist_policy_mode(config_path: &Path, mode: &str) -> Result<Option<PathBuf>> {
     let io = |path: &Path, source: std::io::Error| SbhError::Io {
         path: path.to_path_buf(),
         source,
     };
-    let (mut document, backup) = if config_path.exists() {
+    let mut document: toml::Value = if config_path.exists() {
         let raw = std::fs::read_to_string(config_path).map_err(|e| io(config_path, e))?;
-        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-        let backup = config_path.with_file_name(format!(
-            "{}.bak-{stamp}",
-            config_path.file_name().map_or_else(
-                || "config.toml".to_string(),
-                |name| name.to_string_lossy().into_owned()
-            )
-        ));
-        std::fs::write(&backup, &raw).map_err(|e| io(&backup, e))?;
-        let document: toml::Value = toml::from_str(&raw).map_err(|e| SbhError::Serialization {
+        toml::from_str(&raw).map_err(|e| SbhError::Serialization {
             context: "config",
             details: e.to_string(),
-        })?;
-        (document, Some(backup))
+        })?
     } else {
-        (toml::Value::Table(toml::map::Map::new()), None)
+        toml::Value::Table(toml::map::Map::new())
     };
     let table = document
         .as_table_mut()
@@ -845,19 +835,21 @@ pub fn persist_policy_mode(config_path: &Path, mode: &str) -> Result<Option<Path
         context: "config",
         details: e.to_string(),
     })?;
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
-    }
-    let temp = config_path.with_extension("toml.tmp");
-    std::fs::write(&temp, &rendered).map_err(|e| io(&temp, e))?;
-    if let Err(error) = crate::core::config::Config::load(Some(&temp)) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(SbhError::Runtime {
-            details: format!("refusing to write a config that does not load: {error}"),
-        });
-    }
-    std::fs::rename(&temp, config_path).map_err(|e| io(config_path, e))?;
-    Ok(backup)
+    crate::core::config::write_config_atomic(config_path, &rendered, |staged| {
+        let raw = std::fs::read_to_string(staged)?;
+        crate::core::config::Config::validate_for_write(config_path, &raw)
+            .map(|_| ())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            SbhError::Runtime {
+                details: format!("refusing to write a config that does not load: {error}"),
+            }
+        } else {
+            io(config_path, error)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1116,6 +1108,34 @@ mod tests {
     }
 
     #[test]
+    fn persist_policy_mode_leaves_a_legacy_temp_symlink_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        let unrelated = temp.path().join("unrelated.txt");
+        std::fs::write(&config, "[policy]\ninitial_mode = \"observe\"\n").unwrap();
+        std::fs::write(&unrelated, "keep this data").unwrap();
+        let legacy_temp = config.with_extension("toml.tmp");
+        std::os::unix::fs::symlink(&unrelated, &legacy_temp).unwrap();
+
+        let backup = persist_policy_mode(&config, "canary").unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "keep this data");
+        assert!(
+            std::fs::symlink_metadata(&legacy_temp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::read_to_string(backup)
+                .unwrap()
+                .contains("initial_mode = \"observe\"")
+        );
+        let previous = std::fs::read(&config).unwrap();
+        assert!(persist_policy_mode(&config, "invalid-mode").is_err());
+        assert_eq!(std::fs::read(&config).unwrap(), previous);
+    }
+
+    #[test]
     fn persist_policy_mode_backs_up_and_rewrites_only_the_policy_table() {
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("config.toml");
@@ -1141,6 +1161,19 @@ mod tests {
         assert_eq!(
             loaded.policy.initial_mode,
             crate::daemon::policy::ActiveMode::Canary
+        );
+
+        let next_backup = persist_policy_mode(&config, "enforce").unwrap().unwrap();
+        assert_ne!(backup, next_backup);
+        assert!(
+            std::fs::read_to_string(&backup)
+                .unwrap()
+                .contains("initial_mode = \"observe\"")
+        );
+        assert!(
+            std::fs::read_to_string(&next_backup)
+                .unwrap()
+                .contains("initial_mode = \"canary\"")
         );
 
         let fresh = temp.path().join("new").join("config.toml");

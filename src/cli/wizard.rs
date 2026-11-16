@@ -690,7 +690,8 @@ fn read_line<R: BufRead>(reader: &mut R) -> io::Result<String> {
 
 /// Generate and write the config file from wizard answers.
 ///
-/// Returns the path where config was written.
+/// Returns the path where config was written. A replaced file is retained in
+/// a unique backup beside the destination.
 pub fn write_config(answers: &WizardAnswers, config_path: &Path) -> io::Result<PathBuf> {
     let mut config = answers.to_config();
     config.paths.config_file = config_path.to_path_buf();
@@ -701,12 +702,12 @@ pub fn write_config(answers: &WizardAnswers, config_path: &Path) -> io::Result<P
         )
     })?;
 
-    // Create parent directories.
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    std::fs::write(config_path, toml_str)?;
+    crate::core::config::write_config_atomic(config_path, &toml_str, |staged| {
+        let raw = std::fs::read_to_string(staged)?;
+        Config::validate_for_write(config_path, &raw)
+            .map(|_| ())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    })?;
     Ok(config_path.to_path_buf())
 }
 
@@ -1398,6 +1399,13 @@ mod tests {
         let contents = std::fs::read_to_string(&config_path).unwrap();
         assert!(!contents.contains("old content"), "should overwrite");
         assert!(contents.contains("[scanner]"));
+        let backups: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "bak"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), "old content");
     }
 
     // bd-2j5.19 — WizardAnswers serialization

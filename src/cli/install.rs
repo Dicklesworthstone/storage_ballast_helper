@@ -206,10 +206,16 @@ pub fn run_install_sequence_with_bundle(
             report.config_path = Some(config_path.clone());
         }
     } else if opts.dry_run {
+        if std::fs::symlink_metadata(config_path).is_ok() {
+            report.step_plan(format!("Back up existing config: {}", config_path.display()));
+        }
         report.step_plan(format!("Write config: {}", config_path.display()));
     } else {
         match write_config(&config, config_path) {
-            Ok(()) => {
+            Ok(backup) => {
+                if let Some(backup) = backup {
+                    report.step_ok(format!("Backed up config: {}", backup.display()));
+                }
                 report.step_ok(format!("Wrote config: {}", config_path.display()));
                 report.config_path = Some(config_path.clone());
             }
@@ -416,7 +422,7 @@ fn run_bundle_preflight(
     }
 }
 
-fn write_config(config: &Config, path: &Path) -> std::io::Result<()> {
+fn write_config(config: &Config, path: &Path) -> std::io::Result<Option<PathBuf>> {
     let toml_str = toml::to_string_pretty(config).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -424,15 +430,12 @@ fn write_config(config: &Config, path: &Path) -> std::io::Result<()> {
         )
     })?;
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Atomic write: temp file + rename prevents partial config on crash.
-    let tmp_path = path.with_extension("toml.tmp");
-    std::fs::write(&tmp_path, toml_str)?;
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+    crate::core::config::write_config_atomic(path, &toml_str, |staged| {
+        let raw = std::fs::read_to_string(staged)?;
+        Config::validate_for_write(path, &raw)
+            .map(|_| ())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -797,6 +800,52 @@ mod tests {
         assert_eq!(written.ballast.file_size_bytes, 4096);
         assert_eq!(written.paths.ballast_dir, requested_ballast_dir);
         assert_eq!(opts.config.paths.ballast_dir, config.paths.ballast_dir);
+    }
+
+    #[test]
+    fn install_reconfiguration_reports_and_retains_the_original_backup() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.paths.config_file = tmp.path().join("config.toml");
+        config.paths.state_file = tmp.path().join("data/state.json");
+        config.paths.ballast_dir = tmp.path().join("ballast");
+        config.ballast.auto_provision = false;
+        let original = format!(
+            "# Keep a recovery copy of these settings.\n{}",
+            toml::to_string_pretty(&config).unwrap()
+        );
+        std::fs::write(&config.paths.config_file, &original).unwrap();
+        let mut opts = InstallOptions {
+            ballast_count: 2,
+            ballast_size_bytes: config.ballast.file_size_bytes,
+            config: config.clone(),
+            ballast_path: None,
+            preserve_existing_config: false,
+            dry_run: true,
+        };
+        let preview = run_install_sequence(&opts);
+        assert!(preview.success, "{preview:?}");
+        assert!(preview.steps.iter().any(|step| {
+            step.description.starts_with("Back up existing config:") && !step.done
+        }));
+        assert_eq!(
+            std::fs::read_to_string(&config.paths.config_file).unwrap(),
+            original
+        );
+
+        opts.dry_run = false;
+        let report = run_install_sequence(&opts);
+        assert!(report.success, "{report:?}");
+        let backup = report
+            .steps
+            .iter()
+            .find_map(|step| step.description.strip_prefix("Backed up config: "))
+            .expect("completed install must report its recovery copy");
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+        let written: Config =
+            toml::from_str(&std::fs::read_to_string(&config.paths.config_file).unwrap()).unwrap();
+        assert_eq!(written.ballast.file_count, 2);
+        assert!(!config.paths.ballast_dir.exists());
     }
 
     #[test]

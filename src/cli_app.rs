@@ -7682,6 +7682,7 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
     // a tuning run that writes a file the daemon ignores is worse than no
     // tuning run, because it reports success.
     let config_path = Config::resolve_config_write_path(cli.config.as_deref()).path;
+    let mut config_backup_path = None;
     if !config_recs.is_empty() {
         let mut toml_value: toml::Value = if config_path.exists() {
             let raw = std::fs::read_to_string(&config_path)
@@ -7693,14 +7694,19 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
         for rec in &config_recs {
             set_toml_value(&mut toml_value, &rec.config_key, &rec.suggested_value)?;
         }
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| CliError::Runtime(format!("create config dir: {e}")))?;
-        }
         let toml_str = toml::to_string_pretty(&toml_value)
             .map_err(|e| CliError::Runtime(format!("serialize config: {e}")))?;
-        std::fs::write(&config_path, &toml_str)
-            .map_err(|e| CliError::Runtime(format!("write config: {e}")))?;
+        config_backup_path = storage_ballast_helper::core::config::write_config_atomic(
+            &config_path,
+            &toml_str,
+            |staged| {
+                let raw = std::fs::read_to_string(staged)?;
+                Config::validate_for_write(&config_path, &raw)
+                    .map(|_| ())
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            },
+        )
+        .map_err(|e| CliError::Runtime(format!("write config: {e}")))?;
     }
 
     // Apply kernel-writeback tuning (root-gated; never touches config.toml).
@@ -7734,6 +7740,9 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
                     );
                 }
                 println!("Config updated: {}", config_path.display());
+                if let Some(backup) = &config_backup_path {
+                    println!("  Backup: {}", backup.display());
+                }
             }
             if let Some(report) = &writeback_report {
                 println!("Applied kernel writeback tuning:");
@@ -7797,6 +7806,7 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
                 "applied": changes.len(),
                 "changes": changes,
                 "config_path": config_path.to_string_lossy(),
+                "config_backup_path": config_backup_path,
                 "writeback": writeback_json,
                 "writeback_skipped": writeback_skipped,
             });
@@ -7809,6 +7819,8 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
 
 #[allow(clippy::too_many_lines)]
 fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
+    use storage_ballast_helper::core::config::write_config_atomic;
+
     match &args.command {
         None | Some(ConfigCommand::Path) => {
             // The same resolver `Config::load` uses, so `config path` and
@@ -7975,19 +7987,17 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
             let resolved = Config::resolve_config_write_path(cli.config.as_deref());
             let config_path = resolved.path.clone();
 
-            if let Some(parent) = config_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| CliError::Runtime(format!("create config dir: {e}")))?;
-            }
-
             let toml_str = toml::to_string_pretty(&defaults)
                 .map_err(|e| CliError::Runtime(format!("serialize default config: {e}")))?;
-            std::fs::write(&config_path, &toml_str)
+            let backup_path = write_config_atomic(&config_path, &toml_str, |_| Ok(()))
                 .map_err(|e| CliError::Runtime(format!("write config: {e}")))?;
 
             match output_mode(cli) {
                 OutputMode::Human => {
                     println!("Reset config to defaults: {}", config_path.display());
+                    if let Some(backup) = &backup_path {
+                        println!("  Backup: {}", backup.display());
+                    }
                     println!("  ({})", resolved.reason);
                     if let Some(shadowed) = &resolved.shadowed_user_config {
                         println!(
@@ -8000,6 +8010,7 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
                     let payload = json!({
                         "command": "config reset",
                         "path": config_path.to_string_lossy(),
+                        "backup_path": backup_path,
                         "path_source": resolved.source,
                         "reason": resolved.reason,
                         "shadowed_user_config": resolved.shadowed_user_config,
@@ -8030,28 +8041,22 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
             let toml_str = toml::to_string_pretty(&toml_value)
                 .map_err(|e| CliError::Runtime(format!("serialize config: {e}")))?;
 
-            // Validate BEFORE writing: write to a temp file, validate from it,
-            // then atomically rename to the real path.  This prevents a race
-            // where a daemon SIGHUP reload picks up an invalid config between
-            // the write and the validate step.
-            if let Some(parent) = config_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| CliError::Runtime(format!("create config dir: {e}")))?;
-            }
-            let tmp_path = config_path.with_extension("toml.tmp");
-            std::fs::write(&tmp_path, &toml_str)
-                .map_err(|e| CliError::Runtime(format!("write temp config: {e}")))?;
-
-            if let Err(e) = Config::load(Some(&tmp_path)) {
-                let _ = std::fs::remove_file(&tmp_path);
-                return Err(CliError::User(format!(
-                    "refusing to write invalid config: {e}"
-                )));
-            }
-
-            // Validation passed — atomically replace the real config.
-            std::fs::rename(&tmp_path, &config_path)
-                .map_err(|e| CliError::Runtime(format!("rename config: {e}")))?;
+            // Validate this invocation's exclusively created staging file in
+            // the real destination's context, then publish the complete file.
+            // A unique backup retains the configuration being replaced.
+            let backup_path = write_config_atomic(&config_path, &toml_str, |staged| {
+                let raw = std::fs::read_to_string(staged)?;
+                Config::validate_for_write(&config_path, &raw)
+                    .map(|_| ())
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            })
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::InvalidData {
+                    CliError::User(format!("refusing to write invalid config: {error}"))
+                } else {
+                    CliError::Runtime(format!("write config: {error}"))
+                }
+            })?;
 
             // A changed root/ballast/data path must also be writable inside
             // the systemd sandbox, or the daemon will report every deletion
@@ -8066,6 +8071,9 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
                         set_args.value,
                         config_path.display()
                     );
+                    if let Some(backup) = &backup_path {
+                        println!("  Backup: {}", backup.display());
+                    }
                     println!("  ({})", resolved.reason);
                     if let Some(shadowed) = &resolved.shadowed_user_config {
                         println!(
@@ -8083,6 +8091,7 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
                         "key": set_args.key,
                         "value": set_args.value,
                         "path": config_path.to_string_lossy(),
+                        "backup_path": backup_path,
                         "path_source": resolved.source,
                         "reason": resolved.reason,
                         "shadowed_user_config": resolved.shadowed_user_config,

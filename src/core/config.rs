@@ -2300,10 +2300,26 @@ impl Config {
         Self::load_with_default_paths(path, PathsConfig::default(), true)
     }
 
+    /// Validate replacement text with the destination's normal defaults,
+    /// environment overrides and supplemental protection file, without writing.
+    /// Staging filenames must not change the configuration being validated.
+    pub fn validate_for_write(path: &Path, raw: &str) -> Result<Self> {
+        Self::load_with_default_paths_from(Some(path), PathsConfig::default(), true, Some(raw))
+    }
+
     fn load_with_default_paths(
         path: Option<&Path>,
         default_paths: PathsConfig,
         allow_system_fallback: bool,
+    ) -> Result<Self> {
+        Self::load_with_default_paths_from(path, default_paths, allow_system_fallback, None)
+    }
+
+    fn load_with_default_paths_from(
+        path: Option<&Path>,
+        default_paths: PathsConfig,
+        allow_system_fallback: bool,
+        candidate: Option<&str>,
     ) -> Result<Self> {
         // Which file: `--config`, then `SBH_CONFIG`, then the implicit choice
         // (a regular user without a per-user config reads the system config so
@@ -2324,11 +2340,17 @@ impl Config {
         let announce_system_fallback = resolved.source == ConfigPathSource::SystemFallback;
         let effective_path = resolved.path;
 
-        let mut cfg = if effective_path.exists() {
-            let raw = fs::read_to_string(&effective_path).map_err(|source| SbhError::Io {
-                path: effective_path.clone(),
-                source,
-            })?;
+        let raw = match candidate {
+            Some(raw) => Some(raw.to_string()),
+            None if effective_path.exists() => {
+                Some(fs::read_to_string(&effective_path).map_err(|source| SbhError::Io {
+                    path: effective_path.clone(),
+                    source,
+                })?)
+            }
+            None => None,
+        };
+        let mut cfg = if let Some(raw) = raw {
             let raw_value: toml::Value = toml::from_str(&raw)?;
             let (mut parsed, unknown_keys) = parse_config_lenient(&raw)?;
             parsed.unknown_keys = unknown_keys;
@@ -3393,6 +3415,272 @@ pub fn load_sacred_config(path: &Path) -> Result<SacredConfig> {
     Ok(sacred)
 }
 
+/// Publish a complete configuration from an exclusively created sibling file.
+///
+/// The validator runs before replacement. An existing regular file is copied
+/// to a unique, synced backup, whose path is returned; its permissions and Unix
+/// ownership are retained. Existing symlinks keep pointing at their resolved
+/// regular-file target. Dangling links and non-file destinations are refused.
+///
+/// Each writer owns its staging file, so concurrent invocations cannot publish
+/// one another's unvalidated bytes. The conflict check is best-effort: this is
+/// atomic publication, not a compare-and-swap against arbitrary external edits.
+pub fn write_config_atomic<F>(
+    path: &Path,
+    contents: &str,
+    validate: F,
+) -> std::io::Result<Option<PathBuf>>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    use std::io::Write as _;
+
+    let destination = config_write_destination(path)?;
+    let original = config_file_snapshot(&destination)?;
+    let mut staged = ConfigWriteFile::create(
+        &destination,
+        "tmp",
+        original.as_ref().map(|(metadata, _)| metadata),
+    )?;
+    staged.file.write_all(contents.as_bytes())?;
+    if let Some((metadata, _)) = &original {
+        // Writing can clear Unix set-ID bits; restore the final mode afterwards.
+        preserve_config_permissions(&staged.file, metadata)?;
+    }
+    staged.file.sync_all()?;
+    validate(&staged.path)?;
+
+    // Catch a replaced staging pathname before publishing anything. This also
+    // refuses validators that replace the staged file rather than inspecting it.
+    if !staged.is_bound()
+        || config_file_snapshot(&staged.path)?
+            .is_none_or(|(_, bytes)| bytes != contents.as_bytes())
+    {
+        return Err(std::io::Error::other(
+            "staged configuration changed before publication",
+        ));
+    }
+    // Do not overwrite an edit or a retargeted link observed during validation.
+    // An unrelated writer can still race the final rename; there is no CAS here.
+    let current = config_file_snapshot(&destination)?;
+    let unchanged = match (&original, &current) {
+        (None, None) => true,
+        (Some((before, old)), Some((after, new))) => {
+            same_config_file(before, after) && old == new
+        }
+        _ => false,
+    };
+    if !unchanged || config_write_destination(path)? != destination {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "configuration changed while preparing the update; retry with the current file",
+        ));
+    }
+
+    let backup = if let Some((metadata, bytes)) = &original {
+        let mut backup = ConfigWriteFile::create(&destination, "bak", Some(metadata))?;
+        backup.file.write_all(bytes)?;
+        preserve_config_permissions(&backup.file, metadata)?;
+        backup.file.sync_all()?;
+        let backup_path = backup.path.clone();
+        // From here on, even a failed publication retains this recovery copy.
+        backup.retain = true;
+        Some(backup_path)
+    } else {
+        None
+    };
+
+    #[cfg(unix)]
+    let directory = fs::File::open(destination.parent().ok_or_else(|| {
+        std::io::Error::other("configuration has no parent directory")
+    })?)?;
+    #[cfg(unix)]
+    directory.sync_all()?;
+
+    fs::rename(&staged.path, &destination)?;
+    staged.retain = true;
+    #[cfg(unix)]
+    if let Err(error) = directory.sync_all() {
+        let recovery = backup.as_ref().map_or_else(
+            || "no previous configuration existed".to_string(),
+            |backup| format!("backup retained at {}", backup.display()),
+        );
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "configuration was published at {}, but directory durability could not be \
+                 confirmed: {error}; {recovery}",
+                destination.display()
+            ),
+        ));
+    }
+    Ok(backup)
+}
+
+fn config_write_destination(path: &Path) -> std::io::Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "configuration destination must name a file",
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let destination = fs::canonicalize(parent)?.join(name);
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(&destination),
+        Ok(metadata) if !metadata.is_file() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("configuration is not a regular file: {}", path.display()),
+        )),
+        Ok(_) => Ok(destination),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(destination),
+        Err(error) => Err(error),
+    }
+}
+
+fn config_file_snapshot(path: &Path) -> std::io::Result<Option<(fs::Metadata, Vec<u8>)>> {
+    use std::io::Read as _;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Refuse a symlink or FIFO swapped in after destination resolution.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("configuration is not a regular file: {}", path.display()),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some((metadata, bytes)))
+}
+
+fn preserve_config_permissions(file: &fs::File, metadata: &fs::Metadata) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let staged = file.metadata()?;
+        if staged.uid() != metadata.uid() || staged.gid() != metadata.gid() {
+            nix::unistd::fchown(
+                file,
+                Some(nix::unistd::Uid::from_raw(metadata.uid())),
+                Some(nix::unistd::Gid::from_raw(metadata.gid())),
+            )?;
+        }
+    }
+    file.set_permissions(metadata.permissions())
+}
+
+fn same_config_file(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.uid() == after.uid()
+            && before.gid() == after.gid()
+            && before.mode() == after.mode()
+    }
+    #[cfg(not(unix))]
+    {
+        before.is_file() == after.is_file()
+            && before.len() == after.len()
+            && before.created().ok() == after.created().ok()
+            && before.modified().ok() == after.modified().ok()
+            && before.permissions() == after.permissions()
+    }
+}
+
+struct ConfigWriteFile {
+    path: PathBuf,
+    file: fs::File,
+    retain: bool,
+}
+
+impl ConfigWriteFile {
+    fn create(
+        destination: &Path,
+        kind: &str,
+        original: Option<&fs::Metadata>,
+    ) -> std::io::Result<Self> {
+        let name = destination.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "configuration destination must name a file",
+            )
+        })?;
+        for _ in 0..32 {
+            let mut temporary_name = name.to_os_string();
+            temporary_name.push(format!(
+                ".sbh-{}-{:032x}.{kind}",
+                std::process::id(),
+                rand::random::<u128>()
+            ));
+            let path = destination.with_file_name(temporary_name);
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                // New configurations keep the ordinary file-creation umask.
+                // Existing files start private until their owner/mode is set.
+                options.mode(if original.is_some() { 0o600 } else { 0o666 });
+            }
+            match options.open(&path) {
+                Ok(file) => {
+                    let staged = Self {
+                        path,
+                        file,
+                        retain: false,
+                    };
+                    if let Some(metadata) = original {
+                        preserve_config_permissions(&staged.file, metadata)?;
+                    }
+                    return Ok(staged);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique configuration staging file",
+        ))
+    }
+
+    fn is_bound(&self) -> bool {
+        self.file.metadata().ok().is_some_and(|opened| {
+            fs::symlink_metadata(&self.path)
+                .ok()
+                .is_some_and(|named| named.is_file() && same_config_file(&opened, &named))
+        })
+    }
+}
+
+impl Drop for ConfigWriteFile {
+    fn drop(&mut self) {
+        if !self.retain && self.is_bound() {
+            // Remove only our own exclusively created staging inode.
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 pub fn write_sacred_config(path: &Path, sacred: &SacredConfig) -> Result<()> {
     let mut normalized = sacred.clone();
     normalized.normalize();
@@ -3564,6 +3852,240 @@ mod tests {
         ScannerEngineMode, add_root_unless_covered, load_sacred_config, sacred_config_path_for,
         write_sacred_config,
     };
+
+    #[test]
+    fn atomic_config_write_preserves_original_in_unique_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, b"# operator settings\n").unwrap();
+        let backup = super::write_config_atomic(&path, "config_version = 2\n", |staged| {
+            assert_ne!(staged, path.as_path());
+            assert_eq!(std::fs::read(&path).unwrap(), b"# operator settings\n");
+            assert_eq!(std::fs::read(staged).unwrap(), b"config_version = 2\n");
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"config_version = 2\n");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"# operator settings\n");
+        let next = super::write_config_atomic(&path, "# replacement\n", |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert_ne!(backup, next);
+        assert_eq!(std::fs::read(&backup).unwrap(), b"# operator settings\n");
+        assert_eq!(std::fs::read(&next).unwrap(), b"config_version = 2\n");
+    }
+
+    #[test]
+    fn atomic_config_write_keeps_failed_validation_and_concurrent_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "original").unwrap();
+        let error = super::write_config_atomic(&path, "candidate", |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid configuration",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        let error = super::write_config_atomic(&path, "candidate", |_| {
+            std::fs::write(&path, "edited while validating")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "edited while validating"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_config_write_refuses_modified_staging_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "original").unwrap();
+        assert!(
+            super::write_config_atomic(&path, "validated", |staged| {
+                std::fs::write(staged, "unvalidated replacement")
+            })
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_config_write_uses_independent_staging_for_concurrent_writers() {
+        use std::sync::{Arc, Barrier, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "original").unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let staged_paths = Arc::new(Mutex::new(Vec::new()));
+        let outcomes = std::thread::scope(|scope| {
+            let handles: Vec<_> = ["first candidate", "second candidate"]
+                .into_iter()
+                .map(|contents| {
+                    let path = &path;
+                    let barrier = Arc::clone(&barrier);
+                    let staged_paths = Arc::clone(&staged_paths);
+                    scope.spawn(move || {
+                        super::write_config_atomic(path, contents, |staged| {
+                            staged_paths.lock().unwrap().push(staged.to_path_buf());
+                            barrier.wait();
+                            assert_eq!(std::fs::read_to_string(staged).unwrap(), contents);
+                            Ok(())
+                        })
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let paths = staged_paths.lock().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_ne!(paths[0], paths[1]);
+        assert!(outcomes.iter().any(Result::is_ok));
+        for outcome in outcomes {
+            match outcome {
+                Ok(Some(backup)) => {
+                    assert_eq!(std::fs::read_to_string(backup).unwrap(), "original");
+                }
+                Ok(None) => panic!("an existing file must be backed up"),
+                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
+            }
+        }
+        assert!(matches!(
+            std::fs::read_to_string(&path).unwrap().as_str(),
+            "first candidate" | "second candidate"
+        ));
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_config_write_preserves_links_permissions_and_unrelated_tmp_targets() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let victim = dir.path().join("unrelated.txt");
+        std::fs::write(&path, "original").unwrap();
+        std::fs::write(&victim, "leave alone").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&victim, path.with_extension("toml.tmp")).unwrap();
+        let original = std::fs::metadata(&path).unwrap();
+        let backup = super::write_config_atomic(&path, "replacement", |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        for preserved in [&path, &backup] {
+            let metadata = std::fs::metadata(preserved).unwrap();
+            assert_eq!(metadata.mode() & 0o777, 0o640);
+            assert_eq!(metadata.uid(), original.uid());
+            assert_eq!(metadata.gid(), original.gid());
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "leave alone");
+        assert!(
+            std::fs::symlink_metadata(path.with_extension("toml.tmp"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let alias = dir.path().join("linked.toml");
+        symlink(&path, &alias).unwrap();
+        let linked_backup = super::write_config_atomic(&alias, "through link", |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "through link");
+        assert_eq!(std::fs::read_to_string(linked_backup).unwrap(), "replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_config_write_refuses_dangling_links_and_non_file_destinations() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("missing.toml");
+        let dangling = dir.path().join("dangling.toml");
+        symlink(&absent, &dangling).unwrap();
+        assert!(super::write_config_atomic(&dangling, "new", |_| Ok(())).is_err());
+        assert!(!absent.exists());
+        assert!(
+            std::fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let directory = dir.path().join("not-a-file");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("keep"), "untouched").unwrap();
+        assert!(super::write_config_atomic(&directory, "new", |_| Ok(())).is_err());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("keep")).unwrap(),
+            "untouched"
+        );
+    }
+
+    #[test]
+    fn replacement_validation_uses_destination_without_changing_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = "[ballast]\nauto_provision = false\n";
+        let cfg = Config::validate_for_write(&path, raw).unwrap();
+        assert_eq!(cfg.paths.config_file, path);
+        assert!(!cfg.ballast.auto_provision);
+        assert!(!path.exists());
+
+        std::fs::write(&path, "original").unwrap();
+        assert!(Config::validate_for_write(&path, "[ballast]\nfile_count = 0\n").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_validation_keeps_the_symlink_destinations_sacred_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings");
+        let links = dir.path().join("links");
+        std::fs::create_dir(&settings).unwrap();
+        std::fs::create_dir(&links).unwrap();
+        let target = settings.join("config.toml");
+        let alias = links.join("config.toml");
+        std::fs::write(&target, "# previous configuration\n").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let protected = dir.path().join("protected").to_string_lossy().into_owned();
+        let sacred = SacredConfig {
+            protected_paths: vec![protected.clone()],
+        };
+        write_sacred_config(&sacred_config_path_for(&alias), &sacred).unwrap();
+        // The daemon loads the overlay beside the named config, not its target.
+        std::fs::write(sacred_config_path_for(&target), "not valid TOML").unwrap();
+        let cfg =
+            Config::validate_for_write(&alias, "[ballast]\nauto_provision = false\n").unwrap();
+        assert_eq!(cfg.paths.config_file, alias);
+        assert!(cfg.scanner.protected_paths.contains(&protected));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "# previous configuration\n"
+        );
+    }
 
     #[test]
     fn source_root_opt_in_defaults_false_and_is_a_known_roundtrippable_key() {
