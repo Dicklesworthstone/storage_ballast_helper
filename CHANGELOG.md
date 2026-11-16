@@ -6,6 +6,16 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+### Fixed
+
+- **One APFS container is one filesystem on macOS.** The daemon always
+  watches the system root, and on macOS `/` is the sealed, read-only system
+  volume, which reports the same container free space as the Data volume.
+  A full container therefore produced a second predictive warning for the
+  same space and, every alert interval, a critical "nothing sbh can reclaim
+  on /" notice (191 of them on one Mac under v0.7.15). The writable Data
+  volume now stands for the system root on macOS.
+
 ## v0.7.16 **[release]**
 
 Compare: [`v0.7.15...v0.7.16`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.15...v0.7.16)
