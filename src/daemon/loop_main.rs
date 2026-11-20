@@ -5646,7 +5646,9 @@ impl MonitoringDaemon {
     }
 
     fn prime_filesystem_observations(&self) {
-        for path in std::iter::once(Path::new("/"))
+        // Prime the system root as check_pressure observes it.
+        let system_root = system_root_observation_path();
+        for path in std::iter::once(system_root.as_path())
             .chain(self.config.scanner.root_paths.iter().map(PathBuf::as_path))
             .chain(
                 self.special_locations
@@ -7922,7 +7924,8 @@ impl MonitoringDaemon {
                 .scanner
                 .root_paths
                 .iter()
-                .filter(|path| **path != system_root)
+                // A configured `/` is the sealed system volume on macOS.
+                .filter(|path| **path != system_root && path.as_path() != Path::new("/"))
                 .cloned(),
         );
         // A failed nested filesystem can be outside the ordinary observation
@@ -19814,10 +19817,6 @@ mod tests {
         tick
     }
 
-    /// Three independent mock mounts under one temporary directory. No host
-    /// reserve path resolves to them, and maintenance cannot mask a predictive
-    /// dispatch. Scanner/executor threads are never started.
-    #[cfg(unix)]
     /// One APFS container is one pressured filesystem. On macOS the sealed
     /// `/` reports the same free space as the Data volume, so observing both
     /// sent two predictive warnings for one container and, because no root
@@ -19872,6 +19871,10 @@ mod tests {
         assert_eq!(observed, vec![expected]);
     }
 
+    /// Three independent mock mounts under one temporary directory. No host
+    /// reserve path resolves to them, and maintenance cannot mask a predictive
+    /// dispatch. Scanner/executor threads are never started.
+    #[cfg(unix)]
     fn green_predictive_fixture() -> (RegretDaemonFixture, [PathBuf; 3]) {
         use crate::core::config::PathsConfig;
 
