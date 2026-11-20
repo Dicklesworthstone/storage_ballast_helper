@@ -66,18 +66,19 @@ filesystem.
   on /" notice (191 of them on one Mac under v0.7.15). The writable Data
   volume now stands for the system root on macOS.
 - **A pressure tick after a long sleep no longer fails on expired
-  observations.** Filesystem observations are refreshed when the daemon
-  asks for them and expire after twice the poll interval, while the tick
-  throttle and CPU budget sleep 15-60 s. The first tick after such a sleep
-  found every observation expired, failed with "no filesystem stats
-  available for any root path", and withdrew pressure authority, which
-  revoked every target-only pass in flight. On one Mac that happened once
-  a minute, and every 14 s while its build SSD was Critical, so the
-  target-only tier deleted nothing. A tick now waits up to 2 s for the
-  refreshes it started. It does not wait on a probe still stalled from an
-  earlier tick. When a tick does fail, it names each path's error. On macOS
-  the Data volume, which stands for the system root, also keeps the probe
-  worker reserved for the system root (bd-8x8n).
+  observations.** Filesystem observations are refreshed when the daemon asks
+  for them and expire after twice the poll interval, while the tick throttle
+  and CPU budget sleep 15-60 s. The first tick after such a sleep found
+  every observation expired, failed with "no filesystem stats available for
+  any root path", and withdrew pressure authority, which revoked every
+  target-only pass in flight. On one Mac that happened once a minute, and
+  every 14 s while its build SSD was Critical, so the target-only tier
+  deleted nothing. A tick now waits up to 2 s for the first refresh it
+  starts for each path. It does not wait on a probe still stalled from an
+  earlier tick, and the wait does not count toward the tick throttle's
+  slow-tick backoff. When a tick does fail, it names each path's error. On
+  macOS the Data volume, which stands for the system root, also keeps the
+  probe worker reserved for the system root (bd-8x8n).
 - **Deletion refuses incomplete containment evidence.** A repository or
   protection-marker walk that cannot open a directory, read an entry or
   its type, or read a Git file now retains the candidate instead of

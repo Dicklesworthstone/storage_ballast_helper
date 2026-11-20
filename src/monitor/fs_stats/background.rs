@@ -247,15 +247,15 @@ where
         result
     }
 
-    /// When the probe still running for `key` started, if one is. Finished
-    /// probes are received first, so a delivered result never reads as
-    /// pending. No probe is started and nothing waits.
+    /// When the probe for `key` that has not delivered yet started, if one
+    /// exists. A probe that finished but whose result has not been received
+    /// still counts: its result is taken only by the next `observe`, so the
+    /// caller that waits for it does not miss it. Nothing starts or waits.
     pub fn pending_since(&self, key: &K) -> Option<Instant> {
-        let mut state = self
+        let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.receive_ready(Instant::now());
         state
             .entries
             .get(key)
@@ -337,8 +337,11 @@ mod tests {
         }
     }
 
+    /// A finished probe whose result nobody has received is still pending:
+    /// a caller that checks between its own lookup and the next one must not
+    /// conclude there is nothing to wait for while the result sits unread.
     #[test]
-    fn pending_since_reports_only_a_probe_that_is_still_running() {
+    fn pending_since_reports_a_probe_until_its_result_is_received() {
         let (release, gate) = std::sync::mpsc::channel::<()>();
         let gate = Mutex::new(gate);
         let observer = BoundedObserver::new(
@@ -355,8 +358,19 @@ mod tests {
         assert_eq!(observer.pending_since(&key), None);
         let before = Instant::now();
         assert!(observer.observe(key.clone(), false).is_err());
-        assert!(observer.pending_since(&key).is_some_and(|at| at >= before));
+        let since = observer.pending_since(&key);
+        assert!(since.is_some_and(|at| at >= before));
         release.send(()).unwrap();
+        let deadline = Instant::now() + WAIT;
+        while !observer.state.lock().unwrap().entries[&key]
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.worker.is_finished())
+        {
+            assert!(Instant::now() < deadline, "probe did not finish");
+            std::thread::yield_now();
+        }
+        assert_eq!(observer.pending_since(&key), since);
         assert_eq!(await_value(&observer, "a", false).value, 7);
         assert_eq!(observer.pending_since(&key), None);
     }

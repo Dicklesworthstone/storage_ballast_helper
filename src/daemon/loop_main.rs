@@ -3752,6 +3752,9 @@ pub struct MonitoringDaemon {
     /// completed removal or ballast release). Without per-mount receipts this
     /// censors pending windows; it never proves a successful prediction.
     last_tick_cleanup_ran: bool,
+    /// Time the last pressure check spent waiting for filesystem refreshes
+    /// it started; excluded from the tick throttle's tick duration.
+    pressure_sample_wait: Duration,
     last_swap_thrash_warning: Option<Instant>,
     swap_thrash_active: bool,
     last_scan_channel_warn: Option<Instant>,
@@ -5968,6 +5971,7 @@ impl MonitoringDaemon {
             predictive_policy: PredictiveActionPolicy::from_config(prediction_config),
             last_predictive_action: PredictiveAction::Clear,
             last_tick_cleanup_ran: false,
+            pressure_sample_wait: Duration::ZERO,
             last_swap_thrash_warning: None,
             swap_thrash_active: false,
             last_scan_channel_warn: None,
@@ -7628,7 +7632,13 @@ impl MonitoringDaemon {
                 self.last_summary_report = Instant::now();
             }
 
-            let tick_duration = tick_start.elapsed();
+            // Waiting for filesystem probes is not work the throttle protects
+            // against. Counted, a slow but healthy probe would make every tick
+            // "slow" and hold the daemon at 60 s ticks, which in turn expire
+            // every observation before the next tick.
+            let tick_duration = tick_start
+                .elapsed()
+                .saturating_sub(self.pressure_sample_wait);
             let throttle_decision =
                 self.tick_throttle
                     .observe(requested_tick, self_monitor_tick, tick_duration);
@@ -7979,11 +7989,15 @@ impl MonitoringDaemon {
         // 10 s) every lookup finds its evidence expired and its refresh just
         // started, and the whole tick failed: its authority was withdrawn,
         // which revoked every target-only pass in flight, about once a minute
-        // on one Mac and every 14 s at Critical (2026-11-20). A refresh this
-        // tick started is waited for, briefly; a refused one, or one still
-        // stalled from an earlier tick, is not.
+        // on one Mac and every 14 s at Critical (2026-11-20). Each path's
+        // first refresh started in this tick is waited for, briefly, until it
+        // delivers. A refused probe, one still stalled from an earlier tick,
+        // and any later refresh (an immediate refresh_after restarts a failing
+        // probe on every lookup) are not.
         let started = Instant::now();
         let deadline = started + PRESSURE_SAMPLE_GRACE;
+        let mut awaited: HashMap<PathBuf, Instant> = HashMap::new();
+        let mut waiting_since: Option<Instant> = None;
         let mut remaining: Vec<&PathBuf> = paths.iter().collect();
         let failures: Vec<String> = loop {
             let mut failed = Vec::new();
@@ -8004,22 +8018,28 @@ impl MonitoringDaemon {
                     Err(error) => failed.push((path, error)),
                 }
             }
-            if failed.is_empty()
-                || Instant::now() >= deadline
-                || !failed.iter().any(|(path, _)| {
-                    self.fs_collector
-                        .sample_pending_since(path)
-                        .is_some_and(|since| since >= started)
-                })
-            {
+            let mut wait = false;
+            if Instant::now() < deadline {
+                for (path, _) in &failed {
+                    let Some(since) = self.fs_collector.sample_pending_since(path) else {
+                        continue;
+                    };
+                    let first = *awaited.entry((*path).clone()).or_insert(since);
+                    wait |= since == first && since >= started;
+                }
+            }
+            if !wait {
                 break failed
                     .iter()
                     .map(|(path, error)| sample_failure(path, error))
                     .collect();
             }
             remaining = failed.into_iter().map(|(path, _)| path).collect();
+            waiting_since.get_or_insert_with(Instant::now);
             thread::sleep(PRESSURE_SAMPLE_POLL);
         };
+        // The wait is not the daemon's own work; the tick throttle excludes it.
+        self.pressure_sample_wait = waiting_since.map_or(Duration::ZERO, |since| since.elapsed());
 
         let none_observed = stats_by_mount.is_empty();
         self.evaluate_pressure_samples(stats_by_mount, Instant::now())
@@ -16617,11 +16637,11 @@ mod tests {
     fn a_tick_after_a_long_sleep_waits_for_the_refreshes_it_starts() {
         let mut fixture = RegretDaemonFixture::new();
         let daemon = &mut fixture.daemon;
-        daemon.config.pressure.poll_interval_ms = 20;
+        daemon.config.pressure.poll_interval_ms = 100;
         daemon.config.telemetry.fs_cache_ttl_ms = 5;
         daemon.enable_background_filesystem_observations();
         let max_age = MonitoringDaemon::filesystem_observation_max_age(&daemon.config);
-        assert_eq!(max_age, Duration::from_millis(40));
+        assert_eq!(max_age, Duration::from_millis(200));
         let deadline = Instant::now() + Duration::from_secs(5);
         while daemon.check_pressure().is_err() {
             assert!(
@@ -16630,10 +16650,75 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
-        for _ in 0..3 {
+        for _ in 0..2 {
             thread::sleep(max_age * 3);
             let response = daemon.check_pressure();
             assert!(response.is_ok(), "{response:?}");
+            // It did wait, and for less than the grace: the throttle is
+            // told how long, so the wait cannot make the tick look slow.
+            assert!(daemon.pressure_sample_wait > Duration::ZERO);
+            assert!(daemon.pressure_sample_wait < PRESSURE_SAMPLE_GRACE);
+        }
+    }
+
+    /// With an immediate refresh (fs_cache_ttl_ms = 0) a failing probe is
+    /// restarted by every lookup. The tick waits for the first one only, so
+    /// a root that never answers cannot hold every tick for the full grace.
+    #[cfg(unix)]
+    #[test]
+    fn a_tick_waits_once_for_a_root_whose_probe_keeps_failing() {
+        use crate::platform::pal::{FsStats, MemoryInfo, MountPoint, PlatformPaths};
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        let mount = |path: &str| MountPoint {
+            path: PathBuf::from(path),
+            device: format!("mock{path}"),
+            fs_type: "mockfs".to_string(),
+            is_ram_backed: false,
+        };
+        let stats = FsStats {
+            total_bytes: 1_000_000_000_000,
+            free_bytes: 500_000_000_000,
+            available_bytes: 500_000_000_000,
+            fs_type: "mockfs".to_string(),
+            mount_point: PathBuf::from("/"),
+            is_readonly: false,
+        };
+        // "/no-stats" is a mount whose statfs always fails.
+        daemon.platform = Arc::new(MockPlatform::new(
+            vec![mount("/"), mount("/no-stats")],
+            HashMap::from([(PathBuf::from("/"), stats)]),
+            MemoryInfo {
+                total_bytes: 64 << 30,
+                available_bytes: 32 << 30,
+                swap_total_bytes: 8 << 30,
+                swap_free_bytes: 8 << 30,
+            },
+            PlatformPaths::default(),
+        ));
+        daemon
+            .config
+            .scanner
+            .root_paths
+            .push(PathBuf::from("/no-stats/root"));
+        daemon.config.telemetry.fs_cache_ttl_ms = 0;
+        daemon.enable_background_filesystem_observations();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while daemon.check_pressure().is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "first observations never arrived"
+            );
+        }
+        for _ in 0..3 {
+            let started = Instant::now();
+            let response = daemon.check_pressure();
+            assert!(response.is_ok(), "{response:?}");
+            assert!(
+                started.elapsed() < PRESSURE_SAMPLE_GRACE / 2,
+                "a failing root held the tick for {:?}",
+                started.elapsed()
+            );
         }
     }
 
