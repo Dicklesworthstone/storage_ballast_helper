@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use storage_ballast_helper::scanner::decision_record::stable_decision_id;
 use storage_ballast_helper::scanner::deletion::{
-    CheckedDeletion, DeletionConfig, DeletionExecutor, DeletionMode, DeletionPlan, SkipReason,
+    CheckedDeletion, DeletionConfig, DeletionConfirmation, DeletionExecutor, DeletionMode,
+    DeletionPlan, SkipReason,
 };
 use storage_ballast_helper::scanner::patterns::{ArtifactCategory, ArtifactClassification};
 use storage_ballast_helper::scanner::quarantine::{
@@ -323,6 +324,167 @@ fn live_authorization_cannot_bypass_preflight_protection() {
         assert!(nested.join(".sbh-protect").exists());
         assert_eq!(fs::read(target.join("artifact.o")).unwrap(), PAYLOAD);
         assert!(!dir.path().join(".sbh").exists());
+    }
+}
+
+#[test]
+fn incomplete_deep_containment_retains_payloads_across_public_mutation_boundaries() {
+    // Probe the permission boundary itself: root in a user namespace can
+    // still lack the capability that bypasses these mode bits.
+    let probe = scratch();
+    let unreadable = probe.path().join("unreadable");
+    fs::create_dir(&unreadable).unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let observed = fs::read_dir(&unreadable);
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+    match observed {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Ok(_) => {
+            eprintln!("TEST SKIP: this process bypasses directory read permissions");
+            return;
+        }
+        Err(error) => panic!("unreadable-directory fixture probe failed: {error}"),
+    }
+
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        for boundary in ["preflight", "authorization", "confirmation"] {
+            let dir = scratch();
+            let target = dir.path().join("target");
+            // The general sacred-path scan stops at depth three. The final
+            // containment proof must refuse an unseen subtree below it.
+            let hidden = target.join("a/b/c/d");
+            fs::create_dir_all(&hidden).unwrap();
+            let payload = hidden.join("important.bin");
+            let sibling = target.join("artifact.o");
+            fs::write(&payload, b"protected data").unwrap();
+            fs::write(&sibling, PAYLOAD).unwrap();
+            let item = candidate(&target);
+            let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+            let plan = executor.plan(vec![item.clone()]);
+            assert_eq!(plan.estimated_items, 1);
+            assert!(executor.explain_preflight(&item, None).is_ok());
+            let original_permissions = fs::metadata(&hidden).unwrap().permissions();
+            let hide_marker = || {
+                fs::write(hidden.join(".sbh-protect"), b"keep").unwrap();
+                fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+                assert_eq!(
+                    fs::read_dir(&hidden).unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "fixture must prevent containment inspection"
+                );
+            };
+            let checked = if boundary == "preflight" {
+                hide_marker();
+                Some(executor.delete_candidate_checked(&item, None))
+            } else {
+                None
+            };
+            let calls = Cell::new(0);
+            let report = if boundary == "confirmation" {
+                executor
+                    .execute_confirmed(&plan, None, |index, confirmed| {
+                        assert_eq!(index, 0);
+                        assert_eq!(confirmed.path, target);
+                        calls.set(calls.get() + 1);
+                        hide_marker();
+                        Ok::<_, std::convert::Infallible>(DeletionConfirmation::Accept)
+                    })
+                    .unwrap()
+            } else {
+                executor.execute_with_guard(
+                    &plan,
+                    None,
+                    Some(&|_| {
+                        calls.set(calls.get() + 1);
+                        if boundary == "authorization" && calls.get() == 1 {
+                            hide_marker();
+                        }
+                        Ok(())
+                    }),
+                )
+            };
+            // Restore before assertions so a regression cannot strand a
+            // permission-denied fixture or obscure its retained contents.
+            fs::set_permissions(&hidden, original_permissions).unwrap();
+
+            if let Some(checked) = checked {
+                assert_eq!(
+                    checked.unwrap(),
+                    CheckedDeletion::Skipped(SkipReason::ContainmentIncomplete),
+                    "{mode:?}: direct checked mutation"
+                );
+            }
+            assert_eq!(calls.get(), usize::from(boundary != "preflight"));
+            assert_eq!(report.items_deleted, 0, "{mode:?}/{boundary}: {report:?}");
+            assert_eq!(report.items_quarantined, 0);
+            assert_eq!(report.items_failed, 0, "incomplete proof is a refusal");
+            assert_eq!(report.items_skipped, 1);
+            assert_eq!(
+                report.skipped_by_reason.get("containment_incomplete"),
+                Some(&1)
+            );
+            assert_eq!(report.bytes_freed, 0);
+            assert_eq!(report.bytes_quarantined, 0);
+            assert_eq!(fs::read(&payload).unwrap(), b"protected data");
+            assert_eq!(fs::read(&sibling).unwrap(), PAYLOAD);
+            assert!(!QuarantineStore::under(dir.path()).root().exists());
+            assert_eq!(
+                executor.explain_preflight(&item, None),
+                Err(SkipReason::SacredStowaway),
+                "restored visibility must reveal the hidden protection"
+            );
+        }
+    }
+}
+
+#[test]
+fn unreadable_deep_gitfiles_are_unknown_instead_of_disposable_cache_markers() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let dir = scratch();
+        let target = dir.path().join("target");
+        let nested = target.join("a/b/c/d");
+        fs::create_dir_all(&nested).unwrap();
+        let marker = nested.join(".git");
+        fs::write(&marker, b"gitdir: /elsewhere/repo/.git/worktrees/live\n").unwrap();
+        fs::write(target.join("artifact.o"), PAYLOAD).unwrap();
+        let item = candidate(&target);
+        let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+        let original_permissions = fs::metadata(&marker).unwrap().permissions();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o000)).unwrap();
+        let observed = fs::read(&marker);
+        let checked = executor.delete_candidate_checked(&item, None);
+        let report = executor.execute(&raw_plan(vec![item.clone()], mode), None);
+        fs::set_permissions(&marker, original_permissions).unwrap();
+
+        match observed {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Ok(_) => {
+                eprintln!("TEST SKIP: this process bypasses gitfile read permissions");
+                return;
+            }
+            Err(error) => panic!("unreadable-gitfile fixture probe failed: {error}"),
+        }
+        assert_eq!(
+            checked.unwrap(),
+            CheckedDeletion::Skipped(SkipReason::ContainmentIncomplete)
+        );
+        assert_eq!(report.items_deleted, 0, "{mode:?}: {report:?}");
+        assert_eq!(report.items_quarantined, 0);
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(
+            report.skipped_by_reason.get("containment_incomplete"),
+            Some(&1)
+        );
+        assert_eq!(report.bytes_freed, 0);
+        assert_eq!(report.bytes_quarantined, 0);
+        assert_eq!(fs::read(target.join("artifact.o")).unwrap(), PAYLOAD);
+        assert!(!QuarantineStore::under(dir.path()).root().exists());
+        assert_eq!(
+            executor.explain_preflight(&item, None),
+            Err(SkipReason::ContainsGit),
+            "readable gitdir evidence must still veto the candidate"
+        );
     }
 }
 

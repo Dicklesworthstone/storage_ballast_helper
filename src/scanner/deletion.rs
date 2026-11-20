@@ -709,6 +709,10 @@ pub enum SkipReason {
     /// A target-driven cleanup cannot confirm the candidate filesystem's
     /// current capacity. Missing evidence must not authorize more removals.
     PressureUnavailable,
+    /// The recursive repository/protection check could not inspect every
+    /// directory entry. Missing evidence must not authorize either unlink
+    /// or quarantine; a later pass may retry with a complete observation.
+    ContainmentIncomplete,
 }
 
 impl SkipReason {
@@ -718,7 +722,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -743,6 +747,7 @@ impl SkipReason {
         Self::PolicyChanged,
         Self::CompressionFirst,
         Self::PressureUnavailable,
+        Self::ContainmentIncomplete,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -781,6 +786,7 @@ impl SkipReason {
             Self::PolicyChanged => "policy_changed",
             Self::CompressionFirst => "compression_first",
             Self::PressureUnavailable => "pressure_unavailable",
+            Self::ContainmentIncomplete => "containment_incomplete",
         }
     }
 
@@ -832,6 +838,9 @@ impl SkipReason {
             Self::CompressionFirst => "lossless compression is running before permanent cleanup",
             Self::PressureUnavailable => {
                 "current filesystem capacity is unavailable — target-driven cleanup paused"
+            }
+            Self::ContainmentIncomplete => {
+                "repository/protection containment scan incomplete — retained for safety"
             }
         }
     }
@@ -1676,6 +1685,7 @@ impl DeletionExecutor {
                 DeepContainment::ProtectMarker | DeepContainment::Truncated => {
                     return Err(SkipReason::SacredStowaway);
                 }
+                DeepContainment::Incomplete => return Err(SkipReason::ContainmentIncomplete),
             }
         }
 
@@ -2496,6 +2506,9 @@ enum DeepContainment {
     ProtectMarker,
     /// The directory budget ran out before the subtree was proven clear.
     Truncated,
+    /// An entry could not be inspected, including a path that changed
+    /// during the walk. Absence of evidence is not a marker-free verdict.
+    Incomplete,
 }
 
 /// Whether a candidate holds a Git repository or a `.sbh-protect` marker at
@@ -2510,27 +2523,53 @@ enum DeepContainment {
 /// `CARGO_HOME`s hold four levels down and which the force-remove carve-out
 /// exists for. An agent's clone deep inside a temp tree is what this finds.
 fn deep_containment(path: &Path, max_dirs: usize) -> DeepContainment {
+    deep_containment_with(
+        path,
+        max_dirs,
+        |dir| fs::read_dir(dir),
+        fs::DirEntry::file_type,
+    )
+}
+
+/// Keep filesystem failures observable throughout the same bounded walk.
+/// The hooks allow deterministic coverage of late iterator/type failures
+/// without changing the production traversal or collecting its entries.
+fn deep_containment_with<I>(
+    path: &Path,
+    max_dirs: usize,
+    mut read_dir: impl FnMut(&Path) -> std::io::Result<I>,
+    mut entry_type: impl FnMut(&fs::DirEntry) -> std::io::Result<fs::FileType>,
+) -> DeepContainment
+where
+    I: Iterator<Item = std::io::Result<fs::DirEntry>>,
+{
     let mut queue = std::collections::VecDeque::from([(path.to_path_buf(), 0usize)]);
     let mut opened = 0usize;
     while let Some((dir, depth)) = queue.pop_front() {
         if opened >= max_dirs {
             return DeepContainment::Truncated;
         }
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
+        let Ok(entries) = read_dir(&dir) else {
+            return DeepContainment::Incomplete;
         };
         opened += 1;
         let child_depth = depth + 1;
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return DeepContainment::Incomplete;
+            };
+            let Ok(file_type) = entry_type(&entry) else {
+                return DeepContainment::Incomplete;
             };
             let name = entry.file_name();
             if name == ".git" {
-                if child_depth <= NESTED_GIT_ANY_DEPTH
-                    || (is_repository_link(&entry.path(), file_type)
-                        && !is_cargo_git_checkout(&dir))
-                {
+                if child_depth <= NESTED_GIT_ANY_DEPTH {
+                    return DeepContainment::Repository;
+                }
+                let Ok(repository) = is_repository_link(&entry.path(), file_type) else {
+                    return DeepContainment::Incomplete;
+                };
+                if repository && !is_cargo_git_checkout(&dir) {
                     return DeepContainment::Repository;
                 }
                 continue;
@@ -2548,14 +2587,19 @@ fn deep_containment(path: &Path, max_dirs: usize) -> DeepContainment {
 
 /// A `.git` entry that is, or points at, a repository: any directory or
 /// symlink, or a file starting with `gitdir:`.
-fn is_repository_link(path: &Path, file_type: fs::FileType) -> bool {
+fn is_repository_link(path: &Path, file_type: fs::FileType) -> std::io::Result<bool> {
     if !file_type.is_file() {
-        return true;
+        return Ok(true);
     }
     let mut head = [0u8; 7];
-    fs::File::open(path)
-        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut head))
-        .is_ok_and(|()| &head == b"gitdir:")
+    match fs::File::open(path).and_then(|mut file| std::io::Read::read_exact(&mut file, &mut head))
+    {
+        Ok(()) => Ok(&head == b"gitdir:"),
+        // uv's empty bucket marker is positively distinguishable from a
+        // gitfile. Permission/I/O failures or a disappearing marker are not.
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// `dir` is a cargo git checkout: `<CARGO_HOME>/git/checkouts/<name>/<rev>`,
@@ -3630,6 +3674,7 @@ mod tests {
                 SkipReason::PolicyChanged => 21,
                 SkipReason::CompressionFirst => 22,
                 SkipReason::PressureUnavailable => 23,
+                SkipReason::ContainmentIncomplete => 24,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];
@@ -4966,6 +5011,177 @@ mod tests {
         assert_eq!(deep_containment(&root, 8), DeepContainment::Truncated);
     }
 
+    #[test]
+    fn deep_containment_never_treats_filesystem_errors_as_absent_markers() {
+        use std::io::{self, ErrorKind};
+
+        let dir = scratch_dir();
+        let target = dir.path().join("target");
+        let hidden = target.join("a/b/c/d");
+        fs::create_dir_all(&hidden).unwrap();
+        fs::write(hidden.join(protection::MARKER_FILENAME), b"protect").unwrap();
+        fs::write(target.join("cache.o"), b"object").unwrap();
+        assert_eq!(
+            deep_containment(&target, DEEP_CONTAINMENT_MAX_DIRS),
+            DeepContainment::ProtectMarker
+        );
+
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotFound,
+            ErrorKind::Other,
+        ] {
+            for fault in ["open", "iteration", "file_type"] {
+                let observed = deep_containment_with(
+                    &target,
+                    DEEP_CONTAINMENT_MAX_DIRS,
+                    |path| {
+                        if fault == "open" && path == hidden {
+                            return Err(io::Error::from(kind));
+                        }
+                        let entries: Vec<_> = fs::read_dir(path)?
+                            .map(|entry| match entry {
+                                Ok(entry)
+                                    if fault == "iteration"
+                                        && path == hidden
+                                        && entry.file_name() == protection::MARKER_FILENAME =>
+                                {
+                                    Err(io::Error::from(kind))
+                                }
+                                other => other,
+                            })
+                            .collect();
+                        Ok(entries.into_iter())
+                    },
+                    |entry| {
+                        if fault == "file_type" && entry.path() == hidden {
+                            Err(io::Error::from(kind))
+                        } else {
+                            entry.file_type()
+                        }
+                    },
+                );
+                assert_eq!(observed, DeepContainment::Incomplete, "{fault}: {kind:?}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deep_containment_does_not_treat_an_unreadable_gitfile_as_a_cache_marker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("SKIP: root bypasses mode-bit gitfile read denial");
+            return;
+        }
+        let dir = scratch_dir();
+        let target = dir.path().join("target");
+        let nested = target.join("a/b/c/d");
+        fs::create_dir_all(&nested).unwrap();
+        let marker = nested.join(".git");
+        fs::write(&marker, b"gitdir: /elsewhere/repository/worktrees/live\n").unwrap();
+        let permissions = fs::metadata(&marker).unwrap().permissions();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o000)).unwrap();
+        let observation = deep_containment(&target, DEEP_CONTAINMENT_MAX_DIRS);
+        fs::set_permissions(&marker, permissions).unwrap();
+
+        assert_eq!(observation, DeepContainment::Incomplete);
+        assert_eq!(
+            deep_containment(&target, DEEP_CONTAINMENT_MAX_DIRS),
+            DeepContainment::Repository
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_deep_containment_retains_unlink_and_quarantine_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("SKIP: root bypasses mode-bit containment denial");
+            return;
+        }
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for after_preflight in [false, true] {
+                let dir = scratch_dir();
+                let root = dir.path().join("scan-root");
+                let target = root.join("target");
+                let hidden = target.join("a/b/c/d");
+                fs::create_dir_all(&hidden).unwrap();
+                let payload = hidden.join("important.bin");
+                fs::write(&payload, b"keep these bytes").unwrap();
+                let sibling = target.join("cache.o");
+                fs::write(&sibling, b"keep until the whole tree is verified").unwrap();
+                let candidate = make_identity_candidate(&target, 50, 0.95);
+                let executor = DeletionExecutor::new(
+                    DeletionConfig {
+                        require_identity: true,
+                        mode,
+                        quarantine_roots: vec![root.clone()],
+                        ..offline_config()
+                    },
+                    None,
+                );
+                let plan = executor.plan(vec![candidate.clone()]);
+                assert_eq!(plan.candidates.len(), 1);
+                let permissions = fs::metadata(&hidden).unwrap().permissions();
+                let hide_marker = || {
+                    fs::write(hidden.join(protection::MARKER_FILENAME), b"protect").unwrap();
+                    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+                    assert_eq!(
+                        fs::read_dir(&hidden).unwrap_err().kind(),
+                        std::io::ErrorKind::PermissionDenied,
+                        "fixture must actually prevent inspection"
+                    );
+                };
+                if !after_preflight {
+                    hide_marker();
+                    assert_eq!(
+                        executor.delete_candidate_checked(&candidate, None).unwrap(),
+                        CheckedDeletion::Skipped(SkipReason::ContainmentIncomplete)
+                    );
+                }
+                let called = std::cell::Cell::new(false);
+                let report = executor.execute_with_guard(
+                    &plan,
+                    None,
+                    Some(&|_| {
+                        if after_preflight && !called.replace(true) {
+                            hide_marker();
+                        }
+                        Ok(())
+                    }),
+                );
+                // Restore access before assertions and TempDir cleanup.
+                fs::set_permissions(&hidden, permissions).unwrap();
+
+                assert_eq!(called.get(), after_preflight);
+                assert_eq!(report.items_deleted, 0, "{mode:?}: {report:?}");
+                assert_eq!(report.items_quarantined, 0);
+                assert_eq!(report.items_failed, 0, "incomplete evidence is a refusal");
+                assert_eq!(report.items_skipped, 1);
+                assert_eq!(
+                    report.skipped_by_reason.get("containment_incomplete"),
+                    Some(&1)
+                );
+                assert_eq!(report.bytes_freed, 0);
+                assert_eq!(report.bytes_quarantined, 0);
+                assert_eq!(fs::read(&payload).unwrap(), b"keep these bytes");
+                assert_eq!(
+                    fs::read(&sibling).unwrap(),
+                    b"keep until the whole tree is verified"
+                );
+                assert!(!QuarantineStore::under(&root).root().exists());
+                assert_eq!(
+                    deep_containment(&target, DEEP_CONTAINMENT_MAX_DIRS),
+                    DeepContainment::ProtectMarker,
+                    "restored access reveals the protection hidden below depth three"
+                );
+            }
+        }
+    }
+
     /// EROFS is a mount incident, everything else a refusal: the two must
     /// never be confused, because one pauses the mount and the other asks
     /// the operator to fix the unit.
@@ -5837,8 +6053,8 @@ mod tests {
     fn circuit_breaker_halts_batch_on_consecutive_failures() {
         use std::os::unix::fs::PermissionsExt;
 
-        // chmod 000 does not stop root, so nothing here would fail and the
-        // breaker would never trip.
+        // Missing write permissions do not stop root, so no mutation would
+        // fail and the breaker would never trip.
         if crate::platform::running_as_root() {
             eprintln!(
                 "SKIP: running as root (circuit_breaker_halts_batch_on_consecutive_failures)"
@@ -5849,15 +6065,15 @@ mod tests {
         let dir = scratch_dir();
         let mut candidates = Vec::new();
 
-        // Create directories with unremovable subdirs (chmod 000 prevents remove_dir_all).
-        // Preflight passes because the parent of each dir IS writable, but
-        // remove_dir_all fails because the locked subdir can't be traversed.
+        // The subtree remains readable so containment can prove it clear.
+        // Removing its files still fails: their parent lacks write permission.
+        // An unreadable subtree is now refused by preflight, not a mutation failure.
         for i in 0..5 {
             let d = dir.path().join(format!("dir_{i}"));
             let sub = d.join("locked_sub");
             fs::create_dir_all(&sub).unwrap();
             fs::write(sub.join("data.txt"), "x").unwrap();
-            fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+            fs::set_permissions(&sub, fs::Permissions::from_mode(0o500)).unwrap();
             candidates.push(make_candidate(&d, 100, 0.8));
         }
 

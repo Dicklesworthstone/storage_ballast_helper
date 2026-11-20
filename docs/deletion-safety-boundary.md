@@ -21,6 +21,14 @@ does not prove that nobody added a repository or protected content underneath
 it. Positive sacred-path evidence can be reused to refuse a candidate; an
 earlier empty walk cannot authorize its later removal.
 
+The deep repository/protection walk must inspect every entry it reaches within
+its directory budget. Directory-open, iteration, entry-type, and Git-file read
+errors produce `containment_incomplete`; cleanup retains the entire candidate
+for a later pass. A disappearing entry is incomplete evidence too. This hold
+applies before both unlink and quarantine, including the final recheck after
+authorization. A readable, empty cache marker can still be distinguished from
+a repository; an unreadable marker cannot.
+
 ## Ancestor markers are live instructions
 
 Before mutation, the executor checks `.sbh-protect` in the candidate directory
@@ -109,6 +117,10 @@ case reopens an existing artifact without changing its root timestamp after a
 previous empty process sweep, and verifies that the next batch keeps it.
 Quarantine tests replace files and directories after admission and during
 store preparation; stable controls still quarantine and restore successfully.
+Containment regressions inject permission, disappearance, and I/O failures at
+directory-open, iterator, and entry-type boundaries, and exercise unreadable
+deep subtrees and Git files through the real filesystem. Refused candidates
+retain their contents and never acquire a quarantine store.
 
 Direct-removal regressions also cover captured-root replacement, parent replacement
 before mutation, symlink substitution at descent/open checkpoints, leaf replacement
