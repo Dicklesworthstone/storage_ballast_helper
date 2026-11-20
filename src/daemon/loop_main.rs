@@ -8021,11 +8021,17 @@ impl MonitoringDaemon {
             let mut wait = false;
             if Instant::now() < deadline {
                 for (path, _) in &failed {
-                    let Some(since) = self.fs_collector.sample_pending_since(path) else {
+                    // A probe stalled from an earlier tick is never awaited,
+                    // nor recorded: when it delivers mid-tick, the refresh
+                    // that replaces it is this tick's first.
+                    let Some(since) = self
+                        .fs_collector
+                        .sample_pending_since(path)
+                        .filter(|since| *since >= started)
+                    else {
                         continue;
                     };
-                    let first = *awaited.entry((*path).clone()).or_insert(since);
-                    wait |= since == first && since >= started;
+                    wait |= *awaited.entry((*path).clone()).or_insert(since) == since;
                 }
             }
             if !wait {
