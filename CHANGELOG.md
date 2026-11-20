@@ -6,6 +6,22 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.7.17 **[release]**
+
+Compare: [`v0.7.16...v0.7.17`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.16...v0.7.17)
+
+Fixes from the v0.7.16 rollout. Runway forecasts use net consumption
+over an elapsed-time window, so build bursts no longer swing a mostly full
+disk between "full soon" and "never fills" (bd-hosd). A daemon tick after a
+long sleep no longer fails on expired filesystem observations. On one Mac
+that failure revoked every target-only pass, and its build SSD sat at
+Critical with nothing deleted (bd-8x8n). On Linux, a process exiting during
+the memory-map sweep no longer holds every reclaim candidate for the pass.
+The proof that all of a process's threads are exiting now also covers
+threads its task listing missed (bd-jo30, bd-q29t). Deletion refuses
+incomplete containment evidence, and on macOS one APFS container is one
+filesystem.
+
 ### Fixed
 
 - **Stable distant forecasts on bursty build disks** (bd-hosd). Runway
