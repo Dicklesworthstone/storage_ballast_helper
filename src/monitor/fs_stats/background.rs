@@ -247,6 +247,22 @@ where
         result
     }
 
+    /// When the probe still running for `key` started, if one is. Finished
+    /// probes are received first, so a delivered result never reads as
+    /// pending. No probe is started and nothing waits.
+    pub fn pending_since(&self, key: &K) -> Option<Instant> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.receive_ready(Instant::now());
+        state
+            .entries
+            .get(key)
+            .and_then(|entry| entry.pending.as_ref())
+            .map(|pending| pending.started_at)
+    }
+
     pub fn invalidate(&self) {
         self.state
             .lock()
@@ -319,6 +335,30 @@ mod tests {
             assert!(Instant::now() < deadline, "observation did not complete");
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn pending_since_reports_only_a_probe_that_is_still_running() {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let observer = BoundedObserver::new(
+            Arc::new(move |_: &String| {
+                let _ = gate.lock().unwrap().recv();
+                Ok(7_usize)
+            }),
+            CACHE,
+            CACHE,
+            2,
+            4,
+        );
+        let key = "a".to_string();
+        assert_eq!(observer.pending_since(&key), None);
+        let before = Instant::now();
+        assert!(observer.observe(key.clone(), false).is_err());
+        assert!(observer.pending_since(&key).is_some_and(|at| at >= before));
+        release.send(()).unwrap();
+        assert_eq!(await_value(&observer, "a", false).value, 7);
+        assert_eq!(observer.pending_since(&key), None);
     }
 
     fn await_idle(observer: &BoundedObserver<String, usize>, now: Instant) {

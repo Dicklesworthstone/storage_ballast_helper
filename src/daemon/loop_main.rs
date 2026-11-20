@@ -4703,6 +4703,25 @@ impl PassStop {
     }
 }
 
+/// How long a pressure tick waits for filesystem refreshes it started.
+/// A healthy statfs probe answers in about a millisecond, even throttled.
+const PRESSURE_SAMPLE_GRACE: Duration = Duration::from_secs(2);
+const PRESSURE_SAMPLE_POLL: Duration = Duration::from_millis(5);
+
+/// One path's sampling failure for a diagnostic, without the error's own
+/// path prefix. At most the first 200 bytes of its details are kept.
+fn sample_failure(path: &Path, error: &SbhError) -> String {
+    let details = match error {
+        SbhError::FsStats { details, .. } => details.clone(),
+        other => other.to_string(),
+    };
+    let mut end = details.len().min(200);
+    while !details.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}: {}", path.display(), &details[..end])
+}
+
 /// The path whose filesystem the daemon always observes, whatever
 /// `scanner.root_paths` says.
 ///
@@ -7954,23 +7973,67 @@ impl MonitoringDaemon {
 
         // Group paths by mount point to avoid redundant updates.
         let mut stats_by_mount: HashMap<PathBuf, FsStatsSample> = HashMap::new();
-
-        for path in &paths {
-            if let Ok(sample) = self.fs_collector.collect_sample(path) {
-                // Collection can span cache expiry. Keep the newest native
-                // reading if several configured roots share this mount.
-                stats_by_mount
-                    .entry(sample.stats.mount_point.clone())
-                    .and_modify(|previous| {
-                        if sample.collected_at > previous.collected_at {
-                            *previous = sample.clone();
-                        }
-                    })
-                    .or_insert(sample);
+        // Background observations refresh only when asked and expire after
+        // `filesystem_observation_max_age`. After a sleep longer than that
+        // (the tick throttle backs off to 30-60 s, the CPU budget adds up to
+        // 10 s) every lookup finds its evidence expired and its refresh just
+        // started, and the whole tick failed: its authority was withdrawn,
+        // which revoked every target-only pass in flight, about once a minute
+        // on one Mac and every 14 s at Critical (2026-11-20). A refresh this
+        // tick started is waited for, briefly; a refused one, or one still
+        // stalled from an earlier tick, is not.
+        let started = Instant::now();
+        let deadline = started + PRESSURE_SAMPLE_GRACE;
+        let mut remaining: Vec<&PathBuf> = paths.iter().collect();
+        let failures: Vec<String> = loop {
+            let mut failed = Vec::new();
+            for path in remaining {
+                match self.fs_collector.collect_sample(path) {
+                    Ok(sample) => {
+                        // Collection can span cache expiry. Keep the newest native
+                        // reading if several configured roots share this mount.
+                        stats_by_mount
+                            .entry(sample.stats.mount_point.clone())
+                            .and_modify(|previous| {
+                                if sample.collected_at > previous.collected_at {
+                                    *previous = sample.clone();
+                                }
+                            })
+                            .or_insert(sample);
+                    }
+                    Err(error) => failed.push((path, error)),
+                }
             }
-        }
+            if failed.is_empty()
+                || Instant::now() >= deadline
+                || !failed.iter().any(|(path, _)| {
+                    self.fs_collector
+                        .sample_pending_since(path)
+                        .is_some_and(|since| since >= started)
+                })
+            {
+                break failed
+                    .iter()
+                    .map(|(path, error)| sample_failure(path, error))
+                    .collect();
+            }
+            remaining = failed.into_iter().map(|(path, _)| path).collect();
+            thread::sleep(PRESSURE_SAMPLE_POLL);
+        };
 
+        let none_observed = stats_by_mount.is_empty();
         self.evaluate_pressure_samples(stats_by_mount, Instant::now())
+            .map_err(|error| match error {
+                // Name what each path reported, so a recurring failure shows
+                // whether probes were pending, stale or failing outright.
+                SbhError::FsStats { path, details } if none_observed && !failures.is_empty() => {
+                    SbhError::FsStats {
+                        path,
+                        details: format!("{details} ({})", failures.join("; ")),
+                    }
+                }
+                other => other,
+            })
     }
 
     /// Observation timestamps describe the filesystem; `now` describes the
@@ -16543,6 +16606,37 @@ mod tests {
         directory: tempfile::TempDir,
     }
 
+    /// The tick throttle and CPU budget sleep far longer than the observation
+    /// age bound. The first tick after such a sleep found every observation
+    /// expired and its refresh just started, failed outright, and withdrew the
+    /// authority of every target-only pass in flight (one Mac, 2026-11-20:
+    /// once a minute, and every 14 s at Critical). It now waits for the
+    /// refreshes it started.
+    #[cfg(unix)]
+    #[test]
+    fn a_tick_after_a_long_sleep_waits_for_the_refreshes_it_starts() {
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        daemon.config.pressure.poll_interval_ms = 20;
+        daemon.config.telemetry.fs_cache_ttl_ms = 5;
+        daemon.enable_background_filesystem_observations();
+        let max_age = MonitoringDaemon::filesystem_observation_max_age(&daemon.config);
+        assert_eq!(max_age, Duration::from_millis(40));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while daemon.check_pressure().is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "first observations never arrived"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        for _ in 0..3 {
+            thread::sleep(max_age * 3);
+            let response = daemon.check_pressure();
+            assert!(response.is_ok(), "{response:?}");
+        }
+    }
+
     #[cfg(unix)]
     impl RegretDaemonFixture {
         fn new() -> Self {
@@ -20694,7 +20788,7 @@ mod tests {
             tick.uncalibrated_predictive_action = raw_minutes
                 .map(|minutes| predictive_warning_tick(mount, minutes).predictive_action);
             let event = predictive_warning_event(&tick, &config);
-            assert_eq!(event.is_some(), should_warn, "point={point}, lower={lower}",);
+            assert_eq!(event.is_some(), should_warn, "point={point}, lower={lower}");
             if let Some(NotificationEvent::PredictiveWarning {
                 minutes_remaining, ..
             }) = event
@@ -20707,6 +20801,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn collapsed_forecast_preserves_urgent_control_without_claiming_exhaustion() {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;

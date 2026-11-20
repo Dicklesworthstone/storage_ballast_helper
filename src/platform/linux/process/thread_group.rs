@@ -154,14 +154,14 @@ mod tests {
 
     /// Replays a scripted listing, thread reads and counts, checking order.
     struct Script {
-        listing: Option<Option<Vec<i32>>>,
+        listings: VecDeque<Option<Vec<i32>>>,
         reads: VecDeque<(i32, ThreadState)>,
         counts: VecDeque<Option<u64>>,
     }
 
     impl ThreadGroup for Script {
         fn tids(&mut self) -> Option<Vec<i32>> {
-            self.listing.take().expect("listed twice")
+            self.listings.pop_front().expect("listed twice")
         }
         fn thread(&mut self, tid: i32) -> ThreadState {
             let (expected, state) = self.reads.pop_front().expect("unexpected read");
@@ -179,7 +179,7 @@ mod tests {
         counts: &[Option<u64>],
     ) -> bool {
         let mut script = Script {
-            listing: Some(listing),
+            listings: VecDeque::from([listing]),
             reads: reads.iter().copied().collect(),
             counts: counts.iter().copied().collect(),
         };

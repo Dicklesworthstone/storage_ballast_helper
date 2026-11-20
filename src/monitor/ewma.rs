@@ -405,9 +405,10 @@ impl DiskRateEstimator {
             // Integer subtraction preserves small deltas on large volumes.
             let time = sample.at.checked_duration_since(boundary)?.as_secs_f64() / seconds;
             let delta = (i128::from(sample.free_bytes) - i128::from(free_bytes)) as f64;
-            covariance += (time - previous_time) / 6.0
-                * ((2.0 * previous_time + time - 1.5) * previous_delta
-                    + (previous_time + 2.0 * time - 1.5) * delta);
+            let earlier = 2.0f64.mul_add(previous_time, time) - 1.5;
+            let later = 2.0f64.mul_add(time, previous_time) - 1.5;
+            covariance = ((time - previous_time) / 6.0)
+                .mul_add(later.mul_add(delta, earlier * previous_delta), covariance);
             previous_time = time;
             previous_delta = delta;
         }
@@ -1215,7 +1216,7 @@ mod tests {
         }
         (
             estimator,
-            start + Duration::from_secs(900),
+            start + Duration::from_mins(15),
             initial_free - 1_800_000_000,
         )
     }

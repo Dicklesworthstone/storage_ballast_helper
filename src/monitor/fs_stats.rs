@@ -344,12 +344,20 @@ impl FsStatsCollector {
         self.collect_sample(path).map(|sample| sample.stats)
     }
 
+    /// When a background probe of `path` that is still running started, so a
+    /// failed lookup can tell a refresh it just asked for from a stalled one.
+    pub(crate) fn sample_pending_since(&self, path: &Path) -> Option<Instant> {
+        self.background.as_ref().and_then(|background| {
+            background.pending_since(&ProbeRequest::Filesystem(path.to_path_buf()))
+        })
+    }
+
     /// Retain provenance for consumers that derive rates between readings.
     pub(crate) fn collect_sample(&self, path: &Path) -> Result<FsStatsSample> {
         if let Some(background) = &self.background {
             let observation = background.observe(
                 ProbeRequest::Filesystem(path.to_path_buf()),
-                path == Path::new("/"),
+                is_system_root(path),
             );
             if self.platform.has_capacity_metadata() {
                 // Sampling must keep optional metadata refreshing even on
@@ -634,6 +642,17 @@ impl FsStatsCollector {
 
 /// Collect a coherent native frame without walking or resolving unrelated
 /// mount points. Every potentially blocking operation stays on this worker.
+/// The system root keeps the observer's reserved worker when other roots
+/// stall. On macOS the daemon observes it through the writable Data volume,
+/// so that spelling is the system root too.
+fn is_system_root(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    if path == Path::new(crate::platform::macos::sys::FIRMLINK_DATA_ROOT) {
+        return true;
+    }
+    path == Path::new("/")
+}
+
 fn collect_background_sample(platform: &dyn Platform, path: &Path) -> Result<FsStatsSample> {
     let collected_at = Instant::now();
     let resolved_query = platform.observe_mount_lookup_path(path)?;
@@ -760,6 +779,18 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// The daemon observes the macOS system root through the Data volume;
+    /// that spelling must keep the reserved worker "/" has.
+    #[test]
+    fn the_system_root_keeps_its_reserved_worker_in_either_spelling() {
+        assert!(super::is_system_root(Path::new("/")));
+        assert_eq!(
+            super::is_system_root(Path::new("/System/Volumes/Data")),
+            cfg!(target_os = "macos")
+        );
+        assert!(!super::is_system_root(Path::new("/private/tmp")));
+    }
 
     #[derive(Default)]
     struct TestServiceManager;
