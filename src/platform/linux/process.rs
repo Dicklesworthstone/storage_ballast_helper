@@ -26,6 +26,7 @@ const PROC_STAT: &str = "/proc/stat";
 mod deleted_open;
 mod mmap_scan;
 mod reference_scan;
+mod thread_group;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StatusMemory {

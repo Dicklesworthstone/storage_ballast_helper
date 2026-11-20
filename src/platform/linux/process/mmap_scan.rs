@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
+use super::thread_group::{self, ThreadState};
 use super::{OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET, PROC_ROOT, pid_from_proc_entry_name};
 use crate::core::errors::{Result, SbhError};
 use crate::core::paths::resolve_absolute_path;
@@ -403,9 +404,13 @@ impl<'a, A: Access> Sweep<'a, A> {
                     break;
                 }
                 Ok(true) => {}
+                // A task released or reaped between open and read fails the
+                // read with ESRCH; its mappings no longer exist.
                 Err(error) => {
-                    self.snapshot
-                        .fail(format!("PID {pid} maps read failed: {error}"));
+                    if !(disappeared(&error) && self.empty_maps_expected(&process, pid)) {
+                        self.snapshot
+                            .fail(format!("PID {pid} maps read failed: {error}"));
+                    }
                     break;
                 }
             }
@@ -450,6 +455,19 @@ impl<'a, A: Access> Sweep<'a, A> {
         self.expired();
     }
 
+    /// Whether empty maps mean the process has no live address space: it is
+    /// gone, a kernel thread, or a thread group whose every thread is
+    /// exiting or terminal.
+    ///
+    /// The kernel releases a task's address space (exit_mm) before the task
+    /// becomes a zombie (exit_notify), so a process caught exiting during the
+    /// sweep reads empty maps in state R or D with PF_EXITING. On loaded build
+    /// hosts each such exit made the whole sweep incomplete and held every
+    /// candidate: 132 passes on one worker and 110 on another in 4.5 days of
+    /// v0.7.16 (2026-11-20). A lone thread needs only its own record: with
+    /// one thread left, nothing can start another. A leader that exits
+    /// before its siblings reads empty maps while they still unmap theirs,
+    /// and needs the whole group proven (`thread_group`, bd-q29t).
     fn empty_maps_expected(&mut self, process: &Path, pid: i32) -> bool {
         if self.expired() {
             return false;
@@ -457,16 +475,32 @@ impl<'a, A: Access> Sweep<'a, A> {
         if self.access.gone(process) {
             return true;
         }
-        let Ok(file) = self.access.open(&process.join("stat")) else {
-            return false;
-        };
+        let lone = matches!(
+            self.read_stat(&process.join("stat")),
+            Ok(Some(raw)) if thread_group::parse_stat(&raw, pid).is_some_and(|stat| {
+                stat.threads > 0
+                    && (stat.flags & PF_KTHREAD != 0
+                        || (stat.threads == 1 && thread_group::exiting(stat.state, stat.flags)))
+            })
+        );
+        lone || thread_group::whole_group_exiting(&mut MappedThreads {
+            sweep: self,
+            process,
+            pid,
+        })
+    }
+
+    /// A bounded read of one stat record. `Ok(None)` is an oversized or
+    /// non-UTF-8 record, or a read cut short by the sweep deadline.
+    fn read_stat(&mut self, path: &Path) -> io::Result<Option<String>> {
+        let file = self.access.open(path)?;
         let cap = STAT_BYTES.min(self.limits.bytes.saturating_sub(self.bytes));
         let mut raw = Vec::new();
         let mut reader = file.take(cap as u64 + 1);
         let mut buffer = [0u8; 1024];
         loop {
             if self.expired() {
-                return false;
+                return Ok(None);
             }
             match reader.read(&mut buffer) {
                 Ok(0) => break,
@@ -474,37 +508,55 @@ impl<'a, A: Access> Sweep<'a, A> {
                     self.bytes = self.bytes.saturating_add(count);
                     raw.extend_from_slice(&buffer[..count]);
                     if raw.len() > cap {
-                        return false;
+                        return Ok(None);
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => return false,
+                Err(error) => return Err(error),
             }
         }
         if self.expired() {
-            return false;
+            return Ok(None);
         }
-        let Ok(raw) = std::str::from_utf8(&raw) else {
-            return false;
-        };
-        let Some((head, _)) = raw.split_once('(') else {
-            return false;
-        };
-        if head.trim().parse::<i32>().ok() != Some(pid) {
-            return false;
+        Ok(String::from_utf8(raw).ok())
+    }
+}
+
+/// One thread group seen through the map sweep's bounded reads.
+struct MappedThreads<'s, 'a, A> {
+    sweep: &'s mut Sweep<'a, A>,
+    process: &'s Path,
+    pid: i32,
+}
+
+impl<A: Access> thread_group::ThreadGroup for MappedThreads<'_, '_, A> {
+    fn tids(&mut self) -> Option<Vec<i32>> {
+        if self.sweep.expired() {
+            return None;
         }
-        let Ok(fields) = super::proc_stat_fields_after_comm(raw) else {
-            return false;
-        };
-        let Some(flags) = fields.get(6).and_then(|value| value.parse::<u64>().ok()) else {
-            return false;
-        };
-        let Some(threads) = fields.get(17).and_then(|value| value.parse::<u64>().ok()) else {
-            return false;
-        };
-        threads > 0
-            && (flags & PF_KTHREAD != 0
-                || (threads == 1 && matches!(fields.first().copied(), Some("Z" | "X" | "x"))))
+        let entries = self.sweep.access.entries(&self.process.join("task")).ok()?;
+        let mut tids = Vec::new();
+        for entry in entries {
+            if tids.len() >= thread_group::MAX_THREADS || self.sweep.expired() {
+                return None;
+            }
+            tids.push(entry.ok()?.to_str()?.parse::<i32>().ok()?);
+        }
+        Some(tids)
+    }
+
+    fn thread(&mut self, tid: i32) -> ThreadState {
+        let path = self.process.join("task").join(tid.to_string()).join("stat");
+        match self.sweep.read_stat(&path) {
+            Ok(Some(raw)) => ThreadState::from_record(&raw, tid),
+            Err(error) if disappeared(&error) => ThreadState::Gone,
+            Ok(None) | Err(_) => ThreadState::Unknown,
+        }
+    }
+
+    fn thread_count(&mut self) -> Option<u64> {
+        let raw = self.sweep.read_stat(&self.process.join("stat")).ok()??;
+        thread_group::exiting_group_count(&raw, self.pid)
     }
 }
 
@@ -726,6 +778,7 @@ fn path_spellings(path: &Path) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::thread_group::PF_EXITING;
     use super::*;
     use std::collections::BTreeMap;
     use std::rc::Rc;
@@ -773,6 +826,7 @@ mod tests {
 
     struct Faults {
         errors: BTreeMap<PathBuf, i32>,
+        read_errors: BTreeMap<PathBuf, i32>,
         entry_error: Option<PathBuf>,
         absent_pid: Option<i32>,
         clock: Rc<Cell<Instant>>,
@@ -785,6 +839,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 errors: BTreeMap::new(),
+                read_errors: BTreeMap::new(),
                 entry_error: None,
                 absent_pid: None,
                 clock: Rc::new(Cell::new(Instant::now())),
@@ -792,6 +847,15 @@ mod tests {
                 chunk: usize::MAX,
                 interrupt: false,
             }
+        }
+    }
+
+    /// Opens, then fails every read, like a task reaped after the open.
+    struct FailingReader(i32);
+
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from_raw_os_error(self.0))
         }
     }
 
@@ -832,6 +896,9 @@ mod tests {
         fn open(&self, path: &Path) -> io::Result<Box<dyn Read>> {
             if let Some(code) = self.errors.get(path) {
                 return Err(io::Error::from_raw_os_error(*code));
+            }
+            if let Some(&code) = self.read_errors.get(path) {
+                return Ok(Box::new(FailingReader(code)));
             }
             Ok(Box::new(AdvancingReader {
                 inner: Native.open(path)?,
@@ -949,6 +1016,10 @@ mod tests {
             (1, "Z", 0, 1, true),
             (1, "Z", 0, 2, false),
             (1, "S", 0, 1, false),
+            // Between exit_mm and exit_notify: empty maps before the zombie.
+            (1, "R", PF_EXITING, 1, true),
+            (1, "D", PF_EXITING, 1, true),
+            (1, "R", PF_EXITING, 2, false),
             (2, "Z", 0, 1, false),
             (1, "Z", 0, 0, false),
         ] {
@@ -975,6 +1046,80 @@ mod tests {
                 .scan(&access, Limits::default())
                 .incomplete
                 .is_some()
+        );
+    }
+
+    /// bd-q29t: a leader that exits first reads empty maps while its
+    /// siblings still unmap theirs.
+    #[test]
+    fn a_thread_group_is_explained_only_when_every_counted_thread_is_exiting() {
+        for (leader, flags, count, sibling, sibling_flags, complete) in [
+            ("Z", PF_EXITING, 2, "R", PF_EXITING, true),
+            ("R", PF_EXITING, 2, "D", PF_EXITING, true),
+            // A sibling still running user code.
+            ("Z", 0, 2, "S", 0, false),
+            // A third thread the listing missed is still counted.
+            ("Z", PF_EXITING, 3, "R", PF_EXITING, false),
+        ] {
+            let fixture = Fixture::new();
+            fixture.maps(1, b"");
+            let process = fixture.proc.join("1");
+            fs::write(process.join("stat"), task_stat(1, leader, flags, count)).unwrap();
+            for (tid, state, flags) in [(1, leader, flags), (2, sibling, sibling_flags)] {
+                let dir = process.join("task").join(tid.to_string());
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("stat"), task_stat(tid, state, flags, count)).unwrap();
+            }
+            let result = fixture.scan(&Native, Limits::default());
+            assert_eq!(
+                result.incomplete.is_none(),
+                complete,
+                "{leader} {flags:#x} {count} {sibling}: {:?}",
+                result.incomplete
+            );
+        }
+    }
+
+    /// A non-leader thread's execve takes over the leader's ID and start
+    /// time and releases the leader (de_thread): the group record then shows
+    /// the exec'ing thread, so no exiting count is available.
+    #[test]
+    fn a_leader_id_taken_over_by_an_exec_thread_stays_unexplained() {
+        let fixture = Fixture::new();
+        fixture.maps(1, b"");
+        let process = fixture.proc.join("1");
+        fs::write(process.join("stat"), task_stat(1, "R", 0, 1)).unwrap();
+        let leader = process.join("task/1");
+        fs::create_dir_all(&leader).unwrap();
+        fs::write(leader.join("stat"), task_stat(1, "Z", PF_EXITING, 1)).unwrap();
+        // Released after the listing: its directory is listed, its stat gone.
+        fs::create_dir_all(process.join("task/2")).unwrap();
+        assert!(
+            fixture
+                .scan(&Native, Limits::default())
+                .incomplete
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_maps_read_cut_off_by_the_task_exiting_needs_the_same_evidence() {
+        let fixture = Fixture::new();
+        fixture.maps(1, b"");
+        let process = fixture.proc.join("1");
+        let mut access = Faults::default();
+        access.read_errors.insert(process.join("maps"), libc::ESRCH);
+        for (state, flags, complete) in [("S", 0, false), ("R", PF_EXITING, true)] {
+            fs::write(process.join("stat"), task_stat(1, state, flags, 1)).unwrap();
+            let result = fixture.scan(&access, Limits::default());
+            assert_eq!(result.incomplete.is_none(), complete, "{state}");
+        }
+        access.read_errors.insert(process.join("maps"), libc::EIO);
+        assert!(
+            fixture
+                .scan(&access, Limits::default())
+                .incomplete
+                .is_some_and(|reason| reason.contains("maps read failed"))
         );
     }
 

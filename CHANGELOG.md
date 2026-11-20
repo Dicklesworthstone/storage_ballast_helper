@@ -22,6 +22,26 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   of the point. Controllers retain the exact conservative bound; warnings
   can still come from an independent evaluation of the unadjusted forecast.
   Genuine short forecasts and already reached thresholds remain reportable.
+- **A process exiting during the memory-map sweep no longer makes the sweep
+  incomplete.** Linux releases a process's address space before the process
+  becomes a zombie, so a process caught mid-exit reads empty maps while it
+  is still running or in disk sleep. Each such exit made active-reference
+  visibility incomplete for that pass, and candidates are held whenever it
+  is: 132 passes on one build worker and 110 on another in 4.5 days, the
+  most common cause on both. Empty maps are now explained when every thread
+  of the process is proven to be exiting. A maps read that fails because
+  the task was reaped after the open is judged the same way (bd-jo30).
+- **Exit evidence for a multi-threaded process covers threads its task
+  listing missed.** The executable sweep accepted a process whose listed
+  threads were all exiting, but one `/proc/PID/task` listing can miss a live
+  thread: one started after the listing, or one skipped when the kernel's
+  listing stops early at a thread that was just released. The proof now
+  also requires the process's own count of unreleased threads, read twice
+  from a record that shows the process exiting, to equal the exiting threads
+  it read, and rereads each of them in between to confirm it is still there
+  with the same start time. The memory-map sweep uses the same proof, so a
+  process whose threads are all exiting no longer holds the batch there
+  either (bd-q29t).
 - **One APFS container is one filesystem on macOS.** The daemon always
   watches the system root, and on macOS `/` is the sealed, read-only system
   volume, which reports the same container free space as the Data volume.

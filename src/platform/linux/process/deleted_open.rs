@@ -925,9 +925,12 @@ fn read_identity(directory: &Path, pid: i32, deadline: Instant) -> io::Result<Pr
     let flags = fields[6].and_then(decimal).ok_or_else(invalid_metadata)?;
     let threads = fields[17].and_then(decimal).ok_or_else(invalid_metadata)?;
     // Linux include/linux/sched.h PF_KTHREAD. An exited leader is not proof
-    // that its surviving threads have released their address space.
+    // that its surviving threads have released their address space. A task
+    // in do_exit (PF_EXITING, 0x4) loses its exe link at exit_mm, before it
+    // becomes a zombie, so a single-threaded exiting task counts too.
     let no_executable = flags & 0x0020_0000 != 0
-        || (fields[0].is_some_and(|state| matches!(state, b"Z" | b"X")) && threads <= 1);
+        || ((fields[0].is_some_and(|state| matches!(state, b"Z" | b"X")) || flags & 0x4 != 0)
+            && threads <= 1);
     Ok(ProcessIdentity {
         start_ticks,
         name: String::from_utf8_lossy(&raw[open + 1..close]).into_owned(),
@@ -1621,6 +1624,8 @@ mod tests {
             ("Z", 0, 1, true),
             ("X", 0, 1, true),
             ("Z", 0, 2, false),
+            ("R", 0x4, 1, true),
+            ("R", 0x4, 2, false),
         ] {
             let root = tempfile::tempdir().unwrap();
             let directory = process(root.path(), 41);

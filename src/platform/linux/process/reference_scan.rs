@@ -14,6 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use super::thread_group::{self, ThreadState};
 use super::{
     OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET, PROC_ROOT, open_file_kind_for_fd,
     open_file_mode_for_fd, pid_from_proc_entry_name, resolve_absolute_path,
@@ -42,11 +43,6 @@ const MAX_EXECUTABLE_STAT_BYTES: usize = 8192;
 const MAX_UNIX_SOCKET_TABLE_BYTES: usize = 32 * 1024 * 1024;
 // Linux include/linux/sched.h: task has no user executable (PF_KTHREAD).
 const PF_KTHREAD: u64 = 0x0020_0000;
-// Linux include/linux/sched.h: the task has entered do_exit (PF_EXITING) and
-// never returns to user mode.
-const PF_EXITING: u64 = 0x0000_0004;
-/// A thread group larger than this is not walked for exit evidence.
-const MAX_EXIT_EVIDENCE_THREADS: usize = 4096;
 
 type Entries = Box<dyn Iterator<Item = io::Result<OsString>>>;
 
@@ -451,7 +447,7 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
         self.proc
             .read_bounded(&process.join("stat"), MAX_EXECUTABLE_STAT_BYTES)
             .is_ok_and(|raw| stat_has_no_user_executable(&raw, pid))
-            || self.every_thread_exiting(process)
+            || self.every_thread_exiting(process, pid)
     }
 
     /// Whether every thread of the group has entered do_exit, so none can
@@ -460,35 +456,14 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
     /// it becomes a zombie: a rust-lld on a loaded rch worker did, and held
     /// a whole batch (2026-11-14). One thread outside do_exit, such as a
     /// sibling of a main thread that called pthread_exit, keeps the process
-    /// unproven, as does any thread whose state cannot be read.
-    fn every_thread_exiting(&mut self, process: &Path) -> bool {
-        let task = process.join("task");
-        let Ok(threads) = self.proc.entries(&task) else {
-            return false;
-        };
-        let mut seen = 0;
-        for thread in threads {
-            if seen >= MAX_EXIT_EVIDENCE_THREADS || self.expired() {
-                return false;
-            }
-            seen += 1;
-            let Ok(name) = thread else {
-                return false;
-            };
-            let Some(tid) = name.to_str().and_then(|name| name.parse::<i32>().ok()) else {
-                return false;
-            };
-            match self
-                .proc
-                .read_bounded(&task.join(&name).join("stat"), MAX_EXECUTABLE_STAT_BYTES)
-            {
-                Ok(raw) if task_stat_exiting(&raw, tid) => {}
-                // A thread released after the listing runs nothing.
-                Err(error) if disappeared(&error) => {}
-                _ => return false,
-            }
-        }
-        seen > 0
+    /// unproven, as does any thread whose state cannot be read. One listing
+    /// of the group is not proof of it, so see `thread_group` (bd-q29t).
+    fn every_thread_exiting(&mut self, process: &Path, pid: i32) -> bool {
+        thread_group::whole_group_exiting(&mut ReferenceThreads {
+            sweep: self,
+            process,
+            pid,
+        })
     }
 
     /// [`Self::no_user_executable`], giving an exiting process a moment to
@@ -509,6 +484,57 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
             std::thread::sleep(settle);
         }
         self.no_user_executable(process, pid)
+    }
+}
+
+/// One thread group seen through the reference sweep's bounded reads.
+struct ReferenceThreads<'s, 'a, P> {
+    sweep: &'s mut Sweep<'a, P>,
+    process: &'s Path,
+    pid: i32,
+}
+
+impl<P: ProcAccess> ReferenceThreads<'_, '_, P> {
+    fn stat(&mut self, path: &Path) -> io::Result<Option<String>> {
+        if self.sweep.expired() {
+            return Ok(None);
+        }
+        let raw = self
+            .sweep
+            .proc
+            .read_bounded(path, MAX_EXECUTABLE_STAT_BYTES)?;
+        Ok(String::from_utf8(raw).ok())
+    }
+}
+
+impl<P: ProcAccess> thread_group::ThreadGroup for ReferenceThreads<'_, '_, P> {
+    fn tids(&mut self) -> Option<Vec<i32>> {
+        if self.sweep.expired() {
+            return None;
+        }
+        let entries = self.sweep.proc.entries(&self.process.join("task")).ok()?;
+        let mut tids = Vec::new();
+        for entry in entries {
+            if tids.len() >= thread_group::MAX_THREADS || self.sweep.expired() {
+                return None;
+            }
+            tids.push(entry.ok()?.to_str()?.parse::<i32>().ok()?);
+        }
+        Some(tids)
+    }
+
+    fn thread(&mut self, tid: i32) -> ThreadState {
+        let path = self.process.join("task").join(tid.to_string()).join("stat");
+        match self.stat(&path) {
+            Ok(Some(raw)) => ThreadState::from_record(&raw, tid),
+            Err(error) if disappeared(&error) => ThreadState::Gone,
+            Ok(None) | Err(_) => ThreadState::Unknown,
+        }
+    }
+
+    fn thread_count(&mut self) -> Option<u64> {
+        let raw = self.stat(&self.process.join("stat")).ok()??;
+        thread_group::exiting_group_count(&raw, self.pid)
     }
 }
 
@@ -546,33 +572,14 @@ fn read_proc_bytes(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
 }
 
 fn stat_has_no_user_executable(raw: &[u8], pid: i32) -> bool {
-    task_stat_fields(raw, pid).is_some_and(|(state, flags, threads)| {
-        threads > 0
-            && (flags & PF_KTHREAD != 0 || (threads == 1 && matches!(state, "Z" | "X" | "x")))
-    })
-}
-
-/// Whether one thread's stat shows it inside do_exit or already dead.
-fn task_stat_exiting(raw: &[u8], tid: i32) -> bool {
-    task_stat_fields(raw, tid).is_some_and(|(state, flags, _)| {
-        flags & PF_EXITING != 0 || matches!(state, "Z" | "X" | "x")
-    })
-}
-
-/// State, flags and thread count from a stat record that names `pid`:
-/// stat fields 3, 9 and 20.
-fn task_stat_fields(raw: &[u8], pid: i32) -> Option<(&str, u64, u64)> {
-    let raw = std::str::from_utf8(raw).ok()?;
-    let (observed_pid, _) = raw.split_once('(')?;
-    if observed_pid.trim().parse::<i32>().ok() != Some(pid) {
-        return None;
-    }
-    let fields = super::proc_stat_fields_after_comm(raw).ok()?;
-    // fields[0] is stat field 3 (state).
-    let state = *fields.first()?;
-    let flags = fields.get(6)?.parse::<u64>().ok()?;
-    let threads = fields.get(17)?.parse::<u64>().ok()?;
-    Some((state, flags, threads))
+    std::str::from_utf8(raw)
+        .ok()
+        .and_then(|raw| thread_group::parse_stat(raw, pid))
+        .is_some_and(|stat| {
+            stat.threads > 0
+                && (stat.flags & PF_KTHREAD != 0
+                    || (stat.threads == 1 && matches!(stat.state, "Z" | "X" | "x")))
+        })
 }
 
 fn disappeared(error: &io::Error) -> bool {
@@ -889,6 +896,7 @@ fn executables_with_roots(
 
 #[cfg(test)]
 mod tests {
+    use super::super::thread_group::PF_EXITING;
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
@@ -2169,8 +2177,8 @@ mod tests {
     #[test]
     fn an_exiting_group_with_unproven_threads_still_holds_the_batch() {
         // One sibling still outside do_exit; a thread record naming another
-        // task; no thread records at all.
-        for case in 0..3 {
+        // task; no thread records at all; a thread count above the listing.
+        for case in 0..4 {
             let fixture = Fixture::new();
             let process = fixture.pid(1);
             fs::write(process.join("stat"), task_stat(1, "Z", PF_EXITING, 2)).unwrap();
@@ -2184,7 +2192,13 @@ mod tests {
                     fs::create_dir_all(&thread).unwrap();
                     fs::write(thread.join("stat"), task_stat(3, "R", PF_EXITING, 2)).unwrap();
                 }
-                _ => fs::create_dir_all(process.join("task")).unwrap(),
+                2 => fs::create_dir_all(process.join("task")).unwrap(),
+                _ => {
+                    // A third thread the listing missed is still counted.
+                    fs::write(process.join("stat"), task_stat(1, "Z", PF_EXITING, 3)).unwrap();
+                    thread_stat(&process, 1, "Z", PF_EXITING);
+                    thread_stat(&process, 2, "R", PF_EXITING);
+                }
             }
             let result = fixture.scan_executables(&NativeProc, Limits::default());
             assert!(!result.complete, "case {case}");

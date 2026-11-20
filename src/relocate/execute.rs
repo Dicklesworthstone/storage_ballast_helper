@@ -4002,7 +4002,8 @@ mod tests {
         unmount(&sibling(&unit, "sbh-relocating").unwrap().join("a/mnt"));
         let staged = fs::read(staging.join("victim"));
         unmount(&staging);
-        assert!(bound.get(), "bind mount failed");
+        // The hook runs only after a passed precheck, so show the outcome.
+        assert!(bound.get(), "bind mount failed or never ran: {outcome:?}");
         assert!(
             matches!(&outcome, Outcome::Failed { stage, .. } if stage == "postcheck"),
             "{outcome:?}"
