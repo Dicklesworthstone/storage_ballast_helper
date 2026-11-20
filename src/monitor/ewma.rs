@@ -4,7 +4,7 @@
 #![allow(clippy::cast_precision_loss)]
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Trend classification for disk pressure dynamics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +65,11 @@ impl BurstState {
 #[derive(Debug, Clone)]
 pub struct RateEstimate {
     pub bytes_per_second: f64,
+    /// Signed net consumption measured over elapsed time when a distant
+    /// forecast uses a longer observation window. `None` means the immediate
+    /// EWMA supplies the projection (warmup or an imminent boundary).
+    /// Unlike the burst median, this evidence includes space freed by builds.
+    pub forecast_rate_bytes_per_second: Option<f64>,
     pub acceleration: f64,
     pub seconds_to_exhaustion: f64,
     pub seconds_to_threshold: f64,
@@ -94,6 +99,16 @@ pub const DEFAULT_RATE_HISTORY_CAP: usize = 200;
 /// Minimum samples in rate_history before burst detection is considered calibrated.
 pub const BURST_CALIBRATION_MIN: usize = 30;
 
+// Keep the projection window in wall time: at Critical the monitor may poll
+// every 100 ms, so a 200-sample rate ring can represent only twenty seconds.
+const FORECAST_HISTORY_INTERVAL: Duration = Duration::from_secs(5);
+const FORECAST_HISTORY_WINDOW: Duration = Duration::from_mins(15);
+const FORECAST_HISTORY_MIN: Duration = Duration::from_mins(5);
+const FORECAST_HISTORY_MAX_GAP: Duration = Duration::from_mins(1);
+const FORECAST_FAST_HORIZON: f64 = 5.0 * 60.0;
+const FORECAST_CHANGE_INTERVAL: Duration = Duration::from_secs(20);
+const FORECAST_HISTORY_CAP: usize = 182;
+
 /// Online EWMA estimator with adaptive alpha and fallback signaling.
 #[derive(Debug, Clone)]
 pub struct DiskRateEstimator {
@@ -116,6 +131,10 @@ pub struct DiskRateEstimator {
     rate_history_cap: usize,
     /// Count of consecutive recent samples exceeding 3× the median rate.
     burst_duration_samples: u32,
+    /// Sparsely retained free-space observations for long-horizon forecasts.
+    /// Time-weighted trends preserve signed net consumption rather than
+    /// treating every brief allocation or release as a new trend.
+    forecast_history: VecDeque<SampleState>,
 }
 
 impl DiskRateEstimator {
@@ -154,6 +173,7 @@ impl DiskRateEstimator {
             rate_history: VecDeque::with_capacity(rate_history_cap.min(1024)),
             rate_history_cap: rate_history_cap.max(1),
             burst_duration_samples: 0,
+            forecast_history: VecDeque::with_capacity(FORECAST_HISTORY_CAP),
         }
     }
 
@@ -181,11 +201,13 @@ impl DiskRateEstimator {
         threshold_free_bytes: u64,
     ) -> RateEstimate {
         let Some(previous) = self.last else {
-            self.last = Some(SampleState {
+            let initial = SampleState {
                 free_bytes,
                 at: observed_at,
                 inst_rate: 0.0,
-            });
+            };
+            self.last = Some(initial);
+            self.forecast_history.push_back(initial);
             return self.fallback_estimate(free_bytes, threshold_free_bytes);
         };
 
@@ -229,6 +251,7 @@ impl DiskRateEstimator {
             at: observed_at,
             inst_rate,
         });
+        self.record_forecast_observation(free_bytes, observed_at, dt_duration);
 
         // Maintain rate history ring buffer for burst detection.
         self.rate_history.push_back(inst_rate);
@@ -239,9 +262,12 @@ impl DiskRateEstimator {
         let burst_state = self.compute_burst_state(inst_rate);
 
         let trend = classify_trend(self.ewma_rate, self.ewma_accel);
-        let seconds_to_exhaustion = project_time(self.ewma_rate, free_bytes as f64);
         let threshold_distance = free_bytes.saturating_sub(threshold_free_bytes);
-        let seconds_to_threshold = project_time(self.ewma_rate, threshold_distance as f64);
+        let forecast_rate_bytes_per_second =
+            self.forecast_rate(free_bytes, observed_at, threshold_distance);
+        let projection_rate = forecast_rate_bytes_per_second.unwrap_or(self.ewma_rate);
+        let seconds_to_exhaustion = project_time(projection_rate, free_bytes as f64);
+        let seconds_to_threshold = project_time(projection_rate, threshold_distance as f64);
 
         // Track prediction jitter: how much seconds_to_threshold changes between
         // ticks, normalized by the prediction magnitude. Swings like 47m → 2m
@@ -263,6 +289,7 @@ impl DiskRateEstimator {
 
         RateEstimate {
             bytes_per_second: self.ewma_rate,
+            forecast_rate_bytes_per_second,
             acceleration: self.ewma_accel,
             seconds_to_exhaustion,
             seconds_to_threshold,
@@ -274,6 +301,177 @@ impl DiskRateEstimator {
             burst_state,
             free_bytes,
         }
+    }
+
+    fn record_forecast_observation(&mut self, free_bytes: u64, at: Instant, gap: Duration) {
+        if gap > FORECAST_HISTORY_MAX_GAP {
+            // An unobserved interval is not evidence that a rate persisted.
+            self.forecast_history.clear();
+        }
+        if self
+            .forecast_history
+            .back()
+            .is_none_or(|last| at.saturating_duration_since(last.at) >= FORECAST_HISTORY_INTERVAL)
+        {
+            self.forecast_history.push_back(SampleState {
+                free_bytes,
+                at,
+                inst_rate: 0.0,
+            });
+        }
+        // Retain one observation before the window boundary for interpolation.
+        while self.forecast_history.len() > 1
+            && self.forecast_history.get(1).is_some_and(|next| {
+                at.saturating_duration_since(next.at) >= FORECAST_HISTORY_WINDOW
+            })
+        {
+            self.forecast_history.pop_front();
+        }
+        debug_assert!(self.forecast_history.len() <= FORECAST_HISTORY_CAP);
+    }
+
+    /// A longer, measured net rate for distant projections. Immediate danger
+    /// retains the original EWMA response; neither a historical average nor a
+    /// persistence test may postpone crossing a nearby pressure boundary.
+    fn forecast_rate(&self, free_bytes: u64, at: Instant, threshold_distance: u64) -> Option<f64> {
+        let elapsed = at.checked_duration_since(self.forecast_history.front()?.at)?;
+        if elapsed < FORECAST_HISTORY_MIN {
+            return None;
+        }
+        let danger_distance = if threshold_distance == 0 {
+            free_bytes
+        } else {
+            threshold_distance
+        };
+        if project_time(self.ewma_rate, danger_distance as f64) <= FORECAST_FAST_HORIZON {
+            return None;
+        }
+
+        let window = elapsed.min(FORECAST_HISTORY_WINDOW);
+        let net_rate = self.trend_rate(free_bytes, at, window)?;
+        if !self.recent_change_observed(at) {
+            return Some(net_rate);
+        }
+
+        // A new steady writer (or sustained recovery) must not wait half a
+        // fifteen-minute median window. Three non-overlapping measured windows
+        // must agree in sign and within a factor of two. A short burst followed
+        // by idle time or deletion therefore cannot establish a new regime.
+        let mut recent_rates = [0.0; 3];
+        let mut newer_consumption = 0.0;
+        for (step, rate) in (1..=3).zip(&mut recent_rates) {
+            let older = self.consumed_since(free_bytes, at, FORECAST_CHANGE_INTERVAL * step)?;
+            *rate = (older - newer_consumption) / FORECAST_CHANGE_INTERVAL.as_secs_f64();
+            newer_consumption = older;
+        }
+        let recent_rate = newer_consumption / (FORECAST_CHANGE_INTERVAL * 3).as_secs_f64();
+        let min_rate = recent_rates.into_iter().fold(f64::INFINITY, f64::min);
+        let max_rate = recent_rates.into_iter().fold(f64::NEG_INFINITY, f64::max);
+        let consistent = (min_rate > 0.0 && max_rate <= 2.0 * min_rate)
+            || (max_rate < 0.0 && min_rate >= 2.0 * max_rate)
+            || (min_rate.abs() <= 1.0 && max_rate.abs() <= 1.0);
+        let changed = recent_rate.signum() != net_rate.signum()
+            || recent_rate.abs() > 2.0 * net_rate.abs()
+            || 2.0 * recent_rate.abs() < net_rate.abs();
+        Some(if consistent && changed {
+            recent_rate
+        } else {
+            net_rate
+        })
+    }
+
+    /// A least-squares consumption slope over elapsed time. Integrate each
+    /// observed linear segment exactly, so variable polling does not give a
+    /// densely sampled moment more weight. Using the entire window avoids
+    /// letting a late build allocation or release dominate its endpoints.
+    fn trend_rate(&self, free_bytes: u64, at: Instant, window: Duration) -> Option<f64> {
+        let boundary = at.checked_sub(window)?;
+        let seconds = window.as_secs_f64();
+        let mut previous_time = 0.0;
+        let mut previous_delta = self.consumed_since(free_bytes, at, window)?;
+        let mut covariance = 0.0;
+        let current = SampleState {
+            free_bytes,
+            at,
+            inst_rate: 0.0,
+        };
+        for sample in self
+            .forecast_history
+            .iter()
+            .filter(|sample| sample.at > boundary)
+            .chain([&current])
+        {
+            // Normalize time to [0, 1]; its centered second moment is 1/12.
+            // Integer subtraction preserves small deltas on large volumes.
+            let time = sample.at.checked_duration_since(boundary)?.as_secs_f64() / seconds;
+            let delta = (i128::from(sample.free_bytes) - i128::from(free_bytes)) as f64;
+            covariance += (time - previous_time) / 6.0
+                * ((2.0 * previous_time + time - 1.5) * previous_delta
+                    + (previous_time + 2.0 * time - 1.5) * delta);
+            previous_time = time;
+            previous_delta = delta;
+        }
+        Some(-12.0 * covariance / seconds)
+    }
+
+    /// Three interpolated windows are not three observations. In particular,
+    /// a single minute-long native interval cannot establish persistence.
+    fn recent_change_observed(&self, at: Instant) -> bool {
+        let Some(boundary) = at.checked_sub(FORECAST_CHANGE_INTERVAL * 3) else {
+            return false;
+        };
+        let Some(first) = self.forecast_history.front() else {
+            return false;
+        };
+        if first.at > boundary {
+            return false;
+        }
+        let mut previous = first.at;
+        for next in self
+            .forecast_history
+            .iter()
+            .skip(1)
+            .map(|sample| sample.at)
+            .chain([at])
+        {
+            if next > boundary
+                && next.saturating_duration_since(previous) > FORECAST_CHANGE_INTERVAL
+            {
+                return false;
+            }
+            previous = next;
+        }
+        true
+    }
+
+    /// Signed bytes consumed since an exact elapsed-time boundary, including
+    /// a partial bucket. Subtract integer counters before conversion so a
+    /// small change on a large filesystem retains its precision.
+    fn consumed_since(&self, free_bytes: u64, at: Instant, ago: Duration) -> Option<f64> {
+        let boundary = at.checked_sub(ago)?;
+        let current = SampleState {
+            free_bytes,
+            at,
+            inst_rate: 0.0,
+        };
+        let mut previous = *self.forecast_history.front()?;
+        if previous.at > boundary {
+            return None;
+        }
+        for next in self.forecast_history.iter().skip(1).chain([&current]) {
+            if next.at >= boundary {
+                let span = next.at.checked_duration_since(previous.at)?.as_secs_f64();
+                let offset = boundary.checked_duration_since(previous.at)?.as_secs_f64();
+                let start_delta = (i128::from(previous.free_bytes) - i128::from(free_bytes)) as f64;
+                if span == 0.0 {
+                    return Some(start_delta);
+                }
+                let change = (i128::from(next.free_bytes) - i128::from(previous.free_bytes)) as f64;
+                return Some(change.mul_add(offset / span, start_delta));
+            }
+            previous = *next;
+        }
+        None
     }
 
     /// Number of rate samples collected (excludes the initial seed sample).
@@ -297,10 +495,15 @@ impl DiskRateEstimator {
         threshold_free_bytes: u64,
     ) -> RateEstimate {
         let mut estimate = previous.clone();
-        estimate.seconds_to_threshold = project_time(
-            self.ewma_rate,
-            previous.free_bytes.saturating_sub(threshold_free_bytes) as f64,
-        );
+        let distance = previous.free_bytes.saturating_sub(threshold_free_bytes);
+        estimate.forecast_rate_bytes_per_second = self
+            .last
+            .and_then(|last| self.forecast_rate(previous.free_bytes, last.at, distance));
+        let projection_rate = estimate
+            .forecast_rate_bytes_per_second
+            .unwrap_or(self.ewma_rate);
+        estimate.seconds_to_threshold = project_time(projection_rate, distance as f64);
+        estimate.seconds_to_exhaustion = project_time(projection_rate, previous.free_bytes as f64);
         estimate.confidence = self.compute_confidence();
         estimate.fallback_active = self.samples < self.min_samples || estimate.confidence < 0.2;
         self.last_predicted_secs = estimate
@@ -331,6 +534,7 @@ impl DiskRateEstimator {
         let threshold_distance = free_bytes.saturating_sub(threshold_free_bytes);
         RateEstimate {
             bytes_per_second: self.ewma_rate,
+            forecast_rate_bytes_per_second: None,
             acceleration: self.ewma_accel,
             seconds_to_exhaustion: if self.ewma_rate > 0.0 {
                 free_bytes as f64 / self.ewma_rate
@@ -897,5 +1101,223 @@ mod tests {
             burst.alpha_used,
             steady.alpha_used,
         );
+    }
+
+    #[test]
+    fn distant_runway_tracks_net_drain_through_repeated_allocations_and_frees() {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+        let start = Instant::now();
+        let initial_free = 80_000_000_000;
+        let threshold = 40_000_000_000;
+        let net_rate = 3_000_000;
+        estimator.update(initial_free, start, threshold);
+        let mut immediate_recoveries = 0;
+        for seconds in (5..=1800_u64).step_by(5) {
+            let phase = seconds % 60;
+            let transient = phase.min(60 - phase) * 60_000_000;
+            let free = initial_free - seconds * net_rate - transient;
+            let estimate = estimator.update(free, start + Duration::from_secs(seconds), threshold);
+            if seconds < 900 {
+                continue;
+            }
+            let projected_rate = estimate.forecast_rate_bytes_per_second.unwrap();
+            assert!(
+                (projected_rate / net_rate as f64 - 1.0).abs() < 0.1,
+                "{estimate:?}"
+            );
+            let realized_runway = (free - threshold) as f64 / net_rate as f64;
+            assert!((estimate.seconds_to_threshold / realized_runway - 1.0).abs() < 0.1);
+            assert!(estimate.seconds_to_exhaustion.is_finite());
+            immediate_recoveries += usize::from(estimate.bytes_per_second < 0.0);
+        }
+        // The test includes the former false "never fills" case, not just
+        // positive spikes around an otherwise steady rate.
+        assert!(immediate_recoveries > 0);
+    }
+
+    #[test]
+    fn distant_runway_handles_misaligned_pulses_and_nonuniform_observations() {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+        let start = Instant::now();
+        let initial_free = 90_000_000_000;
+        let threshold = 45_000_000_000;
+        let net_rate = 2_700_000;
+        // Independent build jobs allocate and later free 3 GB. Their starts,
+        // durations and native observation cadence share no aligned period
+        // with the forecast window. Only the persistent 2.7 MB/s drain remains.
+        let pulses = [
+            (337, 37),
+            (503, 29),
+            (811, 41),
+            (1057, 23),
+            (1289, 47),
+            (1567, 31),
+            (1891, 39),
+        ];
+        let cadences = [3, 11, 5, 17, 7];
+        estimator.update(initial_free, start, threshold);
+        let mut seconds = 0;
+        let mut step = 0;
+        let mut misleading_endpoints = 0;
+        while seconds < 2200 {
+            seconds += cadences[step % cadences.len()];
+            step += 1;
+            let transient: u64 = pulses
+                .iter()
+                .map(|&(begin, duration)| {
+                    if seconds < begin || seconds >= begin + duration {
+                        return 0;
+                    }
+                    let phase = seconds - begin;
+                    phase.min(duration - phase) * 6_000_000_000 / duration
+                })
+                .sum();
+            let free = initial_free - seconds * net_rate - transient;
+            let at = start + Duration::from_secs(seconds);
+            let estimate = estimator.update(free, at, threshold);
+            if seconds < 900 {
+                continue;
+            }
+            let projected = estimate.forecast_rate_bytes_per_second.unwrap();
+            let runway = (free - threshold) as f64 / net_rate as f64;
+            assert!(
+                (0.5..=2.0).contains(&(projected / net_rate as f64)),
+                "at {seconds}s: {estimate:?}"
+            );
+            assert!(
+                (0.5..=2.0).contains(&(estimate.seconds_to_threshold / runway)),
+                "at {seconds}s: {estimate:?}"
+            );
+            assert!(estimate.seconds_to_exhaustion.is_finite());
+            // An endpoint-only history would still falsely say "never fills"
+            // on this trace, so passing cannot rely on harmonic cancellation.
+            misleading_endpoints += usize::from(
+                estimator
+                    .consumed_since(free, at, super::FORECAST_HISTORY_WINDOW)
+                    .unwrap()
+                    < 0.0,
+            );
+        }
+        assert!(misleading_endpoints > 0);
+    }
+
+    fn warm_long_forecast() -> (DiskRateEstimator, Instant, u64) {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+        let start = Instant::now();
+        let initial_free = 80_000_000_000;
+        estimator.update(initial_free, start, 0);
+        for seconds in (5..=900_u64).step_by(5) {
+            estimator.update(
+                initial_free - seconds * 2_000_000,
+                start + Duration::from_secs(seconds),
+                0,
+            );
+        }
+        (
+            estimator,
+            start + Duration::from_secs(900),
+            initial_free - 1_800_000_000,
+        )
+    }
+
+    #[test]
+    fn short_burst_does_not_become_a_new_long_horizon_rate() {
+        let (mut estimator, start, mut free) = warm_long_forecast();
+        for seconds in (5..=60).step_by(5) {
+            let rate = if seconds <= 30 { 50_000_000 } else { 2_000_000 };
+            free -= rate * 5;
+            let estimate = estimator.update(free, start + Duration::from_secs(seconds), 0);
+            let projection_rate = estimate.forecast_rate_bytes_per_second.unwrap();
+            assert!(projection_rate < 4_000_000.0, "{estimate:?}");
+            assert!(estimate.seconds_to_exhaustion > 4.0 * 3600.0);
+        }
+    }
+
+    #[test]
+    fn sustained_new_writer_is_recognized_without_waiting_for_old_history_to_expire() {
+        let (mut estimator, start, mut free) = warm_long_forecast();
+        let mut last = None;
+        for seconds in (5..=60).step_by(5) {
+            free -= 100_000_000 * 5;
+            last = Some(estimator.update(free, start + Duration::from_secs(seconds), 0));
+        }
+        let estimate = last.unwrap();
+        assert_eq!(estimate.forecast_rate_bytes_per_second, Some(100_000_000.0));
+        assert!((estimate.seconds_to_exhaustion - free as f64 / 100_000_000.0).abs() < 1e-6);
+        assert!(estimate.seconds_to_exhaustion < 15.0 * 60.0);
+    }
+
+    #[test]
+    fn sustained_recovery_and_stopped_writer_end_the_old_drain_forecast() {
+        for recovery in [false, true] {
+            let (mut estimator, start, mut free) = warm_long_forecast();
+            let mut last = None;
+            for seconds in (5..=60).step_by(5) {
+                if recovery {
+                    free += 20_000_000 * 5;
+                }
+                last = Some(estimator.update(free, start + Duration::from_secs(seconds), 0));
+            }
+            let estimate = last.unwrap();
+            assert!(estimate.forecast_rate_bytes_per_second.unwrap() <= 0.0);
+            assert!(estimate.seconds_to_exhaustion.is_infinite());
+        }
+    }
+
+    #[test]
+    fn imminent_boundary_keeps_the_immediate_ewma_response() {
+        let (mut estimator, start, mut free) = warm_long_forecast();
+        let threshold = free - 5_000_000_000;
+        let mut fast_samples = 0;
+        for seconds in (5..=30).step_by(5) {
+            free -= 100_000_000 * 5;
+            let estimate = estimator.update(free, start + Duration::from_secs(seconds), threshold);
+            let immediate = (free - threshold) as f64 / estimate.bytes_per_second;
+            if immediate <= super::FORECAST_FAST_HORIZON {
+                assert_eq!(estimate.forecast_rate_bytes_per_second, None);
+                assert!((estimate.seconds_to_threshold - immediate).abs() < 1e-6);
+                fast_samples += 1;
+            }
+        }
+        assert!(
+            fast_samples > 0,
+            "fixture must reach the immediate danger path"
+        );
+    }
+
+    #[test]
+    fn projection_history_is_time_weighted_and_bounded_at_fast_poll_cadences() {
+        for millis_per_sample in [100_u64, 5000, 17000] {
+            let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+            let start = Instant::now();
+            let initial_free = 80_000_000_000;
+            estimator.update(initial_free, start, 0);
+            let mut last = None;
+            for step in 1..=1_000_000 / millis_per_sample {
+                let elapsed_ms = step * millis_per_sample;
+                let free = initial_free - elapsed_ms * 2000;
+                last = Some(estimator.update(free, start + Duration::from_millis(elapsed_ms), 0));
+                assert!(estimator.forecast_history.len() <= super::FORECAST_HISTORY_CAP);
+            }
+            let estimate = last.unwrap();
+            assert!((estimate.forecast_rate_bytes_per_second.unwrap() - 2_000_000.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn unobserved_gap_cannot_substantiate_a_sustained_forecast() {
+        let (mut estimator, start, free) = warm_long_forecast();
+        let estimate = estimator.update(free - 240_000_000, start + Duration::from_secs(120), 0);
+        assert_eq!(estimate.forecast_rate_bytes_per_second, None);
+        assert_eq!(estimator.forecast_history.len(), 1);
+    }
+
+    #[test]
+    fn one_coarse_observation_cannot_establish_three_sustained_change_windows() {
+        let (mut estimator, start, free) = warm_long_forecast();
+        let estimate = estimator.update(free - 6_000_000_000, start + Duration::from_secs(60), 0);
+        assert!(estimate.forecast_rate_bytes_per_second.unwrap() < 20_000_000.0);
+        assert!(estimate.seconds_to_exhaustion > 3600.0);
+        assert!(!estimator.recent_change_observed(start + Duration::from_secs(60)));
     }
 }

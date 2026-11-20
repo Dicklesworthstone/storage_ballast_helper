@@ -189,7 +189,10 @@ fn check_predict_keeps_collapsed_bounds_conservative_without_claiming_zero_runwa
     for (point, lower, reported, unknown) in [
         (5182.0, 0.0, Some(0.0), true),
         (5182.0, 0.0, None, true),
+        (5182.0, 1.0, Some(1.0), true),
+        (5182.0, 1.0, None, true),
         (5182.0, 60.0, Some(60.0), false),
+        (30.0, 30.0, Some(30.0), false),
         (0.0, 0.0, Some(0.0), false),
     ] {
         let rate = serde_json::json!({

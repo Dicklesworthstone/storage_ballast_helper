@@ -8,6 +8,20 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Stable distant forecasts on bursty build disks** (bd-hosd). Runway
+  projections use signed net consumption over an elapsed-time window, so
+  temporary allocations and frees cannot alternately imply imminent full
+  and "never fills" on a mostly full disk. Near-boundary response remains
+  immediate; a sustained new writer, recovery or stop replaces the old
+  rate after a short persistence check. State and status expose the
+  projection rate separately from the immediate EWMA measurement.
+- **Keep nearly collapsed forecasts honest** (bd-hosd). When calibration
+  recovers from a zero lower bound, its first positive bound can still be
+  only a tiny fraction of the point forecast. The daemon, CLI and dashboard
+  now keep that runway unknown until the bound retains at least one percent
+  of the point. Controllers retain the exact conservative bound; warnings
+  can still come from an independent evaluation of the unadjusted forecast.
+  Genuine short forecasts and already reached thresholds remain reportable.
 - **One APFS container is one filesystem on macOS.** The daemon always
   watches the system root, and on macOS `/` is the sealed, read-only system
   volume, which reports the same container free space as the Data volume.

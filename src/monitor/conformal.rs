@@ -101,14 +101,31 @@ pub struct TteInterval {
 }
 
 impl TteInterval {
-    /// A zero lower bound for a positive point forecast cannot establish a
-    /// safe runway. It does not mean the filesystem has reached the boundary.
-    /// Controllers may still use that bound conservatively, but reports must
-    /// not turn it into a prediction of immediate exhaustion.
+    /// Whether calibration leaves too little of the point forecast to report
+    /// an informative runway. Controllers still consume the original bound.
     #[must_use]
     pub fn runway_unknown(&self) -> bool {
-        self.point_secs.is_finite() && self.point_secs > 0.0 && self.lo_secs == 0.0
+        runway_is_unknown(self.point_secs, self.lo_secs)
     }
+}
+
+/// Whether a valid positive point forecast has a collapsed or nearly collapsed
+/// lower bound. This is a reporting rule, not a change to the calibration or
+/// the conservative bound used by controllers.
+///
+/// After ACI recovers from the unsupported quantile rank, its largest observed
+/// score can still be arbitrarily close to one. A few positive seconds from
+/// that correction are no stronger evidence of immediate exhaustion than an
+/// exact zero. Keep such a bound unknown until it retains at least one percent
+/// of the point forecast. A genuinely short point estimate remains reportable,
+/// and a reached boundary (point zero) remains an observation.
+#[must_use]
+pub fn runway_is_unknown(point_secs: f64, lo_secs: f64) -> bool {
+    point_secs.is_finite()
+        && point_secs > 0.0
+        && lo_secs.is_finite()
+        && lo_secs >= 0.0
+        && lo_secs / point_secs < 0.01
 }
 
 /// What one `observe` call resolved.
@@ -524,6 +541,56 @@ mod tests {
         let reached = calibrator.lower_bound(0.0);
         assert_eq!(reached.lo_secs, 0.0);
         assert!(!reached.runway_unknown());
+    }
+
+    #[test]
+    fn recovering_alpha_does_not_turn_an_uninformative_bound_into_a_deadline() {
+        let mut calibrator = ConformalCalibrator::new(ConformalConfig {
+            warmup: 5,
+            ..ConformalConfig::default()
+        });
+        for _ in 0..12 {
+            assert_eq!(calibrator.record(6000.0, 1.0, 6000.0), Some(false));
+        }
+        assert!(calibrator.alpha() < 0.0);
+        assert_eq!(calibrator.lower_bound(6000.0).lo_secs, 0.0);
+
+        // Covered forecasts move alpha back into the observed ranks. The
+        // retained severe miss then yields a positive but nearly zero bound.
+        let mut saw_near_collapse = false;
+        for _ in 0..200 {
+            assert_eq!(calibrator.record(6000.0, 6000.0, 0.0), Some(true));
+            let interval = calibrator.lower_bound(6000.0);
+            if interval.lo_secs > 0.0 && interval.lo_secs < 1.1 {
+                assert!(interval.runway_unknown(), "{interval:?}");
+                // Reporting never rewrites the evidence consumed by control.
+                assert!((interval.lo_secs - 1.0).abs() < 1e-9);
+                saw_near_collapse = true;
+            }
+        }
+        assert!(saw_near_collapse);
+        let recovered = calibrator.lower_bound(6000.0);
+        assert_eq!(recovered.lo_secs, recovered.point_secs);
+        assert!(!recovered.runway_unknown());
+    }
+
+    #[test]
+    fn unknown_runway_depends_on_relative_collapse_not_a_short_deadline() {
+        for (point, lower, unknown) in [
+            (6000.0, 0.0, true),
+            (6000.0, 1.0, true),
+            (6000.0, 59.9, true),
+            (6000.0, 60.0, false),
+            (30.0, 30.0, false),
+            (30.0, 1.0, false),
+            (0.0, 0.0, false),
+            (f64::INFINITY, 0.0, false),
+            (f64::NAN, 0.0, false),
+            (6000.0, f64::NAN, false),
+            (6000.0, -1.0, false),
+        ] {
+            assert_eq!(runway_is_unknown(point, lower), unknown, "{point}, {lower}");
+        }
     }
 
     #[test]

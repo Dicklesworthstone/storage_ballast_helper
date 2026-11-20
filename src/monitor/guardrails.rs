@@ -308,9 +308,9 @@ pub struct ForecastSnapshot {
     pub tte_point_s: Option<f64>,
     /// The conformal lower bound (seconds); the point while warming.
     pub tte_lo_s: Option<f64>,
-    /// The lower bound collapsed to zero despite a positive point forecast.
-    /// Zero still drives conservative control, but supplies no measured or
-    /// predicted time at which the filesystem reaches the threshold.
+    /// The lower bound collapsed or retains too little of the positive point
+    /// forecast to report a runway. The original bound still drives
+    /// conservative control without becoming a precise exhaustion deadline.
     #[serde(default)]
     pub runway_unknown: bool,
     /// The configured coverage target of the bound.

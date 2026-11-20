@@ -2624,6 +2624,10 @@ struct MountTickResponse {
     /// This mount's policy decision after every prediction confidence gate.
     /// Its runway is time to exhaustion, not the controller's time to Red.
     predictive_action: PredictiveAction,
+    /// When calibration cannot support a reported runway, evaluate the raw
+    /// forecast separately for notifications. This preserves independently
+    /// supported warnings without changing conservative control authority.
+    uncalibrated_predictive_action: Option<PredictiveAction>,
     /// The predictive policy put this mount itself in imminent danger this
     /// tick (after confidence gating). `last_predictive_action` keeps only
     /// the most severe action across mounts, so it can name one mount only.
@@ -2688,7 +2692,17 @@ fn predictive_warning_event(
     {
         return None;
     }
-    let (mount, minutes_remaining, confidence) = match &tick.predictive_action {
+    let runway_unknown = tick
+        .rate
+        .forecast
+        .as_ref()
+        .is_some_and(|forecast| forecast.runway_unknown);
+    let action = if runway_unknown {
+        tick.uncalibrated_predictive_action.as_ref()?
+    } else {
+        &tick.predictive_action
+    };
+    let (mount, minutes_remaining, confidence) = match action {
         PredictiveAction::Clear => return None,
         PredictiveAction::EarlyWarning {
             mount,
@@ -2709,16 +2723,9 @@ fn predictive_warning_event(
         } => (mount, *minutes_remaining, tick.rate.confidence),
     };
     // A collapsed bound cannot substantiate an immediate-exhaustion notice.
-    // The policy can still supply a positive runway independently from its
-    // historical rate baseline, and that warning must remain deliverable.
-    // Actual zero-point exhaustion remains distinct from unknown runway.
-    if minutes_remaining <= 0.0
-        && tick
-            .rate
-            .forecast
-            .as_ref()
-            .is_some_and(|forecast| forecast.runway_unknown)
-    {
+    // Only the separate, unadjusted policy evaluation can supply a deadline
+    // while that bound is unknown. An actually reached boundary stays distinct.
+    if minutes_remaining <= 0.0 && runway_unknown {
         return None;
     }
     if mount != &tick.response.causing_mount
@@ -2763,14 +2770,17 @@ fn log_forecast(
         .coverage_empirical
         .map_or_else(|| "-".to_string(), |c| format!("{c:.3}"));
     let message = format!(
-        "forecast mount={} tte_point={:.0} tte_lo={:.0} alpha={:.3} coverage={coverage} samples={} state={:?} rate={:.0}",
+        "forecast mount={} tte_point={:.0} tte_lo={:.0} alpha={:.3} coverage={coverage} samples={} state={:?} rate={:.0} forecast_rate={:.0}",
         mount.display(),
         interval.point_secs,
         interval.lo_secs,
         interval.alpha,
         interval.samples,
         interval.coverage_state,
-        estimate.bytes_per_second
+        estimate.bytes_per_second,
+        estimate
+            .forecast_rate_bytes_per_second
+            .unwrap_or(estimate.bytes_per_second)
     );
     eprintln!("[SBH-FORECAST] {message}");
     logger.send(ActivityEvent::Info { message });
@@ -8145,7 +8155,7 @@ impl MonitoringDaemon {
             // Predicted time to red threshold: the point estimate, and the
             // conformal lower bound the controllers act on. A zero point
             // means the boundary has been reached; a positive point with a
-            // collapsed zero bound keeps control conservative but supplies
+            // collapsed bound keeps control conservative but supplies
             // no reportable runway.
             let predicted_point = if rate_estimate.seconds_to_threshold.is_finite()
                 && rate_estimate.seconds_to_threshold >= 0.0
@@ -8156,6 +8166,13 @@ impl MonitoringDaemon {
             };
             let interval = predicted_point.map(|point| monitor.forecast_interval(point));
             let runway_unknown = interval.as_ref().is_some_and(TteInterval::runway_unknown);
+            let uncalibrated_predictive_action = runway_unknown.then(|| {
+                self.predictive_policy.evaluate(
+                    &rate_estimate,
+                    stats.free_pct(),
+                    mount_path.clone(),
+                )
+            });
             let predicted_seconds = interval
                 .as_ref()
                 .map(|i| i.lo_secs)
@@ -8418,15 +8435,18 @@ impl MonitoringDaemon {
                 seconds_to_red: predicted_seconds,
                 prediction_confident: rate_estimate.confidence >= effective_min_conf,
                 predictive_action: pred_action,
+                uncalibrated_predictive_action,
                 imminent_danger,
                 rate: MountRateState {
                     bytes_per_sec: rate_estimate.bytes_per_second,
+                    forecast_rate_bytes_per_sec: rate_estimate.forecast_rate_bytes_per_second,
                     accel: rate_estimate.acceleration,
                     confidence: rate_estimate.confidence,
                     // Preserve the control bound in `forecast`, including
                     // zero, without publishing uncertainty as a time left.
                     seconds_to_red: predicted_seconds.filter(|_| !runway_unknown),
-                    seconds_to_full: finite_positive(rate_estimate.seconds_to_exhaustion),
+                    seconds_to_full: finite_positive(rate_estimate.seconds_to_exhaustion)
+                        .filter(|_| !runway_unknown),
                     forecast: interval.as_ref().map(|i| {
                         ForecastSnapshot::from_interval(
                             i,
@@ -19769,6 +19789,7 @@ mod tests {
             seconds_to_red: None,
             prediction_confident: false,
             predictive_action: PredictiveAction::Clear,
+            uncalibrated_predictive_action: None,
             imminent_danger: false,
             rate: MountRateState::default(),
             device_id: None,
@@ -20641,11 +20662,14 @@ mod tests {
 
         let config = crate::core::config::PredictionConfig::default();
         let mount = Path::new("/filling");
-        for (point, lower, minutes, should_warn) in [
-            (5182.0, 0.0, 0.0, false),
-            (5182.0, 0.0, 1.5, true),
-            (5182.0, 60.0, 1.0, true),
-            (0.0, 0.0, 0.0, true),
+        for (point, lower, minutes, raw_minutes, should_warn) in [
+            (5182.0, 0.0, 0.0, None, false),
+            (5182.0, 0.0, 0.0, Some(1.5), true),
+            (5182.0, 1.0, 0.05, None, false),
+            (5182.0, 1.0, 0.05, Some(20.0), true),
+            (5182.0, 60.0, 1.0, None, true),
+            (30.0, 30.0, 0.5, None, true),
+            (0.0, 0.0, 0.0, None, true),
         ] {
             let mut tick = predictive_warning_tick(mount, minutes);
             tick.predictive_action = PredictiveAction::ImminentDanger {
@@ -20664,11 +20688,16 @@ mod tests {
                 },
                 config.coverage_target,
             ));
-            assert_eq!(
-                predictive_warning_event(&tick, &config).is_some(),
-                should_warn,
-                "point={point}, lower={lower}",
-            );
+            tick.uncalibrated_predictive_action = raw_minutes
+                .map(|minutes| predictive_warning_tick(mount, minutes).predictive_action);
+            let event = predictive_warning_event(&tick, &config);
+            assert_eq!(event.is_some(), should_warn, "point={point}, lower={lower}",);
+            if let Some(NotificationEvent::PredictiveWarning {
+                minutes_remaining, ..
+            }) = event
+            {
+                assert_eq!(minutes_remaining, raw_minutes.unwrap_or(minutes));
+            }
             assert!(tick.predictive_action.should_release_ballast());
         }
     }
@@ -20760,6 +20789,40 @@ mod tests {
             raw.seconds_to_exhaustion / 2.0
         );
         assert_eq!(calibrated.free_bytes, raw.free_bytes);
+
+        // Once alpha recovers into the observed ranks, the worst retained
+        // miss produces a tiny positive lower bound. It must preserve exactly
+        // that control input without reviving an unsupported numeric notice.
+        let point = raw.seconds_to_threshold;
+        let monitor = daemon.mount_monitors.get_mut(&mount).unwrap();
+        monitor.conformal.reset();
+        for _ in 0..12 {
+            assert_eq!(monitor.conformal.record(point, 1.0, point), Some(false));
+        }
+        for _ in 0..40 {
+            assert_eq!(monitor.conformal.record(point, point, 0.0), Some(true));
+        }
+        sample.collected_at += Duration::from_secs(1);
+        sample.stats.available_bytes -= 2 * MIB;
+        sample.stats.free_bytes = sample.stats.available_bytes;
+        let response = daemon
+            .evaluate_pressure_samples(
+                HashMap::from([(mount.clone(), sample.clone())]),
+                sample.collected_at,
+            )
+            .unwrap();
+        let tick = daemon.mount_responses.first().unwrap();
+        let forecast = tick.rate.forecast.as_ref().unwrap();
+        let lower = forecast.tte_lo_s.unwrap();
+        assert!(lower > 0.0 && lower < forecast.tte_point_s.unwrap() * 0.01);
+        assert!(forecast.runway_unknown);
+        assert_eq!(response.predicted_seconds, Some(lower));
+        assert_eq!(tick.seconds_to_red, Some(lower));
+        assert_eq!(tick.rate.seconds_to_red, None);
+        assert_eq!(tick.rate.seconds_to_full, None);
+        assert!(tick.predictive_action.should_cleanup());
+        assert!(tick.predictive_action.should_release_ballast());
+        assert!(predictive_warning_event(tick, &daemon.config.pressure.prediction).is_none());
     }
 
     #[cfg(unix)]

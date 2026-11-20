@@ -1189,13 +1189,28 @@ alpha = clamp(base_alpha * damping, 0.10, 0.75)
 
 When disk consumption is steady, `burstiness` is low, damping is near 1.0, and alpha stays near the base value (<!-- claim:constants.ewma.ewma_base_alpha -->0.3<!-- /claim -->), producing smooth rate estimates. When a sudden burst hits (e.g., a large `cargo build` starts), burstiness spikes, damping decreases alpha toward its floor (`0.10`), and the estimator becomes stickier so transient spikes do not cause wild overreactions.
 
-The estimator also tracks acceleration (rate of rate change) using the same EWMA formula, enabling quadratic time-to-exhaustion predictions:
+The estimator also tracks acceleration for trend classification. Runway uses a
+linear projection; a brief change in rate is not extrapolated as acceleration
+over the entire forecast:
 
 ```
-time_to_exhaustion = solve(distance = rate * t + 0.5 * accel * t^2)
+time_to_exhaustion = available_bytes / forecast_rate
+time_to_red = max(available_bytes - red_threshold_bytes, 0) / forecast_rate
 ```
 
-For non-zero acceleration, the quadratic is solved using the numerically stable conjugate form to avoid catastrophic cancellation when the discriminant is close to `rate^2`.
+For distant projections, a bounded history measures signed net consumption over
+five to fifteen minutes of elapsed time. Space released by a build offsets its
+allocations, and faster polling does not shorten that observation window. A new
+writer, recovery, or stopped writer replaces the old rate after three consecutive
+twenty-second windows agree. During warmup, after a collection gap, or when the
+immediate estimate puts a pressure boundary within five minutes, the projection
+keeps the immediate EWMA response. These projections retain the normal confidence
+and sample gates; the long-window evidence applies at any free-space percentage.
+
+`state.json` keeps the immediate rate in `bytes_per_sec` and publishes the measured
+projection rate separately as `forecast_rate_bytes_per_sec` when that history is
+in use. Human status names both rates, and forecast log lines include
+`forecast_rate`. A nonpositive projection rate means no finite exhaustion forecast.
 
 A confidence metric combines sample count adequacy (`50%` weight), residual tracking (`20%` weight), and prediction stability (`30%` weight). When confidence drops below `0.2` or fewer than <!-- claim:constants.ewma.ewma_min_samples -->3<!-- /claim --> samples exist, the estimator enters fallback mode and reports uncertainty rather than potentially misleading predictions.
 
@@ -2166,17 +2181,22 @@ alpha_t+1 = alpha_t + 0.01 * ((1 - coverage_target) - err_t)
 
 The controllers act on `tte_lo`: it is the PID feedforward input, the mount controller's seconds-to-red, and the predictive policy's estimate (the time to exhaustion is shrunk by the same factor). Below 30 resolved samples the bound is the point estimate and the state is `warming`. `pressure.prediction.coverage_target` (0.90) sets the guarantee; `sbh status` shows `red in >=<lo> (point <estimate>)`, `sbh check --predict` uses the bound, `state.json` carries `rates.<mount>.forecast`, decision records carry the bound and coverage at decision time, and the daemon logs a `forecast mount=.. tte_point=.. tte_lo=.. alpha=.. coverage=.. samples=..` line per filling mount per minute that `sbh stats --json` aggregates as `forecast.coverage_by_day`.
 
-If calibration collapses the bound to zero while the point estimate is still
-positive, there is no reliable positive runway. `sbh status` reports
+If calibration collapses the bound to zero or below one percent of a positive
+point estimate, the lower bound cannot support an informative deadline. This
+also covers the first tiny positive bounds as calibration recovers from severe
+misses. `sbh status` reports
 `red runway unknown` with the point estimate and observed coverage. Numerical
-`disk full in 0m` notifications are suppressed for that case; measured pressure
-alerts and conservative controller actions still apply. The forecast object
+notifications derived from that bound are suppressed; the unadjusted forecast
+can still support a warning after passing the predictive policy's normal gates.
+Measured pressure alerts and conservative controller actions still apply. The forecast object
 sets `runway_unknown: true` and retains both `tte_point_s` and `tte_lo_s`, while
 the reported `seconds_to_red` and `seconds_to_full` are null. `sbh check --predict`
-still exits with code `1` because it cannot establish the requested safe window, with
-`reason: "forecast_runway_unknown"`, null deadline fields, and zero preserved in
+still uses the original bound and exits with code `1` when that bound cannot
+establish the requested safe window, with `reason: "forecast_runway_unknown"`,
+null deadline fields, and the exact lower bound preserved in
 `seconds_to_red_lower_bound` and the nested forecast. A reached red threshold
-keeps its measured zero and normal warning behavior.
+keeps its measured zero and normal warning behavior; a genuinely short point
+forecast remains reportable.
 The dashboard shows the same mount's published time to red, distinguishing the
 point estimate from its conservative bound. Missing, stopped, stale or invalid
 forecasts remain unknown; a trend without a forecast never substitutes an
@@ -2864,7 +2884,7 @@ src/
 
   monitor/
     fs_stats.rs             Filesystem stats via statvfs with mount-aware caching
-    ewma.rs                 Adaptive EWMA rate estimator with quadratic prediction
+    ewma.rs                 Adaptive EWMA and elapsed-time net-consumption forecasts
     pid.rs                  PID pressure controller with predictive urgency boost
     predictive.rs           Predictive action pipeline with early warning
     guardrails.rs           E-process drift detection + calibration monitoring

@@ -912,6 +912,10 @@ pub fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
 pub struct MountRateState {
     /// Net fill rate; negative means the mount is recovering.
     pub bytes_per_sec: f64,
+    /// Signed net rate from the longer observation window used for a distant
+    /// forecast. Absent when the immediate EWMA supplies the projection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forecast_rate_bytes_per_sec: Option<f64>,
     /// Change in the fill rate.
     pub accel: f64,
     /// Estimator confidence (0.0–1.0).
@@ -1845,6 +1849,7 @@ mod state_schema_tests {
             "/".to_string(),
             MountRateState {
                 bytes_per_sec: 1_048_576.0,
+                forecast_rate_bytes_per_sec: Some(524_288.0),
                 accel: -12.5,
                 confidence: 0.8,
                 seconds_to_red: Some(900.0),
@@ -1868,6 +1873,7 @@ mod state_schema_tests {
         let json = serde_json::to_value(&v2).expect("serializes");
         assert_eq!(json["schema_version"], 2);
         assert_eq!(json["rates"]["/"]["bytes_per_sec"], 1_048_576.0);
+        assert_eq!(json["rates"]["/"]["forecast_rate_bytes_per_sec"], 524_288.0);
         assert_eq!(json["rates"]["/"]["seconds_to_red"], 900.0);
         assert_eq!(json["threads"]["scanner"]["status"], "stalled");
         assert_eq!(json["exit_reason"], "clean shutdown");

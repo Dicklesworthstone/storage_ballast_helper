@@ -240,6 +240,33 @@ impl PredictiveActionPolicy {
             return PredictiveAction::Clear;
         }
 
+        // A distant forecast backed by elapsed-time, signed net consumption
+        // already spans allocation/freeing bursts. Percentage heuristics and
+        // the median of absolute instantaneous rates are weaker evidence and
+        // must not veto it, especially on a large disk with little percent
+        // free. The estimator leaves this field absent during warmup and when
+        // an imminent boundary needs the immediate EWMA response.
+        if let Some(rate) = estimate.forecast_rate_bytes_per_second {
+            if rate <= 0.0 {
+                return PredictiveAction::Clear;
+            }
+            let trend = if estimate.trend == Trend::Recovering {
+                // One short freeing interval is not a reversal of the measured
+                // net drain. A sustained recovery produces a nonpositive rate.
+                Trend::Decelerating
+            } else {
+                estimate.trend
+            };
+            return self.classify(
+                estimate.seconds_to_exhaustion / 60.0,
+                estimate.confidence,
+                rate,
+                trend,
+                current_free_pct,
+                mount,
+            );
+        }
+
         // Slowing consumption is not recovery. The estimator already returns
         // infinity when deceleration stops writes before exhaustion; a finite
         // forecast means the disk still fills before the rate reaches zero.
@@ -578,6 +605,9 @@ fn valid_prediction_evidence(estimate: &RateEstimate, current_free_pct: f64) -> 
     let burst = &estimate.burst_state;
     (0.0..=1.0).contains(&estimate.confidence)
         && estimate.bytes_per_second.is_finite()
+        && estimate
+            .forecast_rate_bytes_per_second
+            .is_none_or(f64::is_finite)
         && estimate.acceleration.is_finite()
         && estimate.seconds_to_exhaustion.is_finite()
         && estimate.seconds_to_exhaustion >= 0.0
@@ -612,6 +642,7 @@ mod tests {
     ) -> RateEstimate {
         RateEstimate {
             bytes_per_second,
+            forecast_rate_bytes_per_second: None,
             acceleration: 0.0,
             seconds_to_exhaustion,
             seconds_to_threshold: seconds_to_exhaustion * 0.8,
@@ -641,6 +672,7 @@ mod tests {
     ) -> RateEstimate {
         RateEstimate {
             bytes_per_second,
+            forecast_rate_bytes_per_second: None,
             acceleration: 0.0,
             seconds_to_exhaustion,
             seconds_to_threshold: seconds_to_exhaustion * 0.8,

@@ -669,7 +669,11 @@ fn mount_red_horizon(model: &DashboardModel, mount: &str) -> String {
     if point == Some(0.0) {
         return "red in 0s".into();
     }
+    let projection_rate = rate
+        .forecast_rate_bytes_per_sec
+        .unwrap_or(rate.bytes_per_sec);
     if !rate.bytes_per_sec.is_finite()
+        || !projection_rate.is_finite()
         || !rate.confidence.is_finite()
         || !(0.0..=1.0).contains(&rate.confidence)
     {
@@ -678,11 +682,13 @@ fn mount_red_horizon(model: &DashboardModel, mount: &str) -> String {
     if rate.confidence == 0.0 {
         return "red runway unknown (warming)".into();
     }
-    if rate.bytes_per_sec <= 0.0 {
+    if projection_rate <= 0.0 {
         return "not filling".into();
     }
     match (lower, point) {
-        (Some(0.0), Some(point)) if point > 0.0 => {
+        (Some(lower), Some(point))
+            if crate::monitor::conformal::runway_is_unknown(point, lower) =>
+        {
             format!("red runway unknown (point {})", eta_label(point))
         }
         (Some(lower), Some(point)) if lower < point => {
@@ -6107,6 +6113,7 @@ mod tests {
                 mount.into(),
                 MountRateState {
                     bytes_per_sec: estimate.bytes_per_second,
+                    forecast_rate_bytes_per_sec: estimate.forecast_rate_bytes_per_second,
                     accel: estimate.acceleration,
                     confidence: estimate.confidence,
                     seconds_to_red: Some(estimate.seconds_to_threshold),
@@ -6142,7 +6149,9 @@ mod tests {
         let theme = Theme::for_terminal(160, AccessibilityProfile::default());
         for (point, lower, expected) in [
             (Some(5182.0), Some(0.0), "red runway unknown (point 1.4h)"),
+            (Some(5182.0), Some(1.0), "red runway unknown (point 1.4h)"),
             (Some(5182.0), Some(60.0), "red in >=1.0m (point 1.4h)"),
+            (Some(30.0), Some(30.0), "red in 30s"),
             (Some(0.0), Some(0.0), "red in 0s"),
             (None, None, "red runway unknown (no forecast)"),
         ] {
@@ -6220,6 +6229,32 @@ mod tests {
                 assert!(text.contains("red runway unknown (no forecast)"), "{text}");
             }
         }
+    }
+
+    #[test]
+    fn forecast_horizon_keeps_net_drain_during_a_brief_freeing_sample() {
+        use crate::daemon::self_monitor::MountRateState;
+
+        let mut state = sample_state("yellow", 15.0);
+        state.rates.insert(
+            "/".into(),
+            MountRateState {
+                bytes_per_sec: -1_048_576.0,
+                forecast_rate_bytes_per_sec: Some(2_097_152.0),
+                confidence: 0.9,
+                seconds_to_red: Some(600.0),
+                ..Default::default()
+            },
+        );
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (80, 24),
+        );
+        model.degraded = false;
+        model.daemon_state = Some(state);
+        assert_eq!(mount_red_horizon(&model, "/"), "red in 10.0m");
     }
 
     #[test]

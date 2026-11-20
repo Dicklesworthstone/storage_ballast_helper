@@ -889,6 +889,7 @@ mod tests {
             "/data".to_string(),
             MountRateState {
                 bytes_per_sec: 2048.5,
+                forecast_rate_bytes_per_sec: None,
                 accel: 0.0,
                 confidence: 0.9,
                 seconds_to_red: Some(3600.0),

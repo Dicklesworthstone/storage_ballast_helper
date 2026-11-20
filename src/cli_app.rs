@@ -55,6 +55,7 @@ use storage_ballast_helper::logger::stats::{
     RamScratchFreshness, RamScratchNotice, StatsEngine, window_label,
 };
 use storage_ballast_helper::monitor::burst::BurstStats;
+use storage_ballast_helper::monitor::conformal::runway_is_unknown;
 use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
 use storage_ballast_helper::monitor::inode_pressure::{
     InodePressureEvidence, classify_inode_pressure,
@@ -17057,11 +17058,11 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             ForecastRead::Fresh(Some(forecast)) => {
                 forecast_json = forecast.to_json(min_confidence);
                 let seconds_left = forecast.acting_seconds_to_red().or_else(|| {
-                    (forecast.bytes_per_sec > 0.0).then(|| {
+                    (forecast.projection_rate() > 0.0).then(|| {
                         let bytes_until_threshold = capacity.available_bytes.saturating_sub(
                             (threshold_pct / 100.0 * capacity.total_bytes as f64) as u64,
                         );
-                        bytes_until_threshold as f64 / forecast.bytes_per_sec
+                        bytes_until_threshold as f64 / forecast.projection_rate()
                     })
                 });
                 if let Some(seconds_left) = seconds_left
@@ -17087,7 +17088,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                                     format_bytes(capacity.available_bytes),
                                     format_eta(seconds_left),
                                     predict_minutes,
-                                    format_bytes(forecast.bytes_per_sec.max(0.0) as u64),
+                                    format_bytes(forecast.projection_rate().max(0.0) as u64),
                                     forecast.confidence,
                                     if forecast.warming(min_confidence) {
                                         ", warming"
@@ -17432,6 +17433,7 @@ fn reclaim_capability_checks_at(
 #[derive(Debug, Clone, PartialEq)]
 struct MountForecast {
     bytes_per_sec: f64,
+    forecast_rate_bytes_per_sec: Option<f64>,
     accel: f64,
     confidence: f64,
     seconds_to_red: Option<f64>,
@@ -17446,6 +17448,9 @@ impl MountForecast {
     fn from_rate(rate: &Value) -> Option<Self> {
         Some(Self {
             bytes_per_sec: rate.get("bytes_per_sec")?.as_f64()?,
+            forecast_rate_bytes_per_sec: rate
+                .get("forecast_rate_bytes_per_sec")
+                .and_then(Value::as_f64),
             accel: rate.get("accel").and_then(Value::as_f64).unwrap_or(0.0),
             confidence: rate
                 .get("confidence")
@@ -17467,6 +17472,11 @@ impl MountForecast {
         self.tte_lo.or(self.seconds_to_red)
     }
 
+    fn projection_rate(&self) -> f64 {
+        self.forecast_rate_bytes_per_sec
+            .unwrap_or(self.bytes_per_sec)
+    }
+
     /// The unadjusted estimate remains useful evidence when calibration
     /// cannot establish a positive lower bound.
     fn point_seconds_to_red(&self) -> Option<f64> {
@@ -17478,13 +17488,12 @@ impl MountForecast {
     }
 
     /// Calibration may collapse its bound without observing the red boundary.
-    /// That zero still refuses a promised headroom window, but cannot be shown
-    /// as a prediction that the disk reaches the boundary in zero seconds.
+    /// Keep the same reporting rule as the daemon, including older snapshots
+    /// that predate the explicit unknown flag or retain a tiny positive bound.
     fn runway_unknown(&self) -> bool {
-        self.tte_lo == Some(0.0)
-            && self
-                .point_seconds_to_red()
-                .is_some_and(|point| point.is_finite() && point > 0.0)
+        self.point_seconds_to_red()
+            .zip(self.tte_lo)
+            .is_some_and(|(point, lower)| runway_is_unknown(point, lower))
     }
 
     fn red_horizon_description(&self) -> String {
@@ -17521,6 +17530,7 @@ impl MountForecast {
         let runway_unknown = self.runway_unknown();
         json!({
             "bytes_per_sec": self.bytes_per_sec,
+            "forecast_rate_bytes_per_sec": self.forecast_rate_bytes_per_sec,
             "accel": self.accel,
             "confidence": self.confidence,
             "seconds_to_red": self.seconds_to_red.filter(|_| !runway_unknown),
@@ -17617,6 +17627,16 @@ fn rate_line(mount: &str, forecast: &MountForecast, min_confidence: f64) -> Stri
         "0 B/s\u{b2}".to_string()
     };
     let horizon = forecast.red_horizon_description();
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let projection = forecast
+        .forecast_rate_bytes_per_sec
+        .map_or_else(String::new, |rate| {
+            format!(
+                ", forecast net {}{}/s",
+                if rate >= 0.0 { "+" } else { "-" },
+                format_bytes(rate.abs() as u64),
+            )
+        });
     let status = if forecast.warming(min_confidence) {
         format!(
             "warming (confidence {:.2} < {min_confidence:.2})",
@@ -17625,7 +17645,9 @@ fn rate_line(mount: &str, forecast: &MountForecast, min_confidence: f64) -> Stri
     } else {
         format!("confidence {:.2}", forecast.confidence)
     };
-    format!("  {mount:<20}  {rate_str:<12} {trend:<10} accel {accel_str:<12} {horizon}, {status}")
+    format!(
+        "  {mount:<20}  {rate_str:<12} {trend:<10} accel {accel_str:<12} {horizon}, {status}{projection}"
+    )
 }
 
 /// `42s`, `7m`, `3h 10m`, `2d 4h`.
@@ -23334,6 +23356,7 @@ mod tests {
             fresh,
             ForecastRead::Fresh(Some(MountForecast {
                 bytes_per_sec: 2048.5,
+                forecast_rate_bytes_per_sec: None,
                 accel: 1.5,
                 confidence: 0.8,
                 seconds_to_red: Some(1200.0),
@@ -23370,6 +23393,7 @@ mod tests {
     fn rate_line_shows_the_horizon_and_marks_warming_below_min_confidence() {
         let confident = MountForecast {
             bytes_per_sec: 1_048_576.0,
+            forecast_rate_bytes_per_sec: None,
             accel: 2048.0,
             confidence: 0.9,
             seconds_to_red: Some(2520.0),
@@ -23409,7 +23433,14 @@ mod tests {
                 "red runway unknown (point 1h 26m; forecast coverage 28%)",
                 true,
             ),
+            (
+                5182.0,
+                1.0,
+                "red runway unknown (point 1h 26m; forecast coverage 28%)",
+                true,
+            ),
             (5182.0, 60.0, "red in >=1m (point 1h 26m)", false),
+            (30.0, 30.0, "red in 30s", false),
             (0.0, 0.0, "red in 0s", false),
         ] {
             let rate = json!({
@@ -23442,6 +23473,27 @@ mod tests {
                 assert!(!line.contains("red in 0s"), "{line}");
             }
         }
+    }
+
+    #[test]
+    fn forecast_rate_stays_distinct_from_a_brief_freeing_sample() {
+        let forecast = MountForecast::from_rate(&json!({
+            "bytes_per_sec": -1_048_576.0,
+            "forecast_rate_bytes_per_sec": 2_097_152.0,
+            "confidence": 0.9,
+            "seconds_to_red": 600.0,
+            "seconds_to_full": 1800.0,
+        }))
+        .unwrap();
+        assert_eq!(forecast.projection_rate(), 2_097_152.0);
+        let payload = forecast.to_json(0.7);
+        assert_eq!(payload["bytes_per_sec"], -1_048_576.0);
+        assert_eq!(payload["forecast_rate_bytes_per_sec"], 2_097_152.0);
+        assert_eq!(payload["seconds_to_red"], 600.0);
+        let line = rate_line("/data", &forecast, 0.7);
+        assert!(line.contains("recovering"), "{line}");
+        assert!(line.contains("red in 10m"), "{line}");
+        assert!(line.contains("forecast net +"), "{line}");
     }
 
     #[test]

@@ -13,6 +13,7 @@ fn policy() -> PredictiveActionPolicy {
 fn forecast(acceleration: f64, burst_probability: f64, median_rate: f64) -> RateEstimate {
     RateEstimate {
         bytes_per_second: 1000.0,
+        forecast_rate_bytes_per_second: None,
         acceleration,
         seconds_to_exhaustion: 60.0,
         seconds_to_threshold: 48.0,
@@ -30,6 +31,120 @@ fn forecast(acceleration: f64, burst_probability: f64, median_rate: f64) -> Rate
             ..BurstState::default()
         },
         free_bytes: 60_000,
+    }
+}
+
+#[test]
+fn long_window_forecasts_remain_clear_for_noisy_drain_at_low_free_percent() {
+    let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+    let start = Instant::now();
+    let initial_free = 80_000_000_000;
+    estimator.update(initial_free, start, 40_000_000_000);
+    let mut short_ewma_forecasts = 0;
+    let mut recovering_ewma_samples = 0;
+    for seconds in (5..=1800_u64).step_by(5) {
+        let phase = seconds % 60;
+        let transient = phase.min(60 - phase) * 60_000_000;
+        let free = initial_free - seconds * 3_000_000 - transient;
+        let estimate = estimator.update(free, start + Duration::from_secs(seconds), 40_000_000_000);
+        if seconds < 900 {
+            continue;
+        }
+        if estimate.bytes_per_second > 0.0 && free as f64 / estimate.bytes_per_second < 3600.0 {
+            short_ewma_forecasts += 1;
+        }
+        recovering_ewma_samples += usize::from(estimate.trend == Trend::Recovering);
+        assert_eq!(
+            policy().evaluate(&estimate, 9.0, PathBuf::from("/data")),
+            PredictiveAction::Clear,
+            "large, mostly full build disk still has hours of net runway: {estimate:?}"
+        );
+    }
+    assert!(
+        short_ewma_forecasts > 0,
+        "fixture must contain transient warning forecasts"
+    );
+    assert!(
+        recovering_ewma_samples > 0,
+        "fixture must contain transient recovery forecasts"
+    );
+}
+
+#[test]
+fn long_window_net_drain_remains_actionable_during_a_short_freeing_interval() {
+    let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+    let start = Instant::now();
+    let initial_free = 25_000_000_000;
+    let mut estimate = estimator.update(initial_free, start, 0);
+    for seconds in (5..=900_u64).step_by(5) {
+        let phase = seconds % 100;
+        let transient = phase.min(100 - phase) * 60_000_000;
+        let free = initial_free - seconds * 10_000_000 - transient;
+        estimate = estimator.update(free, start + Duration::from_secs(seconds), 0);
+    }
+    assert_eq!(estimate.trend, Trend::Recovering);
+    assert!((estimate.forecast_rate_bytes_per_second.unwrap() - 10_000_000.0).abs() < 1e-6);
+    assert!(
+        matches!(
+            policy().evaluate(&estimate, 9.0, PathBuf::from("/data")),
+            PredictiveAction::PreemptiveCleanup { .. }
+        ),
+        "a brief release cannot hide the measured net drain: {estimate:?}"
+    );
+}
+
+#[test]
+fn long_window_policy_recognizes_a_new_sustained_writer_at_any_free_percent() {
+    let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+    let start = Instant::now();
+    let mut free = 80_000_000_000;
+    let mut estimate = estimator.update(free, start, 0);
+    for seconds in (5..=960_u64).step_by(5) {
+        let rate = if seconds <= 900 {
+            2_000_000
+        } else {
+            100_000_000
+        };
+        free -= 5 * rate;
+        estimate = estimator.update(free, start + Duration::from_secs(seconds), 0);
+    }
+    assert!(estimate.burst_state.burst_probability > 0.5);
+    assert_eq!(estimate.forecast_rate_bytes_per_second, Some(100_000_000.0));
+    for free_pct in [9.0, 90.0] {
+        match policy().evaluate(&estimate, free_pct, PathBuf::from("/data")) {
+            PredictiveAction::PreemptiveCleanup {
+                minutes_remaining, ..
+            } => {
+                assert!((minutes_remaining - free as f64 / 100_000_000.0 / 60.0).abs() < 1e-6);
+            }
+            action => panic!("confirmed new writer at {free_pct}%: {action:?}; {estimate:?}"),
+        }
+    }
+}
+
+#[test]
+fn long_window_policy_preserves_confidence_and_evidence_gates() {
+    let mut base = forecast(0.0, 0.9, 1.0);
+    base.forecast_rate_bytes_per_second = Some(1000.0);
+    for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+        let mut estimate = base.clone();
+        estimate.forecast_rate_bytes_per_second = Some(invalid);
+        assert_eq!(
+            policy().evaluate(&estimate, 9.0, PathBuf::from("/data")),
+            PredictiveAction::Clear
+        );
+    }
+    let mut low_confidence = base.clone();
+    low_confidence.confidence = 0.2;
+    let mut warming = base.clone();
+    warming.sample_count = 1;
+    let mut fallback = base;
+    fallback.fallback_active = true;
+    for estimate in [low_confidence, warming, fallback] {
+        assert_eq!(
+            policy().evaluate(&estimate, 9.0, PathBuf::from("/data")),
+            PredictiveAction::Clear
+        );
     }
 }
 
