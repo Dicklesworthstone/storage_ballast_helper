@@ -361,6 +361,17 @@ impl VoiScheduler {
         self.path_stats.entry(path).or_insert_with(PathStats::new);
     }
 
+    /// Replace the configured root set without losing evidence for roots that
+    /// remain configured. Removed roots must not receive new scan authority
+    /// from an old maintenance plan after a configuration reload.
+    pub fn reconcile_paths(&mut self, paths: &[PathBuf]) {
+        self.path_stats.retain(|path, _| paths.contains(path));
+        for path in paths {
+            self.register_path(path.clone());
+        }
+        self.pressure_order.reset();
+    }
+
     /// Update configuration at runtime. Discard old pressure opportunities,
     /// but retain completed-scan and calibration evidence.
     pub fn update_config(&mut self, config: VoiConfig) {
@@ -527,9 +538,26 @@ impl VoiScheduler {
     /// Produce a prioritized scan plan for the current interval.
     #[must_use]
     pub fn schedule(&mut self, now: Instant) -> ScanPlan {
-        let budget = self.config.scan_budget_per_interval;
+        let paths: Vec<PathBuf> = self.path_stats.keys().cloned().collect();
+        self.schedule_within(&paths, now)
+    }
 
-        if self.path_stats.is_empty() || budget == 0 {
+    /// Allocate maintenance budget only among currently eligible, registered
+    /// roots. Filtering a completed plan would let recovering or unavailable
+    /// mounts consume the finite budget without giving healthy roots a turn.
+    /// The caller's scope never registers new paths or changes scan evidence.
+    #[must_use]
+    pub fn schedule_within(&mut self, paths: &[PathBuf], now: Instant) -> ScanPlan {
+        let budget = self.config.scan_budget_per_interval;
+        let mut paths: Vec<PathBuf> = paths
+            .iter()
+            .filter(|path| self.path_stats.contains_key(*path))
+            .cloned()
+            .collect();
+        paths.sort();
+        paths.dedup();
+
+        if paths.is_empty() || budget == 0 {
             return ScanPlan {
                 paths: Vec::new(),
                 fallback_active: self.is_fallback_active(),
@@ -539,11 +567,9 @@ impl VoiScheduler {
         }
 
         if self.is_fallback_active() {
-            let paths: Vec<PathBuf> = self.path_stats.keys().cloned().collect();
             return self.schedule_round_robin(&paths, budget);
         }
 
-        let paths: Vec<PathBuf> = self.path_stats.keys().cloned().collect();
         self.schedule_voi(&paths, budget, now)
     }
 
@@ -754,6 +780,80 @@ mod tests {
         let plan = s.schedule(Instant::now());
         assert!(!plan.paths.is_empty());
         assert!(plan.budget_used <= s.config.scan_budget_per_interval);
+    }
+
+    #[test]
+    fn root_reconciliation_revokes_removed_paths_and_preserves_surviving_evidence() {
+        let mut s = scheduler_with_paths(&["/removed", "/retained"]);
+        let now = Instant::now();
+        let retained = PathBuf::from("/retained");
+        s.record_scan_result(&retained, 8192, 2, 0, 100.0, now);
+        s.record_dirty(&retained, true, now);
+        s.record_partial_scan_result(&retained, 4096, 1, now);
+        let before = s.path_stats(&retained).unwrap().clone();
+
+        s.reconcile_paths(&[retained.clone(), PathBuf::from("/added"), retained.clone()]);
+        assert!(s.path_stats(&PathBuf::from("/removed")).is_none());
+        let after = s.path_stats(&retained).unwrap();
+        assert_eq!(after.scan_count, before.scan_count);
+        assert_eq!(after.last_scanned, before.last_scanned);
+        assert_eq!(after.forecast_reclaim, before.forecast_reclaim);
+        assert_eq!(after.partial_candidates, before.partial_candidates);
+        assert_eq!(
+            after.partial_candidate_bytes,
+            before.partial_candidate_bytes
+        );
+        assert_eq!(after.dirty_pending, before.dirty_pending);
+        assert_eq!(
+            s.path_stats(&PathBuf::from("/added")).unwrap().scan_count,
+            0
+        );
+        assert_eq!(s.calibration_summary().total_paths_tracked, 2);
+        assert!(
+            s.schedule(now)
+                .paths
+                .iter()
+                .all(|entry| entry.path != Path::new("/removed"))
+        );
+
+        // Removing every root is valid and late feedback cannot re-register
+        // one that no longer belongs to the configured scan scope.
+        s.reconcile_paths(&[]);
+        s.record_scan_result(&retained, 16384, 1, 0, 100.0, now);
+        assert!(s.schedule(now).paths.is_empty());
+    }
+
+    #[test]
+    fn eligible_maintenance_scope_gets_the_budget_before_ineligible_paths() {
+        for enabled in [false, true] {
+            let mut s = scheduler_with_paths(&["/a-recovering", "/z-healthy"]);
+            s.update_config(VoiConfig {
+                enabled,
+                scan_budget_per_interval: 1,
+                ..VoiConfig::default()
+            });
+            let now = Instant::now();
+            let recovering = PathBuf::from("/a-recovering");
+            let healthy = PathBuf::from("/z-healthy");
+            s.record_scan_result(&recovering, 1_000_000_000, 100, 0, 1.0, now);
+            s.record_dirty(&recovering, true, now);
+            for _ in 0..4 {
+                let plan = s.schedule_within(
+                    &[
+                        healthy.clone(),
+                        PathBuf::from("/unregistered"),
+                        healthy.clone(),
+                    ],
+                    now,
+                );
+                assert_eq!(plan.budget_used, 1, "enabled={enabled}");
+                assert_eq!(plan.paths[0].path, healthy, "enabled={enabled}");
+                assert_eq!(s.path_stats(&healthy).unwrap().scan_count, 0);
+            }
+            assert!(s.path_stats(&recovering).unwrap().dirty_pending);
+            assert!(s.schedule_within(&[], now).paths.is_empty());
+            assert_eq!(s.calibration_summary().total_paths_tracked, 2);
+        }
     }
 
     #[test]

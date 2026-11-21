@@ -5833,9 +5833,7 @@ impl MonitoringDaemon {
 
         // 9. VOI Scheduler.
         let mut voi_scheduler = VoiScheduler::new(config.scheduler.clone());
-        for root in &config.scanner.root_paths {
-            voi_scheduler.register_path(root.clone());
-        }
+        voi_scheduler.reconcile_paths(&config.scanner.root_paths);
 
         // 10. Shared executor config (atomics for live reload propagation).
         let shared_executor_config = Arc::new(SharedExecutorConfig::new(
@@ -9425,13 +9423,27 @@ impl MonitoringDaemon {
         });
         if let Some(maintain_tick) = maintain_tick
             && scan_allowed
+            // The monitor is the sole producer. Do not spend a VOI turn or
+            // the maintenance interval on a queue that cannot accept it.
+            && !scan_tx.is_full()
             && maintenance_interval > Duration::ZERO
             && self.behavior_state.memory_level != MemoryPressureLevel::Critical
             && self
                 .last_maintenance_scan
                 .is_none_or(|last| now.saturating_duration_since(last) >= maintenance_interval)
         {
-            let plan = self.voi_scheduler.schedule(now);
+            // Scope before spending the finite VOI budget. A root removed
+            // by reload, or a mount in Recovery/Idle or missing this tick,
+            // cannot consume maintenance slots or mint fresh scan authority.
+            let eligible: Vec<PathBuf> = self
+                .config
+                .scanner
+                .root_paths
+                .iter()
+                .filter(|path| self.root_mount_in_maintain(path, &responses))
+                .cloned()
+                .collect();
+            let plan = self.voi_scheduler.schedule_within(&eligible, now);
             self.last_voi_plan = Some((chrono::Utc::now().to_rfc3339(), plan.clone()));
             // Only roots whose own mount is in Maintain: a root on a mount
             // parked in Recovery (or reclaiming, or idle after an empty
@@ -9439,11 +9451,10 @@ impl MonitoringDaemon {
             let entries: Vec<_> = plan
                 .paths
                 .iter()
-                .filter(|entry| self.root_mount_in_maintain(&entry.path))
+                .filter(|entry| self.root_mount_in_maintain(&entry.path, &responses))
                 .collect();
             let paths: Vec<PathBuf> = entries.iter().map(|entry| entry.path.clone()).collect();
             if !paths.is_empty() {
-                self.last_maintenance_scan = Some(now);
                 let response = &maintain_tick.response;
                 let message = format!(
                     "maintenance scan: {} of {} root(s) by hazard index (budget {}, fallback={}): {}",
@@ -9461,8 +9472,6 @@ impl MonitoringDaemon {
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
-                eprintln!("[SBH-DAEMON] {message}");
-                self.logger_handle.send(ActivityEvent::Info { message });
                 let request = ScanRequest {
                     paths,
                     admitted_scanner: Arc::new(self.config.scanner.clone()),
@@ -9485,7 +9494,14 @@ impl MonitoringDaemon {
                     ram_reclaim: None,
                 };
                 let response = response.clone();
-                self.enqueue_scan_logged(scan_tx, scan_rx, &response, request);
+                if matches!(
+                    self.enqueue_scan_logged(scan_tx, scan_rx, &response, request),
+                    ScanEnqueueStatus::Queued | ScanEnqueueStatus::ReplacedStale
+                ) {
+                    self.last_maintenance_scan = Some(now);
+                    eprintln!("[SBH-DAEMON] {message}");
+                    self.logger_handle.send(ActivityEvent::Info { message });
+                }
             }
         }
 
@@ -9900,21 +9916,35 @@ impl MonitoringDaemon {
         }
     }
 
+    /// Maintenance requires a currently configured root and a mount observed
+    /// in this tick whose controller allows maintenance. A retained controller
+    /// alone cannot authorize a root that was removed or has gone unobserved.
+    fn root_mount_in_maintain(&self, root: &Path, responses: &[MountTickResponse]) -> bool {
+        if !self
+            .config
+            .scanner
+            .root_paths
+            .iter()
+            .any(|path| path == root)
+        {
+            return false;
+        }
+        let Ok(stats) = self.fs_collector.collect(root) else {
+            return false;
+        };
+        responses
+            .iter()
+            .any(|tick| tick.response.causing_mount == stats.mount_point)
+            && self
+                .mount_controllers
+                .get(&stats.mount_point)
+                .is_some_and(|controller| controller.state() == MountState::Maintain)
+    }
+
     /// A mount just entered `Recovery` (EROFS or ENOSPC on deletion): free
     /// what can be freed without a metadata write of our own (release every
     /// ballast file on it), tell the operator exactly what to run, and let
     /// the controller hold deletions until a probe write succeeds.
-    /// Whether `root` sits on a mount whose controller is in `Maintain`
-    /// (true for a mount that has no controller yet).
-    fn root_mount_in_maintain(&self, root: &Path) -> bool {
-        let Ok(stats) = self.fs_collector.collect(root) else {
-            return false;
-        };
-        self.mount_controllers
-            .get(&stats.mount_point)
-            .is_none_or(|controller| controller.state() == MountState::Maintain)
-    }
-
     fn enter_mount_recovery(
         &mut self,
         mount: &Path,
@@ -11292,9 +11322,8 @@ impl MonitoringDaemon {
                     // Update VOI scheduler.
                     self.voi_scheduler
                         .update_config(new_config.scheduler.clone());
-                    for root in &new_config.scanner.root_paths {
-                        self.voi_scheduler.register_path(root.clone());
-                    }
+                    self.voi_scheduler
+                        .reconcile_paths(&new_config.scanner.root_paths);
 
                     // Update shared configs for scanner thread.
                     self.regret.update_config(&new_config);
@@ -17554,7 +17583,7 @@ mod tests {
             );
             thread::yield_now();
         };
-        assert!(!daemon.root_mount_in_maintain(&blocked));
+        assert!(!daemon.root_mount_in_maintain(&blocked, &daemon.mount_responses));
         assert!(
             !daemon
                 .mount_responses
@@ -17621,11 +17650,220 @@ mod tests {
     fn unavailable_filesystem_observation_cannot_authorize_maintenance() {
         let mut fixture = RegretDaemonFixture::new();
         fixture.daemon.fs_collector = unavailable_pressure_collector();
-        assert!(
-            !fixture
-                .daemon
-                .root_mount_in_maintain(Path::new("/unobserved"))
+        fixture.daemon.config.scanner.root_paths = vec![PathBuf::from("/unobserved")];
+        assert!(!fixture.daemon.root_mount_in_maintain(
+            Path::new("/unobserved"),
+            &[quarantine_tick(PressureLevel::Green, Path::new("/"))],
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_retries_after_a_full_queue_without_spending_its_turn_or_interval() {
+        let mut fixture = RegretDaemonFixture::new();
+        let second = fixture.directory.path().join("z-second");
+        std::fs::create_dir(&second).unwrap();
+        let daemon = &mut fixture.daemon;
+        let first = daemon.config.scanner.root_paths[0].clone();
+        daemon.config.scanner.root_paths.push(second);
+        daemon.config.scanner.quarantine_enabled = false;
+        daemon.config.scheduler.enabled = false;
+        daemon.config.scheduler.scan_budget_per_interval = 1;
+        daemon
+            .voi_scheduler
+            .update_config(daemon.config.scheduler.clone());
+        daemon
+            .voi_scheduler
+            .reconcile_paths(&daemon.config.scanner.root_paths);
+        let (scan_tx, scan_rx) = bounded(1);
+        let (del_tx, _del_rx) = bounded(4);
+        scan_tx
+            .send(queued_request("/busy", PressureLevel::Critical))
+            .unwrap();
+
+        for _ in 0..2 {
+            let response = daemon.check_pressure().unwrap();
+            daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+            assert!(daemon.last_maintenance_scan.is_none());
+            assert!(
+                daemon.last_voi_plan.is_none(),
+                "a full queue grants no scheduling opportunity"
+            );
+        }
+        assert_eq!(
+            scan_rx.try_recv().unwrap().paths,
+            vec![PathBuf::from("/busy")]
         );
+
+        let response = daemon.check_pressure().unwrap();
+        daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+        let request = scan_rx
+            .try_recv()
+            .expect("retry as soon as the queue has capacity");
+        assert!(request.maintenance);
+        assert_eq!(
+            request.paths,
+            vec![first],
+            "failed admission must not rotate past this root"
+        );
+        assert!(daemon.last_maintenance_scan.is_some());
+
+        let response = daemon.check_pressure().unwrap();
+        daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+        assert!(
+            scan_rx.is_empty(),
+            "an accepted pass starts the maintenance interval"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_after_reload_never_reauthorizes_a_removed_root() {
+        let mut fixture = RegretDaemonFixture::new();
+        let retained = fixture.directory.path().join("retained");
+        let added = fixture.directory.path().join("added");
+        std::fs::create_dir(&retained).unwrap();
+        std::fs::create_dir(&added).unwrap();
+        let daemon = &mut fixture.daemon;
+        let removed = daemon.config.scanner.root_paths[0].clone();
+        daemon.config.scanner.root_paths.push(retained.clone());
+        daemon.voi_scheduler.register_path(retained.clone());
+        let now = Instant::now();
+        daemon
+            .voi_scheduler
+            .record_scan_result(&retained, 8192, 1, 0, 100.0, now);
+
+        let mut updated = daemon.config.clone();
+        updated.scanner.root_paths = vec![retained.clone(), added.clone()];
+        updated.scanner.quarantine_enabled = false;
+        updated.scanner.catalog_roots_on_pressured_device = false;
+        updated.scheduler.enabled = false;
+        updated.scheduler.scan_budget_per_interval = 8;
+        updated.notifications.enabled = false;
+        daemon.apply_config_reload(Ok(updated));
+        assert!(daemon.voi_scheduler.path_stats(&removed).is_none());
+        assert_eq!(
+            daemon
+                .voi_scheduler
+                .path_stats(&retained)
+                .unwrap()
+                .scan_count,
+            1,
+            "a surviving root keeps its completed-scan evidence"
+        );
+
+        let response = daemon.check_pressure().unwrap();
+        assert_eq!(response.level, PressureLevel::Green);
+        let observations = daemon.mount_responses.clone();
+        let (scan_tx, scan_rx) = bounded(8);
+        let (del_tx, _del_rx) = bounded(4);
+        daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+        let maintenance: Vec<_> = scan_rx
+            .try_iter()
+            .filter(|request| request.maintenance)
+            .collect();
+        assert_eq!(maintenance.len(), 1);
+        assert_eq!(maintenance[0].paths.len(), 2);
+        assert!(maintenance[0].paths.contains(&retained));
+        assert!(maintenance[0].paths.contains(&added));
+        assert!(!maintenance[0].paths.contains(&removed));
+        assert_eq!(
+            maintenance[0].admitted_scanner.root_paths, daemon.config.scanner.root_paths,
+            "the queued pass still carries the live scope for worker revalidation"
+        );
+        assert!(!daemon.root_mount_in_maintain(&removed, &observations));
+        assert!(daemon.root_mount_in_maintain(&retained, &observations));
+        assert!(
+            removed.is_dir(),
+            "revoking scope does not mutate the old root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn maintenance_budget_is_reserved_for_currently_maintainable_mounts() {
+        for state in ["unobserved", "recovery", "idle"] {
+            let mut fixture = RegretDaemonFixture::new();
+            let excluded = fixture.directory.path().join("a-unavailable");
+            let healthy = fixture.directory.path().join("z-healthy");
+            for root in [&excluded, &healthy] {
+                std::fs::create_dir(root).unwrap();
+            }
+            let platform: Arc<dyn Platform> = Arc::new(disk_pressure_platform(
+                [&excluded, &healthy]
+                    .into_iter()
+                    .map(|mount| disk_pressure_sample(&mount.to_string_lossy(), 1_000_000, 900_000))
+                    .collect(),
+            ));
+            let daemon = &mut fixture.daemon;
+            daemon.platform = Arc::clone(&platform);
+            daemon.fs_collector = FsStatsCollector::new(platform, Duration::ZERO);
+            daemon.config.scanner.root_paths = vec![excluded.clone(), healthy.clone()];
+            daemon.config.scanner.quarantine_enabled = false;
+            daemon.config.scanner.catalog_roots_on_pressured_device = false;
+            daemon.config.scheduler.enabled = false;
+            daemon.config.scheduler.scan_budget_per_interval = 1;
+            daemon
+                .voi_scheduler
+                .update_config(daemon.config.scheduler.clone());
+            daemon
+                .voi_scheduler
+                .reconcile_paths(&daemon.config.scanner.root_paths);
+            *daemon.shared_scanner_config.write() = daemon.config.scanner.clone();
+
+            // The first root retains a controller, but cannot be maintained
+            // this tick. Before scoping the plan, it consumed the sole slot.
+            let now = Instant::now();
+            let mut controller =
+                MountController::new(excluded.clone(), mount_controller_config(&daemon.config));
+            controller.observe(MountTickInput {
+                level: PressureLevel::Green,
+                urgency: 0.0,
+                free_pct: 90.0,
+                seconds_to_red: None,
+                prediction_confident: false,
+                surface: MountSurface {
+                    configured_roots: 1,
+                    ..MountSurface::default()
+                },
+                releasable_ballast: false,
+                recovery_needed: false,
+                recovery_probe_ok: None,
+                wake: WakeSignals::default(),
+                now,
+            });
+            if state == "idle" {
+                controller.note_pass(0, false, now);
+                assert_eq!(controller.state(), MountState::Idle);
+            } else if state == "recovery" {
+                daemon.pending_recovery.insert(excluded.clone());
+            }
+            daemon
+                .mount_controllers
+                .insert(excluded.clone(), controller);
+            let tick = quarantine_tick(PressureLevel::Green, &healthy);
+            daemon.mount_responses = vec![tick.clone()];
+            if state != "unobserved" {
+                daemon
+                    .mount_responses
+                    .push(quarantine_tick(PressureLevel::Green, &excluded));
+            }
+            let (scan_tx, scan_rx) = bounded(8);
+            let (del_tx, _del_rx) = bounded(4);
+            daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+            let maintenance: Vec<_> = scan_rx
+                .try_iter()
+                .filter(|request| request.maintenance)
+                .collect();
+            assert_eq!(maintenance.len(), 1, "{state}");
+            assert_eq!(maintenance[0].paths, vec![healthy], "{state}");
+            assert_eq!(
+                daemon.last_voi_plan.as_ref().unwrap().1.budget_used,
+                1,
+                "{state}"
+            );
+        }
     }
 
     #[test]
