@@ -3483,9 +3483,12 @@ impl MountMonitor {
     }
 
     fn red_threshold(config: &Config, total_bytes: u64) -> u64 {
-        let [_, _, _, red_min_free_pct] = config.pressure.free_pct_thresholds_for(total_bytes);
+        // Red begins below Orange's minimum. Red's own minimum is the
+        // later boundary into Critical, so forecasting to it overstates the
+        // remaining safe runway and delays both feedforward and calibration.
+        let [_, _, red_entry_free_pct, _] = config.pressure.free_pct_thresholds_for(total_bytes);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let threshold = (total_bytes as f64 * red_min_free_pct / 100.0) as u64;
+        let threshold = (total_bytes as f64 * red_entry_free_pct / 100.0) as u64;
         threshold
     }
 
@@ -21389,7 +21392,9 @@ mod tests {
         let forecast = tick.rate.forecast.as_ref().unwrap();
         assert!(sample.stats.available_bytes > 11 * GIB);
         assert!(forecast.runway_unknown);
-        assert!(forecast.tte_point_s.unwrap() > 1800.0);
+        let expected_red_runway =
+            (sample.stats.available_bytes - 10 * GIB) as f64 / (2 * MIB) as f64;
+        assert!((forecast.tte_point_s.unwrap() - expected_red_runway).abs() < 1e-6);
         assert_eq!(forecast.tte_lo_s, Some(0.0));
         assert_eq!(response.predicted_seconds, Some(0.0));
         assert_eq!(tick.seconds_to_red, Some(0.0));
@@ -21472,7 +21477,9 @@ mod tests {
     fn collapsed_conformal_runway_does_not_consume_notification_cooldown() {
         use crate::daemon::notifications::{FileConfig, NotificationConfig};
 
-        const TOTAL: u64 = 1_000_000_000_000;
+        // Keep this sample above the entry to Red so the positive point
+        // forecast can collapse; already-Red space has a reached boundary.
+        const TOTAL: u64 = 600_000_000_000;
         const FREE: u64 = 62_000_000_000;
         let mut fixture = RegretDaemonFixture::new();
         let mount = install_disk_pressure_probe(&mut fixture, TOTAL, FREE, false);
@@ -21658,6 +21665,90 @@ mod tests {
         let mut sample = collector.collect_sample(mount).unwrap();
         sample.collected_at = at;
         sample
+    }
+
+    #[test]
+    fn red_runway_and_calibration_follow_entry_to_red_before_critical() {
+        const GIB: u64 = 1 << 30;
+        for (total, floors, orange_min, red_min, red_entry) in [
+            (100 * GIB, [0; 4], 10.0, 6.0, 10 * GIB),
+            (4096 * GIB, [80, 60, 40, 10], 10.0, 6.0, 40 * GIB),
+            (100 * GIB, [80, 60, 40, 10], 10.0, 6.0, 10 * GIB),
+            (100 * GIB, [0; 4], 8.0, 3.0, 8 * GIB),
+            (100 * GIB, [0; 4], 10.0, 1.0, 10 * GIB),
+        ] {
+            let mut config = Config::default();
+            config.telemetry.ewma_base_alpha = 1.0;
+            config.telemetry.ewma_min_alpha = 1.0;
+            config.telemetry.ewma_max_alpha = 1.0;
+            config.telemetry.ewma_min_samples = 1;
+            config.pressure.orange_min_free_pct = orange_min;
+            config.pressure.red_min_free_pct = red_min;
+            config.pressure.green_min_free_bytes = floors[0] * GIB;
+            config.pressure.yellow_min_free_bytes = floors[1] * GIB;
+            config.pressure.orange_min_free_bytes = floors[2] * GIB;
+            config.pressure.red_min_free_bytes = floors[3] * GIB;
+            assert_eq!(MountMonitor::red_threshold(&config, total), red_entry);
+
+            let mut monitor = MountMonitor::new(&config);
+            let start = Instant::now();
+            let mut sample = native_pressure_sample(
+                Path::new("/red-boundary"),
+                "disk-a",
+                total,
+                red_entry + 5 * GIB,
+                start,
+            );
+            for step in 0..=3 {
+                sample.collected_at = start + Duration::from_secs(step * 10);
+                sample.stats.available_bytes = red_entry + (5 - step) * GIB;
+                sample.stats.free_bytes = sample.stats.available_bytes;
+                monitor.observe_filesystem(sample.clone(), &config);
+            }
+            let rate = &monitor.last_observation.as_ref().unwrap().rate;
+            assert!((rate.seconds_to_threshold - 20.0).abs() < 1e-6);
+            let response = monitor.pressure_controller.update(
+                PressureReading {
+                    free_bytes: sample.stats.available_bytes,
+                    total_bytes: total,
+                    mount: sample.stats.mount_point.clone(),
+                },
+                Some(rate.seconds_to_threshold),
+                sample.collected_at,
+            );
+            assert_eq!(response.level, PressureLevel::Orange);
+            let expected_feedforward = config.pressure.controller.kf
+                * (1.0 - 20.0 / (config.pressure.prediction.action_horizon_minutes * 60.0));
+            assert!(
+                (monitor.pressure_controller.last_feedforward() - expected_feedforward).abs()
+                    < 1e-9
+            );
+            assert_eq!(monitor.conformal.pending(), 3);
+            assert_eq!(monitor.conformal.resolved_total(), 0);
+
+            // A faster writer crosses into Red before all three forecasts
+            // expected it, but remains well above Critical. These are real
+            // misses now; waiting for Critical would leave them unresolved.
+            sample.collected_at = start + Duration::from_secs(40);
+            sample.stats.available_bytes = red_entry - GIB;
+            sample.stats.free_bytes = sample.stats.available_bytes;
+            let crossing = monitor.observe_filesystem(sample.clone(), &config);
+            assert_eq!(crossing.observation.rate.seconds_to_threshold, 0.0);
+            assert!(!monitor.forecast_interval(0.0).runway_unknown());
+            let response = monitor.pressure_controller.update(
+                PressureReading {
+                    free_bytes: sample.stats.available_bytes,
+                    total_bytes: total,
+                    mount: sample.stats.mount_point,
+                },
+                Some(crossing.observation.rate.seconds_to_threshold),
+                sample.collected_at,
+            );
+            assert_eq!(response.level, PressureLevel::Red);
+            assert_eq!(monitor.conformal.pending(), 0);
+            assert_eq!(monitor.conformal.resolved_total(), 3);
+            assert_eq!(monitor.conformal.coverage_empirical(), Some(0.0));
+        }
     }
 
     #[test]
@@ -21859,7 +21950,7 @@ mod tests {
         config.telemetry.ewma_min_alpha = 1.0;
         config.telemetry.ewma_max_alpha = 1.0;
         config.telemetry.ewma_min_samples = 3;
-        config.pressure.red_min_free_bytes = 0;
+        config.pressure.orange_min_free_bytes = 0;
         let mut monitor = MountMonitor::new(&config);
         let start = Instant::now();
         let mut sample =
@@ -21874,6 +21965,7 @@ mod tests {
         let old_confidence = monitor.last_observation.as_ref().unwrap().rate.confidence;
         let resolved = monitor.conformal.resolved_total();
         let guard_evidence = monitor.guard.diagnostics().e_process_value;
+        config.pressure.orange_min_free_pct = 8.0;
         config.pressure.red_min_free_pct = 3.0;
         config.pressure.prediction.enabled = false;
         config.telemetry.ewma_min_samples = 100;
@@ -21885,7 +21977,7 @@ mod tests {
         assert_eq!(monitor.guard.diagnostics().e_process_value, guard_evidence);
         assert_eq!(monitor.conformal.pending(), 0);
         assert_eq!(monitor.conformal.resolved_total(), resolved);
-        assert!((refresh.observation.rate.seconds_to_threshold - 90.0).abs() < 1e-6);
+        assert!((refresh.observation.rate.seconds_to_threshold - 40.0).abs() < 1e-6);
         assert!(refresh.observation.rate.confidence < old_confidence);
         assert!(refresh.observation.rate.fallback_active);
         let response = monitor.pressure_controller.update(
@@ -22383,49 +22475,65 @@ mod tests {
             (
                 "large-byte-floor",
                 4096 * GIB,
-                11 * GIB,
+                41 * GIB,
                 true,
-                10 * GIB,
-                PressureLevel::Red,
+                40 * GIB,
+                PressureLevel::Orange,
             ),
             (
                 "percentage-only",
                 100 * GIB,
-                7 * GIB,
+                11 * GIB,
                 false,
-                6 * GIB,
-                PressureLevel::Red,
+                10 * GIB,
+                PressureLevel::Orange,
             ),
             (
                 "small-volume",
                 100 * GIB,
-                7 * GIB,
+                11 * GIB,
                 true,
-                6 * GIB,
-                PressureLevel::Red,
+                10 * GIB,
+                PressureLevel::Orange,
             ),
             (
                 "imminent",
                 4096 * GIB,
-                10 * GIB + MIB,
+                40 * GIB + MIB,
                 true,
-                10 * GIB,
-                PressureLevel::Red,
+                40 * GIB,
+                PressureLevel::Orange,
             ),
             (
                 "reached",
                 4096 * GIB,
-                10 * GIB,
+                40 * GIB,
                 true,
-                10 * GIB,
-                PressureLevel::Red,
+                40 * GIB,
+                PressureLevel::Orange,
             ),
             (
                 "crossed",
                 4096 * GIB,
+                40 * GIB - MIB,
+                true,
+                40 * GIB,
+                PressureLevel::Red,
+            ),
+            (
+                "already-red",
+                100 * GIB,
+                7 * GIB,
+                false,
+                10 * GIB,
+                PressureLevel::Red,
+            ),
+            (
+                "already-critical",
+                4096 * GIB,
                 10 * GIB - MIB,
                 true,
-                10 * GIB,
+                40 * GIB,
                 PressureLevel::Critical,
             ),
         ] {

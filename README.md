@@ -1198,6 +1198,11 @@ time_to_exhaustion = available_bytes / forecast_rate
 time_to_red = max(available_bytes - red_threshold_bytes, 0) / forecast_rate
 ```
 
+`red_threshold_bytes` is the effective `orange_min_free_pct` /
+`orange_min_free_bytes` boundary where the filesystem enters Red. The
+`red_min_*` settings define the later boundary into Critical. Forecasts,
+controller feedforward, and crossing calibration all use the Red-entry boundary.
+
 For distant projections, a bounded history measures signed net consumption over
 five to fifteen minutes of elapsed time. Space released by a build offsets its
 allocations, and faster polling does not shorten that observation window. A new
