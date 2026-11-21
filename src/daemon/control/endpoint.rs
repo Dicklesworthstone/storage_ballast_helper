@@ -267,6 +267,26 @@ fn connection_refused(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// Closes a test's listener and waits until its socket refuses connections.
+/// A child that another test thread spawns can inherit the listener and keep
+/// the closed socket connectable, and `bind` is right to refuse a connectable
+/// socket. On macOS 344 of 3,000 closed listeners still accepted a connect
+/// while 8 threads spawned `true`, and 0 of 3,000 without them. A fixture
+/// that needs a stale socket therefore waits until it is stale.
+#[cfg(test)]
+pub(super) fn close_until_stale(listener: UnixListener, path: &Path) {
+    drop(listener);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !connection_refused(path).unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "{} still accepts connections 10 s after its listener closed",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,7 +400,7 @@ mod tests {
         assert!(bind(&path).is_err());
         assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), inode);
         assert!(UnixStream::connect(&path).is_ok());
-        drop(listener);
+        close_until_stale(listener, &path);
         let (listener, guard) = bind(&path).unwrap();
         drop(listener);
         drop(guard);
@@ -391,8 +411,7 @@ mod tests {
     fn confirmed_stale_socket_recovers_with_private_permissions() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("control.sock");
-        drop(UnixListener::bind(&path).unwrap());
-        assert!(connection_refused(&path).unwrap());
+        close_until_stale(UnixListener::bind(&path).unwrap(), &path);
         let (listener, guard) = bind(&path).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,

@@ -996,7 +996,7 @@ mod tests {
         let socket = control_socket_path(&state);
         // A closed listener leaves a real stale socket, not a regular file
         // which startup has no authority to delete.
-        drop(UnixListener::bind(&socket).unwrap());
+        endpoint::close_until_stale(UnixListener::bind(&socket).unwrap(), &socket);
 
         let server = ControlServer::start(&socket, "secret", Arc::new(EchoBackend)).unwrap();
         {
