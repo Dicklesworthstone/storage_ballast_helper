@@ -1745,7 +1745,7 @@ mod standalone_incremental {
                     l_start: 0,
                     l_len: 0,
                     l_pid: 0,
-                    l_type: lock_type.try_into().unwrap(),
+                    l_type: lock_type,
                     l_whence: libc::SEEK_SET.try_into().unwrap(),
                 };
                 nix::fcntl::fcntl(&lock, nix::fcntl::FcntlArg::F_SETLK(&record)).unwrap();
