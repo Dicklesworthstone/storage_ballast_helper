@@ -6,6 +6,15 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+### Fixed
+
+- **A stop during startup is an orderly stop** (bd-jg93). `sbh update`
+  restarts a loaded service itself, so a `systemctl restart` right after it
+  stopped the new daemon while its first filesystem observations were still
+  pending. The daemon exited with status 2 and a false SBH-2001, and the unit
+  was marked failed. It now finishes the shutdown sequence (final state,
+  stop event, log flush) and exits 0.
+
 ## v0.7.17 **[release]**
 
 Compare: [`v0.7.16...v0.7.17`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.16...v0.7.17)

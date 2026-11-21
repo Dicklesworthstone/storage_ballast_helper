@@ -5710,6 +5710,19 @@ impl MonitoringDaemon {
         }
     }
 
+    /// The first pressure response, or `None` when a stop request arrived
+    /// while the first observations were still pending. Restarting a service
+    /// that is itself still starting sends exactly that request; it is an
+    /// orderly stop, not a filesystem failure (an exit status of 2 with
+    /// SBH-2001 on four hosts during the v0.7.17 rollout).
+    fn first_pressure_response(&mut self) -> Result<Option<PressureResponse>> {
+        match self.initial_pressure_check() {
+            Ok(response) => Ok(Some(response)),
+            Err(_) if self.signal_handler.should_shutdown() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     #[cfg(test)]
     fn init_with_platform(
         config: Config,
@@ -7265,7 +7278,16 @@ impl MonitoringDaemon {
         }
 
         // Wait only a bounded time for the first background observation.
-        let initial_response = self.initial_pressure_check()?;
+        let Some(initial_response) = self.first_pressure_response()? else {
+            // Workers and channels do not exist yet: only the tail of the
+            // shutdown sequence applies.
+            if let Err(error) = self.platform.service_manager().notify_stopping() {
+                eprintln!("[SBH-DAEMON] sd_notify STOPPING=1 failed: {error}");
+            }
+            let uptime_secs = self.start_time.elapsed().as_secs();
+            self.finish_shutdown("shutdown during startup", uptime_secs);
+            return Ok(());
+        };
         if initial_response.level != PressureLevel::Green {
             eprintln!(
                 "[SBH-DAEMON] starting under pressure: {:?} (urgency={:.2})",
@@ -11658,6 +11680,12 @@ impl MonitoringDaemon {
             );
         }
 
+        self.finish_shutdown(exit_reason, uptime_secs);
+    }
+
+    /// Steps 3-4 of the shutdown sequence, which also end a stop requested
+    /// before the workers start.
+    fn finish_shutdown(&mut self, exit_reason: &str, uptime_secs: u64) {
         // 3. Log shutdown and stamp the state file so readers can tell a
         //    stopped daemon from a stalled one.
         self.self_monitor.write_final_state(exit_reason);
@@ -16726,6 +16754,46 @@ mod tests {
                 started.elapsed()
             );
         }
+    }
+
+    /// `systemctl restart` of a service whose own update just restarted it
+    /// stops the new daemon before its first observation arrives. That stop is
+    /// orderly: it must not leave the daemon with an SBH-2001 runtime failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_before_the_first_observation_is_an_orderly_stop() {
+        use crate::platform::pal::{MemoryInfo, MountPoint, PlatformPaths};
+        let mut healthy = RegretDaemonFixture::new();
+        healthy.daemon.enable_background_filesystem_observations();
+        let response = healthy.daemon.first_pressure_response();
+        assert!(matches!(response, Ok(Some(_))), "{response:?}");
+
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        // No mount answers statfs, so no first observation can arrive.
+        daemon.platform = Arc::new(MockPlatform::new(
+            vec![MountPoint {
+                path: PathBuf::from("/"),
+                device: "mock/".to_string(),
+                fs_type: "mockfs".to_string(),
+                is_ram_backed: false,
+            }],
+            HashMap::new(),
+            MemoryInfo {
+                total_bytes: 64 << 30,
+                available_bytes: 32 << 30,
+                swap_total_bytes: 8 << 30,
+                swap_free_bytes: 8 << 30,
+            },
+            PlatformPaths::default(),
+        ));
+        daemon.enable_background_filesystem_observations();
+        daemon.signal_handler.request_shutdown();
+        let started = Instant::now();
+        let response = daemon.first_pressure_response();
+        assert!(matches!(response, Ok(None)), "{response:?}");
+        // It stopped at the first failed check, not the 10 s startup grace.
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[cfg(unix)]
