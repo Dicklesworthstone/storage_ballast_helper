@@ -1361,6 +1361,9 @@ pub(super) mod tests {
             // system binaries can have foreign owners, and /tmp is untrusted.
             let test_home = std::env::var_os("HOME").expect("test user's home directory");
             let rch_dir = tempfile::tempdir_in(test_home).unwrap();
+            // tempfile creates the dir 0777 & !umask: under a group-writable
+            // umask (002) the trust check rightly refuses it, so pin the mode.
+            fs::set_permissions(rch_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let runner = script_runner(rch_dir.path(), "#!/bin/sh\nexit 1\n");
             let binary = trusted_binary(&runner.binary, effective_uid())
                 .expect("isolated probe executable must pass the production trust checks");
