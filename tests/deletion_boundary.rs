@@ -1785,6 +1785,7 @@ mod standalone_incremental {
                             *child =
                                 Some(CompilerLock::acquire(&fixture.lock, dir.path(), protocol));
                         }
+                        drop(child);
                         Ok(())
                     }),
                 );
