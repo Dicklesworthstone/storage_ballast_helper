@@ -2111,9 +2111,12 @@ fn why_not_report(
     };
 
     let registry = ArtifactPatternRegistry::default();
-    let classification = if let Some(opaque_tree) = &entry.opaque_tree {
+    let (classification, classified_tree_modified) = if let Some(opaque_tree) = &entry.opaque_tree {
         match opaque_tree.disposition {
-            OpaqueTreeDisposition::CandidateOpaque => opaque_tree.classification.clone(),
+            OpaqueTreeDisposition::CandidateOpaque => (
+                opaque_tree.classification.clone(),
+                opaque_tree.tree_last_modified,
+            ),
             OpaqueTreeDisposition::SignalOnly | OpaqueTreeDisposition::ProtectedOpaque => {
                 report.scanner_note = Some(format!(
                     "part of an opaque tree ({:?}): the scanner scores the tree as a whole, not this directory",
@@ -2124,13 +2127,14 @@ fn why_not_report(
             }
         }
     } else {
-        registry.classify(&entry.path, entry.structural_signals)
+        registry.classify_with_freshness(&entry.path, entry.structural_signals)
     };
     let now = SystemTime::now();
     let age = now
-        .duration_since(
-            entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
-        )
+        .duration_since(entry.effective_age_timestamp(
+            classification.category.is_regenerable_tree(),
+            classified_tree_modified,
+        ))
         .unwrap_or_default();
     let mut candidate = CandidateInput {
         path: entry.path.clone(),
@@ -11373,7 +11377,7 @@ fn count_sacred_scan_overlaps(
     let mut candidate_count = 0usize;
     let mut overlap_count = 0usize;
     for entry in entries.iter().filter(|entry| entry.metadata.is_dir) {
-        let Some(classification) = entry.walk_classification(&patterns) else {
+        let Some((classification, _)) = entry.walk_classification(&patterns) else {
             continue;
         };
         if classification.category == ArtifactCategory::Unknown {
@@ -14376,11 +14380,13 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     let scored_entries = entries
         .iter()
         .filter_map(|entry| {
-            let classification = entry.walk_classification(&registry)?;
+            let (classification, classified_tree_modified) =
+                entry.walk_classification(&registry)?;
             let age = now
-                .duration_since(
-                    entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
-                )
+                .duration_since(entry.effective_age_timestamp(
+                    classification.category.is_regenerable_tree(),
+                    classified_tree_modified,
+                ))
                 .unwrap_or_default();
             let mut candidate = CandidateInput {
                 path: entry.path.clone(),
@@ -14767,23 +14773,28 @@ fn scan_ab_pass(
     let mut hard_vetoes: Vec<ScanAbVeto> = Vec::new();
 
     for entry in &entries {
-        let classification = if let Some(opaque_tree) = &entry.opaque_tree {
-            match opaque_tree.disposition {
-                OpaqueTreeDisposition::CandidateOpaque => {
-                    opaque_pruned_dirs += 1;
-                    opaque_tree.classification.clone()
+        let (classification, classified_tree_modified) =
+            if let Some(opaque_tree) = &entry.opaque_tree {
+                match opaque_tree.disposition {
+                    OpaqueTreeDisposition::CandidateOpaque => {
+                        opaque_pruned_dirs += 1;
+                        (
+                            opaque_tree.classification.clone(),
+                            opaque_tree.tree_last_modified,
+                        )
+                    }
+                    OpaqueTreeDisposition::SignalOnly | OpaqueTreeDisposition::ProtectedOpaque => {
+                        continue;
+                    }
                 }
-                OpaqueTreeDisposition::SignalOnly | OpaqueTreeDisposition::ProtectedOpaque => {
-                    continue;
-                }
-            }
-        } else {
-            registry.classify(&entry.path, entry.structural_signals)
-        };
+            } else {
+                registry.classify_with_freshness(&entry.path, entry.structural_signals)
+            };
         let age = now
-            .duration_since(
-                entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
-            )
+            .duration_since(entry.effective_age_timestamp(
+                classification.category.is_regenerable_tree(),
+                classified_tree_modified,
+            ))
             .unwrap_or_default();
         let candidate = CandidateInput {
             path: entry.path.clone(),
@@ -15742,12 +15753,13 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
             .iter()
             .filter_map(|entry| {
                 // As `sbh scan` and the daemon walk classify (bd-10yj).
-                let classification = entry.walk_classification(&registry)?;
+                let (classification, classified_tree_modified) =
+                    entry.walk_classification(&registry)?;
                 let age = now
-                    .duration_since(
-                        entry
-                            .effective_age_timestamp(classification.category.is_regenerable_tree()),
-                    )
+                    .duration_since(entry.effective_age_timestamp(
+                        classification.category.is_regenerable_tree(),
+                        classified_tree_modified,
+                    ))
                     .unwrap_or_default();
                 let mut candidate = CandidateInput {
                     path: entry.path.clone(),
@@ -18155,11 +18167,13 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         .iter()
         .filter_map(|entry| {
             // As `sbh scan` and the daemon walk classify (bd-10yj).
-            let classification = entry.walk_classification(&registry)?;
+            let (classification, classified_tree_modified) =
+                entry.walk_classification(&registry)?;
             let age = now
-                .duration_since(
-                    entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
-                )
+                .duration_since(entry.effective_age_timestamp(
+                    classification.category.is_regenerable_tree(),
+                    classified_tree_modified,
+                ))
                 .unwrap_or_default();
             let mut candidate = CandidateInput {
                 path: entry.path.clone(),

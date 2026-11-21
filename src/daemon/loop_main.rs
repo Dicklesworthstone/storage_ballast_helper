@@ -3020,6 +3020,7 @@ fn catalog_walk_entries(roots: &[ExpandedCatalogRoot]) -> (Vec<WalkEntry>, usize
                 disposition: OpaqueTreeDisposition::CandidateOpaque,
                 reason: Cow::Owned(format!("catalog root ({})", root.rule)),
                 classification,
+                tree_last_modified: None,
             }),
         });
     }
@@ -3122,13 +3123,17 @@ fn prescan_disposition(
 /// directories by the newest of their mtime, birth time and a bounded probe
 /// of the tree, so a tree created a moment ago with old mtimes (a copy, an
 /// extracted archive) is as young as the walker would find it.
-fn prescan_age(path: &Path) -> Duration {
+fn prescan_age(path: &Path, classified_tree_modified: Option<SystemTime>) -> Duration {
     let Ok(meta) = path.metadata() else {
         return Duration::ZERO;
     };
     let entry = crate::scanner::walker::entry_metadata(&meta);
     let mut newest = entry.effective_age_timestamp();
-    if entry.is_dir {
+    if entry.is_dir
+        && let Some(modified) = classified_tree_modified
+    {
+        newest = newest.max(modified);
+    } else if entry.is_dir {
         let probe = crate::scanner::walker::tree_newest_mtime(
             path,
             crate::scanner::walker::TREE_IDLE_PROBE_MAX_ENTRIES,
@@ -12196,12 +12201,12 @@ fn replay_indexed_record(
         .then(|| classify_opaque_tree(path, opaque_context_for_path(path)))
         .flatten()
         .filter(|opaque| opaque.disposition == OpaqueTreeDisposition::CandidateOpaque);
-    let classification = match opaque {
+    let (classification, classified_tree_modified) = match opaque {
         Some(opaque) => {
             // The evidence the walk's subtree probe found, persisted in the
             // record; the size estimate below comes from the same probe.
             signals = record.structural_signals;
-            opaque.classification
+            (opaque.classification, opaque.tree_last_modified)
         }
         // As the walk would classify it now (bd-10yj): a tree it only
         // descends into or protects is not replayed on its name.
@@ -12224,7 +12229,11 @@ fn replay_indexed_record(
     if let Ok(created) = meta.created() {
         newest = newest.max(created);
     }
-    if meta.is_dir() && classification.category.is_regenerable_tree() {
+    if meta.is_dir()
+        && let Some(modified) = classified_tree_modified
+    {
+        newest = newest.max(modified);
+    } else if meta.is_dir() && classification.category.is_regenerable_tree() {
         let probe = tree_newest_mtime(path, TREE_IDLE_PROBE_MAX_ENTRIES, TREE_IDLE_PROBE_MAX_DEPTH);
         if let Some(tree_newest) = probe.newest_mtime {
             newest = newest.max(tree_newest);
@@ -13936,7 +13945,7 @@ fn scanner_thread_main(
                             // walker's opaque verdict first, so a tree it only
                             // descends into or protects is not nominated here on
                             // its name (a plain `target` inside an hfdt store).
-                            let Some(candidate_class) =
+                            let Some((candidate_class, classified_tree_modified)) =
                                 crate::scanner::walker::classify_dir_as_walked(
                                     &pattern_registry,
                                     &candidate_path,
@@ -13950,7 +13959,7 @@ fn scanner_thread_main(
                             {
                                 break 'score_candidate;
                             }
-                            let age = prescan_age(&candidate_path);
+                            let age = prescan_age(&candidate_path, classified_tree_modified);
                             // For directories, metadata().len() only returns the
                             // dir entry size (~4KB), not the recursive contents.
                             // Use a heuristic floor: known artifact dirs (target/,
@@ -14621,7 +14630,9 @@ fn scanner_thread_main(
             }
 
             // Classify.
-            let classification = if let Some(opaque_tree) = &entry.opaque_tree {
+            let (classification, classified_tree_modified) = if let Some(opaque_tree) =
+                &entry.opaque_tree
+            {
                 match opaque_tree.disposition {
                     OpaqueTreeDisposition::CandidateOpaque => {
                         opaque_pruned_dirs += 1;
@@ -14632,20 +14643,26 @@ fn scanner_thread_main(
                                 entry.path.display()
                             ),
                         });
-                        opaque_tree.classification.clone()
+                        (
+                            opaque_tree.classification.clone(),
+                            opaque_tree.tree_last_modified,
+                        )
                     }
                     OpaqueTreeDisposition::SignalOnly | OpaqueTreeDisposition::ProtectedOpaque => {
                         continue;
                     }
                 }
             } else {
-                pattern_registry.classify(&entry.path, entry.structural_signals)
+                pattern_registry.classify_with_freshness(&entry.path, entry.structural_signals)
             };
             // Age means idleness of the whole tree for regenerable categories:
             // the opaque probe recorded the newest mtime for pruned trees, and
             // a bounded sample covers v1-walked build/cache directories.
             let age = entry
-                .effective_age_timestamp(classification.category.is_regenerable_tree())
+                .effective_age_timestamp(
+                    classification.category.is_regenerable_tree(),
+                    classified_tree_modified,
+                )
                 .elapsed()
                 .unwrap_or(Duration::ZERO);
 
@@ -27471,6 +27488,140 @@ mod tests {
         let _ = logger_join.join();
     }
 
+    /// Replaying a checkpoint must re-observe the complete compiler cache,
+    /// including a changed member outside the generic idle sample's budget.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn index_replay_renews_incremental_freshness_beyond_the_idle_probe_budget() {
+        use crate::scanner::index::{CandidateSafetyState, IndexedPruneDecision};
+        use crate::scanner::walker::{
+            TREE_IDLE_PROBE_MAX_DEPTH, TREE_IDLE_PROBE_MAX_ENTRIES, identity_for_path,
+            tree_newest_mtime,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("compiler-data");
+        let crate_dir = root.join("example-0123456789abc");
+        let session = crate_dir.join("s-0123456789-0123456-0123456789abcdefghijklmno");
+        std::fs::create_dir_all(&session).unwrap();
+        let lock = crate_dir.join("s-0123456789-0123456.lock");
+        std::fs::write(&lock, []).unwrap();
+        for name in ["dep-graph.bin", "query-cache.bin", "work-products.bin"] {
+            std::fs::write(session.join(name), b"RSIC\0\0\x04test\x01").unwrap();
+        }
+        for index in 0..TREE_IDLE_PROBE_MAX_ENTRIES + 32 {
+            std::fs::write(session.join(format!("unit-{index}.o")), b"object").unwrap();
+        }
+        let old = SystemTime::now() - Duration::from_hours(48);
+        let stamp = filetime::FileTime::from_system_time(old);
+        let members: Vec<_> = std::fs::read_dir(&session)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        for path in members.iter().chain([&root, &crate_dir, &session, &lock]) {
+            filetime::set_file_mtime(path, stamp).unwrap();
+        }
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: temp.path().join("activity.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 64,
+            run_id: None,
+        })
+        .unwrap();
+        let mut config = Config::default();
+        // Keep the real replay path's resulting age observable. A freshly
+        // created fixture has a recent birth time, so a minute-based veto
+        // alone would pass even if the complete inspection were discarded.
+        config.scanner.min_file_age_minutes = 0;
+        config.scanner.root_paths = vec![temp.path().to_path_buf()];
+        let registry = ArtifactPatternRegistry::default();
+        let engine = ScoringEngine::from_config(&config.scoring, 0);
+        let mut protection = ProtectionRegistry::new(None).unwrap();
+        let request = ScanRequest {
+            urgency: 1.0,
+            pressure_level: PressureLevel::Critical,
+            ..event_test_request_for_config(config.scanner.root_paths.clone(), &config.scanner)
+        };
+        let mut record = CandidateIndexRecord {
+            path: root.clone(),
+            identity: identity_for_path(&root, false).unwrap().into(),
+            parent_identity: None,
+            parent_mtime_nanos: None,
+            candidate_mtime_nanos: 0,
+            candidate_ctime_nanos: None,
+            size_estimate_bytes: 200 * 1_048_576,
+            prune_decision: IndexedPruneDecision::CandidateOpaque,
+            score: Some(0.95),
+            safety_state: CandidateSafetyState::Safe,
+            fail_count: 0,
+            cooldown_until_nanos: None,
+            event_generation: 3,
+            structural_signals: StructuralSignals::default(),
+        };
+        let replay = |record: &CandidateIndexRecord, protection: &mut ProtectionRegistry| {
+            replay_indexed_record(
+                record,
+                3,
+                &registry,
+                &engine,
+                &config.scanner,
+                &request,
+                protection,
+                &[],
+                &HashSet::new(),
+                None,
+                &logger,
+            )
+        };
+        let before = replay(&record, &mut protection).unwrap();
+        assert!(before.age > Duration::ZERO);
+        assert_eq!(
+            before.classification.pattern_name,
+            crate::scanner::rustc_incremental::PATTERN_NAME
+        );
+
+        // Updating an existing file preserves root identity and directory
+        // order. The future stamp makes the expected age exactly zero,
+        // independent of filesystem timestamp resolution and test duration.
+        let future = SystemTime::now() + Duration::from_mins(1);
+        filetime::set_file_mtime(
+            members.last().unwrap(),
+            filetime::FileTime::from_system_time(future),
+        )
+        .unwrap();
+        let bounded = tree_newest_mtime(
+            &root,
+            TREE_IDLE_PROBE_MAX_ENTRIES,
+            TREE_IDLE_PROBE_MAX_DEPTH,
+        );
+        assert!(bounded.truncated);
+        assert!(bounded.newest_mtime.unwrap() < future);
+        for prune in [
+            IndexedPruneDecision::CandidateOpaque,
+            IndexedPruneDecision::None,
+        ] {
+            record.prune_decision = prune;
+            let renewed = replay(&record, &mut protection).unwrap();
+            assert_eq!(renewed.age, Duration::ZERO, "{prune:?}");
+            assert_eq!(renewed.identity, Some(record.identity.into()));
+        }
+        record.event_generation = 2;
+        assert_eq!(
+            replay(&record, &mut protection).unwrap_err(),
+            ReplayDrop::GenerationAdvanced,
+            "fresh classification cannot override an obsolete checkpoint generation"
+        );
+        logger.shutdown();
+        logger_join.join().unwrap();
+    }
+
     fn test_candidate(path: &str, total_score: f64) -> CandidacyScore {
         CandidacyScore {
             path: PathBuf::from(path),
@@ -33008,6 +33159,40 @@ mod tests {
         assert_eq!(daemon_idle_reason(&recovering), None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn prescan_age_preserves_complete_classification_freshness() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("compiler-data");
+        let crate_dir = root.join("example-0123456789abc");
+        let session = crate_dir.join("s-0123456789-0123456-0123456789abcdefghijklmno");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(crate_dir.join("s-0123456789-0123456.lock"), []).unwrap();
+        for name in ["dep-graph.bin", "query-cache.bin", "work-products.bin"] {
+            std::fs::write(session.join(name), b"RSIC\0\0\x04test\x01").unwrap();
+        }
+        // A complete inspection may observe a future mtime (clock skew).
+        // The age must saturate at zero even if a later bounded probe only
+        // sees older entries. Reset the payload after classification to make
+        // rereading the filesystem insufficient to satisfy this assertion.
+        let future = SystemTime::now() + Duration::from_hours(24);
+        let payload = session.join("query-cache.bin");
+        filetime::set_file_mtime(&payload, filetime::FileTime::from_system_time(future)).unwrap();
+        let (_, modified) = crate::scanner::walker::classify_dir_as_walked(
+            &ArtifactPatternRegistry::default(),
+            &root,
+            StructuralSignals::default(),
+        )
+        .unwrap();
+        assert!(modified.unwrap() >= future - Duration::from_secs(1));
+        filetime::set_file_mtime(
+            &payload,
+            filetime::FileTime::from_system_time(SystemTime::UNIX_EPOCH),
+        )
+        .unwrap();
+        assert_eq!(prescan_age(&root, modified), Duration::ZERO);
+    }
+
     /// A cargo target created just now whose mtimes were set five hours back
     /// is young by the walker's rule (birth time). The priority pre-scan must
     /// measure it the same way and hold it behind `min_file_age_minutes`.
@@ -33052,12 +33237,12 @@ mod tests {
         // just-created tree must not age by its reset mtimes).
         if cfg!(target_os = "linux") {
             assert!(
-                prescan_age(&target) < Duration::from_secs(60),
+                prescan_age(&target, None) < Duration::from_secs(60),
                 "a just-created tree is young whatever its mtimes say"
             );
         }
         assert!(
-            prescan_age(&debug.join("deps").join("libx.rlib")) >= Duration::from_hours(4),
+            prescan_age(&debug.join("deps").join("libx.rlib"), None) >= Duration::from_hours(4),
             "files still age by mtime"
         );
 
@@ -33175,7 +33360,7 @@ mod tests {
 
         let meta = std::fs::metadata(&target).unwrap();
         let entry = crate::scanner::walker::entry_metadata(&meta);
-        let age = prescan_age(&target);
+        let age = prescan_age(&target, None);
         eprintln!(
             "bd-awc5 probe: prescan_age={age:?} std_created={:?} std_modified={:?} \
              entry_created={:?} entry_modified={:?} entry_is_dir={}",

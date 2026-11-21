@@ -1025,6 +1025,7 @@ mod tests {
             disposition: OpaqueTreeDisposition::CandidateOpaque,
             reason: "test".into(),
             classification: score.classification.clone(),
+            tree_last_modified: None,
         };
         let record = CandidateIndexRecord::from_candidate_score(
             &score,

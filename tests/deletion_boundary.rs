@@ -1317,7 +1317,8 @@ mod standalone_incremental {
         fn candidate(&self) -> CandidacyScore {
             let registry = ArtifactPatternRegistry::default();
             let signals = structural_signals_for_path(&self.root);
-            let classification = classify_dir_as_walked(&registry, &self.root, signals).unwrap();
+            let (classification, _) =
+                classify_dir_as_walked(&registry, &self.root, signals).unwrap();
             assert_eq!(classification.pattern_name.as_ref(), PATTERN_NAME);
             let mut item = candidate(&self.root);
             item.classification = classification;
@@ -1371,7 +1372,8 @@ mod standalone_incremental {
                 .any(|entry| entry.path.starts_with(&fixture.root) && entry.path != fixture.root),
             "the cache must be one reclaim unit, not independent session payloads"
         );
-        let classification = entry.walk_classification(&registry).unwrap();
+        let (classification, classified_tree_modified) =
+            entry.walk_classification(&registry).unwrap();
         assert_eq!(classification.pattern_name.as_ref(), PATTERN_NAME);
         assert_eq!(classification.category, ArtifactCategory::RustTarget);
         assert_eq!(
@@ -1380,7 +1382,7 @@ mod standalone_incremental {
                 &fixture.root,
                 structural_signals_for_path(&fixture.root),
             ),
-            Some(classification.clone()),
+            Some((classification.clone(), classified_tree_modified)),
             "priority scans and index replay must use the same classification"
         );
         assert!(entry.metadata.content_size_bytes >= PAYLOAD.len() as u64);

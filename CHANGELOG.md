@@ -8,6 +8,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Fresh compiler caches retain their complete idleness evidence** (bd-homj).
+  Standalone rustc incremental-cache recognition inspects every member; its
+  newest modification time now follows the candidate through daemon pre-scans,
+  index replay, both scanner modes, and CLI scoring. A later bounded sample
+  cannot make a large recently used cache appear old enough for cleanup.
 - **A stop during startup is an orderly stop** (bd-jg93). `sbh update`
   restarts a loaded service itself, so a `systemctl restart` right after it
   stopped the new daemon while its first filesystem observations were still

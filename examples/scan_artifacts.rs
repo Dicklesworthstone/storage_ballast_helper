@@ -48,9 +48,16 @@ fn main() {
     let mut candidates: Vec<CandidateInput> = Vec::new();
     for entry in &entries {
         if entry.metadata.is_dir {
-            let classification = registry.classify(&entry.path, entry.structural_signals);
+            let Some((classification, classified_tree_modified)) =
+                entry.walk_classification(&registry)
+            else {
+                continue;
+            };
             let age = now
-                .duration_since(entry.metadata.effective_age_timestamp())
+                .duration_since(entry.effective_age_timestamp(
+                    classification.category.is_regenerable_tree(),
+                    classified_tree_modified,
+                ))
                 .unwrap_or_default();
             candidates.push(CandidateInput {
                 path: entry.path.clone(),

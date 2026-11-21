@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 use std::path::Path;
+use std::time::SystemTime;
 
 use crate::platform::cleanup_catalog::{self, CleanupConfidence, CleanupRule, ReclaimCommand};
 
@@ -164,6 +165,9 @@ pub struct OpaqueTreeClassification {
     pub disposition: OpaqueTreeDisposition,
     pub reason: Cow<'static, str>,
     pub classification: ArtifactClassification,
+    /// Newest tree mtime from the same complete inspection that classified it.
+    /// A bounded follow-up sample must never replace this freshness evidence.
+    pub tree_last_modified: Option<SystemTime>,
 }
 
 impl OpaqueTreeClassification {
@@ -183,6 +187,7 @@ impl OpaqueTreeClassification {
                 structural_confidence: 1.0,
                 combined_confidence: confidence,
             },
+            tree_last_modified: None,
         }
     }
 
@@ -191,6 +196,7 @@ impl OpaqueTreeClassification {
             disposition: OpaqueTreeDisposition::ProtectedOpaque,
             reason: Cow::Borrowed(reason),
             classification: ArtifactClassification::unknown(),
+            tree_last_modified: None,
         }
     }
 
@@ -199,6 +205,7 @@ impl OpaqueTreeClassification {
             disposition: OpaqueTreeDisposition::SignalOnly,
             reason: Cow::Borrowed(reason),
             classification: ArtifactClassification::unknown(),
+            tree_last_modified: None,
         }
     }
 }
@@ -339,13 +346,15 @@ pub fn classify_opaque_tree(
 }
 
 fn classify_rustc_incremental_cache(path: &Path) -> Option<OpaqueTreeClassification> {
-    crate::scanner::rustc_incremental::inspect(path)?;
-    Some(OpaqueTreeClassification::candidate(
+    let cache = crate::scanner::rustc_incremental::inspect(path)?;
+    let mut opaque = OpaqueTreeClassification::candidate(
         "rustc incremental cache: complete compiler layout and metadata headers",
         crate::scanner::rustc_incremental::PATTERN_NAME,
         ArtifactCategory::RustTarget,
         0.95,
-    ))
+    );
+    opaque.tree_last_modified = Some(cache.latest_modified);
+    Some(opaque)
 }
 
 /// Chromium browsers on macOS (Chrome, Canary, Edge, Brave, Opera) keep an
@@ -1129,6 +1138,18 @@ impl ArtifactPatternRegistry {
         self.classify_with_cleanup_rules(path, signals, platform_cleanup_rules())
     }
 
+    /// Classify a path and retain freshness from its structural inspection.
+    /// Scoring callers must combine this timestamp with their ordinary age
+    /// evidence, rather than replacing a complete proof with a bounded sample.
+    #[must_use]
+    pub fn classify_with_freshness(
+        &self,
+        path: &Path,
+        signals: StructuralSignals,
+    ) -> (ArtifactClassification, Option<SystemTime>) {
+        self.classify_with_cleanup_rules_inner(path, signals, platform_cleanup_rules(), None)
+    }
+
     /// Classify one path name against an explicit cleanup catalog.
     #[must_use]
     pub fn classify_with_cleanup_rules(
@@ -1138,6 +1159,7 @@ impl ArtifactPatternRegistry {
         cleanup_rules: &'static [CleanupRule],
     ) -> ArtifactClassification {
         self.classify_with_cleanup_rules_inner(path, signals, cleanup_rules, None)
+            .0
     }
 
     /// Classify one path against an explicit cleanup catalog and synthetic home root.
@@ -1150,6 +1172,7 @@ impl ArtifactPatternRegistry {
         home: &Path,
     ) -> ArtifactClassification {
         self.classify_with_cleanup_rules_inner(path, signals, cleanup_rules, Some(home))
+            .0
     }
 
     fn classify_with_cleanup_rules_inner(
@@ -1158,19 +1181,19 @@ impl ArtifactPatternRegistry {
         signals: StructuralSignals,
         cleanup_rules: &'static [CleanupRule],
         home: Option<&Path>,
-    ) -> ArtifactClassification {
+    ) -> (ArtifactClassification, Option<SystemTime>) {
         let Some(name_os) = path.file_name() else {
-            return ArtifactClassification::unknown();
+            return (ArtifactClassification::unknown(), None);
         };
         // Crate source unpacked under a cargo store is never an artifact,
         // whatever its basename looks like (`target-triple-1.0.0`), and
         // neither is a package uv unpacked or installed in its cache.
         if is_cargo_registry_internal_path(path) || is_uv_cache_internal_path(path) {
-            return ArtifactClassification::unknown();
+            return (ArtifactClassification::unknown(), None);
         }
         let normalized = name_os.to_string_lossy().to_lowercase();
         if is_agent_harness_dir_name(&normalized) {
-            return ArtifactClassification::unknown();
+            return (ArtifactClassification::unknown(), None);
         }
 
         // The legacy walker and direct registry callers need the same
@@ -1180,7 +1203,7 @@ impl ArtifactPatternRegistry {
             && !signals.has_cargo_toml
             && let Some(opaque) = classify_rustc_incremental_cache(path)
         {
-            return opaque.classification;
+            return (opaque.classification, opaque.tree_last_modified);
         }
 
         let catalog_classification = cleanup_catalog_path_classification(path, cleanup_rules, home);
@@ -1288,11 +1311,14 @@ impl ArtifactPatternRegistry {
             combined *= 0.1;
         }
 
-        ArtifactClassification {
-            structural_confidence: structural,
-            combined_confidence: combined,
-            ..best
-        }
+        (
+            ArtifactClassification {
+                structural_confidence: structural,
+                combined_confidence: combined,
+                ..best
+            },
+            None,
+        )
     }
 }
 

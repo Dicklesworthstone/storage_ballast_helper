@@ -953,11 +953,24 @@ impl WalkEntry {
     /// already recorded; when nothing recorded the tree and `probe_tree` is
     /// set (regenerable-tree categories such as cargo targets and caches), a
     /// bounded [`tree_newest_mtime`] sample is taken so files written deep
-    /// inside the tree count as activity.
+    /// inside the tree count as activity. `classified_tree_modified` retains
+    /// a complete classification inspection's newest member, including ones
+    /// a bounded sample would miss.
     #[must_use]
-    pub fn effective_age_timestamp(&self, probe_tree: bool) -> SystemTime {
+    pub fn effective_age_timestamp(
+        &self,
+        probe_tree: bool,
+        classified_tree_modified: Option<SystemTime>,
+    ) -> SystemTime {
         let base = self.metadata.effective_age_timestamp();
-        if !self.metadata.is_dir || self.metadata.tree_last_modified.is_some() || !probe_tree {
+        if !self.metadata.is_dir {
+            return base;
+        }
+        let base = classified_tree_modified.map_or(base, |modified| base.max(modified));
+        if classified_tree_modified.is_some()
+            || self.metadata.tree_last_modified.is_some()
+            || !probe_tree
+        {
             return base;
         }
         let probe = tree_newest_mtime(
@@ -985,17 +998,19 @@ impl WalkEntry {
     /// candidate's own (structural) classification, nothing for a tree the
     /// walker only descends into or protects, and the name registry where
     /// it made no opaque verdict. `sbh scan`, `clean` and `emergency` all
-    /// classify through this, so they agree on what is a candidate.
+    /// classify through this, so they agree on what is a candidate. The
+    /// optional timestamp is freshness from that same classification, to be
+    /// passed into [`Self::effective_age_timestamp`].
     #[must_use]
     pub fn walk_classification(
         &self,
         registry: &ArtifactPatternRegistry,
-    ) -> Option<ArtifactClassification> {
+    ) -> Option<(ArtifactClassification, Option<SystemTime>)> {
         self.opaque_tree.as_ref().map_or_else(
-            || Some(registry.classify(&self.path, self.structural_signals)),
+            || Some(registry.classify_with_freshness(&self.path, self.structural_signals)),
             |opaque| {
                 (opaque.disposition == OpaqueTreeDisposition::CandidateOpaque)
-                    .then(|| opaque.classification.clone())
+                    .then(|| (opaque.classification.clone(), opaque.tree_last_modified))
             },
         )
     }
@@ -1015,11 +1030,11 @@ pub fn classify_dir_as_walked(
     registry: &ArtifactPatternRegistry,
     path: &Path,
     signals: StructuralSignals,
-) -> Option<ArtifactClassification> {
+) -> Option<(ArtifactClassification, Option<SystemTime>)> {
     match classify_opaque_tree(path, opaque_context_for_path(path)) {
         Some(opaque) => (opaque.disposition == OpaqueTreeDisposition::CandidateOpaque)
-            .then_some(opaque.classification),
-        None => Some(registry.classify(path, signals)),
+            .then_some((opaque.classification, opaque.tree_last_modified)),
+        None => Some(registry.classify_with_freshness(path, signals)),
     }
 }
 
@@ -2194,7 +2209,11 @@ fn emit_opaque_candidate(
             OPAQUE_SIZE_PROBE_BUDGET,
             cancel,
         );
-        emeta.tree_last_modified = probe.newest_mtime;
+        emeta.tree_last_modified = probe.newest_mtime.max(
+            opaque_tree
+                .as_ref()
+                .and_then(|opaque| opaque.tree_last_modified),
+        );
         probe_signals = probe.signals;
         let measured = emeta
             .content_size_bytes
@@ -4673,8 +4692,8 @@ mod tests {
 
         // Without the probe the directory looks six hours idle (the v0.5.1
         // regression); with it, the fresh deep file makes it young.
-        assert_eq!(entry.effective_age_timestamp(false), old);
-        let probed = entry.effective_age_timestamp(true);
+        assert_eq!(entry.effective_age_timestamp(false, None), old);
+        let probed = entry.effective_age_timestamp(true, None);
         assert!(probed >= fresh - Duration::from_secs(2), "{probed:?}");
 
         // A recorded opaque-probe result wins without re-walking.
@@ -4687,7 +4706,18 @@ mod tests {
             metadata: recorded,
             ..entry
         };
-        assert_eq!(recorded_entry.effective_age_timestamp(false), fresh);
+        assert_eq!(recorded_entry.effective_age_timestamp(false, None), fresh);
+        assert_eq!(
+            recorded_entry.effective_age_timestamp(true, Some(old)),
+            fresh,
+            "a complete classification must not erase a newer probe observation"
+        );
+        let newer = fresh + Duration::from_secs(30);
+        assert_eq!(
+            recorded_entry.effective_age_timestamp(true, Some(newer)),
+            newer,
+            "a stale recorded sample must not erase a newer complete observation"
+        );
 
         // Birth time is only a lower bound: newest of the three wins.
         let young_birth = EntryMetadata {
@@ -4703,6 +4733,85 @@ mod tests {
             ..young_birth
         };
         assert_eq!(file.effective_age_timestamp(), old);
+    }
+
+    /// The complete compiler-layout proof sees members past the ordinary
+    /// 4,096-entry idle sample. Both scanner modes and outside-walk discovery
+    /// must keep that observation instead of reporting an actively modified
+    /// cache as old enough for maintenance cleanup.
+    #[cfg(unix)]
+    #[test]
+    fn standalone_incremental_freshness_survives_a_truncated_idle_probe() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("compiler-data");
+        let crate_dir = root.join("example-0123456789abc");
+        let session = crate_dir.join("s-0123456789-0123456-0123456789abcdefghijklmno");
+        fs::create_dir_all(&session).unwrap();
+        let lock = crate_dir.join("s-0123456789-0123456.lock");
+        fs::write(&lock, []).unwrap();
+        for name in ["dep-graph.bin", "query-cache.bin", "work-products.bin"] {
+            fs::write(session.join(name), b"RSIC\0\0\x04test\x01").unwrap();
+        }
+        for index in 0..TREE_IDLE_PROBE_MAX_ENTRIES + 32 {
+            fs::write(session.join(format!("unit-{index}.o")), b"object").unwrap();
+        }
+        let old = SystemTime::now() - Duration::from_hours(48);
+        let stamp = filetime::FileTime::from_system_time(old);
+        let members: Vec<_> = fs::read_dir(&session)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        for member in &members {
+            filetime::set_file_mtime(member, stamp).unwrap();
+        }
+        for path in [&root, &crate_dir, &session, &lock] {
+            filetime::set_file_mtime(path, stamp).unwrap();
+        }
+        // Keep the directory inventory unchanged and modify the last member
+        // in its enumeration order, beyond the probe's entry budget.
+        let fresh = SystemTime::now() - Duration::from_secs(30);
+        filetime::set_file_mtime(
+            members.last().unwrap(),
+            filetime::FileTime::from_system_time(fresh),
+        )
+        .unwrap();
+        let sample = tree_newest_mtime(
+            &root,
+            TREE_IDLE_PROBE_MAX_ENTRIES,
+            TREE_IDLE_PROBE_MAX_DEPTH,
+        );
+        assert!(!sample.complete);
+        assert!(sample.newest_mtime.unwrap() < fresh);
+
+        let registry = ArtifactPatternRegistry::default();
+        for opaque_pruning in [false, true] {
+            let mut entry = bare_entry(root.to_str().unwrap());
+            // Model the existing root from the incident. A new tempfile's
+            // birth time would otherwise conceal the lost-proof regression.
+            entry.metadata.modified = old;
+            entry.metadata.created = Some(old);
+            if opaque_pruning {
+                entry.opaque_tree = classify_opaque_tree(&root, OpaqueTreeContext::default());
+                entry.metadata.tree_last_modified = sample.newest_mtime;
+            }
+            assert!(
+                entry.effective_age_timestamp(true, None).elapsed().unwrap()
+                    > Duration::from_hours(47),
+                "without the classification proof the old age path misses the fresh member"
+            );
+            let (classification, modified) = entry.walk_classification(&registry).unwrap();
+            assert_eq!(
+                classification.pattern_name,
+                crate::scanner::rustc_incremental::PATTERN_NAME
+            );
+            assert!(modified.unwrap() >= fresh - Duration::from_secs(1));
+            let timestamp = entry.effective_age_timestamp(true, modified);
+            assert!(timestamp >= fresh - Duration::from_secs(1));
+            assert!(timestamp.elapsed().unwrap() < Duration::from_secs(60));
+        }
+        let (_, outside_walk_modified) =
+            classify_dir_as_walked(&registry, &root, StructuralSignals::default()).unwrap();
+        assert!(outside_walk_modified.unwrap() >= fresh - Duration::from_secs(1));
     }
 
     #[test]
@@ -6356,7 +6465,7 @@ mod tests {
             ArtifactCategory::Unknown,
             "the name alone says nothing"
         );
-        let class = classify_dir_as_walked(&registry, &cache, StructuralSignals::default())
+        let (class, _) = classify_dir_as_walked(&registry, &cache, StructuralSignals::default())
             .expect("an opaque candidate");
         assert_eq!(class.category, ArtifactCategory::GoCache);
 
@@ -6374,7 +6483,7 @@ mod tests {
         assert!(classify_opaque_tree(&plain, opaque_context_for_path(&plain)).is_none());
         assert_eq!(
             classify_dir_as_walked(&registry, &plain, StructuralSignals::default()),
-            Some(registry.classify(&plain, StructuralSignals::default())),
+            Some(registry.classify_with_freshness(&plain, StructuralSignals::default())),
             "no opaque verdict: the name registry decides"
         );
 
@@ -6382,7 +6491,9 @@ mod tests {
         let mut entry = bare_entry("/x/ci-gocache-1");
         entry.opaque_tree = classify_opaque_tree(&cache, OpaqueTreeContext::default());
         assert_eq!(
-            entry.walk_classification(&registry).map(|c| c.category),
+            entry
+                .walk_classification(&registry)
+                .map(|(c, _)| c.category),
             Some(ArtifactCategory::GoCache)
         );
         entry.opaque_tree =
