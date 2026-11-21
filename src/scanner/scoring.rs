@@ -3553,35 +3553,6 @@ mod tests {
             ),
             ArtifactCertainty::Definite
         );
-        // A standalone rustc cache has no Cargo target markers. Its complete
-        // layout/header proof supplies the structural evidence instead.
-        assert_eq!(
-            classify_certainty(
-                &classification(
-                    ArtifactCategory::RustTarget,
-                    crate::scanner::rustc_incremental::PATTERN_NAME,
-                    0.95,
-                    1.0
-                ),
-                StructuralSignals::default(),
-                projects
-            ),
-            ArtifactCertainty::Definite
-        );
-        // A name-only/custom label cannot claim that structural proof.
-        assert_eq!(
-            classify_certainty(
-                &classification(
-                    ArtifactCategory::RustTarget,
-                    crate::scanner::rustc_incremental::PATTERN_NAME,
-                    0.95,
-                    0.0
-                ),
-                StructuralSignals::default(),
-                projects
-            ),
-            ArtifactCertainty::Unclear
-        );
         // Likely: confident name plus one marker; recognized category in a temp root.
         let one_marker = StructuralSignals {
             has_build: true,
@@ -3625,6 +3596,30 @@ mod tests {
         assert_eq!(
             ArtifactCertainty::from_rank(ArtifactCertainty::Likely.rank()),
             ArtifactCertainty::Likely
+        );
+    }
+
+    #[test]
+    fn standalone_incremental_certainty_requires_structural_proof() {
+        // A standalone rustc cache has no Cargo target markers. Its complete
+        // layout/header proof supplies the structural evidence instead.
+        let mut classification = ArtifactClassification {
+            pattern_name: Cow::Borrowed(crate::scanner::rustc_incremental::PATTERN_NAME),
+            category: ArtifactCategory::RustTarget,
+            name_confidence: 0.95,
+            structural_confidence: 1.0,
+            combined_confidence: 1.0,
+        };
+        assert_eq!(
+            classify_certainty(&classification, StructuralSignals::default(), 0.40),
+            ArtifactCertainty::Definite
+        );
+        // A name-only/custom label cannot claim that structural proof.
+        classification.structural_confidence = 0.0;
+        classification.combined_confidence = 0.95;
+        assert_eq!(
+            classify_certainty(&classification, StructuralSignals::default(), 0.40),
+            ArtifactCertainty::Unclear
         );
     }
 

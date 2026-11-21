@@ -16,11 +16,11 @@ use std::time::SystemTime;
 
 use crate::scanner::walker::FsIdentity;
 
-pub(crate) const PATTERN_NAME: &str = "rustc-incremental-cache";
+pub const PATTERN_NAME: &str = "rustc-incremental-cache";
 
 /// A complete, deterministically ordered observation of a recognized cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IncrementalCache {
+pub struct IncrementalCache {
     pub(crate) lock_files: Vec<PathBuf>,
     pub(crate) entries: Vec<IncrementalEntry>,
     pub(crate) latest_modified: SystemTime,
@@ -29,7 +29,7 @@ pub(crate) struct IncrementalCache {
 /// Includes the root, every directory, every lock, and every payload file.
 /// Access time is intentionally absent because reading headers can update it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IncrementalEntry {
+pub struct IncrementalEntry {
     pub(crate) path: PathBuf,
     pub(crate) identity: FsIdentity,
     pub(crate) modified: SystemTime,
@@ -40,7 +40,7 @@ pub(crate) struct IncrementalEntry {
 
 /// Recognize an entire standalone cache without following its symlinks.
 /// Unsupported platforms cannot supply the descriptor-relative proof.
-pub(crate) fn inspect(path: &Path) -> Option<IncrementalCache> {
+pub fn inspect(path: &Path) -> Option<IncrementalCache> {
     #[cfg(unix)]
     {
         native::inspect_with_limit(path, 200_000)
@@ -55,7 +55,7 @@ pub(crate) fn inspect(path: &Path) -> Option<IncrementalCache> {
 /// A denial-only hint for public candidates that carry a generic pattern label.
 /// A crate-shaped child or uncertain directory listing requires full proof;
 /// this function can never establish that anything is safe to delete.
-pub(crate) fn requires_proof(path: &Path) -> bool {
+pub fn requires_proof(path: &Path) -> bool {
     #[cfg(unix)]
     {
         native::requires_proof_with_limit(path, 200_000).unwrap_or(true)

@@ -99,6 +99,46 @@ descriptor confinement with identity rechecks, not an atomic whole-tree
 transaction: a last-moment rename after a check can still affect the originally
 opened object, and the final identity check and unlink are separate syscalls.
 
+## Standalone rustc incremental caches
+
+A standalone `rustc -C incremental=DIR` cache does not need to be named
+`incremental` or live inside a Cargo `target` directory. The scanner recognizes
+its compiler-specific crate/session layout and versioned `RSIC` metadata
+headers. Every entry must be accounted for; unknown contents, symlinks,
+incomplete reads, missing session locks, or exhausted inspection budgets keep
+the cache. Each proof is bounded to 200,000 entries and two seconds of cooperative
+inspection. Generated names alone are not sufficient evidence. Ordinary object
+files may be hardlinked, but session lock files must be empty and have one link.
+
+The executor renews that proof and acquires nonblocking exclusive locks on every
+observed session lock, including orphan locks. A shared compiler reader or an
+exclusive writer keeps the entire cache. Entries changed in the last ten
+seconds are also retained: rustc creates a new lock file before locking it.
+The existing age, open-reference, source-tree, lease, and protection-marker
+rules still apply. Linux and macOS are the supported lock implementations;
+other platforms cannot authorize this new removal path.
+
+The locks stay held through direct removal. Holding old session locks cannot
+stop a compiler from creating a different session with a new lock, so the
+descriptor-relative remover also checks a positive inventory of relative paths,
+devices, inodes, and entry types before descent and immediately before unlink.
+An unlisted or replaced entry stops removal without touching that entry. Some
+previously approved children may already have been removed; an interrupted
+operation does not report the whole cache's bytes as reclaimed.
+
+This proof requirement is retained across planning, interactive confirmation,
+and live authorization callbacks. A stale or manually constructed candidate
+cannot bypass the compiler checks by supplying an ordinary `target` label.
+
+Whole-cache quarantine is refused with `incremental_quarantine_unsupported`.
+An atomic rename of the root cannot exclude a newly created, independently
+locked session, and a requested recoverable cleanup never falls back to unlink.
+Pressure cleanup and emergency cleanup can use guarded direct removal. To
+review an explicit manual cleanup, use
+`sbh clean PATH --no-quarantine --dry-run` before choosing direct removal.
+A quarantine refusal does not place the candidate in a repeat-deletion backoff,
+so a later direct pressure pass can reconsider it immediately.
+
 ## Regression coverage
 
 Unit tests beside the admission helper exercise the public batch and checked
@@ -128,3 +168,13 @@ before unlink, stable parent aliases, external hardlink permissions, and filesys
 boundaries. Bind-mount fixtures require mount capability and report a skip when it
 is unavailable; separate read-only Linux tests exercise existing mount boundaries
 without attempting to remove system paths.
+
+Standalone compiler-cache tests cover structural recognition, fresh and active
+caches, shared and exclusive session locks held by a separate process, forged
+and stale classifications, malformed metadata, non-session contents, symlinks,
+and markers added after planning. Additional authorization and confirmation
+tests preserve a cache that changes after admission. The confined-removal tests
+introduce new sessions, replacement files, hardlinks under unapproved names,
+and special files after the initial inventory, verifying that none inherits
+permission from an approved parent. Quarantine and dry-run tests require an
+explicit refusal with no fallback unlink or recovery-store allocation.

@@ -1256,3 +1256,602 @@ fn quarantine_maintenance_renews_permission_after_the_durable_witness_update() {
         );
     }
 }
+
+mod standalone_incremental {
+    use super::*;
+    use std::io::Read as _;
+    use std::process::{Child, Command, Stdio};
+    use std::time::SystemTime;
+
+    use storage_ballast_helper::core::config::ScoringConfig;
+    use storage_ballast_helper::scanner::patterns::ArtifactPatternRegistry;
+    use storage_ballast_helper::scanner::protection::ProtectionRegistry;
+    use storage_ballast_helper::scanner::scoring::{
+        ActiveReferenceSummary, CandidateInput, ScoringEngine,
+    };
+    use storage_ballast_helper::scanner::walker::{
+        DirectoryWalker, WalkerConfig, classify_dir_as_walked, structural_signals_for_path,
+    };
+
+    const PATTERN_NAME: &str = "rustc-incremental-cache";
+    const SESSION: &str = "s-0123456789-0abcdef-0123456789abcdefghijklmno";
+    const LOCK: &str = "s-0123456789-0abcdef.lock";
+    const OBJECT: &str = "0123456789abcdefghijklmno.o";
+    const METADATA: &[u8] = b"RSIC\0\0\x07fixture\x01";
+
+    struct Fixture {
+        root: PathBuf,
+        crate_dir: PathBuf,
+        session: PathBuf,
+        lock: PathBuf,
+        object: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(parent: &Path) -> Self {
+            // The operator controls -C incremental=DIR. Recognition must not
+            // depend on "incremental", "target", or "cache" in its basename.
+            let root = parent.join("unrelated-name");
+            let crate_dir = root.join("ee-2f1eohql34ytd");
+            let session = crate_dir.join(SESSION);
+            let lock = crate_dir.join(LOCK);
+            let object = session.join(OBJECT);
+            fs::create_dir_all(&session).unwrap();
+            fs::write(&lock, b"").unwrap();
+            for name in ["dep-graph.bin", "query-cache.bin", "work-products.bin"] {
+                fs::write(session.join(name), METADATA).unwrap();
+            }
+            fs::write(&object, PAYLOAD).unwrap();
+            let old =
+                filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_hours(48));
+            set_old_mtime(&root, old);
+            Self {
+                root,
+                crate_dir,
+                session,
+                lock,
+                object,
+            }
+        }
+
+        fn candidate(&self) -> CandidacyScore {
+            let registry = ArtifactPatternRegistry::default();
+            let signals = structural_signals_for_path(&self.root);
+            let classification = classify_dir_as_walked(&registry, &self.root, signals).unwrap();
+            assert_eq!(classification.pattern_name.as_ref(), PATTERN_NAME);
+            let mut item = candidate(&self.root);
+            item.classification = classification;
+            item
+        }
+
+        fn assert_intact(&self) {
+            assert_eq!(fs::read(&self.object).unwrap(), PAYLOAD);
+            assert_eq!(
+                fs::read(self.session.join("dep-graph.bin")).unwrap(),
+                METADATA
+            );
+            assert!(self.lock.is_file());
+        }
+    }
+
+    fn set_old_mtime(path: &Path, old: filetime::FileTime) {
+        if fs::symlink_metadata(path).unwrap().is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                set_old_mtime(&entry.unwrap().path(), old);
+            }
+        }
+        filetime::set_file_mtime(path, old).unwrap();
+    }
+
+    #[test]
+    fn walker_and_scoring_deliver_a_standalone_cache_to_real_unlink() {
+        let dir = scratch();
+        let fixture = Fixture::new(dir.path());
+        let registry = ArtifactPatternRegistry::default();
+        let walker = DirectoryWalker::new(
+            WalkerConfig {
+                root_paths: vec![dir.path().to_path_buf()],
+                max_depth: 6,
+                follow_symlinks: false,
+                cross_devices: false,
+                parallelism: 1,
+                excluded_paths: HashSet::new(),
+                opaque_pruning: true,
+            },
+            ProtectionRegistry::new(None).unwrap(),
+        );
+        let entries = walker.walk().unwrap();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.path == fixture.root)
+            .expect("arbitrarily named standalone incremental root is discoverable");
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.path.starts_with(&fixture.root) && entry.path != fixture.root),
+            "the cache must be one reclaim unit, not independent session payloads"
+        );
+        let classification = entry.walk_classification(&registry).unwrap();
+        assert_eq!(classification.pattern_name.as_ref(), PATTERN_NAME);
+        assert_eq!(classification.category, ArtifactCategory::RustTarget);
+        assert_eq!(
+            classify_dir_as_walked(
+                &registry,
+                &fixture.root,
+                structural_signals_for_path(&fixture.root),
+            ),
+            Some(classification.clone()),
+            "priority scans and index replay must use the same classification"
+        );
+        assert!(entry.metadata.content_size_bytes >= PAYLOAD.len() as u64);
+        let input = CandidateInput {
+            path: fixture.root.clone(),
+            size_bytes: entry.metadata.content_size_bytes,
+            // The fixture's birth time is necessarily now. Supply an old
+            // observation age at the public scoring boundary; the live
+            // executor independently reads the 48-hour-old tree mtimes.
+            age: Duration::from_hours(48),
+            classification,
+            signals: entry.structural_signals,
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+        let engine = ScoringEngine::from_config(&ScoringConfig::default(), 30);
+        let mut item = engine.score_candidate(&input, 0.9);
+        assert!(!item.vetoed, "{:?}", item.veto_reason);
+        assert_eq!(item.decision.certainty, ArtifactCertainty::Definite);
+        assert_eq!(item.decision.action, DecisionAction::Delete, "{item:?}");
+        item.identity = Some(entry.metadata.identity());
+
+        let mut fresh = input.clone();
+        fresh.age = Duration::ZERO;
+        assert!(engine.score_candidate(&fresh, 0.9).vetoed);
+        let mut active = input;
+        active
+            .active_references
+            .add_open_file_descriptor(42, Some("rustc".to_string()));
+        assert!(engine.score_candidate(&active, 0.9).vetoed);
+
+        let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+        let plan = executor.plan(vec![item]);
+        assert_eq!(plan.estimated_items, 1, "{:?}", plan.refused);
+        let report = executor.execute(&plan, None);
+        assert_eq!(report.items_deleted, 1, "{report:?}");
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.items_skipped, 0);
+        assert_eq!(report.items_quarantined, 0);
+        assert!(!fixture.root.exists());
+        assert!(!dir.path().join(".sbh").exists());
+    }
+
+    #[test]
+    fn stale_labels_cannot_authorize_unknown_contents_or_aliases() {
+        for changed in ["root", "crate", "session", "metadata", "symlink"] {
+            let dir = scratch();
+            let fixture = Fixture::new(dir.path());
+            let item = fixture.candidate();
+            let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+            let plan = executor.plan(vec![item.clone()]);
+            assert_eq!(plan.estimated_items, 1);
+            let outside = dir.path().join("outside-data");
+            fs::write(&outside, b"operator data").unwrap();
+            match changed {
+                "root" => fs::write(fixture.root.join("notes.txt"), b"keep").unwrap(),
+                "crate" => fs::write(fixture.crate_dir.join("notes.txt"), b"keep").unwrap(),
+                "session" => fs::write(fixture.session.join("source.rs"), b"keep").unwrap(),
+                "metadata" => {
+                    fs::write(fixture.session.join("query-cache.bin"), b"not rustc data").unwrap();
+                }
+                "symlink" => {
+                    symlink(
+                        &outside,
+                        fixture.session.join("zzzzzzzzzzzzzzzzzzzzzzzzz.o"),
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                executor.plan(vec![item.clone()]).candidates.is_empty(),
+                "{changed}"
+            );
+            let report = executor.execute(&plan, None);
+            assert_eq!(report.items_skipped, 1, "{changed}: {report:?}");
+            assert_eq!(report.items_deleted, 0);
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.bytes_freed, 0);
+            assert_eq!(
+                executor.delete_candidate_checked(&item, None).unwrap(),
+                CheckedDeletion::Skipped(SkipReason::Vetoed),
+                "{changed}"
+            );
+            fixture.assert_intact();
+            assert_eq!(fs::read(&outside).unwrap(), b"operator data");
+            assert!(!dir.path().join(".sbh").exists());
+        }
+
+        // A public caller can fabricate the label without ever running the
+        // classifier. A regular file is not an incremental root.
+        let dir = scratch();
+        let mut item = artifact(dir.path(), "ordinary-data");
+        item.classification.pattern_name = Cow::Borrowed(PATTERN_NAME);
+        let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+        assert_eq!(
+            executor.delete_candidate_checked(&item, None).unwrap(),
+            CheckedDeletion::Skipped(SkipReason::Vetoed)
+        );
+        assert_eq!(fs::read(item.path).unwrap(), PAYLOAD);
+    }
+
+    #[test]
+    fn marker_protection_and_open_file_evidence_survive_the_new_classification() {
+        for marker_depth in ["ancestor", "root", "session"] {
+            let dir = scratch();
+            let fixture = Fixture::new(dir.path());
+            let item = fixture.candidate();
+            let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+            let plan = executor.plan(vec![item]);
+            assert_eq!(plan.estimated_items, 1);
+            let marker_parent = match marker_depth {
+                "ancestor" => dir.path(),
+                "root" => fixture.root.as_path(),
+                "session" => fixture.session.as_path(),
+                _ => unreachable!(),
+            };
+            fs::write(marker_parent.join(".sbh-protect"), b"keep").unwrap();
+            let report = executor.execute(&plan, None);
+            assert_eq!(report.items_skipped, 1, "{marker_depth}: {report:?}");
+            assert_eq!(report.items_deleted, 0);
+            assert_eq!(report.bytes_freed, 0);
+            fixture.assert_intact();
+        }
+
+        let dir = scratch();
+        let fixture = Fixture::new(dir.path());
+        let item = fixture.candidate();
+        let mut cfg = config(dir.path(), DeletionMode::Unlink);
+        cfg.check_open_files = true;
+        let executor = DeletionExecutor::new(cfg, None);
+        let _open_object = fs::File::open(&fixture.object).unwrap();
+        let open_paths = HashSet::from([fs::canonicalize(&fixture.root).unwrap()]);
+        assert_eq!(
+            executor
+                .delete_candidate_checked(&item, Some(&open_paths))
+                .unwrap(),
+            CheckedDeletion::Skipped(SkipReason::FileOpen)
+        );
+        fixture.assert_intact();
+    }
+
+    #[test]
+    fn whole_cache_quarantine_refuses_without_falling_back_to_unlink() {
+        for dry_run in [false, true] {
+            for configured_mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+                let dir = scratch();
+                let fixture = Fixture::new(dir.path());
+                let item = fixture.candidate();
+                let mut cfg = config(dir.path(), configured_mode);
+                cfg.dry_run = dry_run;
+                let executor = DeletionExecutor::new(cfg, None);
+                if configured_mode == DeletionMode::Quarantine {
+                    let plan = executor.plan(vec![item.clone()]);
+                    assert!(plan.candidates.is_empty());
+                    assert_eq!(
+                        plan.refused[0].1,
+                        SkipReason::IncrementalQuarantineUnsupported
+                    );
+                }
+                // The actual plan mode is public, independent of the
+                // receiving executor's configured default.
+                let report = executor.execute(
+                    &raw_plan(vec![item.clone()], DeletionMode::Quarantine),
+                    None,
+                );
+                assert_eq!(report.items_skipped, 1, "{report:?}");
+                assert_eq!(
+                    report
+                        .skipped_by_reason
+                        .get("incremental_quarantine_unsupported"),
+                    Some(&1)
+                );
+                assert_eq!(report.items_deleted, 0);
+                assert_eq!(report.items_quarantined, 0);
+                assert_eq!(report.items_would_delete, 0);
+                assert_eq!(report.items_failed, 0);
+                assert_eq!(report.bytes_freed, 0);
+                assert_eq!(report.bytes_quarantined, 0);
+                assert_eq!(report.bytes_would_free, 0);
+                if configured_mode == DeletionMode::Quarantine && !dry_run {
+                    assert_eq!(
+                        executor.delete_candidate_checked(&item, None).unwrap(),
+                        CheckedDeletion::Skipped(SkipReason::IncrementalQuarantineUnsupported)
+                    );
+                }
+                fixture.assert_intact();
+                assert!(!QuarantineStore::under(dir.path()).root().exists());
+            }
+        }
+    }
+
+    #[test]
+    fn live_authorization_and_confirmation_renew_layout_and_recent_activity() {
+        for boundary in ["authorization", "confirmation"] {
+            for change in ["unknown", "fresh"] {
+                let dir = scratch();
+                let fixture = Fixture::new(dir.path());
+                let item = fixture.candidate();
+                let executor =
+                    DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+                let plan = executor.plan(vec![item]);
+                assert_eq!(plan.estimated_items, 1);
+                let calls = Cell::new(0);
+                let mutate = || {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 1 {
+                        if change == "unknown" {
+                            fs::write(fixture.crate_dir.join("operator-notes.txt"), b"keep")
+                                .unwrap();
+                        } else {
+                            // Even a still-valid object filename can become
+                            // active after an old plan was authorized.
+                            fs::write(&fixture.object, PAYLOAD).unwrap();
+                        }
+                    }
+                };
+                let report = if boundary == "confirmation" {
+                    executor
+                        .execute_confirmed(&plan, None, |_, _| {
+                            mutate();
+                            Ok::<_, std::convert::Infallible>(DeletionConfirmation::Accept)
+                        })
+                        .unwrap()
+                } else {
+                    executor.execute_with_guard(
+                        &plan,
+                        None,
+                        Some(&|_| {
+                            mutate();
+                            Ok(())
+                        }),
+                    )
+                };
+                assert!(calls.get() > 0, "fixture must reach {boundary}");
+                assert_eq!(report.items_deleted, 0, "{boundary}/{change}: {report:?}");
+                assert_eq!(report.items_failed, 0);
+                assert_eq!(report.items_skipped, 1);
+                let expected = if change == "unknown" {
+                    SkipReason::Vetoed
+                } else {
+                    SkipReason::FileOpen
+                };
+                assert_eq!(report.skipped_by_reason.get(expected.as_str()), Some(&1));
+                assert_eq!(report.bytes_freed, 0);
+                fixture.assert_intact();
+                assert!(!dir.path().join(".sbh").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn generic_label_cannot_drop_compiler_safety_when_the_cache_changes() {
+        let dir = scratch();
+        let fixture = Fixture::new(dir.path());
+        let mut item = fixture.candidate();
+        item.classification.pattern_name = Cow::Borrowed("target");
+        let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+        let plan = executor.plan(vec![item]);
+        assert_eq!(plan.estimated_items, 1);
+        let added = fixture.crate_dir.join("new-owner-data.bin");
+        let calls = Cell::new(0);
+        let report = executor.execute_with_guard(
+            &plan,
+            None,
+            Some(&|_| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    // This breaks structural recognition after an ordinary
+                    // public label has already been admitted. Losing the
+                    // proof must not select unguarded generic deletion.
+                    fs::write(&added, b"new owner data").unwrap();
+                }
+                Ok(())
+            }),
+        );
+        assert!(calls.get() > 0, "the fixture must reach live authorization");
+        assert_eq!(report.items_deleted, 0, "{report:?}");
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.bytes_freed, 0);
+        fixture.assert_intact();
+        assert_eq!(fs::read(added).unwrap(), b"new owner data");
+        assert!(!dir.path().join(".sbh").exists());
+    }
+
+    struct CompilerLock {
+        child: Child,
+    }
+
+    impl CompilerLock {
+        fn acquire(lock: &Path, parent: &Path, protocol: &str) -> Self {
+            let ready = parent.join("compiler-lock-ready");
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "standalone_incremental::compiler_lock_child",
+                    "--nocapture",
+                ])
+                .env("SBH_TEST_INCREMENTAL_LOCK_PATH", lock)
+                .env("SBH_TEST_INCREMENTAL_LOCK_READY", &ready)
+                .env("SBH_TEST_INCREMENTAL_LOCK_PROTOCOL", protocol)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            let mut guard = Self { child };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ready.exists() {
+                assert!(
+                    guard.child.try_wait().unwrap().is_none(),
+                    "compiler lock helper exited before acquiring {protocol}"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "compiler lock helper did not become ready"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            guard
+        }
+    }
+
+    impl Drop for CompilerLock {
+        fn drop(&mut self) {
+            // Closing the pipe also releases the helper if its parent exits.
+            // Kill on unwind as well, so no failed assertion can strand it.
+            drop(self.child.stdin.take());
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture; invoked by the compiler-lock boundary test"]
+    fn compiler_lock_child() {
+        let path = std::env::var_os("SBH_TEST_INCREMENTAL_LOCK_PATH").unwrap();
+        let ready = std::env::var_os("SBH_TEST_INCREMENTAL_LOCK_READY").unwrap();
+        let protocol = std::env::var("SBH_TEST_INCREMENTAL_LOCK_PROTOCOL").unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        match protocol.as_str() {
+            "flock-shared" => lock.try_lock_shared().unwrap(),
+            "flock-exclusive" => lock.try_lock().unwrap(),
+            #[cfg(target_os = "macos")]
+            "posix-shared" | "posix-exclusive" => {
+                // Pinned rustc uses fcntl on macOS. An independent process
+                // matters: POSIX record locks owned by this test process
+                // would not model a competing compiler.
+                let lock_type = if protocol == "posix-shared" {
+                    libc::F_RDLCK
+                } else {
+                    libc::F_WRLCK
+                };
+                let record = libc::flock {
+                    l_start: 0,
+                    l_len: 0,
+                    l_pid: 0,
+                    l_type: lock_type.try_into().unwrap(),
+                    l_whence: libc::SEEK_SET.try_into().unwrap(),
+                };
+                nix::fcntl::fcntl(&lock, nix::fcntl::FcntlArg::F_SETLK(&record)).unwrap();
+            }
+            _ => panic!("unknown compiler lock protocol: {protocol}"),
+        }
+        fs::write(ready, b"locked").unwrap();
+        let mut input = Vec::new();
+        std::io::stdin().read_to_end(&mut input).unwrap();
+        drop(lock);
+    }
+
+    #[test]
+    fn a_compiler_starting_in_live_authorization_still_blocks_unlink() {
+        for protocol in ["flock-shared", "flock-exclusive"] {
+            for relabel in [false, true] {
+                let dir = scratch();
+                let fixture = Fixture::new(dir.path());
+                let mut item = fixture.candidate();
+                if relabel {
+                    item.classification.pattern_name = Cow::Borrowed("target");
+                }
+                let executor =
+                    DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+                let plan = executor.plan(vec![item]);
+                assert_eq!(plan.estimated_items, 1);
+                let held = std::sync::Arc::new(std::sync::Mutex::new(None::<CompilerLock>));
+                let report = executor.execute_with_guard(
+                    &plan,
+                    None,
+                    Some(&|_| {
+                        let mut child = held.lock().unwrap();
+                        if child.is_none() {
+                            // Preflight has already admitted this cache.
+                            // A compiler can acquire its lock before the
+                            // final mutation boundary rechecks the proof.
+                            *child =
+                                Some(CompilerLock::acquire(&fixture.lock, dir.path(), protocol));
+                        }
+                        Ok(())
+                    }),
+                );
+                assert!(held.lock().unwrap().is_some(), "authorizer must be called");
+                assert_eq!(
+                    report.items_skipped, 1,
+                    "{protocol}, relabel={relabel}: {report:?}"
+                );
+                assert_eq!(report.skipped_by_reason.get("file_open"), Some(&1));
+                assert_eq!(report.items_deleted, 0);
+                assert_eq!(report.items_failed, 0);
+                assert_eq!(report.bytes_freed, 0);
+                fixture.assert_intact();
+
+                drop(held.lock().unwrap().take());
+                let retry = executor.execute(&plan, None);
+                assert_eq!(retry.items_deleted, 1, "{protocol}: {retry:?}");
+                assert_eq!(retry.items_failed, 0);
+                assert!(!fixture.root.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn a_live_compiler_keeps_the_cache_even_when_a_public_caller_relabels_it() {
+        #[cfg(target_os = "macos")]
+        let protocols = [
+            "flock-shared",
+            "flock-exclusive",
+            "posix-shared",
+            "posix-exclusive",
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let protocols = ["flock-shared", "flock-exclusive"];
+        for protocol in protocols {
+            for relabel in [false, true] {
+                let dir = scratch();
+                let fixture = Fixture::new(dir.path());
+                let mut item = fixture.candidate();
+                if relabel {
+                    item.classification.pattern_name = Cow::Borrowed("target");
+                }
+                let executor =
+                    DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+                let plan = executor.plan(vec![item.clone()]);
+                assert_eq!(plan.estimated_items, 1);
+                let held = CompilerLock::acquire(&fixture.lock, dir.path(), protocol);
+                assert!(executor.plan(vec![item.clone()]).candidates.is_empty());
+                assert_eq!(
+                    executor.delete_candidate_checked(&item, None).unwrap(),
+                    CheckedDeletion::Skipped(SkipReason::FileOpen),
+                    "{protocol}, relabel={relabel}"
+                );
+                let report = executor.execute(&plan, None);
+                assert_eq!(report.items_skipped, 1, "{protocol}: {report:?}");
+                assert_eq!(report.skipped_by_reason.get("file_open"), Some(&1));
+                assert_eq!(report.items_deleted, 0);
+                assert_eq!(report.items_failed, 0);
+                assert_eq!(report.bytes_freed, 0);
+                fixture.assert_intact();
+
+                drop(held);
+                let retry = executor.execute(&plan, None);
+                assert_eq!(retry.items_deleted, 1, "{protocol}: {retry:?}");
+                assert_eq!(retry.items_failed, 0);
+                assert!(!fixture.root.exists());
+            }
+        }
+    }
+}

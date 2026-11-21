@@ -1901,23 +1901,27 @@ impl DeletionExecutor {
         // recovery record: emergency removal must work at ENOSPC. The exact
         // metadata just checked remains the expected root identity. Only
         // recognized regenerable caches may widen directory permissions.
-        if let Some(guard) = incremental_guard {
-            quarantine::remove_direct_guarded(
-                path,
-                metadata,
-                false,
-                &|relative, device, inode, is_directory| {
-                    guard.authorize_entry(relative, device, inode, is_directory)
+        incremental_guard
+            .map_or_else(
+                || {
+                    quarantine::remove_direct(
+                        path,
+                        metadata,
+                        classification_allows_force_remove(&candidate.classification),
+                    )
+                },
+                |guard| {
+                    quarantine::remove_direct_guarded(
+                        path,
+                        metadata,
+                        false,
+                        &|relative, device, inode, is_directory| {
+                            guard.authorize_entry(relative, device, inode, is_directory)
+                        },
+                    )
                 },
             )
-        } else {
-            quarantine::remove_direct(
-                path,
-                metadata,
-                classification_allows_force_remove(&candidate.classification),
-            )
-        }
-        .map_err(|e| SbhError::io(path, e))?;
+            .map_err(|e| SbhError::io(path, e))?;
 
         // Post-deletion verification (symlink_metadata to avoid following dangling symlinks).
         if fs::symlink_metadata(path).is_ok() {

@@ -741,7 +741,7 @@ mod unix {
                 let sentinel = temp.path().join("sentinel");
                 fs::write(&sentinel, b"outside bytes").unwrap();
                 let special = root.join("special");
-                let _listener = match kind {
+                let _listener: Option<std::os::unix::net::UnixListener> = match kind {
                     "symlink" => {
                         symlink(&sentinel, &special).unwrap();
                         None
@@ -750,7 +750,22 @@ mod unix {
                         nix::unistd::mkfifo(&special, nix::sys::stat::Mode::S_IRUSR).unwrap();
                         None
                     }
-                    "socket" => Some(std::os::unix::net::UnixListener::bind(&special).unwrap()),
+                    "socket" => {
+                        #[cfg(target_os = "linux")]
+                        {
+                            use nix::sys::stat::{Mode, SFlag, mknod};
+
+                            // The guard inspects the inode type, so no live
+                            // listener or permission to create sockets is needed.
+                            mknod(&special, SFlag::S_IFSOCK, Mode::S_IRUSR | Mode::S_IWUSR, 0)
+                                .unwrap();
+                            None
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            Some(std::os::unix::net::UnixListener::bind(&special).unwrap())
+                        }
+                    }
                     _ => unreachable!(),
                 };
                 let observed_special = std::cell::Cell::new(false);

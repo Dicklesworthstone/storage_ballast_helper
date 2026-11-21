@@ -112,10 +112,9 @@ fn inspect_candidate(candidate: &CandidacyScore) -> Result<Option<IncrementalCac
     if !labelled && !rustc_incremental::requires_proof(&path) {
         return Ok(None);
     }
-    match rustc_incremental::inspect(&path) {
-        Some(cache) => Ok(Some(cache)),
-        None => Err(SkipReason::Vetoed),
-    }
+    rustc_incremental::inspect(&path)
+        .map(Some)
+        .ok_or(SkipReason::Vetoed)
 }
 
 /// Whole-root rename cannot exclude a new, independently locked session.
@@ -132,18 +131,21 @@ pub(super) fn check(candidate: &CandidacyScore) -> Result<(), SkipReason> {
     let Some(cache) = inspect_candidate(candidate)? else {
         return Ok(());
     };
-    let _guard = lock_cache(cache)?;
+    let _guard = lock_cache(&cache)?;
     Ok(())
 }
 
 /// Renew the proof after all caller hooks; the returned guard must outlive
 /// actual removal, including every descriptor-relative child operation.
 pub(super) fn acquire(candidate: &CandidacyScore) -> Result<Option<Guard>, SkipReason> {
-    inspect_candidate(candidate)?.map(lock_cache).transpose()
+    inspect_candidate(candidate)?
+        .as_ref()
+        .map(lock_cache)
+        .transpose()
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn lock_cache(cache: IncrementalCache) -> Result<Guard, SkipReason> {
+fn lock_cache(cache: &IncrementalCache) -> Result<Guard, SkipReason> {
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -240,13 +242,13 @@ fn lock_cache(cache: IncrementalCache) -> Result<Guard, SkipReason> {
     // Lock acquisition and header reads can race compiler publication. The
     // full identity/timestamp inventory must still agree once every lock is
     // held; afterward the per-entry allowlist excludes all new sessions.
-    if rustc_incremental::inspect(&root.path).as_ref() != Some(&cache) {
+    if rustc_incremental::inspect(&root.path).as_ref() != Some(cache) {
         return Err(SkipReason::Vetoed);
     }
     Ok(guard)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn lock_cache(_cache: IncrementalCache) -> Result<Guard, SkipReason> {
+fn lock_cache(_cache: &IncrementalCache) -> Result<Guard, SkipReason> {
     Err(SkipReason::Vetoed)
 }
