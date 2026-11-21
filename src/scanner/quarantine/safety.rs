@@ -33,7 +33,7 @@ mod transaction;
 pub use beneath::mount_id;
 #[cfg(unix)]
 pub use beneath::open_beneath;
-pub use confined_purge::remove_direct;
+pub use confined_purge::{remove_direct, remove_direct_guarded};
 use transaction::{Directory, Kind, Payload};
 
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;

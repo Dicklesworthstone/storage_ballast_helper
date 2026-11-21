@@ -15,6 +15,7 @@ pub mod prescan_cursor;
 pub mod protection;
 pub mod quarantine;
 pub mod regret;
+pub(crate) mod rustc_incremental;
 pub mod scoring;
 pub mod source_roots;
 pub mod walker;

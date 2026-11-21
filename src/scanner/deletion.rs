@@ -47,6 +47,7 @@ use crate::scanner::source_roots::SourceRootPolicy;
 use crate::scanner::walker;
 
 mod eligibility;
+mod incremental;
 #[cfg(test)]
 mod source_root_tests;
 
@@ -713,6 +714,10 @@ pub enum SkipReason {
     /// directory entry. Missing evidence must not authorize either unlink
     /// or quarantine; a later pass may retry with a complete observation.
     ContainmentIncomplete,
+    /// A standalone rustc cache can gain a new independently locked session.
+    /// Whole-root quarantine cannot exclude that session; only guarded direct
+    /// removal can honor the verified entry set. Never fall back to unlink.
+    IncrementalQuarantineUnsupported,
 }
 
 impl SkipReason {
@@ -722,7 +727,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -748,6 +753,7 @@ impl SkipReason {
         Self::CompressionFirst,
         Self::PressureUnavailable,
         Self::ContainmentIncomplete,
+        Self::IncrementalQuarantineUnsupported,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -787,6 +793,7 @@ impl SkipReason {
             Self::CompressionFirst => "compression_first",
             Self::PressureUnavailable => "pressure_unavailable",
             Self::ContainmentIncomplete => "containment_incomplete",
+            Self::IncrementalQuarantineUnsupported => "incremental_quarantine_unsupported",
         }
     }
 
@@ -842,6 +849,10 @@ impl SkipReason {
             Self::ContainmentIncomplete => {
                 "repository/protection containment scan incomplete — retained for safety"
             }
+            Self::IncrementalQuarantineUnsupported => {
+                "standalone rustc incremental caches require guarded direct removal; \
+                 quarantine retained the cache (review with clean --no-quarantine --dry-run)"
+            }
         }
     }
 }
@@ -891,6 +902,7 @@ fn should_backoff_skip(reason: SkipReason) -> bool {
             | SkipReason::PolicyChanged
             | SkipReason::CompressionFirst
             | SkipReason::PressureUnavailable
+            | SkipReason::IncrementalQuarantineUnsupported
     )
 }
 
@@ -1003,15 +1015,18 @@ impl DeletionExecutor {
         let mut refused = Vec::new();
         let mut candidates: Vec<CandidacyScore> = candidates
             .into_iter()
-            .filter_map(
-                |candidate| match eligibility::check(&candidate, &self.config) {
+            .map(incremental::bind_owned)
+            .filter_map(|candidate| {
+                match incremental::check_mode(&candidate, self.config.mode)
+                    .and_then(|()| eligibility::check(&candidate, &self.config))
+                {
                     Ok(()) => Some(candidate),
                     Err(reason) => {
                         refused.push((candidate, reason));
                         None
                     }
-                },
-            )
+                }
+            })
             .collect();
 
         // Sort: unambiguous Delete decisions first, then Review escalations,
@@ -1099,6 +1114,8 @@ impl DeletionExecutor {
                 });
                 break;
             }
+            let bound_candidate = incremental::bind(candidate);
+            let candidate = bound_candidate.as_ref();
             // Avoid asking for work already unnecessary or unobservable. The
             // executor checks again after the answer and before mutation.
             if let Some(reason) = should_skip.and_then(|skip| skip(&candidate.path)) {
@@ -1292,10 +1309,25 @@ impl DeletionExecutor {
                 break;
             }
 
+            let bound_candidate = incremental::bind(candidate);
+            let candidate = bound_candidate.as_ref();
+
             // Dynamic skip check: target free space met, a live protection
             // refusal, or a shutdown. Each is recorded under its own reason.
             if let Some(reason) = should_skip.and_then(|skip| skip(&candidate.path)) {
                 report.record_skip(reason);
+                if should_backoff_skip(reason) {
+                    report.backoff_candidates.push(candidate.clone());
+                }
+                continue;
+            }
+
+            // A public plan can override the executor's default mode. Apply
+            // the cache-specific recoverability rule to the actual plan,
+            // including dry runs, before collecting deletion evidence.
+            if let Err(reason) = incremental::check_mode(candidate, plan.mode) {
+                report.record_skip(reason);
+                consecutive_failures = 0;
                 if should_backoff_skip(reason) {
                     report.backoff_candidates.push(candidate.clone());
                 }
@@ -1385,7 +1417,7 @@ impl DeletionExecutor {
                 }
                 Ok(())
             };
-            let metadata =
+            let (metadata, incremental_guard) =
                 match self.check_before_mutation(candidate, &mut sacred, Some(&renew_authority)) {
                     Ok(metadata) => metadata,
                     Err(reason) => {
@@ -1398,6 +1430,12 @@ impl DeletionExecutor {
                     }
                 };
 
+            if incremental_guard.is_some() && plan.mode == DeletionMode::Quarantine {
+                report.record_skip(SkipReason::IncrementalQuarantineUnsupported);
+                consecutive_failures = 0;
+                continue;
+            }
+
             if self.config.dry_run {
                 report.items_would_delete += 1;
                 report.bytes_would_free =
@@ -1409,8 +1447,10 @@ impl DeletionExecutor {
             // Actual deletion, or quarantine (Layer 7). Quarantine has no
             // successful-unlink outcome: failure cannot widen this plan.
             let outcome = match plan.mode {
-                DeletionMode::Unlink => Self::delete_after_check(candidate, &metadata)
-                    .map(|()| CheckedDeletion::Deleted),
+                DeletionMode::Unlink => {
+                    Self::delete_after_check(candidate, &metadata, incremental_guard.as_ref())
+                        .map(|()| CheckedDeletion::Deleted)
+                }
                 DeletionMode::Quarantine => {
                     self.quarantine_after_check(candidate, &metadata, Some(&renew_authority))
                 }
@@ -1544,6 +1584,11 @@ impl DeletionExecutor {
                 details: "delete_candidate_checked called on a dry-run executor".to_string(),
             });
         }
+        let bound_candidate = incremental::bind(candidate);
+        let candidate = bound_candidate.as_ref();
+        if let Err(reason) = incremental::check_mode(candidate, self.config.mode) {
+            return Ok(CheckedDeletion::Skipped(reason));
+        }
         let mut sacred = SacredScanStats::default();
         if let Err(skip) = self.preflight_check(candidate, open_paths, &mut sacred) {
             return Ok(CheckedDeletion::Skipped(skip));
@@ -1581,6 +1626,7 @@ impl DeletionExecutor {
         candidate: &CandidacyScore,
         open_paths: Option<&HashSet<PathBuf>>,
     ) -> std::result::Result<(), SkipReason> {
+        incremental::check_mode(candidate, self.config.mode)?;
         let mut sacred = SacredScanStats::default();
         self.preflight_check(candidate, open_paths, &mut sacred)
     }
@@ -1774,7 +1820,7 @@ impl DeletionExecutor {
         candidate: &CandidacyScore,
         sacred: &mut SacredScanStats,
         renew_authority: Option<AuthorizationCheck<'_>>,
-    ) -> std::result::Result<fs::Metadata, SkipReason> {
+    ) -> std::result::Result<(fs::Metadata, Option<incremental::Guard>), SkipReason> {
         let path = &candidate.path;
         eligibility::check(candidate, &self.config)?;
         self.config
@@ -1807,6 +1853,9 @@ impl DeletionExecutor {
         // can arise while the recursive checks run. Do not reuse admission's
         // unprotected verdict, even when the inode is unchanged.
         eligibility::check(candidate, &self.config)?;
+        // Unlike the admission probe, these locks survive the entire removal.
+        // New sessions are excluded by the confined traversal's entry guard.
+        let incremental_guard = incremental::acquire(candidate)?;
         // Recheck immediately before mutation. A lease can begin after the
         // earlier preflight, and deleting despite the newly held lock would
         // recreate the exact scan/reap race this protection exists to close.
@@ -1823,10 +1872,13 @@ impl DeletionExecutor {
         if walker::entry_metadata(&before).identity() != walker::entry_metadata(&meta).identity() {
             return Err(SkipReason::IdentityMismatch);
         }
-        Ok(meta)
+        Ok((meta, incremental_guard))
     }
 
-    fn recheck_before_mutation(&self, candidate: &CandidacyScore) -> Result<fs::Metadata> {
+    fn recheck_before_mutation(
+        &self,
+        candidate: &CandidacyScore,
+    ) -> Result<(fs::Metadata, Option<incremental::Guard>)> {
         self.check_before_mutation(candidate, &mut SacredScanStats::default(), None)
             .map_err(|reason| SbhError::SafetyVeto {
                 path: candidate.path.clone(),
@@ -1835,21 +1887,36 @@ impl DeletionExecutor {
     }
 
     fn delete_path(&self, candidate: &CandidacyScore) -> Result<()> {
-        let meta = self.recheck_before_mutation(candidate)?;
-        Self::delete_after_check(candidate, &meta)
+        let (meta, incremental_guard) = self.recheck_before_mutation(candidate)?;
+        Self::delete_after_check(candidate, &meta, incremental_guard.as_ref())
     }
 
-    fn delete_after_check(candidate: &CandidacyScore, metadata: &fs::Metadata) -> Result<()> {
+    fn delete_after_check(
+        candidate: &CandidacyScore,
+        metadata: &fs::Metadata,
+        incremental_guard: Option<&incremental::Guard>,
+    ) -> Result<()> {
         let path = &candidate.path;
         // Reuse the confined quarantine traversal without creating a store or
         // recovery record: emergency removal must work at ENOSPC. The exact
         // metadata just checked remains the expected root identity. Only
         // recognized regenerable caches may widen directory permissions.
-        quarantine::remove_direct(
-            path,
-            metadata,
-            classification_allows_force_remove(&candidate.classification),
-        )
+        if let Some(guard) = incremental_guard {
+            quarantine::remove_direct_guarded(
+                path,
+                metadata,
+                false,
+                &|relative, device, inode, is_directory| {
+                    guard.authorize_entry(relative, device, inode, is_directory)
+                },
+            )
+        } else {
+            quarantine::remove_direct(
+                path,
+                metadata,
+                classification_allows_force_remove(&candidate.classification),
+            )
+        }
         .map_err(|e| SbhError::io(path, e))?;
 
         // Post-deletion verification (symlink_metadata to avoid following dangling symlinks).
@@ -1867,7 +1934,15 @@ impl DeletionExecutor {
     /// authorizes an unlink: a busy store or failed recovery record must not
     /// silently turn a recoverable cleanup into permanent data loss.
     fn quarantine_path(&self, candidate: &CandidacyScore) -> Result<()> {
-        let metadata = self.recheck_before_mutation(candidate)?;
+        let (metadata, incremental_guard) = self.recheck_before_mutation(candidate)?;
+        if incremental_guard.is_some() {
+            return Err(SbhError::SafetyVeto {
+                path: candidate.path.clone(),
+                reason: SkipReason::IncrementalQuarantineUnsupported
+                    .explanation()
+                    .to_string(),
+            });
+        }
         match self.quarantine_after_check(candidate, &metadata, None)? {
             CheckedDeletion::Skipped(reason) => Err(SbhError::SafetyVeto {
                 path: candidate.path.clone(),
@@ -1883,6 +1958,11 @@ impl DeletionExecutor {
         metadata: &fs::Metadata,
         authorize: Option<AuthorizationCheck<'_>>,
     ) -> Result<CheckedDeletion> {
+        // Even private callers arriving after a previously successful
+        // preflight cannot rename a newly recognized incremental root.
+        if let Err(reason) = incremental::check_mode(candidate, DeletionMode::Quarantine) {
+            return Ok(CheckedDeletion::Skipped(reason));
+        }
         let path = &candidate.path;
         let store = QuarantineStore::for_root(&quarantine::quarantine_root_for(
             path,
@@ -3637,6 +3717,9 @@ mod tests {
         assert!(!should_backoff_skip(SkipReason::PolicyChanged));
         assert!(!should_backoff_skip(SkipReason::CompressionFirst));
         assert!(!should_backoff_skip(SkipReason::PressureUnavailable));
+        assert!(!should_backoff_skip(
+            SkipReason::IncrementalQuarantineUnsupported
+        ));
         assert!(!should_backoff_skip(SkipReason::SourceRootDenied));
         assert!(should_backoff_skip(SkipReason::Symlink));
         assert!(!should_backoff_skip(SkipReason::PathGone));
@@ -3675,6 +3758,7 @@ mod tests {
                 SkipReason::CompressionFirst => 22,
                 SkipReason::PressureUnavailable => 23,
                 SkipReason::ContainmentIncomplete => 24,
+                SkipReason::IncrementalQuarantineUnsupported => 25,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];

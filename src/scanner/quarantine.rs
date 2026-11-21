@@ -38,7 +38,7 @@ use budget::PurgeBudget;
 pub(crate) use safety::mount_id as descriptor_mount_id;
 #[cfg(unix)]
 pub(crate) use safety::open_beneath;
-pub(crate) use safety::remove_direct;
+pub(crate) use safety::{remove_direct, remove_direct_guarded};
 
 /// Directory under the mount's `.sbh` that holds quarantined entries.
 pub const QUARANTINE_DIR_NAME: &str = "quarantine";

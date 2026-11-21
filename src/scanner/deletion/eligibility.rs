@@ -102,6 +102,10 @@ fn check_path(candidate: &CandidacyScore, config: &DeletionConfig) -> Result<(),
             check_go_cache(&normalized)?;
         }
     }
+    // A standalone incremental root needs a current structural proof and
+    // idle compiler locks, regardless of a public candidate's supplied label.
+    // This also rejects an incremental label forged onto a regular file.
+    super::incremental::check(candidate)?;
     // Recheck direct/ancestor catalog rules for directories as well as
     // files at the mutation boundary. The protection module resolves exact
     // paths and literal glob prefixes, including operator-configured aliases.

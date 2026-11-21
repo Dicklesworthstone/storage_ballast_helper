@@ -249,6 +249,13 @@ pub fn classify_opaque_tree(
         ));
     }
 
+    // A relocated CARGO_INCREMENTAL root has neither Cargo's target markers
+    // nor a predictable basename. The complete compiler layout and metadata
+    // headers are the evidence; the deletion boundary separately locks it.
+    if let Some(opaque) = classify_rustc_incremental_cache(path) {
+        return Some(opaque);
+    }
+
     // Go toolchain caches (GOCACHE build cache / GOMODCACHE module cache).
     // Detected structurally because on the fleet they sit under arbitrarily
     // named roots in /data/tmp that no name pattern matches. The cheap
@@ -329,6 +336,16 @@ pub fn classify_opaque_tree(
     }
 
     None
+}
+
+fn classify_rustc_incremental_cache(path: &Path) -> Option<OpaqueTreeClassification> {
+    crate::scanner::rustc_incremental::inspect(path)?;
+    Some(OpaqueTreeClassification::candidate(
+        "rustc incremental cache: complete compiler layout and metadata headers",
+        crate::scanner::rustc_incremental::PATTERN_NAME,
+        ArtifactCategory::RustTarget,
+        0.95,
+    ))
 }
 
 /// Chromium browsers on macOS (Chrome, Canary, Edge, Brave, Opera) keep an
@@ -1154,6 +1171,16 @@ impl ArtifactPatternRegistry {
         let normalized = name_os.to_string_lossy().to_lowercase();
         if is_agent_harness_dir_name(&normalized) {
             return ArtifactClassification::unknown();
+        }
+
+        // The legacy walker and direct registry callers need the same
+        // structural rescue as opaque discovery. Source evidence remains a
+        // veto even if a caller supplies signals from an earlier observation.
+        if !signals.has_git
+            && !signals.has_cargo_toml
+            && let Some(opaque) = classify_rustc_incremental_cache(path)
+        {
+            return opaque.classification;
         }
 
         let catalog_classification = cleanup_catalog_path_classification(path, cleanup_rules, home);
@@ -3900,6 +3927,89 @@ mod tests {
         let category = classify_opaque_tree(&root, OpaqueTreeContext::default())
             .map(|o| o.classification.category);
         assert_ne!(category, Some(ArtifactCategory::GoCache));
+    }
+
+    #[cfg(unix)]
+    fn rustc_incremental_fixture() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("arbitrary-build-data");
+        let crate_path = root.join("example-0123456789abc");
+        let session = crate_path.join("s-0123456789-0123456-0123456789abcdefghijklmno");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(crate_path.join("s-0123456789-0123456.lock"), []).unwrap();
+        for name in ["dep-graph.bin", "query-cache.bin", "work-products.bin"] {
+            std::fs::write(session.join(name), b"RSIC\0\0\x04test\x01").unwrap();
+        }
+        std::fs::write(session.join("example.0-cgu.0.o"), b"object").unwrap();
+        (temp, root)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_incremental_cache_is_discovered_without_a_name_or_cargo_context() {
+        let (_temp, root) = rustc_incremental_fixture();
+        let opaque = classify_opaque_tree(&root, OpaqueTreeContext::default()).unwrap();
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
+        assert_eq!(opaque.classification.category, ArtifactCategory::RustTarget);
+        assert_eq!(
+            opaque.classification.pattern_name,
+            crate::scanner::rustc_incremental::PATTERN_NAME
+        );
+        assert_eq!(opaque.classification.structural_confidence, 1.0);
+        let legacy =
+            ArtifactPatternRegistry::default().classify(&root, StructuralSignals::default());
+        assert_eq!(legacy.pattern_name, opaque.classification.pattern_name);
+        assert_eq!(legacy.category, opaque.classification.category);
+        assert_eq!(legacy.structural_confidence, 1.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incremental_names_and_partial_layout_do_not_promote_unknown_data() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in [
+            "incremental",
+            "ee-cargo-incremental",
+            "arbitrary-build-data",
+        ] {
+            let root = temp.path().join(name);
+            std::fs::create_dir_all(root.join("example-0123456789abc")).unwrap();
+            std::fs::write(root.join("important.txt"), b"user data").unwrap();
+            assert!(classify_opaque_tree(&root, OpaqueTreeContext::default()).is_none());
+            let classification =
+                ArtifactPatternRegistry::default().classify(&root, StructuralSignals::default());
+            assert_eq!(classification.category, ArtifactCategory::Unknown, "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incremental_structure_never_overrides_source_signals_or_unknown_children() {
+        let (_temp, root) = rustc_incremental_fixture();
+        let registry = ArtifactPatternRegistry::default();
+        for signals in [
+            StructuralSignals {
+                has_git: true,
+                ..StructuralSignals::default()
+            },
+            StructuralSignals {
+                has_cargo_toml: true,
+                ..StructuralSignals::default()
+            },
+        ] {
+            assert_eq!(
+                registry.classify(&root, signals).category,
+                ArtifactCategory::Unknown
+            );
+        }
+        std::fs::write(root.join("Cargo.toml"), b"[package]\nname = 'source'\n").unwrap();
+        assert!(classify_opaque_tree(&root, OpaqueTreeContext::default()).is_none());
+        assert_eq!(
+            registry
+                .classify(&root, StructuralSignals::default())
+                .category,
+            ArtifactCategory::Unknown
+        );
     }
 
     #[test]

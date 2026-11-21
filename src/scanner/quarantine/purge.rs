@@ -45,6 +45,35 @@ pub fn remove_direct(
     }
 }
 
+/// Remove only entries admitted by the caller's positive inventory.
+///
+/// `guard` receives the path relative to the artifact root (empty for the root),
+/// its device and inode, and whether it is a directory. It is renewed before
+/// descending and immediately before unlinking. An error can leave already
+/// admitted children removed, but never reports the whole artifact as removed.
+/// A concurrent addition is not admitted merely because its parent was.
+/// Guarded removal accepts only regular files and directories; a symlink or
+/// special file cannot inherit a regular file's permission through the boolean.
+pub fn remove_direct_guarded(
+    path: &Path,
+    expected: &std::fs::Metadata,
+    allow_permission_changes: bool,
+    guard: &dyn Fn(&Path, u64, u64, bool) -> io::Result<()>,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        unix::remove_direct_guarded(path, expected, allow_permission_changes, guard)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, expected, allow_permission_changes, guard);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "confined artifact removal requires Unix directory descriptors",
+        ))
+    }
+}
+
 pub(super) fn remove_payload(store: &File, record: &QuarantineRecord) -> io::Result<bool> {
     #[cfg(unix)]
     {
@@ -88,7 +117,7 @@ mod unix {
     use std::io;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    use std::path::{Component, Path};
+    use std::path::{Component, Path, PathBuf};
 
     use rustix::fs::{AtFlags, Dir, FileType, Stat, fstat, statat, unlinkat};
     use rustix::io::Errno;
@@ -99,6 +128,8 @@ mod unix {
     // stack/fd consumption independently of adversarial tree depth. A wide
     // directory is streamed, not collected into an unbounded in-memory plan.
     const MAX_DIRECTORY_DEPTH: usize = 64;
+
+    type EntryGuard<'a> = dyn Fn(&Path, u64, u64, bool) -> io::Result<()> + 'a;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct Identity {
@@ -190,10 +221,57 @@ mod unix {
         remove_direct_with_hook(path, expected, allow_permission_changes, &mut |_, _| {})
     }
 
+    pub(super) fn remove_direct_guarded(
+        path: &Path,
+        expected: &Metadata,
+        allow_permission_changes: bool,
+        guard: &dyn Fn(&Path, u64, u64, bool) -> io::Result<()>,
+    ) -> io::Result<()> {
+        remove_direct_with_guard_and_hook(
+            path,
+            expected,
+            allow_permission_changes,
+            guard,
+            &mut |_, _| {},
+        )
+    }
+
     fn remove_direct_with_hook(
         path: &Path,
         expected: &Metadata,
         allow_permission_changes: bool,
+        hook: &mut impl FnMut(&OsStr, Step),
+    ) -> io::Result<()> {
+        remove_direct_with_optional_guard_and_hook(
+            path,
+            expected,
+            allow_permission_changes,
+            None,
+            hook,
+        )
+    }
+
+    fn remove_direct_with_guard_and_hook(
+        path: &Path,
+        expected: &Metadata,
+        allow_permission_changes: bool,
+        guard: &EntryGuard<'_>,
+        hook: &mut impl FnMut(&OsStr, Step),
+    ) -> io::Result<()> {
+        remove_direct_with_optional_guard_and_hook(
+            path,
+            expected,
+            allow_permission_changes,
+            Some(guard),
+            hook,
+        )
+    }
+
+    fn remove_direct_with_optional_guard_and_hook(
+        path: &Path,
+        expected: &Metadata,
+        allow_permission_changes: bool,
+        guard: Option<&EntryGuard<'_>>,
         hook: &mut impl FnMut(&OsStr, Step),
     ) -> io::Result<()> {
         let expected = Identity::from_metadata(expected)?;
@@ -234,10 +312,12 @@ mod unix {
             &parent,
             name,
             expected,
+            &mut PathBuf::new(),
             0,
             allow_permission_changes,
             &mut PurgeBudget::unlimited(),
             &mut || true,
+            guard,
             hook,
         )? {
             Some(true) => Ok(()),
@@ -320,7 +400,18 @@ mod unix {
                 "quarantine payload identity changed; refusing purge",
             ));
         }
-        let Some(removed) = remove_child(&entry, name, payload, 0, false, budget, gate, hook)?
+        let Some(removed) = remove_child(
+            &entry,
+            name,
+            payload,
+            &mut PathBuf::new(),
+            0,
+            false,
+            budget,
+            gate,
+            None,
+            hook,
+        )?
         else {
             // The manifest remains the recovery anchor. Never finalize a
             // partially removed payload or give it a failed-deletion cooldown.
@@ -333,21 +424,45 @@ mod unix {
         Ok(Some(removed))
     }
 
+    fn authorize_entry(
+        guard: Option<&EntryGuard<'_>>,
+        relative: &Path,
+        expected: Identity,
+    ) -> io::Result<()> {
+        if let Some(guard) = guard {
+            if !matches!(expected.kind, FileType::RegularFile | FileType::Directory) {
+                return Err(invalid(
+                    "guarded removal refuses symlinks and special files",
+                ));
+            }
+            guard(
+                relative,
+                expected.device,
+                expected.inode,
+                expected.kind == FileType::Directory,
+            )?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn remove_child(
         parent: &File,
         name: &OsStr,
         expected: Identity,
+        relative: &mut PathBuf,
         depth: usize,
         allow_permission_changes: bool,
         budget: &mut PurgeBudget,
         gate: &mut impl FnMut() -> bool,
+        guard: Option<&EntryGuard<'_>>,
         hook: &mut impl FnMut(&OsStr, Step),
     ) -> io::Result<Option<bool>> {
         if !budget.take() {
             return Ok(None);
         }
         hook(name, Step::Inspected);
+        authorize_entry(guard, relative, expected)?;
         if expected.kind == FileType::Directory {
             if depth >= MAX_DIRECTORY_DEPTH {
                 return Err(invalid("quarantine purge directory depth limit reached"));
@@ -391,18 +506,27 @@ mod unix {
                 if identity.device != expected.device {
                     return Err(invalid("quarantine purge refuses a nested filesystem"));
                 }
-                if remove_child(
+                // Ordinary direct removals and recovery purges do not need a
+                // relative inventory path or an indirect policy call per entry.
+                if guard.is_some() {
+                    relative.push(child_name);
+                }
+                let removed = remove_child(
                     &directory,
                     child_name,
                     identity,
+                    relative,
                     depth + 1,
                     allow_permission_changes,
                     budget,
                     gate,
+                    guard,
                     hook,
-                )?
-                .is_none()
-                {
+                );
+                if guard.is_some() {
+                    relative.pop();
+                }
+                if removed?.is_none() {
                     return Ok(None);
                 }
             }
@@ -414,6 +538,7 @@ mod unix {
         if !gate() {
             return Ok(None);
         }
+        authorize_entry(guard, relative, expected)?;
         // Capacity and policy checks may block. Revalidate the admitted child
         // after that boundary so a replacement cannot inherit this unlink.
         if !same_child(parent, name, expected)? {
@@ -452,6 +577,269 @@ mod unix {
                 .quarantine(&source, id, 100, Duration::ZERO, None)
                 .unwrap();
             (store, record)
+        }
+
+        fn direct_inventory(
+            root: &Path,
+            paths: &[&str],
+        ) -> impl Fn(&Path, u64, u64, bool) -> io::Result<()> {
+            let entries: std::collections::BTreeMap<_, _> = paths
+                .iter()
+                .map(|relative| {
+                    let metadata = fs::symlink_metadata(root.join(relative)).unwrap();
+                    (
+                        PathBuf::from(relative),
+                        (metadata.dev(), metadata.ino(), metadata.is_dir()),
+                    )
+                })
+                .collect();
+            move |relative, device, inode, is_directory| {
+                if entries.get(relative) == Some(&(device, inode, is_directory)) {
+                    Ok(())
+                } else {
+                    Err(invalid("entry is absent from the approved inventory"))
+                }
+            }
+        }
+
+        #[test]
+        fn guarded_direct_removal_removes_the_complete_approved_tree() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("cache");
+            fs::create_dir_all(root.join("crate/session")).unwrap();
+            fs::write(root.join("crate/session/payload"), b"cached object").unwrap();
+            fs::write(root.join("crate/session.lock"), b"").unwrap();
+            let guard = direct_inventory(
+                &root,
+                &[
+                    "",
+                    "crate",
+                    "crate/session",
+                    "crate/session/payload",
+                    "crate/session.lock",
+                ],
+            );
+
+            super::super::remove_direct_guarded(
+                &root,
+                &fs::symlink_metadata(&root).unwrap(),
+                false,
+                &guard,
+            )
+            .unwrap();
+
+            assert!(!root.exists());
+            assert!(!temp.path().join(".sbh").exists());
+        }
+
+        #[test]
+        fn guarded_direct_removal_keeps_a_new_session_after_inventory() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("cache");
+            fs::create_dir_all(root.join("crate/old-session")).unwrap();
+            fs::write(root.join("crate/old-session/payload"), b"idle object").unwrap();
+            let guard = direct_inventory(
+                &root,
+                &[
+                    "",
+                    "crate",
+                    "crate/old-session",
+                    "crate/old-session/payload",
+                ],
+            );
+            let expected = fs::symlink_metadata(&root).unwrap();
+            let live_session = root.join("crate/new-session");
+            let mut fired = false;
+            let result = remove_direct_with_guard_and_hook(
+                &root,
+                &expected,
+                false,
+                &guard,
+                &mut |name, step| {
+                    if name == "crate" && step == Step::Opened && !fired {
+                        fired = true;
+                        fs::create_dir(&live_session).unwrap();
+                        fs::write(live_session.join("payload"), b"live compiler output").unwrap();
+                    }
+                },
+            );
+
+            assert!(fired);
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                fs::read(live_session.join("payload")).unwrap(),
+                b"live compiler output"
+            );
+            assert!(root.is_dir());
+        }
+
+        #[test]
+        fn guarded_direct_removal_rejects_a_replacement_from_a_fresh_listing() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("cache");
+            fs::create_dir_all(root.join("session")).unwrap();
+            let payload = root.join("session/payload");
+            fs::write(&payload, b"approved object").unwrap();
+            let guard = direct_inventory(&root, &["", "session", "session/payload"]);
+            let saved = temp.path().join("saved-object");
+            let expected = fs::symlink_metadata(&root).unwrap();
+            let mut fired = false;
+            let result = remove_direct_with_guard_and_hook(
+                &root,
+                &expected,
+                false,
+                &guard,
+                &mut |name, step| {
+                    if name == "session" && step == Step::Opened && !fired {
+                        fired = true;
+                        fs::rename(&payload, &saved).unwrap();
+                        fs::write(&payload, b"unapproved replacement").unwrap();
+                    }
+                },
+            );
+
+            assert!(fired);
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::read(saved).unwrap(), b"approved object");
+            assert_eq!(fs::read(payload).unwrap(), b"unapproved replacement");
+        }
+
+        #[test]
+        fn guarded_direct_removal_refuses_an_unlisted_hardlink_name() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("cache");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("approved"), b"shared object").unwrap();
+            let guard = direct_inventory(&root, &["", "approved"]);
+            let expected = fs::symlink_metadata(&root).unwrap();
+            let newcomer = root.join("newcomer");
+            let mut fired = false;
+            let result = remove_direct_with_guard_and_hook(
+                &root,
+                &expected,
+                false,
+                &guard,
+                &mut |name, step| {
+                    if name == "cache" && step == Step::Opened && !fired {
+                        fired = true;
+                        fs::hard_link(root.join("approved"), &newcomer).unwrap();
+                    }
+                },
+            );
+
+            assert!(fired);
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::read(newcomer).unwrap(), b"shared object");
+        }
+
+        #[test]
+        fn guarded_direct_removal_rejects_special_files_even_with_a_permissive_guard() {
+            for kind in ["symlink", "fifo", "socket"] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("cache");
+                fs::create_dir(&root).unwrap();
+                let sentinel = temp.path().join("sentinel");
+                fs::write(&sentinel, b"outside bytes").unwrap();
+                let special = root.join("special");
+                let _listener = match kind {
+                    "symlink" => {
+                        symlink(&sentinel, &special).unwrap();
+                        None
+                    }
+                    "fifo" => {
+                        nix::unistd::mkfifo(&special, nix::sys::stat::Mode::S_IRUSR).unwrap();
+                        None
+                    }
+                    "socket" => Some(std::os::unix::net::UnixListener::bind(&special).unwrap()),
+                    _ => unreachable!(),
+                };
+                let observed_special = std::cell::Cell::new(false);
+                let result = remove_direct_guarded(
+                    &root,
+                    &fs::symlink_metadata(&root).unwrap(),
+                    false,
+                    &|relative, _, _, _| {
+                        if relative == Path::new("special") {
+                            observed_special.set(true);
+                        }
+                        Ok(())
+                    },
+                );
+
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+                assert!(
+                    !observed_special.get(),
+                    "{kind} must not be offered as a file"
+                );
+                assert!(fs::symlink_metadata(special).is_ok(), "{kind} was removed");
+                assert_eq!(fs::read(sentinel).unwrap(), b"outside bytes");
+            }
+        }
+
+        #[test]
+        fn guarded_direct_removal_renews_entry_permission_before_unlink() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("cache");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("payload"), b"permission revoked").unwrap();
+            let inventory = direct_inventory(&root, &["", "payload"]);
+            let admitted = std::cell::Cell::new(true);
+            let guard = |relative: &Path, device, inode, is_directory| {
+                inventory(relative, device, inode, is_directory)?;
+                if admitted.get() {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "revoked"))
+                }
+            };
+            let result = remove_direct_with_guard_and_hook(
+                &root,
+                &fs::symlink_metadata(&root).unwrap(),
+                false,
+                &guard,
+                &mut |name, step| {
+                    if name == "payload" && step == Step::BeforeUnlink {
+                        admitted.set(false);
+                    }
+                },
+            );
+
+            assert!(!admitted.get());
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                fs::read(root.join("payload")).unwrap(),
+                b"permission revoked"
+            );
+        }
+
+        #[test]
+        fn guarded_direct_removal_rechecks_identity_after_the_final_guard() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("cache");
+            fs::create_dir(&root).unwrap();
+            let payload = root.join("payload");
+            fs::write(&payload, b"original").unwrap();
+            let inventory = direct_inventory(&root, &["", "payload"]);
+            let saved = temp.path().join("saved-object");
+            let checks = std::cell::Cell::new(0);
+            let guard = |relative: &Path, device, inode, is_directory| {
+                inventory(relative, device, inode, is_directory)?;
+                if relative == Path::new("payload") {
+                    checks.set(checks.get() + 1);
+                    if checks.get() == 2 {
+                        fs::rename(&payload, &saved).unwrap();
+                        fs::write(&payload, b"replacement").unwrap();
+                    }
+                }
+                Ok(())
+            };
+            let result =
+                remove_direct_guarded(&root, &fs::symlink_metadata(&root).unwrap(), false, &guard);
+
+            assert_eq!(checks.get(), 2);
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::read(saved).unwrap(), b"original");
+            assert_eq!(fs::read(payload).unwrap(), b"replacement");
         }
 
         #[test]

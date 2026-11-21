@@ -127,6 +127,9 @@ pub fn classify_certainty(
         || rust_markers >= 2
         || (classification.category == ArtifactCategory::GoCache
             && classification.structural_confidence >= 0.9)
+        || (classification.category == ArtifactCategory::RustTarget
+            && pattern == crate::scanner::rustc_incremental::PATTERN_NAME
+            && classification.structural_confidence >= 0.9)
         || (classification.category == ArtifactCategory::NodeModules && in_temp_root)
         || pattern == "xcode-derived-data"
         // A copy of an installed app, made again at every launch.
@@ -3549,6 +3552,35 @@ mod tests {
                 temp_root
             ),
             ArtifactCertainty::Definite
+        );
+        // A standalone rustc cache has no Cargo target markers. Its complete
+        // layout/header proof supplies the structural evidence instead.
+        assert_eq!(
+            classify_certainty(
+                &classification(
+                    ArtifactCategory::RustTarget,
+                    crate::scanner::rustc_incremental::PATTERN_NAME,
+                    0.95,
+                    1.0
+                ),
+                StructuralSignals::default(),
+                projects
+            ),
+            ArtifactCertainty::Definite
+        );
+        // A name-only/custom label cannot claim that structural proof.
+        assert_eq!(
+            classify_certainty(
+                &classification(
+                    ArtifactCategory::RustTarget,
+                    crate::scanner::rustc_incremental::PATTERN_NAME,
+                    0.95,
+                    0.0
+                ),
+                StructuralSignals::default(),
+                projects
+            ),
+            ArtifactCertainty::Unclear
         );
         // Likely: confident name plus one marker; recognized category in a temp root.
         let one_marker = StructuralSignals {
