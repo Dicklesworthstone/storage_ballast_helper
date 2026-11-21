@@ -13,6 +13,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   newest modification time now follows the candidate through daemon pre-scans,
   index replay, both scanner modes, and CLI scoring. A later bounded sample
   cannot make a large recently used cache appear old enough for cleanup.
+- **Predictive protection continues across mixed-pressure volumes** (bd-4etu).
+  A pressured peer no longer suppresses a Green filesystem's own forecast
+  cleanup or imminent-danger ballast release. Controller scans carry their
+  scoped predictive score permission without queueing a duplicate plain pass;
+  fallback recovery remains per mount and respects recovery holds and backoff.
 - **A stop during startup is an orderly stop** (bd-jg93). `sbh update`
   restarts a loaded service itself, so a `systemctl restart` right after it
   stopped the new daemon while its first filesystem observations were still

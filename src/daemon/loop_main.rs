@@ -8772,8 +8772,9 @@ impl MonitoringDaemon {
     /// Drive every mount from its own reading through its `MountController`
     /// and return the tick the daemon should sleep for.
     ///
-    /// `response` is still the worst mount's reading; it gates the Green
-    /// safety net. Everything per mount, including FallbackSafe recovery scans,
+    /// `response` is still the worst mount's reading. A mixed-pressure tick
+    /// must also run the Green safety net for its own eligible mounts.
+    /// Everything per mount, including FallbackSafe recovery scans,
     /// (scan dispatch, ballast release and replenish, observe-only reporting)
     /// comes from `self.mount_responses`. The returned tick is the tightest
     /// cadence among mounts sbh is working on: a pressured mount it cannot
@@ -8879,6 +8880,7 @@ impl MonitoringDaemon {
                 .any(|tick| &tick.response.causing_mount == mount)
         });
         let mut pending_scans = Vec::new();
+        let mut ballast_release_attempted = HashSet::new();
         let mut cadence = Vec::with_capacity(responses.len());
         let mut replenish_mounts = HashMap::new();
         let mut refill_refused = HashSet::new();
@@ -9116,7 +9118,14 @@ impl MonitoringDaemon {
             match decision.state {
                 MountState::Reclaim => {
                     if decision.release_ballast && release_here {
-                        files_released = self.release_ballast(&mount, &tick.response).unwrap_or(0);
+                        ballast_release_attempted.insert(mount.clone());
+                        let release_response = if predictive_cleanup_mount(tick).is_some() {
+                            &tick.filesystem_response
+                        } else {
+                            &tick.response
+                        };
+                        files_released =
+                            self.release_ballast(&mount, release_response).unwrap_or(0);
                         self.last_tick_cleanup_ran = true;
                     }
                     if decision.scan && scan_allowed {
@@ -9285,6 +9294,7 @@ impl MonitoringDaemon {
             let policy = self.policy_engine.lock();
             (policy.mode(), policy.transitions_total())
         };
+        let in_fallback = policy_mode == ActiveMode::FallbackSafe;
         self.quarantine_sweeper.observe(
             &responses,
             &root_mounts,
@@ -9339,6 +9349,7 @@ impl MonitoringDaemon {
 
         self.quarantine_sweeper
             .start(QuarantineSweepContext::new(self), Instant::now(), false);
+        let mut green_scan_attempted = HashSet::new();
         for (response, paths, catalog, ram_reclaim, inode_reclaim) in pending_scans {
             if self
                 .quarantine_sweeper
@@ -9358,14 +9369,36 @@ impl MonitoringDaemon {
             if let Some(catalog) = catalog {
                 self.send_catalog_scan_request(scan_tx, scan_rx, response, catalog);
             } else {
-                self.send_scan_request(
-                    scan_tx,
-                    scan_rx,
-                    response,
-                    &paths,
-                    ram_reclaim,
-                    inode_reclaim,
-                );
+                let green_tick = responses.iter().find(|tick| {
+                    tick.response.causing_mount == response.causing_mount
+                        && tick.response.level == PressureLevel::Green
+                        && tick.filesystem_response.level == PressureLevel::Green
+                        && tick.ram_reclaim.is_none()
+                        && tick.inode_reclaim.is_none()
+                });
+                if green_tick.is_some() {
+                    green_scan_attempted.insert(response.causing_mount.clone());
+                }
+                // A confident Green forecast already puts its controller in
+                // Reclaim. Carry that forecast's scoped score permission on
+                // this pass instead of filling the bounded queue with an
+                // ordinary pass before the predictive safety net can run.
+                // A collapsed/unsupported forecast may not admit a relaxed
+                // score; its controller still gets the ordinary safe pass.
+                let predicted = !in_fallback
+                    && green_tick.is_some_and(|tick| {
+                        self.send_predictive_scan_request(scan_tx, scan_rx, tick, &paths)
+                    });
+                if !predicted {
+                    self.send_scan_request(
+                        scan_tx,
+                        scan_rx,
+                        response,
+                        &paths,
+                        ram_reclaim,
+                        inode_reclaim,
+                    );
+                }
             }
             self.last_tick_cleanup_ran = true;
         }
@@ -9455,9 +9488,13 @@ impl MonitoringDaemon {
 
         // Green predictive work belongs to each mount's current policy action
         // and physical reading. The worst response and last_predictive_action
-        // may name different mounts; neither grants cleanup on a peer's roots.
-        if response.level == PressureLevel::Green {
-            let in_fallback = self.policy_engine.lock().mode() == ActiveMode::FallbackSafe;
+        // may name different mounts; neither grants cleanup on a peer's roots
+        // nor suppresses it because an unrelated filesystem is pressured.
+        if response.level == PressureLevel::Green
+            || responses
+                .iter()
+                .any(|tick| tick.response.level == PressureLevel::Green)
+        {
             let mut predictive_cleanup = false;
             for tick in &responses {
                 let Some(mount) = predictive_cleanup_mount(tick) else {
@@ -9465,13 +9502,26 @@ impl MonitoringDaemon {
                 };
                 let physical = &tick.filesystem_response;
                 predictive_cleanup = true;
-                if tick.predictive_action.should_release_ballast() && tick.imminent_danger {
+                if tick.predictive_action.should_release_ballast()
+                    && tick.imminent_danger
+                    && !ballast_release_attempted.contains(mount)
+                {
                     let _ = self.release_ballast(mount, physical);
                     self.last_tick_cleanup_ran = true;
                 }
-                // FallbackSafe retains its existing recovery scan below;
-                // do not enqueue a second predictive pass over the same roots.
-                if scan_allowed && !in_fallback {
+                // A Reclaim controller may have queued its predictive pass
+                // already. FallbackSafe uses the recovery pass below; neither
+                // path may bypass a mount's recovery hold or empty-pass backoff.
+                if scan_allowed
+                    && !in_fallback
+                    && !green_scan_attempted.contains(mount)
+                    && self.mount_controllers.get(mount).is_some_and(|controller| {
+                        matches!(
+                            controller.state(),
+                            MountState::Maintain | MountState::Reclaim
+                        )
+                    })
+                {
                     let paths: Vec<PathBuf> = root_mounts
                         .iter()
                         .filter(|(_, root_mount)| root_mount.as_deref() == Some(mount))
@@ -9492,6 +9542,16 @@ impl MonitoringDaemon {
                     .filter(|tick| {
                         tick.response.level == PressureLevel::Green
                             && tick.filesystem_response.level == PressureLevel::Green
+                            && !green_scan_attempted.contains(&tick.response.causing_mount)
+                            && self
+                                .mount_controllers
+                                .get(&tick.response.causing_mount)
+                                .is_some_and(|controller| {
+                                    matches!(
+                                        controller.state(),
+                                        MountState::Maintain | MountState::Reclaim
+                                    )
+                                })
                     })
                     .collect();
                 recovery_ticks.sort_by(|left, right| {
@@ -20290,6 +20350,154 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn green_predictive_scans_survive_a_pressured_peer_without_duplicate_plain_passes() {
+        for peer_level in [
+            PressureLevel::Yellow,
+            PressureLevel::Orange,
+            PressureLevel::Red,
+            PressureLevel::Critical,
+        ] {
+            for observe_only in [false, true] {
+                let (mut fixture, [steady, filling, _]) = green_predictive_fixture();
+                let peer = if observe_only {
+                    fixture.directory.path().join("uncovered-peer")
+                } else {
+                    steady.clone()
+                };
+                let daemon = &mut fixture.daemon;
+                daemon.config.scanner.quarantine_enabled = false;
+                let worst = quarantine_tick(peer_level, &peer);
+                let mut forecast = green_predictive_tick(&filling);
+                forecast.prediction_confident = true;
+                forecast.seconds_to_red = Some(5.0 * 60.0);
+                daemon.update_behavior_mode(
+                    MemoryPressureLevel::Normal,
+                    peer_level,
+                    "startup",
+                    Duration::ZERO,
+                );
+                daemon.mount_responses = vec![worst.clone(), forecast];
+                // The production queue holds two requests. An ordinary pass
+                // for the Green mount must not take its own predictive slot.
+                let (scan_tx, scan_rx) = bounded(SCANNER_CHANNEL_CAP);
+                let (del_tx, _del_rx) = bounded(2);
+                daemon.handle_pressure(&worst.response, &scan_tx, &scan_rx, &del_tx);
+                let scans: Vec<_> = scan_rx.try_iter().collect();
+                assert_eq!(scans.len(), if observe_only { 1 } else { 2 });
+                let predicted: Vec<_> = scans
+                    .iter()
+                    .filter(|scan| scan.paths == vec![filling.join("project")])
+                    .collect();
+                assert_eq!(
+                    predicted.len(),
+                    1,
+                    "{peer_level:?}, observe_only={observe_only}"
+                );
+                let request = predicted[0];
+                assert_eq!(request.pressure_level, PressureLevel::Green);
+                assert_eq!(request.free_pct, Some(50.0));
+                let admission = request.predictive_reclaim.as_ref().unwrap();
+                assert_eq!(admission.mount(), filling.as_path());
+                assert_eq!(admission.min_score(), 0.1);
+                assert!(
+                    request
+                        .authorize_predictive(&daemon.shared_executor_config, Instant::now())
+                        .is_ok()
+                );
+                assert_eq!(daemon.shared_executor_config.min_score(), 0.85);
+                if observe_only {
+                    assert_eq!(
+                        daemon.mount_controllers[&peer].state(),
+                        MountState::ObserveOnly
+                    );
+                } else {
+                    assert!(scans.iter().any(|scan| {
+                        scan.paths == vec![steady.join("project")]
+                            && scan.pressure_level == peer_level
+                            && scan.predictive_reclaim.is_none()
+                    }));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn green_predictive_controller_keeps_a_safe_pass_for_an_unknown_runway() {
+        let (mut fixture, [_, filling, _]) = green_predictive_fixture();
+        let daemon = &mut fixture.daemon;
+        let mut tick = green_predictive_tick(&filling);
+        tick.prediction_confident = true;
+        tick.seconds_to_red = Some(0.0);
+        tick.imminent_danger = true;
+        tick.predictive_action = PredictiveAction::ImminentDanger {
+            mount: filling.clone(),
+            minutes_remaining: 0.0,
+            critical: true,
+        };
+        daemon.mount_responses = vec![tick.clone()];
+        let (scan_tx, scan_rx) = bounded(SCANNER_CHANNEL_CAP);
+        let (del_tx, _del_rx) = bounded(2);
+        daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+        let request = scan_rx
+            .try_recv()
+            .expect("the controller keeps its safe pass");
+        assert_eq!(request.paths, vec![filling.join("project")]);
+        assert_eq!(request.pressure_level, PressureLevel::Green);
+        assert!(request.predictive_reclaim.is_none());
+        assert_eq!(
+            request
+                .scoring_config(
+                    &daemon.config.scoring,
+                    &daemon.shared_executor_config,
+                    Instant::now(),
+                )
+                .unwrap()
+                .min_score,
+            daemon.config.scoring.min_score,
+        );
+        assert!(scan_rx.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn green_predictive_defers_to_a_full_critical_queue_then_retries() {
+        let (mut fixture, [pressured, filling, _]) = green_predictive_fixture();
+        let daemon = &mut fixture.daemon;
+        daemon.config.scanner.quarantine_enabled = false;
+        let worst = quarantine_tick(PressureLevel::Critical, &pressured);
+        let mut forecast = green_predictive_tick(&filling);
+        forecast.prediction_confident = true;
+        forecast.seconds_to_red = Some(5.0 * 60.0);
+        daemon.mount_responses = vec![worst.clone(), forecast.clone()];
+        let (scan_tx, scan_rx) = bounded(1);
+        let (del_tx, _del_rx) = bounded(2);
+        daemon.handle_pressure(&worst.response, &scan_tx, &scan_rx, &del_tx);
+        let urgent = scan_rx.try_recv().unwrap();
+        assert_eq!(urgent.pressure_level, PressureLevel::Critical);
+        assert_eq!(urgent.paths, vec![pressured.join("project")]);
+        assert!(scan_rx.is_empty());
+        assert!(!daemon.last_scan_admission.contains_key(&filling));
+
+        // The pressured pass has finished and reported no remaining work.
+        // Its backoff frees the queue for the still-current Green forecast.
+        daemon
+            .mount_controllers
+            .get_mut(&pressured)
+            .unwrap()
+            .note_pass(0, false, Instant::now());
+        daemon.mount_responses = vec![worst.clone(), forecast];
+        daemon.handle_pressure(&worst.response, &scan_tx, &scan_rx, &del_tx);
+        let predicted = scan_rx
+            .try_recv()
+            .expect("deferred forecast retries next tick");
+        assert_eq!(predicted.paths, vec![filling.join("project")]);
+        assert!(predicted.predictive_reclaim.is_some());
+        assert!(scan_rx.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn green_predictive_scans_require_current_cleanup_action_and_observed_scope() {
         for case in [
             "early-warning",
@@ -20532,6 +20740,165 @@ mod tests {
             }
             assert_eq!(daemon.shared_executor_config.min_score(), 0.85);
             assert_eq!(daemon.last_tick_cleanup_ran, predicted);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn green_predictive_fallback_recovers_each_mount_beside_a_critical_peer() {
+        for predicted in [false, true] {
+            let (mut fixture, [pressured, first, second]) = green_predictive_fixture();
+            let daemon = &mut fixture.daemon;
+            daemon.config.scanner.quarantine_enabled = false;
+            *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+                initial_mode: ActiveMode::FallbackSafe,
+                ..PolicyConfig::default()
+            });
+            let worst = quarantine_tick(PressureLevel::Critical, &pressured);
+            let mut ticks = vec![worst.clone()];
+            for mount in [&first, &second] {
+                let mut tick = green_predictive_tick(mount);
+                if predicted {
+                    tick.prediction_confident = true;
+                    tick.seconds_to_red = Some(5.0 * 60.0);
+                } else {
+                    tick.predictive_action = PredictiveAction::Clear;
+                }
+                ticks.push(tick);
+            }
+            daemon.mount_responses = ticks;
+            let (scan_tx, scan_rx) = bounded(8);
+            let (del_tx, _del_rx) = bounded(2);
+            daemon.handle_pressure(&worst.response, &scan_tx, &scan_rx, &del_tx);
+            let scans: Vec<_> = scan_rx.try_iter().collect();
+            assert_eq!(scans.len(), 3, "predicted={predicted}");
+            for mount in [&pressured, &first, &second] {
+                let matching: Vec<_> = scans
+                    .iter()
+                    .filter(|scan| scan.paths == vec![mount.join("project")])
+                    .collect();
+                assert_eq!(
+                    matching.len(),
+                    1,
+                    "{} predicted={predicted}",
+                    mount.display()
+                );
+                assert!(matching[0].predictive_reclaim.is_none());
+                assert_eq!(
+                    matching[0].filesystem_reclaim.as_ref().unwrap().mount(),
+                    mount.as_path(),
+                );
+            }
+            assert_eq!(daemon.shared_executor_config.min_score(), 0.85);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn green_predictive_scans_respect_mount_recovery_and_empty_pass_backoff() {
+        for in_fallback in [false, true] {
+            for recovery in [false, true] {
+                let (mut fixture, [peer, filling, _]) = green_predictive_fixture();
+                let daemon = &mut fixture.daemon;
+                daemon.config.scanner.quarantine_enabled = false;
+                if in_fallback {
+                    *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+                        initial_mode: ActiveMode::FallbackSafe,
+                        ..PolicyConfig::default()
+                    });
+                }
+                let worst = quarantine_tick(PressureLevel::Critical, &peer);
+                let mut tick = green_predictive_tick(&filling);
+                tick.prediction_confident = true;
+                tick.seconds_to_red = Some(5.0 * 60.0);
+                let (scan_tx, scan_rx) = bounded(8);
+                let (del_tx, _del_rx) = bounded(2);
+                daemon.mount_responses = vec![worst.clone(), tick.clone()];
+                daemon.handle_pressure(&worst.response, &scan_tx, &scan_rx, &del_tx);
+                let _: Vec<_> = scan_rx.try_iter().collect();
+                if recovery {
+                    daemon.pending_recovery.insert(filling.clone());
+                } else {
+                    let transition = daemon
+                        .mount_controllers
+                        .get_mut(&filling)
+                        .unwrap()
+                        .note_pass(0, false, Instant::now());
+                    assert_eq!(transition, Some((MountState::Reclaim, MountState::Idle)));
+                }
+                daemon.mount_responses = vec![worst.clone(), tick];
+                daemon.handle_pressure(&worst.response, &scan_tx, &scan_rx, &del_tx);
+                assert_eq!(
+                    daemon.mount_controllers[&filling].state(),
+                    if recovery {
+                        MountState::Recovery
+                    } else {
+                        MountState::Idle
+                    },
+                );
+                assert!(
+                    scan_rx
+                        .try_iter()
+                        .all(|scan| !scan.paths.contains(&filling.join("project"))),
+                    "in_fallback={in_fallback}, recovery={recovery}: no scan may bypass the controller",
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn green_predictive_ballast_uses_its_own_response_beside_a_pressured_peer() {
+        for peer_level in [
+            PressureLevel::Yellow,
+            PressureLevel::Orange,
+            PressureLevel::Critical,
+        ] {
+            let (mut fixture, [pressured, filling, steady]) = green_predictive_fixture();
+            let daemon = &mut fixture.daemon;
+            daemon.config.scanner.quarantine_enabled = false;
+            daemon.ballast_coordinator.set_provision_floor(0.0);
+            let provisioned = daemon
+                .ballast_coordinator
+                .provision_all(daemon.platform.as_ref())
+                .unwrap();
+            assert_eq!(provisioned.total_files_created(), 6);
+            daemon.update_behavior_mode(
+                MemoryPressureLevel::Normal,
+                peer_level,
+                "startup",
+                Duration::ZERO,
+            );
+            let worst = quarantine_tick(peer_level, &pressured);
+            let mut tick = green_predictive_tick(&filling);
+            tick.prediction_confident = true;
+            tick.seconds_to_red = Some(60.0);
+            tick.imminent_danger = true;
+            tick.predictive_action = PredictiveAction::ImminentDanger {
+                mount: filling.clone(),
+                minutes_remaining: 3.0,
+                critical: false,
+            };
+            tick.filesystem_response.urgency = 0.35;
+            tick.filesystem_response.release_ballast_files = 1;
+            // A summary's urgency must not replace the physical response.
+            tick.response.urgency = 0.95;
+            daemon.mount_responses = vec![worst.clone(), tick];
+            let (scan_tx, scan_rx) = bounded(8);
+            let (del_tx, _del_rx) = bounded(2);
+            daemon.handle_pressure(&worst.response, &scan_tx, &scan_rx, &del_tx);
+            for (mount, expected) in [(&filling, 1), (&steady, 2)] {
+                assert_eq!(
+                    daemon
+                        .ballast_coordinator
+                        .pool_for_mount(mount)
+                        .unwrap()
+                        .available_count(),
+                    expected,
+                    "{peer_level:?}: {} keeps its own release budget",
+                    mount.display(),
+                );
+            }
         }
     }
 
