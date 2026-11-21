@@ -8,6 +8,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **A sustained writer keeps protection as exhaustion approaches** (bd-hosd).
+  Crossing into the immediate forecast no longer discards measured consumption
+  and lets an older, slower burst median cancel cleanup or ballast rescue.
+  The fast rate must agree with the measured windows before receiving that
+  corroboration, so a short allocation spike cannot borrow a slow writer's proof.
 - **Fresh compiler caches retain their complete idleness evidence** (bd-homj).
   Standalone rustc incremental-cache recognition inspects every member; its
   newest modification time now follows the candidate through daemon pre-scans,

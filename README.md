@@ -1204,12 +1204,16 @@ allocations, and faster polling does not shorten that observation window. A new
 writer, recovery, or stopped writer replaces the old rate after three consecutive
 twenty-second windows agree. During warmup, after a collection gap, or when the
 immediate estimate puts a pressure boundary within five minutes, the projection
-keeps the immediate EWMA response. These projections retain the normal confidence
-and sample gates; the long-window evidence applies at any free-space percentage.
+keeps at least the immediate EWMA response. When that rate agrees with the
+measured windows, a confirmed writer retains its corroboration as the boundary
+approaches, so an older, slower burst median cannot cancel cleanup or ballast
+rescue. A spike outside their agreement bound keeps the existing predictive
+burst checks. These projections retain the normal confidence and sample gates;
+the measured evidence applies at any free-space percentage.
 
-`state.json` keeps the immediate rate in `bytes_per_sec` and publishes the measured
-projection rate separately as `forecast_rate_bytes_per_sec` when that history is
-in use. Human status names both rates, and forecast log lines include
+`state.json` keeps the immediate rate in `bytes_per_sec` and publishes the
+corroborated projection rate separately as `forecast_rate_bytes_per_sec` when
+that history is in use. Human status names both rates, and forecast log lines include
 `forecast_rate`. A nonpositive projection rate means no finite exhaustion forecast.
 
 A confidence metric combines sample count adequacy (`50%` weight), residual tracking (`20%` weight), and prediction stability (`30%` weight). When confidence drops below `0.2` or fewer than <!-- claim:constants.ewma.ewma_min_samples -->3<!-- /claim --> samples exist, the estimator enters fallback mode and reports uncertainty rather than potentially misleading predictions.

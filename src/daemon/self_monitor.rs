@@ -912,8 +912,9 @@ pub fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
 pub struct MountRateState {
     /// Net fill rate; negative means the mount is recovering.
     pub bytes_per_sec: f64,
-    /// Signed net rate from the longer observation window used for a distant
-    /// forecast. Absent when the immediate EWMA supplies the projection.
+    /// Projection rate corroborated by measured net consumption. At an
+    /// imminent boundary, a confirmed writer retains at least the immediate
+    /// EWMA rate when it agrees with the measured windows; otherwise absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forecast_rate_bytes_per_sec: Option<f64>,
     /// Change in the fill rate.

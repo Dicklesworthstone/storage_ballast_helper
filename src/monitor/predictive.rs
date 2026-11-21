@@ -240,12 +240,13 @@ impl PredictiveActionPolicy {
             return PredictiveAction::Clear;
         }
 
-        // A distant forecast backed by elapsed-time, signed net consumption
+        // A forecast corroborated by elapsed-time, signed net consumption
         // already spans allocation/freeing bursts. Percentage heuristics and
         // the median of absolute instantaneous rates are weaker evidence and
         // must not veto it, especially on a large disk with little percent
-        // free. The estimator leaves this field absent during warmup and when
-        // an imminent boundary needs the immediate EWMA response.
+        // free. This includes a confirmed new writer approaching an imminent
+        // boundary; the old median must not cancel its cleanup or ballast
+        // rescue. The field stays absent during warmup and unconfirmed spikes.
         if let Some(rate) = estimate.forecast_rate_bytes_per_second {
             if rate <= 0.0 {
                 return PredictiveAction::Clear;

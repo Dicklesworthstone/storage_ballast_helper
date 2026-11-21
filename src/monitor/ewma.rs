@@ -65,10 +65,12 @@ impl BurstState {
 #[derive(Debug, Clone)]
 pub struct RateEstimate {
     pub bytes_per_second: f64,
-    /// Signed net consumption measured over elapsed time when a distant
-    /// forecast uses a longer observation window. `None` means the immediate
-    /// EWMA supplies the projection (warmup or an imminent boundary).
-    /// Unlike the burst median, this evidence includes space freed by builds.
+    /// Projection rate corroborated by elapsed-time net consumption. Distant
+    /// forecasts use the measured trend; at an imminent boundary a confirmed
+    /// writer retains at least the immediate EWMA rate when it agrees with
+    /// the measured windows. `None` means the EWMA supplies a projection
+    /// without that sustained-consumption evidence.
+    /// Unlike the burst median, the corroboration includes space freed by builds.
     pub forecast_rate_bytes_per_second: Option<f64>,
     pub acceleration: f64,
     pub seconds_to_exhaustion: f64,
@@ -330,9 +332,10 @@ impl DiskRateEstimator {
         debug_assert!(self.forecast_history.len() <= FORECAST_HISTORY_CAP);
     }
 
-    /// A longer, measured net rate for distant projections. Immediate danger
-    /// retains the original EWMA response; neither a historical average nor a
-    /// persistence test may postpone crossing a nearby pressure boundary.
+    /// A corroborated projection rate. Distant forecasts use a longer measured
+    /// net trend. Immediate danger retains at least the original EWMA response;
+    /// neither a historical average nor a persistence test may postpone
+    /// crossing a nearby pressure boundary.
     fn forecast_rate(&self, free_bytes: u64, at: Instant, threshold_distance: u64) -> Option<f64> {
         let elapsed = at.checked_duration_since(self.forecast_history.front()?.at)?;
         if elapsed < FORECAST_HISTORY_MIN {
@@ -343,14 +346,13 @@ impl DiskRateEstimator {
         } else {
             threshold_distance
         };
-        if project_time(self.ewma_rate, danger_distance as f64) <= FORECAST_FAST_HORIZON {
-            return None;
-        }
+        let immediate_danger =
+            project_time(self.ewma_rate, danger_distance as f64) <= FORECAST_FAST_HORIZON;
 
         let window = elapsed.min(FORECAST_HISTORY_WINDOW);
         let net_rate = self.trend_rate(free_bytes, at, window)?;
         if !self.recent_change_observed(at) {
-            return Some(net_rate);
+            return (!immediate_danger).then_some(net_rate);
         }
 
         // A new steady writer (or sustained recovery) must not wait half a
@@ -370,6 +372,22 @@ impl DiskRateEstimator {
         let consistent = (min_rate > 0.0 && max_rate <= 2.0 * min_rate)
             || (max_rate < 0.0 && min_rate >= 2.0 * max_rate)
             || (min_rate.abs() <= 1.0 && max_rate.abs() <= 1.0);
+        if immediate_danger {
+            // Losing corroboration here sends predictive policy back through
+            // its old burst median. After a confirmed new writer, that median
+            // can still say "hours" and turn cleanup/ballast rescue into Clear
+            // exactly when the new workload approaches Red or exhaustion.
+            // Retain the measured persistence without slowing the immediate
+            // response, but require the selected rate to agree with every
+            // measured window under the same factor-of-two bound. At 100 ms
+            // polling, one allocation can barely change a 20 s window yet
+            // inflate EWMA twentyfold; the windows do not corroborate that
+            // spike. Without agreement keep the immediate PID forecast and
+            // leave predictive policy's independent burst gates in force.
+            let projection_rate = recent_rate.max(self.ewma_rate);
+            return (consistent && min_rate > 0.0 && projection_rate <= 2.0 * min_rate)
+                .then_some(projection_rate);
+        }
         let changed = recent_rate.signum() != net_rate.signum()
             || recent_rate.abs() > 2.0 * net_rate.abs()
             || 2.0 * recent_rate.abs() < net_rate.abs();

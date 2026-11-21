@@ -123,6 +123,127 @@ fn long_window_policy_recognizes_a_new_sustained_writer_at_any_free_percent() {
 }
 
 #[test]
+fn sustained_writer_keeps_protection_when_the_immediate_forecast_takes_over() {
+    // The long-window estimator has proved a new 100 MB/s writer after a
+    // minute, but the burst median still reflects the old 2 MB/s workload.
+    // Approaching Red or full must not discard that proof and change cleanup
+    // back to Clear just because the immediate EWMA runway falls below 5 min.
+    for (initial_free, threshold) in [
+        (80_000_000_000_u64, 50_000_000_000_u64),
+        (40_000_000_000, 0),
+    ] {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+        let start = Instant::now();
+        let mut free = initial_free;
+        estimator.update(free, start, threshold);
+        let mut crossed_fast_boundary = false;
+        let mut rescued_before_full = false;
+        for seconds in (5..=1080_u64).step_by(5) {
+            free -= 5 * if seconds <= 900 {
+                2_000_000
+            } else {
+                100_000_000
+            };
+            let estimate = estimator.update(free, start + Duration::from_secs(seconds), threshold);
+            if seconds < 960 {
+                continue;
+            }
+            let distance = free - threshold;
+            let immediate_seconds = distance as f64 / estimate.bytes_per_second;
+            let action = policy().evaluate(&estimate, 9.0, PathBuf::from("/data"));
+            assert!(
+                action.should_cleanup(),
+                "confirmed writer lost protection at {seconds}s: {action:?}; {estimate:?}"
+            );
+            if immediate_seconds <= 300.0 {
+                crossed_fast_boundary = true;
+                assert!(
+                    estimate.seconds_to_threshold <= immediate_seconds + 1e-6,
+                    "corroboration must not delay an imminent boundary: {estimate:?}"
+                );
+                if threshold == 0 {
+                    rescued_before_full = true;
+                    assert!(
+                        action.should_release_ballast(),
+                        "confirmed imminent exhaustion must retain ballast rescue: {action:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            crossed_fast_boundary,
+            "fixture must enter the immediate path"
+        );
+        assert_eq!(rescued_before_full, threshold == 0);
+    }
+}
+
+#[test]
+fn transient_writer_near_a_boundary_does_not_gain_sustained_authority() {
+    let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+    let start = Instant::now();
+    let mut free = 40_000_000_000;
+    estimator.update(free, start, 34_000_000_000);
+    for seconds in (5..=900_u64).step_by(5) {
+        free -= 5 * 2_000_000;
+        estimator.update(free, start + Duration::from_secs(seconds), 34_000_000_000);
+    }
+    let mut saw_fast_forecast = false;
+    for seconds in (905..=960_u64).step_by(5) {
+        // Thirty seconds of allocation, followed by a return to the ordinary
+        // rate, never establish three consistent twenty-second windows.
+        free -= 5 * if seconds <= 930 {
+            100_000_000
+        } else {
+            2_000_000
+        };
+        let estimate = estimator.update(free, start + Duration::from_secs(seconds), 34_000_000_000);
+        if (free - 34_000_000_000) as f64 / estimate.bytes_per_second <= 300.0 {
+            saw_fast_forecast = true;
+            assert!(estimate.forecast_rate_bytes_per_second.is_none());
+        }
+        assert_eq!(
+            policy().evaluate(&estimate, 9.0, PathBuf::from("/data")),
+            PredictiveAction::Clear,
+            "a transient allocation cannot corroborate itself: {estimate:?}"
+        );
+    }
+    assert!(
+        saw_fast_forecast,
+        "fixture must exercise the immediate path"
+    );
+}
+
+#[test]
+fn fast_polling_spike_cannot_borrow_sustained_consumption_evidence() {
+    let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+    let start = Instant::now();
+    let mut free = 3_800_000_000;
+    estimator.update(free, start, 0);
+    for tick in 1..=9000_u64 {
+        free -= 200_000;
+        estimator.update(free, start + Duration::from_millis(tick * 100), 0);
+    }
+    assert_eq!(free, 2_000_000_000);
+
+    // One 100 ms allocation at 400 MB/s doubles the last 20-second bucket's
+    // measured rate (still inside the window-consistency bound), but inflates
+    // the immediate EWMA twentyfold. Those windows corroborate the ordinary
+    // writer, not the inflated spike. Keep PID's immediate conservative input
+    // without allowing it to bypass the predictive burst gate.
+    free -= 40_000_000;
+    let estimate = estimator.update(free, start + Duration::from_millis(900_100), 0);
+    assert!(estimate.bytes_per_second > 40_000_000.0);
+    assert!(estimate.seconds_to_threshold < 60.0);
+    assert!(estimate.forecast_rate_bytes_per_second.is_none());
+    assert_eq!(
+        policy().evaluate(&estimate, 9.0, PathBuf::from("/data")),
+        PredictiveAction::Clear,
+        "a fast-poll spike cannot turn a sustained 16-minute runway into Critical: {estimate:?}"
+    );
+}
+
+#[test]
 fn long_window_policy_preserves_confidence_and_evidence_gates() {
     let mut base = forecast(0.0, 0.9, 1.0);
     base.forecast_rate_bytes_per_second = Some(1000.0);
