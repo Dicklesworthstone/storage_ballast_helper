@@ -446,7 +446,7 @@ mod native {
             modified,
             changed,
             size: u64::try_from(metadata.st_size).ok()?,
-            link_count: u64::try_from(metadata.st_nlink).ok()?,
+            link_count: u64::from(metadata.st_nlink),
         })
     }
 
