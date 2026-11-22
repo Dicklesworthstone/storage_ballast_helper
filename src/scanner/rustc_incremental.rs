@@ -67,6 +67,25 @@ pub fn requires_proof(path: &Path) -> bool {
     }
 }
 
+/// A cache's crate directories, sessions, locks, and payloads are one reclaim
+/// unit. A public candidate naming a member must not bypass the whole-root
+/// proof and compiler locks by presenting an ordinary artifact label.
+///
+/// This is denial-only evidence: a malformed cache still owns its members.
+/// Resolve ancestor aliases and inspect only names, never opening a lock or
+/// requiring the entire cache to pass the positive recognition proof.
+pub fn is_cache_member(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        native::is_cache_member_with_limit(path, 200_000).unwrap_or(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 #[cfg(unix)]
 mod native {
     use std::collections::HashSet;
@@ -93,8 +112,60 @@ mod native {
         device: u64,
     }
 
-    pub(super) fn requires_proof_with_limit(path: &Path, limit: usize) -> Option<bool> {
+    pub(super) fn requires_proof_with_limit(path: &Path, mut limit: usize) -> Option<bool> {
+        directory_has_name(path, &mut limit, Instant::now(), crate_name)
+    }
+
+    pub(super) fn is_cache_member_with_limit(path: &Path, mut limit: usize) -> Option<bool> {
         let started = Instant::now();
+        let normalized = fs::canonicalize(path).ok()?;
+        let metadata = fs::symlink_metadata(&normalized).ok()?;
+        if metadata.file_type().is_symlink() {
+            return None;
+        }
+        // Only directories can supply the crate/session relationship. An
+        // ordinary executable can itself have a crate-shaped basename; do
+        // not mistake its inevitable ENOTDIR for uncertain cache evidence.
+        let directory = if metadata.is_dir() {
+            normalized.as_path()
+        } else {
+            normalized.parent()?
+        };
+        for ancestor in directory.ancestors() {
+            if !ancestor
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(crate_name)
+            {
+                continue;
+            }
+            // A session-shaped component below a crate-shaped directory is
+            // sufficient to refuse even if the cache has become malformed.
+            // For the crate itself or an unknown stowaway, inspect its other
+            // entry names. The arbitrary cache-root basename may itself look
+            // like a crate, so that name alone must not refuse a whole root.
+            if normalized
+                .strip_prefix(ancestor)
+                .ok()?
+                .components()
+                .next()
+                .and_then(|component| component.as_os_str().to_str())
+                .is_some_and(session_entry_name)
+                || directory_has_name(ancestor, &mut limit, started, session_entry_name)?
+            {
+                return Some(true);
+            }
+        }
+        // A changing alias is uncertainty, not clearance for generic removal.
+        (fs::canonicalize(path).ok()? == normalized).then_some(false)
+    }
+
+    fn directory_has_name(
+        path: &Path,
+        remaining: &mut usize,
+        started: Instant,
+        matches: impl Fn(&str) -> bool,
+    ) -> Option<bool> {
         if path.components().any(|c| c == Component::ParentDir) {
             return None;
         }
@@ -108,7 +179,6 @@ mod native {
             &statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW).ok()?,
         )?;
         let directory = open_directory(&parent, &root)?;
-        let mut remaining = limit;
         // Only names are inspected. A directory with a corrupt cache plus
         // unknown files must not downgrade to ordinary, unguarded deletion.
         for entry in Dir::read_from(&directory).ok()? {
@@ -120,8 +190,8 @@ mod native {
             if name == b"." || name == b".." {
                 continue;
             }
-            remaining = remaining.checked_sub(1)?;
-            if std::str::from_utf8(name).is_ok_and(crate_name) {
+            *remaining = remaining.checked_sub(1)?;
+            if std::str::from_utf8(name).is_ok_and(&matches) {
                 return Some(true);
             }
         }
@@ -493,6 +563,10 @@ mod native {
         }
     }
 
+    fn session_entry_name(name: &str) -> bool {
+        session_name(name).is_some() || name.strip_suffix(".lock").is_some_and(session_prefix)
+    }
+
     fn work_product(name: &str) -> bool {
         let Some((stem, extension)) = name.rsplit_once('.') else {
             return false;
@@ -567,6 +641,78 @@ mod native {
             assert!(super::super::requires_proof(
                 &alias.path().join("root-link")
             ));
+        }
+
+        #[test]
+        fn member_hint_covers_every_depth_even_when_the_root_is_malformed() {
+            let (_temp, root, session) = fixture();
+            let crate_path = root.join(CRATE);
+            let lock = crate_path.join(format!("{STEM}.lock"));
+            let object = session.join("example.9f0b-cgu.0.rcgu.o");
+            let stowaway = crate_path.join("operator-data.bin");
+            fs::write(&stowaway, b"not compiler data").unwrap();
+            fs::write(root.join("unrelated.bin"), b"malformed cache root").unwrap();
+            assert!(inspect_with_limit(&root, 100).is_none());
+            assert_eq!(is_cache_member_with_limit(&root, 100), Some(false));
+            for path in [&crate_path, &session, &lock, &object, &stowaway] {
+                assert_eq!(
+                    is_cache_member_with_limit(path, 100),
+                    Some(true),
+                    "{path:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn member_hint_resolves_aliases_but_does_not_reserve_the_root_basename() {
+            let (temp, root, session) = fixture();
+            let alias = temp.path().join("session-alias");
+            symlink(&session, &alias).unwrap();
+            assert_eq!(
+                is_cache_member_with_limit(&alias.join("dep-graph.bin"), 100),
+                Some(true)
+            );
+
+            let crate_named_root = temp.path().join(CRATE);
+            fs::rename(&root, &crate_named_root).unwrap();
+            assert!(inspect_with_limit(&crate_named_root, 100).is_some());
+            assert_eq!(
+                is_cache_member_with_limit(&crate_named_root, 100),
+                Some(false)
+            );
+            assert_eq!(
+                is_cache_member_with_limit(&crate_named_root.join(CRATE), 100),
+                Some(true)
+            );
+
+            let ordinary = temp.path().join("ordinary-0123456789abc");
+            fs::create_dir(&ordinary).unwrap();
+            fs::write(ordinary.join("unrelated.o"), b"ordinary artifact").unwrap();
+            assert_eq!(is_cache_member_with_limit(&ordinary, 100), Some(false));
+            assert_eq!(
+                is_cache_member_with_limit(&ordinary.join("unrelated.o"), 100),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn member_hint_budget_and_missing_path_fail_closed() {
+            let (_temp, root, _) = fixture();
+            assert!(is_cache_member_with_limit(&root.join(CRATE), 0).is_none());
+            assert!(super::super::is_cache_member(&root.join("missing")));
+        }
+
+        #[test]
+        fn crate_shaped_regular_files_need_cache_directory_evidence() {
+            let (temp, _root, session) = fixture();
+            let executable_name = "example-0123456789abc";
+            assert!(crate_name(executable_name));
+            let ordinary = temp.path().join(executable_name);
+            let member = session.join(executable_name);
+            fs::write(&ordinary, b"ordinary build executable").unwrap();
+            fs::write(&member, b"malformed cache member").unwrap();
+            assert_eq!(is_cache_member_with_limit(&ordinary, 0), Some(false));
+            assert_eq!(is_cache_member_with_limit(&member, 0), Some(true));
         }
 
         #[test]

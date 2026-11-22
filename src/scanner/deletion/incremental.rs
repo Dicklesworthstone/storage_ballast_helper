@@ -72,26 +72,60 @@ impl Guard {
 
 /// Check both the supplied label and the actual layout: a public or stale
 /// candidate relabeled as an ordinary target must not bypass compiler locks.
-fn needs_binding(candidate: &CandidacyScore) -> bool {
-    candidate.classification.pattern_name != rustc_incremental::PATTERN_NAME
-        && fs::symlink_metadata(&candidate.path).is_ok_and(|metadata| metadata.is_dir())
-        && rustc_incremental::requires_proof(&candidate.path)
+enum Binding {
+    WholeRoot,
+    Member,
+}
+
+impl Binding {
+    fn apply(self, candidate: &mut CandidacyScore) {
+        match self {
+            Self::WholeRoot => {
+                candidate.classification.pattern_name =
+                    Cow::Borrowed(rustc_incremental::PATTERN_NAME);
+            }
+            Self::Member => {
+                candidate.vetoed = true;
+                candidate.veto_reason = Some(Cow::Borrowed(
+                    "rustc incremental-cache members require whole-cache reclamation",
+                ));
+            }
+        }
+    }
+}
+
+fn required_binding(candidate: &CandidacyScore) -> Option<Binding> {
+    if candidate.vetoed {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(&candidate.path).ok()?;
+    if metadata.file_type().is_symlink() {
+        return None;
+    }
+    if rustc_incremental::is_cache_member(&candidate.path) {
+        return Some(Binding::Member);
+    }
+    (candidate.classification.pattern_name != rustc_incremental::PATTERN_NAME
+        && metadata.is_dir()
+        && rustc_incremental::requires_proof(&candidate.path))
+    .then_some(Binding::WholeRoot)
 }
 
 /// Preserve the safety requirement through caller hooks even if the layout
 /// subsequently becomes unrecognizable. This never increases the score or
-/// changes the decision/category; the label only requires additional proof.
+/// changes the decision/category. A whole-root label requires additional
+/// proof; a member veto cannot disappear when a hook moves or alters the tree.
 pub(super) fn bind_owned(mut candidate: CandidacyScore) -> CandidacyScore {
-    if needs_binding(&candidate) {
-        candidate.classification.pattern_name = Cow::Borrowed(rustc_incremental::PATTERN_NAME);
+    if let Some(binding) = required_binding(&candidate) {
+        binding.apply(&mut candidate);
     }
     candidate
 }
 
 pub(super) fn bind(candidate: &CandidacyScore) -> Cow<'_, CandidacyScore> {
-    if needs_binding(candidate) {
+    if let Some(binding) = required_binding(candidate) {
         let mut bound = candidate.clone();
-        bound.classification.pattern_name = Cow::Borrowed(rustc_incremental::PATTERN_NAME);
+        binding.apply(&mut bound);
         Cow::Owned(bound)
     } else {
         Cow::Borrowed(candidate)
@@ -101,6 +135,9 @@ pub(super) fn bind(candidate: &CandidacyScore) -> Cow<'_, CandidacyScore> {
 fn inspect_candidate(candidate: &CandidacyScore) -> Result<Option<IncrementalCache>, SkipReason> {
     let labelled = candidate.classification.pattern_name == rustc_incremental::PATTERN_NAME;
     let metadata = fs::symlink_metadata(&candidate.path).map_err(|_| SkipReason::PathGone)?;
+    if !metadata.file_type().is_symlink() && rustc_incremental::is_cache_member(&candidate.path) {
+        return Err(SkipReason::Vetoed);
+    }
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return if labelled {
             Err(SkipReason::Vetoed)

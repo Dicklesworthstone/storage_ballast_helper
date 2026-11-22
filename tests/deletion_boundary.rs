@@ -1345,6 +1345,235 @@ mod standalone_incremental {
     }
 
     #[test]
+    fn members_cannot_bypass_whole_cache_locks_through_public_mutation_apis() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for dry_run in [false, true] {
+                for compiler_running in [false, true] {
+                    let dir = scratch();
+                    let fixture = Fixture::new(dir.path());
+                    let held = compiler_running.then(|| {
+                        CompilerLock::acquire(&fixture.lock, dir.path(), "flock-exclusive")
+                    });
+                    let mut cfg = config(dir.path(), mode);
+                    cfg.dry_run = dry_run;
+                    let executor = DeletionExecutor::new(cfg, None);
+                    for path in [
+                        &fixture.crate_dir,
+                        &fixture.session,
+                        &fixture.lock,
+                        &fixture.object,
+                    ] {
+                        // Public candidates need not use the scanner's cache
+                        // label. The actual membership remains load-bearing.
+                        let item = candidate(path);
+                        let plan = executor.plan(vec![item.clone()]);
+                        assert!(plan.candidates.is_empty(), "{mode:?}/{path:?}");
+                        assert_eq!(plan.refused[0].1, SkipReason::Vetoed);
+                        assert_eq!(
+                            executor.explain_preflight(&item, None),
+                            Err(SkipReason::Vetoed)
+                        );
+                        for public_mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+                            let report =
+                                executor.execute(&raw_plan(vec![item.clone()], public_mode), None);
+                            assert_eq!(report.items_skipped, 1, "{report:?}");
+                            assert_eq!(report.skipped_by_reason.get("vetoed"), Some(&1));
+                            assert_eq!(report.items_deleted, 0);
+                            assert_eq!(report.items_quarantined, 0);
+                            assert_eq!(report.items_would_delete, 0);
+                            assert_eq!(report.items_failed, 0);
+                            assert_eq!(report.bytes_freed, 0);
+                            assert_eq!(report.bytes_quarantined, 0);
+                            assert_eq!(report.bytes_would_free, 0);
+                        }
+                        if !dry_run {
+                            assert_eq!(
+                                executor.delete_candidate_checked(&item, None).unwrap(),
+                                CheckedDeletion::Skipped(SkipReason::Vetoed)
+                            );
+                        }
+                        fixture.assert_intact();
+                        assert!(!dir.path().join(".sbh").exists());
+                    }
+                    drop(held);
+                    // The denial is confined to partial-cache mutations:
+                    // the complete, idle cache remains reclaimable with its
+                    // full proof and all compiler locks held by the executor.
+                    let executor =
+                        DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+                    assert_eq!(
+                        executor
+                            .delete_candidate_checked(&fixture.candidate(), None)
+                            .unwrap(),
+                        CheckedDeletion::Deleted
+                    );
+                    assert!(!fixture.root.exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_crate_shaped_executables_remain_reclaimable() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            let dir = scratch();
+            let item = artifact(dir.path(), "example-0123456789abc");
+            fs::set_permissions(&item.path, fs::Permissions::from_mode(0o755)).unwrap();
+            let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+            let plan = executor.plan(vec![item.clone()]);
+            assert_eq!(plan.estimated_items, 1, "{mode:?}: {:?}", plan.refused);
+            assert!(plan.refused.is_empty());
+            assert_eq!(executor.explain_preflight(&item, None), Ok(()));
+            let report = executor.execute(&plan, None);
+            assert_eq!(report.items_deleted, 1, "{mode:?}: {report:?}");
+            assert_eq!(report.items_skipped, 0);
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(
+                report.items_quarantined,
+                usize::from(mode == DeletionMode::Quarantine)
+            );
+            assert!(!item.path.exists());
+        }
+    }
+
+    #[test]
+    fn malformed_cache_members_and_parent_aliases_remain_protected() {
+        let dir = scratch();
+        let fixture = Fixture::new(dir.path());
+        fs::write(fixture.root.join("operator-data.bin"), b"root is malformed").unwrap();
+        let stowaway = fixture.crate_dir.join("operator-data.bin");
+        fs::write(&stowaway, b"not a rustc session").unwrap();
+        let alias = dir.path().join("session-alias");
+        symlink(&fixture.session, &alias).unwrap();
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+            for path in [
+                fixture.crate_dir.clone(),
+                fixture.session.clone(),
+                fixture.lock.clone(),
+                fixture.object.clone(),
+                stowaway.clone(),
+                alias.join(OBJECT),
+            ] {
+                for label in ["target", PATTERN_NAME] {
+                    let mut item = candidate(&path);
+                    item.classification.pattern_name = Cow::Borrowed(label);
+                    assert!(executor.plan(vec![item.clone()]).candidates.is_empty());
+                    assert_eq!(
+                        executor.delete_candidate_checked(&item, None).unwrap(),
+                        CheckedDeletion::Skipped(SkipReason::Vetoed)
+                    );
+                    let report = executor.execute(&raw_plan(vec![item], mode), None);
+                    assert_eq!(report.items_skipped, 1, "{path:?}/{label}: {report:?}");
+                    assert_eq!(report.items_deleted, 0);
+                    assert_eq!(report.items_failed, 0);
+                    fixture.assert_intact();
+                    assert_eq!(fs::read(&stowaway).unwrap(), b"not a rustc session");
+                    assert!(!dir.path().join(".sbh").exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_member_veto_survives_callbacks_that_remove_its_structural_evidence() {
+        for boundary in ["confirmation", "skip"] {
+            let dir = scratch();
+            let fixture = Fixture::new(dir.path());
+            let alias = dir.path().join("selected");
+            let detached = dir.path().join("detached");
+            fs::create_dir(&detached).unwrap();
+            symlink(&fixture.session, &alias).unwrap();
+            let item = candidate(&alias.join(OBJECT));
+            let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+            let plan = raw_plan(vec![item], DeletionMode::Unlink);
+            let calls = Cell::new(0);
+            let mutate = || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    // The same inode now has no cache-shaped ancestors. It
+                    // must retain the veto bound before the caller's hook.
+                    fs::rename(&fixture.object, detached.join(OBJECT)).unwrap();
+                    fs::rename(&alias, dir.path().join("old-alias")).unwrap();
+                    symlink(&detached, &alias).unwrap();
+                }
+            };
+            let report = if boundary == "confirmation" {
+                executor
+                    .execute_confirmed(&plan, None, |_, _| {
+                        mutate();
+                        Ok::<_, std::convert::Infallible>(DeletionConfirmation::Accept)
+                    })
+                    .unwrap()
+            } else {
+                executor.execute(
+                    &plan,
+                    Some(&|_| {
+                        mutate();
+                        None
+                    }),
+                )
+            };
+            assert!(calls.get() > 0, "fixture must reach {boundary}");
+            assert_eq!(report.items_skipped, 1, "{boundary}: {report:?}");
+            assert_eq!(report.skipped_by_reason.get("vetoed"), Some(&1));
+            assert_eq!(report.items_deleted, 0);
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.bytes_freed, 0);
+            assert_eq!(fs::read(detached.join(OBJECT)).unwrap(), PAYLOAD);
+            assert!(fixture.lock.is_file());
+            assert_eq!(
+                fs::read(fixture.session.join("dep-graph.bin")).unwrap(),
+                METADATA
+            );
+            assert!(!dir.path().join(".sbh").exists());
+        }
+    }
+
+    #[test]
+    fn a_new_cache_membership_after_live_authorization_still_blocks_mutation() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            let dir = scratch();
+            let fixture = Fixture::new(dir.path());
+            let ordinary = dir.path().join("ordinary");
+            let alias = dir.path().join("selected");
+            fs::create_dir(&ordinary).unwrap();
+            let initial = artifact(&ordinary, "incoming.o");
+            symlink(&ordinary, &alias).unwrap();
+            let item = candidate(&alias.join("incoming.o"));
+            let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+            let plan = executor.plan(vec![item]);
+            assert_eq!(plan.estimated_items, 1);
+            let calls = Cell::new(0);
+            let report = executor.execute_with_guard(
+                &plan,
+                None,
+                Some(&|_| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 1 {
+                        fs::rename(&initial.path, fixture.session.join("incoming.o")).unwrap();
+                        fs::rename(&alias, dir.path().join("old-alias")).unwrap();
+                        symlink(&fixture.session, &alias).unwrap();
+                    }
+                    Ok(())
+                }),
+            );
+            assert!(calls.get() > 0, "fixture must reach live authorization");
+            assert_eq!(report.items_skipped, 1, "{mode:?}: {report:?}");
+            assert_eq!(report.skipped_by_reason.get("vetoed"), Some(&1));
+            assert_eq!(report.items_deleted, 0);
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.bytes_freed, 0);
+            assert_eq!(
+                fs::read(fixture.session.join("incoming.o")).unwrap(),
+                PAYLOAD
+            );
+            fixture.assert_intact();
+            assert!(!dir.path().join(".sbh").exists());
+        }
+    }
+
+    #[test]
     fn walker_and_scoring_deliver_a_standalone_cache_to_real_unlink() {
         let dir = scratch();
         let fixture = Fixture::new(dir.path());
