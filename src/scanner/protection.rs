@@ -25,6 +25,92 @@ use crate::platform::types::{SacredPath, SacredPathKind, SacredPathSource};
 pub const MARKER_FILENAME: &str = ".sbh-protect";
 pub const DEFAULT_STOWAWAY_SCAN_DEPTH: usize = 3;
 
+/// Whether a path is an excluded entry or lies beneath one.
+///
+/// The filesystem root is an exact-only exclusion: the default `/` entry
+/// prevents a whole-filesystem scan without excluding every configured root.
+/// Check both the supplied spelling and its current resolved location. Unlike
+/// cached discovery hints, these comparisons renew aliases on every call.
+#[must_use]
+pub fn path_is_excluded(path: &Path, excluded_paths: &[PathBuf]) -> bool {
+    exclusion_matches(path, excluded_paths, false)
+}
+
+/// Whether removing `path` would remove an excluded entry, including one
+/// nested inside an opaque artifact. A fresh comparison also protects queued
+/// or public deletion plans that did not pass through the walker.
+#[must_use]
+pub fn path_overlaps_exclusion(path: &Path, excluded_paths: &[PathBuf]) -> bool {
+    exclusion_matches(path, excluded_paths, true)
+}
+
+fn exclusion_matches(path: &Path, excluded_paths: &[PathBuf], include_descendants: bool) -> bool {
+    if excluded_paths.is_empty() {
+        return false;
+    }
+    let Ok(candidates) = exclusion_path_spellings(path) else {
+        return true;
+    };
+    excluded_paths.iter().any(|excluded| {
+        let Ok(spellings) = exclusion_path_spellings(excluded) else {
+            // An inaccessible or looping alias is unknown scope, not proof
+            // that the current candidate is outside the operator's exclusion.
+            return true;
+        };
+        // A configured alias of `/` is the same exact-only sentinel as `/`,
+        // including when the candidate uses the alias's original spelling.
+        let subtree = spellings[1].parent().is_some();
+        spellings.iter().any(|excluded| {
+            candidates.iter().any(|candidate| {
+                candidate == excluded
+                    || (subtree
+                        && (candidate.starts_with(excluded)
+                            || (include_descendants && excluded.starts_with(candidate))))
+            })
+        })
+    })
+}
+
+/// Absolute spelling and freshly resolved spelling of an exclusion scope.
+/// A missing suffix is permitted: an exclusion applies before its child is
+/// created. Only existing ancestors resolve aliases; `..` across a missing
+/// component and all non-NotFound errors remain failures. No directory tree
+/// is enumerated and no result is retained between admissions.
+pub(crate) fn exclusion_path_spellings(path: &Path) -> std::io::Result<[PathBuf; 2]> {
+    let absolute = std::path::absolute(path)?;
+    let mut probe = absolute.as_path();
+    let mut missing = Vec::new();
+    let resolved = loop {
+        match fs::canonicalize(probe) {
+            Ok(mut resolved) => {
+                for name in missing.iter().rev() {
+                    resolved.push(name);
+                }
+                break resolved;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // NotFound also describes a dangling ancestor alias. It is
+                // not an absent literal component: its target can overlap
+                // another candidate even though canonicalize cannot follow
+                // it. Refuse unknown scope rather than discard that alias.
+                match fs::symlink_metadata(probe) {
+                    Err(inspect) if inspect.kind() == ErrorKind::NotFound => {}
+                    Err(inspect) => return Err(inspect),
+                    Ok(_) => return Err(error),
+                }
+                let Some(std::path::Component::Normal(name)) = probe.components().next_back()
+                else {
+                    return Err(error);
+                };
+                missing.push(name);
+                probe = probe.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    Ok([absolute, resolved])
+}
+
 /// Upper bound on directory entries *name-checked* during a single stowaway
 /// (sacred-marker containment) sub-walk.
 ///
@@ -1386,6 +1472,105 @@ mod tests {
     use crate::platform::types::{SacredPath, SacredPathKind, SacredPathSource};
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn exclusion_scopes_cover_ancestors_and_descendants_with_component_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let excluded = dir.path().join("cache/keep");
+        fs::create_dir_all(&excluded).unwrap();
+        let exclusions = vec![excluded.clone()];
+        assert!(path_is_excluded(&excluded, &exclusions));
+        assert!(path_is_excluded(
+            &excluded.join("future/child"),
+            &exclusions
+        ));
+        assert!(!path_is_excluded(&dir.path().join("cache"), &exclusions));
+        assert!(path_overlaps_exclusion(
+            &dir.path().join("cache"),
+            &exclusions
+        ));
+        for sibling in ["cache/keep-other", "cache-other"] {
+            let sibling = dir.path().join(sibling);
+            assert!(!path_is_excluded(&sibling, &exclusions));
+            assert!(!path_overlaps_exclusion(&sibling, &exclusions));
+        }
+        // A configured descendant applies even before that child exists.
+        assert!(path_overlaps_exclusion(
+            &excluded,
+            &[excluded.join("future/child")]
+        ));
+    }
+
+    #[test]
+    fn exclusion_scopes_resolve_relative_and_absolute_spellings() {
+        let current = std::env::current_dir().unwrap();
+        let dir = TempDir::new_in(&current).unwrap();
+        let excluded = dir.path().join("keep");
+        fs::create_dir(&excluded).unwrap();
+        let relative = excluded.strip_prefix(&current).unwrap().to_path_buf();
+        assert!(path_is_excluded(&excluded, std::slice::from_ref(&relative)));
+        assert!(path_is_excluded(&relative, std::slice::from_ref(&excluded)));
+        assert!(path_overlaps_exclusion(dir.path(), &[relative]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusion_aliases_are_resolved_again_after_retargeting() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let candidate = dir.path().join("candidate");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(candidate.join("keep")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let alias = dir.path().join("excluded-alias");
+        symlink(&outside, &alias).unwrap();
+        let exclusions = vec![alias.clone()];
+        assert!(!path_overlaps_exclusion(&candidate, &exclusions));
+        fs::remove_file(&alias).unwrap();
+        symlink(candidate.join("keep"), &alias).unwrap();
+        assert!(path_overlaps_exclusion(&candidate, &exclusions));
+        assert!(path_is_excluded(&candidate.join("keep"), &exclusions));
+        assert!(!path_overlaps_exclusion(&outside, &exclusions));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusion_root_and_root_alias_are_exact_only_sentinels() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let alias = dir.path().join("root-alias");
+        symlink("/", &alias).unwrap();
+        let through_alias = alias.join(dir.path().strip_prefix("/").unwrap());
+        for excluded in [PathBuf::from("/"), alias] {
+            let exclusions = vec![excluded];
+            assert!(path_is_excluded(Path::new("/"), &exclusions));
+            assert!(path_overlaps_exclusion(Path::new("/"), &exclusions));
+            assert!(!path_is_excluded(dir.path(), &exclusions));
+            assert!(!path_overlaps_exclusion(dir.path(), &exclusions));
+            assert!(!path_is_excluded(&through_alias, &exclusions));
+            assert!(!path_overlaps_exclusion(&through_alias, &exclusions));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusion_dangling_and_looping_aliases_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let alias = dir.path().join("dangling");
+        symlink(dir.path().join("missing/keep"), &alias).unwrap();
+        for excluded in [alias.clone(), alias.join("child")] {
+            assert!(exclusion_path_spellings(&excluded).is_err());
+            assert!(path_overlaps_exclusion(dir.path(), &[excluded]));
+        }
+        let loop_alias = dir.path().join("loop");
+        symlink(&loop_alias, &loop_alias).unwrap();
+        assert!(exclusion_path_spellings(&loop_alias).is_err());
+        assert!(path_is_excluded(dir.path(), &[loop_alias]));
+    }
 
     #[test]
     fn marker_only_registry_starts_empty() {

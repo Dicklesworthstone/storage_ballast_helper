@@ -64,7 +64,15 @@ fn check_path(candidate: &CandidacyScore, config: &DeletionConfig) -> Result<(),
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
         Err(_) => return Err(SkipReason::SacredStowaway),
     };
-    // Leave the existing preflight's explicit Symlink attribution intact.
+    // Exclusions are reclamation boundaries, including protected descendants
+    // inside an opaque artifact. Repeat this for public plans and the final
+    // unlink/quarantine admission; neither a cached scan nor an earlier alias
+    // target proves that the current object is outside the excluded scope.
+    if protection::path_overlaps_exclusion(path, &config.excluded_paths) {
+        return Err(SkipReason::SacredStowaway);
+    }
+    // Leave the existing preflight's Symlink attribution intact when no
+    // operator exclusion forbids removing the link itself.
     if metadata.file_type().is_symlink() {
         return Ok(());
     }
@@ -300,6 +308,156 @@ mod tests {
             CheckedDeletion::Skipped(SkipReason::SacredStowaway)
         );
         assert!(item.path.exists());
+    }
+
+    #[test]
+    fn exclusions_block_ancestors_exact_candidates_and_nested_entries_in_both_modes() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for scope in ["ancestor", "exact", "descendant", "missing-descendant"] {
+                let dir = scratch();
+                let path = dir.path().join("cache/target");
+                fs::create_dir_all(&path).unwrap();
+                let payload = path.join("artifact.bin");
+                fs::write(&payload, PAYLOAD).unwrap();
+                let excluded = match scope {
+                    "ancestor" => dir.path().join("cache"),
+                    "exact" => path.clone(),
+                    "descendant" => payload.clone(),
+                    _ => path.join("future/keep"),
+                };
+                let mut cfg = config(dir.path(), mode);
+                cfg.excluded_paths = vec![excluded];
+                let executor = DeletionExecutor::new(cfg, None);
+                assert_checked_refusal(
+                    &executor,
+                    &candidate(&path),
+                    mode,
+                    SkipReason::SacredStowaway,
+                );
+                assert_eq!(fs::read(&payload).unwrap(), PAYLOAD);
+                assert!(!QuarantineStore::under(dir.path()).root().exists());
+            }
+        }
+    }
+
+    #[test]
+    fn exclusion_alias_retarget_after_preflight_revokes_both_final_mutations() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            let dir = scratch();
+            let root = dir.path().join("scan");
+            let path = root.join("cache");
+            let kept = path.join("keep");
+            let outside = dir.path().join("outside");
+            fs::create_dir_all(&kept).unwrap();
+            fs::create_dir(&outside).unwrap();
+            let payload = kept.join("artifact.bin");
+            fs::write(&payload, PAYLOAD).unwrap();
+            let alias = dir.path().join("excluded-alias");
+            symlink(&outside, &alias).unwrap();
+            let mut cfg = config(&root, mode);
+            cfg.excluded_paths = vec![alias.clone()];
+            let executor = DeletionExecutor::new(cfg, None);
+            let item = candidate(&path);
+            assert!(executor.explain_preflight(&item, None).is_ok());
+            let plan = executor.plan(vec![item.clone()]);
+            assert_eq!(plan.estimated_items, 1);
+
+            fs::rename(&alias, dir.path().join("previous-alias")).unwrap();
+            symlink(&kept, &alias).unwrap();
+            assert_eq!(
+                item.identity,
+                Some(identity_for_path(&path, false).unwrap())
+            );
+            let report = executor.execute(&plan, None);
+            assert_eq!(report.items_deleted, 0);
+            assert_eq!(report.items_skipped, 1);
+            assert_checked_refusal(&executor, &item, mode, SkipReason::SacredStowaway);
+            assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
+            assert!(!QuarantineStore::under(&root).root().exists());
+        }
+    }
+
+    #[test]
+    fn exclusion_siblings_and_root_sentinel_still_allow_reclamation() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            let dir = scratch();
+            let excluded = dir.path().join("cache");
+            let path = dir.path().join("cache-other");
+            fs::create_dir(&excluded).unwrap();
+            fs::create_dir(&path).unwrap();
+            fs::write(excluded.join("kept.bin"), PAYLOAD).unwrap();
+            fs::write(path.join("artifact.bin"), PAYLOAD).unwrap();
+            let mut cfg = config(dir.path(), mode);
+            cfg.excluded_paths = vec![excluded.clone(), std::path::PathBuf::from("/")];
+            let executor = DeletionExecutor::new(cfg, None);
+            let plan = executor.plan(vec![candidate(&path)]);
+            assert_eq!(plan.estimated_items, 1);
+            let report = executor.execute(&plan, None);
+            assert_eq!(report.items_deleted, 1);
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.items_skipped, 0);
+            assert!(!path.exists());
+            assert_eq!(fs::read(excluded.join("kept.bin")).unwrap(), PAYLOAD);
+        }
+    }
+
+    #[test]
+    fn exclusion_scope_tracks_candidate_parent_alias_relocation() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            let dir = scratch();
+            let real = dir.path().join("real");
+            fs::create_dir_all(real.join("target")).unwrap();
+            fs::write(real.join("target/artifact.bin"), PAYLOAD).unwrap();
+            let alias = dir.path().join("alias");
+            symlink(&real, &alias).unwrap();
+            let excluded = dir.path().join("excluded");
+            let mut cfg = config(dir.path(), mode);
+            cfg.source_roots = SourceRootPolicy::new(std::slice::from_ref(&real), false);
+            cfg.excluded_paths = vec![excluded.clone()];
+            let executor = DeletionExecutor::new(cfg, None);
+            let item = candidate(&alias.join("target"));
+            assert!(executor.explain_preflight(&item, None).is_ok());
+
+            fs::rename(&real, &excluded).unwrap();
+            fs::rename(&alias, dir.path().join("previous-alias")).unwrap();
+            symlink(&excluded, &alias).unwrap();
+            assert_eq!(
+                item.identity,
+                Some(identity_for_path(&item.path, false).unwrap())
+            );
+            assert_checked_refusal(&executor, &item, mode, SkipReason::SacredStowaway);
+            assert_eq!(
+                fs::read(excluded.join("target/artifact.bin")).unwrap(),
+                PAYLOAD
+            );
+        }
+    }
+
+    #[test]
+    fn exclusion_of_symlink_entry_is_enforced_by_both_mutation_backends() {
+        let dir = scratch();
+        let target = dir.path().join("artifact.bin");
+        fs::write(&target, PAYLOAD).unwrap();
+        let alias = dir.path().join("excluded-link");
+        symlink(&target, &alias).unwrap();
+        let item = candidate(&alias);
+        let mut cfg = config(dir.path(), DeletionMode::Unlink);
+        cfg.excluded_paths = vec![alias.clone()];
+        let executor = DeletionExecutor::new(cfg, None);
+        assert_eq!(
+            check(&item, &executor.config),
+            Err(SkipReason::SacredStowaway)
+        );
+        assert!(executor.delete_path(&item).is_err());
+        assert!(executor.quarantine_path(&item).is_err());
+        assert!(
+            fs::symlink_metadata(alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(target).unwrap(), PAYLOAD);
+        assert!(!QuarantineStore::under(dir.path()).root().exists());
     }
 
     #[test]

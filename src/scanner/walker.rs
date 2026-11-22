@@ -35,10 +35,12 @@ mod code_sign_clones;
 use code_sign_clones::AppInstance;
 mod dispatch_cursor;
 use dispatch_cursor::DispatchContext;
+mod exclusions;
 pub use dispatch_cursor::{
     MAX_DISPATCH_CURSOR_BYTES, MAX_DISPATCH_CURSOR_PATH_BYTES, MAX_DISPATCH_CURSOR_ROWS,
     WalkDispatchCursor, WalkDispatchPosition,
 };
+use exclusions::{ExclusionRelation, WalkExclusions};
 mod read_ahead;
 
 /// Release this thread's retained directory read-ahead outside `roots`.
@@ -1174,6 +1176,7 @@ impl DirectoryWalker {
     /// The walk runs in background threads. Dropping the stream sets the
     /// walker's cancel flag, so one walker serves one stream.
     pub fn stream(&self) -> Result<WalkStream> {
+        let exclusions = WalkExclusions::new(&self.config)?;
         let parallelism = self.config.parallelism.max(1);
         let dispatch_cursor = self
             .dispatch_cursor
@@ -1201,6 +1204,10 @@ impl DirectoryWalker {
 
         // Seed work queue with root paths.
         for root in &self.config.root_paths {
+            if exclusions.root_is_unresolved(root) {
+                unfinished.lock().push(root.clone());
+                continue;
+            }
             // A configured root is followed even when it is a symlink: on
             // macOS the default `/tmp` is a link to `/private/tmp`, and the
             // no-follow stat skipped it silently, so the daemon never walked
@@ -1248,6 +1255,7 @@ impl DirectoryWalker {
             reads: read_ahead::shared(),
             unfinished: Arc::clone(&unfinished),
             dispatch_cursor,
+            exclusions,
         });
         // Clone sender for workers; drop original so channel closes when workers finish.
         for _ in 0..parallelism {
@@ -1402,17 +1410,25 @@ fn process_directory(
         path,
         depth,
         root_device_id: root_dev,
-        opaque_tree,
+        mut opaque_tree,
         filesystem,
         expected_metadata,
         mut dispatch,
         completion: _,
     } = item;
     let dir_path = path.as_path();
-    // Check exclusion list.
-    if config.excluded_paths.contains(dir_path) {
-        windows.reads.lock().forget(dir_path);
-        return;
+    match windows
+        .exclusions
+        .relation(dir_path, config.follow_symlinks)
+    {
+        ExclusionRelation::Excluded => {
+            windows.reads.lock().forget(dir_path);
+            return;
+        }
+        ExclusionRelation::ContainsExcluded => {
+            opaque_tree = Some(excluded_descendant_signal());
+        }
+        ExclusionRelation::Clear => {}
     }
 
     // Check protection registry (covers config patterns and previously discovered markers).
@@ -1944,6 +1960,7 @@ fn process_directory(
                 parent_has_node_manifest: read.parent_has_node_manifest,
             },
             config,
+            &windows.exclusions,
             results,
         ) {
             if retain_reads {
@@ -2056,6 +2073,7 @@ fn dispatch_turn(
                 parent_has_node_manifest: read.parent_has_node_manifest,
             },
             config,
+            &windows.exclusions,
             results,
         ) {
             completion.defer_to(&mut parent);
@@ -2135,6 +2153,7 @@ fn emit_dispatch_parent(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn child_work_item(
     path: PathBuf,
     depth: usize,
@@ -2142,12 +2161,14 @@ fn child_work_item(
     filesystem: WalkFilesystem,
     context: OpaqueTreeContext,
     config: &WalkerConfig,
+    exclusions: &WalkExclusions,
     results: &ResultBatch<'_>,
 ) -> Option<WorkItem> {
-    if config.excluded_paths.contains(&path) {
+    let exclusion = exclusions.relation(&path, config.follow_symlinks);
+    if exclusion == ExclusionRelation::Excluded {
         return None;
     }
-    let opaque_tree = config
+    let mut opaque_tree = config
         .opaque_pruning
         .then(|| classify_opaque_tree(&path, context))
         .flatten();
@@ -2156,6 +2177,9 @@ fn child_work_item(
         .is_some_and(|opaque| opaque.disposition == OpaqueTreeDisposition::ProtectedOpaque)
     {
         return None;
+    }
+    if exclusion == ExclusionRelation::ContainsExcluded {
+        opaque_tree = Some(excluded_descendant_signal());
     }
     let expected_metadata = if opaque_tree
         .as_ref()
@@ -2183,6 +2207,15 @@ fn child_work_item(
         dispatch: None,
         completion: TaskCompletion::default(),
     })
+}
+
+fn excluded_descendant_signal() -> OpaqueTreeClassification {
+    OpaqueTreeClassification {
+        disposition: OpaqueTreeDisposition::SignalOnly,
+        reason: "contains an excluded path".into(),
+        classification: ArtifactClassification::unknown(),
+        tree_last_modified: None,
+    }
 }
 
 /// Preserve the opaque probe's allocated-byte, freshness, and structural
@@ -2616,6 +2649,8 @@ struct DirWindows {
     unfinished: Arc<parking_lot::Mutex<Vec<PathBuf>>>,
     /// Per-walk registration epoch for durable branch-priority cells.
     dispatch_cursor: Option<DispatchContext>,
+    /// Root-mapped exclusions, renewed before this walk begins.
+    exclusions: WalkExclusions,
 }
 
 /// Where the next pass's window starts, after a pass that processed
@@ -4370,6 +4405,220 @@ mod tests {
         assert!(!paths.contains(&tmp.path().join("skip")));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exclusion_preparation_keeps_unresolved_roots_from_stalling_healthy_roots() {
+        let tmp = TempDir::new().unwrap();
+        let healthy = tmp.path().join("healthy");
+        fs::create_dir_all(healthy.join("cache/leaf")).unwrap();
+        fs::create_dir_all(healthy.join("skip/nested")).unwrap();
+        let unavailable = tmp.path().join("unavailable-root");
+        std::os::unix::fs::symlink(tmp.path().join("missing"), &unavailable).unwrap();
+        for opaque_pruning in [false, true] {
+            let mut config = test_config(&unavailable);
+            config.root_paths.push(healthy.clone());
+            config.excluded_paths.insert(PathBuf::from("/"));
+            config.excluded_paths.insert(healthy.join("skip"));
+            config.opaque_pruning = opaque_pruning;
+            let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+            let mut stream = walker.stream().unwrap();
+            let entries: Vec<_> = stream.by_ref().collect();
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.path == healthy.join("cache/leaf"))
+            );
+            assert!(entries.iter().all(|entry| {
+                !entry.path.starts_with(&unavailable)
+                    && !entry.path.starts_with(healthy.join("skip"))
+            }));
+            assert_eq!(
+                stream.unfinished_after_cancel(Duration::ZERO).unwrap(),
+                vec![unavailable.clone()]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusion_preparation_still_refuses_unknown_excluded_scope() {
+        let tmp = TempDir::new().unwrap();
+        let healthy = tmp.path().join("healthy");
+        fs::create_dir_all(healthy.join("cache")).unwrap();
+        let excluded = tmp.path().join("excluded-alias");
+        std::os::unix::fs::symlink(tmp.path().join("missing"), &excluded).unwrap();
+        let mut config = test_config(&healthy);
+        config.excluded_paths.insert(excluded.clone());
+        let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+        let Err(SbhError::Io { path, source }) = walker.stream() else {
+            panic!("an unresolved exclusion must prevent traversal of any root");
+        };
+        assert_eq!(path, excluded);
+        assert_eq!(source.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn exclusion_ancestors_cover_explicit_roots_without_hiding_siblings() {
+        let tmp = TempDir::new().unwrap();
+        let excluded = tmp.path().join("skip");
+        let nested_root = excluded.join("nested");
+        let sibling_root = tmp.path().join("skip-other");
+        fs::create_dir_all(nested_root.join("cache")).unwrap();
+        fs::create_dir_all(sibling_root.join("cache")).unwrap();
+        for opaque_pruning in [false, true] {
+            let mut config = test_config(&nested_root);
+            config.root_paths.push(sibling_root.clone());
+            config.excluded_paths.insert(excluded.clone());
+            config.excluded_paths.insert(PathBuf::from("/"));
+            config.opaque_pruning = opaque_pruning;
+            let entries = DirectoryWalker::new(config, ProtectionRegistry::marker_only())
+                .walk()
+                .unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| !entry.path.starts_with(&excluded))
+            );
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.path == sibling_root.join("cache"))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusion_aliases_and_root_aliases_have_the_same_scope() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir_all(real.join("skip/nested")).unwrap();
+        fs::create_dir_all(real.join("skip-other/cache")).unwrap();
+        let root_alias = tmp.path().join("root-alias");
+        let excluded_alias = tmp.path().join("excluded-alias");
+        std::os::unix::fs::symlink(&real, &root_alias).unwrap();
+        std::os::unix::fs::symlink(real.join("skip"), &excluded_alias).unwrap();
+        for root in [&real, &root_alias] {
+            for excluded in [real.join("skip"), excluded_alias.clone()] {
+                let mut config = test_config(root);
+                config.excluded_paths.insert(excluded);
+                let entries = DirectoryWalker::new(config, ProtectionRegistry::marker_only())
+                    .walk()
+                    .unwrap();
+                assert!(
+                    entries
+                        .iter()
+                        .all(|entry| !entry.path.starts_with(root.join("skip")))
+                );
+                assert!(
+                    entries
+                        .iter()
+                        .any(|entry| entry.path == root.join("skip-other/cache"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exclusion_relative_paths_cover_absolute_roots_and_the_reverse() {
+        let current = std::env::current_dir().unwrap();
+        let tmp = TempDir::new_in(&current).unwrap();
+        fs::create_dir_all(tmp.path().join("skip/nested")).unwrap();
+        fs::create_dir_all(tmp.path().join("safe/cache")).unwrap();
+        let relative = tmp.path().strip_prefix(&current).unwrap();
+        for (root, excluded) in [
+            (tmp.path(), relative.join("skip")),
+            (relative, tmp.path().join("skip")),
+        ] {
+            let mut config = test_config(root);
+            config.excluded_paths.insert(excluded);
+            let entries = DirectoryWalker::new(config, ProtectionRegistry::marker_only())
+                .walk()
+                .unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| !entry.path.starts_with(root.join("skip")))
+            );
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.path == root.join("safe/cache"))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusion_applies_to_followed_child_aliases_and_root_alias_sentinels() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("scan");
+        let excluded = tmp.path().join("private");
+        fs::create_dir_all(root.join("safe")).unwrap();
+        fs::create_dir_all(excluded.join("cache")).unwrap();
+        std::os::unix::fs::symlink(&excluded, root.join("link")).unwrap();
+        let mut config = test_config(&root);
+        config.follow_symlinks = true;
+        config.excluded_paths.insert(excluded);
+        let entries = DirectoryWalker::new(config, ProtectionRegistry::marker_only())
+            .walk()
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.path.starts_with(root.join("link")))
+        );
+        assert!(entries.iter().any(|entry| entry.path == root.join("safe")));
+
+        let root_alias = tmp.path().join("filesystem-root");
+        std::os::unix::fs::symlink("/", &root_alias).unwrap();
+        let aliased_root = root_alias.join(root.strip_prefix("/").unwrap());
+        let mut config = test_config(&aliased_root);
+        config.excluded_paths.insert(root_alias);
+        let entries = DirectoryWalker::new(config, ProtectionRegistry::marker_only())
+            .walk()
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path == aliased_root.join("safe"))
+        );
+    }
+
+    #[test]
+    fn exclusion_inside_opaque_artifact_keeps_parent_signal_only_and_discovers_safe_children() {
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("cache");
+        let excluded = cache.join("keep");
+        let safe = cache.join("safe-cache");
+        fs::create_dir_all(excluded.join("nested")).unwrap();
+        fs::create_dir_all(safe.join("payload")).unwrap();
+        fs::write(cache.join("CACHEDIR.TAG"), VALID_CACHEDIR_TAG).unwrap();
+        fs::write(safe.join("CACHEDIR.TAG"), VALID_CACHEDIR_TAG).unwrap();
+        let registry = ArtifactPatternRegistry::default();
+        for opaque_pruning in [false, true] {
+            let mut config = test_config(tmp.path());
+            config.excluded_paths.insert(excluded.clone());
+            config.opaque_pruning = opaque_pruning;
+            let entries = DirectoryWalker::new(config, ProtectionRegistry::marker_only())
+                .walk()
+                .unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| !entry.path.starts_with(&excluded))
+            );
+            let parent = entries.iter().find(|entry| entry.path == cache).unwrap();
+            assert!(parent.walk_classification(&registry).is_none());
+            assert_eq!(
+                parent.opaque_tree.as_ref().unwrap().disposition,
+                OpaqueTreeDisposition::SignalOnly
+            );
+            let safe = entries.iter().find(|entry| entry.path == safe).unwrap();
+            assert!(safe.walk_classification(&registry).is_some());
+        }
+    }
+
     #[test]
     fn skips_protected_directories() {
         let tmp = TempDir::new().unwrap();
@@ -5724,6 +5973,7 @@ mod tests {
                 reads: Arc::default(),
                 unfinished: Arc::clone(&worker_unfinished),
                 dispatch_cursor: None,
+                exclusions: WalkExclusions::new(&config).unwrap(),
             };
             process_directory(
                 WorkItem {
@@ -6094,6 +6344,7 @@ mod tests {
             reads: Arc::default(),
             unfinished: Arc::clone(&unfinished),
             dispatch_cursor: None,
+            exclusions: WalkExclusions::new(config).unwrap(),
         };
         let protection = parking_lot::RwLock::new(ProtectionRegistry::marker_only());
         let cancel = AtomicBool::new(false);

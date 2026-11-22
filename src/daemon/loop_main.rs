@@ -12259,6 +12259,11 @@ fn replay_indexed_record(
     if IndexedIdentity::from(identity) != record.identity {
         return Err(ReplayDrop::IdentityChanged);
     }
+    if protection::path_overlaps_exclusion(path, &scanner_config.excluded_paths) {
+        return Err(ReplayDrop::Vetoed(
+            "excluded by scanner.excluded_paths".to_string(),
+        ));
+    }
     if should_skip_protected_daemon_candidate(
         protection,
         path,
@@ -15524,6 +15529,22 @@ fn batch_protected_paths(
     )
 }
 
+/// Ordinary batches retain every exclusion. A live target-only consent lifts
+/// only the exclusion naming its own root, preserving exclusions above or
+/// inside it and the same rule used when the tier surveyed the candidates.
+fn batch_excluded_paths(
+    batch: &DeletionBatch,
+    scanner: &crate::core::config::ScannerConfig,
+) -> Vec<PathBuf> {
+    if !target_only_consent_current(batch, scanner) {
+        return scanner.excluded_paths.clone();
+    }
+    batch.target_only_root.as_deref().map_or_else(
+        || scanner.excluded_paths.clone(),
+        |root| crate::daemon::target_tier::exclusions_under(root, &scanner.excluded_paths),
+    )
+}
+
 /// Keep only the candidates a target-only batch may hold: strictly inside its
 /// root, with the identity the tier recorded when it surveyed them, and
 /// still pure now (`target_tier::still_pure`). Returns how many were dropped;
@@ -15585,7 +15606,7 @@ fn authorize_target_only_mutation(
         return Ok(());
     };
     authorize_target_only_candidate(candidate, Some(root))?;
-    if crate::daemon::target_tier::is_excluded(
+    if protection::path_overlaps_exclusion(
         &candidate.path,
         &crate::daemon::target_tier::exclusions_under(root, &scanner.excluded_paths),
     ) {
@@ -15609,6 +15630,15 @@ fn authorize_target_only_mutation(
         || !references.summary_for_identity(identity).is_empty()
     {
         return Err(SkipReason::FileOpen);
+    }
+    // The survey and process sweep can outlive an alias change. Recompute
+    // the root-only exception here: an exclusion that pointed at the whole
+    // root on admission may now name a child inside this opaque candidate.
+    if protection::path_overlaps_exclusion(
+        &candidate.path,
+        &crate::daemon::target_tier::exclusions_under(root, &scanner.excluded_paths),
+    ) {
+        return Err(SkipReason::SacredStowaway);
     }
     Ok(())
 }
@@ -16054,6 +16084,7 @@ fn executor_thread_main(
                     || batch.inode_reclaim.is_some()
                     || matches!(scanner_snapshot.engine, ScannerEngineMode::V2),
                 sacred_paths: executor_sacred_paths,
+                excluded_paths: batch_excluded_paths(&batch, &scanner_snapshot),
                 // Layer 7: at Green there is time to keep the bytes around,
                 // so the batch quarantines; from Yellow up the space is
                 // needed and candidates are removed for good.
@@ -28140,6 +28171,73 @@ mod tests {
             assert!(!score.vetoed);
         }
 
+        // Persisted candidates cannot bypass an excluded ancestor or remove
+        // an opaque tree that contains an excluded descendant. The index's
+        // identity and event generation are unchanged in every case.
+        for excluded in [
+            temp.path().to_path_buf(),
+            target.clone(),
+            target.join("debug"),
+            target.join("debug/deps/libfoo.rlib"),
+        ] {
+            let mut scanner = config.scanner.clone();
+            scanner.excluded_paths = vec![excluded.clone()];
+            let result = replay_indexed_record(
+                &record(3),
+                3,
+                &registry,
+                &engine,
+                &scanner,
+                &request,
+                &mut protection,
+                &sacred,
+                &open_files,
+                None,
+                &logger,
+            );
+            assert_eq!(
+                result.unwrap_err(),
+                ReplayDrop::Vetoed("excluded by scanner.excluded_paths".to_string()),
+                "excluded {} must veto replay of {}",
+                excluded.display(),
+                target.display(),
+            );
+        }
+
+        // Resolve exclusions again on replay: an alias can be redirected
+        // into the candidate without changing the candidate's own inode.
+        let other = temp.path().join("other-cache");
+        std::fs::create_dir_all(&other).unwrap();
+        let alias = temp.path().join("excluded-alias");
+        std::os::unix::fs::symlink(&other, &alias).unwrap();
+        let mut aliased = config.scanner.clone();
+        aliased.excluded_paths = vec![alias.clone()];
+        let replay_alias = |protection: &mut ProtectionRegistry| {
+            replay_indexed_record(
+                &record(3),
+                3,
+                &registry,
+                &engine,
+                &aliased,
+                &request,
+                protection,
+                &sacred,
+                &open_files,
+                None,
+                &logger,
+            )
+        };
+        assert!(matches!(
+            replay_alias(&mut protection),
+            Ok(_) | Err(ReplayDrop::NotDelete(_))
+        ));
+        std::fs::rename(&alias, temp.path().join("previous-excluded-alias")).unwrap();
+        std::os::unix::fs::symlink(target.join("debug"), &alias).unwrap();
+        assert_eq!(
+            replay_alias(&mut protection).unwrap_err(),
+            ReplayDrop::Vetoed("excluded by scanner.excluded_paths".to_string()),
+        );
+
         // A stale generation is never trusted; the walker re-discovers it.
         assert_eq!(
             replay(&record(2), 3, &mut protection).unwrap_err(),
@@ -30167,6 +30265,136 @@ mod tests {
                 .is_ok()
         );
         assert!(candidate.path.join("debug/deps/libdemo.rlib").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn target_only_exclusion_alias_is_renewed_after_the_reference_sweep() {
+        use crate::platform::types::{
+            ExecutablesResult, MappedRegion, OpenFilesResult, ProcessInfo,
+        };
+        use std::os::unix::fs::symlink;
+
+        struct RetargetDuringReferences {
+            inner: MockPlatform,
+            alias: PathBuf,
+            destination: PathBuf,
+            retarget: AtomicBool,
+            changed: AtomicBool,
+        }
+        impl Platform for RetargetDuringReferences {
+            fn name(&self) -> &'static str {
+                self.inner.name()
+            }
+            fn fs_stats(&self, path: &Path) -> Result<crate::platform::pal::FsStats> {
+                self.inner.fs_stats(path)
+            }
+            fn mount_points(&self) -> Result<Vec<crate::platform::pal::MountPoint>> {
+                self.inner.mount_points()
+            }
+            fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+                self.inner.is_ram_backed(path)
+            }
+            fn default_paths(&self) -> crate::platform::pal::PlatformPaths {
+                self.inner.default_paths()
+            }
+            fn memory_info(&self) -> Result<MemoryInfo> {
+                self.inner.memory_info()
+            }
+            fn service_manager(&self) -> Box<dyn crate::platform::pal::ServiceManager> {
+                self.inner.service_manager()
+            }
+            fn process_list_without_command_lines(&self) -> Result<Vec<ProcessInfo>> {
+                if self.retarget.swap(false, Ordering::AcqRel) {
+                    std::fs::rename(&self.alias, self.alias.with_extension("previous")).unwrap();
+                    symlink(&self.destination, &self.alias).unwrap();
+                    self.changed.store(true, Ordering::Release);
+                }
+                self.inner.process_list_without_command_lines()
+            }
+            fn build_directories_in_use_checked(&self) -> (Vec<(i32, PathBuf)>, bool) {
+                self.inner.build_directories_in_use_checked()
+            }
+            fn open_files_under(&self, path: &Path) -> Result<OpenFilesResult> {
+                self.inner.open_files_under(path)
+            }
+            fn executables_under(&self, path: &Path) -> Result<ExecutablesResult> {
+                self.inner.executables_under(path)
+            }
+            fn mmap_regions_under(&self, path: &Path) -> Result<Vec<MappedRegion>> {
+                self.inner.mmap_regions_under(path)
+            }
+        }
+
+        for retarget in [false, true] {
+            let scratch = temp_root_scratch_dir();
+            let root = scratch.path().join("original/deps");
+            let candidate = target_mutation_candidate(&root, "session/target", 1.0);
+            let payload = candidate.path.join("debug/deps/libdemo.rlib");
+            let alias = scratch.path().join("exclusion-parent");
+            symlink(root.parent().unwrap(), &alias).unwrap();
+            let excluded = alias.join("deps");
+            let scanner = ScannerConfig {
+                target_only_roots: vec![root.clone()],
+                excluded_paths: vec![excluded.clone()],
+                ..ScannerConfig::default()
+            };
+            // Seed the ordinary ancestor-resolution cache. Safety must not
+            // borrow its old root-wide exemption after the parent link moves.
+            assert_eq!(
+                crate::core::paths::resolve_absolute_path(&excluded),
+                std::fs::canonicalize(&root).unwrap()
+            );
+            assert!(
+                crate::daemon::target_tier::exclusions_under(&root, &scanner.excluded_paths)
+                    .is_empty()
+            );
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    min_score: 0.0,
+                    check_open_files: true,
+                    require_identity: true,
+                    ..DeletionConfig::default()
+                },
+                None,
+            )
+            .with_platform(Arc::new(MockPlatform::healthy()));
+            let plan = executor.plan(vec![candidate.clone()]);
+            assert_eq!(plan.candidates.len(), 1);
+            let platform = RetargetDuringReferences {
+                inner: MockPlatform::healthy(),
+                alias,
+                destination: candidate.path.join("debug"),
+                retarget: AtomicBool::new(retarget),
+                changed: AtomicBool::new(false),
+            };
+            let now = SystemTime::now() + Duration::from_hours(25);
+            let heartbeat = ThreadHeartbeat::new("target-exclusion-renewal");
+            let authorize = |candidate: &CandidacyScore| {
+                authorize_target_only_mutation(
+                    candidate,
+                    Some(&root),
+                    &scanner,
+                    Some(&platform),
+                    now,
+                    &heartbeat,
+                )
+            };
+            let report = executor.execute_with_hooks(&plan, None, Some(&authorize), None);
+            assert_eq!(platform.changed.load(Ordering::Acquire), retarget);
+            assert_eq!(report.items_deleted, usize::from(!retarget), "{report:?}");
+            assert_eq!(report.items_failed, 0, "{report:?}");
+            if retarget {
+                assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+                assert_eq!(std::fs::read(&payload).unwrap(), [7_u8; 64]);
+            } else {
+                assert!(
+                    !payload.exists(),
+                    "the root-only exception must remain usable"
+                );
+            }
+        }
     }
 
     /// A target-only batch can outlive the purity observation that admitted

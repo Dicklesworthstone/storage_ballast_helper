@@ -107,6 +107,10 @@ pub struct DeletionConfig {
     /// `Default` still refuses the markers every route must honor; the daemon
     /// and CLI extend it with the platform catalog and operator patterns.
     pub sacred_paths: Vec<SacredPath>,
+    /// Excluded paths, checked again before mutation. A candidate containing
+    /// an excluded descendant is refused as well as candidates beneath one.
+    /// Aliases are resolved afresh so queued plans cannot retain stale scope.
+    pub excluded_paths: Vec<PathBuf>,
     /// Bounds for the pre-flight containment sub-walk. A walk that exhausts
     /// its budget before proving the subtree marker-free fails closed.
     pub stowaway_scan: StowawayScanConfig,
@@ -138,6 +142,7 @@ impl Default for DeletionConfig {
             require_identity: false,
             include_review: false,
             sacred_paths: cross_platform_sacred_paths().to_vec(),
+            excluded_paths: Vec::new(),
             stowaway_scan: StowawayScanConfig::default(),
             mode: DeletionMode::Unlink,
             quarantine_ttl: Duration::from_secs(quarantine::DEFAULT_TTL_HOURS * 3600),

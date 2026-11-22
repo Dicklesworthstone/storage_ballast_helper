@@ -343,12 +343,18 @@ pub(super) fn is_excluded(dir: &Path, excluded: &[PathBuf]) -> bool {
 /// `/private/tmp/claude-501` in `excluded_paths`, and with that entry applied
 /// the tier found no targets on that Mac (2026-11-03). `target_only_roots` exists to
 /// look inside exactly such a root. An excluded ancestor of the root, and an
-/// entry inside it, still exclude.
+/// entry inside it, still exclude. Renew aliases on every admission: a cached
+/// root-wide exception must not hide an exclusion that now names a child.
 pub(super) fn exclusions_under(root: &Path, excluded: &[PathBuf]) -> Vec<PathBuf> {
-    let root = resolve_absolute_path(root);
+    let Ok([_, root]) = crate::scanner::protection::exclusion_path_spellings(root) else {
+        return excluded.to_vec();
+    };
     excluded
         .iter()
-        .filter(|path| resolve_absolute_path(path) != root)
+        .filter(|path| {
+            !crate::scanner::protection::exclusion_path_spellings(path)
+                .is_ok_and(|[_, resolved]| resolved == root)
+        })
         .cloned()
         .collect()
 }
@@ -2085,6 +2091,41 @@ pub(super) mod tests {
         assert!(is_excluded(Path::new("/data/tmp/rch/keep/tree"), &excluded));
         assert!(!is_excluded(Path::new("/data/tmp/rch/keeper"), &excluded));
         assert!(!is_excluded(Path::new("/data/tmp/rch"), &excluded));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_exclusion_exemption_rechecks_parent_aliases_and_unknown_targets() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().join("original/deps");
+        let target = root.join("session/target");
+        fs::create_dir_all(target.join("debug/deps")).unwrap();
+        let alias = scratch.path().join("exclusion-parent");
+        symlink(root.parent().unwrap(), &alias).unwrap();
+        let excluded = alias.join("deps");
+        assert_eq!(
+            resolve_absolute_path(&excluded),
+            fs::canonicalize(&root).unwrap()
+        );
+        assert!(exclusions_under(&root, std::slice::from_ref(&excluded)).is_empty());
+
+        fs::rename(&alias, scratch.path().join("previous-alias")).unwrap();
+        symlink(target.join("debug"), &alias).unwrap();
+        let retained = exclusions_under(&root, std::slice::from_ref(&excluded));
+        assert_eq!(retained, vec![excluded]);
+        assert!(crate::scanner::protection::path_overlaps_exclusion(
+            &target, &retained
+        ));
+
+        // An unresolvable alias cannot obtain the narrow root-only exception.
+        let dangling = scratch.path().join("dangling-alias");
+        symlink(scratch.path().join("missing"), &dangling).unwrap();
+        assert_eq!(
+            exclusions_under(&root, std::slice::from_ref(&dangling)),
+            vec![dangling]
+        );
     }
 
     #[test]

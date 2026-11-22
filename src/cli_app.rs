@@ -2073,13 +2073,12 @@ fn why_not_report(
     let _ = protection.discover_markers(path, 1);
     let _ = protection.discover_ancestor_markers(path);
     let protection_reason = protection.protection_reason(path);
-    // The walker excludes exact directories, not prefixes (the default list
-    // holds `/`, which would otherwise cover everything).
-    let excluded = config
-        .scanner
-        .excluded_paths
-        .iter()
-        .any(|excluded| excluded == path);
+    // Exclusions cover subtrees and enclosing deletion candidates. The default
+    // `/` entry is an exact-only sentinel, so it does not cover every scan.
+    let excluded = storage_ballast_helper::scanner::protection::path_overlaps_exclusion(
+        path,
+        &config.scanner.excluded_paths,
+    );
 
     let mut report = WhyNotReport {
         path: path.to_path_buf(),
@@ -2206,6 +2205,7 @@ fn why_not_report(
             check_open_files: true,
             require_identity: matches!(config.scanner.engine, ScannerEngineMode::V2),
             sacred_paths,
+            excluded_paths: config.scanner.excluded_paths.clone(),
             ..Default::default()
         },
         None,
@@ -15818,6 +15818,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
         check_open_files: true,
         require_identity: matches!(config.scanner.engine, ScannerEngineMode::V2),
         sacred_paths,
+        excluded_paths: config.scanner.excluded_paths.clone(),
         // Layer 7: a manual clean has time to keep the bytes around.
         mode: if args.no_quarantine || !config.scanner.quarantine_enabled {
             DeletionMode::Unlink
@@ -18239,6 +18240,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         // still applies.
         include_review: true,
         sacred_paths,
+        excluded_paths: config.scanner.excluded_paths.clone(),
         ..Default::default()
     };
     let executor = DeletionExecutor::new(deletion_config, None);
