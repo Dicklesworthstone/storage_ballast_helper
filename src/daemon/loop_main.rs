@@ -2328,6 +2328,9 @@ struct PressureBehaviorState {
     mode: BehaviorMode,
     last_escalation_at: Option<Instant>,
     last_recovery_at: Option<Instant>,
+    /// Most recent observation confirming the applied cell. Recovery waits
+    /// from this observation; unchanged pressure is not evidence of relief.
+    last_confirmed_at: Option<Instant>,
     pending_target: Option<PendingBehaviorTarget>,
 }
 
@@ -2345,6 +2348,7 @@ impl PressureBehaviorState {
             mode,
             last_escalation_at: None,
             last_recovery_at: None,
+            last_confirmed_at: None,
             pending_target: None,
         }
     }
@@ -2402,6 +2406,7 @@ impl PressureBehaviorState {
             && self.disk_level == disk_level
             && self.mode == next_mode
         {
+            self.last_confirmed_at = Some(now);
             self.pending_target = None;
             return BehaviorUpdate::Unchanged;
         }
@@ -2418,6 +2423,7 @@ impl PressureBehaviorState {
             transition_direction(self.memory_level, memory_level, self.disk_level, disk_level)
         else {
             let transition = self.apply_behavior_transition(memory_level, disk_level, next_mode);
+            self.last_confirmed_at = Some(now);
             self.pending_target = None;
             return BehaviorUpdate::Applied(transition);
         };
@@ -2439,6 +2445,7 @@ impl PressureBehaviorState {
 
         let transition = self.apply_behavior_transition(memory_level, disk_level, next_mode);
         self.record_transition_direction(direction, now);
+        self.last_confirmed_at = Some(now);
         self.pending_target = None;
         BehaviorUpdate::Applied(transition)
     }
@@ -2475,7 +2482,16 @@ impl PressureBehaviorState {
 
         let last = match direction {
             BehaviorTransitionDirection::Escalating => self.last_escalation_at,
-            BehaviorTransitionDirection::Recovering => self.last_recovery_at,
+            // A lower-pressure tick immediately after an escalation can be
+            // a partial observation of the host, not a real recovery. Keep
+            // the raised behavior for its dwell interval after the latest
+            // confirming observation, as well as spacing recoveries. Without
+            // that dwell, Critical -> Yellow applies at once while the next
+            // Critical tick is held by the escalation
+            // cooldown, leaving the daemon in the weaker cell under pressure.
+            BehaviorTransitionDirection::Recovering => {
+                self.last_recovery_at.max(self.last_confirmed_at)
+            }
         }?;
         let elapsed = now.saturating_duration_since(last);
         if elapsed >= min_interval {
@@ -24025,6 +24041,7 @@ mod tests {
 
         daemon.behavior_state.last_recovery_at =
             Instant::now().checked_sub(Duration::from_secs(61));
+        daemon.behavior_state.last_confirmed_at = daemon.behavior_state.last_recovery_at;
         daemon.update_behavior_mode(
             MemoryPressureLevel::Normal,
             response.level,
@@ -35142,6 +35159,121 @@ mod tests {
                 assert_eq!(transition.to_disk, PressureLevel::Green);
             }
             other => panic!("deferred recovery should apply after hysteresis: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn critical_behavior_survives_interleaved_lower_pressure_observations() {
+        let t0 = Instant::now();
+        let hysteresis = Duration::from_secs(5);
+        let mut state = PressureBehaviorState::new(
+            BehaviorDispatchTable::default(),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Yellow,
+        );
+        assert!(matches!(
+            state.update_with_hysteresis(
+                MemoryPressureLevel::Normal,
+                PressureLevel::Critical,
+                t0,
+                hysteresis,
+            ),
+            BehaviorUpdate::Applied(_)
+        ));
+        let critical_mode = state.mode;
+        assert_eq!(critical_mode.ballast_action, BallastAction::ReleaseFirst);
+        assert_eq!(
+            critical_mode.notification_priority,
+            NotificationPriority::Emergency
+        );
+
+        // bd-de9a: a partial tick can see only a Yellow peer while another
+        // mount remains Critical. Repeat beyond the initial dwell interval:
+        // every confirmed Critical tick must cancel and re-arm recovery.
+        for second in 0..20 {
+            let tick = t0 + Duration::from_secs(second);
+            assert!(matches!(
+                state.update_with_hysteresis(
+                    MemoryPressureLevel::Normal,
+                    PressureLevel::Yellow,
+                    tick + Duration::from_millis(250),
+                    hysteresis,
+                ),
+                BehaviorUpdate::Deferred {
+                    direction: BehaviorTransitionDirection::Recovering,
+                    repeated: false,
+                    ..
+                }
+            ));
+            assert_eq!(state.disk_level, PressureLevel::Critical);
+            assert_eq!(state.mode, critical_mode);
+            assert!(matches!(
+                state.update_with_hysteresis(
+                    MemoryPressureLevel::Normal,
+                    PressureLevel::Critical,
+                    tick + Duration::from_millis(500),
+                    hysteresis,
+                ),
+                BehaviorUpdate::Unchanged
+            ));
+            assert!(!state.has_pending_target());
+        }
+
+        let recovery_at = t0 + Duration::from_millis(24_500);
+        assert!(matches!(
+            state.update_with_hysteresis(
+                MemoryPressureLevel::Normal,
+                PressureLevel::Yellow,
+                recovery_at - Duration::from_millis(1),
+                hysteresis,
+            ),
+            BehaviorUpdate::Deferred { .. }
+        ));
+        assert!(matches!(
+            state.update_with_hysteresis(
+                MemoryPressureLevel::Normal,
+                PressureLevel::Yellow,
+                recovery_at,
+                hysteresis,
+            ),
+            BehaviorUpdate::Applied(_)
+        ));
+        assert_eq!(state.disk_level, PressureLevel::Yellow);
+
+        // The recovery dwell must not also postpone renewed danger. Only
+        // another recent escalation can activate the escalation cooldown.
+        assert!(matches!(
+            state.update_with_hysteresis(
+                MemoryPressureLevel::Normal,
+                PressureLevel::Critical,
+                recovery_at + Duration::from_millis(250),
+                hysteresis,
+            ),
+            BehaviorUpdate::Applied(_)
+        ));
+        assert_eq!(state.mode, critical_mode);
+    }
+
+    #[test]
+    fn disabled_behavior_hysteresis_allows_immediate_recovery_after_escalation() {
+        let t0 = Instant::now();
+        let mut state = PressureBehaviorState::new(
+            BehaviorDispatchTable::default(),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Yellow,
+        );
+        for (millis, level) in [(0, PressureLevel::Critical), (250, PressureLevel::Yellow)] {
+            assert!(matches!(
+                state.update_with_hysteresis(
+                    MemoryPressureLevel::Normal,
+                    level,
+                    t0 + Duration::from_millis(millis),
+                    Duration::ZERO,
+                ),
+                BehaviorUpdate::Applied(_)
+            ));
+            assert_eq!(state.disk_level, level);
+            assert!(!state.has_pending_target());
         }
     }
 
