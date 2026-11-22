@@ -1104,7 +1104,9 @@ impl BallastPoolCoordinator {
     /// Retired reserves go first so release does not depend on opening or
     /// allocating anything in the managed directory. Preserve partial progress
     /// if that directory subsequently fails; each error remains in the report.
-    /// Returns None if there is no pool, no inventory, or no release requested.
+    /// A cached empty inventory does not rule out an external provision.
+    /// Returns None if there is no pool, no release requested, or the locked
+    /// release finds no files and no error to report.
     pub fn release_for_mount(
         &mut self,
         mount_path: &Path,
@@ -1114,7 +1116,7 @@ impl BallastPoolCoordinator {
         let Some(pool) = self.pools.get_mut(&key) else {
             return Ok(None);
         };
-        if count == 0 || pool.available_count() == 0 {
+        if count == 0 {
             return Ok(None);
         }
 
@@ -1125,7 +1127,10 @@ impl BallastPoolCoordinator {
 
         let mut report = pool.stranded.release(count);
         let wanted = count.saturating_sub(report.files_released);
-        if wanted > 0 && pool.manager.available_count() > 0 {
+        if wanted > 0 {
+            // The manager re-enumerates canonical slots under the existing
+            // nonblocking pool lock. Startup/release inventory may be empty
+            // even though another sbh process has since provisioned reserve.
             match pool.manager.release(wanted) {
                 Ok(managed) => {
                     report.files_released =
@@ -1143,7 +1148,11 @@ impl BallastPoolCoordinator {
                 }
             }
         }
-        Ok(Some(report))
+        if report.files_released == 0 && report.errors.is_empty() && report.warnings.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(report))
+        }
     }
 
     /// Replenish at most one ballast file on a specific mount point after
@@ -2376,6 +2385,86 @@ mod tests {
             .release_for_mount(Path::new("/nonexistent"), 1)
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_rechecks_an_externally_provisioned_empty_pool_under_its_lock() {
+        use rustix::fs::{FlockOperation, flock};
+
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let platform = mock_platform_two_volumes(dir_a.path(), dir_b.path());
+        let watched = vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()];
+        let config = tiny_ballast_config();
+        let mut coordinator =
+            BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        let pool = coordinator.pool_for_mount(dir_a.path()).unwrap();
+        let directory = pool.ballast_dir.clone();
+        assert_eq!(pool.available_count(), 0);
+
+        // A separate CLI invocation provisions after the daemon's discovery.
+        let mut external = BallastManager::new_unfloored(directory.clone(), config).unwrap();
+        assert_eq!(external.provision(None).unwrap().files_created, 3);
+        assert_eq!(
+            coordinator
+                .pool_for_mount(dir_a.path())
+                .unwrap()
+                .available_count(),
+            0,
+            "external provisioning does not update the daemon's cached inventory"
+        );
+
+        let lock = std::fs::File::open(directory.join(".lock")).unwrap();
+        flock(&lock, FlockOperation::LockExclusive).unwrap();
+        let busy = coordinator
+            .release_for_mount(dir_a.path(), 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(busy.files_released, 0);
+        assert!(
+            !busy.errors.is_empty(),
+            "the native lock still governs release"
+        );
+        assert!(directory.join("SBH_BALLAST_FILE_00003.dat").exists());
+        flock(&lock, FlockOperation::Unlock).unwrap();
+
+        let released = coordinator
+            .release_for_mount(dir_a.path(), 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(released.files_released, 2);
+        assert!(released.errors.is_empty());
+        assert_eq!(
+            coordinator
+                .pool_for_mount(dir_a.path())
+                .unwrap()
+                .available_count(),
+            1
+        );
+        assert_eq!(
+            coordinator
+                .pool_for_mount(dir_b.path())
+                .unwrap()
+                .available_count(),
+            0
+        );
+        assert!(!directory.join("SBH_BALLAST_FILE_00003.dat").exists());
+        assert!(directory.join("SBH_BALLAST_FILE_00001.dat").exists());
+        assert_eq!(
+            coordinator
+                .release_for_mount(dir_a.path(), 1)
+                .unwrap()
+                .unwrap()
+                .files_released,
+            1
+        );
+        assert!(
+            coordinator
+                .release_for_mount(dir_a.path(), 1)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -8926,7 +8926,7 @@ impl MonitoringDaemon {
                 .map_or((false, false, None), |pool| {
                     (
                         true,
-                        pool.available_count() > 0,
+                        self.ballast_available_for_release(&mount) > 0,
                         Some(pool.ballast_dir.clone()),
                     )
                 });
@@ -9992,10 +9992,7 @@ impl MonitoringDaemon {
                 |root| root.display().to_string(),
             );
 
-        let available = self.ballast_coordinator.pool_for_mount(mount).map_or(
-            0,
-            super::super::ballast::coordinator::BallastPool::available_count,
-        );
+        let available = self.ballast_available_for_release(mount);
         self.ballast_reserve_monitor.invalidate(&pool_mount);
         let mut released = 0;
         if available > 0
@@ -10061,10 +10058,7 @@ impl MonitoringDaemon {
             if found == 0 && (!complete || unresolved_root) {
                 continue;
             }
-            let releasable = self
-                .ballast_coordinator
-                .pool_for_mount(&mount)
-                .is_some_and(|pool| pool.available_count() > 0);
+            let releasable = self.ballast_available_for_release(&mount) > 0;
             let Some(controller) = self.mount_controllers.get_mut(&mount) else {
                 continue;
             };
@@ -10093,6 +10087,21 @@ impl MonitoringDaemon {
         self.ballast_coordinator
             .pool_for_mount(mount)
             .map_or_else(|| mount.to_path_buf(), |pool| pool.mount_point.clone())
+    }
+
+    /// Reuse a current observer's count to notice externally provisioned
+    /// reserve without native inventory work on every pressure tick. Keep
+    /// cached actuator inventory only when no current observation exists.
+    /// Observed depletion also matters: the controller credits external
+    /// releases toward its cumulative target rather than spending them again.
+    /// Only the manager's locked scan authorizes removal of an actual file.
+    fn ballast_available_for_release(&self, mount: &Path) -> usize {
+        let Some(pool) = self.ballast_coordinator.pool_for_mount(mount) else {
+            return 0;
+        };
+        self.ballast_reserve_monitor
+            .release_count_hint(&pool.mount_point, &pool.ballast_dir, Instant::now())
+            .unwrap_or_else(|| pool.available_count())
     }
 
     /// Only native release/control actions call this. Periodic state output
@@ -10256,10 +10265,10 @@ impl MonitoringDaemon {
         mount: &std::path::Path,
         response: &crate::monitor::pid::PressureResponse,
     ) -> Result<usize> {
+        let available = self.ballast_available_for_release(mount);
         let Some(pool) = self.ballast_coordinator.pool_for_mount(mount) else {
             return Ok(0);
         };
-        let available = pool.available_count();
         let expected = pool.expected_count();
         // A same-filesystem alias mount shares its keeper's pool; release
         // history lives under the pool's own mount, the key it is saved and
@@ -17243,6 +17252,216 @@ mod tests {
             "initial growth binds its newly created directory"
         );
         assert_eq!(history["release_credit"], 0);
+    }
+
+    #[cfg(unix)]
+    fn wait_for_ballast_observation(
+        daemon: &mut MonitoringDaemon,
+        mount: &Path,
+        expected_count: usize,
+    ) {
+        let pool = daemon.ballast_coordinator.pool_for_mount(mount).unwrap();
+        let pool_mount = pool.mount_point.clone();
+        let directory = pool.ballast_dir.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let now = Instant::now();
+            daemon
+                .ballast_reserve_monitor
+                .tick(&daemon.ballast_coordinator, &daemon.platform, now)
+                .unwrap();
+            if daemon
+                .ballast_reserve_monitor
+                .release_count_hint(&pool_mount, &directory, now)
+                == Some(expected_count)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "reserve count {expected_count} on {} was not observed",
+                pool_mount.display()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn externally_provisioned_ballast_wakes_idle_reclaim_and_mount_recovery() {
+        for recovery in [false, true] {
+            let mut fixture = RegretDaemonFixture::new();
+            let daemon = &mut fixture.daemon;
+            daemon.config.ballast.file_count = 2;
+            daemon.config.ballast.file_size_bytes = 8192;
+            daemon.ballast_coordinator =
+                DiscoverySnapshot::collect(&daemon.config, &daemon.platform)
+                    .unwrap()
+                    .ballast_coordinator;
+            daemon.ballast_reserve_monitor = BallastReserveMonitor::default();
+            let mount = Path::new("/");
+            let tick = quarantine_tick(PressureLevel::Critical, mount);
+            let now = Instant::now();
+            let mut controller =
+                MountController::new(mount.to_path_buf(), mount_controller_config(&daemon.config));
+            controller.observe(MountTickInput {
+                level: PressureLevel::Critical,
+                urgency: 1.0,
+                free_pct: 1.0,
+                seconds_to_red: None,
+                prediction_confident: false,
+                surface: MountSurface {
+                    configured_roots: 1,
+                    ballast_pool: true,
+                    ..Default::default()
+                },
+                releasable_ballast: false,
+                recovery_needed: false,
+                recovery_probe_ok: None,
+                wake: WakeSignals::default(),
+                now,
+            });
+            controller.note_pass(0, false, now);
+            assert_eq!(controller.state(), MountState::Idle);
+            daemon
+                .mount_controllers
+                .insert(mount.to_path_buf(), controller);
+            daemon.wake_next_tick = WakeSignals::default();
+            daemon.undelivered_wakes.clear();
+            daemon.behavior_state = PressureBehaviorState::new(
+                BehaviorDispatchTable::default(),
+                MemoryPressureLevel::Normal,
+                PressureLevel::Critical,
+            );
+
+            let mut external = DiscoverySnapshot::collect(&daemon.config, &daemon.platform)
+                .unwrap()
+                .ballast_coordinator;
+            assert_eq!(
+                external
+                    .provision_all(daemon.platform.as_ref())
+                    .unwrap()
+                    .total_files_created(),
+                2
+            );
+            assert_eq!(daemon.ballast_available_for_release(mount), 0);
+            wait_for_ballast_observation(daemon, mount, 2);
+            assert_eq!(
+                daemon
+                    .ballast_coordinator
+                    .pool_for_mount(mount)
+                    .unwrap()
+                    .available_count(),
+                0,
+                "the observation remains separate from actuator inventory"
+            );
+
+            if recovery {
+                daemon.enter_mount_recovery(mount, &tick.response);
+            } else {
+                let (scan_tx, scan_rx) = bounded(4);
+                let (del_tx, _del_rx) = bounded(4);
+                daemon.mount_responses = vec![tick.clone()];
+                daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+                assert_eq!(daemon.mount_controllers[mount].state(), MountState::Reclaim);
+            }
+            for index in 1..=2 {
+                assert!(
+                    !daemon
+                        .config
+                        .paths
+                        .ballast_dir
+                        .join(format!("SBH_BALLAST_FILE_{index:05}.dat"))
+                        .exists(),
+                    "externally provisioned reserve must be released (recovery={recovery})"
+                );
+            }
+            assert_eq!(daemon.ballast_available_for_release(mount), 0);
+            let history = serde_json::to_value(
+                daemon
+                    .release_controller
+                    .cached_pool_history(mount)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(history["available"], 0);
+            assert_eq!(history["release_credit"], 2);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_external_depletion_satisfies_orange_release_budget() {
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        daemon.config.ballast.file_count = 3;
+        daemon.config.ballast.file_size_bytes = 8192;
+        daemon.ballast_coordinator = DiscoverySnapshot::collect(&daemon.config, &daemon.platform)
+            .unwrap()
+            .ballast_coordinator;
+        assert_eq!(
+            daemon
+                .ballast_coordinator
+                .provision_all(daemon.platform.as_ref())
+                .unwrap()
+                .total_files_created(),
+            3
+        );
+        let mount = Path::new("/");
+        daemon.reconcile_ballast_inventory(mount);
+        daemon.ballast_reserve_monitor = BallastReserveMonitor::default();
+        let directory = daemon.config.paths.ballast_dir.clone();
+
+        let mut external = DiscoverySnapshot::collect(&daemon.config, &daemon.platform)
+            .unwrap()
+            .ballast_coordinator;
+        assert_eq!(
+            external
+                .release_for_mount(mount, 1)
+                .unwrap()
+                .unwrap()
+                .files_released,
+            1
+        );
+        wait_for_ballast_observation(daemon, mount, 2);
+        assert_eq!(
+            daemon
+                .ballast_coordinator
+                .pool_for_mount(mount)
+                .unwrap()
+                .available_count(),
+            3,
+            "the actuator retains its older, higher inventory"
+        );
+
+        // Orange needs one file of cumulative relief. The external release
+        // has already supplied it; max(observed, cached) would conceal that
+        // depletion and spend a second file. Repeated recommendations must
+        // also leave the observed credit unchanged.
+        let mut response = quarantine_tick(PressureLevel::Orange, mount).response;
+        response.urgency = 0.3;
+        response.release_ballast_files = 1;
+        for _ in 0..2 {
+            assert_eq!(daemon.release_ballast(mount, &response).unwrap(), 0);
+        }
+        assert_eq!(daemon.ballast_available_for_release(mount), 2);
+        let history = serde_json::to_value(
+            daemon
+                .release_controller
+                .cached_pool_history(mount)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(history["available"], 2);
+        assert_eq!(history["release_credit"], 1);
+        assert!(!directory.join("SBH_BALLAST_FILE_00003.dat").exists());
+        for index in 1..=2 {
+            assert!(
+                directory
+                    .join(format!("SBH_BALLAST_FILE_{index:05}.dat"))
+                    .exists()
+            );
+        }
     }
 
     #[cfg(unix)]

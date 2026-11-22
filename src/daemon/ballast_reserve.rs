@@ -335,6 +335,25 @@ impl BallastReserveMonitor {
         self.observations.get(mount).map(|value| &value.snapshot)
     }
 
+    /// Fresh inventory can wake a release even when another process filled
+    /// an empty managed pool. This is a scheduling hint, not mutation or
+    /// refill authority: the release still inspects actual slots under lock.
+    pub(super) fn release_count_hint(
+        &self,
+        mount: &Path,
+        directory: &Path,
+        now: Instant,
+    ) -> Option<usize> {
+        let observation = self.observations.get(mount)?;
+        (!observation.pending
+            && observation.snapshot.inventory_authoritative
+            && observation.snapshot.ballast_dir == directory
+            && now
+                .checked_duration_since(observation.started_at)
+                .is_some_and(|age| age < MAX_OBSERVATION_AGE))
+        .then_some(observation.snapshot.files_available)
+    }
+
     /// Retry the latest transition without replaying its activity log entry.
     /// The notification manager deduplicates accepted deliveries, but leaves
     /// disabled or full-queue delivery eligible for a subsequent tick.
@@ -571,6 +590,54 @@ mod tests {
                 _ => panic!("unexpected reserve event"),
             })
             .collect()
+    }
+
+    #[test]
+    fn release_hint_requires_current_authoritative_observation_of_the_same_pool() {
+        let fixture = Fixture::new();
+        let mut monitor = BallastReserveMonitor::default();
+        let now = Instant::now();
+        let directory = fixture
+            .coordinator
+            .pool_for_mount(fixture.mount())
+            .unwrap()
+            .ballast_dir
+            .clone();
+        assert_eq!(
+            monitor.release_count_hint(fixture.mount(), &directory, now),
+            None
+        );
+        fixture.observe(&mut monitor, now);
+        assert_eq!(
+            monitor.release_count_hint(fixture.mount(), &directory, now),
+            Some(10)
+        );
+        assert_eq!(
+            monitor.release_count_hint(fixture.mount(), &directory.join("replacement"), now),
+            None
+        );
+        // Expiry is checked by the accessor even before the next monitor tick.
+        assert_eq!(
+            monitor.release_count_hint(fixture.mount(), &directory, now + MAX_OBSERVATION_AGE),
+            None
+        );
+        monitor.invalidate_at(fixture.mount(), now);
+        assert_eq!(
+            monitor.release_count_hint(fixture.mount(), &directory, now),
+            None
+        );
+        fixture.observe(&mut monitor, now);
+        assert_eq!(
+            monitor.release_count_hint(fixture.mount(), &directory, now),
+            Some(10)
+        );
+        fixture.platform.readonly.store(true, Ordering::Release);
+        fixture.observe(&mut monitor, now);
+        assert_eq!(
+            monitor.release_count_hint(fixture.mount(), &directory, now),
+            None
+        );
+        assert!(directory.join("SBH_BALLAST_FILE_00010.dat").exists());
     }
 
     #[test]
