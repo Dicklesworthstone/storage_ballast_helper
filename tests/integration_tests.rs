@@ -4303,6 +4303,118 @@ fn config_path_and_validate_agree_and_log_explains_missing_file() {
     );
 }
 
+#[test]
+fn log_tail_preserves_json_records_and_honors_human_output() {
+    let fixture = tempfile::tempdir().unwrap();
+    let config_path = fixture.path().join("config.toml");
+    let log_path = fixture.path().join("activity.jsonl");
+    fs::write(
+        &config_path,
+        format!("[paths]\njsonl_log = {:?}\n", log_path.to_str().unwrap()),
+    )
+    .unwrap();
+    fs::write(
+        &log_path,
+        "{\"ts\":\"first\",\"event\":\"scan\",\"bytes\":1}\n\
+         {\"event\":\"pressure\"}\n\
+         {\"ts\":\"second\",\"event\":\"scan\",\"bytes\":2}\n\
+         broken { record\n",
+    )
+    .unwrap();
+    let config_arg = config_path.to_str().unwrap();
+    let json = common::run_cli_case(
+        "log_tail_filtered_json",
+        &[
+            "--config", config_arg, "log", "--tail", "2", "--type", "SCAN", "--json",
+        ],
+    );
+    assert_cli_success(&json, "log --json");
+    let records: Vec<Value> = json
+        .stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["bytes"], 1);
+    assert_eq!(records[1]["bytes"], 2);
+    let human = common::run_cli_case(
+        "log_tail_filtered_human",
+        &[
+            "--config", config_arg, "log", "--tail", "1", "--type", "scan",
+        ],
+    );
+    assert_cli_success(&human, "log in human mode");
+    assert_eq!(human.stdout.trim(), "second  scan");
+    let damaged = common::run_cli_case(
+        "log_tail_damaged_json",
+        &["--config", config_arg, "log", "--tail", "1", "--json"],
+    );
+    assert_cli_success(&damaged, "log of damaged JSONL");
+    let record = parse_json_stdout(&damaged);
+    assert_eq!(record["event"], "invalid_log_line");
+    assert_eq!(record["raw"], "broken { record");
+}
+
+#[test]
+fn log_follow_streams_json_after_rename_and_copytruncate_rotation() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let config_path = fixture.path().join("config.toml");
+    let log_path = fixture.path().join("activity.jsonl");
+    fs::write(
+        &config_path,
+        format!("[paths]\njsonl_log = {:?}\n", log_path.to_str().unwrap()),
+    )
+    .unwrap();
+    fs::write(&log_path, "{\"event\":\"ready\"}\n").unwrap();
+    let child = Command::new(common::sbh_bin_path())
+        .arg("--config")
+        .arg(&config_path)
+        .args(["log", "--json", "--follow", "--tail", "1"])
+        .env("SBH_OUTPUT_FORMAT", "human")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = ChildGuard::new(child);
+    let stdout = child.child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let output_reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let next = || -> Value {
+        let line = receiver
+            .recv_timeout(Duration::from_secs(15))
+            .expect("a complete log record should reach the pipe promptly")
+            .unwrap();
+        serde_json::from_str(&line).expect("--json must emit JSONL during follow")
+    };
+    assert_eq!(next()["event"], "ready");
+
+    fs::rename(&log_path, fixture.path().join("activity.jsonl.1")).unwrap();
+    fs::write(&log_path, "{\"event\":\"renamed\",\"bytes\":42}\n").unwrap();
+    let renamed = next();
+    assert_eq!(renamed["event"], "renamed");
+    assert_eq!(renamed["bytes"], 42);
+
+    // Rewrite the same inode to a size beyond the old cursor between polls;
+    // an EOF-size check alone silently skips the beginning of this generation.
+    fs::write(
+        &log_path,
+        "{\"event\":\"copytruncate\",\"message\":\"new generation longer than the old cursor\"}\n",
+    )
+    .unwrap();
+    assert_eq!(next()["event"], "copytruncate");
+    drop(child);
+    output_reader.join().unwrap();
+}
+
 /// Unknown config keys are reported with a did-you-mean, ignored by default,
 /// fatal under `--strict` or `[core] strict_config`, and stop the daemon.
 #[test]

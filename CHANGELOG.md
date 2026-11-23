@@ -8,6 +8,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Activity-log following survives rotation and preserves JSON records.**
+  `sbh log --follow` keeps its cursor across the initial tail, drains renamed
+  files, and detects copytruncate even when output blocks or the replacement
+  grows past the old cursor. Partial records wait for their newline; reverse
+  tailing bounds memory independently of log size. JSON output preserves
+  original fields and frames damaged lines as explicit diagnostic records.
 - **Live telemetry reloads apply memory and calibration limits immediately.**
   Existing mount monitors now adopt the configured rate-history bound and
   guardrail observation limits; shrinking a window retains its newest evidence,

@@ -1144,7 +1144,7 @@ struct LogArgs {
     /// Number of recent log entries to display (default 50).
     #[arg(long, short = 'n', default_value_t = 50, value_name = "N")]
     tail: usize,
-    /// Follow the log file for new entries (like `tail -f`).
+    /// Follow new entries through log rotation (like `tail -F`).
     #[arg(long, short = 'f')]
     follow: bool,
     /// Filter by event type (deletion, scan, pressure, error).
@@ -12484,7 +12484,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
 }
 
 fn run_log(cli: &Cli, args: &LogArgs) -> Result<(), CliError> {
-    use io::{BufRead, Seek};
+    use storage_ballast_helper::cli::logs::{ActivityLogReader, write_json_entry};
 
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -12493,12 +12493,14 @@ fn run_log(cli: &Cli, args: &LogArgs) -> Result<(), CliError> {
     // Read-side command on a system install: the daemon's log usually lives
     // in the system data dir and belongs to another user. Say so instead of
     // failing with a bare "not found"/EACCES.
-    let permission_denied = log_path.exists()
-        && matches!(
-            std::fs::File::open(log_path),
-            Err(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied
-        );
-    if !log_path.exists() || permission_denied {
+    let reader = ActivityLogReader::open(log_path, args.r#type.as_deref());
+    let permission_denied = reader
+        .as_ref()
+        .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied);
+    let missing = reader
+        .as_ref()
+        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+    if missing || permission_denied {
         let hint = daemon_activity_db_hint(log_path);
         let error = if permission_denied {
             "permission_denied"
@@ -12550,76 +12552,32 @@ fn run_log(cli: &Cli, args: &LogArgs) -> Result<(), CliError> {
         )));
     }
 
-    // Always print the tail first, whether following or not.
-    print_tail_lines(log_path, args.tail, args.r#type.as_deref())?;
-
+    let mode = output_mode(cli);
+    let mut output = io::stdout().lock();
+    let mut emit = |line: &str| -> io::Result<()> {
+        match mode {
+            OutputMode::Human => writeln!(output, "{}", format_log_line(line))?,
+            OutputMode::Json => write_json_entry(&mut output, line)?,
+        }
+        // Pipes must see each complete event while following, rather than
+        // waiting for the stdout buffer to fill during a quiet incident.
+        output.flush()
+    };
+    let mut reader = reader.map_err(|e| CliError::Runtime(format!("failed to open log: {e}")))?;
+    reader
+        .tail(args.tail, args.follow, &mut emit)
+        .map_err(|e| CliError::Runtime(format!("failed to read log: {e}")))?;
     if args.follow {
-        // Follow mode: watch for new lines after the initial tail.
-        let file = std::fs::File::open(log_path)
-            .map_err(|e| CliError::Runtime(format!("failed to open log: {e}")))?;
-        let mut reader = io::BufReader::new(file);
-
-        // Seek to end.
-        reader
-            .seek(io::SeekFrom::End(0))
-            .map_err(|e| CliError::Runtime(format!("seek error: {e}")))?;
-
         loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    // No new data; sleep briefly and retry.
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                }
-                Ok(_) => {
-                    let trimmed = line.trim_end();
-                    if !trimmed.is_empty() && matches_type_filter(trimmed, args.r#type.as_deref()) {
-                        println!("{}", format_log_line(trimmed));
-                    }
-                }
-                Err(e) => {
-                    return Err(CliError::Runtime(format!("read error: {e}")));
-                }
+            if !reader
+                .poll(&mut emit)
+                .map_err(|e| CliError::Runtime(format!("failed to follow log: {e}")))?
+            {
+                std::thread::sleep(Duration::from_millis(250));
             }
         }
     }
-
     Ok(())
-}
-
-fn print_tail_lines(path: &Path, count: usize, type_filter: Option<&str>) -> Result<(), CliError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| CliError::Runtime(format!("failed to read log: {e}")))?;
-
-    let lines: Vec<&str> = content
-        .lines()
-        .filter(|line| !line.trim().is_empty() && matches_type_filter(line, type_filter))
-        .collect();
-
-    let start = lines.len().saturating_sub(count);
-    for line in &lines[start..] {
-        println!("{}", format_log_line(line));
-    }
-
-    Ok(())
-}
-
-fn matches_type_filter(line: &str, type_filter: Option<&str>) -> bool {
-    let Some(filter) = type_filter else {
-        return true;
-    };
-    let filter_lower = filter.to_lowercase();
-    // Match against the "event" field in the JSONL line.
-    // Common event types: "deletion", "scan_started", "scan_completed",
-    // "pressure_changed", "error", "ballast_released", etc.
-    if let Ok(v) = serde_json::from_str::<Value>(line)
-        && let Some(event) = v.get("event").and_then(|e| e.as_str())
-    {
-        let event_lower = event.to_lowercase();
-        return event_lower.contains(&filter_lower);
-    }
-    // Fallback: substring match on the raw line.
-    line.to_lowercase().contains(&filter_lower)
 }
 
 fn format_log_line(line: &str) -> String {
