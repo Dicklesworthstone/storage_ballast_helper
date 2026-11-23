@@ -1463,7 +1463,7 @@ impl DeletionExecutor {
                         .map(|()| CheckedDeletion::Deleted)
                 }
                 DeletionMode::Quarantine => {
-                    self.quarantine_after_check(candidate, &metadata, renewal)
+                    self.quarantine_after_check(candidate, &metadata, &mut sacred, renewal)
                 }
             };
             let completed_at = Instant::now();
@@ -1861,9 +1861,11 @@ impl DeletionExecutor {
         // below: the renewal itself may also block or change the filesystem.
         if let Some(renew_authority) = renew_authority {
             renew_authority(candidate)?;
-            if before.is_dir() {
-                Self::check_descendant_protection(path)?;
-            }
+            // Renew every content veto, including the bounded sacred
+            // catalog and tracked Git contents. Rechecking only repository,
+            // protection and lease markers would miss a database or a
+            // configured stowaway glob introduced by this last callback.
+            self.check_contents(candidate, &before, sacred)?;
         }
 
         // The shared policy can be replaced while the recursive work runs.
@@ -1973,7 +1975,12 @@ impl DeletionExecutor {
                     .to_string(),
             });
         }
-        match self.quarantine_after_check(candidate, &metadata, None)? {
+        match self.quarantine_after_check(
+            candidate,
+            &metadata,
+            &mut SacredScanStats::default(),
+            None,
+        )? {
             CheckedDeletion::Skipped(reason) => Err(SbhError::SafetyVeto {
                 path: candidate.path.clone(),
                 reason: reason.explanation().to_string(),
@@ -1986,6 +1993,7 @@ impl DeletionExecutor {
         &self,
         candidate: &CandidacyScore,
         metadata: &fs::Metadata,
+        sacred: &mut SacredScanStats,
         authorize: Option<AuthorizationCheck<'_>>,
     ) -> Result<CheckedDeletion> {
         // Even private callers arriving after a previously successful
@@ -2003,20 +2011,20 @@ impl DeletionExecutor {
             candidate.identity,
             candidate.size_bytes,
         );
+        let sacred = std::cell::RefCell::new(sacred);
         let renew_authority = || {
             if let Some(authorize) = authorize {
                 authorize(candidate)?;
             }
             // Store preparation and fsync can outlive both the open-file
-            // sweep and the earlier containment walk. A lease started there
-            // protects the source before its rename, including nested targets.
-            if metadata.is_dir() {
-                Self::check_descendant_protection(path)?;
-            }
-            if active_lease::path_is_actively_leased(path)
-                || active_lease::lease_sidecar_blocks_removal(path)
-            {
-                return Err(SkipReason::ActiveLease);
+            // sweep and every earlier protection check. Renew the complete
+            // mutation boundary, without calling the authorizer recursively:
+            // a new ancestor marker, exclusion alias, nested database or
+            // source-root restriction is just as binding as a new lease.
+            let (_, incremental_guard) =
+                self.check_before_mutation(candidate, &mut sacred.borrow_mut(), None)?;
+            if incremental_guard.is_some() {
+                return Err(SkipReason::IncrementalQuarantineUnsupported);
             }
             Ok(())
         };

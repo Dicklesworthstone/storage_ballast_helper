@@ -12,6 +12,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use storage_ballast_helper::platform::types::{SacredPath, SacredPathKind, SacredPathSource};
 use storage_ballast_helper::scanner::active_lease::{ActiveLease, LeasePolicy};
 use storage_ballast_helper::scanner::decision_record::stable_decision_id;
 use storage_ballast_helper::scanner::deletion::{
@@ -510,6 +511,172 @@ fn live_authorization_cannot_bypass_preflight_protection() {
         assert!(nested.join(".sbh-protect").exists());
         assert_eq!(fs::read(target.join("artifact.o")).unwrap(), PAYLOAD);
         assert!(!dir.path().join(".sbh").exists());
+    }
+}
+
+#[test]
+fn final_authorization_renews_nested_sacred_rules_in_both_mutation_modes() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let last_renewal = if mode == DeletionMode::Quarantine { 3 } else { 2 };
+        for protect_on_call in 2..=last_renewal {
+            for name in ["state.db", ".beads", "operator.keep"] {
+                let dir = scratch();
+                let target = dir.path().join("target");
+                let nested = target.join("debug");
+                fs::create_dir_all(&nested).unwrap();
+                let payload = target.join("artifact.o");
+                fs::write(&payload, PAYLOAD).unwrap();
+                let protected = nested.join(name);
+                let item = candidate(&target);
+                let mut settings = config(dir.path(), mode);
+                settings.sacred_paths.push(SacredPath {
+                    pattern: "**/*.keep".to_string(),
+                    kind: SacredPathKind::StowawayMarker,
+                    reason: "operator-owned data".to_string(),
+                    source: SacredPathSource::UserConfig,
+                });
+                let executor = DeletionExecutor::new(settings, None);
+                assert!(executor.explain_preflight(&item, None).is_ok());
+                let plan = executor.plan(vec![item.clone()]);
+                assert_eq!(plan.estimated_items, 1);
+                let calls = Cell::new(0);
+                let report = executor.execute_with_guard(
+                    &plan,
+                    None,
+                    Some(&|_| {
+                        calls.set(calls.get() + 1);
+                        if calls.get() == protect_on_call {
+                            // This is after the ordinary full content walk,
+                            // or after durable quarantine-store preparation.
+                            if name == ".beads" {
+                                fs::create_dir(&protected).unwrap();
+                            } else {
+                                fs::write(&protected, b"protected data").unwrap();
+                                fs::set_permissions(
+                                    &protected,
+                                    fs::Permissions::from_mode(0o400),
+                                )
+                                .unwrap();
+                            }
+                        }
+                        Ok(())
+                    }),
+                );
+
+                assert_eq!(calls.get(), protect_on_call);
+                assert_eq!(
+                    report.items_deleted, 0,
+                    "{mode:?}, {name}, renewal {protect_on_call}: {report:?}"
+                );
+                assert_eq!(report.items_quarantined, 0);
+                assert_eq!(report.items_failed, 0);
+                assert_eq!(report.items_skipped, 1);
+                assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+                assert_eq!(report.quarantine_unavailable, 0);
+                assert_eq!(report.bytes_freed, 0);
+                assert_eq!(report.bytes_quarantined, 0);
+                assert_eq!(identity_for_path(&target, false).ok(), item.identity);
+                assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
+                assert!(protected.exists());
+                if name != ".beads" {
+                    assert_eq!(fs::read(&protected).unwrap(), b"protected data");
+                }
+                let store = QuarantineStore::under(dir.path());
+                if store.root().exists() {
+                    assert!(store.records().unwrap().is_empty());
+                }
+                assert!(report.sacred_scans >= protect_on_call);
+            }
+        }
+    }
+}
+
+#[test]
+fn quarantine_final_authorization_renews_ancestor_markers_for_files_and_directories() {
+    for directory in [false, true] {
+        let dir = scratch();
+        let target = dir.path().join("target");
+        let payload = if directory {
+            fs::create_dir(&target).unwrap();
+            target.join("artifact.o")
+        } else {
+            target.clone()
+        };
+        fs::write(&payload, PAYLOAD).unwrap();
+        let item = candidate(&target);
+        let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Quarantine), None);
+        let plan = executor.plan(vec![item.clone()]);
+        assert_eq!(plan.estimated_items, 1);
+        let calls = Cell::new(0);
+        let report = executor.execute_with_guard(
+            &plan,
+            None,
+            Some(&|_| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 3 {
+                    fs::write(dir.path().join(".sbh-protect"), b"new operator instruction")
+                        .unwrap();
+                }
+                Ok(())
+            }),
+        );
+
+        assert_eq!(calls.get(), 3, "must reach the prepared-store renewal");
+        assert_eq!(report.items_deleted, 0, "directory={directory}: {report:?}");
+        assert_eq!(report.items_quarantined, 0);
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+        assert_eq!(report.quarantine_unavailable, 0);
+        assert_eq!(identity_for_path(&target, false).ok(), item.identity);
+        assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
+        assert!(QuarantineStore::under(dir.path()).records().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn final_authorization_still_allows_unprotected_contents_and_quarantine_restore() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let dir = scratch();
+        let target = dir.path().join("target");
+        let nested = target.join("debug");
+        fs::create_dir_all(&nested).unwrap();
+        let payload = target.join("artifact.o");
+        fs::write(&payload, PAYLOAD).unwrap();
+        let late_payload = nested.join("ordinary.bin");
+        let item = candidate(&target);
+        let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+        let plan = executor.plan(vec![item.clone()]);
+        assert_eq!(plan.estimated_items, 1);
+        let last_renewal = if mode == DeletionMode::Quarantine { 3 } else { 2 };
+        let calls = Cell::new(0);
+        let report = executor.execute_with_guard(
+            &plan,
+            None,
+            Some(&|_| {
+                calls.set(calls.get() + 1);
+                if calls.get() == last_renewal {
+                    fs::write(&late_payload, b"unprotected artifact").unwrap();
+                }
+                Ok(())
+            }),
+        );
+
+        assert_eq!(calls.get(), last_renewal);
+        assert_eq!(report.items_deleted, 1, "{mode:?}: {report:?}");
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.items_skipped, 0);
+        assert!(!target.exists());
+        if mode == DeletionMode::Quarantine {
+            assert_eq!(report.items_quarantined, 1);
+            let store = QuarantineStore::under(dir.path());
+            let records = store.records().unwrap();
+            assert_eq!(records.len(), 1);
+            store.restore(&records[0].decision_id, false).unwrap();
+            assert_eq!(identity_for_path(&target, false).ok(), item.identity);
+            assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
+            assert_eq!(fs::read(late_payload).unwrap(), b"unprotected artifact");
+        }
     }
 }
 

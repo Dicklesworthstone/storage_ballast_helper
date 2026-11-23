@@ -21,6 +21,15 @@ does not prove that nobody added a repository or protected content underneath
 it. Positive sacred-path evidence can be reused to refuse a candidate; an
 earlier empty walk cannot authorize its later removal.
 
+The final authorization renewal repeats the complete bounded content checks,
+including the sacred catalog and configured stowaway glob rules. A database
+or `.beads` directory added during that callback protects the enclosing
+candidate even when its inode stays unchanged. Quarantine renews the same
+admission rules after durable store preparation, so an ancestor protection
+marker or changed exclusion also stops the final rename. These checks retain
+the configured scan budgets and contribute to the batch's scan accounting;
+they do not invoke authorization callbacks recursively.
+
 The deep repository/protection walk must inspect every entry it reaches within
 its directory budget. Directory-open, iteration, entry-type, and Git-file read
 errors produce `containment_incomplete`; cleanup retains the entire candidate
