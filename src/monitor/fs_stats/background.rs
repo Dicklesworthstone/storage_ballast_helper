@@ -1,7 +1,7 @@
 //! Bounded background observations. Probes run on workers that never acquire
 //! the bookkeeping lock. A stalled probe keeps its slot until its worker exits.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -46,6 +46,7 @@ impl<V> Entry<V> {
 
 struct State<K, V> {
     entries: BTreeMap<K, Entry<V>>,
+    waiting: VecDeque<K>,
     epoch: Option<u64>,
     refresh_after: Duration,
     max_age: Duration,
@@ -54,6 +55,7 @@ struct State<K, V> {
 impl<K, V> State<K, V> {
     fn invalidate(&mut self) {
         self.epoch = self.epoch.and_then(|epoch| epoch.checked_add(1));
+        self.waiting.clear();
         for entry in self.entries.values_mut() {
             entry.observation = None;
             entry.last_attempt = None;
@@ -111,6 +113,8 @@ impl<K, V> State<K, V> {
 /// One slot is reserved for priority requests (the daemon's `/` observation).
 /// Other paths and inventory discovery cannot occupy that final slot.
 /// Normal cache churn also cannot evict a priority root's completed evidence.
+/// Requests waiting for an ordinary slot are served in admission order, so
+/// repeated refreshes of early roots cannot starve later filesystems.
 /// Dropping this value detaches workers; it never waits for a blocked probe.
 pub struct BoundedObserver<K, V> {
     probe: Arc<Probe<K, V>>,
@@ -142,6 +146,7 @@ where
             max_entries,
             state: Mutex::new(State {
                 entries: BTreeMap::new(),
+                waiting: VecDeque::new(),
                 epoch: Some(0),
                 refresh_after,
                 max_age,
@@ -174,22 +179,11 @@ where
                     return Err("filesystem observation capacity is occupied".to_string());
                 };
                 state.entries.remove(&evict);
+                state.waiting.retain(|queued| queued != &evict);
             }
             state.entries.insert(key.clone(), Entry::new(now, priority));
         }
 
-        let pending_total = state
-            .entries
-            .values()
-            .filter(|entry| entry.pending.is_some())
-            .count();
-        let pending_regular = state
-            .entries
-            .values()
-            .filter(|entry| entry.pending.as_ref().is_some_and(|probe| !probe.priority))
-            .count();
-        let slot_available = pending_total < self.max_workers
-            && (priority || pending_regular < self.max_workers - 1);
         let refresh_after = state.refresh_after;
         let max_age = state.max_age;
         let entry = state.entries.get_mut(&key).expect("requested entry exists");
@@ -200,33 +194,12 @@ where
                 now.checked_duration_since(attempt)
                     .is_some_and(|elapsed| elapsed >= refresh_after)
             });
-        if needs_refresh && slot_available {
-            let (sender, receiver) = sync_channel(1);
-            let probe = Arc::clone(&self.probe);
-            let request = key;
-            entry.last_attempt = Some(now);
-            match std::thread::Builder::new()
-                .name("sbh-fs-probe".to_string())
-                .spawn(move || {
-                    let result = probe(&request);
-                    let _ = sender.try_send(result);
-                }) {
-                Ok(worker) => {
-                    entry.pending = Some(Pending {
-                        epoch,
-                        started_at: now,
-                        priority,
-                        receiver,
-                        worker,
-                    });
-                }
-                Err(error) => {
-                    entry.observation = None;
-                    entry.error = Some(format!("could not start filesystem probe: {error}"));
-                }
-            }
+        if needs_refresh && !state.waiting.contains(&key) {
+            state.waiting.push_back(key.clone());
         }
+        self.start_waiting(&mut state, epoch, now);
 
+        let entry = state.entries.get_mut(&key).expect("requested entry exists");
         let result = if let Some(observation) = &entry.observation
             && now
                 .checked_duration_since(observation.collected_at)
@@ -245,6 +218,69 @@ where
         };
         drop(state);
         result
+    }
+
+    fn start_waiting(&self, state: &mut State<K, V>, epoch: u64, now: Instant) {
+        let mut pending_total = state
+            .entries
+            .values()
+            .filter(|entry| entry.pending.is_some())
+            .count();
+        let mut pending_regular = state
+            .entries
+            .values()
+            .filter(|entry| entry.pending.as_ref().is_some_and(|probe| !probe.priority))
+            .count();
+        while pending_total < self.max_workers {
+            // Priority demand can always use its reserved slot. Otherwise
+            // preserve FIFO order, including requests that returned unknown
+            // on an earlier tick. Serving only the current caller lets a
+            // cached root take the same slot again on every fixed-order poll.
+            let next = state
+                .waiting
+                .iter()
+                .position(|key| state.entries[key].priority)
+                .or_else(|| {
+                    (pending_regular < self.max_workers - 1 && !state.waiting.is_empty())
+                        .then_some(0)
+                });
+            let Some(next) = next else {
+                break;
+            };
+            let request = state.waiting.remove(next).expect("queued request exists");
+            let entry = state
+                .entries
+                .get_mut(&request)
+                .expect("queued entry exists");
+            let priority = entry.priority;
+            let (sender, receiver) = sync_channel(1);
+            let probe = Arc::clone(&self.probe);
+            // Queue residence is not observation age: native work starts
+            // now, and delayed completion still cannot renew this timestamp.
+            entry.last_attempt = Some(now);
+            match std::thread::Builder::new()
+                .name("sbh-fs-probe".to_string())
+                .spawn(move || {
+                    let result = probe(&request);
+                    let _ = sender.try_send(result);
+                }) {
+                Ok(worker) => {
+                    entry.pending = Some(Pending {
+                        epoch,
+                        started_at: now,
+                        priority,
+                        receiver,
+                        worker,
+                    });
+                    pending_total += 1;
+                    pending_regular += usize::from(!priority);
+                }
+                Err(error) => {
+                    entry.observation = None;
+                    entry.error = Some(format!("could not start filesystem probe: {error}"));
+                }
+            }
+        }
     }
 
     /// When the probe for `key` that has not delivered yet started, if one
@@ -464,7 +500,8 @@ mod tests {
                 .observation
                 .is_none()
         );
-        assert_eq!(await_value(&observer, "mount", false).value, 2);
+        assert_eq!(await_value(&observer, "new-config-root", false).value, 2);
+        assert_eq!(await_value(&observer, "mount", false).value, 3);
     }
 
     #[test]
@@ -666,5 +703,158 @@ mod tests {
         let retained = observer.observe("/".into(), true).unwrap();
         assert_eq!(retained.collected_at, root.collected_at);
         assert!(observer.state.lock().unwrap().entries.len() <= 2);
+    }
+
+    #[test]
+    fn waiting_probe_precedes_repeated_cached_refresh() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let calls = AtomicUsize::new(0);
+        let observer = BoundedObserver::new(
+            Arc::new(move |key: &String| {
+                started_tx.send(key.clone()).unwrap();
+                if key == "early" && calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                    release_rx.lock().unwrap().recv_timeout(WAIT).unwrap();
+                }
+                Ok(80)
+            }),
+            CACHE,
+            CACHE * 10,
+            2,
+            4,
+        );
+        let first = await_value(&observer, "early", false);
+        assert_eq!(started_rx.recv_timeout(WAIT).unwrap(), "early");
+        let refresh_at = first.collected_at + CACHE;
+        assert!(
+            observer
+                .observe_at("early".into(), false, refresh_at)
+                .is_ok()
+        );
+        assert_eq!(started_rx.recv_timeout(WAIT).unwrap(), "early");
+        for _ in 0..10 {
+            assert!(
+                observer
+                    .observe_at("late".into(), false, refresh_at)
+                    .is_err()
+            );
+        }
+        assert!(observer.pending_since(&"late".into()).is_none());
+        release_tx.send(()).unwrap();
+        await_idle(&observer, refresh_at);
+
+        // The daemon reads configured roots in the same order each tick. A
+        // cached early root must not reclaim the only ordinary slot forever.
+        let next_tick = refresh_at + CACHE;
+        assert!(
+            observer
+                .observe_at("early".into(), false, next_tick)
+                .is_ok()
+        );
+        let admitted = started_rx.recv_timeout(WAIT).unwrap();
+        release_tx.send(()).unwrap();
+        await_idle(&observer, next_tick);
+        assert_eq!(
+            admitted, "late",
+            "waiting filesystem was starved by a refresh"
+        );
+        let state = observer.state.lock().unwrap();
+        let late = state.entries["late"].observation.as_ref().unwrap();
+        assert_eq!(late.collected_at, next_tick, "queue wait is not probe age");
+    }
+
+    #[test]
+    fn invalidation_discards_waiting_work_but_preserves_occupied_slots() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let observer = BoundedObserver::new(
+            Arc::new(move |key: &String| {
+                started_tx.send(key.clone()).unwrap();
+                if key == "old" {
+                    release_rx.lock().unwrap().recv_timeout(WAIT).unwrap();
+                }
+                Ok(80)
+            }),
+            CACHE,
+            CACHE,
+            2,
+            4,
+        );
+        assert!(observer.observe("old".into(), false).is_err());
+        assert_eq!(started_rx.recv_timeout(WAIT).unwrap(), "old");
+        assert!(observer.observe("removed".into(), false).is_err());
+        observer.invalidate();
+        assert!(observer.observe("current".into(), false).is_err());
+        assert!(started_rx.try_recv().is_err());
+        release_tx.send(()).unwrap();
+        await_idle(&observer, Instant::now());
+
+        assert_eq!(await_value(&observer, "current", false).value, 80);
+        assert_eq!(started_rx.recv_timeout(WAIT).unwrap(), "current");
+        assert!(
+            started_rx.try_recv().is_err(),
+            "removed work must not start"
+        );
+        let state = observer.state.lock().unwrap();
+        assert!(state.entries["old"].observation.is_none());
+        assert!(state.entries["removed"].observation.is_none());
+    }
+
+    #[test]
+    fn evicting_waiting_requests_cannot_leave_orphaned_work() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let observer = BoundedObserver::new(
+            Arc::new(move |key: &String| {
+                started_tx.send(key.clone()).unwrap();
+                if key == "blocked" {
+                    release_rx.lock().unwrap().recv_timeout(WAIT).unwrap();
+                }
+                Ok(80)
+            }),
+            CACHE,
+            CACHE,
+            2,
+            2,
+        );
+        assert!(observer.observe("blocked".into(), false).is_err());
+        assert_eq!(started_rx.recv_timeout(WAIT).unwrap(), "blocked");
+        assert!(observer.observe("evicted".into(), false).is_err());
+        assert!(observer.observe("retained".into(), false).is_err());
+        release_tx.send(()).unwrap();
+        await_idle(&observer, Instant::now());
+        assert_eq!(await_value(&observer, "retained", false).value, 80);
+        assert_eq!(started_rx.recv_timeout(WAIT).unwrap(), "retained");
+        assert!(started_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_waiting_request_promoted_to_priority_can_use_the_reserved_slot() {
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let release_rx = Mutex::new(release_rx);
+        let observer = BoundedObserver::new(
+            Arc::new(move |key: &String| {
+                if key == "blocked" {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv_timeout(WAIT).unwrap();
+                }
+                Ok(80)
+            }),
+            CACHE,
+            CACHE,
+            2,
+            4,
+        );
+        assert!(observer.observe("blocked".into(), false).is_err());
+        entered_rx.recv_timeout(WAIT).unwrap();
+        assert!(observer.observe("promoted".into(), false).is_err());
+        assert_eq!(await_value(&observer, "promoted", true).value, 80);
+        assert!(observer.pending_since(&"blocked".into()).is_some());
+        release_tx.send(()).unwrap();
+        await_idle(&observer, Instant::now());
     }
 }
