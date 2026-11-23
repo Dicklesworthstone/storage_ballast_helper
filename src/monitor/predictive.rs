@@ -429,10 +429,14 @@ impl PredictiveActionPolicy {
             }
         }
 
-        // Median-rate cross-check: when the burst detector is calibrated and
-        // we have plenty of free space (>25%), cross-validate the EWMA-based
-        // prediction against the robust median rate. If the EWMA rate diverges
-        // >3× from the median, the EWMA is tracking a transient spike.
+        // Median-rate cross-check: once the burst detector is calibrated,
+        // cross-validate an uncorroborated EWMA against the robust baseline
+        // at every free-space percentage. The burst flag can clear as soon as
+        // instantaneous writes return to normal while the EWMA still carries
+        // a spike. A low percentage on a large volume does not establish a
+        // short runway or make that residual spike sustained consumption.
+        // Confirmed writers and corroborated imminent exhaustion have already
+        // taken their independent evidence paths above.
         //
         // Production evidence: trj at 32% free predicted "disk full on /data
         // in 37m at 74% confidence" — burst_probability was only 0.3 (below
@@ -440,7 +444,6 @@ impl PredictiveActionPolicy {
         // burst. The median rate (which is robust to outliers) showed no danger.
         if bs.calibrated
             && bs.median_rate > 0.0
-            && current_free_pct > 25.0
             && minutes_remaining <= self.config.warning_horizon_minutes
         {
             let rate_divergence = estimate.bytes_per_second / bs.median_rate;
@@ -1342,10 +1345,11 @@ mod tests {
     }
 
     #[test]
-    fn median_rate_crosscheck_inactive_at_low_free_space() {
+    fn low_free_percentage_does_not_corroborate_a_spike() {
         let policy = default_policy();
-        // When free space is low (<25%), the cross-check doesn't apply —
-        // we need to act even if rates diverge.
+        // The measured free bytes still have 100 minutes of baseline runway.
+        // Putting them on a larger, more occupied volume cannot turn the
+        // residual spike's ten-minute EWMA into sustained consumption.
         let mut est = make_estimate(1000.0, 10.0 * 60.0, 0.85, Trend::Stable, false);
         est.burst_state = BurstState {
             burst_probability: 0.2,
@@ -1354,12 +1358,14 @@ mod tests {
             calibrated: true,
             ..BurstState::default()
         };
-        // 15% free — cross-check should NOT gate.
-        let action = policy.evaluate(&est, 15.0, PathBuf::from("/data"));
-        assert!(
-            action.severity() >= 2,
-            "low free space should bypass median cross-check: got {action:?}"
-        );
+        for free_pct in [1.0, 9.0, 15.0, 20.0, 25.0, 30.0] {
+            let action = policy.evaluate(&est, free_pct, PathBuf::from("/data"));
+            assert_eq!(
+                action,
+                PredictiveAction::Clear,
+                "a free percentage of {free_pct} cannot corroborate a transient rate"
+            );
+        }
     }
 
     #[test]

@@ -189,6 +189,7 @@ fn transient_writer_near_a_boundary_does_not_gain_sustained_authority() {
         estimator.update(free, start + Duration::from_secs(seconds), 34_000_000_000);
     }
     let mut saw_fast_forecast = false;
+    let mut saw_post_burst_tail = false;
     for seconds in (905..=960_u64).step_by(5) {
         // Thirty seconds of allocation, followed by a return to the ordinary
         // rate, never establish three consistent twenty-second windows.
@@ -202,15 +203,25 @@ fn transient_writer_near_a_boundary_does_not_gain_sustained_authority() {
             saw_fast_forecast = true;
             assert!(estimate.forecast_rate_bytes_per_second.is_none());
         }
-        assert_eq!(
-            policy().evaluate(&estimate, 9.0, PathBuf::from("/data")),
-            PredictiveAction::Clear,
-            "a transient allocation cannot corroborate itself: {estimate:?}"
-        );
+        saw_post_burst_tail |= seconds > 930
+            && estimate.burst_state.burst_probability < 0.5
+            && estimate.forecast_rate_bytes_per_second.is_none()
+            && estimate.seconds_to_exhaustion < 30.0 * 60.0;
+        for free_pct in [1.0, 9.0, 15.0, 20.0, 25.0, 30.0, 90.0] {
+            assert_eq!(
+                policy().evaluate(&estimate, free_pct, PathBuf::from("/data")),
+                PredictiveAction::Clear,
+                "a transient allocation at {free_pct}% cannot corroborate itself: {estimate:?}"
+            );
+        }
     }
     assert!(
         saw_fast_forecast,
         "fixture must exercise the immediate path"
+    );
+    assert!(
+        saw_post_burst_tail,
+        "fixture must retain a short EWMA forecast after the burst flag clears"
     );
 }
 
@@ -293,17 +304,28 @@ fn burst_path_projects_the_baseline_runway_without_acceleration() {
 #[test]
 fn normal_path_median_crosscheck_projects_the_baseline_runway() {
     // Below the detected-burst threshold; high confidence passes the
-    // implied-rate gate, so the separate median cross-check decides.
-    match policy().evaluate(&forecast(200.0, 0.3, 100.0), 30.0, PathBuf::from("/data")) {
-        PredictiveAction::PreemptiveCleanup {
-            minutes_remaining, ..
-        } => assert!((minutes_remaining - 10.0).abs() < 1e-9),
-        other => panic!("baseline 10 min from full: {other:?}"),
+    // implied-rate gate, so the separate median cross-check decides. Low
+    // free percentages still admit real danger at the measured baseline.
+    for free_pct in [1.0, 9.0, 15.0, 25.0, 30.0, 90.0] {
+        match policy().evaluate(
+            &forecast(200.0, 0.3, 100.0),
+            free_pct,
+            PathBuf::from("/data"),
+        ) {
+            PredictiveAction::PreemptiveCleanup {
+                minutes_remaining, ..
+            } => assert!((minutes_remaining - 10.0).abs() < 1e-9),
+            other => panic!("baseline 10 min from full at {free_pct}%: {other:?}"),
+        }
+        assert_eq!(
+            policy().evaluate(
+                &forecast(200.0, 0.3, 10.0),
+                free_pct,
+                PathBuf::from("/data")
+            ),
+            PredictiveAction::Clear
+        );
     }
-    assert_eq!(
-        policy().evaluate(&forecast(200.0, 0.3, 10.0), 30.0, PathBuf::from("/data")),
-        PredictiveAction::Clear
-    );
 }
 
 #[test]
