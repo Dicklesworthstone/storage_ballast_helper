@@ -8845,9 +8845,6 @@ impl MonitoringDaemon {
             .filter(|(_, mount)| mount.is_some())
             .map(|(root, _)| root.clone())
             .collect();
-        let cross_device_fallback =
-            self.config.scanner.cross_devices && !observed_root_paths.is_empty();
-
         let mut responses = std::mem::take(&mut self.mount_responses);
         let predictive_observations: Vec<_> = responses
             .iter()
@@ -8910,16 +8907,29 @@ impl MonitoringDaemon {
 
         for tick in &responses {
             let mount = tick.response.causing_mount.clone();
-            // Disk caches cannot relieve a tmpfs backing-store shortage.
-            // The observer's list of RAM mounts is never a source of new
-            // cleanup roots, and cross_devices cannot widen this request.
-            let cross_device_fallback =
-                cross_device_fallback && tick.ram_reclaim.is_none() && tick.inode_reclaim.is_none();
             let roots_here: Vec<PathBuf> = root_mounts
                 .iter()
                 .filter(|(_, root_mount)| root_mount.as_deref() == Some(mount.as_path()))
                 .map(|(root, _)| root.clone())
                 .collect();
+            // Cross-device permission only helps when an observed configured
+            // ancestor actually leads to this mount. An unrelated peer root
+            // cannot reclaim here: claiming it as a surface would suppress
+            // catalog fallback and keep an impossible Reclaim loop active.
+            // Reuse the same native observations and scope as scan admission;
+            // missing evidence defers traversal without probing on the monitor.
+            // Resource relief never widens to disk-backed ancestor roots.
+            let crossed_roots = if roots_here.is_empty()
+                && self.config.scanner.cross_devices
+                && tick.ram_reclaim.is_none()
+                && tick.inode_reclaim.is_none()
+            {
+                self.filesystem_reclaim_scope(&mount, &observed_root_paths, false)
+                    .map_or_else(Vec::new, |scope| scope.admitted_paths())
+            } else {
+                Vec::new()
+            };
+            let cross_device_fallback = !crossed_roots.is_empty();
             let (has_pool, releasable_ballast, ballast_dir) = self
                 .ballast_coordinator
                 .pool_for_mount(&mount)
@@ -9163,11 +9173,10 @@ impl MonitoringDaemon {
                                 ));
                             }
                         } else {
-                            // A mount with no root of its own only gets here
-                            // via cross_devices, where any configured root may
-                            // help.
+                            // A rootless mount scans only the observed
+                            // ancestors that can reach its filesystem.
                             let paths = if roots_here.is_empty() {
-                                observed_root_paths.clone()
+                                crossed_roots
                             } else {
                                 roots_here
                             };
@@ -20472,6 +20481,187 @@ mod tests {
             &scanner
         ));
         assert_eq!(std::fs::read_dir(unrelated).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_device_peer_roots_do_not_claim_a_reclaim_surface_or_busy_cadence() {
+        for missing_root in [false, true] {
+            let mut fixture = RegretDaemonFixture::new();
+            let mount = fixture.directory.path().join("pressured-mount");
+            let peer = fixture.directory.path().join("peer-mount");
+            let root = peer.join("builds");
+            std::fs::create_dir(&mount).unwrap();
+            std::fs::create_dir(&peer).unwrap();
+            if !missing_root {
+                std::fs::create_dir(&root).unwrap();
+            }
+            let daemon = &mut fixture.daemon;
+            daemon.platform = Arc::new(disk_pressure_platform(vec![
+                disk_pressure_sample("/", 1_000_000, 900_000),
+                disk_pressure_sample(&peer.to_string_lossy(), 1_000_000, 900_000),
+                disk_pressure_sample(&mount.to_string_lossy(), 1_000_000, 1_000),
+            ]));
+            daemon.fs_collector =
+                FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::ZERO);
+            daemon.config.scanner.root_paths = vec![root];
+            daemon.config.scanner.cross_devices = true;
+            daemon.config.scanner.catalog_roots_on_pressured_device = false;
+            daemon.config.scanner.quarantine_enabled = false;
+            daemon.behavior_state.mode = mock_behavior_mode(
+                ScanAggressiveness::Aggressive,
+                CleanupAction::AnyDefiniteCandidate,
+                BallastAction::None,
+                NotificationPriority::Low,
+            );
+            assert!(daemon.ballast_coordinator.pool_for_mount(&mount).is_none());
+            let mut tick = quarantine_tick(PressureLevel::Critical, &mount);
+            tick.response.scan_interval = Duration::from_millis(100);
+            let base_poll = Duration::from_millis(daemon.config.pressure.poll_interval_ms);
+            assert!(base_poll > tick.response.scan_interval);
+            let (scan_tx, scan_rx) = bounded(4);
+            let (del_tx, _del_rx) = bounded(4);
+
+            for _ in 0..3 {
+                daemon.mount_responses = vec![tick.clone()];
+                assert_eq!(
+                    daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx),
+                    base_poll,
+                    "an unreachable mount must not tighten the poll (missing_root={missing_root})"
+                );
+                let controller = &daemon.mount_controllers[&mount];
+                assert_eq!(controller.state(), MountState::ObserveOnly);
+                assert_eq!(controller.idle_reason(), Some(IdleReason::NoSurface));
+                assert!(!controller.surface().scannable());
+                assert!(scan_rx.is_empty());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_device_peer_roots_do_not_suppress_catalog_reclaim() {
+        let mut fixture = RegretDaemonFixture::new();
+        let mount = fixture.directory.path().join("pressured-mount");
+        let cache = mount.join("cache");
+        let peer = fixture.directory.path().join("peer-mount");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir(&peer).unwrap();
+        let daemon = &mut fixture.daemon;
+        daemon.platform = Arc::new(disk_pressure_platform(vec![
+            disk_pressure_sample("/", 1_000_000, 900_000),
+            disk_pressure_sample(&peer.to_string_lossy(), 1_000_000, 900_000),
+            disk_pressure_sample(&mount.to_string_lossy(), 1_000_000, 1_000),
+        ]));
+        daemon.fs_collector = FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::ZERO);
+        daemon.config.scanner.root_paths = vec![peer];
+        daemon.config.scanner.cross_devices = true;
+        daemon.config.scanner.excluded_paths.clear();
+        daemon.config.scanner.protected_paths.clear();
+        daemon.config.scanner.catalog_roots_on_pressured_device = true;
+        daemon.config.scanner.quarantine_enabled = false;
+        daemon.catalog_root_cache.insert(
+            mount.clone(),
+            (
+                Instant::now(),
+                vec![ExpandedCatalogRoot {
+                    path: cache.clone(),
+                    rule: "fixture-cache",
+                    confidence: crate::platform::cleanup_catalog::CleanupConfidence::Definite,
+                    min_age: Duration::from_hours(1),
+                }],
+            ),
+        );
+        daemon.behavior_state.mode = mock_behavior_mode(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::None,
+            NotificationPriority::Low,
+        );
+        let tick = quarantine_tick(PressureLevel::Critical, &mount);
+        let (scan_tx, scan_rx) = bounded(4);
+        let (del_tx, _del_rx) = bounded(4);
+        daemon.mount_responses = vec![tick.clone()];
+        daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+
+        let controller = &daemon.mount_controllers[&mount];
+        assert_eq!(controller.state(), MountState::Reclaim);
+        assert_eq!(controller.surface().catalog_roots, 1);
+        assert!(!controller.surface().cross_device_fallback);
+        let request = scan_rx
+            .try_recv()
+            .expect("catalog fallback must remain live");
+        assert_eq!(request.paths, vec![cache.clone()]);
+        assert_eq!(request.filesystem_reclaim.as_ref().unwrap().mount(), mount);
+        assert_eq!(request.catalog_roots.len(), 1);
+        assert_eq!(request.catalog_roots[0].path, cache);
+        assert!(scan_rx.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_device_surface_uses_only_its_observed_ancestor_and_tracks_alias_changes() {
+        let mut fixture = RegretDaemonFixture::new();
+        let ancestor = fixture.directory.path().join("ancestor");
+        let mount = ancestor.join("nested-mount");
+        let peer = fixture.directory.path().join("peer-mount");
+        let alias = fixture.directory.path().join("configured-alias");
+        std::fs::create_dir_all(&mount).unwrap();
+        std::fs::create_dir(&peer).unwrap();
+        std::os::unix::fs::symlink(&ancestor, &alias).unwrap();
+        let daemon = &mut fixture.daemon;
+        daemon.platform = Arc::new(disk_pressure_platform(vec![
+            disk_pressure_sample("/", 1_000_000, 900_000),
+            disk_pressure_sample(&peer.to_string_lossy(), 1_000_000, 900_000),
+            disk_pressure_sample(&mount.to_string_lossy(), 1_000_000, 1_000),
+        ]));
+        daemon.fs_collector = FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::ZERO);
+        daemon.config.scanner.root_paths = vec![peer.clone(), alias.clone()];
+        daemon.config.scanner.cross_devices = true;
+        daemon.config.scanner.excluded_paths.clear();
+        daemon.config.scanner.protected_paths.clear();
+        daemon.config.scanner.catalog_roots_on_pressured_device = false;
+        daemon.config.scanner.quarantine_enabled = false;
+        daemon.behavior_state.mode = mock_behavior_mode(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::None,
+            NotificationPriority::Low,
+        );
+        let tick = quarantine_tick(PressureLevel::Critical, &mount);
+        let (scan_tx, scan_rx) = bounded(4);
+        let (del_tx, _del_rx) = bounded(4);
+        daemon.mount_responses = vec![tick.clone()];
+        daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+
+        let controller = &daemon.mount_controllers[&mount];
+        assert_eq!(controller.state(), MountState::Reclaim);
+        assert!(controller.surface().cross_device_fallback);
+        let request = scan_rx
+            .try_recv()
+            .expect("a true ancestor must reach its mount");
+        assert_eq!(request.paths, vec![alias.join("nested-mount")]);
+        let scope = request.filesystem_reclaim.as_ref().unwrap();
+        assert_eq!(scope.mount(), mount);
+        assert_eq!(scope.admitted_paths(), vec![alias.clone()]);
+        assert!(request.catalog_roots.is_empty());
+
+        // A configured spelling that now points elsewhere cannot keep the
+        // old mount in Reclaim, nor grant its new peer the old scan's scope.
+        std::fs::rename(&alias, fixture.directory.path().join("previous-alias")).unwrap();
+        std::os::unix::fs::symlink(&peer, &alias).unwrap();
+        daemon.mount_responses = vec![tick.clone()];
+        let base_poll = Duration::from_millis(daemon.config.pressure.poll_interval_ms);
+        assert_eq!(
+            daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx),
+            base_poll
+        );
+        assert_eq!(
+            daemon.mount_controllers[&mount].state(),
+            MountState::ObserveOnly
+        );
+        assert!(!scope.contains_path(&alias));
+        assert!(scan_rx.is_empty());
     }
 
     #[cfg(unix)]
