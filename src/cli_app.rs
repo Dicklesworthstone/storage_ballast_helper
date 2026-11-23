@@ -2868,42 +2868,110 @@ fn run_truncate_logs(cli: &Cli, args: &TruncateLogsArgs) -> Result<(), CliError>
     if let Some(size) = args.min_size {
         policy.min_size_bytes = size;
     }
-    if !policy.enabled {
-        eprintln!(
-            "[sbh] scanner.log_truncation.enabled = false. Pass --enable-anyway to override, \
-             or edit /etc/sbh/config.toml to enable persistently."
-        );
-        return Ok(());
-    }
-
-    // Force-mode collapses the age gate by reporting critical pressure.
-    let synthetic_free_pct = if args.force { 0.0 } else { 100.0 };
-
-    let report: LogTruncationReport =
-        truncate_oversized_logs(&policy, synthetic_free_pct, args.dry_run);
-
-    let verb = if args.dry_run { "would free" } else { "freed" };
-    let bytes = if args.dry_run {
-        report.bytes_would_reclaim
+    let report = if policy.enabled {
+        // Force-mode collapses the age gate by reporting critical pressure.
+        let synthetic_free_pct = if args.force { 0.0 } else { 100.0 };
+        truncate_oversized_logs(&policy, synthetic_free_pct, args.dry_run)
     } else {
-        report.bytes_reclaimed
+        LogTruncationReport {
+            dry_run: args.dry_run,
+            ..LogTruncationReport::default()
+        }
     };
-    let files = if args.dry_run {
-        report.files_would_truncate
+    let result = if report.errors.is_empty() {
+        Ok(())
     } else {
-        report.files_truncated
+        Err(CliError::Partial(format!(
+            "log truncation pass encountered {} error(s)",
+            report.errors.len()
+        )))
     };
-    println!(
-        "[sbh] log truncation pass {verb} {bytes} bytes across {n} file(s); skipped {sk}; {e} error(s); took {ms} ms",
-        n = files,
-        sk = report.files_skipped,
-        e = report.errors.len(),
-        ms = report.duration.as_millis(),
-    );
-    for (path, err) in &report.errors {
-        eprintln!("  error: {} — {err}", path.display());
+    let exit_code = result.as_ref().err().map_or(0, CliError::exit_code);
+
+    match output_mode(cli) {
+        OutputMode::Json => {
+            write_json_line(&truncate_logs_json(&report, policy.enabled, exit_code))?;
+        }
+        OutputMode::Human if !policy.enabled => {
+            println!(
+                "[sbh] log truncation disabled: scanner.log_truncation.enabled = false. \
+                 Pass --enable-anyway to override, or edit {} to enable persistently.",
+                config.paths.config_file.display(),
+            );
+        }
+        OutputMode::Human => {
+            let (verb, bytes, files) = if report.dry_run {
+                (
+                    "would free",
+                    report.bytes_would_reclaim,
+                    report.files_would_truncate,
+                )
+            } else {
+                ("freed", report.bytes_reclaimed, report.files_truncated)
+            };
+            println!(
+                "[sbh] log truncation pass {verb} {bytes} bytes across {files} file(s); skipped {sk}; {e} error(s); took {ms} ms",
+                sk = report.files_skipped,
+                e = report.errors.len(),
+                ms = report.duration.as_millis(),
+            );
+            for (path, error) in &report.errors {
+                eprintln!("  error: {} — {error}", path.display());
+            }
+        }
     }
-    Ok(())
+    result
+}
+
+/// Preserve completed mutations and read-only estimates independently, even
+/// when another configured pattern or candidate failed during the same sweep.
+fn truncate_logs_json(
+    report: &storage_ballast_helper::scanner::log_truncator::LogTruncationReport,
+    enabled: bool,
+    exit_code: i32,
+) -> Value {
+    use storage_ballast_helper::scanner::log_truncator::SkipReason as LogSkipReason;
+
+    let errors: Vec<_> = report
+        .errors
+        .iter()
+        .map(|(path, error)| json!({ "path": path.to_string_lossy(), "error": error }))
+        .collect();
+    let skipped: Vec<_> = report
+        .skipped_with_reason
+        .iter()
+        .map(|(path, reason)| {
+            let reason = match reason {
+                LogSkipReason::NotARegularFile => "not_a_regular_file",
+                LogSkipReason::BelowMinSize => "below_min_size",
+                LogSkipReason::YoungerThanMinAge => "younger_than_min_age",
+                LogSkipReason::SymlinkRejected => "symlink_rejected",
+                LogSkipReason::UnsafeLinkCount => "unsafe_link_count",
+                LogSkipReason::FailureBackoff => "failure_backoff",
+                LogSkipReason::IdentityChanged => "identity_changed",
+                LogSkipReason::RecentTruncation => "recent_truncation",
+                LogSkipReason::PolicyChanged => "policy_changed",
+            };
+            json!({ "path": path.to_string_lossy(), "reason": reason })
+        })
+        .collect();
+    json!({
+        "command": "truncate-logs",
+        "status": if !enabled { "disabled" } else if exit_code == 0 { "success" } else { "partial_success" },
+        "exit_code": exit_code,
+        "enabled": enabled,
+        "dry_run": report.dry_run,
+        "files_truncated": report.files_truncated,
+        "files_would_truncate": report.files_would_truncate,
+        "files_skipped": report.files_skipped,
+        "bytes_reclaimed": report.bytes_reclaimed,
+        "bytes_would_reclaim": report.bytes_would_reclaim,
+        "byte_counts_are_estimates": true,
+        "error_count": errors.len(),
+        "errors": errors,
+        "skipped": skipped,
+        "duration_ms": report.duration.as_millis(),
+    })
 }
 
 fn to_runtime_daemon_args(args: &DaemonArgs) -> RuntimeDaemonArgs {

@@ -78,3 +78,22 @@ overlapping patterns, regular-file and parent replacement, refreshed/shrunk
 inodes, future timestamps, sparse allocation accounting, and a live non-append
 writer resuming after truncation. Failure timing is injected without sleeps;
 identity and sparse-writer cases operate on real temporary files.
+
+## CLI results and automation
+
+`sbh truncate-logs --json` emits one JSON report, including when truncation
+is disabled. Piped output uses the same report unless human output is explicitly
+selected. The report includes `enabled`, `dry_run`, `status` and `exit_code`,
+separate counters for completed truncations and dry-run estimates, per-path
+errors, and named safety skips. Byte counters are estimates rather than measured
+filesystem free-space gains.
+
+A completed or disabled pass exits 0. Safety refusals such as symlinks or
+non-file matches remain normal skips. A pattern-expansion or truncation error
+exits 4 after emitting the full report, retaining any successful results from
+independent paths. Dry-run errors also exit 4 because the preview is incomplete;
+preview counts never become completed mutation counts.
+
+The real-binary tests in `tests/cli_exit_codes.rs::truncate_logs` exercise
+these results, disabled-policy overrides, file preservation during previews,
+successful in-place truncation, and mixed successful and failed patterns.

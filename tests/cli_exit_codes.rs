@@ -724,3 +724,196 @@ fn status_ram_scratch_retains_incomplete_notices_in_human_and_json_read_only() {
         assert_ram_scratch_status(&config, &database, &payload, expected);
     }
 }
+
+#[cfg(unix)]
+mod truncate_logs {
+    use super::*;
+    use storage_ballast_helper::core::config::LogTruncationConfig;
+
+    fn configure(dir: &Path, enabled: bool, paths: &[PathBuf]) -> PathBuf {
+        let config = config_in(dir);
+        let policy = LogTruncationConfig {
+            enabled,
+            paths: paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            min_size_bytes: 1,
+            min_age_minutes: 0,
+            ..LogTruncationConfig::default()
+        };
+        let base = fs::read_to_string(&config).unwrap();
+        fs::write(
+            &config,
+            format!(
+                "{base}\n[scanner.log_truncation]\n{}",
+                toml::to_string(&policy).unwrap()
+            ),
+        )
+        .unwrap();
+        config
+    }
+
+    fn write_log(path: &Path) -> Vec<u8> {
+        use std::io::Write as _;
+
+        let contents = vec![b'x'; 16 * 1024];
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(&contents).unwrap();
+        file.sync_all().unwrap();
+        contents
+    }
+
+    #[test]
+    fn json_distinguishes_preview_from_completed_truncation() {
+        let dir = disk_tempdir();
+        let log = dir.path().join("active.log");
+        let contents = write_log(&log);
+        let config = configure(dir.path(), true, std::slice::from_ref(&log));
+        let preview = sbh(&config, &["--json", "truncate-logs", "--dry-run"]);
+        assert_eq!(preview.status.code(), Some(0), "{preview:?}");
+        let payload: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+        assert_eq!(payload["command"], "truncate-logs");
+        assert_eq!(payload["status"], "success");
+        assert_eq!(payload["exit_code"], 0);
+        assert_eq!(payload["enabled"], true);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(payload["files_truncated"], 0);
+        assert_eq!(payload["bytes_reclaimed"], 0);
+        assert_eq!(payload["files_would_truncate"], 1);
+        assert!(payload["bytes_would_reclaim"].as_u64().unwrap() > 0);
+        assert_eq!(payload["byte_counts_are_estimates"], true);
+        assert!(payload["errors"].as_array().unwrap().is_empty());
+        assert_eq!(fs::read(&log).unwrap(), contents);
+
+        let human = sbh(&config, &["truncate-logs", "--dry-run"]);
+        assert_eq!(human.status.code(), Some(0), "{human:?}");
+        assert!(stdout(&human).contains("would free"));
+        assert!(stdout(&human).contains("across 1 file(s)"));
+        assert!(!stderr(&human).contains("would free"));
+        assert_eq!(fs::read(&log).unwrap(), contents);
+
+        let applied = sbh(&config, &["--json", "truncate-logs"]);
+        assert_eq!(applied.status.code(), Some(0), "{applied:?}");
+        let payload: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(payload["files_truncated"], 1);
+        assert!(payload["bytes_reclaimed"].as_u64().unwrap() > 0);
+        assert_eq!(payload["files_would_truncate"], 0);
+        assert_eq!(payload["bytes_would_reclaim"], 0);
+        assert!(fs::read(&log).unwrap().is_empty());
+    }
+
+    #[test]
+    fn piped_disabled_report_is_explicit_and_override_still_works() {
+        let dir = disk_tempdir();
+        let log = dir.path().join("active.log");
+        let contents = write_log(&log);
+        let config = configure(dir.path(), false, std::slice::from_ref(&log));
+        let disabled = Command::new(common::sbh_bin_path())
+            .arg("--config")
+            .arg(&config)
+            .arg("truncate-logs")
+            .env_remove("SBH_TEST_MODE")
+            .env_remove("SBH_OUTPUT_FORMAT")
+            .output()
+            .expect("run piped truncation command");
+        assert_eq!(disabled.status.code(), Some(0), "{disabled:?}");
+        let payload: serde_json::Value = serde_json::from_slice(&disabled.stdout).unwrap();
+        assert_eq!(payload["status"], "disabled");
+        assert_eq!(payload["exit_code"], 0);
+        assert_eq!(payload["enabled"], false);
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(payload["files_truncated"], 0);
+        assert_eq!(payload["files_would_truncate"], 0);
+        assert_eq!(payload["bytes_reclaimed"], 0);
+        assert_eq!(payload["bytes_would_reclaim"], 0);
+        assert_eq!(payload["error_count"], 0);
+        assert_eq!(fs::read(&log).unwrap(), contents);
+
+        let preview = sbh(
+            &config,
+            &["--json", "truncate-logs", "--enable-anyway", "--dry-run"],
+        );
+        assert_eq!(preview.status.code(), Some(0), "{preview:?}");
+        let payload: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+        assert_eq!(payload["status"], "success");
+        assert_eq!(payload["enabled"], true);
+        assert_eq!(payload["files_would_truncate"], 1);
+        assert_eq!(payload["files_truncated"], 0);
+        assert_eq!(fs::read(&log).unwrap(), contents);
+    }
+
+    #[test]
+    fn failed_pattern_returns_partial_and_preserves_other_results() {
+        for dry_run in [true, false] {
+            let dir = disk_tempdir();
+            let log = dir.path().join("active.log");
+            let contents = write_log(&log);
+            let too_deep = dir.path().join(["nested"; 130].join("/"));
+            let config = configure(dir.path(), true, &[log.clone(), too_deep.clone()]);
+            let mut args = vec!["--json", "truncate-logs"];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let output = sbh(&config, &args);
+            assert_eq!(output.status.code(), Some(4), "{output:?}");
+            let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(payload["status"], "partial_success");
+            assert_eq!(payload["exit_code"], 4);
+            assert_eq!(payload["dry_run"], dry_run);
+            assert_eq!(payload["error_count"], 1);
+            assert_eq!(payload["files_skipped"], 1);
+            assert_eq!(payload["errors"][0]["path"], too_deep.to_string_lossy().as_ref());
+            assert!(
+                payload["errors"][0]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("pattern has too many path segments")
+            );
+            if dry_run {
+                assert_eq!(payload["files_would_truncate"], 1);
+                assert_eq!(payload["files_truncated"], 0);
+                assert_eq!(payload["bytes_reclaimed"], 0);
+                assert_eq!(fs::read(&log).unwrap(), contents);
+                let human = sbh(&config, &["truncate-logs", "--dry-run"]);
+                assert_eq!(human.status.code(), Some(4), "{human:?}");
+                assert!(stdout(&human).contains("would free"));
+                assert!(!stdout(&human).contains("expand failed"));
+                assert!(stderr(&human).contains("pattern has too many path segments"));
+                assert_eq!(fs::read(&log).unwrap(), contents);
+            } else {
+                assert_eq!(payload["files_truncated"], 1);
+                assert_eq!(payload["files_would_truncate"], 0);
+                assert_eq!(payload["bytes_would_reclaim"], 0);
+                assert!(fs::read(&log).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn safety_skips_are_reported_without_a_partial_failure() {
+        let dir = disk_tempdir();
+        let log = dir.path().join("preserved.log");
+        let contents = write_log(&log);
+        let alias = dir.path().join("alias.log");
+        std::os::unix::fs::symlink(&log, &alias).unwrap();
+        let directory = dir.path().join("not-a-log");
+        fs::create_dir(&directory).unwrap();
+        let config = configure(dir.path(), true, &[alias, directory]);
+        let output = sbh(&config, &["--json", "truncate-logs"]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["status"], "success");
+        assert_eq!(payload["exit_code"], 0);
+        assert_eq!(payload["files_skipped"], 2);
+        assert_eq!(payload["files_truncated"], 0);
+        assert_eq!(payload["bytes_reclaimed"], 0);
+        assert_eq!(payload["error_count"], 0);
+        assert!(payload["errors"].as_array().unwrap().is_empty());
+        let skipped = payload["skipped"].as_array().unwrap();
+        assert!(skipped.iter().any(|item| item["reason"] == "symlink_rejected"));
+        assert!(skipped.iter().any(|item| item["reason"] == "not_a_regular_file"));
+        assert_eq!(fs::read(&log).unwrap(), contents);
+    }
+}
