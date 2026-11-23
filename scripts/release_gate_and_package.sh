@@ -323,7 +323,7 @@ if [[ "$mode" == "package" ]]; then
     if git -C "$root_dir" rev-parse "${tag}^{commit}" >/dev/null 2>&1; then
       commit_sha="$(git -C "$root_dir" rev-parse "${tag}^{commit}")"
     fi
-    rustc_ver="$(rustc --version 2>/dev/null || echo "rustc nightly")"
+    rustc_ver="$(cd "$root_dir" && rustc --version 2>/dev/null || echo "rustc nightly")"
     cat > "${artifact_dir}/release-provenance.json" <<EOF
 {
   "tag": "${tag}",

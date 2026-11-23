@@ -4,9 +4,59 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
-## Unreleased
+## v0.8.0 **[release]**
+
+Compare: [`v0.7.17...v0.8.0`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.17...v0.8.0)
+
+Major hardening and release-packaging milestone. Release binaries now ship
+with the `tui` cockpit enabled by default (`#32`), `release-provenance.json`
+records the repository's pinned toolchain (`#37`), and bundled SQLite and
+`rustix` dependencies are updated to resolve `RUSTSEC-2026-0459` and
+`RUSTSEC-2026-0486` (`#43`). Across the daemon, monitor, scanner, and CLI,
+this release hardens predictive forecasting against post-burst and idle-baseline
+false positives, preserves active leases and operator `protected_paths` globs
+through final deletion and quarantine authorization, pauses mutating quarantine
+sweeps during mount recovery, preserves forecast evidence across shared pool
+aliases, applies live telemetry limits on config reload, and adds rotation-safe
+`sbh log --follow`.
+
+### Added
+
+- **Interactive `tui` cockpit shipped in release binaries (`#32`).** All four
+  release platform builds (`linux/amd64`, `linux/arm64`, `darwin/amd64`,
+  `darwin/arm64`) are compiled with `--features cli,daemon,sqlite,tui`, matching
+  `Cargo.toml` and `AGENTS.md`.
+
+### Security
+
+- **Upgraded bundled SQLite and `rustix` dependencies (`#43`).** Updated
+  `rusqlite` to `0.41.1` (`libsqlite3-sys` `0.39.1`, fixing `RUSTSEC-2026-0459`
+  / SQLite CVE-2026-119375) and pinned `rustix` `1.1.6` (fixing
+  `RUSTSEC-2026-0486`).
 
 ### Fixed
+
+- **Bounded idle-baseline and post-burst forecasts across all free-space percentages** (bd-hosd, bd-xx4i).
+  Uncorroborated EWMA forecasts now apply the calibrated median-rate cross-check
+  and latest observed interval-rate floor at every free-space percentage,
+  preventing transient allocation spikes and idle post-burst tails from triggering
+  false Critical or preemptive cleanup actions while keeping immediate rescue
+  for genuine sustained rapid writers.
+- **Complete deletion-boundary protection across subtrees, active leases, and final authorization** (bd-13xn, bd-8nuw, bd-r4t8).
+  User-configured `protected_paths` globs, active leases, sacred stowaways,
+  tracked Git contents, and standalone `rustc` compiler locks are renewed
+  through the final bounded containment check before both direct unlink and
+  quarantine, including unresolved alias refusal and post-store ancestor checks.
+- **Recovery-safe ballast reserve observation and quarantine pause** (bd-36qj, bd-uo23, bd-9mmu, bd-ynmt).
+  Shared ballast pool aliases honor a common recovery retry deadline, externally
+  provisioned reserve files are released after the entry tick, cross-device
+  reclaim is scoped to reachable mounts, filesystem observations do not starve
+  behind stalled mounts, and mutating quarantine sweeps are cancelled and
+  suppressed while a mount (or its shared pool) is in `MountState::Recovery`.
+- **Release provenance records the repository's pinned Rust toolchain (`#37`).**
+  `scripts/release_gate_and_package.sh` and `scripts/release-manual.sh` now
+  invoke `rustc --version` inside the repository root so `rust-toolchain.toml`
+  applies instead of the packager host's default toolchain.
 
 - **Activity-log following survives rotation and preserves JSON records.**
   `sbh log --follow` keeps its cursor across the initial tail, drains renamed
