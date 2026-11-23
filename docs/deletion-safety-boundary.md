@@ -107,6 +107,25 @@ as permanent protection markers, so the enclosing artifact remains reclaimable.
 This narrows the observation gap; it does not make lease acquisition and an
 entire recursive removal one atomic operation.
 
+## Recovery holds include queued daemon cleanup
+
+When a completed deletion batch reports a disk-full or read-only incident,
+the executor publishes a hold before delivering the report to the monitor.
+Already queued candidates on that physical filesystem are held before policy
+evaluation, and final authorization checks the hold again after potentially
+blocking surveys. Quarantine maintenance and pressure purges share this gate.
+Healthy peer filesystems remain eligible, and emergency ballast release remains
+available to restore writability. An unresolved incident initially holds only
+overlapping paths until fresh evidence identifies its filesystem.
+
+A successful write probe releases only the failure generation it observed.
+A newer incident wins over an older success, and replaying a cleared incident
+does not rearm it. Invalid capacity evidence cannot release the hold. Refusals
+use the ordinary policy-change skip, so they do not count as new filesystem
+failures or restart recovery themselves. This fences later authorized work;
+it does not add a failure callback between candidates in the already executing
+batch that first encounters the error.
+
 ## Process absence is fresh for each deletion batch
 
 Opening an existing object file or changing a process's working directory does

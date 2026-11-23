@@ -575,6 +575,7 @@ impl QuarantineSweepContext {
     pub(super) fn authorize_maintenance(
         &self,
         mount: &Path,
+        mutation_path: &Path,
         level: PressureLevel,
         approved_mode: ActiveMode,
     ) -> std::result::Result<(), SkipReason> {
@@ -586,7 +587,10 @@ impl QuarantineSweepContext {
         {
             return Err(SkipReason::CompressionFirst);
         }
-        self.authorize_mutation(approved_mode)
+        self.authorize_mutation(approved_mode)?;
+        // A still-unidentified incident holds overlapping paths, not every
+        // store under the mount. Device holds are resolved from this store.
+        self.executor.authorize_recovery_path(mutation_path, None)
     }
 
     pub(super) fn authorize_pressure(
@@ -647,7 +651,7 @@ impl QuarantineSweepContext {
         {
             return Err(SkipReason::CompressionFirst);
         }
-        Ok(())
+        self.executor.authorize_recovery_path(store.root(), None)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -735,6 +739,7 @@ impl QuarantineSweepContext {
                     && self
                         .authorize_maintenance(
                             task.mount(),
+                            store.root(),
                             task.tick.response.level,
                             approved_mode,
                         )

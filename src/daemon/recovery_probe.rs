@@ -13,6 +13,149 @@ use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
+
+#[derive(Clone, Copy)]
+struct RecoveryHold {
+    failed_at: Instant,
+    active: bool,
+}
+
+impl RecoveryHold {
+    fn note(&mut self, failed_at: Instant) -> bool {
+        if failed_at > self.failed_at {
+            self.failed_at = failed_at;
+            self.active = true;
+        }
+        self.active
+    }
+}
+
+#[derive(Default)]
+struct RecoveryHoldState {
+    devices: HashMap<u64, RecoveryHold>,
+    unresolved: HashMap<PathBuf, RecoveryHold>,
+}
+
+/// The failure observed before a write probe began. A cleared generation is
+/// retained so a delayed copy of its executor receipt cannot rearm the hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RecoveryGeneration {
+    device_id: u64,
+    failed_at: Option<Instant>,
+}
+
+/// Filesystem recovery is shared with already queued executor work. Unknown
+/// identities hold only overlapping paths until fresh native evidence assigns
+/// them to a device; they never turn into a global deletion hold.
+#[derive(Default)]
+pub(super) struct RecoveryHolds {
+    state: Mutex<RecoveryHoldState>,
+}
+
+impl RecoveryHolds {
+    pub(super) fn note_failure(
+        &self,
+        path: &Path,
+        device_id: Option<u64>,
+        failed_at: Instant,
+    ) -> bool {
+        let mut state = self.state.lock();
+        let hold = if let Some(device_id) = device_id {
+            state.devices.entry(device_id).or_insert(RecoveryHold {
+                failed_at,
+                active: true,
+            })
+        } else {
+            state
+                .unresolved
+                .entry(path.to_path_buf())
+                .or_insert(RecoveryHold {
+                    failed_at,
+                    active: true,
+                })
+        };
+        hold.note(failed_at)
+    }
+
+    /// Promote only the failure whose identity was freshly observed. A newer
+    /// unresolved refusal must not lose its path hold to an older receipt.
+    pub(super) fn resolve_path(&self, path: &Path, failed_at: Instant, device_id: u64) -> bool {
+        let mut state = self.state.lock();
+        if state
+            .unresolved
+            .get(path)
+            .is_some_and(|hold| hold.failed_at > failed_at || !hold.active)
+        {
+            return false;
+        }
+        let active = state
+            .devices
+            .entry(device_id)
+            .or_insert(RecoveryHold {
+                failed_at,
+                active: true,
+            })
+            .note(failed_at);
+        if let Some(hold) = state.unresolved.get_mut(path) {
+            hold.active = false;
+        }
+        drop(state);
+        active
+    }
+
+    pub(super) fn blocks(&self, path: &Path, device_id: Option<u64>) -> bool {
+        let state = self.state.lock();
+        device_id.is_some_and(|device_id| {
+            state
+                .devices
+                .get(&device_id)
+                .is_some_and(|hold| hold.active)
+        }) || state.unresolved.iter().any(|(failed_path, hold)| {
+            hold.active && (path.starts_with(failed_path) || failed_path.starts_with(path))
+        })
+    }
+
+    pub(super) fn has_device_holds(&self) -> bool {
+        self.state.lock().devices.values().any(|hold| hold.active)
+    }
+
+    pub(super) fn device_is_held(&self, device_id: u64) -> bool {
+        self.state
+            .lock()
+            .devices
+            .get(&device_id)
+            .is_some_and(|hold| hold.active)
+    }
+
+    pub(super) fn generation(&self, device_id: u64) -> RecoveryGeneration {
+        RecoveryGeneration {
+            device_id,
+            failed_at: self
+                .state
+                .lock()
+                .devices
+                .get(&device_id)
+                .map(|hold| hold.failed_at),
+        }
+    }
+
+    /// Accept success and clear the hold in one critical section. Native
+    /// probe work happens outside this lock; a newer refusal always wins.
+    pub(super) fn release(&self, generation: RecoveryGeneration) -> bool {
+        let mut state = self.state.lock();
+        let current = state.devices.get_mut(&generation.device_id);
+        if current.as_ref().map(|hold| hold.failed_at) != generation.failed_at {
+            return false;
+        }
+        if let Some(hold) = current {
+            hold.active = false;
+        }
+        drop(state);
+        true
+    }
+}
+
 /// Permission expires even if the monitor cannot poll again. Cancellation
 /// never frees a worker slot until its native operation actually returns.
 pub(super) struct ProbePermit {
@@ -146,6 +289,78 @@ impl<K> Drop for BackgroundProbes<K> {
         for pending in self.pending.values() {
             pending.cancelled.store(true, Ordering::Release);
         }
+    }
+}
+
+#[cfg(test)]
+mod hold_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_success_is_bound_to_the_latest_device_failure() {
+        let holds = RecoveryHolds::default();
+        let path = Path::new("/affected/cache");
+        let before_failure = holds.generation(7);
+        let first = Instant::now();
+        assert!(holds.note_failure(path, Some(7), first));
+        assert!(!holds.release(before_failure));
+        let first_probe = holds.generation(7);
+        assert!(holds.blocks(Path::new("/alias/other-cache"), Some(7)));
+        assert!(!holds.blocks(Path::new("/healthy/cache"), Some(8)));
+
+        let latest = first + Duration::from_millis(1);
+        assert!(holds.note_failure(path, Some(7), latest));
+        assert!(!holds.release(first_probe));
+        assert!(holds.device_is_held(7));
+        let current_probe = holds.generation(7);
+        assert!(holds.release(current_probe));
+        assert!(!holds.device_is_held(7));
+        // Both a delayed copy and an out-of-order older receipt retain the
+        // cleared timestamp instead of creating another recovery episode.
+        assert!(!holds.note_failure(path, Some(7), latest));
+        assert!(!holds.note_failure(path, Some(7), first));
+        assert!(!holds.blocks(path, Some(7)));
+    }
+
+    #[test]
+    fn unknown_recovery_scope_stays_local_and_revokes_old_probe_on_promotion() {
+        let holds = RecoveryHolds::default();
+        let path = Path::new("/affected/cache");
+        let affected_probe = holds.generation(7);
+        let peer_probe = holds.generation(8);
+        let failed_at = Instant::now();
+        assert!(holds.note_failure(path, None, failed_at));
+        assert!(holds.blocks(path, None));
+        assert!(holds.blocks(Path::new("/affected"), Some(7)));
+        assert!(holds.blocks(Path::new("/affected/cache/nested"), None));
+        assert!(!holds.blocks(Path::new("/affected/sibling"), Some(7)));
+        assert!(!holds.blocks(Path::new("/healthy/cache"), Some(8)));
+        assert!(holds.release(peer_probe));
+
+        assert!(holds.resolve_path(path, failed_at, 7));
+        assert!(!holds.release(affected_probe));
+        assert!(holds.blocks(Path::new("/alias/other-cache"), Some(7)));
+        assert!(holds.release(holds.generation(7)));
+        assert!(!holds.blocks(path, Some(7)));
+        assert!(!holds.note_failure(path, None, failed_at));
+        assert!(!holds.note_failure(path, Some(7), failed_at));
+    }
+
+    #[test]
+    fn older_path_resolution_cannot_consume_a_newer_unidentified_failure() {
+        let holds = RecoveryHolds::default();
+        let path = Path::new("/affected/cache");
+        let first = Instant::now();
+        let latest = first + Duration::from_millis(1);
+        assert!(holds.note_failure(path, None, first));
+        assert!(holds.note_failure(path, None, latest));
+        assert!(!holds.resolve_path(path, first, 7));
+        assert!(holds.blocks(path, None));
+        assert!(!holds.device_is_held(7));
+        assert!(holds.resolve_path(path, latest, 7));
+        assert!(holds.device_is_held(7));
+        assert!(holds.release(holds.generation(7)));
+        assert!(!holds.blocks(path, None));
     }
 }
 

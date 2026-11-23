@@ -60,7 +60,7 @@ use crate::daemon::predictive_reclaim::{
 use crate::daemon::process_io_history::{ProcessIoHistory, ProcessIoSampler};
 use crate::daemon::ram_reclaim::RamReclaimRequest;
 use crate::daemon::rch_staging::RchStagingTier;
-use crate::daemon::recovery_probe::BackgroundProbes;
+use crate::daemon::recovery_probe::{BackgroundProbes, RecoveryGeneration, RecoveryHolds};
 use crate::daemon::scan_now::{ScanNowClaim, ScanNowQueue, ScanNowScope};
 use crate::daemon::self_monitor::{
     DaemonLock, DiscoveryState, LoggingState, MountPressure, MountRateState, PolicyStateRecord,
@@ -277,6 +277,9 @@ struct SharedExecutorConfig {
     compression_first: Arc<CompressionFirst>,
     /// Only an admitted quarantine worker holds fresh deletion on its mount.
     quarantine_first: Arc<QuarantineFirst>,
+    /// Filesystem failures revoke already queued work before the monitor can
+    /// consume their receipts. Only a current write probe releases a hold.
+    recovery_holds: RecoveryHolds,
 }
 
 impl SharedExecutorConfig {
@@ -315,6 +318,7 @@ impl SharedExecutorConfig {
             planner: RwLock::new((RiskBudgetByLevel::default(), 50.0)),
             compression_first: Arc::new(CompressionFirst::default()),
             quarantine_first: Arc::new(QuarantineFirst::default()),
+            recovery_holds: RecoveryHolds::default(),
         }
     }
 
@@ -438,6 +442,39 @@ impl SharedExecutorConfig {
             return Err(SkipReason::PolicyChanged);
         }
         Ok(())
+    }
+
+    fn authorize_recovery(
+        &self,
+        candidate: &CandidacyScore,
+    ) -> std::result::Result<(), SkipReason> {
+        self.authorize_recovery_path(
+            &candidate.path,
+            candidate.identity.map(|identity| identity.device_id),
+        )
+    }
+
+    fn authorize_recovery_path(
+        &self,
+        path: &Path,
+        device_id: Option<u64>,
+    ) -> std::result::Result<(), SkipReason> {
+        let device_id = device_id.or_else(|| {
+            self.recovery_holds
+                .has_device_holds()
+                .then(|| crate::scanner::walker::identity_for_path(path, false).ok())
+                .flatten()
+                .map(|identity| identity.device_id)
+        });
+        if self.recovery_holds.blocks(path, device_id)
+            // An identity lookup that failed, or a device hold published
+            // during it, cannot prove this path belongs to a healthy peer.
+            || (device_id.is_none() && self.recovery_holds.has_device_holds())
+        {
+            Err(SkipReason::PolicyChanged)
+        } else {
+            Ok(())
+        }
     }
 
     /// Stop queued pressure-driven cleanup when its own filesystem reaches
@@ -2888,6 +2925,7 @@ type CatalogObserver = BoundedObserver<CatalogObservationKey, Vec<ExpandedCatalo
 #[derive(PartialEq, Eq)]
 struct RecoveryProbeKey {
     mount: CatalogObservationKey,
+    generation: RecoveryGeneration,
     ballast_dir: Option<PathBuf>,
     roots: Vec<PathBuf>,
     catalog_paths: Vec<PathBuf>,
@@ -7772,7 +7810,23 @@ impl MonitoringDaemon {
                             == Some(device)
                     })
             })
-            .map_or_else(Vec::new, |sample| vec![sample.stats.mount_point])
+            .map_or_else(Vec::new, |sample| {
+                if incident.device_id.is_none() {
+                    let Some(device) =
+                        pressure_observation_device_id(&sample, self.fs_collector.is_background())
+                    else {
+                        return Vec::new();
+                    };
+                    if !self.shared_executor_config.recovery_holds.resolve_path(
+                        &incident.path,
+                        incident.failed_at,
+                        device,
+                    ) {
+                        return Vec::new();
+                    }
+                }
+                vec![sample.stats.mount_point]
+            })
     }
 
     fn note_recovery_mounts(&mut self, mounts: Vec<PathBuf>) {
@@ -7785,6 +7839,13 @@ impl MonitoringDaemon {
     fn resolve_pending_recovery_incidents(&mut self) {
         let pending = std::mem::take(&mut self.pending_recovery_incidents);
         for incident in pending {
+            if !self.shared_executor_config.recovery_holds.note_failure(
+                &incident.path,
+                incident.device_id,
+                incident.failed_at,
+            ) {
+                continue;
+            }
             let mounts = self.recovery_incident_mounts(&incident);
             if mounts.is_empty() {
                 self.pending_recovery_incidents.push(incident);
@@ -7799,10 +7860,19 @@ impl MonitoringDaemon {
     /// its counters remain untouched until all incidents have a durable home.
     fn admit_recovery_incidents(&mut self, incidents: &mut Vec<RecoveryIncident>) -> bool {
         incidents.retain(|incident| {
+            if !self.shared_executor_config.recovery_holds.note_failure(
+                &incident.path,
+                incident.device_id,
+                incident.failed_at,
+            ) {
+                // The executor publishes this same incident before sending
+                // its receipt. An intervening successful probe must not be
+                // undone when the receipt is finally drained.
+                return false;
+            }
             // Revocation can use an old device receipt: it grants nothing.
             // Do this before trying the fresh mapping, so a renewed pressure
             // frame cannot revive a success that predates this failure.
-            let mut revoked = false;
             if let Some(device) = incident.device_id {
                 for (mount, monitor) in &self.mount_monitors {
                     if monitor
@@ -7816,13 +7886,11 @@ impl MonitoringDaemon {
                         })
                     {
                         self.recovery_probes.cancel_mount(mount);
-                        revoked = true;
                     }
                 }
             }
-            if !revoked {
-                self.recovery_probes.cancel_all();
-            }
+            // Unknown-device failures hold their overlapping paths until a
+            // fresh lookup resolves them; unrelated probes remain useful.
             let mounts = self.recovery_incident_mounts(incident);
             if !mounts.is_empty() {
                 self.note_recovery_mounts(mounts);
@@ -8735,14 +8803,28 @@ impl MonitoringDaemon {
         cross_device_fallback: bool,
     ) -> Option<bool> {
         if !self.fs_collector.is_background() {
-            return Some(probe_mount_writable(
+            let device = crate::scanner::walker::identity_for_path(mount, false)
+                .ok()?
+                .device_id;
+            let generation = self
+                .shared_executor_config
+                .recovery_holds
+                .generation(device);
+            let success = probe_mount_writable(
                 mount,
                 ballast_dir,
                 roots,
                 catalog,
                 cross_device_fallback,
                 &self.config.scanner,
-            ));
+            );
+            return Some(
+                success
+                    && self
+                        .shared_executor_config
+                        .recovery_holds
+                        .release(generation),
+            );
         }
         let sample = &self
             .mount_monitors
@@ -8759,6 +8841,10 @@ impl MonitoringDaemon {
             .checked_add(Self::filesystem_observation_max_age(&self.config))?;
         let key = RecoveryProbeKey {
             mount: binding.clone(),
+            generation: self
+                .shared_executor_config
+                .recovery_holds
+                .generation(binding.directory_identity.0),
             ballast_dir: ballast_dir.map(Path::to_path_buf),
             roots: roots.to_vec(),
             catalog_paths: catalog.iter().map(|root| root.path.clone()).collect(),
@@ -8769,7 +8855,8 @@ impl MonitoringDaemon {
         let ballast_dir = key.ballast_dir.clone();
         let roots = key.roots.clone();
         let catalog = catalog.to_vec();
-        self.recovery_probes.poll_or_start(
+        let generation = key.generation;
+        let result = self.recovery_probes.poll_or_start(
             mount,
             key,
             deadline,
@@ -8787,7 +8874,14 @@ impl MonitoringDaemon {
                     )
                     && catalog_mount_matches(&binding, platform.as_ref())
             },
-        )
+        );
+        result.map(|success| {
+            success
+                && self
+                    .shared_executor_config
+                    .recovery_holds
+                    .release(generation)
+        })
     }
 
     /// Drive every mount from its own reading through its `MountController`
@@ -8977,12 +9071,33 @@ impl MonitoringDaemon {
                 ballast_pool: has_pool && tick.inode_reclaim.is_none(),
                 cross_device_fallback,
             };
-            let recovery_needed = self.pending_recovery.remove(&mount);
             let recovering = self
                 .mount_controllers
                 .get(&mount)
                 .is_some_and(|controller| controller.state() == MountState::Recovery);
-            let recovery_probe_ok = if recovering && !recovery_needed {
+            // The executor publishes the hold before delivering its receipt.
+            // A currently observed device must acquire a controller/probe
+            // even if that receipt is delayed behind the monitor queue.
+            let shared_recovery = self
+                .mount_monitors
+                .get(&mount)
+                .and_then(|monitor| monitor.last_observation.as_ref())
+                .and_then(|observation| {
+                    pressure_observation_device_id(
+                        &observation.sample,
+                        self.fs_collector.is_background(),
+                    )
+                })
+                .is_some_and(|device| {
+                    self.shared_executor_config
+                        .recovery_holds
+                        .device_is_held(device)
+                });
+            let recovery_needed =
+                self.pending_recovery.remove(&mount) || (shared_recovery && !recovering);
+            let valid_recovery_capacity = tick.response.free_pct.is_finite()
+                && (0.0..=100.0).contains(&tick.response.free_pct);
+            let recovery_probe_ok = if recovering && !recovery_needed && valid_recovery_capacity {
                 self.recovery_probe_result(
                     &mount,
                     ballast_dir.as_deref(),
@@ -11752,7 +11867,7 @@ impl MonitoringDaemon {
         level: PressureLevel,
         approved_mode: ActiveMode,
     ) -> std::result::Result<(), SkipReason> {
-        QuarantineSweepContext::new(self).authorize_maintenance(mount, level, approved_mode)
+        QuarantineSweepContext::new(self).authorize_maintenance(mount, mount, level, approved_mode)
     }
 
     /// A pressure tick is evidence to start a sweep, not authority to empty
@@ -15788,6 +15903,20 @@ fn drop_zero_byte_candidates(batch: &mut DeletionBatch) -> usize {
 /// line with the running count, not one per batch.
 const ZERO_BYTE_DROP_LOG_EVERY: Duration = Duration::from_mins(10);
 
+/// Recovery is a live mutation refusal, not a new filesystem failure. Filter
+/// it before policy evaluation so held candidates cannot spend Canary slots.
+fn retain_recovery_candidates(
+    candidates: &mut Vec<CandidacyScore>,
+    shared: &SharedExecutorConfig,
+) -> usize {
+    if shared.dry_run.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let before = candidates.len();
+    candidates.retain(|candidate| shared.authorize_recovery(candidate).is_ok());
+    before - candidates.len()
+}
+
 /// Executor thread: receives deletion batches and safely removes artifacts.
 ///
 /// Gates all deletions through the `PolicyEngine` before execution. In Observe
@@ -16005,6 +16134,18 @@ fn executor_thread_main(
         }
         if batch.candidates.is_empty() {
             continue;
+        }
+
+        let held = retain_recovery_candidates(&mut batch.candidates, shared_config);
+        if held > 0 {
+            logger.send(ActivityEvent::Info {
+                message: format!(
+                    "dropped {held} queued candidate(s): filesystem recovery needs a current write probe",
+                ),
+            });
+            if batch.candidates.is_empty() {
+                continue;
+            }
         }
 
         // Forecast permission can expire or be withdrawn while filesystem
@@ -16454,6 +16595,12 @@ fn executor_thread_main(
             {
                 return Err(SkipReason::PolicyChanged);
             }
+            if !dry_run {
+                // Native surveys and policy callbacks above can outlive a
+                // newly published filesystem refusal. Every mutation lane
+                // renews the shared hold at this final authority boundary.
+                shared_config.authorize_recovery(candidate)?;
+            }
             Ok(())
         };
         let on_unlinked = |candidate: &CandidacyScore, completed_at: Instant| {
@@ -16475,6 +16622,29 @@ fn executor_thread_main(
             Some(&authorize_candidate),
             Some(&on_unlinked),
         );
+        let recovery_incidents: Vec<_> = report
+            .recovery_paths()
+            .map(|path| RecoveryIncident {
+                path: path.clone(),
+                failed_at: Instant::now(),
+                device_id: plan
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.path == *path)
+                    .and_then(|candidate| candidate.identity)
+                    .map(|identity| identity.device_id),
+            })
+            .collect();
+        for incident in &recovery_incidents {
+            // Publish before report delivery, which can block on the bounded
+            // monitor channel. Later batches and concurrent purge workers
+            // cannot depend on the monitor having drained this receipt.
+            shared_config.recovery_holds.note_failure(
+                &incident.path,
+                incident.device_id,
+                incident.failed_at,
+            );
+        }
 
         // The ledger skips repeats of an unchanged verdict (bd-jl92), so a
         // Delete held back for passes would otherwise be explained by its
@@ -16654,19 +16824,6 @@ fn executor_thread_main(
         // truncated probes, or a 100 MiB floor) where it frees them at commit
         // or a removal could not be measured, marked as such (bd-oj33).
         let (bytes_freed, freed_basis) = report.reported_freed();
-        let recovery_incidents = report
-            .recovery_paths()
-            .map(|path| RecoveryIncident {
-                path: path.clone(),
-                failed_at: Instant::now(),
-                device_id: plan
-                    .candidates
-                    .iter()
-                    .find(|candidate| candidate.path == *path)
-                    .and_then(|candidate| candidate.identity)
-                    .map(|identity| identity.device_id),
-            })
-            .collect();
         let _ = send_worker_report(
             report_tx,
             WorkerReport::DeletionCompleted {
@@ -20344,6 +20501,267 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn recovery_gate_filters_queued_device_aliases_without_pausing_healthy_peers() {
+        let scratch = temp_root_scratch_dir();
+        let affected = target_mutation_candidate(scratch.path(), "target", 0.95);
+        let mut alias = affected.clone();
+        alias.path = scratch.path().join("alias/target");
+        let mut peer = target_mutation_candidate(scratch.path(), "peer", 0.90);
+        let device = affected.identity.unwrap().device_id;
+        // Admission operates on checked identity receipts. A synthetic peer
+        // device exercises isolation without requiring a second mounted test
+        // filesystem; this candidate never reaches a mutation API.
+        peer.identity.as_mut().unwrap().device_id = device ^ 1;
+        let shared = test_dispatch_config();
+        assert!(
+            shared
+                .recovery_holds
+                .note_failure(&affected.path, Some(device), Instant::now(),)
+        );
+        let mut queued = vec![affected.clone(), alias.clone(), peer.clone()];
+        assert_eq!(retain_recovery_candidates(&mut queued, &shared), 2);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].path, peer.path);
+        assert!(affected.path.exists());
+        assert!(peer.path.exists());
+
+        let generation = shared.recovery_holds.generation(device);
+        assert!(shared.recovery_holds.release(generation));
+        let mut resumed = vec![affected, alias];
+        assert_eq!(retain_recovery_candidates(&mut resumed, &shared), 0);
+        assert_eq!(resumed.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_hold_arriving_at_final_authorization_preserves_unlink_and_quarantine() {
+        use std::cell::Cell;
+
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            let scratch = temp_root_scratch_dir();
+            let candidate = target_mutation_candidate(scratch.path(), "target", 0.95);
+            let identity = candidate.identity.unwrap();
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    mode,
+                    check_open_files: false,
+                    require_identity: true,
+                    quarantine_roots: vec![scratch.path().to_path_buf()],
+                    ..Default::default()
+                },
+                None,
+            );
+            let plan = executor.plan(vec![candidate.clone()]);
+            assert_eq!(plan.estimated_items, 1);
+            let shared = test_dispatch_config();
+            let calls = Cell::new(0);
+            let final_call = if mode == DeletionMode::Quarantine {
+                3
+            } else {
+                2
+            };
+            let authorize = |item: &CandidacyScore| {
+                calls.set(calls.get() + 1);
+                if calls.get() == final_call {
+                    // Another cleanup receipt can arrive after admission,
+                    // including while quarantine prepares its durable store.
+                    shared.recovery_holds.note_failure(
+                        &scratch.path().join("another-failed-artifact"),
+                        Some(identity.device_id),
+                        Instant::now(),
+                    );
+                }
+                shared.authorize_recovery(item)
+            };
+            let report = executor.execute_with_guard(&plan, None, Some(&authorize));
+            assert_eq!(calls.get(), final_call);
+            assert_eq!(report.items_deleted, 0, "{mode:?}: {report:?}");
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.items_skipped, 1);
+            assert_eq!(report.skipped_by_reason.get("policy_changed"), Some(&1));
+            assert_eq!(report.bytes_freed, 0);
+            assert_eq!(report.bytes_quarantined, 0);
+            assert_eq!(report.quarantine_unavailable, 0);
+            assert!(report.backoff_candidates.is_empty());
+            assert_eq!(
+                crate::scanner::walker::identity_for_path(&candidate.path, false).unwrap(),
+                identity,
+            );
+            assert_eq!(
+                std::fs::read(candidate.path.join("debug/deps/libdemo.rlib")).unwrap(),
+                [7_u8; 64],
+            );
+            let store = QuarantineStore::under(scratch.path());
+            if store.root().exists() {
+                assert!(store.records().unwrap().is_empty());
+            }
+
+            // A successful probe releases exactly this episode. The same
+            // queued work then proceeds without failure or refusal backoff.
+            let generation = shared.recovery_holds.generation(identity.device_id);
+            assert!(shared.recovery_holds.release(generation));
+            let resumed = executor.execute_with_guard(
+                &plan,
+                None,
+                Some(&|item| shared.authorize_recovery(item)),
+            );
+            assert_eq!(resumed.items_deleted, 1, "{mode:?}: {resumed:?}");
+            assert!(!candidate.path.exists());
+            if mode == DeletionMode::Quarantine {
+                let records = store.records().unwrap();
+                assert_eq!(records.len(), 1);
+                store.restore(&records[0].decision_id, false).unwrap();
+                assert_eq!(
+                    std::fs::read(candidate.path.join("debug/deps/libdemo.rlib")).unwrap(),
+                    [7_u8; 64],
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_hold_preserves_quarantine_at_green_and_under_pressure_until_probe_success() {
+        for level in [PressureLevel::Green, PressureLevel::Critical] {
+            let mut fixture = RegretDaemonFixture::new();
+            let mount = fixture.directory.path().to_path_buf();
+            let root = fixture.daemon.config.scanner.root_paths[0].clone();
+            let source = root.join("target");
+            std::fs::write(&source, b"recoverable").unwrap();
+            let store = QuarantineStore::under(&root);
+            let record = store
+                .quarantine(&source, "held", 11, Duration::ZERO, None)
+                .unwrap();
+            fixture.daemon.platform = Arc::new(disk_pressure_platform(vec![disk_pressure_sample(
+                &mount.to_string_lossy(),
+                100_000,
+                1_000,
+            )]));
+            let tick = quarantine_tick(level, &mount);
+            let shared = Arc::clone(&fixture.daemon.shared_executor_config);
+            assert!(shared.recovery_holds.note_failure(
+                &root.join("failed-artifact"),
+                Some(record.device_id),
+                Instant::now(),
+            ));
+            let admission = if level == PressureLevel::Green {
+                fixture
+                    .daemon
+                    .authorize_quarantine_maintenance(&mount, level, ActiveMode::Enforce)
+            } else {
+                fixture.daemon.authorize_quarantine_pressure(
+                    &tick,
+                    &store,
+                    &record,
+                    ActiveMode::Enforce,
+                )
+            };
+            assert_eq!(admission, Err(SkipReason::PolicyChanged));
+            let roots = vec![(root, Some(mount.clone()))];
+            fixture
+                .daemon
+                .sweep_quarantine_entries(std::slice::from_ref(&tick), &roots, true);
+            assert_eq!(
+                std::fs::read(&record.quarantine_path).unwrap(),
+                b"recoverable"
+            );
+            assert!(
+                store
+                    .record("held")
+                    .unwrap()
+                    .unwrap()
+                    .recovery_state
+                    .is_intact()
+            );
+            assert!(store.stuck_entries().unwrap().is_empty());
+            assert_eq!(fixture.daemon.quarantine_held.get(&mount), Some(&11));
+
+            let generation = shared.recovery_holds.generation(record.device_id);
+            assert!(shared.recovery_holds.release(generation));
+            fixture
+                .daemon
+                .sweep_quarantine_entries(std::slice::from_ref(&tick), &roots, true);
+            assert!(!record.quarantine_path.exists(), "{level:?}");
+            assert!(store.record("held").unwrap().is_none());
+            assert!(store.stuck_entries().unwrap().is_empty());
+            assert_eq!(fixture.daemon.quarantine_held.get(&mount), Some(&0));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolved_recovery_holds_only_overlapping_quarantine_stores() {
+        for level in [PressureLevel::Green, PressureLevel::Critical] {
+            for overlaps_store in [false, true] {
+                let mut fixture = RegretDaemonFixture::new();
+                let mount = fixture.directory.path().to_path_buf();
+                let root = fixture.daemon.config.scanner.root_paths[0].clone();
+                let source = root.join("target");
+                std::fs::write(&source, b"recoverable").unwrap();
+                let store = QuarantineStore::under(&root);
+                let record = store
+                    .quarantine(&source, "held", 11, Duration::ZERO, None)
+                    .unwrap();
+                fixture.daemon.platform =
+                    Arc::new(disk_pressure_platform(vec![disk_pressure_sample(
+                        &mount.to_string_lossy(),
+                        100_000,
+                        1_000,
+                    )]));
+                let failed = if overlaps_store {
+                    record.quarantine_path.clone()
+                } else {
+                    let unrelated = mount.join("unrelated/failed-cache");
+                    std::fs::create_dir_all(&unrelated).unwrap();
+                    unrelated
+                };
+                let shared = Arc::clone(&fixture.daemon.shared_executor_config);
+                assert!(
+                    shared
+                        .recovery_holds
+                        .note_failure(&failed, None, Instant::now())
+                );
+                assert!(!shared.recovery_holds.has_device_holds());
+                let tick = quarantine_tick(level, &mount);
+                let roots = vec![(root, Some(mount.clone()))];
+                fixture
+                    .daemon
+                    .sweep_quarantine_entries(std::slice::from_ref(&tick), &roots, true);
+
+                assert_eq!(
+                    record.quarantine_path.exists(),
+                    overlaps_store,
+                    "{level:?}, overlaps_store={overlaps_store}",
+                );
+                if overlaps_store {
+                    assert_eq!(
+                        std::fs::read(&record.quarantine_path).unwrap(),
+                        b"recoverable",
+                    );
+                    assert!(
+                        store
+                            .record("held")
+                            .unwrap()
+                            .unwrap()
+                            .recovery_state
+                            .is_intact()
+                    );
+                    assert_eq!(fixture.daemon.quarantine_held.get(&mount), Some(&11));
+                } else {
+                    assert!(store.record("held").unwrap().is_none());
+                    assert_eq!(fixture.daemon.quarantine_held.get(&mount), Some(&0));
+                }
+                assert!(store.stuck_entries().unwrap().is_empty());
+                assert!(
+                    shared.recovery_holds.blocks(&failed, None),
+                    "an unrelated purge cannot clear the unresolved incident",
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
     fn recovery_receipt(incidents: Vec<RecoveryIncident>) -> WorkerReport {
         WorkerReport::DeletionCompleted {
             deleted: 3,
@@ -20382,6 +20800,248 @@ mod tests {
             assert!(Instant::now() < deadline, "fixture mount was not observed");
             thread::yield_now();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn unresolved_recovery_preserves_peer_probe_and_revokes_old_success_after_mapping() {
+        let mut fixture = RegretDaemonFixture::new();
+        let sample = observed_recovery_fixture(&mut fixture);
+        let mount = fixture.directory.path().to_path_buf();
+        let device = sample.mount_device_id().unwrap();
+        let shared = Arc::clone(&fixture.daemon.shared_executor_config);
+        shared.recovery_holds.note_failure(
+            &mount.join("first-failure"),
+            Some(device),
+            Instant::now(),
+        );
+        let old_generation = shared.recovery_holds.generation(device);
+        let binding = CatalogObservationKey::from_sample(&mount, &sample).unwrap();
+        let key = |generation| RecoveryProbeKey {
+            mount: binding.clone(),
+            generation,
+            ballast_dir: None,
+            roots: vec![mount.clone()],
+            catalog_paths: Vec::new(),
+            cross_device_fallback: false,
+        };
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let shutdown = fixture.daemon.signal_handler.shutdown_token();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        fixture.daemon.recovery_probes.poll_or_start(
+            &mount,
+            key(old_generation),
+            deadline,
+            Arc::clone(&shutdown),
+            move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                true
+            },
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let peer_mount = mount.join("independent-probe");
+        let peer_key = || RecoveryProbeKey {
+            mount: CatalogObservationKey {
+                mount: peer_mount.clone(),
+                ..binding.clone()
+            },
+            generation: old_generation,
+            ballast_dir: None,
+            roots: Vec::new(),
+            catalog_paths: Vec::new(),
+            cross_device_fallback: false,
+        };
+        fixture.daemon.recovery_probes.poll_or_start(
+            &peer_mount,
+            peer_key(),
+            deadline,
+            Arc::clone(&shutdown),
+            |_| true,
+        );
+
+        let failed = mount.join("unidentified-failure");
+        std::fs::create_dir(&failed).unwrap();
+        fixture.daemon.fs_collector.invalidate_observations();
+        let (sender, receiver) = bounded(1);
+        sender
+            .send(recovery_receipt(vec![RecoveryIncident {
+                path: failed.clone(),
+                device_id: None,
+                failed_at: Instant::now(),
+            }]))
+            .unwrap();
+        fixture.daemon.drain_worker_reports(&receiver);
+        assert_eq!(fixture.daemon.pending_recovery_incidents.len(), 1);
+        assert!(shared.recovery_holds.blocks(&failed, None));
+        let completion_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(success) = fixture.daemon.recovery_probes.poll_or_start(
+                &peer_mount,
+                peer_key(),
+                deadline,
+                Arc::clone(&shutdown),
+                |_| false,
+            ) {
+                assert!(success, "an unknown incident must not cancel a peer probe");
+                break;
+            }
+            assert!(Instant::now() < completion_deadline);
+            thread::yield_now();
+        }
+
+        while !fixture.daemon.pending_recovery_incidents.is_empty() {
+            fixture.daemon.drain_worker_reports(&receiver);
+            assert!(Instant::now() < completion_deadline);
+            thread::yield_now();
+        }
+        let current_generation = shared.recovery_holds.generation(device);
+        assert_ne!(current_generation, old_generation);
+        assert!(!shared.recovery_holds.release(old_generation));
+        assert!(shared.recovery_holds.device_is_held(device));
+        release_tx.send(()).unwrap();
+        loop {
+            if let Some(success) = fixture.daemon.recovery_probes.poll_or_start(
+                &mount,
+                key(current_generation),
+                deadline,
+                Arc::clone(&shutdown),
+                |_| false,
+            ) {
+                assert!(
+                    !success,
+                    "the old successful probe cannot release a new incident"
+                );
+                break;
+            }
+            assert!(Instant::now() < completion_deadline);
+            thread::yield_now();
+        }
+        assert!(shared.recovery_holds.device_is_held(device));
+        assert!(fixture.daemon.pending_recovery.contains(&mount));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delayed_recovery_receipt_cannot_rearm_a_successfully_probed_incident() {
+        let mut fixture = RegretDaemonFixture::new();
+        let sample = observed_recovery_fixture(&mut fixture);
+        let mount = fixture.directory.path().to_path_buf();
+        let device = sample.mount_device_id().unwrap();
+        let failed = mount.join("failed-candidate");
+        let failed_at = Instant::now();
+        let shared = Arc::clone(&fixture.daemon.shared_executor_config);
+        shared
+            .recovery_holds
+            .note_failure(&failed, Some(device), failed_at);
+        let generation = shared.recovery_holds.generation(device);
+        assert!(shared.recovery_holds.release(generation));
+        let (sender, receiver) = bounded(1);
+        sender
+            .send(recovery_receipt(vec![RecoveryIncident {
+                path: failed,
+                device_id: Some(device),
+                failed_at,
+            }]))
+            .unwrap();
+        fixture.daemon.drain_worker_reports(&receiver);
+        assert!(!shared.recovery_holds.device_is_held(device));
+        assert!(fixture.daemon.pending_recovery.is_empty());
+        assert!(fixture.daemon.pending_recovery_incidents.is_empty());
+        assert_eq!(fixture.daemon.summary_deleted, 3);
+        fixture.daemon.drain_worker_reports(&receiver);
+        assert_eq!(fixture.daemon.summary_deleted, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_recovery_hold_drives_controller_and_waits_for_valid_probe_tick() {
+        let mut fixture = RegretDaemonFixture::new();
+        let mount = fixture.directory.path().to_path_buf();
+        let candidate = target_mutation_candidate(&mount, "target", 0.95);
+        let device = candidate.identity.unwrap().device_id;
+        let daemon = &mut fixture.daemon;
+        daemon.platform = Arc::new(disk_pressure_platform(vec![
+            disk_pressure_sample("/", 1_000_000, 900_000),
+            disk_pressure_sample(&mount.to_string_lossy(), 1_000_000, 1_000),
+        ]));
+        daemon.fs_collector = FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::ZERO);
+        daemon.config.scanner.root_paths = vec![mount.clone()];
+        daemon.config.scanner.excluded_paths.clear();
+        daemon.config.scanner.protected_paths.clear();
+        daemon.config.scanner.catalog_roots_on_pressured_device = false;
+        daemon.config.scanner.quarantine_enabled = false;
+        *daemon.shared_scanner_config.write() = daemon.config.scanner.clone();
+        daemon.behavior_state.mode = mock_behavior_mode(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::None,
+            NotificationPriority::Low,
+        );
+        daemon.check_pressure().unwrap();
+        let shared = Arc::clone(&daemon.shared_executor_config);
+        assert!(
+            shared
+                .recovery_holds
+                .note_failure(&candidate.path, Some(device), Instant::now(),)
+        );
+        assert!(
+            daemon.pending_recovery.is_empty(),
+            "the receipt is still queued"
+        );
+        let tick = quarantine_tick(PressureLevel::Critical, &mount);
+        let (scan_tx, scan_rx) = bounded(4);
+        let (del_tx, _del_rx) = bounded(4);
+        daemon.mount_responses = vec![tick.clone()];
+        daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(
+            daemon.mount_controllers[&mount].state(),
+            MountState::Recovery
+        );
+        assert_eq!(
+            shared.authorize_recovery(&candidate),
+            Err(SkipReason::PolicyChanged)
+        );
+        assert!(scan_rx.is_empty());
+
+        // A writable probe is insufficient when this tick cannot leave the
+        // controller's Recovery state. No executor lane may reopen early.
+        for free_pct in [f64::NAN, f64::INFINITY, -1.0, 101.0] {
+            let mut invalid = tick.clone();
+            invalid.response.free_pct = free_pct;
+            daemon.mount_responses = vec![invalid.clone()];
+            daemon.handle_pressure(&invalid.response, &scan_tx, &scan_rx, &del_tx);
+            assert_eq!(
+                daemon.mount_controllers[&mount].state(),
+                MountState::Recovery
+            );
+            assert!(shared.recovery_holds.device_is_held(device));
+            assert_eq!(
+                shared.authorize_recovery(&candidate),
+                Err(SkipReason::PolicyChanged)
+            );
+            assert!(scan_rx.is_empty());
+        }
+
+        daemon.mount_responses = vec![tick.clone()];
+        daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(
+            daemon.mount_controllers[&mount].state(),
+            MountState::Reclaim
+        );
+        assert!(!shared.recovery_holds.device_is_held(device));
+        assert_eq!(shared.authorize_recovery(&candidate), Ok(()));
+        assert!(
+            scan_rx
+                .try_iter()
+                .any(|request| request.paths.contains(&mount))
+        );
+        assert_eq!(
+            std::fs::read(candidate.path.join("debug/deps/libdemo.rlib")).unwrap(),
+            [7_u8; 64],
+        );
     }
 
     #[cfg(unix)]
@@ -20506,8 +21166,14 @@ mod tests {
         let sample = observed_recovery_fixture(&mut fixture);
         let mount = fixture.directory.path().to_path_buf();
         let binding = CatalogObservationKey::from_sample(&mount, &sample).unwrap();
+        let generation = fixture
+            .daemon
+            .shared_executor_config
+            .recovery_holds
+            .generation(binding.directory_identity.0);
         let key = || RecoveryProbeKey {
             mount: binding.clone(),
+            generation,
             ballast_dir: None,
             roots: vec![mount.clone()],
             catalog_paths: Vec::new(),
