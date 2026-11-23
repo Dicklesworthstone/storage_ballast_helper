@@ -8,6 +8,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- **Live telemetry reloads apply memory and calibration limits immediately.**
+  Existing mount monitors now adopt the configured rate-history bound and
+  guardrail observation limits; shrinking a window retains its newest evidence,
+  and reloading cannot clear a drift alarm or manufacture calibration samples.
+  RSS warning and exit limits take effect on the next daemon tick without
+  resetting the run identity, counters, or warning cooldown on unrelated reloads.
 - **A sustained writer keeps protection as exhaustion approaches** (bd-hosd).
   Crossing into the immediate forecast no longer discards measured consumption
   and lets an older, slower burst median cancel cleanup or ballast rescue.

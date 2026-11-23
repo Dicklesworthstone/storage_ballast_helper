@@ -179,18 +179,31 @@ impl DiskRateEstimator {
         }
     }
 
-    /// Update estimator parameters at runtime (e.g. after config reload).
+    /// Update estimator parameters at runtime, retaining the most recent
+    /// history within the new bound and all elapsed-time forecasting evidence.
     pub fn update_params(
         &mut self,
         base_alpha: f64,
         min_alpha: f64,
         max_alpha: f64,
         min_samples: u64,
+        rate_history_cap: usize,
     ) {
         self.base_alpha = base_alpha;
         self.min_alpha = min_alpha;
         self.max_alpha = max_alpha;
         self.min_samples = min_samples;
+        let rate_history_cap = rate_history_cap.max(1);
+        if self.rate_history_cap != rate_history_cap {
+            self.rate_history_cap = rate_history_cap;
+            while self.rate_history.len() > rate_history_cap {
+                self.rate_history.pop_front();
+            }
+            self.rate_history.shrink_to(rate_history_cap);
+            self.burst_duration_samples = self
+                .burst_duration_samples
+                .min(u32::try_from(self.rate_history.len()).unwrap_or(u32::MAX));
+        }
     }
 
     /// Update estimator state with a new free-bytes sample.
@@ -261,7 +274,7 @@ impl DiskRateEstimator {
             self.rate_history.pop_front();
         }
 
-        let burst_state = self.compute_burst_state(inst_rate);
+        let burst_state = self.compute_burst_state(inst_rate, true);
 
         let trend = classify_trend(self.ewma_rate, self.ewma_accel);
         let threshold_distance = free_bytes.saturating_sub(threshold_free_bytes);
@@ -525,6 +538,10 @@ impl DiskRateEstimator {
         estimate.seconds_to_exhaustion = project_time(projection_rate, previous.free_bytes as f64);
         estimate.confidence = self.compute_confidence();
         estimate.fallback_active = self.samples < self.min_samples || estimate.confidence < 0.2;
+        estimate.burst_state = self
+            .last
+            .map(|last| self.compute_burst_state(last.inst_rate, false))
+            .unwrap_or_default();
         self.last_predicted_secs = estimate
             .seconds_to_threshold
             .is_finite()
@@ -576,7 +593,7 @@ impl DiskRateEstimator {
     }
 
     /// Compute burst detection state from the rate history ring buffer.
-    fn compute_burst_state(&mut self, latest_rate: f64) -> BurstState {
+    fn compute_burst_state(&mut self, latest_rate: f64, new_sample: bool) -> BurstState {
         let calibrated = self.rate_history.len() >= BURST_CALIBRATION_MIN;
         if !calibrated || self.rate_history.is_empty() {
             self.burst_duration_samples = 0;
@@ -615,7 +632,9 @@ impl DiskRateEstimator {
         // and ensure the counter resets instead of going stale.
         let threshold = median_rate * 3.0;
         if threshold > 1.0 && latest_rate.abs() > threshold {
-            self.burst_duration_samples = self.burst_duration_samples.saturating_add(1);
+            if new_sample {
+                self.burst_duration_samples = self.burst_duration_samples.saturating_add(1);
+            }
         } else {
             self.burst_duration_samples = 0;
         }
@@ -1338,5 +1357,76 @@ mod tests {
         assert!(estimate.forecast_rate_bytes_per_second.unwrap() < 20_000_000.0);
         assert!(estimate.seconds_to_exhaustion > 3600.0);
         assert!(!estimator.recent_change_observed(start + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn reload_history_bound_retains_newest_rates_and_elapsed_time_forecasts() {
+        let (mut estimator, start, mut free) = warm_long_forecast();
+        for step in 1..=40 {
+            free -= step * 5000;
+            estimator.update(free, start + Duration::from_secs(step), 0);
+        }
+        let rate = estimator.ewma_rate;
+        let samples = estimator.sample_count();
+        let forecast_samples = estimator.forecast_history.len();
+        let forecast_start = estimator.forecast_history.front().unwrap().at;
+        estimator.update_params(0.3, 0.1, 0.8, 5, 30);
+        assert_eq!(estimator.sample_count(), samples);
+        assert_eq!(estimator.ewma_rate.to_bits(), rate.to_bits());
+        assert_eq!(estimator.forecast_history.len(), forecast_samples);
+        assert_eq!(
+            estimator.forecast_history.front().unwrap().at,
+            forecast_start
+        );
+        assert_eq!(estimator.rate_history.len(), 30);
+        assert_eq!(estimator.rate_history.front(), Some(&55_000.0));
+        assert_eq!(estimator.rate_history.back(), Some(&200_000.0));
+        let estimate = estimator.update(free - 205_000, start + Duration::from_secs(41), 0);
+        assert!(estimate.burst_state.calibrated);
+        assert!((estimate.burst_state.median_rate - 132_500.0).abs() < f64::EPSILON);
+
+        // Growing the cap cannot resurrect discarded measurements or turn
+        // the reload itself into an observed consumption interval.
+        estimator.update_params(0.3, 0.1, 0.8, 5, 100);
+        assert_eq!(estimator.rate_history.len(), 30);
+        assert_eq!(estimator.sample_count(), samples + 1);
+        estimator.update(free - 415_000, start + Duration::from_secs(42), 0);
+        assert_eq!(estimator.rate_history.len(), 31);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn reforecast_uses_resized_burst_history_without_counting_cached_samples() {
+        let mut estimator = DiskRateEstimator::with_history_cap(0.3, 0.1, 0.8, 5, 50);
+        let start = Instant::now();
+        let mut free = 1_000_000_000;
+        estimator.update(free, start, 0);
+        for step in 1..=40 {
+            free -= 1000;
+            estimator.update(free, start + Duration::from_secs(step), 0);
+        }
+        free -= 50_000;
+        let burst = estimator.update(free, start + Duration::from_secs(41), 0);
+        assert!(burst.burst_state.calibrated);
+        assert_eq!(burst.burst_state.burst_duration_samples, 1);
+        for _ in 0..3 {
+            let replay = estimator.reforecast(&burst, 0);
+            assert_eq!(replay.sample_count, burst.sample_count);
+            assert_eq!(replay.burst_state.burst_duration_samples, 1);
+            assert_eq!(
+                replay.burst_state.burst_probability.to_bits(),
+                burst.burst_state.burst_probability.to_bits()
+            );
+        }
+
+        estimator.update_params(0.3, 0.1, 0.8, 5, 20);
+        let reduced = estimator.reforecast(&burst, 0);
+        assert!(!reduced.burst_state.calibrated);
+        assert_eq!(reduced.burst_state.burst_duration_samples, 0);
+        assert_eq!(reduced.sample_count, burst.sample_count);
+        assert_eq!(
+            reduced.bytes_per_second.to_bits(),
+            burst.bytes_per_second.to_bits()
+        );
     }
 }

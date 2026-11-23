@@ -1369,6 +1369,23 @@ impl SelfMonitor {
         monitor
     }
 
+    /// Apply live RSS limits without resetting this run's identity, counters,
+    /// or snapshots. A changed limit is checked and reported on the next tick;
+    /// unrelated reloads retain the existing warning cooldown and write cadence.
+    pub(crate) fn update_rss_limits(&mut self, telemetry: &TelemetryConfig) {
+        let warning_changed = self.rss_warning_bytes != telemetry.daemon_rss_warning_bytes;
+        let hard_limit_changed = self.rss_hard_limit_bytes != telemetry.daemon_rss_hard_limit_bytes;
+        if !warning_changed && !hard_limit_changed {
+            return;
+        }
+        self.rss_warning_bytes = telemetry.daemon_rss_warning_bytes;
+        self.rss_hard_limit_bytes = telemetry.daemon_rss_hard_limit_bytes;
+        if warning_changed {
+            self.rss_warned = None;
+        }
+        self.force_next_write();
+    }
+
     fn with_rss_limits(
         state_file_path: PathBuf,
         platform: Arc<dyn Platform>,
@@ -2838,6 +2855,85 @@ mod tests {
         let state = SelfMonitor::read_state(&path).expect("hard-limit tick should force write");
         assert_eq!(state.pressure.overall, "red");
         assert_eq!(state.memory_rss_bytes, 4096);
+    }
+
+    #[test]
+    fn reloaded_rss_limits_change_the_next_tick_without_restarting_the_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut telemetry = TelemetryConfig {
+            daemon_rss_warning_bytes: 4096,
+            daemon_rss_hard_limit_bytes: 8192,
+            ..TelemetryConfig::default()
+        };
+        let mut monitor = SelfMonitor::from_telemetry_config(
+            path.clone(),
+            Arc::new(MockPlatform::healthy().with_self_stats(test_self_stats(2048))),
+            &telemetry,
+        );
+        monitor.record_scan(4, 0, Duration::from_secs(2));
+        monitor.record_deletions(2, 1024);
+        let run_id = monitor.run_id().to_string();
+        let initial =
+            monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 1, 1, 0, "enforce");
+        assert!(!initial.should_exit_for_rss_hard_limit());
+
+        telemetry.daemon_rss_warning_bytes = 1024;
+        telemetry.daemon_rss_hard_limit_bytes = 1536;
+        monitor.update_rss_limits(&telemetry);
+        let lowered =
+            monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 1, 1, 0, "enforce");
+        assert!(lowered.should_exit_for_rss_hard_limit());
+        assert_eq!(lowered.rss_warning_bytes, 1024);
+        assert_eq!(lowered.rss_hard_limit_bytes, 1536);
+        assert_eq!(monitor.rss_warned.map(|(_, rss)| rss), Some(2048));
+        assert_eq!(monitor.run_id(), run_id);
+        assert_eq!(monitor.scan_count, 1);
+        assert_eq!(monitor.deletions_total, 2);
+        assert_eq!(monitor.bytes_freed_total, 1024);
+
+        telemetry.daemon_rss_warning_bytes = 4096;
+        telemetry.daemon_rss_hard_limit_bytes = 8192;
+        monitor.update_rss_limits(&telemetry);
+        let raised =
+            monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 1, 1, 0, "enforce");
+        assert!(!raised.should_exit_for_rss_hard_limit());
+        assert_eq!(monitor.rss_warned, None);
+        let state = SelfMonitor::read_state(&path).unwrap();
+        assert_eq!(state.run_id, run_id);
+        assert_eq!(state.counters.deletions, 2);
+    }
+
+    #[test]
+    fn unrelated_reload_preserves_rss_warning_cooldown_and_write_cadence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut telemetry = TelemetryConfig {
+            daemon_rss_warning_bytes: 1024,
+            daemon_rss_hard_limit_bytes: 8192,
+            ..TelemetryConfig::default()
+        };
+        let mut monitor = SelfMonitor::from_telemetry_config(
+            dir.path().join("state.json"),
+            Arc::new(MockPlatform::healthy().with_self_stats(test_self_stats(2048))),
+            &telemetry,
+        );
+        monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 1, 1, 0, "enforce");
+        let warned = monitor.rss_warned;
+        let last_write = monitor.last_write;
+        assert!(warned.is_some());
+        assert!(last_write.is_some());
+
+        telemetry.cpu_budget_pct = 20;
+        monitor.update_rss_limits(&telemetry);
+        monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 1, 1, 0, "enforce");
+        assert_eq!(monitor.rss_warned, warned);
+        assert_eq!(monitor.last_write, last_write);
+
+        // Raising only the hard cap is not a new warning episode.
+        telemetry.daemon_rss_hard_limit_bytes = 16_384;
+        monitor.update_rss_limits(&telemetry);
+        monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 1, 1, 0, "enforce");
+        assert_eq!(monitor.rss_warned, warned);
     }
 
     #[test]

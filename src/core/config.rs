@@ -3110,6 +3110,32 @@ impl Config {
                 details: "EWMA alpha values must satisfy 0 < min <= base <= max < 1".to_string(),
             });
         }
+        for (name, value) in [
+            (
+                "ewma_rate_history_size",
+                self.telemetry.ewma_rate_history_size,
+            ),
+            (
+                "guardrail_window_size",
+                self.telemetry.guardrail_window_size,
+            ),
+            (
+                "guardrail_min_observations",
+                self.telemetry.guardrail_min_observations,
+            ),
+        ] {
+            if value == 0 {
+                return Err(SbhError::InvalidConfig {
+                    details: format!("telemetry.{name} must be >= 1"),
+                });
+            }
+        }
+        if self.telemetry.guardrail_min_observations > self.telemetry.guardrail_window_size {
+            return Err(SbhError::InvalidConfig {
+                details: "telemetry.guardrail_min_observations must be <= telemetry.guardrail_window_size"
+                    .to_string(),
+            });
+        }
         if self.telemetry.daemon_rss_warning_bytes == 0 {
             return Err(SbhError::InvalidConfig {
                 details: "telemetry.daemon_rss_warning_bytes must be > 0".to_string(),
@@ -5313,6 +5339,39 @@ mod tests {
         cfg.telemetry.ewma_base_alpha = 0.1;
         let err = cfg.validate().expect_err("expected alpha validation error");
         assert!(err.to_string().contains("alpha"));
+    }
+
+    #[test]
+    fn telemetry_calibration_windows_must_hold_the_required_evidence() {
+        for field in [
+            "ewma_rate_history_size",
+            "guardrail_window_size",
+            "guardrail_min_observations",
+        ] {
+            let mut config = Config::default();
+            match field {
+                "ewma_rate_history_size" => config.telemetry.ewma_rate_history_size = 0,
+                "guardrail_window_size" => config.telemetry.guardrail_window_size = 0,
+                _ => config.telemetry.guardrail_min_observations = 0,
+            }
+            let error = config.validate().expect_err("zero calibration bound");
+            assert!(error.to_string().contains(field));
+        }
+        let mut config = Config::default();
+        config.telemetry.guardrail_min_observations = config.telemetry.guardrail_window_size + 1;
+        let error = config.validate().expect_err("unreachable warmup minimum");
+        assert!(
+            error
+                .to_string()
+                .contains("guardrail_min_observations must be <=")
+        );
+
+        config.telemetry.ewma_rate_history_size = 1;
+        config.telemetry.guardrail_window_size = 1;
+        config.telemetry.guardrail_min_observations = 1;
+        config
+            .validate()
+            .expect("one-sample windows are meaningful");
     }
 
     #[test]

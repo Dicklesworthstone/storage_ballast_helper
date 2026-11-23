@@ -3341,12 +3341,6 @@ impl MountMonitor {
                 .set_action_horizon_minutes(config.pressure.prediction.action_horizon_minutes);
         }
 
-        let guard_config = crate::monitor::guardrails::GuardrailConfig {
-            min_observations: config.telemetry.guardrail_min_observations,
-            window_size: config.telemetry.guardrail_window_size,
-            ..crate::monitor::guardrails::GuardrailConfig::default()
-        };
-
         Self {
             rate_estimator,
             last_observation: None,
@@ -3354,10 +3348,18 @@ impl MountMonitor {
             pressure_controller,
             swap_pressure_controller: Self::swap_controller(config),
             inode_pressure_level: PressureLevel::Green,
-            guard: AdaptiveGuard::new(guard_config),
+            guard: AdaptiveGuard::new(Self::guard_config(config)),
             last_guard_sample: None,
             conformal: ConformalCalibrator::new(conformal_config(config)),
             prediction_scorecard: PredictionScorecard::new(200),
+        }
+    }
+
+    fn guard_config(config: &Config) -> crate::monitor::guardrails::GuardrailConfig {
+        crate::monitor::guardrails::GuardrailConfig {
+            min_observations: config.telemetry.guardrail_min_observations,
+            window_size: config.telemetry.guardrail_window_size,
+            ..crate::monitor::guardrails::GuardrailConfig::default()
         }
     }
 
@@ -3386,11 +3388,13 @@ impl MountMonitor {
             self.last_guard_sample = None;
         }
         self.forecast_needs_refresh = true;
+        self.guard.reconfigure(Self::guard_config(config));
         self.rate_estimator.update_params(
             config.telemetry.ewma_base_alpha,
             config.telemetry.ewma_min_alpha,
             config.telemetry.ewma_max_alpha,
             config.telemetry.ewma_min_samples,
+            config.telemetry.ewma_rate_history_size,
         );
 
         self.pressure_controller
@@ -11380,6 +11384,8 @@ impl MonitoringDaemon {
                     );
                     self.release_controller
                         .set_replenish_cooldown(new_config.ballast.replenish_cooldown_minutes);
+
+                    self.self_monitor.update_rss_limits(&new_config.telemetry);
 
                     // Propagate pressure thresholds and EWMA params to all active monitors.
                     for monitor in self.mount_monitors.values_mut() {
@@ -19892,6 +19898,68 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn config_reload_applies_live_rss_limits_without_resetting_counters() {
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        daemon.self_monitor = SelfMonitor::from_telemetry_config(
+            daemon.config.paths.state_file.clone(),
+            Arc::new(
+                MockPlatform::healthy().with_self_stats(crate::platform::types::SelfStats {
+                    rss_bytes: 2048,
+                    virtual_memory_bytes: 4096,
+                    cpu_user_micros: 0,
+                    cpu_system_micros: 0,
+                    idle_wakeups: None,
+                    bytes_read: None,
+                    bytes_written: None,
+                }),
+            ),
+            &daemon.config.telemetry,
+        );
+        daemon.self_monitor.record_deletions(3, 4096);
+        let run_id = daemon.self_monitor.run_id().to_string();
+        let initial = daemon.self_monitor.maybe_write_state(
+            PressureLevel::Green,
+            25.0,
+            "/",
+            0,
+            0,
+            0,
+            "enforce",
+        );
+        assert!(!initial.should_exit_for_rss_hard_limit());
+
+        let mut updated = daemon.config.clone();
+        updated.telemetry.daemon_rss_warning_bytes = 1024;
+        updated.telemetry.daemon_rss_hard_limit_bytes = 1536;
+        std::fs::write(
+            &updated.paths.config_file,
+            toml::to_string(&updated).unwrap(),
+        )
+        .unwrap();
+        let (scan_tx, _scan_rx) = bounded(1);
+        daemon.handle_config_reload(&scan_tx);
+
+        let tick = daemon.self_monitor.maybe_write_state(
+            PressureLevel::Green,
+            25.0,
+            "/",
+            0,
+            0,
+            0,
+            "enforce",
+        );
+        assert!(tick.should_exit_for_rss_hard_limit());
+        assert_eq!(tick.rss_warning_bytes, 1024);
+        assert_eq!(tick.rss_hard_limit_bytes, 1536);
+        let state = SelfMonitor::read_state(&daemon.config.paths.state_file).unwrap();
+        assert_eq!(state.run_id, run_id);
+        assert_eq!(state.counters.deletions, 3);
+        assert_eq!(state.counters.bytes_freed, 4096);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn scanner_log_truncation_uses_the_executors_live_policy() {
         for mode in ["enforce", "canary", "observe", "kill-switch", "dry-run"] {
             let mut fixture = RegretDaemonFixture::new();
@@ -23156,6 +23224,100 @@ mod tests {
         );
         assert_eq!(response.level, PressureLevel::Orange);
         assert_eq!(monitor.pressure_controller.last_feedforward(), 0.0);
+    }
+
+    #[test]
+    fn live_reload_applies_history_and_guardrail_limits_to_existing_monitors() {
+        const GIB: u64 = 1 << 30;
+        let mut config = Config::default();
+        config.telemetry.guardrail_min_observations = 5;
+        config.telemetry.guardrail_window_size = 50;
+        config.telemetry.ewma_rate_history_size = 50;
+        let mut monitor = MountMonitor::new(&config);
+        let start = Instant::now();
+        let mut sample = native_pressure_sample(
+            Path::new("/reconfigured"),
+            "disk-a",
+            100 * GIB,
+            80 * GIB,
+            start,
+        );
+        for step in 0..=40 {
+            sample.collected_at = start + Duration::from_secs(step * 10);
+            sample.stats.available_bytes = 80 * GIB - step * 1_048_576;
+            sample.stats.free_bytes = sample.stats.available_bytes;
+            monitor.observe_filesystem(sample.clone(), &config);
+        }
+        let before = monitor.guard.diagnostics();
+        assert_eq!(before.status, GuardStatus::Pass);
+        assert_eq!(before.observation_count, 40);
+        assert!(
+            monitor
+                .last_observation
+                .as_ref()
+                .unwrap()
+                .rate
+                .burst_state
+                .calibrated
+        );
+
+        // An unrelated change retains learned calibration and does not count
+        // the cached filesystem reading as another measurement.
+        config.scoring.min_score = 0.4;
+        monitor.update_config(&config);
+        let repeated = monitor.observe_filesystem(sample.clone(), &config);
+        assert!(!repeated.fresh);
+        assert_eq!(
+            monitor.guard.diagnostics().observation_count,
+            before.observation_count
+        );
+        assert_eq!(
+            monitor.guard.diagnostics().consecutive_clean,
+            before.consecutive_clean
+        );
+        assert_eq!(
+            monitor.guard.diagnostics().e_process_value.to_bits(),
+            before.e_process_value.to_bits()
+        );
+
+        config.telemetry.guardrail_window_size = 10;
+        config.telemetry.ewma_rate_history_size = 20;
+        monitor.update_config(&config);
+        let resized = monitor.observe_filesystem(sample.clone(), &config);
+        assert!(!resized.fresh);
+        assert_eq!(resized.observation.rate.sample_count, 40);
+        assert!(!resized.observation.rate.burst_state.calibrated);
+        assert_eq!(monitor.guard.observation_count(), 10);
+        assert_eq!(monitor.guard.status(), GuardStatus::Pass);
+        assert_eq!(
+            monitor.guard.diagnostics().e_process_value.to_bits(),
+            before.e_process_value.to_bits()
+        );
+
+        config.telemetry.guardrail_window_size = 15;
+        config.telemetry.guardrail_min_observations = 15;
+        monitor.update_config(&config);
+        assert_eq!(monitor.guard.status(), GuardStatus::Unknown);
+        let mut newcomer = MountMonitor::new(&config);
+        for step in 41..=56 {
+            sample.collected_at = start + Duration::from_secs(step * 10);
+            sample.stats.available_bytes = 80 * GIB - step * 1_048_576;
+            sample.stats.free_bytes = sample.stats.available_bytes;
+            let current = monitor.observe_filesystem(sample.clone(), &config);
+            newcomer.observe_filesystem(sample.clone(), &config);
+            assert!(!current.observation.rate.burst_state.calibrated);
+            assert!(monitor.guard.observation_count() <= 15);
+            if step < 45 {
+                assert_eq!(monitor.guard.status(), GuardStatus::Unknown);
+            } else {
+                assert_eq!(monitor.guard.status(), GuardStatus::Pass);
+            }
+            if step < 56 {
+                assert_eq!(newcomer.guard.status(), GuardStatus::Unknown);
+            } else {
+                assert_eq!(newcomer.guard.status(), GuardStatus::Pass);
+            }
+        }
     }
 
     #[cfg(unix)]

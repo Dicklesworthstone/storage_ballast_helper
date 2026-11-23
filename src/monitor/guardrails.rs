@@ -252,7 +252,7 @@ impl DeletionFailureMonitor {
 }
 
 /// Configuration for the statistical guardrails.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GuardrailConfig {
     /// Minimum observations before guard can transition to PASS.
     pub min_observations: usize,
@@ -415,6 +415,36 @@ impl AdaptiveGuard {
             consecutive_clean: 0,
             material_rate: NOISE_FLOOR_RATE_BYTES_PER_SEC,
             forecast: None,
+        }
+    }
+
+    /// Apply changed calibration limits without inventing a new observation.
+    ///
+    /// Recent measurements and accumulated drift evidence survive a reload.
+    /// A smaller window drops only its oldest measurements; stricter limits
+    /// can withdraw permission immediately, but a reload cannot promote an
+    /// unknown or failed guard. Recovery still needs fresh observations.
+    pub fn reconfigure(&mut self, config: GuardrailConfig) {
+        if self.config == config {
+            return;
+        }
+        let previous = self.status;
+        self.config = config;
+        while self.observations.len() > self.config.window_size {
+            self.observations.pop_front();
+        }
+        self.observations.shrink_to(self.config.window_size);
+        self.consecutive_clean = 0;
+        self.recompute_status(false);
+        if previous == GuardStatus::Fail
+            || self.e_process_log.exp() >= self.config.e_process_threshold
+        {
+            // Raising the observation minimum must not hide a live alarm
+            // behind UNKNOWN, or reset its evidence to the startup prior.
+            self.status = GuardStatus::Fail;
+        } else if previous == GuardStatus::Unknown && self.status == GuardStatus::Pass {
+            self.status = GuardStatus::Unknown;
+            self.consecutive_clean = 0;
         }
     }
 
@@ -588,16 +618,22 @@ impl AdaptiveGuard {
     }
 
     fn recompute_status(&mut self, latest_obs_good: bool) {
-        // Not enough data → Unknown.
+        let e_val = self.e_process_log.exp();
+        let alarm = e_val >= self.config.e_process_threshold;
+        // A changed minimum can require more calibration without making an
+        // existing failure safe. Keep it latched until fresh observations
+        // satisfy both the new warmup and the normal recovery streak.
         if self.observations.len() < self.config.min_observations {
-            self.status = GuardStatus::Unknown;
+            self.status = if self.status == GuardStatus::Fail || alarm {
+                GuardStatus::Fail
+            } else {
+                GuardStatus::Unknown
+            };
             self.consecutive_clean = 0;
             return;
         }
 
         let (median_error, conservative_frac) = self.calibration_metrics();
-        let e_val = self.e_process_log.exp();
-        let alarm = e_val >= self.config.e_process_threshold;
 
         // Coverage of the conformal bound replaces the per-tick
         // "conservative fraction" as the TTE gate: a stated error rate with
@@ -1139,6 +1175,153 @@ mod tests {
         let guard = AdaptiveGuard::with_defaults();
         assert_eq!(guard.status(), GuardStatus::Unknown);
         assert!(!guard.adaptive_allowed());
+    }
+
+    #[test]
+    fn reload_trims_old_calibration_without_erasing_failure_evidence() {
+        let mut config = GuardrailConfig {
+            min_observations: 3,
+            window_size: 10,
+            e_process_threshold: 100.0,
+            ..Default::default()
+        };
+        let mut guard = AdaptiveGuard::new(config.clone());
+        for _ in 0..7 {
+            guard.observe(good_obs());
+        }
+        for _ in 0..3 {
+            guard.observe(bad_obs());
+        }
+        assert_eq!(guard.status(), GuardStatus::Pass);
+        let evidence = guard.diagnostics().e_process_value;
+
+        config.window_size = 3;
+        guard.reconfigure(config.clone());
+        assert_eq!(guard.observation_count(), 3);
+        assert_eq!(guard.status(), GuardStatus::Fail);
+        assert_eq!(
+            guard.diagnostics().e_process_value.to_bits(),
+            evidence.to_bits()
+        );
+        assert!(guard.diagnostics().median_rate_error > config.max_rate_error);
+
+        // A smaller window can drop the bad measurements, but reloading is
+        // not a clean observation and cannot complete failure recovery.
+        guard.observe(good_obs());
+        config.window_size = 1;
+        config.min_observations = 1;
+        guard.reconfigure(config.clone());
+        assert_eq!(guard.observation_count(), 1);
+        assert_eq!(guard.status(), GuardStatus::Fail);
+        assert_eq!(guard.diagnostics().consecutive_clean, 0);
+        guard.observe(good_obs());
+        let before = guard.diagnostics();
+        guard.reconfigure(config);
+        assert_eq!(
+            guard.diagnostics().consecutive_clean,
+            before.consecutive_clean
+        );
+        assert_eq!(
+            guard.diagnostics().e_process_value.to_bits(),
+            before.e_process_value.to_bits()
+        );
+        guard.observe(good_obs());
+        assert_eq!(guard.status(), GuardStatus::Fail);
+        guard.observe(good_obs());
+        assert_eq!(guard.status(), GuardStatus::Pass);
+    }
+
+    #[test]
+    fn reload_reapplies_warmup_without_promoting_from_retained_samples() {
+        let mut config = GuardrailConfig {
+            min_observations: 3,
+            window_size: 10,
+            ..Default::default()
+        };
+        let mut guard = AdaptiveGuard::new(config.clone());
+        for _ in 0..3 {
+            guard.observe(good_obs());
+        }
+        assert_eq!(guard.status(), GuardStatus::Pass);
+        let before = guard.diagnostics();
+        guard.reconfigure(config.clone());
+        assert_eq!(
+            guard.diagnostics().consecutive_clean,
+            before.consecutive_clean
+        );
+        assert_eq!(
+            guard.diagnostics().e_process_value.to_bits(),
+            before.e_process_value.to_bits()
+        );
+
+        config.min_observations = 5;
+        guard.reconfigure(config.clone());
+        assert_eq!(guard.status(), GuardStatus::Unknown);
+        assert_eq!(guard.observation_count(), 3);
+        assert_eq!(
+            guard.diagnostics().e_process_value.to_bits(),
+            before.e_process_value.to_bits()
+        );
+        guard.observe(good_obs());
+        assert_eq!(guard.status(), GuardStatus::Unknown);
+        guard.observe(good_obs());
+        assert_eq!(guard.status(), GuardStatus::Pass);
+
+        let mut warming = AdaptiveGuard::new(config.clone());
+        for _ in 0..3 {
+            warming.observe(good_obs());
+        }
+        config.min_observations = 3;
+        warming.reconfigure(config);
+        assert_eq!(warming.status(), GuardStatus::Unknown);
+        warming.observe(good_obs());
+        assert_eq!(warming.status(), GuardStatus::Pass);
+    }
+
+    #[test]
+    fn reload_cannot_hide_a_live_drift_alarm_behind_a_larger_minimum() {
+        let mut config = GuardrailConfig {
+            min_observations: 3,
+            window_size: 100,
+            ..Default::default()
+        };
+        let mut guard = AdaptiveGuard::new(config.clone());
+        for _ in 0..30 {
+            guard.observe(bad_obs());
+        }
+        let before = guard.diagnostics();
+        assert_eq!(before.status, GuardStatus::Fail);
+        assert!(before.e_process_alarm);
+        config.min_observations = 60;
+        guard.reconfigure(config);
+        let after = guard.diagnostics();
+        assert_eq!(after.status, GuardStatus::Fail);
+        assert!(after.e_process_alarm);
+        assert_eq!(
+            after.e_process_value.to_bits(),
+            before.e_process_value.to_bits()
+        );
+        assert_eq!(after.observation_count, before.observation_count);
+
+        // The next native measurement must not demote the alarm to Unknown:
+        // Unknown allows a conservative fallback, while Fail blocks the action.
+        for _ in 0..3 {
+            guard.observe(bad_obs());
+            assert_eq!(guard.status(), GuardStatus::Fail);
+            assert!(guard.diagnostics().e_process_alarm);
+            assert!(!gate_action(&guard, true).should_proceed());
+        }
+        // Clean evidence eventually clears the alarm, but permission returns
+        // only after reaching the new minimum and completing normal recovery.
+        while guard.observation_count() < 60 {
+            guard.observe(good_obs());
+            assert_eq!(guard.status(), GuardStatus::Fail);
+        }
+        assert!(!guard.diagnostics().e_process_alarm);
+        guard.observe(good_obs());
+        assert_eq!(guard.status(), GuardStatus::Fail);
+        guard.observe(good_obs());
+        assert_eq!(guard.status(), GuardStatus::Pass);
     }
 
     #[test]
