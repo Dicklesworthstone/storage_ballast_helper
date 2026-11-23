@@ -320,11 +320,10 @@ impl DescendantGlobMatcher {
                             .to_string(),
                     }
                 })?;
-                normalized = if let Some(tail) = suffix.strip_prefix('/') {
-                    normalize_path_for_matching(&spellings[1].join(tail))
-                } else {
-                    format!("{}{suffix}", normalize_path_for_matching(&spellings[1]))
-                };
+                normalized = suffix.strip_prefix('/').map_or_else(
+                    || format!("{}{suffix}", normalize_path_for_matching(&spellings[1])),
+                    |tail| normalize_path_for_matching(&spellings[1].join(tail)),
+                );
                 Some(spellings)
             } else {
                 None

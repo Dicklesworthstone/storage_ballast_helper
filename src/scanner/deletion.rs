@@ -5174,8 +5174,7 @@ mod tests {
         // 1 + 4 + 4 directories to open.
         assert_eq!(deep_containment(&root, 9, &[]), DeepContainment::Clear);
         assert_eq!(deep_containment(&root, 8, &[]), DeepContainment::Truncated);
-        let catalog =
-            protection::sacred_paths_from_protected_patterns(&["**/*.keep".to_string()]);
+        let catalog = protection::sacred_paths_from_protected_patterns(&["**/*.keep".to_string()]);
         assert_eq!(deep_containment(&root, 9, &catalog), DeepContainment::Clear);
         assert_eq!(
             deep_containment(&root, 8, &catalog),

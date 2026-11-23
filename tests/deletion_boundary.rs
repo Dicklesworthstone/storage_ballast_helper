@@ -561,11 +561,8 @@ fn final_authorization_renews_nested_sacred_rules_in_both_mutation_modes() {
                                 fs::create_dir(&protected).unwrap();
                             } else {
                                 fs::write(&protected, b"protected data").unwrap();
-                                fs::set_permissions(
-                                    &protected,
-                                    fs::Permissions::from_mode(0o400),
-                                )
-                                .unwrap();
+                                fs::set_permissions(&protected, fs::Permissions::from_mode(0o400))
+                                    .unwrap();
                             }
                         }
                         Ok(())
@@ -639,7 +636,12 @@ fn quarantine_final_authorization_renews_ancestor_markers_for_files_and_director
         assert_eq!(report.quarantine_unavailable, 0);
         assert_eq!(identity_for_path(&target, false).ok(), item.identity);
         assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
-        assert!(QuarantineStore::under(dir.path()).records().unwrap().is_empty());
+        assert!(
+            QuarantineStore::under(dir.path())
+                .records()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 
@@ -761,7 +763,10 @@ fn configured_globs_protect_complete_cleanup_subtrees() {
             settings.source_roots = SourceRootPolicy::new(std::slice::from_ref(&target), true);
             let executor = DeletionExecutor::new(settings, None);
             let plan = executor.plan(vec![item.clone()]);
-            assert_eq!(plan.estimated_items, 1, "{shape}: must reach full containment");
+            assert_eq!(
+                plan.estimated_items, 1,
+                "{shape}: must reach full containment"
+            );
             let report = executor.execute(&plan, None);
             assert_eq!(report.items_deleted, 0, "{mode:?}, {shape}: {report:?}");
             assert_eq!(report.items_failed, 0);
