@@ -225,6 +225,139 @@ fn transient_writer_near_a_boundary_does_not_gain_sustained_authority() {
     );
 }
 
+fn estimator_after_idle_burst() -> (DiskRateEstimator, Instant, u64) {
+    let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+    let start = Instant::now();
+    let mut free = 6_000_000_000;
+    estimator.update(free, start, 0);
+    for seconds in (5..=900_u64).step_by(5) {
+        estimator.update(free, start + Duration::from_secs(seconds), 0);
+    }
+    for seconds in (905..=930_u64).step_by(5) {
+        free -= 500_000_000;
+        estimator.update(free, start + Duration::from_secs(seconds), 0);
+    }
+    (estimator, start, free)
+}
+
+#[test]
+fn transient_writer_after_idle_does_not_corroborate_its_residual_forecast() {
+    for tail_bytes_per_interval in [0_u64, 4096] {
+        let (mut estimator, start, mut free) = estimator_after_idle_burst();
+        let mut saw_uncorroborated_fast_forecast = false;
+        for seconds in (935..=990_u64).step_by(5) {
+            free -= tail_bytes_per_interval;
+            let estimate = estimator.update(free, start + Duration::from_secs(seconds), 0);
+            assert!(estimate.burst_state.calibrated);
+            assert_eq!(estimate.burst_state.median_rate, 0.0);
+            assert_eq!(
+                estimate.burst_state.latest_rate,
+                Some(tail_bytes_per_interval as f64 / 5.0)
+            );
+            saw_uncorroborated_fast_forecast |= estimate.forecast_rate_bytes_per_second.is_none()
+                && estimate.seconds_to_exhaustion < 300.0
+                && estimate.confidence >= PredictiveConfig::default().min_confidence;
+            for free_pct in [9.0, 90.0] {
+                assert_eq!(
+                    policy().evaluate(&estimate, free_pct, PathBuf::from("/data")),
+                    PredictiveAction::Clear,
+                    "transient writer at {seconds}s and {free_pct}% with {tail_bytes_per_interval} byte tail cannot corroborate its own EWMA: {estimate:?}"
+                );
+            }
+        }
+        assert!(
+            saw_uncorroborated_fast_forecast,
+            "fixture must retain an actionable immediate EWMA without persistence evidence"
+        );
+    }
+}
+
+#[test]
+fn slower_writer_after_idle_burst_uses_its_measured_runway() {
+    let (mut estimator, start, mut free) = estimator_after_idle_burst();
+    free -= 5 * 2_000_000;
+    let estimate = estimator.update(free, start + Duration::from_secs(935), 0);
+    assert_eq!(estimate.burst_state.median_rate, 0.0);
+    assert_eq!(estimate.burst_state.latest_rate, Some(2_000_000.0));
+    assert!(estimate.forecast_rate_bytes_per_second.is_none());
+    assert!(estimate.seconds_to_exhaustion < 120.0);
+    match policy().evaluate(&estimate, 9.0, PathBuf::from("/data")) {
+        PredictiveAction::PreemptiveCleanup {
+            minutes_remaining, ..
+        } => {
+            assert!((minutes_remaining - free as f64 / 2_000_000.0 / 60.0).abs() < 1e-6);
+        }
+        action => panic!(
+            "slower writer still needs cleanup at its measured runway: {action:?}; {estimate:?}"
+        ),
+    }
+}
+
+#[test]
+fn idle_baseline_does_not_delay_a_live_rapid_writer() {
+    // At 5-second polling the writer has only seconds left; at 60-second
+    // polling the persistence windows cannot be independently observed.
+    // Both need the immediate rescue path before a minute of corroboration.
+    for (interval, initial_free, consuming_intervals) in
+        [(5_u64, 2_500_000_000_u64, 4_u64), (60, 9_000_000_000, 1)]
+    {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+        let start = Instant::now();
+        let mut free = initial_free;
+        estimator.update(free, start, 0);
+        for seconds in (interval..=1800).step_by(usize::try_from(interval).unwrap()) {
+            estimator.update(free, start + Duration::from_secs(seconds), 0);
+        }
+        for tick in 1..=consuming_intervals {
+            free -= interval * 100_000_000;
+            let estimate =
+                estimator.update(free, start + Duration::from_secs(1800 + tick * interval), 0);
+            assert!(estimate.burst_state.calibrated);
+            assert_eq!(estimate.burst_state.median_rate, 0.0);
+            assert_eq!(estimate.burst_state.latest_rate, Some(100_000_000.0));
+            assert!(estimate.forecast_rate_bytes_per_second.is_none());
+            assert!(free as f64 / 100_000_000.0 < 60.0);
+            for free_pct in [9.0, 90.0] {
+                let action = policy().evaluate(&estimate, free_pct, PathBuf::from("/data"));
+                assert!(
+                    action.should_release_ballast(),
+                    "live rapid writer at {interval}s polling and {free_pct}% must retain rescue: {action:?}; {estimate:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn confirmed_writer_keeps_rescue_during_a_brief_idle_interval() {
+    let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+    let start = Instant::now();
+    let mut free = 10_000_000_000;
+    estimator.update(free, start, 0);
+    for seconds in (5..=900_u64).step_by(5) {
+        estimator.update(free, start + Duration::from_secs(seconds), 0);
+    }
+    for seconds in (905..=960_u64).step_by(5) {
+        free -= 500_000_000;
+        estimator.update(free, start + Duration::from_secs(seconds), 0);
+    }
+    let estimate = estimator.update(free, start + Duration::from_secs(965), 0);
+    assert_eq!(estimate.burst_state.median_rate, 0.0);
+    assert_eq!(estimate.burst_state.latest_rate, Some(0.0));
+    assert!(
+        estimate
+            .forecast_rate_bytes_per_second
+            .is_some_and(|rate| rate > 0.0)
+    );
+    for free_pct in [9.0, 90.0] {
+        let action = policy().evaluate(&estimate, free_pct, PathBuf::from("/data"));
+        assert!(
+            action.should_release_ballast(),
+            "one idle interval cannot erase confirmed net drain: {action:?}; {estimate:?}"
+        );
+    }
+}
+
 #[test]
 fn fast_polling_spike_cannot_borrow_sustained_consumption_evidence() {
     let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);

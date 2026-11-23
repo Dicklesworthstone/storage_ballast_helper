@@ -37,6 +37,10 @@ pub struct BurstState {
     /// Unlike `median_rate` (over absolute rates), intervals that freed space
     /// do not count as consumption (#29).
     pub median_consumption_rate: f64,
+    /// Signed rate of the latest observed interval, when calibrated. Unlike
+    /// the EWMA or the positive-only median, this records whether consumption
+    /// actually continued after a burst. `None` means no measured evidence.
+    pub latest_rate: Option<f64>,
 }
 
 impl Default for BurstState {
@@ -49,6 +53,7 @@ impl Default for BurstState {
             mad_rate: 0.0,
             robust_upper_bound: f64::INFINITY,
             median_consumption_rate: 0.0,
+            latest_rate: None,
         }
     }
 }
@@ -667,6 +672,7 @@ impl DiskRateEstimator {
             mad_rate,
             robust_upper_bound,
             median_consumption_rate: median_of_positive(&self.rate_history),
+            latest_rate: Some(latest_rate),
         }
     }
 }
@@ -1409,10 +1415,15 @@ mod tests {
         let burst = estimator.update(free, start + Duration::from_secs(41), 0);
         assert!(burst.burst_state.calibrated);
         assert_eq!(burst.burst_state.burst_duration_samples, 1);
+        assert_eq!(burst.burst_state.latest_rate, Some(50_000.0));
         for _ in 0..3 {
             let replay = estimator.reforecast(&burst, 0);
             assert_eq!(replay.sample_count, burst.sample_count);
             assert_eq!(replay.burst_state.burst_duration_samples, 1);
+            assert_eq!(
+                replay.burst_state.latest_rate,
+                burst.burst_state.latest_rate
+            );
             assert_eq!(
                 replay.burst_state.burst_probability.to_bits(),
                 burst.burst_state.burst_probability.to_bits()
@@ -1423,6 +1434,7 @@ mod tests {
         let reduced = estimator.reforecast(&burst, 0);
         assert!(!reduced.burst_state.calibrated);
         assert_eq!(reduced.burst_state.burst_duration_samples, 0);
+        assert_eq!(reduced.burst_state.latest_rate, None);
         assert_eq!(reduced.sample_count, burst.sample_count);
         assert_eq!(
             reduced.bytes_per_second.to_bits(),

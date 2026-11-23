@@ -280,6 +280,19 @@ impl PredictiveActionPolicy {
             return PredictiveAction::Clear;
         }
 
+        // An idle baseline has no ordinary consumption rate. Its positive-only
+        // median can consist entirely of a brief allocation, and the sticky
+        // EWMA can keep projecting imminent exhaustion after that writer has
+        // stopped or returned to light background writes. The latest measured
+        // rate supplies a conservative runway floor for this idle baseline.
+        // A currently consuming fast writer retains immediate rescue, and a
+        // confirmed elapsed-time net drain has already taken the stronger
+        // evidence path above, even during a short idle or freeing interval.
+        // Do not change the immediate PID forecast.
+        let bs = &estimate.burst_state;
+        let minutes_remaining =
+            (estimate.seconds_to_exhaustion / 60.0).max(idle_baseline_runway_floor(estimate));
+
         // A percentage is not a time budget: a small volume can be mostly
         // empty and still fill within minutes at its ordinary historical rate.
         // Only agreement with a calibrated median can bypass percentage-only
@@ -296,7 +309,6 @@ impl PredictiveActionPolicy {
         // historical median rate (not the burst-inflated EWMA) for time projection.
         // This is the key fix: a 30-second rustc burst consuming 5GB/min will NOT
         // trigger "disk full in 1m" because the median rate shows it's transient.
-        let bs = &estimate.burst_state;
         if bs.calibrated && bs.burst_probability > 0.5 {
             // Project the historical baseline's runway at the median rate,
             // not the burst-inflated EWMA rate.
@@ -357,8 +369,6 @@ impl PredictiveActionPolicy {
                 mount,
             );
         }
-
-        let minutes_remaining = estimate.seconds_to_exhaustion / 60.0;
 
         // Guard against infinite or nonsensical values.
         if !minutes_remaining.is_finite() || minutes_remaining < 0.0 {
@@ -555,7 +565,8 @@ fn corroborated_imminent_runway(estimate: &RateEstimate, horizon_minutes: f64) -
         return None;
     }
     let ewma_minutes = estimate.seconds_to_exhaustion / 60.0;
-    let median_minutes = consumption_runway_minutes(estimate);
+    let median_minutes =
+        consumption_runway_minutes(estimate).max(idle_baseline_runway_floor(estimate));
     // Check both before max: f64::max deliberately ignores one NaN operand.
     if !ewma_minutes.is_finite()
         || ewma_minutes < 0.0
@@ -566,6 +577,24 @@ fn corroborated_imminent_runway(estimate: &RateEstimate, horizon_minutes: f64) -
     }
     let conservative_minutes = ewma_minutes.max(median_minutes);
     (conservative_minutes <= horizon_minutes).then_some(conservative_minutes)
+}
+
+/// A lower bound on unconfirmed runway when the robust baseline is idle.
+/// The positive-only median can contain only the recent burst; its rate must
+/// not exceed what the latest interval actually consumed. Missing evidence
+/// adds no constraint, and a stopped writer has no finite measured runway.
+fn idle_baseline_runway_floor(estimate: &RateEstimate) -> f64 {
+    let burst = &estimate.burst_state;
+    if !burst.calibrated || burst.median_rate != 0.0 {
+        return 0.0;
+    }
+    let Some(rate) = burst.latest_rate else {
+        return 0.0;
+    };
+    if !rate.is_finite() || rate <= 0.0 {
+        return f64::INFINITY;
+    }
+    estimate.free_bytes as f64 / rate / 60.0
 }
 
 /// Minutes until the measured free bytes run out at the median rate of the
@@ -613,6 +642,7 @@ fn valid_prediction_evidence(estimate: &RateEstimate, current_free_pct: f64) -> 
             .forecast_rate_bytes_per_second
             .is_none_or(f64::is_finite)
         && estimate.acceleration.is_finite()
+        && burst.latest_rate.is_none_or(f64::is_finite)
         && estimate.seconds_to_exhaustion.is_finite()
         && estimate.seconds_to_exhaustion >= 0.0
         && (0.0..=100.0).contains(&current_free_pct)
@@ -1491,6 +1521,13 @@ mod tests {
                 policy.evaluate(&est, 10.0, PathBuf::from("/data")),
                 PredictiveAction::Clear,
                 "invalid acceleration {invalid}"
+            );
+            est = base.clone();
+            est.burst_state.latest_rate = Some(invalid);
+            assert_eq!(
+                policy.evaluate(&est, 10.0, PathBuf::from("/data")),
+                PredictiveAction::Clear,
+                "invalid latest observed rate {invalid}"
             );
         }
         for invalid in [f64::NAN, f64::INFINITY, -1.0, 101.0] {
