@@ -101,8 +101,8 @@ use crate::platform::types::{
     MemoryPressureLevel,
 };
 use crate::scanner::deletion::{
-    DeletionConfig, DeletionExecutor, DeletionMode, FreedBasis, SkipReason,
-    retain_planning_write_access,
+    DeletionConfig, DeletionExecutor, DeletionMode, DeletionPlan, DeletionReport, FreedBasis,
+    SkipReason, retain_planning_write_access,
 };
 use crate::scanner::engine::{ScannerEngine, SelectedScannerEngine};
 use crate::scanner::events::{
@@ -2012,9 +2012,9 @@ enum WorkerReport {
         /// Candidates whose filesystem answered EROFS or ENOSPC: their
         /// mounts need recovery, not another attempt.
         recovery_incidents: Vec<RecoveryIncident>,
-        /// Set when the deletion-failure e-process crossed its alarm
-        /// threshold on this batch: the dominant failure reason and count.
-        failure_alarm: Option<(&'static str, u64)>,
+        /// Newly raised failure alarms, isolated to the candidates' observed
+        /// filesystems. They notify without inventing a recovery cause.
+        failure_alarms: Vec<ExecutorFailureAlarm>,
     },
 }
 
@@ -7957,7 +7957,7 @@ impl MonitoringDaemon {
                     bytes_freed_observed,
                     failed,
                     recovery_incidents: _,
-                    failure_alarm,
+                    failure_alarms,
                 } => {
                     self.summary_deleted += deleted;
                     self.summary_failed += failed;
@@ -7977,11 +7977,18 @@ impl MonitoringDaemon {
                         self.burst_stats
                             .record_cycle(poll + scan_duration + scan_completed_at.elapsed());
                     }
-                    if let Some((reason, count)) = failure_alarm {
+                    for alarm in failure_alarms {
                         let message = format!(
-                            "deletion failure rate alarm (e-process >= 20:1 against a <=10% \
-                             failure rate): dominant reason {reason} x{count}; see \
-                             `sbh stats` and the [SBH-EXECUTOR] skip lines"
+                            "deletion failure rate alarm on {} (last path {}): \
+                             dominant reason {} x{}; evidence={:.1} successes={} failures={}; see \
+                             `sbh stats` and the [SBH-EXECUTOR] skip lines",
+                            alarm.scope.label(),
+                            alarm.path.display(),
+                            alarm.reason,
+                            alarm.count,
+                            alarm.evidence,
+                            alarm.successes,
+                            alarm.failures
                         );
                         self.logger_handle.send(ActivityEvent::Error {
                             code: "SBH-2005".to_string(),
@@ -15934,14 +15941,245 @@ fn retain_recovery_candidates(
     before - candidates.len()
 }
 
+/// Native identity keeps bind aliases on the same failure stream. Missing
+/// identity is evidence about this exact path only, never the worst-pressure
+/// mount or an arbitrary healthy peer.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ExecutorFailureScope {
+    Device(u64),
+    Path(PathBuf),
+}
+
+impl ExecutorFailureScope {
+    fn of(candidate: &CandidacyScore) -> Self {
+        candidate
+            .identity
+            .filter(|identity| identity.device_id != 0 || identity.inode != 0)
+            .map_or_else(
+                || Self::Path(candidate.path.clone()),
+                |identity| Self::Device(identity.device_id),
+            )
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Device(device) => format!("device {device}"),
+            Self::Path(path) => format!("unresolved path {}", path.display()),
+        }
+    }
+}
+
+struct ExecutorFailureState {
+    monitor: DeletionFailureMonitor,
+    alarm_raised: bool,
+    cooldown: Duration,
+    tripped_at: Option<Instant>,
+    last_observed: Instant,
+    path: PathBuf,
+    failures_since_success: u32,
+}
+
+impl ExecutorFailureState {
+    fn cooling_down(&self, now: Instant) -> bool {
+        self.tripped_at
+            .is_some_and(|at| now.saturating_duration_since(at) < self.cooldown)
+    }
+}
+
+#[derive(Debug)]
+struct ExecutorFailureAlarm {
+    scope: ExecutorFailureScope,
+    path: PathBuf,
+    reason: &'static str,
+    count: u64,
+    evidence: f64,
+    successes: u64,
+    failures: u64,
+}
+
+#[derive(Default)]
+struct ExecutorFailureUpdate {
+    alarms: Vec<ExecutorFailureAlarm>,
+    trips: Vec<(ExecutorFailureScope, Duration)>,
+}
+
+/// Cross-batch cooldown and failure evidence are bounded and filesystem-local.
+/// The deletion executor still enforces its existing per-batch failure limit.
+struct ExecutorFailures {
+    scopes: std::collections::BTreeMap<ExecutorFailureScope, ExecutorFailureState>,
+    capacity: usize,
+    base_cooldown: Duration,
+    max_cooldown: Duration,
+    threshold: u32,
+}
+
+impl Default for ExecutorFailures {
+    fn default() -> Self {
+        Self {
+            scopes: std::collections::BTreeMap::new(),
+            capacity: 256,
+            base_cooldown: DeletionConfig::default().circuit_breaker_cooldown,
+            max_cooldown: Duration::from_mins(5),
+            threshold: DeletionConfig::default().circuit_breaker_threshold,
+        }
+    }
+}
+
+impl ExecutorFailures {
+    /// Reserve tracking before policy accounting. A full table may discard an
+    /// inactive stream outside this batch, but never forgets an active hold.
+    /// If all slots are held, new scopes wait instead of running untracked.
+    fn retain_admitted(
+        &mut self,
+        candidates: &mut Vec<CandidacyScore>,
+        now: Instant,
+        dry_run: bool,
+    ) -> usize {
+        if dry_run {
+            return 0;
+        }
+        let requested: HashSet<_> = candidates.iter().map(ExecutorFailureScope::of).collect();
+        let before = candidates.len();
+        candidates.retain(|candidate| {
+            let scope = ExecutorFailureScope::of(candidate);
+            let unknown = ExecutorFailureScope::Path(candidate.path.clone());
+            if self
+                .scopes
+                .get(&scope)
+                .into_iter()
+                .chain(self.scopes.get(&unknown))
+                .any(|state| state.cooling_down(now))
+            {
+                return false;
+            }
+            if self.scopes.contains_key(&scope) {
+                return true;
+            }
+            if self.scopes.len() >= self.capacity {
+                let evict = self
+                    .scopes
+                    .iter()
+                    .filter(|(key, state)| !requested.contains(*key) && !state.cooling_down(now))
+                    .min_by_key(|(_, state)| state.last_observed)
+                    .map(|(key, _)| key.clone());
+                let Some(evict) = evict else {
+                    return false;
+                };
+                self.scopes.remove(&evict);
+            }
+            self.scopes.insert(
+                scope,
+                ExecutorFailureState {
+                    monitor: DeletionFailureMonitor::with_defaults(),
+                    alarm_raised: false,
+                    cooldown: self.base_cooldown,
+                    tripped_at: None,
+                    last_observed: now,
+                    path: candidate.path.clone(),
+                    failures_since_success: 0,
+                },
+            );
+            true
+        });
+        before - candidates.len()
+    }
+
+    fn observe(
+        &mut self,
+        plan: &DeletionPlan,
+        report: &DeletionReport,
+        now: Instant,
+    ) -> ExecutorFailureUpdate {
+        let mut update = ExecutorFailureUpdate::default();
+        if report.dry_run {
+            return update;
+        }
+        let errors: HashSet<_> = report.errors.iter().map(|error| &error.path).collect();
+        let deleted: HashSet<_> = report.deleted_paths.iter().collect();
+        let read_only: HashSet<_> = report.read_only_paths.iter().collect();
+        let no_space: HashSet<_> = report.no_space_paths.iter().collect();
+        // Admission refusals are reported too, but are not iterations of the
+        // accepted plan. Every accepted iteration contributes exactly once to
+        // deleted/failed/skipped; the breaker leaves a suffix unattempted.
+        let attempted = report
+            .items_deleted
+            .saturating_add(report.items_failed)
+            .saturating_add(report.items_skipped.saturating_sub(plan.refused.len()));
+        let mut touched = BTreeSet::new();
+        for candidate in plan.candidates.iter().take(attempted) {
+            let scope = ExecutorFailureScope::of(candidate);
+            let Some(state) = self.scopes.get_mut(&scope) else {
+                continue;
+            };
+            if deleted.contains(&candidate.path) {
+                state.monitor.observe_success();
+                state.failures_since_success = 0;
+                state.cooldown = self.base_cooldown;
+                state.tripped_at = None;
+            } else if read_only.contains(&candidate.path) {
+                state.monitor.observe_failure("filesystem_read_only");
+            } else if no_space.contains(&candidate.path) {
+                state.monitor.observe_failure("no_space");
+            } else if errors.contains(&candidate.path) {
+                state.monitor.observe_failure("delete_error");
+            } else {
+                // Vetoes and incomplete observations provide no success or
+                // failure evidence and cannot clear another attempt's debt.
+                continue;
+            }
+            if errors.contains(&candidate.path) {
+                // The filesystem's own real mutation errors accrue even
+                // when healthy peers or safety skips separate the attempts.
+                // Preflight refusals alone never create cooldown debt.
+                state.failures_since_success = state.failures_since_success.saturating_add(1);
+            }
+            state.last_observed = now;
+            state.path.clone_from(&candidate.path);
+            touched.insert(scope);
+        }
+        for scope in touched {
+            let state = self.scopes.get_mut(&scope).expect("observed scope exists");
+            // The low-level breaker may stop a mixed batch at five combined
+            // errors; cross-batch cooldown needs five on this same scope.
+            // Check completed outcomes even when the final item exhausted
+            // the plan, so no sixth candidate is needed to arm the cooldown.
+            if state.failures_since_success >= self.threshold {
+                state.failures_since_success = 0;
+                state.cooldown = state.cooldown.saturating_mul(2).min(self.max_cooldown);
+                state.tripped_at = Some(now);
+                update.trips.push((scope.clone(), state.cooldown));
+            }
+            if state.monitor.alarm() && !state.alarm_raised {
+                state.alarm_raised = true;
+                if let Some((reason, count)) = state.monitor.dominant_reason() {
+                    let (successes, failures) = state.monitor.counts();
+                    update.alarms.push(ExecutorFailureAlarm {
+                        scope,
+                        path: state.path.clone(),
+                        reason,
+                        count,
+                        evidence: state.monitor.evidence(),
+                        successes,
+                        failures,
+                    });
+                }
+            } else if !state.monitor.alarm() {
+                state.alarm_raised = false;
+            }
+        }
+        update
+    }
+}
+
 /// Executor thread: receives deletion batches and safely removes artifacts.
 ///
 /// Gates all deletions through the `PolicyEngine` before execution. In Observe
 /// or FallbackSafe modes, the policy engine blocks all deletions. In Canary mode,
 /// a capped subset is allowed. In Enforce mode, all scored candidates proceed.
 ///
-/// Reads `dry_run`, `max_batch_size`, and `min_score` from shared atomics on each
-/// batch, so config reloads (SIGHUP) take effect without respawning the thread.
+/// Reads execution settings from shared atomics on each batch, so config
+/// reloads take effect without respawning the thread. A preview cannot become
+/// a mutating batch after policy accounting has started.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn executor_thread_main(
     del_rx: &Receiver<DeletionBatch>,
@@ -15963,10 +16201,7 @@ fn executor_thread_main(
         Duration::from_secs(shared_config.repeat_max_cooldown_secs()),
     );
     let mut batch_count: u64 = 0;
-    let mut last_circuit_breaker_trip: Option<Instant> = None;
-    let base_circuit_breaker_cooldown = DeletionConfig::default().circuit_breaker_cooldown;
-    let mut circuit_breaker_cooldown = base_circuit_breaker_cooldown;
-    let max_circuit_breaker_cooldown = Duration::from_mins(5); // 5 minutes cap
+    let mut failures = ExecutorFailures::default();
     let mut last_policy_reject_log: Option<Instant> = None;
     let mut last_cb_cooldown_log: Option<Instant> = None;
     let mut zero_byte_dropped: usize = 0;
@@ -15975,9 +16210,6 @@ fn executor_thread_main(
     // per executor thread. The condition is persistent until the operator
     // fixes the unit file, so logging on every batch would flood journals.
     let mut last_not_writable_warning: Option<Instant> = None;
-    // Q8: anytime-valid monitor over this thread's success/failure stream.
-    let mut failure_monitor = DeletionFailureMonitor::with_defaults();
-    let mut failure_alarm_raised = false;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -16108,25 +16340,24 @@ fn executor_thread_main(
             }
         }
 
-        // Enforce circuit breaker cooldown from a previous trip. If the breaker
-        // tripped recently, skip this batch entirely and drain the channel.
-        if let Some(trip_time) = last_circuit_breaker_trip {
-            if trip_time.elapsed() < circuit_breaker_cooldown {
-                // Rate-limit this message: log once per 60s during cooldown
-                let should_log =
-                    last_cb_cooldown_log.is_none_or(|t| t.elapsed() >= Duration::from_mins(1));
-                if should_log {
-                    eprintln!(
-                        "[SBH-EXECUTOR] circuit breaker cooldown active ({:.0}s remaining), skipping batches",
-                        circuit_breaker_cooldown.as_secs_f64() - trip_time.elapsed().as_secs_f64(),
-                    );
-                    last_cb_cooldown_log = Some(Instant::now());
-                }
+        // A failing filesystem cannot consume policy slots or pause healthy
+        // candidates delivered in the same batch. Keep the failed scopes'
+        // cooldowns even while other volumes continue to reclaim space.
+        // A preview stays a preview for this batch even if a reload enables
+        // mutation later. It neither observes nor evicts failure evidence.
+        let dry_run = shared_config.dry_run.load(Ordering::Relaxed);
+        let held = failures.retain_admitted(&mut batch.candidates, Instant::now(), dry_run);
+        if held > 0 {
+            if last_cb_cooldown_log.is_none_or(|t| t.elapsed() >= Duration::from_mins(1)) {
+                eprintln!(
+                    "[SBH-EXECUTOR] held {held} candidate(s) for scoped circuit breaker cooldown or tracking capacity; {} peer candidate(s) remain",
+                    batch.candidates.len(),
+                );
+                last_cb_cooldown_log = Some(Instant::now());
+            }
+            if batch.candidates.is_empty() {
                 continue;
             }
-            // Cooldown expired, reset.
-            last_circuit_breaker_trip = None;
-            last_cb_cooldown_log = None;
         }
 
         // Pick up live config reloads for repeat-deletion dampening.
@@ -16254,7 +16485,6 @@ fn executor_thread_main(
         }
 
         // Read latest config from shared atomics (updated by config reload).
-        let dry_run = shared_config.dry_run.load(Ordering::Relaxed);
         let max_batch_size = shared_config.max_batch_size.load(Ordering::Relaxed);
         let Ok(min_score) = batch.min_score(shared_config, Instant::now()) else {
             continue;
@@ -16639,6 +16869,7 @@ fn executor_thread_main(
             Some(&authorize_candidate),
             Some(&on_unlinked),
         );
+        let failure_update = failures.observe(&plan, &report, Instant::now());
         let recovery_incidents: Vec<_> = report
             .recovery_paths()
             .map(|path| RecoveryIncident {
@@ -16790,50 +17021,29 @@ fn executor_thread_main(
             );
         }
 
-        // Q8: feed the failure monitor. Safety refusals are not failures;
-        // delete errors and mount incidents are.
-        if !report.dry_run {
-            for _ in 0..report.items_deleted {
-                failure_monitor.observe_success();
-            }
-            for _ in 0..report.read_only_paths.len() {
-                failure_monitor.observe_failure(
-                    crate::scanner::deletion::SkipReason::FilesystemReadOnly.as_str(),
-                );
-            }
-            for _ in 0..report.no_space_paths.len() {
-                failure_monitor.observe_failure("no_space");
-            }
-            let plain_errors = report
-                .items_failed
-                .saturating_sub(report.no_space_paths.len())
-                .saturating_sub(
-                    report
-                        .errors
-                        .iter()
-                        .filter(|e| report.read_only_paths.contains(&e.path))
-                        .count(),
-                );
-            for _ in 0..plain_errors {
-                failure_monitor.observe_failure("delete_error");
-            }
-        }
-        let failure_alarm = if failure_monitor.alarm() && !failure_alarm_raised {
-            failure_alarm_raised = true;
-            let dominant = failure_monitor.dominant_reason();
-            let (successes, failures) = failure_monitor.counts();
+        // Q8 evidence is isolated by observed device, just like cooldowns.
+        // Alarms remain diagnostic: a generic deletion error does not prove
+        // an EROFS/ENOSPC incident or authorize spending emergency ballast.
+        for alarm in &failure_update.alarms {
             eprintln!(
-                "[SBH-EXECUTOR] deletion failure alarm: evidence={:.1} successes={successes} failures={failures} dominant={:?}",
-                failure_monitor.evidence(),
-                dominant,
+                "[SBH-EXECUTOR] deletion failure alarm on {}: evidence={:.1} successes={} failures={} dominant={} x{}",
+                alarm.scope.label(),
+                alarm.evidence,
+                alarm.successes,
+                alarm.failures,
+                alarm.reason,
+                alarm.count,
             );
-            dominant
-        } else {
-            if !failure_monitor.alarm() {
-                failure_alarm_raised = false;
-            }
-            None
-        };
+        }
+        for (scope, cooldown) in &failure_update.trips {
+            logger.send(ActivityEvent::Error {
+                code: "SBH-2003".to_string(),
+                message: format!(
+                    "executor circuit breaker tripped on {}, cooldown {:.0}s (exponential backoff); healthy filesystems remain eligible",
+                    scope.label(), cooldown.as_secs_f64(),
+                ),
+            });
+        }
 
         // Report deletion stats back to main loop for SelfMonitor counters.
         // What the filesystem gained where every removal was measured and it
@@ -16850,29 +17060,10 @@ fn executor_thread_main(
                 bytes_freed_observed: report.bytes_freed_observed,
                 failed: report.items_failed as u64,
                 recovery_incidents,
-                failure_alarm,
+                failure_alarms: failure_update.alarms,
             },
             shutdown,
         );
-
-        if report.circuit_breaker_tripped {
-            last_circuit_breaker_trip = Some(Instant::now());
-            // Exponential backoff: double cooldown on each consecutive trip,
-            // capped at max. Reset to base on successful batch (below).
-            // Double BEFORE logging so the logged value matches what's enforced.
-            circuit_breaker_cooldown =
-                (circuit_breaker_cooldown * 2).min(max_circuit_breaker_cooldown);
-            logger.send(ActivityEvent::Error {
-                code: "SBH-2003".to_string(),
-                message: format!(
-                    "executor circuit breaker tripped, cooldown {:.0}s (exponential backoff)",
-                    circuit_breaker_cooldown.as_secs_f64(),
-                ),
-            });
-        } else if report.items_deleted > 0 {
-            // Successful deletion — reset exponential backoff to base.
-            circuit_breaker_cooldown = base_circuit_breaker_cooldown;
-        }
 
         // Periodic pruning of expired dampening entries.
         if batch_count.is_multiple_of(10) {
@@ -16907,6 +17098,413 @@ mod tests {
     use crate::scanner::scoring::{DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::path::Path;
     use std::time::Duration;
+
+    fn failure_scope_candidate(path: &str, device: Option<u64>) -> CandidacyScore {
+        let mut candidate = test_candidate(path, 1.0);
+        candidate.identity = device.map(|device_id| crate::scanner::walker::FsIdentity {
+            device_id,
+            inode: 1,
+            kind: crate::scanner::walker::FsEntryKind::Directory,
+        });
+        candidate
+    }
+
+    fn failure_scope_plan(candidates: Vec<CandidacyScore>) -> DeletionPlan {
+        DeletionPlan {
+            estimated_items: candidates.len(),
+            total_reclaimable_bytes: candidates.iter().map(|item| item.size_bytes).sum(),
+            candidates,
+            refused: Vec::new(),
+            mode: DeletionMode::Unlink,
+        }
+    }
+
+    /// Ordered executor receipts: d=deleted, f=native deletion failure,
+    /// s=safety skip. An omitted suffix was never attempted after the trip.
+    fn failure_scope_report(plan: &DeletionPlan, outcomes: &str, tripped: bool) -> DeletionReport {
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let mut report = executor.execute(&failure_scope_plan(Vec::new()), None);
+        for (candidate, outcome) in plan.candidates.iter().zip(outcomes.bytes()) {
+            match outcome {
+                b'd' => {
+                    report.items_deleted += 1;
+                    report.deleted_paths.push(candidate.path.clone());
+                }
+                b'f' => {
+                    report.items_failed += 1;
+                    report.errors.push(crate::scanner::deletion::DeletionError {
+                        path: candidate.path.clone(),
+                        error: "injected native deletion error".to_string(),
+                        error_code: "SBH-3002".to_string(),
+                        recoverable: true,
+                    });
+                }
+                b's' => report.items_skipped += 1,
+                _ => panic!("unknown outcome"),
+            }
+        }
+        report.circuit_breaker_tripped = tripped;
+        report
+    }
+
+    fn failed_scope_plan(device: Option<u64>) -> DeletionPlan {
+        failure_scope_plan(
+            (0..6)
+                .map(|index| failure_scope_candidate(&format!("/failed/target-{index}"), device))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn executor_failure_cooldown_filters_only_the_tripping_scopes_in_a_mixed_batch() {
+        let now = Instant::now();
+        let mut failures = ExecutorFailures::default();
+        let earlier = failure_scope_candidate("/peer/earlier", Some(11));
+        let success = failure_scope_candidate("/peer/success", Some(11));
+        let mut plan = failed_scope_plan(Some(22));
+        plan.candidates
+            .splice(0..0, [earlier.clone(), success.clone()]);
+        assert_eq!(
+            failures.retain_admitted(&mut plan.candidates, now, false),
+            0
+        );
+        let report = failure_scope_report(&plan, "fdfffff", true);
+        let update = failures.observe(&plan, &report, now);
+        assert_eq!(
+            update.trips,
+            vec![(ExecutorFailureScope::Device(22), Duration::from_secs(60))]
+        );
+        let alias = failure_scope_candidate("/bind-alias/target", Some(22));
+        let untouched = failure_scope_candidate("/other/target", Some(33));
+        let mut queued = vec![earlier.clone(), alias, untouched.clone()];
+        assert_eq!(failures.retain_admitted(&mut queued, now, false), 1);
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].path, earlier.path);
+        assert_eq!(queued[1].path, untouched.path);
+
+        // Admission refusals and later safety skips are not successful
+        // mutations and do not add native-error debt to their scope.
+        let mut after_skip = failed_scope_plan(Some(44));
+        after_skip
+            .candidates
+            .splice(0..0, [earlier.clone(), success]);
+        after_skip
+            .refused
+            .push((earlier, SkipReason::SacredStowaway));
+        assert_eq!(
+            failures.retain_admitted(&mut after_skip.candidates, now, false),
+            0
+        );
+        let mut report = failure_scope_report(&after_skip, "fsfffff", true);
+        report.items_skipped += after_skip.refused.len();
+        let update = failures.observe(&after_skip, &report, now);
+        assert_eq!(update.trips[0].0, ExecutorFailureScope::Device(44));
+        assert_eq!(update.trips.len(), 1);
+    }
+
+    #[test]
+    fn executor_failure_backoff_escalates_and_resets_only_on_its_own_success() {
+        let now = Instant::now();
+        let mut failures = ExecutorFailures::default();
+        let mut failed = failed_scope_plan(Some(22));
+        assert_eq!(
+            failures.retain_admitted(&mut failed.candidates, now, false),
+            0
+        );
+        let report = failure_scope_report(&failed, "fffff", true);
+        failures.observe(&failed, &report, now);
+        let mut peer = failure_scope_plan(vec![failure_scope_candidate("/peer/target", Some(33))]);
+        assert_eq!(
+            failures.retain_admitted(&mut peer.candidates, now, false),
+            0
+        );
+        failures.observe(&peer, &failure_scope_report(&peer, "d", false), now);
+        let key = ExecutorFailureScope::Device(22);
+        assert_eq!(failures.scopes[&key].cooldown, Duration::from_secs(60));
+        let mut retry = failed.candidates.clone();
+        assert_eq!(
+            failures.retain_admitted(&mut retry, now + Duration::from_secs(59), false),
+            6
+        );
+        let mut retry = failed.candidates.clone();
+        assert_eq!(
+            failures.retain_admitted(&mut retry, now + Duration::from_secs(60), false),
+            0
+        );
+        let second = failures.observe(&failed, &report, now + Duration::from_secs(60));
+        assert_eq!(second.trips[0].1, Duration::from_secs(120));
+        let third = failures.observe(&failed, &report, now + Duration::from_secs(180));
+        assert_eq!(third.trips[0].1, Duration::from_secs(240));
+        let fourth = failures.observe(&failed, &report, now + Duration::from_secs(420));
+        assert_eq!(fourth.trips[0].1, Duration::from_secs(300));
+        failures.observe(
+            &failed,
+            &failure_scope_report(&failed, "d", false),
+            now + Duration::from_secs(720),
+        );
+        assert_eq!(failures.scopes[&key].cooldown, failures.base_cooldown);
+        assert!(failures.scopes[&key].tripped_at.is_none());
+        let resumed = failures.observe(&failed, &report, now + Duration::from_secs(721));
+        assert_eq!(resumed.trips[0].1, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn executor_failure_debt_never_pools_devices_and_counts_the_final_attempt() {
+        let now = Instant::now();
+        let mut failures = ExecutorFailures::default();
+        let mut mixed = failure_scope_plan(
+            [11, 22, 11, 22, 11, 33]
+                .into_iter()
+                .enumerate()
+                .map(|(index, device)| {
+                    failure_scope_candidate(&format!("/mixed/target-{index}"), Some(device))
+                })
+                .collect(),
+        );
+        assert_eq!(
+            failures.retain_admitted(&mut mixed.candidates, now, false),
+            0
+        );
+        // Five errors trip the low-level batch breaker, but neither device
+        // has accumulated five failures of its own.
+        assert!(
+            failures
+                .observe(&mixed, &failure_scope_report(&mixed, "fffff", true), now)
+                .trips
+                .is_empty()
+        );
+        assert_eq!(
+            failures.scopes[&ExecutorFailureScope::Device(11)].failures_since_success,
+            3
+        );
+        assert_eq!(
+            failures.scopes[&ExecutorFailureScope::Device(22)].failures_since_success,
+            2
+        );
+
+        let mut followup = failure_scope_plan(vec![
+            failure_scope_candidate("/failed/next-one", Some(11)),
+            failure_scope_candidate("/peer/healthy", Some(22)),
+            failure_scope_candidate("/failed/skipped", Some(11)),
+            failure_scope_candidate("/failed/next-two", Some(11)),
+        ]);
+        assert_eq!(
+            failures.retain_admitted(&mut followup.candidates, now, false),
+            0
+        );
+        // A safety skip cannot erase fault evidence. The fifth failure is
+        // the final item, so the low-level loop has no next iteration at
+        // which to set circuit_breaker_tripped.
+        let update = failures.observe(
+            &followup,
+            &failure_scope_report(&followup, "fdsf", false),
+            now,
+        );
+        assert_eq!(
+            update.trips,
+            vec![(ExecutorFailureScope::Device(11), Duration::from_secs(60))]
+        );
+        assert_eq!(
+            failures.scopes[&ExecutorFailureScope::Device(22)].failures_since_success,
+            0
+        );
+        let mut queued = followup.candidates.clone();
+        assert_eq!(failures.retain_admitted(&mut queued, now, false), 3);
+        assert_eq!(queued[0].path, Path::new("/peer/healthy"));
+    }
+
+    #[test]
+    fn executor_failure_evidence_keeps_peer_successes_skips_and_previews_separate() {
+        let now = Instant::now();
+        let mut failures = ExecutorFailures::default();
+        let mut mixed = failure_scope_plan(
+            (0_usize..16)
+                .map(|index| {
+                    failure_scope_candidate(
+                        &format!("/mixed/target-{index}"),
+                        Some(if index.is_multiple_of(2) { 11 } else { 22 }),
+                    )
+                })
+                .collect(),
+        );
+        assert_eq!(
+            failures.retain_admitted(&mut mixed.candidates, now, false),
+            0
+        );
+        let update = failures.observe(
+            &mixed,
+            &failure_scope_report(&mixed, "fdfdfdfdfdfdfdfd", false),
+            now,
+        );
+        assert_eq!(update.alarms.len(), 1);
+        assert_eq!(update.alarms[0].scope, ExecutorFailureScope::Device(11));
+        assert_eq!(update.alarms[0].failures, 8);
+        assert_eq!(update.alarms[0].successes, 0);
+        assert_eq!(
+            failures.scopes[&ExecutorFailureScope::Device(22)]
+                .monitor
+                .counts(),
+            (8, 0)
+        );
+        let evidence = failures.scopes[&ExecutorFailureScope::Device(11)]
+            .monitor
+            .evidence();
+        let original_trip = failures.scopes[&ExecutorFailureScope::Device(11)].tripped_at;
+        let original_cooldown = failures.scopes[&ExecutorFailureScope::Device(11)].cooldown;
+        let original_debt =
+            failures.scopes[&ExecutorFailureScope::Device(11)].failures_since_success;
+        assert!(original_trip.is_some());
+        let skipped = failure_scope_report(&mixed, "ssssssssssssssss", false);
+        assert!(failures.observe(&mixed, &skipped, now).alarms.is_empty());
+        let mut preview = failure_scope_report(&mixed, "dddddddddddddddd", false);
+        preview.dry_run = true;
+        assert!(failures.observe(&mixed, &preview, now).alarms.is_empty());
+        assert_eq!(
+            failures.scopes[&ExecutorFailureScope::Device(11)]
+                .monitor
+                .evidence()
+                .to_bits(),
+            evidence.to_bits()
+        );
+        preview = failure_scope_report(&mixed, "ffffffffffffffff", true);
+        preview.dry_run = true;
+        assert!(failures.observe(&mixed, &preview, now).trips.is_empty());
+        let failed = &failures.scopes[&ExecutorFailureScope::Device(11)];
+        assert_eq!(failed.tripped_at, original_trip);
+        assert_eq!(failed.cooldown, original_cooldown);
+        assert_eq!(failed.failures_since_success, original_debt);
+        assert!(
+            failures.scopes[&ExecutorFailureScope::Device(22)]
+                .tripped_at
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn executor_failure_unknown_identity_holds_only_its_exact_paths() {
+        let now = Instant::now();
+        let mut failures = ExecutorFailures::default();
+        let mut plan = failed_scope_plan(None);
+        assert_eq!(
+            failures.retain_admitted(&mut plan.candidates, now, false),
+            0
+        );
+        for _ in 0..4 {
+            assert!(
+                failures
+                    .observe(&plan, &failure_scope_report(&plan, "f", false), now)
+                    .trips
+                    .is_empty()
+            );
+        }
+        let update = failures.observe(&plan, &failure_scope_report(&plan, "f", false), now);
+        assert_eq!(update.trips.len(), 1);
+        let mut newly_identified = plan.candidates[0].clone();
+        newly_identified.identity = failure_scope_candidate("/unused", Some(91)).identity;
+        let mut queued = vec![
+            newly_identified,
+            failure_scope_candidate("/failed/unrelated", None),
+            failure_scope_candidate("/peer/target", Some(91)),
+        ];
+        assert_eq!(failures.retain_admitted(&mut queued, now, false), 1);
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].path, Path::new("/failed/unrelated"));
+        assert_eq!(queued[1].path, Path::new("/peer/target"));
+    }
+
+    #[test]
+    fn executor_failure_capacity_never_evicts_an_active_cooldown() {
+        let now = Instant::now();
+        let mut failures = ExecutorFailures {
+            capacity: 2,
+            ..Default::default()
+        };
+        for device in [11, 22] {
+            let mut plan = failed_scope_plan(Some(device));
+            assert_eq!(
+                failures.retain_admitted(&mut plan.candidates, now, false),
+                0
+            );
+            failures.observe(&plan, &failure_scope_report(&plan, "fffff", true), now);
+        }
+        let mut new = vec![failure_scope_candidate("/new/target", Some(33))];
+        assert_eq!(failures.retain_admitted(&mut new, now, false), 1);
+        assert!(
+            failures
+                .scopes
+                .values()
+                .all(|state| state.cooling_down(now))
+        );
+        assert_eq!(failures.scopes.len(), 2);
+        let mut preview = vec![
+            failure_scope_candidate("/preview/new", Some(33)),
+            failure_scope_candidate("/failed/target", Some(11)),
+        ];
+        assert_eq!(failures.retain_admitted(&mut preview, now, true), 0);
+        assert_eq!(preview.len(), 2);
+        assert_eq!(failures.scopes.len(), 2);
+        assert!(
+            !failures
+                .scopes
+                .contains_key(&ExecutorFailureScope::Device(33))
+        );
+        assert!(
+            failures
+                .scopes
+                .values()
+                .all(|state| state.cooling_down(now))
+        );
+        let mut new = vec![failure_scope_candidate("/new/target", Some(33))];
+        assert_eq!(
+            failures.retain_admitted(&mut new, now + Duration::from_secs(60), false),
+            0
+        );
+        assert_eq!(failures.scopes.len(), 2);
+        assert!(
+            failures
+                .scopes
+                .contains_key(&ExecutorFailureScope::Device(33))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_failure_mixed_queue_still_reclaims_a_healthy_filesystem() {
+        let scratch = temp_root_scratch_dir();
+        let healthy = target_mutation_candidate(scratch.path(), "healthy-target", 1.0);
+        let mut held = target_mutation_candidate(scratch.path(), "held-target", 2.0);
+        let failed_device = healthy.identity.unwrap().device_id ^ 1;
+        // A different physical device's failed receipt is injected; this
+        // synthetic identity must be filtered before any mutation API.
+        held.identity.as_mut().unwrap().device_id = failed_device;
+        let now = Instant::now();
+        let mut failures = ExecutorFailures::default();
+        let mut failed = failed_scope_plan(Some(failed_device));
+        assert_eq!(
+            failures.retain_admitted(&mut failed.candidates, now, false),
+            0
+        );
+        failures.observe(&failed, &failure_scope_report(&failed, "fffff", true), now);
+        let mut queued = vec![held.clone(), healthy.clone()];
+        assert_eq!(failures.retain_admitted(&mut queued, now, false), 1);
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                min_score: 0.0,
+                require_identity: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .with_platform(Arc::new(MockPlatform::healthy()));
+        let plan = executor.plan(queued);
+        let report = executor.execute(&plan, None);
+        assert_eq!(report.items_deleted, 1, "{report:?}");
+        assert_eq!(report.deleted_paths, vec![healthy.path.clone()]);
+        assert!(!healthy.path.exists());
+        assert!(held.path.join("debug/deps/libdemo.rlib").exists());
+        failures.observe(&plan, &report, now);
+        assert!(failures.scopes[&ExecutorFailureScope::Device(failed_device)].cooling_down(now));
+    }
 
     #[test]
     fn root_observations_preserve_partial_findings_under_their_actual_roots() {
@@ -20787,7 +21385,7 @@ mod tests {
             bytes_freed_observed: Some(30),
             failed: 1,
             recovery_incidents: incidents,
-            failure_alarm: None,
+            failure_alarms: Vec::new(),
         }
     }
 

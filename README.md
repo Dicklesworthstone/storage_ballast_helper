@@ -1574,7 +1574,9 @@ Any single check failure causes the candidate to be skipped (not failed), so it 
 
 #### Layer 3: Circuit Breaker
 
-The deletion executor tracks consecutive failures. After <!-- claim:constants.deletion.circuit_breaker_threshold -->5<!-- /claim --> consecutive deletion errors (not skips), the circuit breaker trips and halts the entire batch. The daemon waits <!-- claim:constants.deletion.circuit_breaker_cooldown.raw -->30<!-- /claim --> seconds before retrying, backing off exponentially up to 5 minutes on sustained errors. This prevents cascading failures when the filesystem is in a degraded state (e.g., hardware errors, NFS timeouts).
+The deletion executor tracks consecutive failures. After <!-- claim:constants.deletion.circuit_breaker_threshold -->5<!-- /claim --> consecutive deletion errors (not skips), the circuit breaker trips and halts that batch.
+
+The daemon also tracks failed cleanup attempts separately for each observed filesystem. Five errors without a successful cleanup on that filesystem start its retry cooldown, using a <!-- claim:constants.deletion.circuit_breaker_cooldown.raw -->30<!-- /claim --> second base that doubles on each trip (60 seconds for the first trip, capped at 5 minutes). Candidates on a cooling filesystem are held before policy accounting; healthy filesystems in the same queued batch remain eligible. A successful cleanup resets only its own filesystem's retry debt, and safety refusals or dry-run previews do not count as failures. Failure-rate alarms use the same filesystem-specific streams, so successes on a healthy volume cannot hide failures elsewhere. If a candidate has no observed filesystem identity, its failure history applies only to that exact path.
 
 #### Layer 4: Policy Engine Gates
 
