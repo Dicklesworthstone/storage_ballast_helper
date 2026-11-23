@@ -53,6 +53,16 @@ pub(super) struct BallastReserveMonitor {
 }
 
 impl BallastReserveMonitor {
+    /// Drive the periodic refresh in daemon tests without sleeping for its
+    /// production interval. This moves only the scheduling clock: existing
+    /// evidence and in-flight jobs retain their identities and freshness.
+    #[cfg(test)]
+    pub(super) fn elapse_refresh_interval(&mut self, mount: &Path) {
+        if let Some(last) = self.last_started.get_mut(mount) {
+            *last = last.checked_sub(OBSERVATION_INTERVAL).unwrap();
+        }
+    }
+
     /// Invalidate a changed pool immediately, without joining a running probe.
     /// Its completion will also be checked against the coordinator's revision.
     pub(super) fn invalidate(&mut self, mount: &Path) {
@@ -809,6 +819,58 @@ mod tests {
                 std::thread::yield_now();
             }
         }
+    }
+
+    #[test]
+    fn empty_observation_discovers_external_reserve_only_when_periodic_refresh_is_due() {
+        use crate::ballast::manager::BallastManager;
+
+        let fixture = MultiPoolFixture::new(1);
+        let mount = &fixture.mounts[0];
+        let directory = fixture
+            .coordinator
+            .pool_for_mount(mount)
+            .unwrap()
+            .ballast_dir
+            .clone();
+        let mut monitor = BallastReserveMonitor::default();
+        let start = Instant::now();
+        fixture.await_observation(&mut monitor, mount, start);
+        assert_eq!(
+            monitor.release_count_hint(mount, &directory, start),
+            Some(0)
+        );
+
+        let platform: Arc<dyn Platform> = fixture.platform.clone();
+        let mut external =
+            BallastManager::with_platform(directory.clone(), MultiPoolFixture::config(), platform)
+                .unwrap();
+        external.set_skip_fallocate(true);
+        assert_eq!(external.provision(None).unwrap().files_created, 2);
+
+        let due = start + OBSERVATION_INTERVAL;
+        let before = due.checked_sub(Duration::from_nanos(1)).unwrap();
+        fixture.tick(&mut monitor, before);
+        assert!(
+            monitor.workers.is_empty(),
+            "a fast peer must not force polling"
+        );
+        assert_eq!(
+            monitor.release_count_hint(mount, &directory, before),
+            Some(0)
+        );
+
+        fixture.settle(&mut monitor, due);
+        assert_eq!(monitor.release_count_hint(mount, &directory, due), Some(2));
+        assert_eq!(
+            fixture
+                .coordinator
+                .pool_for_mount(mount)
+                .unwrap()
+                .available_count(),
+            0,
+            "read-only observation must not replace actuator inventory"
+        );
     }
 
     #[test]

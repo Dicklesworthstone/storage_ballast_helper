@@ -763,6 +763,7 @@ mod tests {
         let state = observer.state.lock().unwrap();
         let late = state.entries["late"].observation.as_ref().unwrap();
         assert_eq!(late.collected_at, next_tick, "queue wait is not probe age");
+        drop(state);
     }
 
     #[test]
@@ -801,6 +802,7 @@ mod tests {
         let state = observer.state.lock().unwrap();
         assert!(state.entries["old"].observation.is_none());
         assert!(state.entries["removed"].observation.is_none());
+        drop(state);
     }
 
     #[test]

@@ -1223,9 +1223,10 @@ mod tests {
     }
 
     #[test]
-    fn low_burst_probability_uses_normal_path() {
+    fn low_burst_probability_does_not_replace_baseline_evidence() {
         let policy = default_policy();
-        // burst_probability below 0.5 threshold — normal path.
+        // A low instantaneous burst probability cannot establish imminent
+        // exhaustion when 30 GB free has years of runway at the baseline.
         let mut est = make_estimate(500_000_000.0, 60.0, 0.95, Trend::Accelerating, false);
         est.burst_state = BurstState {
             burst_probability: 0.3,
@@ -1234,9 +1235,28 @@ mod tests {
             calibrated: true,
             ..BurstState::default()
         };
-        let action = policy.evaluate(&est, 10.0, PathBuf::from("/data"));
-        // Normal path with 1 min left → ImminentDanger.
-        assert!(matches!(action, PredictiveAction::ImminentDanger { .. }));
+        assert_eq!(
+            policy.evaluate(&est, 10.0, PathBuf::from("/data")),
+            PredictiveAction::Clear
+        );
+
+        // With an independently dangerous consumption baseline, the same
+        // low burst probability takes the normal, unpenalized rescue path,
+        // even below the separate 0.85 detected-burst confidence requirement.
+        est.burst_state.median_rate = 400_000_000.0;
+        est.burst_state.median_consumption_rate = 400_000_000.0;
+        est.confidence = 0.8;
+        match policy.evaluate(&est, 10.0, PathBuf::from("/data")) {
+            PredictiveAction::ImminentDanger {
+                minutes_remaining,
+                critical,
+                ..
+            } => {
+                assert!(critical);
+                assert!((minutes_remaining - 1.25).abs() < 1e-9);
+            }
+            other => panic!("a corroborated low-burst forecast must retain rescue: {other:?}"),
+        }
     }
 
     #[test]
@@ -1266,7 +1286,8 @@ mod tests {
     #[test]
     fn free_space_gate_allows_high_confidence_predictions() {
         let policy = default_policy();
-        // Same scenario but with very high confidence — should NOT be gated.
+        // High confidence alone cannot overrule a baseline with five hours
+        // of runway (18 MB free at 1 kB/s), even at 25% free.
         let mut est = make_estimate(100_000.0, 3.0 * 60.0, 0.98, Trend::Accelerating, false);
         est.burst_state = BurstState {
             burst_probability: 0.1,
@@ -1275,11 +1296,27 @@ mod tests {
             calibrated: true,
             ..BurstState::default()
         };
+        assert_eq!(
+            policy.evaluate(&est, 25.0, PathBuf::from("/data")),
+            PredictiveAction::Clear
+        );
+
+        // A 50 kB/s baseline has six minutes left: it does not establish
+        // imminent rescue itself, but the 100 kB/s EWMA is a plausible
+        // acceleration. Confidence still controls the percentage sanity gate.
+        est.burst_state.median_rate = 50_000.0;
+        est.burst_state.median_consumption_rate = 50_000.0;
         let action = policy.evaluate(&est, 25.0, PathBuf::from("/data"));
         // Implied rate = 25%/3min = 8.3%/min > 5, but confidence 0.98 > required.
         assert!(
             action.severity() >= 3,
             "high-confidence prediction should not be gated: got {action:?}"
+        );
+        est.confidence = 0.73;
+        assert_eq!(
+            policy.evaluate(&est, 25.0, PathBuf::from("/data")),
+            PredictiveAction::Clear,
+            "the same plausible rate still needs enough confidence"
         );
     }
 

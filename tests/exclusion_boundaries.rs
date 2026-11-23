@@ -68,7 +68,7 @@ fn candidate(path: &Path) -> CandidacyScore {
         classification: ArtifactPatternRegistry::default()
             .classify(path, structural_signals_for_path(path)),
         size_bytes: fs::metadata(path.join("artifact.bin")).unwrap().len(),
-        age: Duration::from_secs(48 * 3600),
+        age: Duration::from_hours(48),
         decision: DecisionOutcome {
             action: DecisionAction::Delete,
             posterior_abandoned: 0.99,

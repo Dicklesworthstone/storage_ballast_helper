@@ -162,9 +162,12 @@ fn descendant_active_lease_preserves_parent_in_public_mutation_paths() {
         assert_eq!(retry.items_failed, 0);
         assert!(!parent.exists());
         if mode == DeletionMode::Quarantine {
-            let store = QuarantineStore::for_root(dir.path());
+            assert_eq!(retry.items_quarantined, 1);
+            assert_eq!(retry.bytes_freed, 0);
+            let store = QuarantineStore::under(dir.path());
             let held = store.records().unwrap();
             assert_eq!(held.len(), 1);
+            assert_eq!(held[0].original_path, parent);
             store.restore(&held[0].decision_id, false).unwrap();
             assert_eq!(fs::read(&payload).unwrap(), PAYLOAD);
         }

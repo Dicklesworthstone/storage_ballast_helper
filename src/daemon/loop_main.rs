@@ -9193,7 +9193,7 @@ impl MonitoringDaemon {
                         };
                         files_released =
                             self.release_ballast(&mount, release_response).unwrap_or(0);
-                        self.last_tick_cleanup_ran = true;
+                        self.last_tick_cleanup_ran |= files_released > 0;
                     }
                     if decision.scan && scan_allowed {
                         if roots_here.is_empty() && !catalog.is_empty() {
@@ -9582,20 +9582,19 @@ impl MonitoringDaemon {
                 .iter()
                 .any(|tick| tick.response.level == PressureLevel::Green)
         {
-            let mut predictive_cleanup = false;
             for tick in &responses {
                 let Some(mount) = predictive_cleanup_mount(tick) else {
                     continue;
                 };
                 let physical = &tick.filesystem_response;
-                predictive_cleanup = true;
                 if tick.predictive_action.should_release_ballast()
                     && tick.imminent_danger
                     && !ballast_release_attempted.contains(&self.pool_mount(mount))
                     && !recovery_pools.contains(&self.pool_mount(mount))
                 {
-                    let _ = self.release_ballast(mount, physical);
-                    self.last_tick_cleanup_ran = true;
+                    self.last_tick_cleanup_ran |= self
+                        .release_ballast(mount, physical)
+                        .is_ok_and(|released| released > 0);
                 }
                 // A Reclaim controller may have queued its predictive pass
                 // already. FallbackSafe uses the recovery pass below; neither
@@ -9659,12 +9658,16 @@ impl MonitoringDaemon {
                         .map(|(root, _)| root.clone())
                         .collect();
                     if !paths.is_empty() {
-                        self.send_scan_request(scan_tx, scan_rx, physical, &paths, None, None);
+                        let queued =
+                            self.send_scan_request(scan_tx, scan_rx, physical, &paths, None, None);
+                        // A forecast alone is not an intervention. Censor it
+                        // only when its own recovery pass was admitted; a
+                        // held mount or a full queue must keep accumulating
+                        // the clean observations needed to leave fallback.
+                        self.last_tick_cleanup_ran |=
+                            queued && predictive_cleanup_mount(tick).is_some();
                     }
                 }
-                // Preserve intervention censoring when a cleanup forecast
-                // coincides with this recovery pass, even before mode recovery.
-                self.last_tick_cleanup_ran |= predictive_cleanup;
             }
         }
 
@@ -10470,18 +10473,21 @@ impl MonitoringDaemon {
         paths: &[PathBuf],
         ram_reclaim: Option<RamReclaimRequest>,
         inode_reclaim: Option<InodeReclaimRequest>,
-    ) {
+    ) -> bool {
         // Under Green/Yellow pressure, skip enqueue entirely if the channel is
         // already full — a scan is already in progress and there's no urgency.
         // This eliminates most "scan channel saturated" log noise.
         if response.level < PressureLevel::Orange && scan_tx.is_full() {
-            return;
+            return false;
         }
         let Some(request) = self.prepare_scan_request(response, paths, ram_reclaim, inode_reclaim)
         else {
-            return;
+            return false;
         };
-        self.enqueue_scan_logged(scan_tx, scan_rx, response, request);
+        matches!(
+            self.enqueue_scan_logged(scan_tx, scan_rx, response, request),
+            ScanEnqueueStatus::Queued | ScanEnqueueStatus::ReplacedStale
+        )
     }
 
     fn prepare_scan_request(
@@ -17421,6 +17427,7 @@ mod tests {
         );
         assert_eq!(daemon.ballast_available_for_release(mount), 0);
         assert!(!daemon.last_tick_cleanup_ran);
+        wait_for_ballast_observation(daemon, mount, 0);
 
         let mut external = DiscoverySnapshot::collect(&daemon.config, &daemon.platform)
             .unwrap()
@@ -17431,6 +17438,17 @@ mod tests {
                 .unwrap()
                 .total_files_created(),
             2
+        );
+        // Entry already observed an empty pool. External provisioning is
+        // noticed at the next 30-second observation interval, not within
+        // the worker-completion helper's 10-second wall-clock bound.
+        daemon
+            .ballast_reserve_monitor
+            .elapse_refresh_interval(mount);
+        assert_eq!(
+            daemon.ballast_available_for_release(mount),
+            0,
+            "making a refresh due grants no inventory authority"
         );
         wait_for_ballast_observation(daemon, mount, 2);
         assert_eq!(
@@ -17543,7 +17561,9 @@ mod tests {
                 .get_mut(mount)
                 .unwrap()
                 .note_recovery_release_attempt(
-                    Instant::now() - crate::daemon::mount_controller::RECOVERY_POLL_INTERVAL,
+                    Instant::now()
+                        .checked_sub(crate::daemon::mount_controller::RECOVERY_POLL_INTERVAL)
+                        .unwrap(),
                 );
             daemon.mount_responses = vec![tick.clone()];
             daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
@@ -17566,10 +17586,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn recovery_ballast_aliases_share_retry_deadline_and_cannot_bypass_it() {
+    fn recovery_reserve_alias_fixture() -> (RegretDaemonFixture, PathBuf, PathBuf) {
         use crate::platform::pal::{MountPoint, PlatformPaths};
-        use rustix::fs::{FlockOperation, flock};
 
         let mut fixture = recovery_reserve_fixture();
         let alias = fixture.directory.path().join("bind-alias");
@@ -17611,6 +17629,17 @@ mod tests {
         daemon.enable_background_filesystem_observations();
         assert_eq!(daemon.pool_mount(&alias), mount);
         assert_eq!(daemon.pool_mount(&observed_alias), mount);
+        (fixture, alias, observed_alias)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_ballast_aliases_share_retry_deadline_and_cannot_bypass_it() {
+        use rustix::fs::{FlockOperation, flock};
+
+        let (mut fixture, alias, observed_alias) = recovery_reserve_alias_fixture();
+        let daemon = &mut fixture.daemon;
+        let mount = Path::new("/");
         assert_eq!(
             daemon
                 .ballast_coordinator
@@ -17678,7 +17707,9 @@ mod tests {
             .get_mut(mount)
             .unwrap()
             .note_recovery_release_attempt(
-                Instant::now() - crate::daemon::mount_controller::RECOVERY_POLL_INTERVAL,
+                Instant::now()
+                    .checked_sub(crate::daemon::mount_controller::RECOVERY_POLL_INTERVAL)
+                    .unwrap(),
             );
         // Neither recovering view is observable now, but a third, writable
         // view still is. Once the shared deadline passes it must carry the
@@ -21153,6 +21184,14 @@ mod tests {
         let daemon = &mut fixture.daemon;
         daemon.platform = Arc::new(disk_pressure_platform(vec![
             disk_pressure_sample("/", 1_000_000, 900_000),
+            // Model the fixture's actual backing filesystem independently of
+            // '/', since /tmp may live on a separate mount. Native directory
+            // identity must still corroborate the observed ancestor's owner.
+            disk_pressure_sample(
+                &fixture.directory.path().to_string_lossy(),
+                1_000_000,
+                900_000,
+            ),
             disk_pressure_sample(&peer.to_string_lossy(), 1_000_000, 900_000),
             disk_pressure_sample(&mount.to_string_lossy(), 1_000_000, 1_000),
         ]));
@@ -21977,6 +22016,79 @@ mod tests {
             assert_eq!(daemon.shared_executor_config.min_score(), 0.85);
             assert_eq!(daemon.last_tick_cleanup_ran, predicted);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn green_predictive_fallback_does_not_censor_a_deferred_scan() {
+        let (mut fixture, [_, filling, _]) = green_predictive_fixture();
+        let daemon = &mut fixture.daemon;
+        *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+            initial_mode: ActiveMode::FallbackSafe,
+            ..PolicyConfig::default()
+        });
+        let tick = green_predictive_tick(&filling);
+        let paths = vec![filling.join("project")];
+        let (scan_tx, scan_rx) = bounded(1);
+        let (del_tx, _del_rx) = bounded(1);
+        scan_tx
+            .send(
+                daemon
+                    .prepare_scan_request(&tick.filesystem_response, &paths, None, None)
+                    .unwrap(),
+            )
+            .unwrap();
+
+        daemon.mount_responses = vec![tick.clone()];
+        daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(scan_rx.len(), 1);
+        assert!(
+            !daemon.last_tick_cleanup_ran,
+            "a full queue admits no new intervention for the forecast"
+        );
+        scan_rx.try_recv().unwrap();
+
+        daemon.mount_responses = vec![tick.clone()];
+        daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(scan_rx.try_recv().unwrap().paths, paths);
+        assert!(
+            daemon.last_tick_cleanup_ran,
+            "an admitted pass for the forecast still censors its outcome"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn green_predictive_fallback_does_not_censor_a_held_forecast_for_a_peers_scan() {
+        let (mut fixture, [steady, filling, _]) = green_predictive_fixture();
+        let daemon = &mut fixture.daemon;
+        daemon.config.scanner.quarantine_enabled = false;
+        *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+            initial_mode: ActiveMode::FallbackSafe,
+            ..PolicyConfig::default()
+        });
+        let forecast = green_predictive_tick(&filling);
+        let mut unpredicted = green_predictive_tick(&steady);
+        unpredicted.predictive_action = PredictiveAction::Clear;
+        daemon.pending_recovery.insert(filling.clone());
+        daemon.mount_responses = vec![forecast.clone(), unpredicted];
+        let (scan_tx, scan_rx) = bounded(2);
+        let (del_tx, _del_rx) = bounded(2);
+
+        daemon.handle_pressure(&forecast.response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(
+            daemon.mount_controllers[&filling].state(),
+            MountState::Recovery
+        );
+        assert_eq!(scan_rx.len(), 1);
+        assert_eq!(
+            scan_rx.try_recv().unwrap().paths,
+            vec![steady.join("project")]
+        );
+        assert!(
+            !daemon.last_tick_cleanup_ran,
+            "an unpredicted peer's fallback pass did not intervene on the held forecast"
+        );
     }
 
     #[cfg(unix)]
@@ -36329,7 +36441,7 @@ mod tests {
             state.update_with_hysteresis(
                 MemoryPressureLevel::Normal,
                 PressureLevel::Yellow,
-                recovery_at - Duration::from_millis(1),
+                recovery_at.checked_sub(Duration::from_millis(1)).unwrap(),
                 hysteresis,
             ),
             BehaviorUpdate::Deferred { .. }

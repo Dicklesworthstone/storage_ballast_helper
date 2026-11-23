@@ -1327,7 +1327,9 @@ mod tests {
         for elapsed in [
             Duration::from_millis(100),
             Duration::from_secs(1),
-            RECOVERY_POLL_INTERVAL - Duration::from_nanos(1),
+            RECOVERY_POLL_INTERVAL
+                .checked_sub(Duration::from_nanos(1))
+                .unwrap(),
         ] {
             tick.now = now + elapsed;
             let decision = controller.observe(tick);
