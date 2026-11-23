@@ -17595,6 +17595,14 @@ mod tests {
         std::fs::create_dir(&alias).unwrap();
         std::fs::create_dir(&observed_alias).unwrap();
         let daemon = &mut fixture.daemon;
+        // This fixture isolates reserve retry accounting from quarantine I/O.
+        // quarantine_enabled controls ingestion, not draining existing stores;
+        // Observe keeps those unrelated sweeps inventory-only while Recovery
+        // still performs its independent native reserve releases.
+        *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+            initial_mode: ActiveMode::Observe,
+            ..PolicyConfig::default()
+        });
         let mount = Path::new("/");
         let stats = daemon.platform.fs_stats(mount).unwrap();
         let mut alias_stats = stats.clone();
@@ -17669,6 +17677,10 @@ mod tests {
         assert_eq!(
             daemon.mount_controllers[mount].state(),
             MountState::Recovery
+        );
+        assert!(
+            !daemon.quarantine_sweeper.forecast_intervention(),
+            "inventory-only quarantine work cannot censor the reserve retry fixture"
         );
         flock(&lock, FlockOperation::Unlock).unwrap();
 
