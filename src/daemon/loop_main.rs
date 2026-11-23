@@ -12264,7 +12264,7 @@ fn replay_indexed_record(
     visibility_gap: Option<&str>,
     logger: &ActivityLoggerHandle,
 ) -> std::result::Result<CandidacyScore, ReplayDrop> {
-    use crate::scanner::active_lease::{ActiveLeaseState, inspect_path};
+    use crate::scanner::active_lease::path_is_actively_leased;
     use crate::scanner::index::{IndexedIdentity, IndexedPruneDecision};
     use crate::scanner::patterns::{ArtifactCategory, OpaqueTreeDisposition, classify_opaque_tree};
     use crate::scanner::scoring::{CandidateInput, DecisionAction};
@@ -12301,12 +12301,10 @@ fn replay_indexed_record(
     if path.join(".git").exists() {
         return Err(ReplayDrop::Vetoed("contains .git".to_string()));
     }
-    if let Some(lease) = inspect_path(path)
-        && lease.state == ActiveLeaseState::Active
-    {
+    if path_is_actively_leased(path) {
         return Err(ReplayDrop::Vetoed(format!(
             "active lease on {}",
-            lease.leased_target.display()
+            path.display()
         )));
     }
     let mut signals = structural_signals_for_path(path);
@@ -28497,6 +28495,69 @@ mod tests {
             &logger,
         );
         assert_eq!(blind.unwrap_err(), ReplayDrop::Vetoed(gap.to_string()));
+
+        // A locked lease remains a veto after expiry, quota exhaustion or
+        // malformed metadata. Only its watchdog may cancel the build; replay
+        // cannot spend a batch slot on work the executor must still refuse.
+        {
+            use crate::scanner::active_lease::{
+                ActiveLease, ActiveLeaseState, LeasePolicy, inspect_path,
+            };
+
+            let lease_root = temp.path().join("lease-root");
+            std::fs::create_dir(&lease_root).unwrap();
+            let leased_target = lease_root.join("target");
+            let lease = ActiveLease::acquire_with_policy(
+                std::slice::from_ref(&lease_root),
+                &leased_target,
+                Duration::from_secs(30),
+                1024 * 1024,
+                LeasePolicy {
+                    emergency_reserve_bytes: 0,
+                    ..LeasePolicy::default()
+                },
+            )
+            .unwrap();
+            std::fs::create_dir_all(leased_target.join("debug/deps")).unwrap();
+            std::fs::write(leased_target.join("debug/deps/unit.rlib"), vec![1_u8; 8192]).unwrap();
+            let leased = CandidateIndexRecord {
+                path: leased_target.clone(),
+                identity: identity_for_path(&leased_target, false).unwrap().into(),
+                ..record(3)
+            };
+            for state in [
+                ActiveLeaseState::Active,
+                ActiveLeaseState::Expired,
+                ActiveLeaseState::OverQuota,
+                ActiveLeaseState::Invalid,
+            ] {
+                let mut metadata = lease.metadata().clone();
+                if state == ActiveLeaseState::Expired {
+                    metadata.started_at_unix_seconds = 1;
+                    metadata.expires_at_unix_seconds = 2;
+                } else if state == ActiveLeaseState::OverQuota {
+                    metadata.max_bytes = 1;
+                }
+                let bytes = if state == ActiveLeaseState::Invalid {
+                    b"{invalid".to_vec()
+                } else {
+                    serde_json::to_vec(&metadata).unwrap()
+                };
+                std::fs::write(lease.metadata_path(), bytes).unwrap();
+                assert_eq!(inspect_path(&leased_target).unwrap().state, state);
+                assert_eq!(
+                    replay(&leased, 3, &mut protection).unwrap_err(),
+                    ReplayDrop::Vetoed(format!("active lease on {}", leased_target.display())),
+                    "{state:?}"
+                );
+            }
+            drop(lease);
+            let released = replay(&leased, 3, &mut protection);
+            assert!(
+                matches!(released, Ok(_) | Err(ReplayDrop::NotDelete(_))),
+                "released lease must permit fresh scoring: {released:?}"
+            );
+        }
 
         // Planted after the checkpoint: a .git, then a Cargo.toml.
         std::fs::create_dir_all(target.join(".git")).unwrap();

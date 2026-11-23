@@ -381,10 +381,18 @@ pub fn renew(target: &Path, token: &str, extension: Duration) -> Result<u64> {
 #[must_use]
 #[cfg(unix)]
 pub fn inspect_path(path: &Path) -> Option<ActiveLeaseInspection> {
-    let absolute = absolute_lexical(path).ok()?;
+    inspect_spellings(path, inspect_exact_target).ok().flatten()
+}
+
+#[cfg(unix)]
+fn inspect_spellings<T>(
+    path: &Path,
+    mut inspect: impl FnMut(&Path) -> Option<T>,
+) -> Result<Option<T>> {
+    let absolute = absolute_lexical(path)?;
     for cursor in absolute.ancestors() {
-        if let Some(inspection) = inspect_exact_target(cursor) {
-            return Some(inspection);
+        if let Some(inspection) = inspect(cursor) {
+            return Ok(Some(inspection));
         }
     }
     // Leases are recorded under the acquire-time CANONICAL target (sidecar
@@ -396,19 +404,31 @@ pub fn inspect_path(path: &Path) -> Option<ActiveLeaseInspection> {
         && canonical != absolute
     {
         for cursor in canonical.ancestors() {
-            if let Some(inspection) = inspect_exact_target(cursor) {
-                return Some(inspection);
+            if let Some(inspection) = inspect(cursor) {
+                return Ok(Some(inspection));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Whether deletion must skip this path because a lease lock is held.
+///
+/// This admission probe never reads lease metadata or traverses the target.
+/// Expired, over-quota and invalid leases protect exactly as active ones do:
+/// only the watchdog may cancel their owner. Resource inspection belongs to
+/// [`inspect_path`], not to every cleanup/compression candidate beneath a build.
+/// Unreadable, replaced or non-regular sidecars fail closed without waiting.
 #[must_use]
 #[cfg(unix)]
 pub fn path_is_actively_leased(path: &Path) -> bool {
-    inspect_path(path).is_some()
+    inspect_spellings(path, |target| {
+        sidecar_paths(target)
+            .ok()
+            .filter(|sidecars| lease_lock_held(&sidecars.lock).unwrap_or(true))
+            .map(|_| ())
+    })
+    .map_or(true, |inspection| inspection.is_some())
 }
 
 #[cfg(not(unix))]
@@ -498,24 +518,20 @@ fn terminate_process_group(
 #[cfg(unix)]
 fn inspect_exact_target(target: &Path) -> Option<ActiveLeaseInspection> {
     let sidecars = sidecar_paths(target).ok()?;
-    if !sidecars.lock.exists() {
-        return None;
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&sidecars.lock);
-    let Ok(file) = file else {
-        return Some(ActiveLeaseInspection {
-            leased_target: target.to_path_buf(),
-            state: ActiveLeaseState::Invalid,
-            metadata: None,
-            detail: format!("cannot open lease lock {}", sidecars.lock.display()),
-        });
-    };
-    if let Ok(probe) = Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-        drop(probe);
-        return None;
+    match lease_lock_held(&sidecars.lock) {
+        Ok(false) => return None,
+        Ok(true) => {}
+        Err(error) => {
+            return Some(ActiveLeaseInspection {
+                leased_target: target.to_path_buf(),
+                state: ActiveLeaseState::Invalid,
+                metadata: None,
+                detail: format!(
+                    "cannot inspect lease lock {}: {error}",
+                    sidecars.lock.display()
+                ),
+            });
+        }
     }
 
     let parsed = fs::read(&sidecars.metadata)
@@ -558,6 +574,57 @@ fn inspect_exact_target(target: &Path) -> Option<ActiveLeaseInspection> {
         metadata: Some(metadata),
         detail,
     })
+}
+
+/// A negative result requires the same regular sidecar before and after the
+/// nonblocking lock attempt. Never follow a symlink or open a FIFO as a lock.
+/// Acquiring a probe lock does not certify lease metadata or target contents.
+#[cfg(unix)]
+fn lease_lock_held(path: &Path) -> std::io::Result<bool> {
+    let observed = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "lease lock is not the observed regular file",
+        )
+    };
+    if !observed.is_file() {
+        return Err(invalid());
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let same_file = |metadata: &fs::Metadata| {
+        metadata.is_file() && (metadata.dev(), metadata.ino()) == (observed.dev(), observed.ino())
+    };
+    if !same_file(&file.metadata()?) {
+        return Err(invalid());
+    }
+    let verify_path = || {
+        if same_file(&fs::symlink_metadata(path)?) {
+            Ok(())
+        } else {
+            Err(invalid())
+        }
+    };
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(probe) => {
+            verify_path()?;
+            drop(probe);
+            Ok(false)
+        }
+        Err((_file, nix::errno::Errno::EWOULDBLOCK)) => {
+            verify_path()?;
+            Ok(true)
+        }
+        Err((_file, error)) => Err(std::io::Error::from_raw_os_error(error as i32)),
+    }
 }
 
 /// A failed inspection is Invalid, and keeps its error: "invalid" alone
@@ -1279,9 +1346,107 @@ mod tests {
         assert_eq!(inspection.leased_target, target);
         assert_eq!(inspection.state, ActiveLeaseState::Active);
         assert_eq!(inspection.metadata.as_ref().unwrap(), lease.metadata());
+        assert!(path_is_actively_leased(&target));
+        assert!(path_is_actively_leased(&descendant));
 
         drop(lease);
         assert!(inspect_path(&descendant).is_none());
+        assert!(!path_is_actively_leased(&descendant));
+    }
+
+    /// Observe actual filesystem access, rather than a timing threshold: a
+    /// live build may hold millions of entries and the refusal must not open
+    /// its root or metadata. The rich inspector is the positive control.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lock_only_admission_never_opens_metadata_or_the_build_tree() {
+        use inotify::{EventMask, Inotify, WatchMask};
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let target = root.join("target");
+        let lease = ActiveLease::acquire_with_policy(
+            std::slice::from_ref(&root),
+            &target,
+            Duration::from_secs(30),
+            1024 * 1024,
+            test_policy(),
+        )
+        .unwrap();
+        let descendant = target.join("debug/deps/unit.o");
+        fs::create_dir_all(descendant.parent().unwrap()).unwrap();
+        fs::write(&descendant, b"live build output").unwrap();
+        let alias = root.join("alias");
+        symlink(&target, &alias).unwrap();
+        let alias_descendant = alias.join("debug/deps/unit.o");
+        let mut events = Inotify::init().unwrap();
+        let target_watch = events.watches().add(&target, WatchMask::OPEN).unwrap();
+        let metadata_watch = events
+            .watches()
+            .add(lease.metadata_path(), WatchMask::OPEN)
+            .unwrap();
+
+        for path in [&target, &descendant, &alias_descendant] {
+            assert!(path_is_actively_leased(path), "{}", path.display());
+        }
+        let mut buffer = [0_u8; 4096];
+        match events.read_events(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(events) => assert_eq!(events.count(), 0, "lock admission opened target contents"),
+            Err(error) => panic!("cannot observe lock admission: {error}"),
+        }
+
+        let inspection = inspect_path(&target).unwrap();
+        assert_eq!(inspection.state, ActiveLeaseState::Active);
+        let observed: Vec<_> = events
+            .read_events(&mut buffer)
+            .unwrap()
+            .map(|event| (event.wd, event.mask))
+            .collect();
+        for watch in [target_watch, metadata_watch] {
+            assert!(
+                observed
+                    .iter()
+                    .any(|(wd, mask)| { wd == &watch && mask.contains(EventMask::OPEN) }),
+                "the positive control must observe rich inspection: {observed:?}"
+            );
+        }
+        drop(lease);
+        assert!(!path_is_actively_leased(&alias_descendant));
+    }
+
+    #[test]
+    fn nonregular_lease_sidecars_fail_closed_without_following_targets() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let unlocked = root.join("unrelated-unlocked-file");
+        fs::write(&unlocked, b"unrelated content").unwrap();
+        for kind in ["symlink", "dangling", "directory", "fifo"] {
+            let target = root.join(kind);
+            fs::create_dir(&target).unwrap();
+            let sidecars = sidecar_paths(&target).unwrap();
+            match kind {
+                "symlink" => symlink(&unlocked, &sidecars.lock).unwrap(),
+                "dangling" => symlink(root.join("absent"), &sidecars.lock).unwrap(),
+                "directory" => fs::create_dir(&sidecars.lock).unwrap(),
+                "fifo" => nix::unistd::mkfifo(
+                    &sidecars.lock,
+                    nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(path_is_actively_leased(&target), "{kind}");
+            assert_eq!(
+                inspect_path(&target).unwrap().state,
+                ActiveLeaseState::Invalid
+            );
+        }
+        assert_eq!(fs::read(unlocked).unwrap(), b"unrelated content");
+        assert!(!path_is_actively_leased(&root.join("no-sidecar")));
     }
 
     #[test]
@@ -1298,6 +1463,7 @@ mod tests {
         .unwrap();
 
         assert!(inspect_path(&root.path().join("other")).is_none());
+        assert!(!path_is_actively_leased(&root.path().join("other")));
     }
 
     #[test]
@@ -1446,9 +1612,11 @@ mod tests {
         let inspection = inspect_path(&target).expect("locked invalid record must protect");
         assert_eq!(inspection.state, ActiveLeaseState::Invalid);
         assert!(inspection.metadata.is_none());
+        assert!(path_is_actively_leased(&target));
 
         drop(lease);
         assert!(inspect_path(&target).is_none());
+        assert!(!path_is_actively_leased(&target));
     }
 
     #[test]
