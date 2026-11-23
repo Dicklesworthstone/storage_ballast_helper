@@ -1,9 +1,11 @@
 //! Read-only reserve observations, kept off the pressure-monitoring thread.
 //!
-//! One retained worker bounds concurrent inventory I/O. Results belong to the
-//! coordinator's pool mutation epochs, so a slow observation cannot undo a
-//! later release. Neither these observations nor their reporting grants refill
-//! authority; the existing controller and provisioner remain the only gates.
+//! Independent pool workers publish healthy reserves without waiting for a
+//! stalled peer. Occupied slots stay bounded through reloads and expiry. Results
+//! belong to the coordinator's pool mutation epochs, so a slow observation
+//! cannot undo a later release. Neither these observations nor their reporting
+//! grants refill authority; the existing controller and provisioner remain the
+//! only gates.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,6 +25,7 @@ use crate::platform::pal::Platform;
 
 const OBSERVATION_INTERVAL: Duration = Duration::from_secs(DAEMON_STATE_WRITE_INTERVAL_SECS);
 const MAX_OBSERVATION_AGE: Duration = Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS);
+const MAX_OBSERVATION_WORKERS: usize = 4;
 
 struct ObservationWorker {
     started_at: Instant,
@@ -39,9 +42,10 @@ struct ObservedReserve {
 /// again, never restore a saved claim that reserve bytes still exist.
 #[derive(Default)]
 pub(super) struct BallastReserveMonitor {
-    worker: Option<ObservationWorker>,
-    last_started: Option<Instant>,
-    refresh_requested: bool,
+    workers: HashMap<PathBuf, ObservationWorker>,
+    last_started: HashMap<PathBuf, Instant>,
+    refresh_requested: HashSet<PathBuf>,
+    initialized: bool,
     reload_pending: bool,
     observations: HashMap<PathBuf, ObservedReserve>,
     reported: HashMap<(PathBuf, PathBuf), BallastReserveState>,
@@ -72,7 +76,7 @@ impl BallastReserveMonitor {
                 observation.pending = true;
             }
         }
-        self.refresh_requested = true;
+        self.refresh_requested.insert(mount.to_path_buf());
     }
 
     /// A reload can replace both pool identity and the floor rule. Invalidate
@@ -94,7 +98,6 @@ impl BallastReserveMonitor {
             observation.pending = true;
         }
         self.reload_pending = true;
-        self.refresh_requested = true;
     }
 
     /// Start or consume a read-only observation without waiting on native I/O.
@@ -109,56 +112,90 @@ impl BallastReserveMonitor {
         // Seeds use only pool configuration. Even an initial probe stuck in
         // native I/O eventually yields an explicit unknown reserve, instead
         // of silently leaving the status record without any observation.
-        if self.refresh_requested || self.last_started.is_none() {
+        if !self.initialized || !self.refresh_requested.is_empty() || self.reload_pending {
             changed |= self.seed_observations(coordinator, now);
         }
-        if self
-            .worker
-            .as_ref()
-            .is_some_and(|worker| worker.handle.is_finished())
-            && let Some(worker) = self.worker.take()
-        {
+        let completed: Vec<_> = self
+            .workers
+            .iter()
+            .filter(|(_, worker)| worker.handle.is_finished())
+            .map(|(mount, _)| mount.clone())
+            .collect();
+        for mount in completed {
+            let worker = self.workers.remove(&mount).expect("finished worker exists");
             if let Ok(result) = worker.handle.join() {
-                changed |= self.accept_observation(coordinator, result, worker.started_at);
-            } else {
-                // Retry at the ordinary cadence; a failing observer must
-                // not create a thread or diagnostic storm on every tick.
-                for observation in self.observations.values_mut() {
-                    mark_stale(&mut observation.snapshot);
-                    observation.pending = false;
+                let accepted = self.accept_observation(coordinator, result, worker.started_at);
+                changed |= accepted;
+                if !accepted && self.observations.contains_key(&mount) {
+                    // A release or reload retired the task's epoch. Its old
+                    // completion cannot consume the current pool's refresh.
+                    self.refresh_requested.insert(mount);
                 }
+            } else if let Some(observation) = self.observations.get_mut(&mount) {
+                // A failing observer affects only its own pool. The ordinary
+                // attempt interval prevents a panic-driven thread storm.
+                mark_stale(&mut observation.snapshot);
+                observation.pending = false;
                 changed = true;
             }
         }
 
         changed |= self.expire_observations(now);
 
-        let due = self.refresh_requested
-            || self.last_started.is_none_or(|last| {
-                now.checked_duration_since(last)
-                    .is_some_and(|elapsed| elapsed >= OBSERVATION_INTERVAL)
-            });
-        if self.worker.is_none() && due {
-            let task = coordinator.prepare_reserve_observation();
+        let mut due: Vec<_> = self
+            .observations
+            .keys()
+            .filter(|mount| {
+                !self.workers.contains_key(*mount)
+                    && (self.refresh_requested.contains(*mount)
+                        || self.last_started.get(*mount).is_none_or(|last| {
+                            now.checked_duration_since(*last)
+                                .is_some_and(|elapsed| elapsed >= OBSERVATION_INTERVAL)
+                        }))
+            })
+            .cloned()
+            .collect();
+        // A pool that has never had a turn precedes a repeat refresh; oldest
+        // attempts then win. A permanently blocked pool keeps its slot but
+        // cannot make an early path monopolize the remaining slots.
+        due.sort_by(|left, right| {
+            self.last_started
+                .get(left)
+                .cmp(&self.last_started.get(right))
+                .then_with(|| left.cmp(right))
+        });
+        let slots = MAX_OBSERVATION_WORKERS.saturating_sub(self.workers.len());
+        for mount in due.into_iter().take(slots) {
+            let Some(task) = coordinator.prepare_pool_reserve_observation(&mount) else {
+                continue;
+            };
             let platform = Arc::clone(platform);
-            self.last_started = Some(now);
-            self.refresh_requested = false;
+            self.last_started.insert(mount.clone(), now);
+            self.refresh_requested.remove(&mount);
             let handle = std::thread::Builder::new()
                 .name("sbh-reserve-observer".into())
                 .spawn(move || task.run(platform.as_ref()))?;
-            self.worker = Some(ObservationWorker {
-                started_at: now,
-                handle,
-            });
+            self.workers.insert(
+                mount,
+                ObservationWorker {
+                    started_at: now,
+                    handle,
+                },
+            );
         }
         Ok(changed)
     }
 
     fn seed_observations(&mut self, coordinator: &BallastPoolCoordinator, now: Instant) -> bool {
+        self.initialized = true;
         let seeds = coordinator.reserve_observation_seeds();
         let active_pools: HashSet<_> = seeds
             .iter()
             .map(|snapshot| (snapshot.mount_point.clone(), snapshot.ballast_dir.clone()))
+            .collect();
+        let active_mounts: HashSet<_> = seeds
+            .iter()
+            .map(|snapshot| snapshot.mount_point.as_path())
             .collect();
         // A changed or removed physical pool must not inherit an old cursor.
         // The same pool retains its cursor across policy-only reloads.
@@ -169,6 +206,12 @@ impl BallastReserveMonitor {
         self.observations.retain(|mount, observation| {
             active_pools.contains(&(mount.clone(), observation.snapshot.ballast_dir.clone()))
         });
+        // Obsolete native jobs retain their occupied slots until completion.
+        // Only scheduling metadata is pruned; no reload detaches a worker.
+        self.last_started
+            .retain(|mount, _| active_mounts.contains(mount.as_path()));
+        self.refresh_requested
+            .retain(|mount| active_mounts.contains(mount.as_path()));
         let mut changed =
             std::mem::take(&mut self.reload_pending) || self.observations.len() != previous_count;
         for snapshot in seeds {
@@ -592,6 +635,415 @@ mod tests {
             .collect()
     }
 
+    struct MultiPoolPlatform {
+        inner: MockPlatform,
+        blocked: parking_lot::Mutex<HashSet<PathBuf>>,
+        entered: crossbeam_channel::Sender<PathBuf>,
+        releases: HashMap<PathBuf, crossbeam_channel::Receiver<()>>,
+    }
+
+    impl Platform for MultiPoolPlatform {
+        fn fs_stats(&self, path: &Path) -> Result<FsStats> {
+            let stats = self.inner.fs_stats(path)?;
+            let blocked = self.blocked.lock().remove(&stats.mount_point);
+            if blocked {
+                self.entered.send(stats.mount_point.clone()).unwrap();
+                self.releases[&stats.mount_point]
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap();
+            }
+            Ok(stats)
+        }
+
+        fn mount_points(&self) -> Result<Vec<MountPoint>> {
+            self.inner.mount_points()
+        }
+
+        fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+            self.inner.is_ram_backed(path)
+        }
+
+        fn default_paths(&self) -> PlatformPaths {
+            self.inner.default_paths()
+        }
+
+        fn memory_info(&self) -> Result<MemoryInfo> {
+            self.inner.memory_info()
+        }
+
+        fn service_manager(&self) -> Box<dyn ServiceManager> {
+            self.inner.service_manager()
+        }
+    }
+
+    struct MultiPoolFixture {
+        _directory: tempfile::TempDir,
+        mounts: Vec<PathBuf>,
+        coordinator: BallastPoolCoordinator,
+        platform: Arc<MultiPoolPlatform>,
+        entered: crossbeam_channel::Receiver<PathBuf>,
+        releases: HashMap<PathBuf, crossbeam_channel::Sender<()>>,
+    }
+
+    impl MultiPoolFixture {
+        fn new(count: usize) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let mounts: Vec<_> = (0..count)
+                .map(|index| directory.path().join(format!("pool-{index:02}")))
+                .collect();
+            let mut mount_points = Vec::new();
+            let mut readings = HashMap::new();
+            let mut releases = HashMap::new();
+            let mut receivers = HashMap::new();
+            for mount in &mounts {
+                std::fs::create_dir(mount).unwrap();
+                mount_points.push(MountPoint {
+                    path: mount.clone(),
+                    device: mount.display().to_string(),
+                    fs_type: "btrfs".into(),
+                    is_ram_backed: false,
+                });
+                readings.insert(
+                    mount.clone(),
+                    FsStats {
+                        total_bytes: 1_000_000,
+                        free_bytes: 800_000,
+                        available_bytes: 800_000,
+                        fs_type: "btrfs".into(),
+                        mount_point: mount.clone(),
+                        is_readonly: false,
+                    },
+                );
+                let (sender, receiver) = crossbeam_channel::bounded(1);
+                releases.insert(mount.clone(), sender);
+                receivers.insert(mount.clone(), receiver);
+            }
+            let (entered_tx, entered) = crossbeam_channel::bounded(count);
+            let platform = Arc::new(MultiPoolPlatform {
+                inner: MockPlatform::new(
+                    mount_points,
+                    readings,
+                    MockPlatform::healthy().memory_info().unwrap(),
+                    PlatformPaths::default(),
+                ),
+                blocked: parking_lot::Mutex::new(HashSet::new()),
+                entered: entered_tx,
+                releases: receivers,
+            });
+            let manager_platform: Arc<dyn Platform> = platform.clone();
+            let coordinator = BallastPoolCoordinator::discover_with_manager_platform(
+                &Self::config(),
+                &mounts,
+                platform.as_ref(),
+                &manager_platform,
+            )
+            .unwrap();
+            assert_eq!(coordinator.pool_count(), count);
+            Self {
+                _directory: directory,
+                mounts,
+                coordinator,
+                platform,
+                entered,
+                releases,
+            }
+        }
+
+        fn config() -> BallastConfig {
+            BallastConfig {
+                file_count: 2,
+                file_size_bytes: 8192,
+                ..BallastConfig::default()
+            }
+        }
+
+        fn tick(&self, monitor: &mut BallastReserveMonitor, now: Instant) {
+            let platform: Arc<dyn Platform> = self.platform.clone();
+            monitor.tick(&self.coordinator, &platform, now).unwrap();
+            assert!(monitor.workers.len() <= MAX_OBSERVATION_WORKERS);
+        }
+
+        fn await_observation(
+            &self,
+            monitor: &mut BallastReserveMonitor,
+            mount: &Path,
+            now: Instant,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                self.tick(monitor, now);
+                if monitor
+                    .snapshot(mount)
+                    .is_some_and(|snapshot| snapshot.inventory_authoritative)
+                {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pool observation did not complete"
+                );
+                std::thread::yield_now();
+            }
+        }
+
+        fn unblock(&self, monitor: &BallastReserveMonitor, mount: &Path) {
+            self.releases[mount].send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !monitor.workers[mount].handle.is_finished() {
+                assert!(
+                    Instant::now() < deadline,
+                    "released observer did not finish"
+                );
+                std::thread::yield_now();
+            }
+        }
+
+        fn settle(&self, monitor: &mut BallastReserveMonitor, now: Instant) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                self.tick(monitor, now);
+                if monitor.workers.is_empty() {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "pool observers did not settle");
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_pool_does_not_hide_externally_provisioned_reserve_on_a_healthy_peer() {
+        use crate::ballast::manager::BallastManager;
+
+        let mut fixture = MultiPoolFixture::new(2);
+        let blocked = fixture.mounts[0].clone();
+        let healthy = fixture.mounts[1].clone();
+        let directory = fixture
+            .coordinator
+            .pool_for_mount(&healthy)
+            .unwrap()
+            .ballast_dir
+            .clone();
+        // Another sbh process provisions after daemon discovery. The daemon's
+        // cached empty pool needs fresh observation to schedule a release.
+        let platform: Arc<dyn Platform> = fixture.platform.clone();
+        let mut external =
+            BallastManager::with_platform(directory.clone(), MultiPoolFixture::config(), platform)
+                .unwrap();
+        external.set_skip_fallocate(true);
+        assert_eq!(external.provision(None).unwrap().files_created, 2);
+        assert_eq!(
+            fixture
+                .coordinator
+                .pool_for_mount(&healthy)
+                .unwrap()
+                .available_count(),
+            0,
+        );
+
+        fixture.platform.blocked.lock().insert(blocked.clone());
+        let mut monitor = BallastReserveMonitor::default();
+        let start = Instant::now();
+        fixture.tick(&mut monitor, start);
+        assert_eq!(
+            fixture
+                .entered
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            blocked,
+        );
+        let blocked_id = monitor.workers[&blocked].handle.thread().id();
+        fixture.await_observation(&mut monitor, &healthy, start);
+        assert_eq!(monitor.observations[&healthy].started_at, start);
+        let available = monitor
+            .release_count_hint(&healthy, &directory, start)
+            .unwrap();
+        assert_eq!(available, 2);
+        assert_eq!(
+            fixture
+                .coordinator
+                .release_for_mount(&healthy, available)
+                .unwrap()
+                .unwrap()
+                .files_released,
+            2,
+        );
+
+        let refreshed_at = start + Duration::from_secs(1);
+        monitor.invalidate_at(&healthy, refreshed_at);
+        fixture.await_observation(&mut monitor, &healthy, refreshed_at);
+        assert_eq!(
+            monitor.release_count_hint(&healthy, &directory, refreshed_at),
+            Some(0)
+        );
+        assert_eq!(monitor.observations[&healthy].started_at, refreshed_at);
+        assert_eq!(monitor.workers[&blocked].handle.thread().id(), blocked_id);
+        assert!(!monitor.snapshot(&blocked).unwrap().inventory_authoritative);
+        assert!(!directory.join("SBH_BALLAST_FILE_00001.dat").exists());
+
+        // Refreshing one pool must neither re-age nor re-probe its peer.
+        fixture.tick(&mut monitor, refreshed_at + Duration::from_secs(29));
+        assert_eq!(monitor.observations[&healthy].started_at, refreshed_at);
+        assert!(!monitor.workers.contains_key(&healthy));
+        assert_eq!(monitor.last_started[&blocked], start);
+        fixture.unblock(&monitor, &blocked);
+        fixture.tick(&mut monitor, refreshed_at + MAX_OBSERVATION_AGE);
+        assert!(!monitor.snapshot(&blocked).unwrap().inventory_authoritative);
+        fixture.settle(&mut monitor, refreshed_at + MAX_OBSERVATION_AGE);
+    }
+
+    #[test]
+    fn occupied_pool_slots_survive_reload_and_waiting_pools_get_the_next_turn() {
+        let fixture = MultiPoolFixture::new(MAX_OBSERVATION_WORKERS + 2);
+        let blocked = &fixture.mounts[..MAX_OBSERVATION_WORKERS];
+        fixture
+            .platform
+            .blocked
+            .lock()
+            .extend(blocked.iter().cloned());
+        let mut monitor = BallastReserveMonitor::default();
+        let start = Instant::now();
+        fixture.tick(&mut monitor, start);
+        let mut entered = HashSet::new();
+        for _ in blocked {
+            entered.insert(
+                fixture
+                    .entered
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(entered, blocked.iter().cloned().collect());
+        let worker_ids: HashMap<_, _> = monitor
+            .workers
+            .iter()
+            .map(|(mount, worker)| (mount.clone(), worker.handle.thread().id()))
+            .collect();
+        let later = start + MAX_OBSERVATION_AGE;
+        for _ in 0..20 {
+            monitor.invalidate_all_at(later);
+            fixture.tick(&mut monitor, later);
+            assert_eq!(monitor.workers.len(), MAX_OBSERVATION_WORKERS);
+            for (mount, id) in &worker_ids {
+                assert_eq!(monitor.workers[mount].handle.thread().id(), *id);
+            }
+            assert!(
+                fixture.mounts[MAX_OBSERVATION_WORKERS..]
+                    .iter()
+                    .all(|mount| !monitor.last_started.contains_key(mount))
+            );
+        }
+
+        // Even an explicit invalidation of the earliest path cannot jump
+        // ahead of pools that have never obtained an observation slot.
+        fixture.unblock(&monitor, &blocked[0]);
+        fixture.tick(&mut monitor, later);
+        assert_eq!(monitor.last_started[&blocked[0]], start);
+        assert!(
+            !monitor
+                .snapshot(&blocked[0])
+                .unwrap()
+                .inventory_authoritative
+        );
+        let waiting = &fixture.mounts[MAX_OBSERVATION_WORKERS..];
+        for mount in waiting {
+            fixture.await_observation(&mut monitor, mount, later);
+            assert_eq!(monitor.observations[mount].started_at, later);
+        }
+        for mount in &blocked[1..] {
+            fixture.unblock(&monitor, mount);
+        }
+        fixture.settle(&mut monitor, later);
+    }
+
+    #[test]
+    fn removed_pool_completion_does_not_return_after_reload_while_peers_refresh() {
+        let mut fixture = MultiPoolFixture::new(2);
+        let removed = fixture.mounts[0].clone();
+        let retained = fixture.mounts[1].clone();
+        fixture.platform.blocked.lock().insert(removed.clone());
+        let mut monitor = BallastReserveMonitor::default();
+        let start = Instant::now();
+        fixture.tick(&mut monitor, start);
+        assert_eq!(
+            fixture
+                .entered
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            removed,
+        );
+        fixture.await_observation(&mut monitor, &retained, start);
+        let old_worker = monitor.workers[&removed].handle.thread().id();
+
+        let platform: Arc<dyn Platform> = fixture.platform.clone();
+        fixture.coordinator = BallastPoolCoordinator::discover_with_manager_platform(
+            &BallastConfig {
+                file_count: 3,
+                ..MultiPoolFixture::config()
+            },
+            std::slice::from_ref(&retained),
+            fixture.platform.as_ref(),
+            &platform,
+        )
+        .unwrap();
+        let reloaded_at = start + Duration::from_secs(1);
+        monitor.invalidate_all_at(reloaded_at);
+        fixture.await_observation(&mut monitor, &retained, reloaded_at);
+        assert!(monitor.snapshot(&removed).is_none());
+        assert_eq!(monitor.workers[&removed].handle.thread().id(), old_worker);
+        assert_eq!(monitor.snapshot(&retained).unwrap().files_total, 3);
+        assert_eq!(monitor.observations[&retained].started_at, reloaded_at);
+
+        fixture.unblock(&monitor, &removed);
+        fixture.tick(&mut monitor, reloaded_at);
+        assert!(monitor.snapshot(&removed).is_none());
+        assert!(!monitor.workers.contains_key(&removed));
+        assert!(!monitor.last_started.contains_key(&removed));
+        assert!(!monitor.refresh_requested.contains(&removed));
+        fixture.settle(&mut monitor, reloaded_at);
+    }
+
+    #[test]
+    fn same_pool_reload_rejects_old_result_and_immediately_observes_the_current_config() {
+        let mut fixture = MultiPoolFixture::new(1);
+        let mount = fixture.mounts[0].clone();
+        fixture.platform.blocked.lock().insert(mount.clone());
+        let mut monitor = BallastReserveMonitor::default();
+        let start = Instant::now();
+        fixture.tick(&mut monitor, start);
+        assert_eq!(
+            fixture
+                .entered
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            mount,
+        );
+        let old_worker = monitor.workers[&mount].handle.thread().id();
+        fixture.coordinator.update_config(&BallastConfig {
+            file_count: 3,
+            ..MultiPoolFixture::config()
+        });
+        fixture.coordinator.set_provision_floor(17.0);
+        let reloaded_at = start + Duration::from_secs(1);
+        monitor.invalidate_all_at(reloaded_at);
+        fixture.tick(&mut monitor, reloaded_at);
+        assert_eq!(monitor.workers[&mount].handle.thread().id(), old_worker);
+        assert_eq!(monitor.snapshot(&mount).unwrap().files_total, 3);
+        assert!(!monitor.snapshot(&mount).unwrap().inventory_authoritative);
+
+        fixture.unblock(&monitor, &mount);
+        fixture.tick(&mut monitor, reloaded_at);
+        assert!(!monitor.snapshot(&mount).unwrap().inventory_authoritative);
+        assert_eq!(monitor.last_started[&mount], reloaded_at);
+        assert_ne!(monitor.workers[&mount].handle.thread().id(), old_worker);
+        fixture.await_observation(&mut monitor, &mount, reloaded_at);
+        let snapshot = monitor.snapshot(&mount).unwrap();
+        assert_eq!(snapshot.files_total, 3);
+        assert!((snapshot.headroom.unwrap().floor_pct - 17.0).abs() < f64::EPSILON);
+        assert_eq!(monitor.observations[&mount].started_at, reloaded_at);
+        fixture.settle(&mut monitor, reloaded_at);
+    }
+
     #[test]
     fn release_hint_requires_current_authoritative_observation_of_the_same_pool() {
         let fixture = Fixture::new();
@@ -869,7 +1321,7 @@ mod tests {
             .entered
             .recv_timeout(Duration::from_secs(10))
             .unwrap();
-        let worker_id = monitor.worker.as_ref().unwrap().handle.thread().id();
+        let worker_id = monitor.workers[fixture.mount()].handle.thread().id();
         assert_eq!(
             monitor.snapshot(fixture.mount()).unwrap().state,
             BallastReserveState::Unknown,
@@ -890,9 +1342,9 @@ mod tests {
                 assert_eq!(states(&events), vec![BallastReserveState::Unknown]);
             }
             assert_eq!(
-                monitor.worker.as_ref().unwrap().handle.thread().id(),
+                monitor.workers[fixture.mount()].handle.thread().id(),
                 worker_id,
-                "a stalled native call retains the single worker slot",
+                "a stalled native call retains its worker slot",
             );
             assert_eq!(fixture.platform.probes.load(Ordering::Relaxed), before + 1);
             let snapshot = monitor.snapshot(fixture.mount()).unwrap();
@@ -901,7 +1353,7 @@ mod tests {
         }
 
         fixture.release.send(()).unwrap();
-        let worker = monitor.worker.take().unwrap();
+        let worker = monitor.workers.remove(fixture.mount()).unwrap();
         let result = worker.handle.join().unwrap();
         assert!(monitor.accept_observation(&fixture.coordinator, result, worker.started_at));
         assert!(monitor.expire_observations(start + Duration::from_mins(702)));
@@ -933,7 +1385,7 @@ mod tests {
             .entered
             .recv_timeout(Duration::from_secs(10))
             .unwrap();
-        let worker_id = monitor.worker.as_ref().unwrap().handle.thread().id();
+        let worker_id = monitor.workers[fixture.mount()].handle.thread().id();
 
         // Model failed release attempts while the observer is stuck. Each
         // attempt invalidates its evidence, including after expiry; none
@@ -963,14 +1415,14 @@ mod tests {
                 seconds >= 90,
             );
             assert_eq!(
-                monitor.worker.as_ref().unwrap().handle.thread().id(),
+                monitor.workers[fixture.mount()].handle.thread().id(),
                 worker_id,
             );
             assert_eq!(fixture.platform.probes.load(Ordering::Relaxed), before + 1);
         }
 
         fixture.release.send(()).unwrap();
-        let worker = monitor.worker.take().unwrap();
+        let worker = monitor.workers.remove(fixture.mount()).unwrap();
         let result = worker.handle.join().unwrap();
         let recovered_at = invalidated_at + Duration::from_secs(42_121);
         assert!(monitor.accept_observation(&fixture.coordinator, result, worker.started_at));
@@ -1015,7 +1467,7 @@ mod tests {
             .entered
             .recv_timeout(Duration::from_secs(10))
             .unwrap();
-        let worker_id = monitor.worker.as_ref().unwrap().handle.thread().id();
+        let worker_id = monitor.workers[fixture.mount()].handle.thread().id();
         fixture.coordinator.update_config(&BallastConfig {
             file_count: 20,
             file_size_bytes: 8192,
@@ -1048,14 +1500,14 @@ mod tests {
             );
             assert_eq!(monitor.delivery_events().len(), usize::from(seconds >= 90),);
             assert_eq!(
-                monitor.worker.as_ref().unwrap().handle.thread().id(),
+                monitor.workers[fixture.mount()].handle.thread().id(),
                 worker_id,
             );
             assert_eq!(fixture.platform.probes.load(Ordering::Relaxed), before + 1);
         }
 
         fixture.release.send(()).unwrap();
-        let worker = monitor.worker.take().unwrap();
+        let worker = monitor.workers.remove(fixture.mount()).unwrap();
         let result = worker.handle.join().unwrap();
         assert!(!monitor.accept_observation(&fixture.coordinator, result, worker.started_at));
         let recovered_at = start + Duration::from_secs(42_121);

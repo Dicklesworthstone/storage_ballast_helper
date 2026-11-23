@@ -1349,24 +1349,43 @@ impl BallastPoolCoordinator {
         snapshots
     }
 
-    /// Capture each physical pool exactly once, including its per-volume
-    /// target and current mutation epoch. This method performs no I/O.
+    fn reserve_probe(&self, pool: &BallastPool) -> ReserveProbePool {
+        ReserveProbePool {
+            mount_point: pool.mount_point.clone(),
+            ballast_dir: pool.ballast_dir.clone(),
+            config: pool.manager.config().clone(),
+            floor: pool.manager.provision_floor(),
+            stranded: pool.stranded.clone(),
+            revision: self
+                .pool_revisions
+                .get(&pool.mount_point)
+                .copied()
+                .unwrap_or(0),
+        }
+    }
+
+    /// Capture one physical pool without native I/O. Independent tasks let a
+    /// healthy filesystem publish reserve evidence while a peer's probe is
+    /// stalled. Aliases resolve to the same pool and mutation epoch.
+    pub(crate) fn prepare_pool_reserve_observation(
+        &self,
+        mount: &Path,
+    ) -> Option<BallastReserveObservation> {
+        let pool = self.pool_for_mount(mount)?;
+        Some(BallastReserveObservation {
+            origin: Arc::clone(&self.worker_origin),
+            pools: vec![self.reserve_probe(pool)],
+        })
+    }
+
+    /// Synchronous whole-inventory fixture helper. The daemon submits only
+    /// independent pool tasks so one stalled pool cannot hold every result.
+    #[cfg(test)]
     pub(crate) fn prepare_reserve_observation(&self) -> BallastReserveObservation {
         let mut pools: Vec<_> = self
             .pools
             .values()
-            .map(|pool| ReserveProbePool {
-                mount_point: pool.mount_point.clone(),
-                ballast_dir: pool.ballast_dir.clone(),
-                config: pool.manager.config().clone(),
-                floor: pool.manager.provision_floor(),
-                stranded: pool.stranded.clone(),
-                revision: self
-                    .pool_revisions
-                    .get(&pool.mount_point)
-                    .copied()
-                    .unwrap_or(0),
-            })
+            .map(|pool| self.reserve_probe(pool))
             .collect();
         pools.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
         BallastReserveObservation {
