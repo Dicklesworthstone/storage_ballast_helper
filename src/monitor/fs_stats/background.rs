@@ -154,11 +154,11 @@ where
         }
     }
 
-    pub fn observe(&self, key: K, priority: bool) -> Result<Observation<V>, String> {
+    pub fn observe(&self, key: &K, priority: bool) -> Result<Observation<V>, String> {
         self.observe_at(key, priority, Instant::now())
     }
 
-    fn observe_at(&self, key: K, priority: bool, now: Instant) -> Result<Observation<V>, String> {
+    fn observe_at(&self, key: &K, priority: bool, now: Instant) -> Result<Observation<V>, String> {
         let mut state = self
             .state
             .lock()
@@ -167,7 +167,7 @@ where
         let Some(epoch) = state.epoch else {
             return Err("filesystem observation epoch exhausted".to_string());
         };
-        if !state.entries.contains_key(&key) {
+        if !state.entries.contains_key(key) {
             if state.entries.len() >= self.max_entries {
                 let evict = state
                     .entries
@@ -186,7 +186,7 @@ where
 
         let refresh_after = state.refresh_after;
         let max_age = state.max_age;
-        let entry = state.entries.get_mut(&key).expect("requested entry exists");
+        let entry = state.entries.get_mut(key).expect("requested entry exists");
         entry.last_requested = now;
         entry.priority |= priority;
         let needs_refresh = entry.pending.is_none()
@@ -194,12 +194,12 @@ where
                 now.checked_duration_since(attempt)
                     .is_some_and(|elapsed| elapsed >= refresh_after)
             });
-        if needs_refresh && !state.waiting.contains(&key) {
+        if needs_refresh && !state.waiting.contains(key) {
             state.waiting.push_back(key.clone());
         }
         self.start_waiting(&mut state, epoch, now);
 
-        let entry = state.entries.get_mut(&key).expect("requested entry exists");
+        let entry = state.entries.get_mut(key).expect("requested entry exists");
         let result = if let Some(observation) = &entry.observation
             && now
                 .checked_duration_since(observation.collected_at)
@@ -364,8 +364,9 @@ mod tests {
         priority: bool,
     ) -> Observation<usize> {
         let deadline = Instant::now() + WAIT;
+        let key = key.to_string();
         loop {
-            if let Ok(observation) = observer.observe(key.to_string(), priority) {
+            if let Ok(observation) = observer.observe(&key, priority) {
                 return observation;
             }
             assert!(Instant::now() < deadline, "observation did not complete");
@@ -393,7 +394,7 @@ mod tests {
         let key = "a".to_string();
         assert_eq!(observer.pending_since(&key), None);
         let before = Instant::now();
-        assert!(observer.observe(key.clone(), false).is_err());
+        assert!(observer.observe(&key, false).is_err());
         let since = observer.pending_since(&key);
         assert!(since.is_some_and(|at| at >= before));
         release.send(()).unwrap();
@@ -451,10 +452,10 @@ mod tests {
             2,
             4,
         );
-        assert!(observer.observe("stalled".into(), false).is_err());
+        assert!(observer.observe(&"stalled".into(), false).is_err());
         entered_rx.recv_timeout(WAIT).unwrap();
         for _ in 0..100 {
-            assert!(observer.observe("other".into(), false).is_err());
+            assert!(observer.observe(&"other".into(), false).is_err());
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(await_value(&observer, "/", true).value, 2);
@@ -484,13 +485,13 @@ mod tests {
             2,
             4,
         );
-        assert!(observer.observe("mount".into(), false).is_err());
+        assert!(observer.observe(&"mount".into(), false).is_err());
         entered_rx.recv_timeout(WAIT).unwrap();
         for _ in 0..20 {
             observer.invalidate();
             observer.prune();
-            assert!(observer.observe("mount".into(), false).is_err());
-            assert!(observer.observe("new-config-root".into(), false).is_err());
+            assert!(observer.observe(&"mount".into(), false).is_err());
+            assert!(observer.observe(&"new-config-root".into(), false).is_err());
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         resume_tx.send(()).unwrap();
@@ -521,13 +522,13 @@ mod tests {
             4,
         );
         let before = Instant::now();
-        assert!(observer.observe_at("mount".into(), false, before).is_err());
+        assert!(observer.observe_at(&"mount".into(), false, before).is_err());
         entered_rx.recv_timeout(WAIT).unwrap();
         resume_tx.send(()).unwrap();
         let later = before + Duration::from_secs(2);
         await_idle(&observer, later);
         let error = observer
-            .observe_at("mount".into(), false, later)
+            .observe_at(&"mount".into(), false, later)
             .unwrap_err();
         assert!(error.contains("expired before delivery"));
     }
@@ -596,10 +597,10 @@ mod tests {
             2,
             2,
         );
-        assert!(observer.observe("stalled".into(), false).is_err());
+        assert!(observer.observe(&"stalled".into(), false).is_err());
         entered_rx.recv_timeout(WAIT).unwrap();
         for index in 0..100 {
-            assert!(observer.observe(format!("new-{index}"), false).is_err());
+            assert!(observer.observe(&format!("new-{index}"), false).is_err());
             let state = observer.state.lock().unwrap();
             assert_eq!(state.entries.len(), 2);
             assert!(state.entries["stalled"].pending.is_some());
@@ -626,7 +627,7 @@ mod tests {
             2,
             4,
         );
-        assert!(observer.observe("stalled".into(), false).is_err());
+        assert!(observer.observe(&"stalled".into(), false).is_err());
         entered_rx.recv_timeout(WAIT).unwrap();
         let (dropped_tx, dropped_rx) = sync_channel(1);
         std::thread::spawn(move || {
@@ -651,9 +652,9 @@ mod tests {
             2,
             4,
         );
-        assert!(observer.observe("panic".into(), false).is_err());
+        assert!(observer.observe(&"panic".into(), false).is_err());
         await_idle(&observer, Instant::now());
-        let error = observer.observe("panic".into(), false).unwrap_err();
+        let error = observer.observe(&"panic".into(), false).unwrap_err();
         assert!(error.contains("exited without a result"));
         assert_eq!(await_value(&observer, "healthy", false).value, 80);
     }
@@ -680,14 +681,14 @@ mod tests {
         let refresh = first.collected_at + CACHE;
         assert_eq!(
             observer
-                .observe_at("mount".into(), false, refresh)
+                .observe_at(&"mount".into(), false, refresh)
                 .unwrap()
                 .value,
             80
         );
         await_idle(&observer, refresh);
         let error = observer
-            .observe_at("mount".into(), false, refresh)
+            .observe_at(&"mount".into(), false, refresh)
             .unwrap_err();
         assert!(error.contains("native filesystem unavailable"));
     }
@@ -697,10 +698,10 @@ mod tests {
         let observer = BoundedObserver::new(Arc::new(|_key: &String| Ok(80)), CACHE, CACHE, 2, 2);
         let root = await_value(&observer, "/", true);
         for index in 0..100 {
-            let _ = observer.observe(format!("root-{index}"), false);
+            let _ = observer.observe(&format!("root-{index}"), false);
             await_idle(&observer, Instant::now());
         }
-        let retained = observer.observe("/".into(), true).unwrap();
+        let retained = observer.observe(&"/".into(), true).unwrap();
         assert_eq!(retained.collected_at, root.collected_at);
         assert!(observer.state.lock().unwrap().entries.len() <= 2);
     }
@@ -729,14 +730,14 @@ mod tests {
         let refresh_at = first.collected_at + CACHE;
         assert!(
             observer
-                .observe_at("early".into(), false, refresh_at)
+                .observe_at(&"early".into(), false, refresh_at)
                 .is_ok()
         );
         assert_eq!(started_rx.recv_timeout(WAIT).unwrap(), "early");
         for _ in 0..10 {
             assert!(
                 observer
-                    .observe_at("late".into(), false, refresh_at)
+                    .observe_at(&"late".into(), false, refresh_at)
                     .is_err()
             );
         }
@@ -749,7 +750,7 @@ mod tests {
         let next_tick = refresh_at + CACHE;
         assert!(
             observer
-                .observe_at("early".into(), false, next_tick)
+                .observe_at(&"early".into(), false, next_tick)
                 .is_ok()
         );
         let admitted = started_rx.recv_timeout(WAIT).unwrap();
@@ -782,11 +783,11 @@ mod tests {
             2,
             4,
         );
-        assert!(observer.observe("old".into(), false).is_err());
+        assert!(observer.observe(&"old".into(), false).is_err());
         assert_eq!(started_rx.recv_timeout(WAIT).unwrap(), "old");
-        assert!(observer.observe("removed".into(), false).is_err());
+        assert!(observer.observe(&"removed".into(), false).is_err());
         observer.invalidate();
-        assert!(observer.observe("current".into(), false).is_err());
+        assert!(observer.observe(&"current".into(), false).is_err());
         assert!(started_rx.try_recv().is_err());
         release_tx.send(()).unwrap();
         await_idle(&observer, Instant::now());
@@ -820,10 +821,10 @@ mod tests {
             2,
             2,
         );
-        assert!(observer.observe("blocked".into(), false).is_err());
+        assert!(observer.observe(&"blocked".into(), false).is_err());
         assert_eq!(started_rx.recv_timeout(WAIT).unwrap(), "blocked");
-        assert!(observer.observe("evicted".into(), false).is_err());
-        assert!(observer.observe("retained".into(), false).is_err());
+        assert!(observer.observe(&"evicted".into(), false).is_err());
+        assert!(observer.observe(&"retained".into(), false).is_err());
         release_tx.send(()).unwrap();
         await_idle(&observer, Instant::now());
         assert_eq!(await_value(&observer, "retained", false).value, 80);
@@ -849,9 +850,9 @@ mod tests {
             2,
             4,
         );
-        assert!(observer.observe("blocked".into(), false).is_err());
+        assert!(observer.observe(&"blocked".into(), false).is_err());
         entered_rx.recv_timeout(WAIT).unwrap();
-        assert!(observer.observe("promoted".into(), false).is_err());
+        assert!(observer.observe(&"promoted".into(), false).is_err());
         assert_eq!(await_value(&observer, "promoted", true).value, 80);
         assert!(observer.pending_since(&"blocked".into()).is_some());
         release_tx.send(()).unwrap();

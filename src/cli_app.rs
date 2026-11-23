@@ -18240,7 +18240,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         // still applies.
         include_review: true,
         sacred_paths,
-        excluded_paths: config.scanner.excluded_paths.clone(),
+        excluded_paths: config.scanner.excluded_paths,
         ..Default::default()
     };
     let executor = DeletionExecutor::new(deletion_config, None);

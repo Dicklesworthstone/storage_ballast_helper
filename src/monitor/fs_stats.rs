@@ -308,10 +308,10 @@ impl FsStatsCollector {
             // Optional metadata may read global disk caches or invoke native
             // tools. Keep it separate from both targeted capacity and mount
             // inventory, with its own accounted-for bounded worker slot.
-            let _ = background.observe(ProbeRequest::CapacityMetadata, false);
+            let _ = background.observe(&ProbeRequest::CapacityMetadata, false);
         }
         let observation = background
-            .observe(ProbeRequest::MountInventory, false)
+            .observe(&ProbeRequest::MountInventory, false)
             .map_err(|details| SbhError::FsStats {
                 path: PathBuf::from("/"),
                 details,
@@ -356,14 +356,14 @@ impl FsStatsCollector {
     pub(crate) fn collect_sample(&self, path: &Path) -> Result<FsStatsSample> {
         if let Some(background) = &self.background {
             let observation = background.observe(
-                ProbeRequest::Filesystem(path.to_path_buf()),
+                &ProbeRequest::Filesystem(path.to_path_buf()),
                 is_system_root(path),
             );
             if self.platform.has_capacity_metadata() {
                 // Sampling must keep optional metadata refreshing even on
                 // platforms without the uncovered-mount inventory sweep.
                 // The same key deduplicates this with inventory requests.
-                let _ = background.observe(ProbeRequest::CapacityMetadata, false);
+                let _ = background.observe(&ProbeRequest::CapacityMetadata, false);
             }
             let observation = observation.map_err(|details| SbhError::FsStats {
                 path: path.to_path_buf(),

@@ -36,9 +36,10 @@ pub fn path_is_excluded(path: &Path, excluded_paths: &[PathBuf]) -> bool {
     exclusion_matches(path, excluded_paths, false)
 }
 
-/// Whether removing `path` would remove an excluded entry, including one
-/// nested inside an opaque artifact. A fresh comparison also protects queued
-/// or public deletion plans that did not pass through the walker.
+/// Whether removing `path` would remove an excluded entry.
+///
+/// This includes entries nested inside an opaque artifact. A fresh comparison
+/// also protects queued or public deletion plans that did not pass through the walker.
 #[must_use]
 pub fn path_overlaps_exclusion(path: &Path, excluded_paths: &[PathBuf]) -> bool {
     exclusion_matches(path, excluded_paths, true)

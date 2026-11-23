@@ -260,7 +260,8 @@ pub struct MountDecision {
     pub transition: Option<(MountState, MountState)>,
     /// Dispatch a scan for this mount's roots.
     pub scan: bool,
-    /// Release ballast on this mount (subject to the behavior matrix).
+    /// Release ballast on this mount. Reclaim follows the behavior matrix;
+    /// Recovery retries emergency reserve release on its bounded cadence.
     pub release_ballast: bool,
     /// Attempt a probe write on the mount (it is recovering).
     pub probe_write: bool,
@@ -315,6 +316,8 @@ pub struct MountController {
     idle_until: Option<Instant>,
     /// Pressure already attempted during the current empty-pass incident.
     idle_wake: IdleWake,
+    /// Only a native release attempt consumes the Recovery retry interval.
+    last_recovery_release_attempt: Option<Instant>,
     last_transition: Option<(MountState, MountState)>,
 }
 
@@ -336,6 +339,7 @@ impl MountController {
             empty_passes: 0,
             idle_until: None,
             idle_wake: IdleWake::default(),
+            last_recovery_release_attempt: None,
             last_transition: None,
         }
     }
@@ -520,15 +524,36 @@ impl MountController {
         self.last_transition = transition.or(self.last_transition);
 
         let scan = self.state == MountState::Reclaim && input.surface.scannable();
-        let release_ballast = self.state == MountState::Reclaim
-            && input.surface.ballast_pool
-            && input.releasable_ballast;
+        // An inode-pressure scan deliberately has no ordinary ballast surface,
+        // but ENOSPC recovery still needs sacrificial reserve to restore writes.
+        let release_ballast = input.releasable_ballast
+            && ((self.state == MountState::Reclaim && input.surface.ballast_pool)
+                || self.recovery_release_due(input.now));
         MountDecision {
             state: self.state,
             transition,
             scan,
             release_ballast,
             probe_write: self.state == MountState::Recovery,
+        }
+    }
+
+    /// Whether this recovery episode can attempt another emergency release.
+    /// The daemon also checks other recovery controllers sharing the same pool.
+    #[must_use]
+    pub fn recovery_release_due(&self, now: Instant) -> bool {
+        self.state == MountState::Recovery
+            && self
+                .last_recovery_release_attempt
+                .is_none_or(|last| now.saturating_duration_since(last) >= RECOVERY_POLL_INTERVAL)
+    }
+
+    /// Pace failed or partial emergency releases while recovery holds scans.
+    /// Call only after a real native attempt is admitted: missing inventory,
+    /// disabled mutation or a refused scheduling opportunity spends no retry.
+    pub fn note_recovery_release_attempt(&mut self, now: Instant) {
+        if self.state == MountState::Recovery {
+            self.last_recovery_release_attempt = Some(now);
         }
     }
 
@@ -622,6 +647,7 @@ impl MountController {
         self.state = next;
         self.idle_reason = reason;
         self.entered_at = Some(now);
+        self.last_recovery_release_attempt = None;
         if next != MountState::Reclaim {
             self.clean_ticks = 0;
         }
@@ -1196,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn decisions_scan_and_release_only_while_reclaiming() {
+    fn decisions_preserve_scan_and_ballast_surface_requirements() {
         let now = Instant::now();
         let mut controller = fresh();
         let surface = MountSurface {
@@ -1241,6 +1267,87 @@ mod tests {
             ..input(PressureLevel::Orange, surface, now)
         });
         assert!(recovering.probe_write && !recovering.scan && !recovering.release_ballast);
+    }
+
+    #[test]
+    fn recovery_releases_new_reserve_without_waiting_for_a_second_failure() {
+        let now = Instant::now();
+        let mut controller = fresh();
+        let surface = MountSurface {
+            ballast_pool: true,
+            ..configured()
+        };
+        let mut tick = MountTickInput {
+            recovery_needed: true,
+            ..input(PressureLevel::Critical, surface, now)
+        };
+        let decision = controller.observe(tick);
+        assert_eq!(decision.state, MountState::Recovery);
+        assert!(!decision.release_ballast);
+
+        // A newly observed external reserve is useful while the probe still
+        // cannot write. No earlier inventory means no retry was spent.
+        tick.now += Duration::from_millis(100);
+        tick.recovery_needed = false;
+        tick.recovery_probe_ok = Some(false);
+        tick.releasable_ballast = true;
+        let decision = controller.observe(tick);
+        assert_eq!(decision.state, MountState::Recovery);
+        assert!(decision.release_ballast && decision.probe_write && !decision.scan);
+        assert!(decision.transition.is_none());
+
+        // Offering release is not attempting it. A policy hold can leave the
+        // opportunity live for the very next tick without spending a deadline.
+        tick.now += Duration::from_millis(100);
+        assert!(controller.observe(tick).release_ballast);
+        controller.note_recovery_release_attempt(tick.now);
+        assert!(!controller.observe(tick).release_ballast);
+    }
+
+    #[test]
+    fn recovery_release_retries_are_paced_and_reset_for_a_new_incident() {
+        let now = Instant::now();
+        let mut controller = fresh();
+        let surface = MountSurface {
+            ballast_pool: true,
+            ..configured()
+        };
+        let mut tick = MountTickInput {
+            recovery_needed: true,
+            releasable_ballast: true,
+            ..input(PressureLevel::Critical, surface, now)
+        };
+        assert!(controller.observe(tick).release_ballast);
+        controller.note_recovery_release_attempt(now);
+        tick.recovery_needed = false;
+        tick.recovery_probe_ok = Some(false);
+
+        // A Critical peer can drive 100 ms global ticks. The failed release
+        // must not reacquire the pool lock on every one of those ticks.
+        for elapsed in [
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            RECOVERY_POLL_INTERVAL - Duration::from_nanos(1),
+        ] {
+            tick.now = now + elapsed;
+            let decision = controller.observe(tick);
+            assert_eq!(decision.state, MountState::Recovery);
+            assert!(!decision.release_ballast && !decision.scan);
+        }
+        tick.now = now + RECOVERY_POLL_INTERVAL;
+        assert!(controller.observe(tick).release_ballast);
+        controller.note_recovery_release_attempt(tick.now);
+        assert!(!controller.observe(tick).release_ballast);
+
+        // A successful probe ends the incident. A new failure gets its own
+        // immediate reserve attempt, independent of the previous retry time.
+        tick.recovery_probe_ok = Some(true);
+        tick.now += Duration::from_millis(100);
+        assert_eq!(controller.observe(tick).state, MountState::Reclaim);
+        tick.recovery_needed = true;
+        let decision = controller.observe(tick);
+        assert_eq!(decision.state, MountState::Recovery);
+        assert!(decision.release_ballast && !decision.scan);
     }
 
     #[test]

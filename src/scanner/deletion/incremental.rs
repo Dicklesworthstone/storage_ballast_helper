@@ -123,13 +123,11 @@ pub(super) fn bind_owned(mut candidate: CandidacyScore) -> CandidacyScore {
 }
 
 pub(super) fn bind(candidate: &CandidacyScore) -> Cow<'_, CandidacyScore> {
-    if let Some(binding) = required_binding(candidate) {
+    required_binding(candidate).map_or(Cow::Borrowed(candidate), |binding| {
         let mut bound = candidate.clone();
         binding.apply(&mut bound);
         Cow::Owned(bound)
-    } else {
-        Cow::Borrowed(candidate)
-    }
+    })
 }
 
 fn inspect_candidate(candidate: &CandidacyScore) -> Result<Option<IncrementalCache>, SkipReason> {

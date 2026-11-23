@@ -1311,14 +1311,9 @@ impl ArtifactPatternRegistry {
             combined *= 0.1;
         }
 
-        (
-            ArtifactClassification {
-                structural_confidence: structural,
-                combined_confidence: combined,
-                ..best
-            },
-            None,
-        )
+        best.structural_confidence = structural;
+        best.combined_confidence = combined;
+        (best, None)
     }
 }
 
