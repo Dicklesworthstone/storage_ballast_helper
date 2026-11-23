@@ -17240,7 +17240,7 @@ mod tests {
         failures.observe(
             &failed,
             &failure_scope_report(&failed, "d", false),
-            now + Duration::from_secs(720),
+            now + Duration::from_mins(12),
         );
         assert_eq!(failures.scopes[&key].cooldown, failures.base_cooldown);
         assert!(failures.scopes[&key].tripped_at.is_none());

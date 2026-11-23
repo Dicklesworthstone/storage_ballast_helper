@@ -6,7 +6,9 @@
 //! but it cannot block the scanner or cause replacement workers to accumulate.
 //! The slot is released only when the worker actually exits, not on cancellation.
 
+use std::collections::BTreeSet;
 use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, OnceLock};
@@ -14,12 +16,18 @@ use std::thread;
 use std::time::Instant;
 
 use super::inotify_backend::{INSTALL_TIME_BUDGET, LinuxInotifyBackend};
+use super::watch_planner::RootBinding;
 use super::{
     EventBackendKind, EventInvalidation, EventRateTracker, EventSourceBackend,
     EventSourceCapability, EventSourceConfig, EventSourcePlan, ScannerEventSource,
 };
 
 fn global_gate() -> Arc<AtomicBool> {
+    static GATE: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    Arc::clone(GATE.get_or_init(|| Arc::new(AtomicBool::new(false))))
+}
+
+fn root_audit_gate() -> Arc<AtomicBool> {
     static GATE: OnceLock<Arc<AtomicBool>> = OnceLock::new();
     Arc::clone(GATE.get_or_init(|| Arc::new(AtomicBool::new(false))))
 }
@@ -45,6 +53,123 @@ impl Drop for Permit {
     }
 }
 
+/// Re-resolve configured roots away from the live event drain. A blocked
+/// lookup retains the process-wide slot even after its consumer is dropped.
+#[derive(Debug)]
+pub(super) struct RootAudit {
+    completed: Receiver<io::Result<RootAuditOutcome>>,
+    cancelled: Arc<AtomicBool>,
+    pub(super) admitted_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RootAuditOutcome {
+    Unchanged,
+    /// Present roots were verified, but absence cannot be published anymore.
+    AbsentRootChanged,
+}
+
+impl RootAudit {
+    pub(super) fn start(
+        bindings: &[RootBinding],
+        absent: &BTreeSet<PathBuf>,
+        now: Instant,
+    ) -> io::Result<Self> {
+        // A busy or stalled audit must not repeatedly copy a large configured
+        // root set on every drain merely to discover that it has no slot.
+        let permit = Permit::acquire(root_audit_gate())?;
+        let bindings = bindings.to_vec();
+        let absent = absent.clone();
+        Self::spawn_with_permit(permit, now, move |cancelled| {
+            let started = Instant::now();
+            let check = || {
+                if cancelled.load(Ordering::Acquire) {
+                    Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "root audit cancelled",
+                    ))
+                } else if started.elapsed() >= INSTALL_TIME_BUDGET {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "root audit deadline exceeded",
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+            for binding in &bindings {
+                check()?;
+                binding.unchanged()?;
+            }
+            for root in &absent {
+                check()?;
+                if !matches!(std::fs::symlink_metadata(root), Err(error) if error.kind() == io::ErrorKind::NotFound)
+                {
+                    check()?;
+                    return Ok(RootAuditOutcome::AbsentRootChanged);
+                }
+            }
+            check()?;
+            Ok(RootAuditOutcome::Unchanged)
+        })
+    }
+
+    fn spawn_with_permit(
+        permit: Permit,
+        now: Instant,
+        audit: impl FnOnce(&AtomicBool) -> io::Result<RootAuditOutcome> + Send + 'static,
+    ) -> io::Result<Self> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, completed) = mpsc::sync_channel(1);
+        let _worker = thread::Builder::new()
+            .name("sbh-watch-roots".to_string())
+            .spawn(move || {
+                let _permit = permit;
+                let result = audit(&worker_cancelled);
+                let _ = sender.try_send(result);
+            })?;
+        Ok(Self {
+            completed,
+            cancelled,
+            admitted_at: now,
+        })
+    }
+
+    #[cfg(test)]
+    fn spawn(
+        gate: Arc<AtomicBool>,
+        now: Instant,
+        audit: impl FnOnce(&AtomicBool) -> io::Result<()> + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn_with_permit(Permit::acquire(gate)?, now, move |cancelled| {
+            audit(cancelled).map(|()| RootAuditOutcome::Unchanged)
+        })
+    }
+
+    pub(super) fn poll(&self, now: Instant) -> Option<io::Result<RootAuditOutcome>> {
+        if now.saturating_duration_since(self.admitted_at) >= REBUILD_OVERDUE_AFTER {
+            return Some(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "root audit result expired",
+            )));
+        }
+        match self.completed.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(io::Error::other(
+                "root audit worker exited without a result",
+            ))),
+        }
+    }
+}
+
+impl Drop for RootAudit {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
 #[derive(Debug)]
 struct Prepared {
     plan: EventSourcePlan,
@@ -54,6 +179,9 @@ struct Prepared {
 #[derive(Debug)]
 pub(super) struct Rebuild {
     completed: Receiver<io::Result<Prepared>>,
+    prepared: Option<Prepared>,
+    verification: Option<RootAudit>,
+    absent_root_changed: bool,
     retired: SyncSender<EventSourceBackend>,
     cancelled: Arc<AtomicBool>,
     /// Drain-clock admission time, and the last time a still-running
@@ -102,6 +230,9 @@ impl Rebuild {
             })?;
         Ok(Self {
             completed,
+            prepared: None,
+            verification: None,
+            absent_root_changed: false,
             retired,
             cancelled,
             admitted_at: None,
@@ -109,13 +240,41 @@ impl Rebuild {
         })
     }
 
-    fn poll(&self) -> Option<io::Result<Prepared>> {
-        match self.completed.try_recv() {
-            Ok(result) => Some(result),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(Err(io::Error::other(
-                "recursive inotify rebuild worker exited without a result",
-            ))),
+    fn poll(&mut self, now: Instant) -> Option<io::Result<Prepared>> {
+        if self.prepared.is_none() {
+            match self.completed.try_recv() {
+                Ok(Ok(prepared)) => self.prepared = Some(prepared),
+                Ok(Err(error)) => return Some(Err(error)),
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => {
+                    return Some(Err(io::Error::other(
+                        "recursive inotify rebuild worker exited without a result",
+                    )));
+                }
+            }
+        }
+        // Queue residence can outlive the root binding. Renew it on a worker
+        // after receipt, before publishing the replacement's coverage.
+        if self.verification.is_none() {
+            let plan = &self.prepared.as_ref()?.plan;
+            if plan.root_bindings.is_empty() && plan.absent_roots.is_empty() {
+                return self.prepared.take().map(Ok);
+            }
+            match RootAudit::start(&plan.root_bindings, &plan.absent_roots, now) {
+                Ok(audit) => self.verification = Some(audit),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return None,
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        match self.verification.as_ref()?.poll(now)? {
+            Ok(RootAuditOutcome::Unchanged) => self.prepared.take().map(Ok),
+            Ok(RootAuditOutcome::AbsentRootChanged) => {
+                self.absent_root_changed = true;
+                Some(Err(io::Error::other(
+                    "absent root changed before watch handoff",
+                )))
+            }
+            Err(error) => Some(Err(error)),
         }
     }
 
@@ -130,6 +289,14 @@ impl Rebuild {
 impl Drop for Rebuild {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
+        if let Some(prepared) = self.prepared.take() {
+            // A rejected or abandoned handoff still owns the new watches.
+            // Their worker is waiting for retirement just as it does after
+            // a successful handoff; do not close them in the event drain.
+            // A dead worker retains the same disconnected-payload fallback
+            // as ordinary retirement.
+            let _ = self.retired.try_send(prepared.backend);
+        }
     }
 }
 
@@ -161,11 +328,10 @@ fn build(
     let plan = EventSourcePlan::with_rates(config, rates, now);
     check()?;
     let backend = if plan.backend == EventBackendKind::RecursiveInotify {
-        EventSourceBackend::RecursiveInotify(LinuxInotifyBackend::start_with_check(
-            &plan.watched_dirs,
-            config.watch_budget,
-            check,
-        )?)
+        EventSourceBackend::RecursiveInotify(Box::new(
+            LinuxInotifyBackend::start_with_check(&plan.watched_dirs, config.watch_budget, check)?
+                .bind_roots(plan.root_bindings.clone(), now)?,
+        ))
     } else {
         EventSourceBackend::ReconciliationOnly
     };
@@ -177,7 +343,7 @@ fn build(
 /// registration, worker exit, or the old backend's ordinary retirement.
 pub(super) fn poll_or_start(source: &mut ScannerEventSource, now: Instant) -> EventInvalidation {
     if let Some(mut task) = source.rebuild.take() {
-        let Some(result) = task.poll() else {
+        let Some(result) = task.poll(now) else {
             let invalidation = revoke_if_overdue(source, &mut task, now);
             source.rebuild = Some(task);
             return invalidation;
@@ -186,20 +352,6 @@ pub(super) fn poll_or_start(source: &mut ScannerEventSource, now: Instant) -> Ev
         // start time. A slow failed build cannot immediately restart itself.
         source.planned_at = now;
         return match result {
-            Ok(Prepared { plan, .. })
-                if plan.absent_roots.iter().any(|root| {
-                    !matches!(std::fs::symlink_metadata(root), Err(error) if error.kind() == io::ErrorKind::NotFound)
-                }) =>
-            {
-                // Discovery and handoff are separated by a worker queue. A
-                // root may appear after discovery, even before the live
-                // source's next absence audit. Keep old watches and revoke
-                // coverage instead of publishing that stale absence as safe.
-                failed(
-                    source,
-                    &io::Error::other("absent root changed before watch handoff"),
-                )
-            }
             Ok(Prepared { plan, backend }) => {
                 let mut old = std::mem::replace(&mut source.backend, backend);
                 let mut invalidation = EventInvalidation::empty();
@@ -237,7 +389,18 @@ pub(super) fn poll_or_start(source: &mut ScannerEventSource, now: Instant) -> Ev
                 task.retire(old);
                 invalidation
             }
-            Err(error) => failed(source, &error),
+            Err(error) => {
+                if let Some(prepared) = &task.prepared
+                    && let EventSourceBackend::RecursiveInotify(previous) = &mut source.backend
+                    && (!task.absent_root_changed
+                        || !previous.bindings_match(&prepared.plan.root_bindings))
+                {
+                    // A failed post-receipt root audit also withdraws the old
+                    // mapping now, not only the prepared plan's coverage.
+                    previous.revoke_root_bindings();
+                }
+                failed(source, &error)
+            }
         };
     }
 
@@ -378,10 +541,10 @@ mod tests {
         }
     }
 
-    fn ready(task: &Rebuild) -> io::Result<Prepared> {
+    fn ready(task: &mut Rebuild) -> io::Result<Prepared> {
         let deadline = Instant::now() + TEST_WAIT;
         loop {
-            if let Some(result) = task.poll() {
+            if let Some(result) = task.poll(Instant::now()) {
                 return result;
             }
             assert!(Instant::now() < deadline, "worker produced no result");
@@ -393,6 +556,55 @@ mod tests {
         Prepared {
             plan: EventSourcePlan::reconciliation_only(&[], "test"),
             backend: EventSourceBackend::ReconciliationOnly,
+        }
+    }
+
+    #[test]
+    fn abandoned_and_rejected_prepared_watches_return_to_the_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        fs::create_dir(root.join("child")).unwrap();
+        let config = EventSourceConfig::from_scanner_config(
+            std::slice::from_ref(&root),
+            &ScannerConfig::default(),
+        );
+        let now = Instant::now();
+        for rejected in [false, true] {
+            let prepared = build(
+                &config,
+                &EventRateTracker::default(),
+                now,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let (_completed_tx, completed) = mpsc::sync_channel(1);
+            let (retired, retired_rx) = mpsc::sync_channel(1);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let verification = rejected.then(|| {
+                RootAudit::spawn(gate(), now, |_| Err(io::Error::other("binding changed"))).unwrap()
+            });
+            let mut task = Rebuild {
+                completed,
+                prepared: Some(prepared),
+                verification,
+                absent_root_changed: false,
+                retired,
+                cancelled: Arc::clone(&cancelled),
+                admitted_at: Some(now),
+                overdue_revoked_at: None,
+            };
+            if rejected {
+                assert!(ready(&mut task).is_err());
+            }
+            drop(task);
+            assert!(cancelled.load(Ordering::Acquire));
+            let EventSourceBackend::RecursiveInotify(backend) = retired_rx
+                .try_recv()
+                .expect("prepared watches must be returned through the retirement channel")
+            else {
+                panic!("expected live native watches");
+            };
+            assert_eq!(backend.watched_dirs().count(), 2);
         }
     }
 
@@ -416,9 +628,9 @@ mod tests {
         let plan = EventSourcePlan::with_rates(&config, &EventRateTracker::default(), now);
         assert!(plan.complete);
         assert!(plan.absent_roots.contains(&later));
-        let backend = EventSourceBackend::RecursiveInotify(
+        let backend = EventSourceBackend::RecursiveInotify(Box::new(
             LinuxInotifyBackend::start(&plan.watched_dirs, config.watch_budget).unwrap(),
-        );
+        ));
         let gate = gate();
         source.rebuild = Some(
             Rebuild::spawn(Arc::clone(&gate), move |_| Ok(Prepared { plan, backend })).unwrap(),
@@ -477,6 +689,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prepared_alias_binding_is_rechecked_after_waiting_for_handoff() {
+        let _serial = test_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let first = base.join("first");
+        let second = base.join("second");
+        let alias = base.join("alias");
+        fs::create_dir_all(first.join("child")).unwrap();
+        fs::create_dir_all(second.join("different-child")).unwrap();
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        let config = EventSourceConfig::from_scanner_config(
+            std::slice::from_ref(&alias),
+            &ScannerConfig::default(),
+        );
+        let now = Instant::now();
+        let mut source = ScannerEventSource::start_at(config.clone(), now);
+        source.drain_at(now);
+        let prepared = build(
+            &config,
+            &EventRateTracker::default(),
+            now,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(prepared.plan.complete);
+        let gate = gate();
+        source.rebuild = Some(Rebuild::spawn(Arc::clone(&gate), move |_| Ok(prepared)).unwrap());
+        fs::rename(&alias, base.join("retained-alias")).unwrap();
+        std::os::unix::fs::symlink(&second, &alias).unwrap();
+        let rejected = finish_rebuild(&mut source, now + Duration::from_secs(1));
+        assert!(rejected.requires_index_generation_bump());
+        assert!(rejected.dirty_roots().contains(&alias));
+        assert!(!source.capability().complete);
+        assert!(
+            source
+                .capability()
+                .reason
+                .contains("changed its directory binding"),
+            "{:?}",
+            source.capability()
+        );
+        fs::write(first.join("child/obsolete.o"), b"old target").unwrap();
+        let stale = source.drain_at(now + Duration::from_secs(1));
+        assert!(
+            stale.dirty_paths().is_empty(),
+            "failed handoff revoked old alias events too"
+        );
+        wait_free(&gate);
+    }
+
+    #[test]
+    fn root_audit_never_waits_or_releases_a_blocked_workers_slot() {
+        let gate = gate();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (cancel_tx, cancel_rx) = mpsc::sync_channel(1);
+        let now = Instant::now();
+        let audit = RootAudit::spawn(Arc::clone(&gate), now, move |cancelled| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(TEST_WAIT).unwrap();
+            cancel_tx.send(cancelled.load(Ordering::Acquire)).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        entered_rx.recv_timeout(TEST_WAIT).unwrap();
+        assert!(audit.poll(now).is_none());
+        assert_eq!(
+            audit
+                .poll(now + REBUILD_OVERDUE_AFTER)
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        drop(audit);
+        assert!(
+            gate.load(Ordering::Acquire),
+            "cancellation does not free a live native lookup"
+        );
+        assert_eq!(
+            RootAudit::spawn(Arc::clone(&gate), now, |_| panic!("second audit ran"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        release_tx.send(()).unwrap();
+        assert!(cancel_rx.recv_timeout(TEST_WAIT).unwrap());
+        wait_free(&gate);
+    }
+
     fn fixture() -> (tempfile::TempDir, ScannerEventSource, PathBuf, Instant) {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap().join("root");
@@ -504,20 +807,20 @@ mod tests {
         let gate = gate();
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
-        let task = Rebuild::spawn(Arc::clone(&gate), move |_| {
+        let mut task = Rebuild::spawn(Arc::clone(&gate), move |_| {
             entered_tx.send(()).unwrap();
             release_rx.recv_timeout(TEST_WAIT).unwrap();
             Ok(empty_prepared())
         })
         .unwrap();
         entered_rx.recv_timeout(TEST_WAIT).unwrap();
-        assert!(task.poll().is_none());
-        assert!(task.poll().is_none());
+        assert!(task.poll(Instant::now()).is_none());
+        assert!(task.poll(Instant::now()).is_none());
         let error =
             Rebuild::spawn(Arc::clone(&gate), |_| panic!("second builder ran")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         release_tx.send(()).unwrap();
-        assert!(ready(&task).is_ok());
+        assert!(ready(&mut task).is_ok());
         assert!(gate.load(Ordering::Acquire), "ready is not yet retired");
         task.retire(EventSourceBackend::ReconciliationOnly);
         wait_free(&gate);
@@ -548,8 +851,8 @@ mod tests {
         release_tx.send(()).unwrap();
         assert!(cancel_rx.recv_timeout(TEST_WAIT).unwrap());
         wait_free(&gate);
-        let replacement = Rebuild::spawn(Arc::clone(&gate), |_| Ok(empty_prepared())).unwrap();
-        assert!(ready(&replacement).is_ok());
+        let mut replacement = Rebuild::spawn(Arc::clone(&gate), |_| Ok(empty_prepared())).unwrap();
+        assert!(ready(&mut replacement).is_ok());
         replacement.retire(EventSourceBackend::ReconciliationOnly);
         wait_free(&gate);
     }
@@ -557,8 +860,9 @@ mod tests {
     #[test]
     fn a_panicked_worker_becomes_a_retryable_error_and_releases_admission() {
         let gate = gate();
-        let task = Rebuild::spawn(Arc::clone(&gate), |_| panic!("injected builder panic")).unwrap();
-        let error = ready(&task).unwrap_err();
+        let mut task =
+            Rebuild::spawn(Arc::clone(&gate), |_| panic!("injected builder panic")).unwrap();
+        let error = ready(&mut task).unwrap_err();
         assert!(error.to_string().contains("without a result"));
         drop(task);
         wait_free(&gate);

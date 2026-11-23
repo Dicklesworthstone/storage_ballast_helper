@@ -147,6 +147,8 @@ pub struct EventSourcePlan {
     /// Current absence is separate from incomplete event coverage.
     pub absent_roots: BTreeSet<PathBuf>,
     pub reason: String,
+    #[cfg(any(target_os = "linux", test))]
+    root_bindings: Vec<watch_planner::RootBinding>,
 }
 
 impl EventSourcePlan {
@@ -201,6 +203,8 @@ impl EventSourcePlan {
             dirty_roots: root_paths.iter().cloned().collect(),
             absent_roots: BTreeSet::new(),
             reason: reason.into(),
+            #[cfg(any(target_os = "linux", test))]
+            root_bindings: Vec::new(),
         }
     }
 
@@ -228,7 +232,14 @@ impl EventSourcePlan {
             }
         }
 
-        let mut reason = if !enumeration.reason.is_empty() {
+        // Planning uses physical paths so co-configured aliases consume one
+        // watch budget. Reconciliation always uses the operator's spelling.
+        let (dirty_roots, aliases_collapsed) =
+            translate_plan_gaps(dirty_roots, &enumeration.root_bindings, root_paths);
+
+        let mut reason = if aliases_collapsed {
+            "recursive inotify alias translation budget exhausted; configured roots require reconciliation".to_string()
+        } else if !enumeration.reason.is_empty() {
             enumeration.reason
         } else if !allocation.unwatched_roots.is_empty() {
             "recursive inotify watch budget cannot cover the roots".to_string()
@@ -264,8 +275,48 @@ impl EventSourcePlan {
             dirty_roots,
             absent_roots: enumeration.absent_roots,
             reason,
+            root_bindings: enumeration.root_bindings,
         }
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn translate_plan_gaps(
+    gaps: BTreeSet<PathBuf>,
+    bindings: &[watch_planner::RootBinding],
+    roots: &[PathBuf],
+) -> (BTreeSet<PathBuf>, bool) {
+    let configured_roots: BTreeSet<_> = roots.iter().map(PathBuf::as_path).collect();
+    let mut translated = BTreeSet::new();
+    let mut comparisons = 0usize;
+    let mut bytes = 0usize;
+    for path in gaps {
+        let mut matched = false;
+        for binding in bindings {
+            comparisons += 1;
+            if comparisons > 262_144 {
+                return (roots.iter().cloned().collect(), true);
+            }
+            if let Some(configured) = binding.translate(&path) {
+                matched = true;
+                bytes = bytes.saturating_add(configured.as_os_str().len());
+                if bytes > 8 * 1024 * 1024 || translated.len() >= 65_536 {
+                    return (roots.iter().cloned().collect(), true);
+                }
+                translated.insert(configured);
+            }
+        }
+        // An unresolved configured root can lie under another root's physical
+        // tree. Its own spelling remains a gap even when an alias also maps it.
+        if !matched || configured_roots.contains(path.as_path()) {
+            bytes = bytes.saturating_add(path.as_os_str().len());
+            if bytes > 8 * 1024 * 1024 || translated.len() >= 65_536 {
+                return (roots.iter().cloned().collect(), true);
+            }
+            translated.insert(path);
+        }
+    }
+    (translated, false)
 }
 
 /// Above this many unwatched frontier directories under one root, the root
@@ -393,6 +444,7 @@ pub fn allocate_watches(candidates: &[WatchCandidate], budget: usize) -> WatchAl
 #[derive(Debug, Default)]
 struct WatchEnumeration {
     candidates: Vec<WatchCandidate>,
+    root_bindings: Vec<watch_planner::RootBinding>,
     /// Directories whose children were not fully enumerated; their subtrees
     /// rely on reconciliation rather than inferred watch coverage.
     truncated: BTreeSet<PathBuf>,
@@ -873,8 +925,10 @@ impl ScannerEventSource {
             EventBackendKind::RecursiveInotify => {
                 #[cfg(target_os = "linux")]
                 {
-                    match LinuxInotifyBackend::start(&plan.watched_dirs, config.watch_budget) {
-                        Ok(backend) => EventSourceBackend::RecursiveInotify(backend),
+                    match LinuxInotifyBackend::start(&plan.watched_dirs, config.watch_budget)
+                        .and_then(|backend| backend.bind_roots(plan.root_bindings.clone(), now))
+                    {
+                        Ok(backend) => EventSourceBackend::RecursiveInotify(Box::new(backend)),
                         Err(err) => {
                             capability.selected_backend = EventBackendKind::ReconciliationOnly;
                             capability.complete = false;
@@ -1130,7 +1184,7 @@ enum EventSourceBackend {
     #[cfg(target_os = "macos")]
     Fsevents(fsevents::MacOsFseventsBackend),
     #[cfg(target_os = "linux")]
-    RecursiveInotify(LinuxInotifyBackend),
+    RecursiveInotify(Box<LinuxInotifyBackend>),
     ReconciliationOnly,
 }
 

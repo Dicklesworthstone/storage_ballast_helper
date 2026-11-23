@@ -159,6 +159,8 @@ fn resolve_roots(
             dirty_roots: dirty,
             absent_roots,
             reason,
+            #[cfg(any(target_os = "linux", test))]
+            root_bindings: Vec::new(),
         },
         aliases,
     }

@@ -30,8 +30,57 @@ struct Child {
     directory: bool,
 }
 
+/// An explicitly configured spelling and the directory it named when planned.
+/// Only roots may resolve through links; discovered descendants remain no-follow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RootBinding {
+    pub(super) configured: PathBuf,
+    pub(super) canonical: PathBuf,
+    identity: (u64, u64),
+}
+
+impl RootBinding {
+    fn new(configured: &Path, canonical: PathBuf, metadata: &Metadata) -> Self {
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        };
+        #[cfg(not(unix))]
+        let identity = (metadata.len(), 0);
+        Self {
+            configured: configured.to_path_buf(),
+            canonical,
+            identity,
+        }
+    }
+
+    pub(super) fn unchanged(&self) -> io::Result<()> {
+        let canonical = fs::canonicalize(&self.configured)?;
+        let metadata = fs::symlink_metadata(&canonical)?;
+        if !metadata.is_dir()
+            || metadata.is_symlink()
+            || Self::new(&self.configured, canonical, &metadata) != *self
+            || fs::canonicalize(&self.configured)? != self.canonical
+        {
+            return Err(io::Error::other(format!(
+                "configured event root {} changed its directory binding",
+                self.configured.display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn translate(&self, path: &Path) -> Option<PathBuf> {
+        path.strip_prefix(&self.canonical)
+            .ok()
+            .map(|relative| self.configured.join(relative))
+    }
+}
+
 trait Access {
     fn metadata(&self, path: &Path) -> io::Result<Metadata>;
+    fn root(&self, path: &Path) -> io::Result<(PathBuf, Metadata)>;
     fn entries(&self, path: &Path) -> io::Result<Entries>;
     fn now(&self) -> Instant;
 }
@@ -41,6 +90,27 @@ struct Native;
 impl Access for Native {
     fn metadata(&self, path: &Path) -> io::Result<Metadata> {
         fs::symlink_metadata(path)
+    }
+
+    fn root(&self, path: &Path) -> io::Result<(PathBuf, Metadata)> {
+        // Only this initial lookup can establish absence. A dangling link or
+        // a root that vanishes during resolution is an unverified boundary.
+        fs::symlink_metadata(path)?;
+        (|| {
+            let canonical = fs::canonicalize(path)?;
+            let metadata = self.metadata(&canonical)?;
+            RootBinding::new(path, canonical.clone(), &metadata).unchanged()?;
+            Ok((canonical, metadata))
+        })()
+        .map_err(|error: io::Error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                io::Error::other(format!(
+                    "configured event root could not be resolved: {error}"
+                ))
+            } else {
+                error
+            }
+        })
     }
 
     fn entries(&self, path: &Path) -> io::Result<Entries> {
@@ -139,7 +209,7 @@ fn gap(result: &mut WatchEnumeration, path: &Path, reason: &str) {
 
 fn observation_room(result: &WatchEnumeration, limit: usize) -> usize {
     limit
-        .saturating_sub(result.candidates.len())
+        .saturating_sub(result.candidates.len().max(result.root_bindings.len()))
         .saturating_sub(result.absent_roots.len())
 }
 
@@ -156,27 +226,30 @@ fn seed_roots(
 ) -> (BTreeSet<PathBuf>, VecDeque<(usize, Metadata)>) {
     let limits = budget.limits;
     let mut seen = BTreeSet::new();
+    let mut configured = BTreeSet::new();
     let mut queue = VecDeque::new();
 
     // Production config supplies sorted, deduplicated roots. Overlapping roots
     // are seeded independently and are not rediscovered through their parents.
     for root in roots {
-        if seen.contains(root) {
+        if configured.contains(root.as_path()) {
             continue;
         }
         if !budget.live(access) || observation_room(result, limits.candidates) == 0 {
             gap(result, root, "root discovery budget exhausted");
             continue;
         }
-        let metadata = match access.metadata(root) {
-            Ok(metadata) if metadata.is_dir() && !metadata.is_symlink() => metadata,
+        configured.insert(root.as_path());
+        let (canonical, metadata) = match access.root(root) {
+            Ok((canonical, metadata)) if metadata.is_dir() && !metadata.is_symlink() => {
+                (canonical, metadata)
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 if !budget.live(access) || !budget.admit_paths(root, root) {
                     gap(result, root, "absent root observation budget exhausted");
                     continue;
                 }
                 result.absent_roots.insert(root.clone());
-                seen.insert(root.clone());
                 continue;
             }
             _ => {
@@ -184,22 +257,29 @@ fn seed_roots(
                 gap(
                     result,
                     root,
-                    "root is unavailable or is not a plain directory",
+                    "root is unavailable or does not resolve to a directory",
                 );
                 continue;
             }
         };
-        if !budget.live(access) || !budget.admit_paths(root, root) {
+        if !budget.live(access) || !budget.admit_paths(&canonical, root) {
             gap(result, root, "root discovery time or path budget exhausted");
             continue;
         }
-        seen.insert(root.clone());
+        result
+            .root_bindings
+            .push(RootBinding::new(root, canonical.clone(), &metadata));
+        // Different configured aliases share one physical watch tree. Keep
+        // every binding so each indexed spelling receives its invalidation.
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
         queue.push_back((result.candidates.len(), metadata.clone()));
         result.candidates.push(WatchCandidate {
-            path: root.clone(),
-            root: root.clone(),
+            path: canonical.clone(),
+            root: canonical.clone(),
             depth: 0,
-            rate: candidate_rate(rates, root, now, &metadata, wall_time),
+            rate: candidate_rate(rates, &canonical, now, &metadata, wall_time),
         });
     }
 
@@ -463,6 +543,11 @@ mod tests {
             } else {
                 Ok(self.metadata.clone())
             }
+        }
+
+        fn root(&self, path: &Path) -> io::Result<(PathBuf, Metadata)> {
+            self.metadata(path)
+                .map(|metadata| (path.to_path_buf(), metadata))
         }
 
         fn entries(&self, path: &Path) -> io::Result<Entries> {
@@ -909,13 +994,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn real_symlinked_directories_are_not_traversed_or_certified_as_roots() {
+    fn configured_links_are_watched_but_unconfigured_child_links_are_not() {
         let temp = tempfile::tempdir().unwrap().keep();
+        let temp = fs::canonicalize(temp).unwrap();
         let root = temp.join("root");
         let outside = temp.join("outside");
         fs::create_dir(&root).unwrap();
         fs::create_dir_all(outside.join("must-not-watch")).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("alias")).unwrap();
+        let child_only = enumerate_with(
+            &Native,
+            std::slice::from_ref(&root),
+            &EventRateTracker::default(),
+            Instant::now(),
+            Limits {
+                time: Duration::from_secs(10),
+                ..limits()
+            },
+        );
+        assert_eq!(paths(&child_only), vec![root.clone()]);
+        assert!(child_only.truncated.is_empty());
         let result = enumerate_with(
             &Native,
             &[root.clone(), root.join("alias")],
@@ -926,8 +1024,134 @@ mod tests {
                 ..limits()
             },
         );
-        assert_eq!(paths(&result), vec![root.clone()]);
-        assert!(result.unreadable_roots.contains(&root.join("alias")));
+        assert_eq!(
+            paths(&result),
+            vec![
+                root.clone(),
+                outside.clone(),
+                outside.join("must-not-watch")
+            ]
+        );
+        assert!(result.unreadable_roots.is_empty());
+        assert!(result.root_bindings.iter().any(|binding| binding.configured
+            == root.join("alias")
+            && binding.canonical == outside));
         assert!(outside.join("must-not-watch").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_and_nondirectory_aliases_never_count_as_verified_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let broken = temp.path().join("broken");
+        let file = temp.path().join("file");
+        let file_alias = temp.path().join("file-alias");
+        let missing = temp.path().join("missing");
+        fs::write(&file, b"keep").unwrap();
+        std::os::unix::fs::symlink(&missing, &broken).unwrap();
+        std::os::unix::fs::symlink(&file, &file_alias).unwrap();
+        let result = enumerate(
+            &[broken.clone(), file_alias.clone(), missing.clone()],
+            16,
+            &EventRateTracker::default(),
+            Instant::now(),
+        );
+        assert_eq!(result.absent_roots, BTreeSet::from([missing]));
+        assert!(result.unreadable_roots.contains(&broken));
+        assert!(result.unreadable_roots.contains(&file_alias));
+        assert!(result.candidates.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_binding_checks_inode_replacement_and_ancestor_link_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let alias = temp.path().join("alias");
+        fs::create_dir_all(first.join("root")).unwrap();
+        fs::create_dir_all(second.join("root")).unwrap();
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        let result = enumerate(
+            &[alias.join("root")],
+            16,
+            &EventRateTracker::default(),
+            Instant::now(),
+        );
+        let binding = &result.root_bindings[0];
+        assert!(binding.unchanged().is_ok());
+        fs::rename(first.join("root"), first.join("retained-root")).unwrap();
+        fs::create_dir(first.join("root")).unwrap();
+        assert!(
+            binding.unchanged().is_err(),
+            "same canonical spelling is not the same inode"
+        );
+        let rebound = enumerate(
+            &[alias.join("root")],
+            16,
+            &EventRateTracker::default(),
+            Instant::now(),
+        );
+        assert!(rebound.root_bindings[0].unchanged().is_ok());
+        fs::rename(&alias, temp.path().join("previous-alias")).unwrap();
+        std::os::unix::fs::symlink(&second, &alias).unwrap();
+        assert!(
+            rebound.root_bindings[0].unchanged().is_err(),
+            "ancestor aliases are part of the binding"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alias_frontier_fanout_keeps_a_bounded_conservative_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let observed = enumerate(
+            &[temp.path().to_path_buf()],
+            16,
+            &EventRateTracker::default(),
+            Instant::now(),
+        );
+        let bindings: Vec<_> = (0..512)
+            .map(|index| {
+                let mut binding = observed.root_bindings[0].clone();
+                binding.configured = PathBuf::from(format!("/configured/root-{index}"));
+                binding
+            })
+            .collect();
+        let roots: Vec<_> = bindings
+            .iter()
+            .map(|binding| binding.configured.clone())
+            .collect();
+        let gaps = (0..512)
+            .map(|index| bindings[0].canonical.join(format!("gap-{index}")))
+            .collect();
+        let (translated, collapsed) = super::super::translate_plan_gaps(gaps, &bindings, &roots);
+        assert!(collapsed);
+        assert_eq!(translated, roots.into_iter().collect());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolved_configured_roots_keep_their_own_reconciliation_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let physical = fs::canonicalize(temp.path()).unwrap().join("physical");
+        let alias = temp.path().join("alias");
+        fs::create_dir(&physical).unwrap();
+        let blocked = physical.join("not-a-directory");
+        fs::write(&blocked, b"retain").unwrap();
+        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+        let config = super::super::EventSourceConfig::from_scanner_config(
+            &[alias.clone(), blocked.clone()],
+            &crate::core::config::ScannerConfig::default(),
+        );
+        let plan = super::super::EventSourcePlan::recursive_inotify(
+            &config.root_paths,
+            config.watch_budget,
+            &EventRateTracker::default(),
+            Instant::now(),
+        );
+        assert!(!plan.complete);
+        assert!(plan.dirty_roots.contains(&blocked));
+        assert!(plan.dirty_roots.contains(&alias.join("not-a-directory")));
     }
 }

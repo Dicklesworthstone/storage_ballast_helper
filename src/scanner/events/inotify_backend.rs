@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 
 use inotify::{EventMask, WatchDescriptor, WatchMask};
 
+use super::watch_planner::RootBinding;
+use super::watch_rebuild::{RootAudit, RootAuditOutcome};
 use super::{
     DirtyRootTracker, EventInvalidation, EventRateTracker, EventSourceConfig, FsEvent, FsEventKind,
     OverflowBackoff, OverflowDecision,
@@ -28,6 +30,7 @@ const DRAIN_TIME: Duration = Duration::from_millis(50);
 /// Cooperative installation limit, not a timeout on one blocked kernel call.
 /// The caller falls back to reconciliation instead of publishing a partial set.
 pub(super) const INSTALL_TIME_BUDGET: Duration = Duration::from_secs(5);
+const ROOT_AUDIT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 struct DrainBudget {
@@ -67,6 +70,10 @@ pub(super) struct LinuxInotifyBackend {
     pending_events: VecDeque<LinuxInotifyEvent>,
     max_watches: usize,
     repair_required: bool,
+    root_bindings: Vec<RootBinding>,
+    roots_checked_at: Instant,
+    root_audit: Option<RootAudit>,
+    roots_revoked: bool,
 }
 
 #[derive(Debug)]
@@ -113,6 +120,10 @@ impl LinuxInotifyBackend {
             pending_events: VecDeque::new(),
             max_watches,
             repair_required: false,
+            root_bindings: Vec::new(),
+            roots_checked_at: Instant::now(),
+            root_audit: None,
+            roots_revoked: false,
         };
         for path in paths {
             check()?;
@@ -120,6 +131,91 @@ impl LinuxInotifyBackend {
             check()?;
         }
         Ok(backend)
+    }
+
+    /// Called only during synchronous startup or on the rebuild worker. The
+    /// live drain renews these observations with a bounded background audit.
+    pub(super) fn bind_roots(
+        mut self,
+        bindings: Vec<RootBinding>,
+        now: Instant,
+    ) -> io::Result<Self> {
+        let started = Instant::now();
+        for binding in &bindings {
+            if started.elapsed() >= INSTALL_TIME_BUDGET {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "root binding deadline exceeded",
+                ));
+            }
+            binding.unchanged()?;
+        }
+        if started.elapsed() >= INSTALL_TIME_BUDGET {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "root binding deadline exceeded",
+            ));
+        }
+        self.root_bindings = bindings;
+        self.roots_checked_at = now;
+        Ok(self)
+    }
+
+    fn audit_roots(
+        &mut self,
+        config: &EventSourceConfig,
+        now: Instant,
+    ) -> Option<EventInvalidation> {
+        if self.roots_revoked {
+            // The old inode can continue generating events after its alias
+            // moves. None of those events describe the new configured root.
+            return Some(EventInvalidation::empty());
+        }
+        if let Some(audit) = &self.root_audit {
+            if let Some(result) = audit.poll(now) {
+                let admitted_at = audit.admitted_at;
+                self.root_audit = None;
+                match result {
+                    Ok(RootAuditOutcome::Unchanged) => self.roots_checked_at = admitted_at,
+                    Ok(RootAuditOutcome::AbsentRootChanged) => {
+                        return Some(self.revoke_roots(config, "event root coverage changed"));
+                    }
+                    Err(error) => return Some(self.revoke_roots(config, &error.to_string())),
+                }
+            }
+        } else if !self.root_bindings.is_empty()
+            && now.saturating_duration_since(self.roots_checked_at) >= ROOT_AUDIT_INTERVAL
+        {
+            match RootAudit::start(&self.root_bindings, &BTreeSet::new(), now) {
+                Ok(audit) => self.root_audit = Some(audit),
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && now.saturating_duration_since(self.roots_checked_at)
+                            < ROOT_AUDIT_INTERVAL * 2 => {}
+                Err(error) => return Some(self.revoke_roots(config, &error.to_string())),
+            }
+        }
+        None
+    }
+
+    fn revoke_roots(&mut self, config: &EventSourceConfig, reason: &str) -> EventInvalidation {
+        self.revoke_root_bindings();
+        let mut invalidation = EventInvalidation::empty();
+        invalidation.mark_all_roots(
+            config.root_paths(),
+            format!("recursive inotify root binding unavailable: {reason}"),
+            true,
+        );
+        invalidation
+    }
+
+    pub(super) fn revoke_root_bindings(&mut self) {
+        self.roots_revoked = true;
+        self.require_repair();
+    }
+
+    pub(super) fn bindings_match(&self, bindings: &[RootBinding]) -> bool {
+        self.root_bindings == bindings
     }
 
     pub(super) fn watched_dirs(&self) -> impl Iterator<Item = &Path> {
@@ -167,6 +263,9 @@ impl LinuxInotifyBackend {
         budget: DrainBudget,
         mut clock: impl FnMut() -> Instant,
     ) -> EventInvalidation {
+        if let Some(invalidation) = self.audit_roots(config, now) {
+            return invalidation;
+        }
         let started = clock();
         let mut handled = 0;
         let mut collapsed = false;
@@ -317,10 +416,7 @@ impl LinuxInotifyBackend {
             }
             // A queued event must not revive a moved subtree's old path, grow
             // its rate history, or install watches below that obsolete name.
-            return tracker.apply_event(FsEvent {
-                kind: FsEventKind::PermissionLost,
-                path: Some(base),
-            });
+            return self.apply_path_event(tracker, config, FsEventKind::PermissionLost, &base);
         }
         rates.record(&base, now);
         let path = event
@@ -333,16 +429,11 @@ impl LinuxInotifyBackend {
             // Every descendant's stored pathname also became untrustworthy.
             self.forget_subtree(&base, rates);
             self.require_repair();
-            return tracker.apply_event(FsEvent {
-                kind: FsEventKind::PermissionLost,
-                path: Some(base),
-            });
+            return self.apply_path_event(tracker, config, FsEventKind::PermissionLost, &base);
         }
 
-        let mut invalidation = tracker.apply_event(FsEvent {
-            kind: event_kind(event.mask),
-            path: Some(path.clone()),
-        });
+        let mut invalidation =
+            self.apply_path_event(tracker, config, event_kind(event.mask), &path);
         if event.mask.contains(EventMask::ISDIR)
             && event.mask.intersects(
                 EventMask::CREATE | EventMask::MOVED_TO | EventMask::DELETE | EventMask::MOVED_FROM,
@@ -367,19 +458,68 @@ impl LinuxInotifyBackend {
                 // directories. Do not recursively enumerate them in a drain:
                 // report the gap and close it in the paced watch-plan repair.
                 if self.watch_paths.len() >= self.max_watches {
-                    invalidation.merge(tracker.apply_event(FsEvent {
-                        kind: FsEventKind::WatchBudgetExceeded,
-                        path: Some(path),
-                    }));
-                } else if let Err(error) = self.add_watch(&path) {
-                    invalidation.mark_dirty_path(
-                        config.root_paths(),
+                    invalidation.merge(self.apply_path_event(
+                        tracker,
+                        config,
+                        FsEventKind::WatchBudgetExceeded,
                         &path,
-                        format!("recursive inotify add-watch failed: {error}"),
-                    );
+                    ));
+                } else if let Err(error) = self.add_watch(&path) {
+                    invalidation.merge(self.apply_path_event(
+                        tracker,
+                        config,
+                        FsEventKind::PermissionLost,
+                        &path,
+                    ));
+                    invalidation
+                        .reasons
+                        .insert(format!("recursive inotify add-watch failed: {error}"));
                 }
             }
         }
+        invalidation
+    }
+
+    fn apply_path_event(
+        &self,
+        tracker: &DirtyRootTracker,
+        config: &EventSourceConfig,
+        kind: FsEventKind,
+        path: &Path,
+    ) -> EventInvalidation {
+        if self.root_bindings.is_empty() || kind == FsEventKind::PermissionLost {
+            return tracker.apply_event(FsEvent {
+                kind,
+                path: Some(path.to_path_buf()),
+            });
+        }
+        let mut invalidation = EventInvalidation::empty();
+        let mut translated = 0;
+        // Alias fanout belongs to the event budget too. Collapse to root
+        // reconciliation before one event can allocate an unbounded path set.
+        if self.root_bindings.len() <= MAX_EVENTS_PER_DRAIN {
+            for binding in &self.root_bindings {
+                if let Some(configured) = binding.translate(path) {
+                    if translated == MAX_DIRTY_PATHS_PER_DRAIN {
+                        break;
+                    }
+                    invalidation.merge(tracker.apply_event(FsEvent {
+                        kind,
+                        path: Some(configured),
+                    }));
+                    translated += 1;
+                }
+            }
+            if translated > 0 && translated < MAX_DIRTY_PATHS_PER_DRAIN {
+                return invalidation;
+            }
+        }
+        invalidation.dirty_paths.clear();
+        invalidation.mark_all_roots(
+            config.root_paths(),
+            "recursive inotify event alias mapping requires root reconciliation",
+            true,
+        );
         invalidation
     }
 
@@ -544,6 +684,148 @@ mod tests {
             },
         );
         (temp, config)
+    }
+
+    #[test]
+    fn configured_root_aliases_share_watches_and_receive_real_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let physical = base.join("physical");
+        let first = base.join("first");
+        let second = base.join("second");
+        fs::create_dir_all(physical.join("project/build")).unwrap();
+        std::os::unix::fs::symlink(&physical, &first).unwrap();
+        std::os::unix::fs::symlink(&physical, &second).unwrap();
+        let config = EventSourceConfig::from_scanner_config(
+            &[first.clone(), second.clone(), physical.clone()],
+            &ScannerConfig {
+                event_watch_budget: 3,
+                ..ScannerConfig::default()
+            },
+        );
+        let now = Instant::now();
+        let mut source = ScannerEventSource::start_at(config, now);
+        assert!(source.capability().complete, "{:?}", source.capability());
+        assert_eq!(source.capability().watched_dirs, 3);
+        source.drain_at(now);
+
+        fs::write(
+            physical.join("project/build/object.o"),
+            b"new compiler output",
+        )
+        .unwrap();
+        let mut changes = EventInvalidation::empty();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !changes
+            .dirty_paths()
+            .contains(&first.join("project/build/object.o"))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "no aliased inotify event: {changes:?}"
+            );
+            changes.merge(source.drain_at(now));
+            std::thread::yield_now();
+        }
+        for root in [first, second, physical] {
+            assert!(
+                changes
+                    .dirty_paths()
+                    .contains(&root.join("project/build/object.o"))
+            );
+            assert!(changes.dirty_roots().contains(&root.join("project")));
+        }
+        assert!(!changes.requires_index_generation_bump());
+    }
+
+    #[test]
+    fn root_alias_replacement_revokes_old_events_and_rebuilds_the_new_target() {
+        let _serial = super::super::watch_rebuild::test_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let old = base.join("old");
+        let new = base.join("new");
+        let alias = base.join("alias");
+        for root in [&old, &new] {
+            fs::create_dir_all(root.join("project/build")).unwrap();
+        }
+        std::os::unix::fs::symlink(&old, &alias).unwrap();
+        let config = EventSourceConfig::from_scanner_config(
+            std::slice::from_ref(&alias),
+            &ScannerConfig::default(),
+        );
+        let now = Instant::now();
+        let mut source = ScannerEventSource::start_at(config, now);
+        assert!(source.capability().complete);
+        source.drain_at(now);
+        fs::rename(&alias, base.join("previous-alias")).unwrap();
+        std::os::unix::fs::symlink(&new, &alias).unwrap();
+        let audit_at = now + ROOT_AUDIT_INTERVAL;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut invalidated = EventInvalidation::empty();
+        while !invalidated.requires_index_generation_bump() {
+            assert!(Instant::now() < deadline, "alias binding was not revoked");
+            invalidated.merge(source.drain_at(audit_at));
+            std::thread::yield_now();
+        }
+        assert!(invalidated.dirty_roots().contains(&alias));
+        assert!(!source.capability().complete);
+        fs::write(old.join("project/build/obsolete.o"), b"old target").unwrap();
+        let super::super::EventSourceBackend::RecursiveInotify(backend) = &mut source.backend
+        else {
+            panic!("revoked physical watches remain until replacement");
+        };
+        let old_event = backend.drain(
+            &source.tracker,
+            &source.config,
+            &mut source.rates,
+            &mut source.backoff,
+            audit_at,
+        );
+        assert!(
+            !old_event
+                .dirty_paths()
+                .contains(&alias.join("project/build/obsolete.o"))
+        );
+        let repaired = super::super::watch_rebuild::finish_rebuild(&mut source, audit_at);
+        assert!(repaired.requires_index_generation_bump());
+        assert!(source.capability().complete, "{:?}", source.capability());
+        fs::write(new.join("project/build/current.o"), b"new target").unwrap();
+        assert!(
+            source
+                .drain_at(audit_at)
+                .dirty_paths()
+                .contains(&alias.join("project/build/current.o"))
+        );
+    }
+
+    #[test]
+    fn event_alias_fanout_collapses_before_path_memory_can_explode() {
+        let (_temp, original) = fixture();
+        let plan = super::super::EventSourcePlan::for_config(&original);
+        let bindings: Vec<_> = (0..1024)
+            .map(|index| {
+                let mut binding = plan.root_bindings[0].clone();
+                binding.configured = PathBuf::from(format!("/configured/root-{index}"));
+                binding
+            })
+            .collect();
+        let roots: Vec<_> = bindings
+            .iter()
+            .map(|binding| binding.configured.clone())
+            .collect();
+        let config = EventSourceConfig::from_scanner_config(&roots, &ScannerConfig::default());
+        let mut backend = LinuxInotifyBackend::start(&plan.watched_dirs, 1).unwrap();
+        backend.root_bindings = bindings;
+        let invalidation = backend.apply_path_event(
+            &DirtyRootTracker::new(&roots),
+            &config,
+            FsEventKind::Modify,
+            &original.root_paths()[0].join("object.o"),
+        );
+        assert!(invalidation.dirty_paths().is_empty());
+        assert_eq!(invalidation.dirty_roots().len(), roots.len());
+        assert!(invalidation.requires_index_generation_bump());
     }
 
     fn event(
