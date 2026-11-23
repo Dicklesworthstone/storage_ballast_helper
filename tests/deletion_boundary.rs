@@ -20,6 +20,7 @@ use storage_ballast_helper::scanner::deletion::{
     DeletionPlan, SkipReason,
 };
 use storage_ballast_helper::scanner::patterns::{ArtifactCategory, ArtifactClassification};
+use storage_ballast_helper::scanner::protection::sacred_paths_from_protected_patterns;
 use storage_ballast_helper::scanner::quarantine::{
     QuarantineRecord, QuarantineStore, RecoveryState, SweepMode,
 };
@@ -27,6 +28,7 @@ use storage_ballast_helper::scanner::scoring::{
     ArtifactCertainty, CandidacyScore, DecisionAction, DecisionOutcome, EvidenceLedger,
     ScoreFactors,
 };
+use storage_ballast_helper::scanner::source_roots::SourceRootPolicy;
 use storage_ballast_helper::scanner::walker::identity_for_path;
 
 const PAYLOAD: &[u8] = b"artifact data";
@@ -520,7 +522,11 @@ fn live_authorization_cannot_bypass_preflight_protection() {
 #[test]
 fn final_authorization_renews_nested_sacred_rules_in_both_mutation_modes() {
     for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
-        let last_renewal = if mode == DeletionMode::Quarantine { 3 } else { 2 };
+        let last_renewal = if mode == DeletionMode::Quarantine {
+            3
+        } else {
+            2
+        };
         for protect_on_call in 2..=last_renewal {
             for name in ["state.db", ".beads", "operator.keep"] {
                 let dir = scratch();
@@ -651,7 +657,11 @@ fn final_authorization_still_allows_unprotected_contents_and_quarantine_restore(
         let executor = DeletionExecutor::new(config(dir.path(), mode), None);
         let plan = executor.plan(vec![item.clone()]);
         assert_eq!(plan.estimated_items, 1);
-        let last_renewal = if mode == DeletionMode::Quarantine { 3 } else { 2 };
+        let last_renewal = if mode == DeletionMode::Quarantine {
+            3
+        } else {
+            2
+        };
         let calls = Cell::new(0);
         let report = executor.execute_with_guard(
             &plan,
@@ -679,6 +689,237 @@ fn final_authorization_still_allows_unprotected_contents_and_quarantine_restore(
             assert_eq!(identity_for_path(&target, false).ok(), item.identity);
             assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
             assert_eq!(fs::read(late_payload).unwrap(), b"unprotected artifact");
+        }
+    }
+}
+
+fn configured_glob_fixture(root: &Path, shape: &str) -> (PathBuf, PathBuf, String, bool) {
+    let mut target = root.join("target");
+    let (protected, pattern, directory) = match shape {
+        "root-directory" => {
+            target = root.join("keep");
+            (target.clone(), "**/keep/**".to_string(), true)
+        }
+        "nested-directory" => (target.join("a/b/c/d/keep"), "**/keep/**".to_string(), true),
+        "alias" => {
+            let physical = root.join("physical");
+            fs::create_dir(&physical).unwrap();
+            let alias = root.join("alias");
+            symlink(&physical, &alias).unwrap();
+            target = alias.join("target");
+            (
+                target.join("a/b/c/d/operator.keep"),
+                format!("{}/**/*.keep", physical.display()),
+                false,
+            )
+        }
+        "cargo-git" => {
+            let checkout = target.join("cargo/git/checkouts/unit/rev");
+            fs::create_dir_all(checkout.join(".git")).unwrap();
+            fs::write(checkout.join(".cargo-ok"), b"").unwrap();
+            (
+                checkout.join(".git/operator.keep"),
+                "**/*.keep".to_string(),
+                false,
+            )
+        }
+        _ => (
+            target.join("a/b/c/d/operator.keep"),
+            "**/*.keep".to_string(),
+            false,
+        ),
+    };
+    if directory {
+        fs::create_dir_all(&protected).unwrap();
+    } else {
+        fs::create_dir_all(protected.parent().unwrap()).unwrap();
+        fs::write(&protected, PAYLOAD).unwrap();
+    }
+    (target, protected, pattern, directory)
+}
+
+#[test]
+fn configured_globs_protect_complete_cleanup_subtrees() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        for shape in [
+            "root-directory",
+            "nested-directory",
+            "deep-file",
+            "alias",
+            "cargo-git",
+        ] {
+            let dir = scratch();
+            let (target, protected, pattern, directory) =
+                configured_glob_fixture(dir.path(), shape);
+            let item = candidate(&target);
+            let mut settings = config(dir.path(), mode);
+            settings
+                .sacred_paths
+                .extend(sacred_paths_from_protected_patterns(&[pattern]));
+            // Source-root opt-in never grants an exemption from operator
+            // protection, including inside an otherwise valid Cargo cache.
+            settings.source_roots = SourceRootPolicy::new(std::slice::from_ref(&target), true);
+            let executor = DeletionExecutor::new(settings, None);
+            let plan = executor.plan(vec![item.clone()]);
+            assert_eq!(plan.estimated_items, 1, "{shape}: must reach full containment");
+            let report = executor.execute(&plan, None);
+            assert_eq!(report.items_deleted, 0, "{mode:?}, {shape}: {report:?}");
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.items_skipped, 1);
+            assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+            assert_eq!(report.bytes_freed, 0);
+            assert_eq!(report.bytes_quarantined, 0);
+            assert_eq!(
+                executor.delete_candidate_checked(&item, None).unwrap(),
+                CheckedDeletion::Skipped(SkipReason::SacredStowaway)
+            );
+            assert_eq!(identity_for_path(&target, false).ok(), item.identity);
+            assert!(protected.exists());
+            if !directory {
+                assert_eq!(fs::read(&protected).unwrap(), PAYLOAD);
+            }
+            assert!(!QuarantineStore::under(dir.path()).root().exists());
+        }
+    }
+}
+
+#[test]
+fn configured_glob_alias_retarget_is_renewed_after_authorization() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let dir = scratch();
+        let target = dir.path().join("target");
+        let protected = target.join("a/b/c/d/operator.keep");
+        fs::create_dir_all(protected.parent().unwrap()).unwrap();
+        fs::write(&protected, PAYLOAD).unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let alias = dir.path().join("protected-scope");
+        symlink(&outside, &alias).unwrap();
+        let mut settings = config(dir.path(), mode);
+        settings
+            .sacred_paths
+            .extend(sacred_paths_from_protected_patterns(&[format!(
+                "{}/**/*.keep",
+                alias.display()
+            )]));
+        settings.source_roots = SourceRootPolicy::new(std::slice::from_ref(&target), true);
+        let item = candidate(&target);
+        let executor = DeletionExecutor::new(settings, None);
+        assert!(executor.explain_preflight(&item, None).is_ok());
+        let plan = executor.plan(vec![item.clone()]);
+        assert_eq!(plan.estimated_items, 1);
+        let last_renewal = if mode == DeletionMode::Quarantine {
+            3
+        } else {
+            2
+        };
+        let calls = Cell::new(0);
+        let report = executor.execute_with_guard(
+            &plan,
+            None,
+            Some(&|_| {
+                calls.set(calls.get() + 1);
+                if calls.get() == last_renewal {
+                    fs::rename(&alias, dir.path().join("previous-scope")).unwrap();
+                    symlink(&target, &alias).unwrap();
+                }
+                Ok(())
+            }),
+        );
+        assert_eq!(calls.get(), last_renewal);
+        assert_eq!(report.items_deleted, 0, "{mode:?}: {report:?}");
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+        assert_eq!(report.quarantine_unavailable, 0);
+        assert_eq!(identity_for_path(&target, false).ok(), item.identity);
+        assert_eq!(fs::read(protected).unwrap(), PAYLOAD);
+        let store = QuarantineStore::under(dir.path());
+        if store.root().exists() {
+            assert!(store.records().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn configured_globs_refuse_unresolved_alias_scope() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        for looping in [false, true] {
+            let dir = scratch();
+            let target = dir.path().join("target");
+            fs::create_dir(&target).unwrap();
+            let payload = target.join("artifact.o");
+            fs::write(&payload, PAYLOAD).unwrap();
+            let alias = dir.path().join("unknown-scope");
+            let destination = if looping {
+                alias.clone()
+            } else {
+                dir.path().join("missing")
+            };
+            symlink(destination, &alias).unwrap();
+            let mut settings = config(dir.path(), mode);
+            settings
+                .sacred_paths
+                .extend(sacred_paths_from_protected_patterns(&[format!(
+                    "{}/**/*.keep",
+                    alias.display()
+                )]));
+            settings.source_roots = SourceRootPolicy::new(std::slice::from_ref(&target), true);
+            let item = candidate(&target);
+            let executor = DeletionExecutor::new(settings, None);
+            let report = executor.execute(&raw_plan(vec![item.clone()], mode), None);
+            assert_eq!(
+                report.items_deleted, 0,
+                "{mode:?}, looping={looping}: {report:?}"
+            );
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.items_skipped, 1);
+            assert_eq!(
+                report.skipped_by_reason.get("containment_incomplete"),
+                Some(&1)
+            );
+            assert_eq!(
+                executor.delete_candidate_checked(&item, None).unwrap(),
+                CheckedDeletion::Skipped(SkipReason::ContainmentIncomplete)
+            );
+            assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
+            assert!(!QuarantineStore::under(dir.path()).root().exists());
+        }
+    }
+}
+
+#[test]
+fn configured_globs_allow_siblings_and_missing_literal_suffixes() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let dir = scratch();
+        let target = dir.path().join("target");
+        let sibling = target.join("a/b/c/d/keep-other");
+        fs::create_dir_all(&sibling).unwrap();
+        let payload = sibling.join("operator.keep-extra");
+        fs::write(&payload, PAYLOAD).unwrap();
+        let mut settings = config(dir.path(), mode);
+        settings
+            .sacred_paths
+            .extend(sacred_paths_from_protected_patterns(&[
+                "**/keep/**".to_string(),
+                "**/*.keep".to_string(),
+                format!("{}/future/rules/*.keep", dir.path().display()),
+            ]));
+        let item = candidate(&target);
+        let executor = DeletionExecutor::new(settings, None);
+        let plan = executor.plan(vec![item]);
+        assert_eq!(plan.estimated_items, 1);
+        let report = executor.execute(&plan, None);
+        assert_eq!(report.items_deleted, 1, "{mode:?}: {report:?}");
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.items_skipped, 0);
+        assert!(!target.exists());
+        if mode == DeletionMode::Quarantine {
+            let store = QuarantineStore::under(dir.path());
+            let records = store.records().unwrap();
+            assert_eq!(records.len(), 1);
+            store.restore(&records[0].decision_id, false).unwrap();
+            assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
         }
     }
 }

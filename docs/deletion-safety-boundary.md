@@ -38,6 +38,27 @@ applies before both unlink and quarantine, including the final recheck after
 authorization. A readable, empty cache marker can still be distinguished from
 a repository; an unreadable marker cannot.
 
+## Configured globs protect complete subtrees
+
+Operator `protected_paths` globs participate in the existing full-depth
+containment walk before mutation. Matching uses complete lexical and canonical
+paths, including the candidate root, rather than only entry basenames or the
+shallow stowaway scan. A rule such as `**/keep/**` protects an empty `keep`
+directory, and `**/*.keep` protects a matching file below the shallow scan limit.
+The Cargo checkout exemption cannot hide a protected path inside its Git
+metadata.
+
+Absolute glob prefixes are resolved afresh for each containment pass, including
+after authorization callbacks. A missing literal suffix can still describe
+future protected scope; a dangling, looping, or unreadable alias leaves scope
+unknown and refuses mutation with `containment_incomplete`. A prefix is skipped
+only when both its lexical and resolved locations prove it cannot intersect
+the candidate. Builtin catalog entries retain their existing checks.
+
+This adds matching to the existing bounded walk. Exhausting its directory budget
+still retains the candidate, and executors without configured globs avoid the
+additional alias resolution and per-entry glob matching.
+
 ## Ancestor markers are live instructions
 
 Before mutation, the executor checks `.sbh-protect` in the candidate directory

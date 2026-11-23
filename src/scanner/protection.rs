@@ -263,6 +263,139 @@ impl SacredOverlap {
     }
 }
 
+/// Operator glob rules bound to one full containment pass.
+///
+/// Builtin catalog and relative stowaway rules keep their existing checks.
+/// User-configured path globs must also protect descendants below the
+/// shallow stowaway scan, using full path spellings rather than basenames.
+pub(crate) struct DescendantGlobMatcher {
+    patterns: Vec<Regex>,
+    root: PathBuf,
+    canonical_root: PathBuf,
+}
+
+impl DescendantGlobMatcher {
+    pub(crate) fn for_root(root: &Path, catalog: &[SacredPath]) -> Result<Self> {
+        let configured = catalog
+            .iter()
+            .filter(|entry| {
+                entry.kind == SacredPathKind::GlobMatch
+                    && entry.source == SacredPathSource::UserConfig
+            })
+            .collect::<Vec<_>>();
+        if configured.is_empty() {
+            return Ok(Self {
+                patterns: Vec::new(),
+                root: root.to_path_buf(),
+                canonical_root: root.to_path_buf(),
+            });
+        }
+        let root = std::path::absolute(root).map_err(|source| SbhError::io(root, source))?;
+        let canonical_root =
+            fs::canonicalize(&root).map_err(|source| SbhError::io(&root, source))?;
+        let mut patterns = Vec::new();
+        for entry in configured {
+            let mut normalized = expand_home_pattern(&entry.pattern).replace('\\', "/");
+            let prefix = if Path::new(&normalized).is_absolute() {
+                Some(literal_glob_prefix_path(&normalized).unwrap_or_else(|| {
+                    if contains_glob_metachar(&normalized) {
+                        PathBuf::from("/")
+                    } else {
+                        PathBuf::from(&normalized)
+                    }
+                }))
+            } else {
+                None
+            };
+            let prefixes = if let Some(prefix) = prefix {
+                // Missing literal suffixes are meaningful future scope;
+                // unreadable, looping or dangling aliases are unknown scope.
+                // Never prune from the best-effort cached path resolver.
+                let spellings = exclusion_path_spellings(&prefix)
+                    .map_err(|source| SbhError::io(&prefix, source))?;
+                let prefix_text = normalize_path_for_matching(&prefix);
+                let suffix = normalized.strip_prefix(&prefix_text).ok_or_else(|| {
+                    SbhError::InvalidConfig {
+                        details: "protected glob literal prefix changed during normalization"
+                            .to_string(),
+                    }
+                })?;
+                normalized = if let Some(tail) = suffix.strip_prefix('/') {
+                    normalize_path_for_matching(&spellings[1].join(tail))
+                } else {
+                    format!("{}{suffix}", normalize_path_for_matching(&spellings[1]))
+                };
+                Some(spellings)
+            } else {
+                None
+            };
+            // Only fixed prefixes disjoint from both root spellings can
+            // prove that no descendant matches. Keep prefixless/relative
+            // rules and make no deductions from the wildcard portion.
+            if prefixes.as_ref().is_some_and(|prefixes| {
+                prefixes.iter().all(|prefix| {
+                    !root.starts_with(prefix)
+                        && !prefix.starts_with(&root)
+                        && !canonical_root.starts_with(prefix)
+                        && !prefix.starts_with(&canonical_root)
+                })
+            }) {
+                continue;
+            }
+            patterns.push(glob_to_regex(&normalized)?);
+        }
+        Ok(Self {
+            patterns,
+            root,
+            canonical_root,
+        })
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    pub(crate) fn matches(&self, path: &Path, is_directory: bool) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            // The walk must stay bound to the root whose aliases were proved.
+            return true;
+        };
+        if self.matches_spelling(path, is_directory) {
+            return true;
+        }
+        if self.canonical_root.as_os_str() == self.root.as_os_str() {
+            return false;
+        }
+        if relative.as_os_str().is_empty() {
+            self.matches_spelling(&self.canonical_root, is_directory)
+        } else {
+            self.matches_spelling(&self.canonical_root.join(relative), is_directory)
+        }
+    }
+
+    fn matches_spelling(&self, path: &Path, is_directory: bool) -> bool {
+        let mut text = normalize_path_for_matching(path);
+        if self.patterns.iter().any(|pattern| pattern.is_match(&text)) {
+            return true;
+        }
+        // A subtree glob such as **/keep/** protects keep even when empty.
+        // Only actual directories receive this spelling; no symlink target
+        // is followed to decide whether an entry is a directory.
+        if is_directory {
+            text.push('/');
+            return self.patterns.iter().any(|pattern| pattern.is_match(&text));
+        }
+        false
+    }
+}
+
 /// Compiled glob pattern for path matching.
 #[derive(Debug, Clone)]
 struct GlobPattern {

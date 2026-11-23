@@ -1734,11 +1734,11 @@ impl DeletionExecutor {
     ) -> std::result::Result<(), SkipReason> {
         let path = &candidate.path;
 
-        // 5. Does not contain a Git repository or a `.sbh-protect` marker at
-        //    any depth (bd-jydu). The sacred walk in 6c stops at depth 3, so a
-        //    clone deeper inside an agent's temp tree reached remove_dir_all.
+        // 5. Does not contain a repository, protection marker, active lease
+        //    or configured protected-path glob at any depth. The sacred walk
+        //    in 6c stops at depth 3; whole-tree removal needs the deeper proof.
         if meta.is_dir() {
-            Self::check_descendant_protection(path)?;
+            self.check_descendant_protection(path)?;
         }
 
         // A deep source subtree need not contain its repository's .git marker.
@@ -1791,13 +1791,13 @@ impl DeletionExecutor {
     /// Reuse the bounded containment pass for late leases and protections.
     /// A caller's authorization can yield or start work below an unchanged
     /// candidate inode, so its earlier clear pass is not reusable evidence.
-    fn check_descendant_protection(path: &Path) -> std::result::Result<(), SkipReason> {
-        match deep_containment(path, DEEP_CONTAINMENT_MAX_DIRS) {
+    fn check_descendant_protection(&self, path: &Path) -> std::result::Result<(), SkipReason> {
+        match deep_containment(path, DEEP_CONTAINMENT_MAX_DIRS, &self.config.sacred_paths) {
             DeepContainment::Clear => Ok(()),
             DeepContainment::Repository => Err(SkipReason::ContainsGit),
-            DeepContainment::ProtectMarker | DeepContainment::Truncated => {
-                Err(SkipReason::SacredStowaway)
-            }
+            DeepContainment::ProtectMarker
+            | DeepContainment::ConfiguredPath
+            | DeepContainment::Truncated => Err(SkipReason::SacredStowaway),
             DeepContainment::ActiveLease => Err(SkipReason::ActiveLease),
             DeepContainment::Incomplete => Err(SkipReason::ContainmentIncomplete),
         }
@@ -2638,6 +2638,8 @@ enum DeepContainment {
     Clear,
     Repository,
     ProtectMarker,
+    /// A descendant matches a configured path glob, at any visited depth.
+    ConfiguredPath,
     /// A target or acquisition within the candidate still owns its lease lock.
     ActiveLease,
     /// The directory budget ran out before the subtree was proven clear.
@@ -2647,8 +2649,9 @@ enum DeepContainment {
     Incomplete,
 }
 
-/// Whether a candidate holds a Git repository or a `.sbh-protect` marker at
-/// any depth, breadth-first and bounded by `max_dirs` opened directories.
+/// Whether a candidate holds a repository, protection marker, active lease
+/// or configured path glob at any depth. The breadth-first walk is bounded
+/// by `max_dirs` opened directories.
 ///
 /// Within [`NESTED_GIT_ANY_DEPTH`] levels every `.git` entry counts. Below
 /// that only a real repository does: a `.git` directory or symlink, or a
@@ -2658,10 +2661,11 @@ enum DeepContainment {
 /// (`git/checkouts/<name>/<rev>/` with `.cargo-ok`), which rch and temporary
 /// `CARGO_HOME`s hold four levels down and which the force-remove carve-out
 /// exists for. An agent's clone deep inside a temp tree is what this finds.
-fn deep_containment(path: &Path, max_dirs: usize) -> DeepContainment {
+fn deep_containment(path: &Path, max_dirs: usize, catalog: &[SacredPath]) -> DeepContainment {
     deep_containment_with(
         path,
         max_dirs,
+        catalog,
         |dir| fs::read_dir(dir),
         fs::DirEntry::file_type,
     )
@@ -2673,13 +2677,20 @@ fn deep_containment(path: &Path, max_dirs: usize) -> DeepContainment {
 fn deep_containment_with<I>(
     path: &Path,
     max_dirs: usize,
+    catalog: &[SacredPath],
     mut read_dir: impl FnMut(&Path) -> std::io::Result<I>,
     mut entry_type: impl FnMut(&fs::DirEntry) -> std::io::Result<fs::FileType>,
 ) -> DeepContainment
 where
     I: Iterator<Item = std::io::Result<fs::DirEntry>>,
 {
-    let mut queue = std::collections::VecDeque::from([(path.to_path_buf(), 0usize)]);
+    let Ok(globs) = protection::DescendantGlobMatcher::for_root(path, catalog) else {
+        return DeepContainment::Incomplete;
+    };
+    if globs.matches(globs.root(), true) {
+        return DeepContainment::ConfiguredPath;
+    }
+    let mut queue = std::collections::VecDeque::from([(globs.root().to_path_buf(), 0usize)]);
     let mut opened = 0usize;
     while let Some((dir, depth)) = queue.pop_front() {
         if opened >= max_dirs {
@@ -2698,6 +2709,9 @@ where
                 return DeepContainment::Incomplete;
             };
             let name = entry.file_name();
+            if !globs.is_empty() && globs.matches(&entry.path(), file_type.is_dir()) {
+                return DeepContainment::ConfiguredPath;
+            }
             if name == ".git" {
                 if child_depth <= NESTED_GIT_ANY_DEPTH {
                     return DeepContainment::Repository;
@@ -2707,6 +2721,12 @@ where
                 };
                 if repository && !is_cargo_git_checkout(&dir) {
                     return DeepContainment::Repository;
+                }
+                // Cargo's repository exemption does not exempt its metadata
+                // from operator protection. Complete the same bounded walk
+                // when a relevant glob can match inside this directory.
+                if !globs.is_empty() && file_type.is_dir() {
+                    queue.push_back((entry.path(), child_depth));
                 }
                 continue;
             }
@@ -5108,13 +5128,13 @@ mod tests {
         fs::write(checkout.join(".git/HEAD"), "c48399f\n").unwrap();
         fs::write(checkout.join(".cargo-ok"), "").unwrap();
         assert_eq!(
-            deep_containment(&cargo_home, DEEP_CONTAINMENT_MAX_DIRS),
+            deep_containment(&cargo_home, DEEP_CONTAINMENT_MAX_DIRS, &[]),
             DeepContainment::Clear
         );
         // The same layout before cargo marked the checkout complete is kept.
         fs::remove_file(checkout.join(".cargo-ok")).unwrap();
         assert_eq!(
-            deep_containment(&cargo_home, DEEP_CONTAINMENT_MAX_DIRS),
+            deep_containment(&cargo_home, DEEP_CONTAINMENT_MAX_DIRS, &[]),
             DeepContainment::Repository
         );
 
@@ -5124,13 +5144,13 @@ mod tests {
         fs::create_dir_all(&bucket).unwrap();
         fs::write(bucket.join(".git"), "").unwrap();
         assert_eq!(
-            deep_containment(&uv, DEEP_CONTAINMENT_MAX_DIRS),
+            deep_containment(&uv, DEEP_CONTAINMENT_MAX_DIRS, &[]),
             DeepContainment::Clear
         );
         // ...but a `.git` file pointing at one (a linked worktree) is.
         fs::write(bucket.join(".git"), "gitdir: /src/repo/.git/worktrees/x\n").unwrap();
         assert_eq!(
-            deep_containment(&uv, DEEP_CONTAINMENT_MAX_DIRS),
+            deep_containment(&uv, DEEP_CONTAINMENT_MAX_DIRS, &[]),
             DeepContainment::Repository
         );
 
@@ -5139,7 +5159,7 @@ mod tests {
         fs::create_dir_all(shallow.join("a/b")).unwrap();
         fs::write(shallow.join("a/b/.git"), "").unwrap();
         assert_eq!(
-            deep_containment(&shallow, DEEP_CONTAINMENT_MAX_DIRS),
+            deep_containment(&shallow, DEEP_CONTAINMENT_MAX_DIRS, &[]),
             DeepContainment::Repository
         );
     }
@@ -5152,8 +5172,15 @@ mod tests {
             fs::create_dir_all(root.join(format!("b{branch}/leaf"))).unwrap();
         }
         // 1 + 4 + 4 directories to open.
-        assert_eq!(deep_containment(&root, 9), DeepContainment::Clear);
-        assert_eq!(deep_containment(&root, 8), DeepContainment::Truncated);
+        assert_eq!(deep_containment(&root, 9, &[]), DeepContainment::Clear);
+        assert_eq!(deep_containment(&root, 8, &[]), DeepContainment::Truncated);
+        let catalog =
+            protection::sacred_paths_from_protected_patterns(&["**/*.keep".to_string()]);
+        assert_eq!(deep_containment(&root, 9, &catalog), DeepContainment::Clear);
+        assert_eq!(
+            deep_containment(&root, 8, &catalog),
+            DeepContainment::Truncated
+        );
     }
 
     #[test]
@@ -5167,7 +5194,7 @@ mod tests {
         fs::write(hidden.join(protection::MARKER_FILENAME), b"protect").unwrap();
         fs::write(target.join("cache.o"), b"object").unwrap();
         assert_eq!(
-            deep_containment(&target, DEEP_CONTAINMENT_MAX_DIRS),
+            deep_containment(&target, DEEP_CONTAINMENT_MAX_DIRS, &[]),
             DeepContainment::ProtectMarker
         );
 
@@ -5180,6 +5207,7 @@ mod tests {
                 let observed = deep_containment_with(
                     &target,
                     DEEP_CONTAINMENT_MAX_DIRS,
+                    &[],
                     |path| {
                         if fault == "open" && path == hidden {
                             return Err(io::Error::from(kind));
@@ -5228,12 +5256,12 @@ mod tests {
         fs::write(&marker, b"gitdir: /elsewhere/repository/worktrees/live\n").unwrap();
         let permissions = fs::metadata(&marker).unwrap().permissions();
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o000)).unwrap();
-        let observation = deep_containment(&target, DEEP_CONTAINMENT_MAX_DIRS);
+        let observation = deep_containment(&target, DEEP_CONTAINMENT_MAX_DIRS, &[]);
         fs::set_permissions(&marker, permissions).unwrap();
 
         assert_eq!(observation, DeepContainment::Incomplete);
         assert_eq!(
-            deep_containment(&target, DEEP_CONTAINMENT_MAX_DIRS),
+            deep_containment(&target, DEEP_CONTAINMENT_MAX_DIRS, &[]),
             DeepContainment::Repository
         );
     }
@@ -5319,7 +5347,7 @@ mod tests {
                 );
                 assert!(!QuarantineStore::under(&root).root().exists());
                 assert_eq!(
-                    deep_containment(&target, DEEP_CONTAINMENT_MAX_DIRS),
+                    deep_containment(&target, DEEP_CONTAINMENT_MAX_DIRS, &[]),
                     DeepContainment::ProtectMarker,
                     "restored access reveals the protection hidden below depth three"
                 );
