@@ -274,7 +274,7 @@ else
 fi
 
 # release-provenance.json
-rustc_ver="$(rustc --version 2>/dev/null || echo "unknown")"
+rustc_ver="$(cd "$root_dir" && rustc --version 2>/dev/null || echo "unknown")"
 cat > "${artifact_dir}/release-provenance.json" <<EOF
 {
   "tag": "${tag}",

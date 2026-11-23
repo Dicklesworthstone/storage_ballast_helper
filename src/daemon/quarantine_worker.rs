@@ -293,11 +293,12 @@ impl QuarantineSweeper {
         &mut self,
         responses: &[MountTickResponse],
         root_mounts: &[(PathBuf, Option<PathBuf>)],
+        recovering_mounts: &HashSet<PathBuf>,
         config: &Config,
-        mode: ActiveMode,
-        policy_transitions: u64,
+        policy: (ActiveMode, u64),
         now: Instant,
     ) {
+        let (mode, policy_transitions) = policy;
         if let Some(running) = &self.running {
             running.lease.current_at(now);
             let current = responses.iter().find(|tick| {
@@ -306,7 +307,9 @@ impl QuarantineSweeper {
             if current.is_none()
                 || running.task.policy_transitions != policy_transitions
                 || (running.task.allow_mutation
-                    && (config.scanner.dry_run || mode != ActiveMode::Enforce))
+                    && (config.scanner.dry_run
+                        || mode != ActiveMode::Enforce
+                        || recovering_mounts.contains(running.task.mount())))
                 || current.is_some_and(|tick| {
                     (running.task.tick.ram_reclaim.is_some() && tick.ram_reclaim.is_none())
                         || (running.task.tick.inode_reclaim.is_some()
@@ -380,7 +383,8 @@ impl QuarantineSweeper {
                 tick: tick.clone(),
                 roots,
                 cap_pct: config.scanner.quarantine_max_bytes_pct,
-                allow_mutation: !config.scanner.dry_run
+                allow_mutation: !recovering_mounts.contains(mount)
+                    && !config.scanner.dry_run
                     && mode == ActiveMode::Enforce
                     && (!(tick.ram_reclaim.is_some() || tick.inode_reclaim.is_some()) || pressured),
                 observed_at: now,

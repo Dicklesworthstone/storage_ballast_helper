@@ -9364,12 +9364,29 @@ impl MonitoringDaemon {
             (policy.mode(), policy.transitions_total())
         };
         let in_fallback = policy_mode == ActiveMode::FallbackSafe;
+        let active_recovery_pools: HashSet<_> = self
+            .mount_controllers
+            .iter()
+            .filter(|(_, controller)| controller.state() == MountState::Recovery)
+            .map(|(mount, _)| self.pool_mount(mount))
+            .collect();
+        let recovering_mounts: HashSet<PathBuf> = responses
+            .iter()
+            .map(|tick| &tick.response.causing_mount)
+            .filter(|mount| {
+                self.mount_controllers
+                    .get(*mount)
+                    .is_some_and(|controller| controller.state() == MountState::Recovery)
+                    || active_recovery_pools.contains(&self.pool_mount(mount))
+            })
+            .cloned()
+            .collect();
         self.quarantine_sweeper.observe(
             &responses,
             &root_mounts,
+            &recovering_mounts,
             &self.config,
-            policy_mode,
-            policy_transitions,
+            (policy_mode, policy_transitions),
             now,
         );
         self.quarantine_sweeper
@@ -29443,6 +29460,7 @@ mod tests {
 
             let lease_root = temp.path().join("lease-root");
             std::fs::create_dir(&lease_root).unwrap();
+            std::fs::write(lease_root.join("Cargo.toml"), "[package]\nname = \"l\"\n").unwrap();
             let leased_target = lease_root.join("target");
             let lease = ActiveLease::acquire_with_policy(
                 std::slice::from_ref(&lease_root),
