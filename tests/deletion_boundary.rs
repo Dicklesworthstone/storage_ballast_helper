@@ -12,6 +12,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use storage_ballast_helper::scanner::active_lease::{ActiveLease, LeasePolicy};
 use storage_ballast_helper::scanner::decision_record::stable_decision_id;
 use storage_ballast_helper::scanner::deletion::{
     CheckedDeletion, DeletionConfig, DeletionConfirmation, DeletionExecutor, DeletionMode,
@@ -103,6 +104,191 @@ fn raw_plan(candidates: Vec<CandidacyScore>, mode: DeletionMode) -> DeletionPlan
         candidates,
         mode,
         refused: Vec::new(),
+    }
+}
+
+fn descendant_lease(root: &Path) -> ActiveLease {
+    ActiveLease::acquire_with_policy(
+        &[root.to_path_buf()],
+        &root.join("leased-target"),
+        Duration::from_secs(30),
+        1024 * 1024,
+        LeasePolicy {
+            max_active_leases_per_root: 1,
+            max_bytes_per_lease: 1024 * 1024,
+            max_reserved_bytes_per_root: 1024 * 1024,
+            max_lifetime: Duration::from_secs(60),
+            emergency_reserve_bytes: 0,
+            watch_interval: Duration::from_millis(10),
+            termination_grace: Duration::from_millis(20),
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn descendant_active_lease_preserves_parent_in_public_mutation_paths() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let dir = scratch();
+        let parent = dir.path().join("target");
+        let nested_root = parent.join("deep/scratch");
+        fs::create_dir_all(&nested_root).unwrap();
+        let lease = descendant_lease(&nested_root);
+        let payload = nested_root.join("leased-target/live.o");
+        fs::write(&payload, PAYLOAD).unwrap();
+        let item = candidate(&parent);
+        let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+        let plan = raw_plan(vec![item.clone()], mode);
+
+        let report = executor.execute(&plan, None);
+        assert_eq!(report.items_deleted, 0, "{mode:?}: {report:?}");
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.skipped_by_reason.get("active_lease"), Some(&1));
+        assert_eq!(report.bytes_freed, 0);
+        assert_eq!(report.bytes_quarantined, 0);
+        assert_eq!(fs::read(&payload).unwrap(), PAYLOAD);
+        assert_eq!(
+            executor.delete_candidate_checked(&item, None).unwrap(),
+            CheckedDeletion::Skipped(SkipReason::ActiveLease)
+        );
+
+        // No permanent marker was added: unlocked sidecars cannot pin a
+        // formerly leased subtree forever, even when the old plan is reused.
+        drop(lease);
+        let retry = executor.execute(&plan, None);
+        assert_eq!(retry.items_deleted, 1, "{mode:?}: {retry:?}");
+        assert_eq!(retry.items_failed, 0);
+        assert!(!parent.exists());
+        if mode == DeletionMode::Quarantine {
+            let store = QuarantineStore::for_root(dir.path());
+            let held = store.records().unwrap();
+            assert_eq!(held.len(), 1);
+            store.restore(&held[0].decision_id, false).unwrap();
+            assert_eq!(fs::read(&payload).unwrap(), PAYLOAD);
+        }
+    }
+}
+
+#[test]
+fn descendant_active_lease_acquired_after_open_sweep_still_vetoes_parent() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let last_renewal = if mode == DeletionMode::Quarantine {
+            3
+        } else {
+            2
+        };
+        for acquire_on_call in 1..=last_renewal {
+            let dir = scratch();
+            let parent = dir.path().join("target");
+            let nested_root = parent.join("deep/scratch");
+            fs::create_dir_all(&nested_root).unwrap();
+            let payload = nested_root.join("leased-target/live.o");
+            let item = candidate(&parent);
+            let mut settings = config(dir.path(), mode);
+            settings.check_open_files = true;
+            let executor = DeletionExecutor::new(settings, None).with_platform(
+                std::sync::Arc::new(storage_ballast_helper::platform::pal::MockPlatform::healthy()),
+            );
+            let plan = executor.plan(vec![item]);
+            assert_eq!(plan.candidates.len(), 1);
+            let lease = RefCell::new(None);
+            let calls = Cell::new(0);
+            let report = executor.execute_with_guard(
+                &plan,
+                None,
+                Some(&|_| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == acquire_on_call {
+                        // The completed open-reference snapshot and first
+                        // content preflight both preceded this new build. Also
+                        // exercise the renewal after the final content walk and
+                        // the one after durable quarantine-store preparation.
+                        *lease.borrow_mut() = Some(descendant_lease(&nested_root));
+                        fs::write(&payload, PAYLOAD).unwrap();
+                    }
+                    Ok(())
+                }),
+            );
+            assert!(
+                lease.borrow().is_some(),
+                "renewal {acquire_on_call} must run"
+            );
+            assert_eq!(
+                report.items_deleted, 0,
+                "{mode:?} at {acquire_on_call}: {report:?}"
+            );
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.skipped_by_reason.get("active_lease"), Some(&1));
+            assert_eq!(report.bytes_freed, 0);
+            assert_eq!(report.bytes_quarantined, 0);
+            assert_eq!(fs::read(&payload).unwrap(), PAYLOAD);
+        }
+    }
+}
+
+#[test]
+fn descendant_active_lease_protects_its_sidecars_and_aliased_parent() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let dir = scratch();
+        let actual = dir.path().join("actual");
+        let parent = actual.join("target");
+        let nested_root = parent.join("deep/scratch");
+        fs::create_dir_all(&nested_root).unwrap();
+        let lease = descendant_lease(&nested_root);
+        let metadata = lease.metadata_path().to_path_buf();
+        let lock = metadata.with_extension("lock");
+        // Even an incomplete publication or damaged record must preserve
+        // the kernel-owned lock and the target until its holder exits.
+        fs::write(&metadata, b"malformed metadata").unwrap();
+        let alias = dir.path().join("view");
+        symlink(&actual, &alias).unwrap();
+        let aliased_parent = alias.join("target");
+        let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+        for path in [&lock, &metadata, &aliased_parent] {
+            let item = candidate(path);
+            let report = executor.execute(&raw_plan(vec![item.clone()], mode), None);
+            assert_eq!(report.items_deleted, 0, "{mode:?} {path:?}: {report:?}");
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.skipped_by_reason.get("active_lease"), Some(&1));
+            assert_eq!(
+                executor.delete_candidate_checked(&item, None).unwrap(),
+                CheckedDeletion::Skipped(SkipReason::ActiveLease)
+            );
+        }
+        assert!(lock.is_file());
+        assert_eq!(fs::read(&metadata).unwrap(), b"malformed metadata");
+        assert!(nested_root.join("leased-target").is_dir());
+    }
+}
+
+#[test]
+fn descendant_active_lease_lock_alias_is_uncertain_not_released() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let dir = scratch();
+        let parent = dir.path().join("target");
+        let nested_root = parent.join("deep/scratch");
+        fs::create_dir_all(&nested_root).unwrap();
+        let lease = descendant_lease(&nested_root);
+        let lock = lease.metadata_path().with_extension("lock");
+        let retained = dir.path().join("retained-lock");
+        fs::rename(&lock, &retained).unwrap();
+        // The named sidecar no longer supplies a stable lock identity.
+        // Do not follow it or interpret the replacement as a released lease.
+        symlink(&retained, &lock).unwrap();
+        let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+        let report = executor.execute(&raw_plan(vec![candidate(&parent)], mode), None);
+        assert_eq!(report.items_deleted, 0, "{mode:?}: {report:?}");
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.skipped_by_reason.get("active_lease"), Some(&1));
+        assert!(
+            fs::symlink_metadata(&lock)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(retained.is_file());
+        assert!(nested_root.join("leased-target").is_dir());
     }
 }
 

@@ -677,7 +677,7 @@ pub enum SkipReason {
     /// produced by the interactive clean/emergency flows.
     UserDeclined,
     /// A build/test process holds an ephemeral kernel-backed lease on this
-    /// candidate or one of its ancestors. The lease disappears with the
+    /// candidate, an ancestor, or a contained target. The lease disappears with the
     /// process; unlike `.sbh-protect`, it is not permanent policy.
     ActiveLease,
     /// The candidate is, or contains within the bounded containment walk, a
@@ -1422,8 +1422,14 @@ impl DeletionExecutor {
                 }
                 Ok(())
             };
+            let renewal: Option<AuthorizationCheck<'_>> =
+                if should_skip.is_some() || authorize.is_some() {
+                    Some(&renew_authority)
+                } else {
+                    None
+                };
             let (metadata, incremental_guard) =
-                match self.check_before_mutation(candidate, &mut sacred, Some(&renew_authority)) {
+                match self.check_before_mutation(candidate, &mut sacred, renewal) {
                     Ok(metadata) => metadata,
                     Err(reason) => {
                         report.record_skip(reason);
@@ -1457,7 +1463,7 @@ impl DeletionExecutor {
                         .map(|()| CheckedDeletion::Deleted)
                 }
                 DeletionMode::Quarantine => {
-                    self.quarantine_after_check(candidate, &metadata, Some(&renew_authority))
+                    self.quarantine_after_check(candidate, &metadata, renewal)
                 }
             };
             let completed_at = Instant::now();
@@ -1661,7 +1667,9 @@ impl DeletionExecutor {
         // scan/delete race. Locked-but-expired or over-quota targets remain
         // protected until their watchdog terminates the owner and the kernel
         // releases the lock; they are never deleted in the same cycle.
-        if active_lease::path_is_actively_leased(path) {
+        if active_lease::path_is_actively_leased(path)
+            || active_lease::lease_sidecar_blocks_removal(path)
+        {
             return Err(SkipReason::ActiveLease);
         }
 
@@ -1730,14 +1738,7 @@ impl DeletionExecutor {
         //    any depth (bd-jydu). The sacred walk in 6c stops at depth 3, so a
         //    clone deeper inside an agent's temp tree reached remove_dir_all.
         if meta.is_dir() {
-            match deep_containment(path, DEEP_CONTAINMENT_MAX_DIRS) {
-                DeepContainment::Clear => {}
-                DeepContainment::Repository => return Err(SkipReason::ContainsGit),
-                DeepContainment::ProtectMarker | DeepContainment::Truncated => {
-                    return Err(SkipReason::SacredStowaway);
-                }
-                DeepContainment::Incomplete => return Err(SkipReason::ContainmentIncomplete),
-            }
+            Self::check_descendant_protection(path)?;
         }
 
         // A deep source subtree need not contain its repository's .git marker.
@@ -1785,6 +1786,21 @@ impl DeletionExecutor {
         }
 
         Ok(())
+    }
+
+    /// Reuse the bounded containment pass for late leases and protections.
+    /// A caller's authorization can yield or start work below an unchanged
+    /// candidate inode, so its earlier clear pass is not reusable evidence.
+    fn check_descendant_protection(path: &Path) -> std::result::Result<(), SkipReason> {
+        match deep_containment(path, DEEP_CONTAINMENT_MAX_DIRS) {
+            DeepContainment::Clear => Ok(()),
+            DeepContainment::Repository => Err(SkipReason::ContainsGit),
+            DeepContainment::ProtectMarker | DeepContainment::Truncated => {
+                Err(SkipReason::SacredStowaway)
+            }
+            DeepContainment::ActiveLease => Err(SkipReason::ActiveLease),
+            DeepContainment::Incomplete => Err(SkipReason::ContainmentIncomplete),
+        }
     }
 
     // ──────────────────── deletion ────────────────────
@@ -1845,6 +1861,9 @@ impl DeletionExecutor {
         // below: the renewal itself may also block or change the filesystem.
         if let Some(renew_authority) = renew_authority {
             renew_authority(candidate)?;
+            if before.is_dir() {
+                Self::check_descendant_protection(path)?;
+            }
         }
 
         // The shared policy can be replaced while the recursive work runs.
@@ -1864,7 +1883,9 @@ impl DeletionExecutor {
         // Recheck immediately before mutation. A lease can begin after the
         // earlier preflight, and deleting despite the newly held lock would
         // recreate the exact scan/reap race this protection exists to close.
-        if active_lease::path_is_actively_leased(path) {
+        if active_lease::path_is_actively_leased(path)
+            || active_lease::lease_sidecar_blocks_removal(path)
+        {
             return Err(SkipReason::ActiveLease);
         }
         let meta = fs::symlink_metadata(path).map_err(|_| SkipReason::PathGone)?;
@@ -1982,7 +2003,23 @@ impl DeletionExecutor {
             candidate.identity,
             candidate.size_bytes,
         );
-        let renew_authority = || authorize.map_or(Ok(()), |authorize| authorize(candidate));
+        let renew_authority = || {
+            if let Some(authorize) = authorize {
+                authorize(candidate)?;
+            }
+            // Store preparation and fsync can outlive both the open-file
+            // sweep and the earlier containment walk. A lease started there
+            // protects the source before its rename, including nested targets.
+            if metadata.is_dir() {
+                Self::check_descendant_protection(path)?;
+            }
+            if active_lease::path_is_actively_leased(path)
+                || active_lease::lease_sidecar_blocks_removal(path)
+            {
+                return Err(SkipReason::ActiveLease);
+            }
+            Ok(())
+        };
         match store.quarantine_checked(
             path,
             metadata,
@@ -2593,6 +2630,8 @@ enum DeepContainment {
     Clear,
     Repository,
     ProtectMarker,
+    /// A target or acquisition within the candidate still owns its lease lock.
+    ActiveLease,
     /// The directory budget ran out before the subtree was proven clear.
     Truncated,
     /// An entry could not be inspected, including a path that changed
@@ -2665,6 +2704,11 @@ where
             }
             if name == protection::MARKER_FILENAME {
                 return DeepContainment::ProtectMarker;
+            }
+            if active_lease::is_lease_sidecar_name(&name)
+                && active_lease::lease_sidecar_blocks_removal(&entry.path())
+            {
+                return DeepContainment::ActiveLease;
             }
             if file_type.is_dir() && !file_type.is_symlink() {
                 queue.push_back((entry.path(), child_depth));

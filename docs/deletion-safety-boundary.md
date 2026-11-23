@@ -56,6 +56,27 @@ and before moving it. Replacing the source while the store is being prepared
 cannot silently substitute a different payload. The final identity check and
 rename remain separate syscalls.
 
+## Leases protect enclosing cleanup candidates
+
+A live target lease also protects every directory whose removal would consume
+that target. The bounded containment walk recognizes the exact lease lock and
+metadata sidecar names, including the acquisition registry lock. It checks the
+kernel lock without following symlinks or blocking on a replaced special file;
+unreadable, replaced, or otherwise uncertain lock evidence retains the candidate
+with `active_lease`. Malformed or expired metadata does not override a held lock.
+The lock and metadata files themselves receive the same protection when submitted
+as individual cleanup candidates.
+
+Authorization callbacks can start a build after the initial process sweep.
+The executor therefore renews descendant protection after those callbacks and,
+for quarantine, after durable store preparation and before moving the source.
+These passes use the existing directory budget and fail conservatively when it
+is exhausted. Ordinary unlink callers without callbacks do not acquire an extra
+containment pass. Once the lease releases, unlocked regular sidecars do not act
+as permanent protection markers, so the enclosing artifact remains reclaimable.
+This narrows the observation gap; it does not make lease acquisition and an
+entire recursive removal one atomic operation.
+
 ## Process absence is fresh for each deletion batch
 
 Opening an existing object file or changing a process's working directory does
@@ -161,6 +182,11 @@ Containment regressions inject permission, disappearance, and I/O failures at
 directory-open, iterator, and entry-type boundaries, and exercise unreadable
 deep subtrees and Git files through the real filesystem. Refused candidates
 retain their contents and never acquire a quarantine store.
+
+Lease regressions retain enclosing candidates through both public mutation
+backends and checked per-item deletion. They acquire leases at each authorization
+renewal, verify cleanup after release, and cover sidecar file candidates,
+malformed metadata, parent aliases, special files, and lock replacement.
 
 Direct-removal regressions also cover captured-root replacement, parent replacement
 before mutation, symlink substitution at descent/open checkpoints, leaf replacement
