@@ -8860,7 +8860,8 @@ impl MonitoringDaemon {
             }
 
             if let Some(pressure) = &inode_pressure
-                && pressure.pressure_level() > response.level
+                && pressure.pressure_level() >= PressureLevel::Yellow
+                && pressure.pressure_level() >= response.level
                 && pressure.available < pressure.target_available
                 && !stats.is_readonly
                 && let Some(device_id) =
@@ -8887,7 +8888,11 @@ impl MonitoringDaemon {
                 response.urgency = response.urgency.max(urgency);
                 response.scan_interval = response.scan_interval.min(interval);
                 response.max_delete_batch = response.max_delete_batch.max(row.batch_base);
-                response.release_ballast_files = 0;
+                // Tied exhaustion still needs inode authority: a byte or
+                // swap planner cannot choose a zero-byte directory. Keep the
+                // physical reserve response independent; inode severity may
+                // neither suppress byte rescue nor turn it into release-all.
+                response.release_ballast_files = filesystem_response.release_ballast_files;
                 // One resource permission per pass. Inode relief uses actual
                 // inode recovery and a finite artifact count, never swap bytes.
                 ram_reclaim = None;
@@ -9422,10 +9427,18 @@ impl MonitoringDaemon {
             } else {
                 Vec::new()
             };
+            // Inode relief can coincide with physical byte pressure. A pool
+            // remains useful then, but an inode-only escalation must not
+            // borrow the elevated level to spend a healthy disk's reserve.
+            let physical_release_here =
+                behavior_should_release_ballast(self.behavior_state.table().mode_for(
+                    self.behavior_state.memory_level,
+                    tick.filesystem_response.level,
+                )) || tick.imminent_danger;
             let surface = MountSurface {
                 configured_roots: roots_here.len(),
                 catalog_roots: catalog.len(),
-                ballast_pool: has_pool && tick.inode_reclaim.is_none(),
+                ballast_pool: has_pool && (tick.inode_reclaim.is_none() || physical_release_here),
                 cross_device_fallback,
             };
             let recovering = self
@@ -9641,14 +9654,8 @@ impl MonitoringDaemon {
             // the next tick, and refilled it again after each cooldown (#38).
             // The danger is this mount's own forecast: last_predictive_action
             // names only the most severe mount, and two mounts can fill at once.
-            let release_here = release_ballast
-                && tick.ram_reclaim.is_none()
-                && tick.inode_reclaim.is_none()
-                && (behavior_should_release_ballast(
-                    self.behavior_state
-                        .table()
-                        .mode_for(self.behavior_state.memory_level, tick.response.level),
-                ) || tick.imminent_danger);
+            let release_here =
+                release_ballast && tick.ram_reclaim.is_none() && physical_release_here;
 
             let mut files_released = recovery_files_released;
             match decision.state {
@@ -9658,7 +9665,9 @@ impl MonitoringDaemon {
                         && !recovery_pools.contains(&refill_mount)
                     {
                         ballast_release_attempted.insert(refill_mount.clone());
-                        let release_response = if predictive_cleanup_mount(tick).is_some() {
+                        let release_response = if tick.inode_reclaim.is_some()
+                            || predictive_cleanup_mount(tick).is_some()
+                        {
                             &tick.filesystem_response
                         } else {
                             &tick.response
@@ -27124,6 +27133,188 @@ mod tests {
                 .authorize_dispatch(false, true),
             Err(SkipReason::PolicyChanged)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn competing_critical_resources_keep_bounded_inode_relief() {
+        use crate::platform::pal::{InodeStats, PlatformPaths};
+
+        for (kind, free_gib, available_inodes, expect_inode) in [
+            ("ext4", 1, 0, true),
+            ("tmpfs", 70, 0, true),
+            ("tmpfs", 1, 0, true),
+            ("ext4", 1, 300, false),
+            ("tmpfs", 70, 300, false),
+            // Green inode capacity can be below the hysteresis goal without
+            // constituting a shortage. A level tie alone grants no authority.
+            ("ext4", 70, 1025, false),
+        ] {
+            let mut fixture = RegretDaemonFixture::new();
+            let memory = exhausted_swap_sample();
+            let (mount, _) = install_tmpfs_pressure_probe(
+                &mut fixture,
+                memory.clone(),
+                kind,
+                free_gib << 30,
+                false,
+            );
+            let mounts = fixture.daemon.platform.mount_points().unwrap();
+            let stats = mounts
+                .iter()
+                .map(|mount| {
+                    (
+                        mount.path.clone(),
+                        fixture.daemon.platform.fs_stats(&mount.path).unwrap(),
+                    )
+                })
+                .collect();
+            let platform: Arc<dyn Platform> = Arc::new(
+                MockPlatform::new(mounts, stats, memory, PlatformPaths::default())
+                    .with_inode_stats(HashMap::from([(
+                        mount.clone(),
+                        InodeStats::new(10_000, available_inodes, available_inodes).unwrap(),
+                    )]))
+                    .with_home(fixture.directory.path())
+                    .with_temp_dirs(Vec::new())
+                    .with_cache_roots(Vec::new()),
+            );
+            let daemon = &mut fixture.daemon;
+            daemon.platform = Arc::clone(&platform);
+            daemon.fs_collector = FsStatsCollector::new(platform, Duration::ZERO);
+            daemon.config.scanner.max_delete_batch = 2;
+            daemon.config.scanner.quarantine_enabled = false;
+            *daemon.shared_scanner_config.write() = daemon.config.scanner.clone();
+            let response = daemon.check_pressure().unwrap();
+            let tick = daemon
+                .mount_responses
+                .iter()
+                .find(|tick| tick.response.causing_mount == mount)
+                .unwrap()
+                .clone();
+            assert_eq!(
+                tick.inode_reclaim.is_some(),
+                expect_inode,
+                "{kind}, free={free_gib}, inodes={available_inodes}"
+            );
+            if !expect_inode {
+                assert_eq!(tick.ram_reclaim.is_some(), kind == "tmpfs");
+                continue;
+            }
+            assert_eq!(response.level, PressureLevel::Critical);
+            assert!(tick.ram_reclaim.is_none());
+            assert!(tick.backing_pressure.is_none());
+            assert_eq!(
+                tick.response.release_ballast_files, tick.filesystem_response.release_ballast_files,
+                "inode severity cannot replace the physical reserve response"
+            );
+            assert_eq!(
+                tick.inode_reclaim.as_ref().unwrap().remaining_artifacts(),
+                2
+            );
+            daemon.update_behavior_mode(
+                MemoryPressureLevel::Normal,
+                response.level,
+                "startup",
+                Duration::ZERO,
+            );
+            let request = daemon
+                .prepare_scan_request(
+                    &tick.response,
+                    std::slice::from_ref(&mount),
+                    None,
+                    tick.inode_reclaim,
+                )
+                .unwrap();
+            assert!(request.force_full_scan);
+            assert!(!request.bypass_scan_pacing());
+            assert_eq!(request.target_bytes, None);
+            let path = mount.join("target");
+            std::fs::create_dir(&path).unwrap();
+            let mut candidate = test_candidate(&path.to_string_lossy(), 0.9);
+            candidate.size_bytes = 0;
+            candidate.identity = crate::scanner::walker::identity_for_path(&path, false).ok();
+            candidate.decision.certainty = ArtifactCertainty::Definite;
+            let (del_tx, del_rx) = bounded(4);
+            assert!(dispatch_with_behavior_gate(
+                &mut vec![candidate],
+                &request,
+                &del_tx,
+                &mut PassDispatch::default(),
+                &daemon.shared_executor_config,
+            ));
+            let mut batch = del_rx
+                .try_recv()
+                .expect("competing pressure cannot discard zero-byte inode relief");
+            assert_eq!(drop_zero_byte_candidates(&mut batch), 0);
+            let plan = batch.plan_request(&daemon.shared_executor_config, 10);
+            assert_eq!(plan.objective, PlanObjective::ArtifactRemovals);
+            assert_eq!(plan.target_bytes, None);
+            assert_eq!(plan.max_items, 2);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inode_relief_preserves_only_its_filesystems_physical_ballast_response() {
+        for configured_root in [true, false] {
+            for (level, remaining) in [
+                (PressureLevel::Green, 2),
+                (PressureLevel::Yellow, 2),
+                (PressureLevel::Orange, 1),
+                (PressureLevel::Critical, 0),
+            ] {
+                let (mut fixture, mount) = ballast_release_fixture();
+                let daemon = &mut fixture.daemon;
+                assert_eq!(
+                    daemon
+                        .ballast_coordinator
+                        .provision_all(daemon.platform.as_ref())
+                        .unwrap()
+                        .total_files_created(),
+                    2
+                );
+                daemon.config.scanner.quarantine_enabled = false;
+                daemon.config.scanner.catalog_roots_on_pressured_device = false;
+                daemon.config.pressure.maintenance_interval_secs = 0;
+                if !configured_root {
+                    daemon.config.scanner.root_paths.clear();
+                }
+                *daemon.shared_scanner_config.write() = daemon.config.scanner.clone();
+                daemon.behavior_state = PressureBehaviorState::new(
+                    BehaviorDispatchTable::default(),
+                    MemoryPressureLevel::Normal,
+                    PressureLevel::Critical,
+                );
+                daemon.enable_background_filesystem_observations();
+                wait_for_ballast_release_evidence(daemon, &mount);
+                let mut tick = quarantine_tick(level, &mount);
+                tick.filesystem_response.urgency = 0.0;
+                tick.filesystem_response.release_ballast_files = 1;
+                tick.response.level = PressureLevel::Critical;
+                tick.response.urgency = 1.0;
+                tick.inode_reclaim = Some(InodeReclaimRequest::new(
+                    mount.clone(),
+                    crate::scanner::walker::device_id(&std::fs::metadata(&mount).unwrap()),
+                    10_000,
+                    1_050,
+                    2,
+                    &daemon.config.pressure.inodes,
+                    &daemon.config.scanner.root_paths,
+                ));
+                daemon.mount_responses = vec![tick.clone()];
+                let (scan_tx, scan_rx) = bounded(4);
+                let (del_tx, _del_rx) = bounded(4);
+                daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+                assert_eq!(
+                    finish_ballast_releases(daemon),
+                    2 - remaining,
+                    "{level:?}, configured root={configured_root}"
+                );
+                assert_eq!(daemon.ballast_available_for_release(&mount), remaining);
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
