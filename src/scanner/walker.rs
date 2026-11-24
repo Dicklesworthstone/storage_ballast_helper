@@ -1177,7 +1177,6 @@ impl DirectoryWalker {
     /// walker's cancel flag, so one walker serves one stream.
     pub fn stream(&self) -> Result<WalkStream> {
         let exclusions = WalkExclusions::new(&self.config)?;
-        let parallelism = self.config.parallelism.max(1);
         let dispatch_cursor = self
             .dispatch_cursor
             .as_ref()
@@ -1258,7 +1257,7 @@ impl DirectoryWalker {
             exclusions,
         });
         // Clone sender for workers; drop original so channel closes when workers finish.
-        for _ in 0..parallelism {
+        for _ in 0..work.worker_count(self.config.parallelism, self.config.cross_devices) {
             let work = Arc::clone(&work);
             let result_tx = result_tx.clone();
             let config = self.config.clone();

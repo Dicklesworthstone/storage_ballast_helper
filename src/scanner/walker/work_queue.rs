@@ -116,6 +116,28 @@ impl WorkQueue {
         self.rx.is_empty()
     }
 
+    /// Size the pool after seeding, before the first worker starts. A walk
+    /// confined to btrfs can only service the slots on its distinct root
+    /// devices. Extra workers would compete for each handoff and wake every
+    /// receive timeout for the duration of a large CLI scan.
+    pub(super) fn worker_count(&self, configured: usize, cross_devices: bool) -> usize {
+        if self.is_finished() {
+            return 0;
+        }
+        let configured = configured.max(1);
+        if cross_devices {
+            return configured;
+        }
+        let filesystems = self.filesystems.lock();
+        if filesystems
+            .values()
+            .all(|kind| *kind == FilesystemKind::Btrfs)
+        {
+            return configured.min(filesystems.len() * MAX_ACTIVE_BTRFS_DIRECTORIES);
+        }
+        configured
+    }
+
     pub(super) fn is_finished(&self) -> bool {
         self.in_flight.load(Ordering::Acquire) == 0
     }
@@ -205,6 +227,26 @@ mod tests {
             dispatch: None,
             completion: TaskCompletion::default(),
         }
+    }
+
+    #[test]
+    fn worker_pool_matches_reachable_device_slots() {
+        let work = WorkQueue::new();
+        assert_eq!(work.worker_count(64, false), 0);
+        for (path, dev) in [("/root/a", 41), ("/root/b", 41), ("/ssd", 42)] {
+            work.mark_btrfs(dev);
+            work.enqueue(item(path, dev, FilesystemKind::Btrfs));
+        }
+        assert_eq!(
+            work.worker_count(64, false),
+            2 * MAX_ACTIVE_BTRFS_DIRECTORIES
+        );
+        assert_eq!(work.worker_count(0, false), 1);
+        // Descendants can introduce unconstrained work on a crossed mount.
+        assert_eq!(work.worker_count(64, true), 64);
+        work.filesystems.lock().insert(43, FilesystemKind::Other);
+        work.enqueue(item("/data", 43, FilesystemKind::Other));
+        assert_eq!(work.worker_count(64, false), 64);
     }
 
     #[test]
