@@ -1660,10 +1660,6 @@ fn process_directory(
                 windows.reads.lock().discard(dir_path, &read);
                 return; // Skip rest of directory — protected subtree.
             }
-            "incremental" => read.signals.has_incremental = true,
-            "deps" => read.signals.has_deps = true,
-            "build" => read.signals.has_build = true,
-            ".fingerprint" => read.signals.has_fingerprint = true,
             ".git" => read.signals.has_git = true,
             // Root-level cache-directory tag (Cache Directory Tagging
             // Standard, case-sensitive uppercase per the spec). This is the
@@ -1673,6 +1669,7 @@ fn process_directory(
             // Validate the signature line so an unrelated file that merely
             // shares the name cannot mark a directory reclaimable.
             "CACHEDIR.TAG" => {
+                read.has_cache_tag_name = true;
                 if is_valid_cachedir_tag(&entry.path()) {
                     read.signals.has_cachedir_tag = true;
                 }
@@ -1688,19 +1685,12 @@ fn process_directory(
             | "bun.lockb" => {
                 read.parent_has_node_manifest = true;
             }
-            _ => {}
+            _ => note_build_marker(&mut read.signals, &name),
         }
 
         // Check extension for object file heuristics.
-        if let Some(ext) = Path::new(&name_os).extension() {
-            let ext_str = ext.to_string_lossy();
-            if ext_str.eq_ignore_ascii_case("o")
-                || ext_str.eq_ignore_ascii_case("rlib")
-                || ext_str.eq_ignore_ascii_case("rmeta")
-                || ext_str.eq_ignore_ascii_case("d")
-            {
-                read.object_count = read.object_count.saturating_add(1);
-            }
+        if is_object_name(&name_os) {
+            read.object_count = read.object_count.saturating_add(1);
         }
 
         if !window.contains(&index) {
@@ -1793,7 +1783,8 @@ fn process_directory(
                 return;
             }
         }
-        let tagged = is_valid_cachedir_tag(&dir_path.join("CACHEDIR.TAG"));
+        let tagged =
+            read.has_cache_tag_name && is_valid_cachedir_tag(&dir_path.join("CACHEDIR.TAG"));
         if tagged != read.signals.has_cachedir_tag {
             read.observed.store(false, Ordering::Relaxed);
         }
@@ -2327,48 +2318,58 @@ pub fn structural_signals_for_path(path: &Path) -> StructuralSignals {
     let Ok(entries) = fs::read_dir(path) else {
         return StructuralSignals::default();
     };
-    let mut has_tag_name = false;
-    let names: Vec<String> = entries
-        .flatten()
-        .map(|entry| {
-            let name = entry.file_name();
-            // Keep the actual spelling before lowercasing heuristic markers.
-            // A case-insensitive filesystem must not make replay accept a
-            // lowercase tag that the live walker would ignore.
-            has_tag_name |= name == "CACHEDIR.TAG";
-            name.to_string_lossy().to_lowercase()
-        })
-        .collect();
-    let mut signals = signals_from_children(&names);
-    signals.has_cachedir_tag = has_tag_name && is_valid_cachedir_tag(&path.join("CACHEDIR.TAG"));
-    signals
+    signals_from_children(entries.flatten().map(|entry| entry.file_name()), path)
 }
 
-/// Build `StructuralSignals` by checking presence of well-known child names.
-fn signals_from_children(child_names: &[String]) -> StructuralSignals {
+/// Positive build-layout evidence uses the spelling observed by the live walk.
+fn note_build_marker(signals: &mut StructuralSignals, name: &str) {
+    match name {
+        "incremental" => signals.has_incremental = true,
+        "deps" => signals.has_deps = true,
+        "build" => signals.has_build = true,
+        ".fingerprint" => signals.has_fingerprint = true,
+        _ => {}
+    }
+}
+
+fn is_object_name(name: &std::ffi::OsStr) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| {
+            ["o", "rlib", "rmeta", "d"]
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
+}
+
+fn signals_from_children(
+    child_names: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+    path: &Path,
+) -> StructuralSignals {
     let mut signals = StructuralSignals::default();
-    let mut object_count = 0u32;
-    let mut total_count = 0u32;
+    let mut object_count = 0u64;
+    let mut total_count = 0u64;
 
     for name in child_names {
         total_count += 1;
-        match name.as_str() {
-            "incremental" => signals.has_incremental = true,
-            "deps" => signals.has_deps = true,
-            "build" => signals.has_build = true,
-            ".fingerprint" => signals.has_fingerprint = true,
-            ".git" => signals.has_git = true,
-            "cargo.toml" => signals.has_cargo_toml = true,
-            "pyvenv.cfg" => signals.has_pyvenv_cfg = true,
-            // A name list cannot establish cache-tag contents or file type.
-            // Live collection and replay both validate that evidence on disk.
-            _ => {}
+        let name = name.as_ref();
+        let spelling = name.to_string_lossy();
+        // Keep replay's conservative source and venv vetoes, including on
+        // case-insensitive volumes. Case-folding may suppress cleanup, but
+        // must never manufacture affirmative build or cache evidence.
+        if spelling.eq_ignore_ascii_case(".git") {
+            signals.has_git = true;
+        } else if spelling.eq_ignore_ascii_case("cargo.toml") {
+            signals.has_cargo_toml = true;
+        } else if spelling.eq_ignore_ascii_case("pyvenv.cfg") {
+            signals.has_pyvenv_cfg = true;
+        } else if spelling == "CACHEDIR.TAG" {
+            signals.has_cachedir_tag = is_valid_cachedir_tag(&path.join("CACHEDIR.TAG"));
+        } else {
+            note_build_marker(&mut signals, &spelling);
         }
-        // Names are already lowercased, so case-insensitive matching is not needed.
-        let ext = std::path::Path::new(name.as_str())
-            .extension()
-            .map(|e| e.to_string_lossy());
-        if matches!(ext.as_deref(), Some("o" | "rlib" | "rmeta" | "d")) {
+        if is_object_name(name) {
             object_count += 1;
         }
     }
@@ -7183,6 +7184,38 @@ mod tests {
     }
 
     #[test]
+    fn mixed_case_layout_cannot_add_build_evidence_on_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("project");
+        for marker in ["Deps", "BUILD", ".Fingerprint", "Incremental"] {
+            fs::create_dir_all(dir.join(marker)).unwrap();
+        }
+        fs::write(dir.join("cachedir.tag"), CACHEDIR_TAG_SIGNATURE).unwrap();
+        let mut config = test_config(temp.path());
+        config.opaque_pruning = false;
+        let replayed = structural_signals_for_path(&dir);
+        assert!(!replayed.has_strong_signal());
+        // The second pass reuses the first pass's listing. On a
+        // case-insensitive filesystem an uppercase lookup would open the
+        // lowercase tag, despite neither scan ever seeing the required name.
+        for _ in 0..2 {
+            let walked = DirectoryWalker::new(config.clone(), ProtectionRegistry::marker_only())
+                .without_file_sizes()
+                .walk()
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.path == dir)
+                .unwrap();
+            assert_eq!(walked.structural_signals, replayed);
+        }
+        for marker in [".GiT", "CARGO.TOML", "PYVENV.CFG"] {
+            fs::write(dir.join(marker), "").unwrap();
+        }
+        let guarded = structural_signals_for_path(&dir);
+        assert!(guarded.has_git && guarded.has_cargo_toml && guarded.has_pyvenv_cfg);
+    }
+
+    #[test]
     fn signals_from_children_detects_rust_markers() {
         let names = vec![
             "incremental".to_string(),
@@ -7192,7 +7225,7 @@ mod tests {
             "debug".to_string(),
             "release".to_string(),
         ];
-        let signals = signals_from_children(&names);
+        let signals = signals_from_children(&names, Path::new("."));
         assert!(signals.has_incremental);
         assert!(signals.has_deps);
         assert!(signals.has_fingerprint);
@@ -7209,7 +7242,7 @@ mod tests {
             "baz.rmeta".to_string(),
             "deps.d".to_string(),
         ];
-        let signals = signals_from_children(&names);
+        let signals = signals_from_children(&names, Path::new("."));
         assert!(signals.mostly_object_files);
     }
 
