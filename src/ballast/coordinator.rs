@@ -2652,6 +2652,13 @@ mod tests {
                 .unwrap().provision(None).unwrap();
             coordinator.pools.get_mut(mount.path()).unwrap().stranded =
                 StrandedReserve::discover(&[first.clone(), second.clone()], &managed, mount.path());
+            let cached_available = coordinator
+                .pool_for_mount(mount.path())
+                .unwrap()
+                .available_count();
+            // The cache still includes three removed managed slots alongside
+            // the six adopted slots. Only a complete result may replace it.
+            assert_eq!(cached_available, 9);
 
             let last = first.join("SBH_BALLAST_FILE_00003.dat");
             let interrupted = Cell::new(false);
@@ -2673,7 +2680,10 @@ mod tests {
             let budget = task.release_budget().unwrap();
             assert!(coordinator.release_budget_is_current(&task));
             assert!(!coordinator.finish_release(task));
-            assert_eq!(coordinator.pool_for_mount(mount.path()).unwrap().available_count(), 6);
+            assert_eq!(
+                coordinator.pool_for_mount(mount.path()).unwrap().available_count(),
+                cached_available,
+            );
 
             let mut controller = BallastReleaseController::new(0);
             controller.apply_release_budget(mount.path(), budget);
