@@ -2048,6 +2048,55 @@ fn send_worker_report(
 /// main loop's state (the self monitor, the ballast coordinator).
 pub const CONTROL_CHANNEL_CAP: usize = 16;
 
+/// The monitor claims a queued command before mutating state. The connection
+/// worker can cancel an unclaimed command when its reply deadline expires.
+#[derive(Debug)]
+struct ControlAdmission {
+    deadline: Instant,
+    available: AtomicBool,
+}
+
+impl ControlAdmission {
+    fn new(budget: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + budget,
+            available: AtomicBool::new(true),
+        }
+    }
+
+    fn expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
+    fn try_start(&self) -> bool {
+        !self.expired() && self.available.swap(false, Ordering::AcqRel)
+    }
+
+    fn expired_response() -> ControlResponse {
+        ControlResponse::failure("timeout", "the queued command expired before it started")
+    }
+
+    fn close_wait(&self, error: crossbeam_channel::RecvTimeoutError) -> ControlResponse {
+        let (code, before_start) = match error {
+            crossbeam_channel::RecvTimeoutError::Timeout => {
+                ("timeout", "the queued command expired before it started")
+            }
+            crossbeam_channel::RecvTimeoutError::Disconnected => (
+                "unavailable",
+                "the daemon stopped handling the queued command before it started",
+            ),
+        };
+        if self.available.swap(false, Ordering::AcqRel) {
+            ControlResponse::failure(code, before_start)
+        } else {
+            ControlResponse::failure(
+                code,
+                "the daemon admitted the command but its outcome is unknown; inspect status before retrying",
+            )
+        }
+    }
+}
+
 #[derive(Debug)]
 enum MainLoopCommand {
     /// Break the tick sleep so a signal-flag request runs now.
@@ -2058,12 +2107,14 @@ enum MainLoopCommand {
     ScanNow {
         paths: Vec<PathBuf>,
         force: bool,
+        admission: Arc<ControlAdmission>,
         reply: Sender<ControlResponse>,
     },
     /// Release or replenish ballast through the coordinator.
     Ballast {
         action: ControlBallastAction,
-        reply: Sender<std::result::Result<Value, String>>,
+        admission: Arc<ControlAdmission>,
+        reply: Sender<ControlResponse>,
     },
 }
 
@@ -2136,7 +2187,7 @@ impl DaemonControlBackend {
         {
             return ControlResponse::failure("busy", "the main loop command queue is full");
         }
-        match reply_rx.recv_timeout(Duration::from_secs(10)) {
+        match reply_rx.recv_timeout(crate::daemon::control::STATUS_REPLY_BUDGET) {
             Ok(()) => match SelfMonitor::read_state(&self.state_file) {
                 Ok(state) => match serde_json::to_value(state) {
                     Ok(value) => ControlResponse::success(value),
@@ -2151,27 +2202,36 @@ impl DaemonControlBackend {
         }
     }
 
-    fn scan_now(&self, paths: Vec<PathBuf>, force: bool) -> ControlResponse {
+    fn run_queued_mutation(
+        &self,
+        budget: Duration,
+        command: impl FnOnce(Arc<ControlAdmission>, Sender<ControlResponse>) -> MainLoopCommand,
+    ) -> ControlResponse {
+        let admission = Arc::new(ControlAdmission::new(budget));
         let (reply_tx, reply_rx) = bounded(1);
         if self
             .control_tx
-            .try_send(MainLoopCommand::ScanNow {
-                paths,
-                force,
-                reply: reply_tx,
-            })
+            .try_send(command(Arc::clone(&admission), reply_tx))
             .is_err()
         {
             return ControlResponse::failure("busy", "the main loop command queue is full");
         }
-        reply_rx
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap_or_else(|_| {
-                ControlResponse::failure(
-                    "timeout",
-                    "the main loop did not accept the scan request within 10 s",
-                )
-            })
+        match reply_rx.recv_deadline(admission.deadline) {
+            Ok(response) => response,
+            Err(error) => admission.close_wait(error),
+        }
+    }
+
+    fn scan_now(&self, paths: Vec<PathBuf>, force: bool) -> ControlResponse {
+        self.run_queued_mutation(
+            crate::daemon::control::SCAN_REPLY_BUDGET,
+            |admission, reply| MainLoopCommand::ScanNow {
+                paths,
+                force,
+                admission,
+                reply,
+            },
+        )
     }
 
     fn explain(&self, id: &str) -> ControlResponse {
@@ -2201,25 +2261,14 @@ impl DaemonControlBackend {
     }
 
     fn ballast(&self, action: ControlBallastAction) -> ControlResponse {
-        let (reply_tx, reply_rx) = bounded::<std::result::Result<Value, String>>(1);
-        if self
-            .control_tx
-            .try_send(MainLoopCommand::Ballast {
+        self.run_queued_mutation(
+            crate::daemon::control::BALLAST_REPLY_BUDGET,
+            |admission, reply| MainLoopCommand::Ballast {
                 action,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            return ControlResponse::failure("busy", "the main loop command queue is full");
-        }
-        match reply_rx.recv_timeout(Duration::from_secs(60)) {
-            Ok(Ok(result)) => ControlResponse::success(result),
-            Ok(Err(error)) => ControlResponse::failure("failed", error),
-            Err(_) => ControlResponse::failure(
-                "timeout",
-                "the main loop did not finish the ballast action within 60 s",
-            ),
-        }
+                admission,
+                reply,
+            },
+        )
     }
 }
 
@@ -6775,8 +6824,13 @@ impl MonitoringDaemon {
                 MainLoopCommand::ScanNow {
                     paths,
                     force,
+                    admission,
                     reply,
                 } => {
+                    if admission.expired() {
+                        let _ = reply.try_send(ControlAdmission::expired_response());
+                        continue;
+                    }
                     let scopes = ScanNowScope::capture(&paths, force, &self.config.scanner)
                         .and_then(|scope| {
                             scope.partition(|path| {
@@ -6787,6 +6841,7 @@ impl MonitoringDaemon {
                             })
                         });
                     let response = match scopes {
+                        Ok(_) if !admission.try_start() => ControlAdmission::expired_response(),
                         Ok(scopes) => {
                             let paths: Vec<PathBuf> =
                                 scopes.iter().flat_map(ScanNowScope::paths).collect();
@@ -6808,8 +6863,19 @@ impl MonitoringDaemon {
                     };
                     let _ = reply.try_send(response);
                 }
-                MainLoopCommand::Ballast { action, reply } => {
-                    let result = self.execute_ballast_action(&action);
+                MainLoopCommand::Ballast {
+                    action,
+                    admission,
+                    reply,
+                } => {
+                    let result = if admission.try_start() {
+                        match self.execute_ballast_action(&action) {
+                            Ok(result) => ControlResponse::success(result),
+                            Err(error) => ControlResponse::failure("failed", error),
+                        }
+                    } else {
+                        ControlAdmission::expired_response()
+                    };
                     let _ = reply.try_send(result);
                 }
             }
@@ -18925,6 +18991,59 @@ mod tests {
         for n in 1..=2 {
             assert!(daemon.config.paths.ballast_dir.join(format!("SBH_BALLAST_FILE_{n:05}.dat")).exists());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_control_requests_leave_ballast_and_scan_queue_untouched() {
+        let (mut fixture, mount) = recovery_reserve_fixture();
+        let daemon = &mut fixture.daemon;
+        assert_eq!(
+            daemon
+                .ballast_coordinator
+                .provision_all(daemon.platform.as_ref())
+                .unwrap()
+                .total_files_created(),
+            2
+        );
+        let cancellation = Arc::new(ControlAdmission::new(Duration::from_secs(60)));
+        assert!(
+            cancellation
+                .close_wait(crossbeam_channel::RecvTimeoutError::Timeout)
+                .error.unwrap().message.contains("before it started")
+        );
+        for admission in [cancellation, Arc::new(ControlAdmission::new(Duration::ZERO))] {
+            let (reply, result) = bounded(1);
+            daemon.pending_control.push(MainLoopCommand::Ballast {
+                action: ControlBallastAction::Release {
+                    mount: Some(mount.clone()),
+                    count: 1,
+                },
+                admission,
+                reply,
+            });
+            daemon.drain_control_commands();
+            assert_eq!(result.try_recv().unwrap().error.unwrap().code, "timeout");
+            assert_eq!(daemon.ballast_available_for_release(&mount), 2);
+        }
+        let (reply, result) = bounded(1);
+        daemon.pending_control.push(MainLoopCommand::ScanNow {
+            paths: daemon.config.scanner.root_paths.clone(),
+            force: true,
+            admission: Arc::new(ControlAdmission::new(Duration::ZERO)),
+            reply,
+        });
+        daemon.drain_control_commands();
+        assert_eq!(result.try_recv().unwrap().error.unwrap().code, "timeout");
+        assert!(daemon.scan_now_queue.lock().paths().is_empty());
+
+        let admitted = ControlAdmission::new(Duration::from_secs(60));
+        assert!(admitted.try_start());
+        assert!(
+            admitted
+                .close_wait(crossbeam_channel::RecvTimeoutError::Timeout)
+                .error.unwrap().message.contains("outcome is unknown")
+        );
     }
 
     #[cfg(unix)]

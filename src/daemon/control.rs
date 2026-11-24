@@ -57,6 +57,22 @@ pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// Budget for each read/write phase, not a fresh timeout per partial syscall.
 /// Backend execution has its own timeout policy; it is not cancelled by I/O.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const STATUS_REPLY_BUDGET: Duration = Duration::from_secs(10);
+pub(super) const SCAN_REPLY_BUDGET: Duration = Duration::from_secs(10);
+pub(super) const BALLAST_REPLY_BUDGET: Duration = Duration::from_secs(60);
+
+/// A dispatched request can legitimately wait for the monitor before the
+/// response is ready. Keep the extra I/O budget for response delivery.
+fn response_budget(cmd: &str) -> Duration {
+    let backend = match cmd {
+        "status" => STATUS_REPLY_BUDGET,
+        "scan-now" | "scan_now" => SCAN_REPLY_BUDGET,
+        "ballast" => BALLAST_REPLY_BUDGET,
+        _ => Duration::ZERO,
+    };
+    backend + IO_TIMEOUT
+}
+
 /// How often the listener thread checks the shutdown flag while idle.
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
 
@@ -759,16 +775,23 @@ pub fn request(
         source,
     };
     let write_error = transport::write_frame(&stream, &line, Instant::now(), IO_TIMEOUT).err();
-    let reply = transport::read_frame(&stream, MAX_RESPONSE_BYTES, Instant::now(), IO_TIMEOUT)
-        .map_err(|error| {
-            io(write_error.as_ref().map_or(error, |write_error| {
-                std::io::Error::new(write_error.kind(), write_error.to_string())
-            }))
+    let outcome_hint = if write_error.is_none() && matches!(cmd, "ballast" | "scan-now" | "scan_now") {
+        "; command outcome is unknown, inspect status before retrying"
+    } else {
+        ""
+    };
+    let reply = transport::read_frame(&stream, MAX_RESPONSE_BYTES, Instant::now(), response_budget(cmd))
+        .map_err(|error| match &write_error {
+            Some(write_error) => io(std::io::Error::new(write_error.kind(), write_error.to_string())),
+            None if !outcome_hint.is_empty() => io(std::io::Error::new(
+                error.kind(), format!("{error}{outcome_hint}"),
+            )),
+            None => io(error),
         })?;
     if reply.iter().all(u8::is_ascii_whitespace) {
         return Err(SbhError::Runtime {
             details: format!(
-                "{}: the daemon closed the connection without answering",
+                "{}: the daemon closed the connection without answering{outcome_hint}",
                 socket_path.display()
             ),
         });
@@ -776,7 +799,7 @@ pub fn request(
     let response: ControlResponse =
         serde_json::from_slice(&reply).map_err(|error| SbhError::Serialization {
             context: "control response",
-            details: error.to_string(),
+            details: format!("{error}{outcome_hint}"),
         })?;
     // Admission can refuse and close before the client's first write. Surface
     // that explicit pre-dispatch refusal, not an incidental BrokenPipe. Never

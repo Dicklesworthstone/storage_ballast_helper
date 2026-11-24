@@ -56,6 +56,29 @@ fn admission_reserves_capacity_before_any_worker_can_run() {
 }
 
 #[test]
+fn a_lost_reply_after_ballast_dispatch_reports_an_unknown_outcome() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("control.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let frame = transport::read_frame(&stream, MAX_LINE_BYTES, Instant::now(), IO_TIMEOUT)
+            .unwrap();
+        let request: ControlRequest = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(request.cmd, "ballast");
+        // The command reached the server, but its receipt never reached the client.
+    });
+    let error = request(&path, "secret", "ballast", &json!({"release": 1})).unwrap_err();
+    server.join().unwrap();
+    assert!(error.to_string().contains("outcome is unknown"));
+    assert!(response_budget("ballast") > BALLAST_REPLY_BUDGET);
+    for cmd in ["scan-now", "scan_now"] {
+        assert!(response_budget(cmd) > SCAN_REPLY_BUDGET);
+    }
+    assert_eq!(response_budget("ping"), IO_TIMEOUT);
+}
+
+#[test]
 fn a_rate_limited_connection_returns_its_reserved_slot() {
     let shared = shared(Arc::new(CountingBackend(AtomicUsize::new(0))));
     let now = Instant::now();
