@@ -10364,9 +10364,6 @@ impl MonitoringDaemon {
     /// manager identity checks and the nonblocking pool lock remain authoritative.
     fn release_recovery_ballast(&mut self, mount: &Path, response: &PressureResponse) -> usize {
         let pool_mount = self.pool_mount(mount);
-        if self.ballast_available_for_release(mount) == 0 {
-            return 0;
-        }
         let now = Instant::now();
         // A running request needs fresh evidence even after its retry clock
         // was spent. A queued request spends that clock only when it starts.
@@ -10379,6 +10376,8 @@ impl MonitoringDaemon {
         {
             return 0;
         }
+        // An empty inventory hint can precede external provisioning. Recovery
+        // needs the worker's current, locked inventory to decide what exists.
         let _ = self.request_ballast_release(mount, response, true);
         // Completion, inventory and released-byte credit arrive via the worker.
         0
@@ -18577,6 +18576,65 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn recovery_ballast_releases_external_reserve_before_inventory_refresh() {
+        let (mut fixture, mount) = recovery_reserve_fixture();
+        let daemon = &mut fixture.daemon;
+        let mount = mount.as_path();
+        wait_for_ballast_observation(daemon, mount, 0);
+
+        let mut external = DiscoverySnapshot::collect(&daemon.config, &daemon.platform)
+            .unwrap()
+            .ballast_coordinator;
+        assert_eq!(
+            external
+                .provision_all(daemon.platform.as_ref())
+                .unwrap()
+                .total_files_created(),
+            2
+        );
+        let pool = daemon.ballast_coordinator.pool_for_mount(mount).unwrap();
+        let directory = pool.ballast_dir.clone();
+        assert_eq!(pool.available_count(), 0);
+        assert_eq!(
+            daemon
+                .ballast_reserve_monitor
+                .release_count_hint(mount, &directory, Instant::now()),
+            Some(0),
+            "a recent empty observation must not hide the new native reserve"
+        );
+        assert_eq!(daemon.ballast_available_for_release(mount), 0);
+        for index in 1..=2 {
+            assert!(
+                directory
+                    .join(format!("SBH_BALLAST_FILE_{index:05}.dat"))
+                    .exists()
+            );
+        }
+
+        let tick = quarantine_tick(PressureLevel::Critical, mount);
+        let (scan_tx, scan_rx) = bounded(4);
+        let (del_tx, _del_rx) = bounded(4);
+        daemon.pending_recovery.insert(mount.to_path_buf());
+        daemon.mount_responses = vec![tick.clone()];
+        daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(
+            daemon.mount_controllers[mount].state(),
+            MountState::Recovery
+        );
+        assert_eq!(finish_ballast_releases(daemon), 2);
+        assert!(scan_rx.is_empty(), "Recovery still holds ordinary cleanup");
+        assert!(daemon.last_tick_cleanup_ran);
+        for index in 1..=2 {
+            assert!(
+                !directory
+                    .join(format!("SBH_BALLAST_FILE_{index:05}.dat"))
+                    .exists()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn recovery_ballast_releases_external_reserve_after_the_entry_tick() {
         let (mut fixture, mount) = recovery_reserve_fixture();
         let daemon = &mut fixture.daemon;
@@ -18591,6 +18649,7 @@ mod tests {
             daemon.mount_controllers[mount].state(),
             MountState::Recovery
         );
+        assert_eq!(finish_ballast_releases(daemon), 0);
         assert_eq!(daemon.ballast_available_for_release(mount), 0);
         assert!(!daemon.last_tick_cleanup_ran);
         wait_for_ballast_observation(daemon, mount, 0);
@@ -18626,6 +18685,18 @@ mod tests {
             0,
             "external reserve must not require cached actuator inventory"
         );
+        // Entry now performs a real empty native attempt. Keep the retry
+        // paced even when new reserve is observed before the next poll.
+        daemon
+            .mount_controllers
+            .get_mut(mount)
+            .unwrap()
+            .note_recovery_release_attempt(
+                Instant::now()
+                    .checked_sub(crate::daemon::mount_controller::RECOVERY_POLL_INTERVAL)
+                    .unwrap(),
+            );
+        daemon.ballast_releaser.elapse_retry_interval(mount);
         daemon.mount_responses = vec![tick.clone()];
         daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
         assert_eq!(
