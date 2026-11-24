@@ -1493,6 +1493,23 @@ impl BallastPoolCoordinator {
         }
     }
 
+    /// Withdraw routes invalidated by a remount without touching native files.
+    /// A changed alias leaves its keeper and the other aliases usable; a
+    /// changed keeper invalidates every alias that still points to it.
+    pub(crate) fn retire_mount_binding(&mut self, mount: &Path) {
+        self.skipped_pools.remove(mount);
+        if self.aliases.remove(mount).is_none() {
+            self.pools.remove(mount);
+            self.aliases.retain(|alias, keeper| {
+                if keeper.as_path() == mount {
+                    self.skipped_pools.remove(alias);
+                    return false;
+                }
+                true
+            });
+        }
+    }
+
     /// Reserve a mutation epoch and capture a pool without native I/O.
     /// An older observer/refill cannot publish through an admitted release.
     pub(crate) fn prepare_release(&mut self, mount_path: &Path) -> Option<BallastRelease> {

@@ -32,8 +32,13 @@ impl FsStatsSample {
     /// Rates cannot span a replaced mount, a capacity change or a transition
     /// to read-only, even if the caller's pathname stayed the same.
     pub fn same_filesystem_as(&self, other: &Self) -> bool {
+        self.stats.total_bytes == other.stats.total_bytes && self.same_mount_binding_as(other)
+    }
+
+    /// A resize changes forecasting capacity while preserving the route to a
+    /// reserve. A different mount, directory identity or write mode revokes it.
+    pub(crate) fn same_mount_binding_as(&self, other: &Self) -> bool {
         self.binding == other.binding
-            && self.stats.total_bytes == other.stats.total_bytes
             && self.stats.is_readonly == other.stats.is_readonly
             && self
                 .auxiliary

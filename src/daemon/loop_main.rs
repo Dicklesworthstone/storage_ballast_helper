@@ -8316,12 +8316,17 @@ impl MonitoringDaemon {
                 .collect::<Vec<_>>()
         });
 
+        let mut mounts_changed = false;
         // Update monitors for each active mount.
         for (mount_path, sample) in stats_by_mount {
             let monitor = self
                 .mount_monitors
                 .entry(mount_path.clone())
                 .or_insert_with(|| MountMonitor::new(&self.config));
+            let binding_changed = monitor
+                .last_observation
+                .as_ref()
+                .is_some_and(|old| !sample.same_mount_binding_as(&old.sample));
             let MountSampleUpdate {
                 observation,
                 fresh,
@@ -8347,6 +8352,12 @@ impl MonitoringDaemon {
                 self.ballast_releaser.cancel_mount(&pool_mount);
                 self.ballast_replenisher.cancel_mount(&pool_mount);
                 self.ballast_coordinator.invalidate_pool_inventory(&pool_mount);
+                // Manual and automatic requests must stop resolving this
+                // mount to its former pool while native discovery runs.
+                if binding_changed {
+                    self.ballast_coordinator.retire_mount_binding(&mount_path);
+                    mounts_changed = true;
+                }
                 self.ballast_reserve_monitor.invalidate(&pool_mount);
                 self.release_controller.reset_effectiveness(&pool_mount);
                 self.mount_controllers.remove(&mount_path);
@@ -8715,6 +8726,14 @@ impl MonitoringDaemon {
                     }
                 }
             }
+        }
+
+        if mounts_changed {
+            // Supersede even a pending plan: its mount table may predate the
+            // rebinding. Multiple changes in one tick need only one new plan.
+            self.discovery
+                .get_or_insert_with(RetainedDiscovery::default)
+                .request();
         }
 
         // Backing-only pressure must not relax the global certainty gate for
@@ -18851,6 +18870,60 @@ mod tests {
                 assert!(Instant::now() < deadline);
                 thread::yield_now();
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_mount_retires_only_its_reserve_routes_until_rediscovery() {
+        const GIB: u64 = 1 << 30;
+        let (mut fixture, keeper, alias, sibling) = recovery_reserve_alias_fixture();
+        let daemon = &mut fixture.daemon;
+        daemon.ballast_coordinator.provision_all(daemon.platform.as_ref()).unwrap();
+        assert_eq!(daemon.ballast_available_for_release(&keeper), 2);
+        let start = Instant::now();
+        let observe = |daemon: &mut MonitoringDaemon, mount: &Path, device, capacity, seconds| {
+            let now = start + Duration::from_secs(seconds);
+            let sample = native_pressure_sample(mount, device, capacity, 20 * GIB, now);
+            daemon.evaluate_pressure_samples(HashMap::from([(mount.to_path_buf(), sample)]), now).unwrap();
+        };
+        observe(daemon, &alias, "disk-a", 100 * GIB, 0);
+        observe(daemon, &alias, "disk-a", 110 * GIB, 1);
+        assert!(daemon.ballast_coordinator.has_pool(&alias), "resizing preserves the binding");
+        observe(daemon, &alias, "disk-b", 110 * GIB, 2);
+        assert!(daemon.discovery_pending());
+        assert!(!daemon.ballast_coordinator.has_pool(&alias));
+        assert!(daemon.ballast_coordinator.has_pool(&sibling));
+        let result = daemon.execute_ballast_action(&ControlBallastAction::Release {
+            mount: Some(alias.clone()),
+            count: 1,
+        }).unwrap();
+        assert_eq!(result["pools"][0]["released"], 0);
+        assert_eq!(daemon.ballast_available_for_release(&keeper), 2);
+
+        let generation = daemon.discovery.as_ref().unwrap().generation();
+        observe(daemon, &alias, "disk-a", 100 * GIB, 1);
+        assert_eq!(daemon.discovery.as_ref().unwrap().generation(), generation);
+        assert!(!daemon.ballast_coordinator.has_pool(&alias));
+        observe(daemon, &keeper, "disk-a", 100 * GIB, 3);
+        observe(daemon, &keeper, "disk-c", 100 * GIB, 4);
+        assert!(!daemon.ballast_coordinator.has_pool(&keeper));
+        assert!(!daemon.ballast_coordinator.has_pool(&sibling));
+        assert!(daemon.discovery.as_ref().unwrap().generation() > generation);
+        // The replacement inventory now lists only the keeper. Complete the
+        // ordinary retained discovery and verify it can serve requests again.
+        daemon.platform = Arc::new(ballast_release_platform(&keeper));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while daemon.discovery_pending() {
+            daemon.poll_discovery();
+            assert!(Instant::now() < deadline, "replacement plan was not adopted");
+            thread::yield_now();
+        }
+        assert!(daemon.ballast_coordinator.has_pool(&keeper));
+        assert!(!daemon.ballast_coordinator.has_pool(&alias));
+        assert!(!daemon.ballast_coordinator.has_pool(&sibling));
+        for n in 1..=2 {
+            assert!(daemon.config.paths.ballast_dir.join(format!("SBH_BALLAST_FILE_{n:05}.dat")).exists());
         }
     }
 
