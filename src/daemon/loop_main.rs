@@ -3362,15 +3362,17 @@ struct GuardSample {
 }
 
 impl MountMonitor {
-    fn new(config: &Config) -> Self {
-        let rate_estimator = DiskRateEstimator::with_history_cap(
+    fn rate_estimator(config: &Config) -> DiskRateEstimator {
+        DiskRateEstimator::with_history_cap(
             config.telemetry.ewma_base_alpha,
             config.telemetry.ewma_min_alpha,
             config.telemetry.ewma_max_alpha,
             config.telemetry.ewma_min_samples,
             config.telemetry.ewma_rate_history_size,
-        );
+        )
+    }
 
+    fn new(config: &Config) -> Self {
         let mut pressure_controller = PidPressureController::new(
             &PidConfig::from(&config.pressure),
             Duration::from_millis(config.pressure.poll_interval_ms),
@@ -3381,7 +3383,7 @@ impl MountMonitor {
         }
 
         Self {
-            rate_estimator,
+            rate_estimator: Self::rate_estimator(config),
             last_observation: None,
             forecast_needs_refresh: false,
             pressure_controller,
@@ -3473,6 +3475,24 @@ impl MountMonitor {
                 .is_some_and(|last| !sample.same_filesystem_as(&last.sample));
         if filesystem_changed {
             *self = Self::new(config);
+        } else if let Some(previous) = &self.last_observation {
+            // Even an unchanged mount can resume after an observation outage.
+            // Allow two normal collection periods, including throttled ticks.
+            // A writer seen before a longer gap cannot establish current drain,
+            // and a pressure crossing could have gone unobserved within it.
+            let max_gap = MonitoringDaemon::filesystem_observation_max_age(config)
+                .max(TICK_THROTTLE_MAX_BACKOFF.saturating_mul(2));
+            if sample
+                .collected_at
+                .saturating_duration_since(previous.sample.collected_at)
+                > max_gap
+            {
+                self.rate_estimator = Self::rate_estimator(config);
+                self.last_observation = None;
+                self.last_guard_sample = None;
+                self.conformal.discard_pending();
+                self.prediction_scorecard.discard_pending();
+            }
         }
 
         // Apply the current boundary even when collection returns the same
@@ -24937,6 +24957,91 @@ mod tests {
         );
         assert_eq!(cache_heavy.rate_estimator.sample_count(), 40);
         assert_eq!(cache_heavy.guard.observation_count(), 40);
+    }
+
+    #[test]
+    fn observation_outage_cannot_confirm_a_stopped_writer_or_score_unseen_pressure() {
+        const GIB: u64 = 1 << 30;
+        let config = Config::default();
+        let policy = PredictiveActionPolicy::from_config(config.pressure.prediction.clone());
+        let mut monitor = MountMonitor::new(&config);
+        let mount = PathBuf::from("/sampled");
+        let start = Instant::now();
+        let mut sample = native_pressure_sample(&mount, "disk-a", 100 * GIB, 35 * GIB, start);
+        for second in 0..=60 {
+            sample.collected_at = start + Duration::from_secs(second);
+            sample.stats.available_bytes = 35 * GIB - second * (GIB / 4);
+            sample.stats.free_bytes = sample.stats.available_bytes;
+            monitor.observe_filesystem(sample.clone(), &config);
+        }
+        let action = |rate: &RateEstimate| policy.evaluate(rate, 20.0, mount.clone());
+        assert!(action(&monitor.last_observation.as_ref().unwrap().rate).should_release_ballast());
+        assert!(monitor.conformal.pending() > 0);
+        monitor.prediction_scorecard.observe(
+            sample.collected_at,
+            sample.stats.available_bytes,
+            false,
+            MonitoringDaemon::filesystem_observation_max_age(&config),
+        );
+        assert!(
+            monitor
+                .prediction_scorecard
+                .enroll(sample.collected_at, Duration::from_mins(1))
+        );
+        let resolved = monitor.conformal.resolved_total();
+        let guard_observations = monitor.guard.observation_count();
+
+        // Same device and free space on return. The original 80-second
+        // runway has passed many times while neither endpoint changed.
+        sample.collected_at += Duration::from_mins(15);
+        let resumed = monitor.observe_filesystem(sample.clone(), &config);
+        assert!(resumed.fresh && !resumed.filesystem_changed);
+        assert_eq!(action(&resumed.observation.rate), PredictiveAction::Clear);
+        assert_eq!(resumed.observation.rate.sample_count, 0);
+        assert_eq!(monitor.guard.observation_count(), guard_observations);
+        assert_eq!(monitor.conformal.pending(), 0);
+        assert_eq!(monitor.conformal.resolved_total(), resolved);
+        assert_eq!(monitor.prediction_scorecard.pending(), 0);
+
+        // Cached repeats do not rebuild evidence. A newly measured rapid
+        // writer can earn predictive rescue again on this same mount.
+        assert!(!monitor.observe_filesystem(sample.clone(), &config).fresh);
+        for _ in 0..40 {
+            sample.collected_at += Duration::from_secs(1);
+            sample.stats.available_bytes -= GIB / 4;
+            sample.stats.free_bytes = sample.stats.available_bytes;
+            monitor.observe_filesystem(sample.clone(), &config);
+        }
+        let rate = &monitor.last_observation.as_ref().unwrap().rate;
+        assert_eq!(rate.sample_count, 40);
+        assert!(
+            policy
+                .evaluate(rate, sample.stats.free_pct(), mount)
+                .should_release_ballast()
+        );
+    }
+
+    #[test]
+    fn throttled_and_configured_collection_intervals_keep_rate_evidence() {
+        for (poll_ms, seconds) in [(5000, 70), (180_000, 180)] {
+            let mut config = Config::default();
+            config.pressure.poll_interval_ms = poll_ms;
+            let mut monitor = MountMonitor::new(&config);
+            let mut sample = native_pressure_sample(
+                Path::new("/slow"),
+                "disk-a",
+                100 << 30,
+                80 << 30,
+                Instant::now(),
+            );
+            monitor.observe_filesystem(sample.clone(), &config);
+            sample.collected_at += Duration::from_secs(seconds);
+            sample.stats.available_bytes -= 1 << 30;
+            sample.stats.free_bytes = sample.stats.available_bytes;
+            let next = monitor.observe_filesystem(sample, &config);
+            assert_eq!(next.observation.rate.sample_count, 1);
+            assert!(next.observation.rate.bytes_per_second > 0.0);
+        }
     }
 
     #[test]
