@@ -112,6 +112,67 @@ pub(crate) fn exclusion_path_spellings(path: &Path) -> std::io::Result<[PathBuf;
     Ok([absolute, resolved])
 }
 
+/// Test current configured protection without the discovery resolver's cache.
+///
+/// Covers exact path overlap, glob matches at the candidate or its ancestors,
+/// and literal glob prefixes beneath the candidate. It does not inspect a
+/// relocated payload for arbitrary deeper glob matches. Missing literal
+/// suffixes remain meaningful scope; unreadable or dangling aliases fail.
+pub(crate) fn path_overlaps_current_protection(path: &Path, patterns: &[String]) -> Result<bool> {
+    let candidates = exclusion_path_spellings(path).map_err(|source| SbhError::io(path, source))?;
+    for pattern in patterns {
+        let expanded = expand_home_pattern(pattern.trim()).replace('\\', "/");
+        if expanded.is_empty() {
+            continue;
+        }
+        if !contains_glob_metachar(&expanded) {
+            let protected = Path::new(&expanded);
+            let spellings = exclusion_path_spellings(protected)
+                .map_err(|source| SbhError::io(protected, source))?;
+            if candidates.iter().any(|candidate| {
+                spellings
+                    .iter()
+                    .any(|sacred| path_overlap_kind(candidate, sacred).is_some())
+            }) {
+                return Ok(true);
+            }
+            continue;
+        }
+        let mut spellings = vec![expanded.clone()];
+        if let Some(prefix) = literal_glob_prefix_path(&expanded) {
+            let prefix_text = normalize_path_for_matching(&prefix);
+            let suffix = expanded.strip_prefix(&prefix_text).ok_or_else(|| {
+                SbhError::InvalidConfig {
+                    details: format!("cannot resolve protected pattern {pattern:?}"),
+                }
+            })?;
+            let prefixes = exclusion_path_spellings(&prefix)
+                .map_err(|source| SbhError::io(&prefix, source))?;
+            if candidates.iter().any(|candidate| {
+                prefixes.iter().any(|sacred| sacred.starts_with(candidate))
+            }) {
+                return Ok(true);
+            }
+            if Path::new(&expanded).is_absolute() {
+                spellings.extend(prefixes.iter().map(|prefix| {
+                    normalize_path_for_matching(&prefix.join(suffix.trim_start_matches('/')))
+                }));
+            }
+        }
+        for spelling in spellings {
+            let regex = glob_to_regex(&spelling)?;
+            if candidates.iter().any(|candidate| {
+                candidate
+                    .ancestors()
+                    .any(|ancestor| regex.is_match(&normalize_path_for_matching(ancestor)))
+            }) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Upper bound on directory entries *name-checked* during a single stowaway
 /// (sacred-marker containment) sub-walk.
 ///
@@ -1605,6 +1666,85 @@ mod tests {
     use crate::platform::types::{SacredPath, SacredPathKind, SacredPathSource};
     use std::fs;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn current_protection_covers_missing_descendants_and_root_globs() {
+        let dir = TempDir::new().unwrap();
+        let candidate = dir.path().join("target");
+        for pattern in [
+            candidate.display().to_string(),
+            candidate.join("future/keep").display().to_string(),
+            format!("{}/future/keep/**", candidate.display()),
+            "**/target".to_string(),
+            "/*".to_string(),
+            "/**".to_string(),
+        ] {
+            assert!(
+                path_overlaps_current_protection(&candidate, std::slice::from_ref(&pattern))
+                    .unwrap(),
+                "{pattern}"
+            );
+        }
+        assert!(
+            !path_overlaps_current_protection(
+                &candidate,
+                &[dir.path().join("target-other/keep").display().to_string()],
+            )
+            .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_protection_ignores_cached_aliases_replaced_by_real_directories() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(&outside, &alias).unwrap();
+        let candidate = alias.join("target");
+        let _ = crate::core::paths::resolve_absolute_path(&candidate);
+        let _ = crate::core::paths::resolve_absolute_path(&alias);
+        fs::rename(&alias, dir.path().join("retired-alias")).unwrap();
+        fs::create_dir(&alias).unwrap();
+        for pattern in [
+            alias.join("target/keep").display().to_string(),
+            format!("{}/target/keep/**", alias.display()),
+        ] {
+            assert!(
+                path_overlaps_current_protection(&candidate, std::slice::from_ref(&pattern))
+                    .unwrap()
+            );
+            assert!(
+                !path_overlaps_current_protection(
+                    &outside.join("target"),
+                    std::slice::from_ref(&pattern),
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_protection_cannot_clear_an_unresolved_protected_alias() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let alias = dir.path().join("dangling");
+        symlink(dir.path().join("missing"), &alias).unwrap();
+        for pattern in [
+            alias.display().to_string(),
+            format!("{}/keep/**", alias.display()),
+        ] {
+            assert!(
+                path_overlaps_current_protection(&dir.path().join("target"), &[pattern]).is_err()
+            );
+        }
+    }
 
     #[test]
     fn exclusion_scopes_cover_ancestors_and_descendants_with_component_boundaries() {

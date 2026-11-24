@@ -875,8 +875,34 @@ impl QuarantineStore {
         &self,
         now_unix: u64,
         mode: SweepMode,
+        select: impl FnMut(&QuarantineRecord) -> bool,
+        pressure_gate: impl FnMut(&QuarantineRecord) -> bool,
+        maintenance_gate: impl FnMut(&QuarantineRecord) -> bool,
+    ) -> Result<SweepOutcome> {
+        self.sweep_with_filters_and_gates(
+            now_unix,
+            mode,
+            select,
+            pressure_gate,
+            |_| true,
+            maintenance_gate,
+        )
+    }
+
+    /// Sweep with separate record selection for pressure and maintenance.
+    ///
+    /// Both filters renew against the locked manifest and at the bounded
+    /// payload checkpoints. A rejected record remains recoverable while later
+    /// eligible records can proceed. A rejected mutation gate instead pauses
+    /// the entire sweep, including its remaining TTL/cap phases. Maintenance
+    /// never borrows the pressure filter or its resource-specific authority.
+    pub fn sweep_with_filters_and_gates(
+        &self,
+        now_unix: u64,
+        mode: SweepMode,
         mut select: impl FnMut(&QuarantineRecord) -> bool,
         mut pressure_gate: impl FnMut(&QuarantineRecord) -> bool,
+        mut maintenance_select: impl FnMut(&QuarantineRecord) -> bool,
         mut maintenance_gate: impl FnMut(&QuarantineRecord) -> bool,
     ) -> Result<SweepOutcome> {
         let records = self.records()?;
@@ -906,11 +932,12 @@ impl QuarantineStore {
                         continue;
                     }
                     let before = drained.entries;
-                    keep_going = self.try_purge_with_gate(
+                    keep_going = self.try_purge_with_filter(
                         entry,
                         now_unix,
                         &mut drained,
                         &mut budget,
+                        &mut maintenance_select,
                         &mut maintenance_gate,
                     );
                     if drained.entries > before {
@@ -939,11 +966,12 @@ impl QuarantineStore {
                             capped.skipped_stuck += 1;
                             continue;
                         }
-                        if !self.try_purge_with_gate(
+                        if !self.try_purge_with_filter(
                             entry,
                             now_unix,
                             &mut capped,
                             &mut budget,
+                            &mut maintenance_select,
                             &mut maintenance_gate,
                         ) {
                             break;

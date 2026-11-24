@@ -7,7 +7,7 @@
 use super::{
     ActiveMode, ActivityEvent, ActivityLoggerHandle, Arc, AtomicBool, AtomicU64, CandidacyScore,
     Config, Duration, HashMap, HashSet, Instant, MonitoringDaemon, MountTickResponse, Mutex,
-    Ordering, Path, PathBuf, Platform, PolicyEngine, PressureLevel, ProtectionRegistry,
+    Ordering, Path, PathBuf, Platform, PolicyEngine, PressureLevel,
     QUARANTINE_FIRST_CHANCE_SECS, QUARANTINE_PRESSURE_RETRY_SECS, QUARANTINE_SWEEP_INTERVAL,
     QuarantineRecord, QuarantineStore, QuarantineSweepMode, RwLock, ScannerConfig,
     SharedExecutorConfig, SharedRegret, SkipReason, SystemTime, VecDeque, bounded,
@@ -485,6 +485,38 @@ pub(super) struct QuarantineSweepContext {
     shutdown: Arc<AtomicBool>,
 }
 
+/// The original namespace remains the operator's protection boundary after a
+/// recoverable move. Check it independently of the store's own protect marker.
+fn authorize_original_path(
+    record: &QuarantineRecord,
+    scanner: &ScannerConfig,
+) -> std::result::Result<(), SkipReason> {
+    use crate::scanner::protection;
+
+    let spellings = protection::exclusion_path_spellings(&record.original_path)
+        .map_err(|_| SkipReason::SacredStowaway)?;
+    if protection::path_overlaps_exclusion(&spellings[0], &scanner.excluded_paths)
+        || protection::path_overlaps_current_protection(&spellings[0], &scanner.protected_paths)
+            .map_err(|_| SkipReason::SacredStowaway)?
+    {
+        return Err(SkipReason::SacredStowaway);
+    }
+    for path in &spellings {
+        for ancestor in path.ancestors() {
+            match std::fs::symlink_metadata(ancestor.join(protection::MARKER_FILENAME)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                // A rebuilt file at the original leaf has no marker of its
+                // own. Still check every parent and all configured patterns.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotADirectory
+                        && ancestor == path.as_path() => {}
+                _ => return Err(SkipReason::SacredStowaway),
+            }
+        }
+    }
+    Ok(())
+}
+
 impl QuarantineSweepContext {
     pub(super) fn new(daemon: &MonitoringDaemon) -> Self {
         Self {
@@ -507,61 +539,58 @@ impl QuarantineSweepContext {
             && scanner_mutation_scope_matches(&self.admitted_scanner, &self.scanner.read(), false)
     }
 
+    /// A past move into quarantine does not override a later protection,
+    /// exclusion or category suspension. Renew these for every cleanup mode.
+    fn authorize_record_policy(
+        &self,
+        record: &QuarantineRecord,
+    ) -> std::result::Result<(), SkipReason> {
+        let scanner = self.scanner.read().clone();
+        authorize_original_path(record, &scanner)?;
+        if !scanner_mutation_scope_matches(&scanner, &self.scanner.read(), false) {
+            return Err(SkipReason::PolicyChanged);
+        }
+        if let Some(category) = record.category()
+            && self
+                .regret
+                .calibrator
+                .lock()
+                .suspended(&format!("{category:?}"), Instant::now())
+        {
+            return Err(SkipReason::CategorySuspended);
+        }
+        Ok(())
+    }
+
     pub(super) fn authorize_resource_record(
         &self,
         tick: &MountTickResponse,
         record: &QuarantineRecord,
     ) -> std::result::Result<(), SkipReason> {
         if tick.ram_reclaim.is_none() && tick.inode_reclaim.is_none() {
-            return Ok(());
+            return self.authorize_record_policy(record);
         }
         let scanner = self.scanner.read().clone();
-        let resolved = match (&tick.ram_reclaim, &tick.inode_reclaim) {
+        match (&tick.ram_reclaim, &tick.inode_reclaim) {
             (Some(relief), None) => {
                 if !relief.accepts_quarantined(record, false) {
                     return Err(SkipReason::PolicyChanged);
                 }
-                relief.authorize_quarantine_scope(record, &scanner)?
+                relief.authorize_quarantine_scope(record, &scanner)?;
             }
             (None, Some(relief)) => {
                 if !relief.accepts_quarantined(record, false) {
                     return Err(SkipReason::PolicyChanged);
                 }
-                relief.authorize_quarantine_scope(record, &scanner)?
+                relief.authorize_quarantine_scope(record, &scanner)?;
             }
             (None, None) => return Ok(()),
             (Some(_), Some(_)) => return Err(SkipReason::PolicyChanged),
-        };
-        let original =
-            std::path::absolute(&record.original_path).map_err(|_| SkipReason::PolicyChanged)?;
-        let mut protection = ProtectionRegistry::new(Some(&scanner.protected_paths))
-            .map_err(|_| SkipReason::SacredStowaway)?;
-        for path in [&original, &resolved] {
-            protection
-                .discover_ancestor_markers(path)
-                .map_err(|_| SkipReason::SacredStowaway)?;
-            if path
-                .ancestors()
-                .any(|ancestor| protection.is_protected(ancestor))
-            {
-                return Err(SkipReason::SacredStowaway);
-            }
         }
         if !scanner_mutation_scope_matches(&scanner, &self.scanner.read(), false) {
             return Err(SkipReason::PolicyChanged);
         }
-        let category = record
-            .definite_category()
-            .ok_or(SkipReason::PolicyChanged)?;
-        if self
-            .regret
-            .calibrator
-            .lock()
-            .suspended(&format!("{category:?}"), Instant::now())
-        {
-            return Err(SkipReason::CategorySuspended);
-        }
-        Ok(())
+        self.authorize_record_policy(record)
     }
 
     fn authorize_mutation(&self, approved_mode: ActiveMode) -> std::result::Result<(), SkipReason> {
@@ -738,6 +767,11 @@ impl QuarantineSweepContext {
                     .is_ok()
                     && self.current(lease)
             };
+            let maintenance_select = |record: &QuarantineRecord| {
+                self.current(lease)
+                    && self.authorize_record_policy(record).is_ok()
+                    && self.current(lease)
+            };
             let maintenance_gate = |_: &QuarantineRecord| {
                 self.current(lease)
                     && self
@@ -750,7 +784,14 @@ impl QuarantineSweepContext {
                         .is_ok()
                     && self.current(lease)
             };
-            match store.sweep_with_gates(now_unix, mode, select, gate, maintenance_gate) {
+            match store.sweep_with_filters_and_gates(
+                now_unix,
+                mode,
+                select,
+                gate,
+                maintenance_select,
+                maintenance_gate,
+            ) {
                 Ok(swept) => {
                     held = held.map(|sum| sum.saturating_add(swept.held_bytes));
                     let (why, mut drained) = (swept.reason, swept.drained);
@@ -834,5 +875,286 @@ impl QuarantineSweepContext {
             held_bytes: result.held_bytes,
             attempted: result.attempted,
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::core::config::PathsConfig;
+    use crate::daemon::loop_main::DaemonArgs;
+    use crate::daemon::self_monitor::MountRateState;
+    use crate::monitor::pid::PressureResponse;
+    use crate::monitor::predictive::PredictiveAction;
+    use crate::platform::pal::{FsStats, MemoryInfo, MockPlatform, MountPoint, PlatformPaths};
+    use crate::scanner::regret::Outcome;
+    use crate::scanner::scoring::ArtifactCertainty;
+    use std::fs;
+
+    struct Fixture {
+        daemon: MonitoringDaemon,
+        directory: tempfile::TempDir,
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(pressured: bool) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let base = directory.path();
+            let root = base.join("scan");
+            fs::create_dir(&root).unwrap();
+            let mut config = Config::with_paths(PathsConfig {
+                config_file: base.join("config.toml"),
+                ballast_dir: base.join("ballast"),
+                state_file: base.join("state.json"),
+                sqlite_db: base.join("activity.sqlite3"),
+                jsonl_log: base.join("activity.jsonl"),
+            });
+            config.scanner.root_paths = vec![root.clone()];
+            config.scanner.protected_paths.clear();
+            config.scanner.excluded_paths.clear();
+            config.scanner.quarantine_max_bytes_pct = 0;
+            config.ballast.auto_provision = false;
+            config.policy.initial_mode = ActiveMode::Enforce;
+            let available = if pressured { 1 << 30 } else { 90 << 30 };
+            let platform = MockPlatform::new(
+                vec![MountPoint {
+                    path: PathBuf::from("/"),
+                    device: "mock".to_string(),
+                    fs_type: "mockfs".to_string(),
+                    is_ram_backed: false,
+                }],
+                HashMap::from([(
+                    PathBuf::from("/"),
+                    FsStats {
+                        total_bytes: 100 << 30,
+                        free_bytes: available,
+                        available_bytes: available,
+                        fs_type: "mockfs".to_string(),
+                        mount_point: PathBuf::from("/"),
+                        is_readonly: false,
+                    },
+                )]),
+                MemoryInfo {
+                    total_bytes: 64 << 30,
+                    available_bytes: 32 << 30,
+                    swap_total_bytes: 8 << 30,
+                    swap_free_bytes: 8 << 30,
+                },
+                PlatformPaths::default(),
+            )
+            .with_home(base)
+            .with_temp_dirs(Vec::new())
+            .with_cache_roots(Vec::new());
+            let daemon = MonitoringDaemon::init_with_platform(
+                config,
+                &DaemonArgs::default(),
+                Arc::new(platform),
+            )
+            .unwrap();
+            Self {
+                daemon,
+                directory,
+                root,
+            }
+        }
+
+        fn hold(&self, id: &str, category: &str, ttl: Duration) -> QuarantineRecord {
+            let source = self.root.join(id).join("target");
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("payload.bin"), b"retained").unwrap();
+            QuarantineStore::under(&self.root)
+                .quarantine(
+                    &source,
+                    id,
+                    8,
+                    ttl,
+                    Some(serde_json::json!({"category": category, "certainty": "Definite"})),
+                )
+                .unwrap()
+        }
+
+        fn sweep(&self, pressured: bool) -> QuarantineSweepCompletion {
+            let response = PressureResponse {
+                level: if pressured {
+                    PressureLevel::Critical
+                } else {
+                    PressureLevel::Green
+                },
+                urgency: 0.7,
+                scan_interval: Duration::from_secs(1),
+                release_ballast_files: 0,
+                max_delete_batch: 10,
+                fallback_active: false,
+                causing_mount: PathBuf::from("/"),
+                free_pct: if pressured { 1.0 } else { 90.0 },
+                predicted_seconds: None,
+            };
+            let tick = MountTickResponse {
+                filesystem_response: response.clone(),
+                response,
+                backing_pressure: None,
+                ram_reclaim: None,
+                inode_pressure: None,
+                inode_reclaim: None,
+                seconds_to_red: None,
+                prediction_confident: false,
+                predictive_action: PredictiveAction::Clear,
+                uncalibrated_predictive_action: None,
+                imminent_danger: false,
+                rate: MountRateState::default(),
+                device_id: None,
+            };
+            QuarantineSweepContext::new(&self.daemon).run_inline(
+                &tick,
+                vec![self.root.clone()],
+                &self.daemon.config,
+            )
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.daemon.quarantine_sweeper.cancel();
+            self.daemon.logger_handle.shutdown();
+            if let Some(logger) = self.daemon.logger_join.take() {
+                let _ = logger.join();
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_quarantine_sweeps_keep_newly_protected_records_and_purge_eligible_siblings() {
+        for mode in ["pressure", "ttl", "cap"] {
+            for restriction in [
+                "protected",
+                "protected-descendant",
+                "protected-glob-descendant",
+                "excluded",
+                "excluded-descendant",
+                "marker",
+                "suspended",
+            ] {
+                let pressured = mode == "pressure";
+                let mut fixture = Fixture::new(pressured);
+                let ttl = if mode == "ttl" {
+                    Duration::ZERO
+                } else {
+                    Duration::from_hours(24)
+                };
+                let kept = fixture.hold("a", "RustTarget", ttl);
+                let eligible = fixture.hold("b", "GoCache", ttl);
+                let mut updated = fixture.daemon.config.clone();
+                match restriction {
+                    "protected" => updated.scanner.protected_paths.push(
+                        kept.original_path.parent().unwrap().display().to_string(),
+                    ),
+                    "protected-descendant" => updated.scanner.protected_paths.push(
+                        kept.original_path.join("keep").display().to_string(),
+                    ),
+                    "protected-glob-descendant" => updated.scanner.protected_paths.push(
+                        format!("{}/keep/**", kept.original_path.display()),
+                    ),
+                    "excluded" => updated
+                        .scanner
+                        .excluded_paths
+                        .push(kept.original_path.clone()),
+                    "excluded-descendant" => updated
+                        .scanner
+                        .excluded_paths
+                        .push(kept.original_path.join("keep")),
+                    "marker" => fs::write(
+                        kept.original_path.parent().unwrap().join(".sbh-protect"),
+                        b"",
+                    )
+                    .unwrap(),
+                    "suspended" => {
+                        let mut calibrator = fixture.daemon.regret.calibrator.lock();
+                        for _ in 0..10 {
+                            calibrator.record(
+                                "RustTarget",
+                                ArtifactCertainty::Definite,
+                                Outcome::Regret,
+                                Instant::now(),
+                            );
+                        }
+                        assert!(calibrator.suspended("RustTarget", Instant::now()));
+                    }
+                    _ => unreachable!(),
+                }
+                fixture.daemon.apply_config_reload(Ok(updated));
+                let completion = fixture.sweep(pressured);
+                assert!(completion.attempted, "{mode}: {restriction}");
+                assert_eq!(completion.held_bytes, Some(8), "{mode}: {restriction}");
+                assert_eq!(
+                    fs::read(kept.quarantine_path.join("payload.bin")).unwrap(),
+                    b"retained"
+                );
+                assert!(
+                    !eligible.quarantine_path.exists(),
+                    "{mode}: {restriction}"
+                );
+                let store = QuarantineStore::under(&fixture.root);
+                assert_eq!(store.record("a").unwrap(), Some(kept));
+                assert!(store.record("b").unwrap().is_none());
+                assert!(store.stuck_entries().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn quarantine_protection_renews_config_aliases_without_a_discovery_cache_delay() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new(true);
+        let kept = fixture.hold("a", "RustTarget", Duration::from_hours(24));
+        let outside = fixture.directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let alias = fixture.directory.path().join("protected-alias");
+        symlink(&outside, &alias).unwrap();
+        let mut scanner = fixture.daemon.config.scanner.clone();
+        scanner.protected_paths = vec![format!("{}/target/keep/**", alias.display())];
+        assert_eq!(authorize_original_path(&kept, &scanner), Ok(()));
+        let _ = crate::core::paths::resolve_absolute_path(&alias);
+        fs::rename(&alias, fixture.directory.path().join("old-alias")).unwrap();
+        symlink(kept.original_path.parent().unwrap(), &alias).unwrap();
+        assert_eq!(
+            authorize_original_path(&kept, &scanner),
+            Err(SkipReason::SacredStowaway)
+        );
+        assert_eq!(
+            fs::read(kept.quarantine_path.join("payload.bin")).unwrap(),
+            b"retained"
+        );
+    }
+
+    #[test]
+    fn rebuilt_original_files_and_missing_original_parents_do_not_block_eligible_records() {
+        let fixture = Fixture::new(true);
+        let rebuilt = fixture.hold("a", "RustTarget", Duration::from_hours(24));
+        fs::write(&rebuilt.original_path, b"new artifact").unwrap();
+        assert_eq!(
+            authorize_original_path(&rebuilt, &fixture.daemon.config.scanner),
+            Ok(())
+        );
+        assert_eq!(fixture.sweep(true).held_bytes, Some(0));
+        assert!(!rebuilt.quarantine_path.exists());
+        assert_eq!(
+            fs::read(&rebuilt.original_path).unwrap(),
+            b"new artifact"
+        );
+
+        let missing = fixture.hold("b", "RustTarget", Duration::from_hours(24));
+        fs::rename(
+            missing.original_path.parent().unwrap(),
+            fixture.root.join("retired-parent"),
+        )
+        .unwrap();
+        assert_eq!(
+            authorize_original_path(&missing, &fixture.daemon.config.scanner),
+            Ok(())
+        );
+        assert_eq!(fixture.sweep(true).held_bytes, Some(0));
+        assert!(!missing.quarantine_path.exists());
     }
 }

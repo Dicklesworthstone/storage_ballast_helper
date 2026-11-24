@@ -64,11 +64,24 @@ checkpoints. An Enforce-approved sweep stops if the operator moves to Canary,
 Observe or fallback-safe mode. Pressure sweeps also honor shutdown and current
 scanner dry-run settings at these boundaries.
 
-A hold during expiry stops the entire sweep, so a following size-cap phase
-cannot restart removal under the old selection. The next sweep needs fresh
-authority. A held or partially purged entry retains its recovery metadata and
-remaining contents, receives no failure cooldown, and contributes no completed
-removal credit until its payload and manifest are finalized.
+Every automatic purge mode also renews the record's original-path protections,
+exclusions, and recorded-category suspension. Adding a protected path, an
+exclusion, or an ancestor `.sbh-protect` marker after quarantine keeps that payload
+held. Exact protected descendants and literal glob prefixes below the original
+path also protect the enclosing payload. Both lexical and freshly resolved
+spellings are checked, so retargeting a configured alias takes effect without
+waiting for the discovery cache. Missing literal paths still define protection;
+unresolved or unreadable aliases cannot grant removal permission. These checks
+do not walk a relocated payload to match arbitrary deeper globs such as
+`**/keep/**` against its former pathname.
+
+A record-specific protection or suspension skips that entry while permitting
+eligible siblings to be reclaimed. A global hold during expiry stops the entire
+sweep, so a following size-cap phase cannot restart removal under the old
+selection. The next sweep needs fresh authority. A held or partially purged
+entry retains its recovery metadata and remaining contents, receives no failure
+cooldown, and contributes no completed removal credit until its payload and
+manifest are finalized.
 
 ## Bounded background sweeps
 

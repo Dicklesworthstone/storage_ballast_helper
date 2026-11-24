@@ -1708,6 +1708,101 @@ fn held_quarantine_tree(
 }
 
 #[test]
+fn quarantine_maintenance_selection_keeps_protected_entries_without_starving_siblings() {
+    for expired in [true, false] {
+        let dir = scratch();
+        let ttl = if expired {
+            Duration::ZERO
+        } else {
+            Duration::from_hours(24)
+        };
+        let (store, kept) = held_quarantine_tree(dir.path(), "a", 2, ttl);
+        let (_, eligible) = held_quarantine_tree(dir.path(), "b", 1, ttl);
+        let now = if expired {
+            kept.expires_at.max(eligible.expires_at)
+        } else {
+            kept.quarantined_at
+        };
+        let mode = SweepMode::Maintenance {
+            cap_bytes: if expired { None } else { Some(0) },
+        };
+        let out = store
+            .sweep_with_filters_and_gates(
+                now,
+                mode,
+                |_| panic!("maintenance cannot borrow resource selection"),
+                |_| panic!("maintenance cannot borrow pressure authority"),
+                |record| record.decision_id != kept.decision_id,
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(out.drained.counts(), (1, eligible.size_bytes));
+        assert_eq!(out.held_bytes, kept.size_bytes);
+        assert_eq!(out.drained.deferred_entries, 1);
+        assert_eq!(out.drained.completed[0].record.decision_id, "b");
+        assert!(out.drained.failures.is_empty());
+        assert!(!out.drained.budget_exhausted);
+        assert!(!eligible.quarantine_path.exists());
+        assert_eq!(store.record("a").unwrap(), Some(kept.clone()));
+        assert!(store.record("b").unwrap().is_none());
+        assert!(store.stuck_entries().unwrap().is_empty());
+        let restored = store.restore("a", false).unwrap();
+        for index in 0..2 {
+            assert_eq!(
+                fs::read(restored.restored_to.join(format!("part-{index:04}"))).unwrap(),
+                PAYLOAD,
+            );
+        }
+    }
+}
+
+#[test]
+fn quarantine_maintenance_selection_is_renewed_inside_payloads_and_continues() {
+    let dir = scratch();
+    let (store, kept) = held_quarantine_tree(dir.path(), "a", 128, Duration::ZERO);
+    let (_, eligible) = held_quarantine_tree(dir.path(), "b", 1, Duration::ZERO);
+    let mut selections = 0;
+    let out = store
+        .sweep_with_filters_and_gates(
+            kept.expires_at.max(eligible.expires_at),
+            SweepMode::Maintenance { cap_bytes: None },
+            |_| panic!("maintenance cannot borrow resource selection"),
+            |_| panic!("maintenance cannot borrow pressure authority"),
+            |record| {
+                if record.decision_id == kept.decision_id {
+                    selections += 1;
+                    // Revoke after admission and the durable witness update.
+                    selections < 3
+                } else {
+                    true
+                }
+            },
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(selections, 3);
+    assert_eq!(out.drained.counts(), (1, eligible.size_bytes));
+    assert_eq!(out.drained.completed[0].record.decision_id, "b");
+    assert_eq!(out.drained.deferred_entries, 1);
+    assert_eq!(out.held_bytes, kept.size_bytes);
+    assert!(out.drained.failures.is_empty());
+    assert!(!out.drained.budget_exhausted);
+    assert!(!eligible.quarantine_path.exists());
+    let remaining = fs::read_dir(&kept.quarantine_path).unwrap().count();
+    assert!(remaining > 0 && remaining < 128, "remaining={remaining}");
+    assert!(
+        128 - remaining <= 64,
+        "selection must renew at the unlink bound"
+    );
+    assert_eq!(
+        store.record("a").unwrap().unwrap().recovery_state,
+        RecoveryState::PurgeStarted,
+    );
+    assert!(store.record("b").unwrap().is_none());
+    assert!(store.stuck_entries().unwrap().is_empty());
+}
+
+#[test]
 fn quarantine_maintenance_renews_permission_between_payloads_and_stops_both_phases() {
     for (expired, cap_bytes) in [(true, None), (true, Some(0)), (false, Some(0))] {
         let dir = scratch();
