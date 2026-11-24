@@ -184,7 +184,12 @@ mod unix {
             }))
         }
 
-        fn remove(&self, name: &OsStr, expected: &Metadata) -> io::Result<()> {
+        fn remove(
+            &self,
+            name: &OsStr,
+            expected: &Metadata,
+            still_allowed: &dyn Fn() -> bool,
+        ) -> io::Result<bool> {
             // Reject a replacement before unlinking. The flock serializes
             // cooperative manager writes; the opened directory prevents a
             // renamed parent from redirecting the operation into another tree.
@@ -192,8 +197,13 @@ mod unix {
             if !same_file(expected, &current.metadata()?) {
                 return Err(invalid("ballast slot changed during the release pass"));
             }
+            // Native identity reads can stall. Consent captured before them
+            // cannot authorize a later unlink after cancellation or reload.
+            if !still_allowed() {
+                return Ok(false);
+            }
             unlinkat(&self.directory, name, AtFlags::empty())?;
-            Ok(())
+            Ok(true)
         }
     }
 
@@ -217,9 +227,10 @@ mod unix {
     pub(in super::super) fn release(
         manager: &mut BallastManager,
         count: usize,
+        still_allowed: &dyn Fn() -> bool,
     ) -> Result<ReleaseReport> {
         let mut report = empty_report();
-        if count == 0 {
+        if count == 0 || !still_allowed() {
             return Ok(report);
         }
         let last_managed_index =
@@ -241,6 +252,7 @@ mod unix {
         )
         .map_err(|error| SbhError::io(&manager.ballast_dir, error))?;
         let mut inventory = Vec::new();
+        let mut revoked = false;
         // Snapshot actual slots under the lock, not startup inventory or the
         // configured range: reloads and external CLI operations change both.
         for index in indices.into_iter().rev() {
@@ -281,14 +293,17 @@ mod unix {
             // This is a conservative allocation estimate, not an observed free
             // delta: CoW snapshots can still retain blocks after unlink.
             let size = meta.len().min(meta.blocks().saturating_mul(512));
-            if report.files_released < count {
-                match guard.remove(OsStr::new(&name), &meta) {
-                    Ok(()) => {
+            if report.files_released < count && !revoked {
+                match guard.remove(OsStr::new(&name), &meta, still_allowed) {
+                    Ok(true) => {
                         report.files_released += 1;
                         report.bytes_freed = report.bytes_freed.saturating_add(size);
                         report.released.push((path, size));
                         continue;
                     }
+                    // Continue observing the remaining inventory, but a later
+                    // callback cannot revive this invocation's permission.
+                    Ok(false) => revoked = true,
                     Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                     Err(error) => {
                         let message = format!("failed to release file {index}: {error}");
@@ -353,6 +368,67 @@ mod unix {
                 BallastManager::new_unfloored(root.path().join("pool"), config()).unwrap();
             assert_eq!(manager.provision(None).unwrap().files_created, 3);
             (root, manager)
+        }
+
+        #[test]
+        fn revoked_release_retains_inventory_without_opening_a_busy_pool() {
+            let (_root, mut manager) = fixture();
+            let before = manager.releasable_bytes();
+            let lock = File::open(manager.ballast_dir.join(".lock")).unwrap();
+            flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+            let report = manager.release_guarded(3, &|| false).unwrap();
+            assert_eq!(report.files_released, 0);
+            assert_eq!(report.bytes_freed, 0);
+            assert!(report.released.is_empty());
+            assert!(report.errors.is_empty());
+            assert_eq!(manager.available_count(), 3);
+            assert_eq!(manager.releasable_bytes(), before);
+            for index in 1..=3 {
+                assert!(manager.file_path(index).exists());
+            }
+            flock(&lock, FlockOperation::Unlock).unwrap();
+        }
+
+        #[test]
+        fn guarded_release_renews_after_identity_reads_and_never_revives_permission() {
+            use std::cell::Cell;
+
+            for permitted_files in [0, 1] {
+                let (_root, mut manager) = fixture();
+                let calls = Cell::new(0);
+                let reject_at = permitted_files + 2;
+                let report = manager
+                    .release_guarded(3, &|| {
+                        calls.set(calls.get() + 1);
+                        // Initial admission succeeds. Refuse one final unlink
+                        // check, then offer permission again if called later.
+                        calls.get() != reject_at
+                    })
+                    .unwrap();
+                assert_eq!(calls.get(), reject_at);
+                assert_eq!(report.files_released, permitted_files);
+                assert_eq!(
+                    report.bytes_freed,
+                    u64::try_from(permitted_files).unwrap() * config().file_size_bytes
+                );
+                assert!(report.errors.is_empty());
+                assert_eq!(manager.available_count(), 3 - permitted_files);
+                assert_eq!(
+                    manager.releasable_bytes(),
+                    u64::try_from(3 - permitted_files).unwrap() * config().file_size_bytes
+                );
+                for index in 1..=3 {
+                    assert_eq!(
+                        manager.file_path(index).exists(),
+                        index <= u32::try_from(3 - permitted_files).unwrap()
+                    );
+                }
+                // A new explicit invocation may reclaim the preserved reserve.
+                assert_eq!(
+                    manager.release(3).unwrap().files_released,
+                    3 - permitted_files
+                );
+            }
         }
 
         #[test]
@@ -602,7 +678,7 @@ mod unix {
             fs::rename(&path, manager.ballast_dir.join("previous")).unwrap();
             fs::write(&path, b"replacement").unwrap();
             let name = path.file_name().unwrap();
-            assert!(guard.remove(name, &meta).is_err());
+            assert!(guard.remove(name, &meta, &|| true).is_err());
             assert_eq!(fs::read(&path).unwrap(), b"replacement");
         }
 
@@ -628,7 +704,11 @@ mod unix {
             fs::rename(&manager.ballast_dir, &moved).unwrap();
             fs::create_dir(&manager.ballast_dir).unwrap();
             fs::write(&path, b"new directory's contents").unwrap();
-            guard.remove(path.file_name().unwrap(), &meta).unwrap();
+            assert!(
+                guard
+                    .remove(path.file_name().unwrap(), &meta, &|| true)
+                    .unwrap()
+            );
             assert_eq!(fs::read(path).unwrap(), b"new directory's contents");
             assert!(!moved.join(ballast_file_name(3)).exists());
         }
@@ -827,9 +907,16 @@ pub(super) use unix::release;
 // Preserve the portable manager behavior on non-Unix targets. The no-allocation
 // and nonblocking-flock contract above is for the supported Unix daemon hosts.
 #[cfg(not(unix))]
-pub(super) fn release(manager: &mut BallastManager, count: usize) -> Result<ReleaseReport> {
-    let _lock = manager.acquire_lock(false)?;
+pub(super) fn release(
+    manager: &mut BallastManager,
+    count: usize,
+    still_allowed: &dyn Fn() -> bool,
+) -> Result<ReleaseReport> {
     let mut report = empty_report();
+    if count == 0 || !still_allowed() {
+        return Ok(report);
+    }
+    let _lock = manager.acquire_lock(false)?;
     manager.scan_existing();
     let mut available: Vec<u32> = manager.inventory.iter().map(|file| file.index).collect();
     available.sort_unstable_by(|left, right| right.cmp(left));
@@ -839,6 +926,9 @@ pub(super) fn release(manager: &mut BallastManager, count: usize) -> Result<Rele
         }
         let path = manager.file_path(index);
         let size = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+        if !still_allowed() {
+            break;
+        }
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 report.files_released += 1;

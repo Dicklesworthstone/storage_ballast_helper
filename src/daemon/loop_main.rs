@@ -33,6 +33,7 @@ use crate::core::config::{
     Config, InodePressureConfig, PredictionConfig, ScannerConfig, ScannerEngineMode, ScoringConfig,
 };
 use crate::core::errors::{Result, SbhError};
+use crate::daemon::ballast_release::{BallastReleaser, ReleaseContext, ReleaseRequest};
 use crate::daemon::ballast_replenish::BallastReplenisher;
 use crate::daemon::ballast_reserve::BallastReserveMonitor;
 use crate::daemon::compress_tier::{CompressTier, CompressionFirst};
@@ -3776,6 +3777,8 @@ pub struct MonitoringDaemon {
     /// republishes only its identity-bound history, never its old availability.
     startup_pool_history: Vec<super::self_monitor::BallastPoolState>,
     initial_provision: HashSet<PathBuf>,
+    /// Retained workers keep native reserve release off the pressure monitor.
+    ballast_releaser: BallastReleaser,
     /// One retained worker keeps reserve allocation off the pressure monitor.
     ballast_replenisher: BallastReplenisher,
     /// Read-only availability is independent of the actuator's cached inventory.
@@ -6023,6 +6026,7 @@ impl MonitoringDaemon {
             initial_discovery: background,
             startup_pool_history,
             initial_provision: HashSet::new(),
+            ballast_releaser: BallastReleaser::default(),
             ballast_replenisher: BallastReplenisher::default(),
             ballast_reserve_monitor: BallastReserveMonitor::default(),
             ballast_refill_blockers: HashMap::new(),
@@ -6164,10 +6168,10 @@ impl MonitoringDaemon {
         let platform = Arc::clone(&self.platform);
         let prior_revision = self.ballast_coordinator.discovery_revision();
         let previous_pools = self.startup_pool_history.clone();
-        // Cancellation cannot interrupt an in-flight native allocation. Wait
-        // for that retained worker to exit before reading or adopting a plan;
-        // its rejected old result cannot advance the live mutation witness.
-        let completed = if self.ballast_replenisher.busy() {
+        // Cancellation cannot interrupt native allocation or release. Keep
+        // monitoring while those retained workers finish before collecting a
+        // replacement plan; an old result cannot advance its mutation witness.
+        let completed = if self.ballast_replenisher.busy() || self.ballast_releaser.busy() {
             None
         } else {
             discovery.poll(Instant::now(), move || {
@@ -6193,6 +6197,7 @@ impl MonitoringDaemon {
                     .request();
             } else {
                 self.ballast_replenisher.cancel();
+                self.ballast_releaser.cancel();
                 self.ballast_reserve_monitor.invalidate_all();
                 self.initial_provision.clear();
                 if self.initial_discovery {
@@ -6822,6 +6827,21 @@ impl MonitoringDaemon {
         if mounts.is_empty() {
             return Err("no ballast pool is configured".to_string());
         }
+        self.poll_ballast_releases();
+        self.poll_ballast_replenishment();
+        for mount in &mounts {
+            let pool = self.pool_mount(mount);
+            self.ballast_releaser.cancel_mount(&pool);
+            self.ballast_replenisher.cancel_mount(&pool);
+            if self.ballast_releaser.busy_mount(&pool)
+                || self.ballast_replenisher.worker_mount() == Some(pool.as_path())
+            {
+                return Err(format!(
+                    "ballast worker for {} is still finishing native I/O; retry after it exits",
+                    pool.display()
+                ));
+            }
+        }
         let mut pools = Vec::new();
         for mount in mounts {
             let pool_mount = self.pool_mount(&mount);
@@ -7422,6 +7442,7 @@ impl MonitoringDaemon {
                 break;
             }
             self.poll_ballast_replenishment();
+            self.poll_ballast_releases();
             self.drain_control_commands();
 
             // 2. Check config reload signal.
@@ -8045,6 +8066,7 @@ impl MonitoringDaemon {
         self.recovery_probes.cancel_all();
         self.invalidate_logging_ram_observations();
         self.ballast_replenisher.cancel();
+        self.ballast_releaser.cancel();
         self.ballast_refill_blockers.clear();
         self.quarantine_sweeper.cancel();
         self.rch_staging.stop_running_pass();
@@ -8233,6 +8255,7 @@ impl MonitoringDaemon {
             self.rch_staging.take_forecast_intervention(),
             self.target_tier.take_forecast_intervention(),
             self.quarantine_sweeper.forecast_intervention(),
+            self.ballast_releaser.take_forecast_intervention(),
         ]
         .into_iter()
         .any(|intervention| intervention);
@@ -8323,6 +8346,15 @@ impl MonitoringDaemon {
                     .revoke_mount(&mount_path);
                 // A reused mount path does not inherit a former filesystem's
                 // exhausted-surface backoff, reserve growth or release result.
+                let pool_mount = self
+                    .ballast_coordinator
+                    .pool_for_mount(&mount_path)
+                    .map_or_else(|| mount_path.clone(), |pool| pool.mount_point.clone());
+                self.ballast_releaser.cancel_mount(&pool_mount);
+                self.ballast_replenisher.cancel_mount(&pool_mount);
+                self.ballast_coordinator.invalidate_pool_inventory(&pool_mount);
+                self.ballast_reserve_monitor.invalidate(&pool_mount);
+                self.release_controller.reset_effectiveness(&pool_mount);
                 self.mount_controllers.remove(&mount_path);
                 self.pending_recovery.remove(&mount_path);
                 self.recovery_probes.cancel_mount(&mount_path);
@@ -8911,6 +8943,8 @@ impl MonitoringDaemon {
         del_tx: &Sender<DeletionBatch>,
     ) -> Duration {
         self.poll_ballast_replenishment();
+        self.poll_ballast_releases();
+        self.ballast_releaser.begin_tick();
         self.poll_quarantine_worker();
         // This threshold is shared by every queued batch. A forecast for one
         // mount must not lower the executor's score floor on another mount.
@@ -9373,7 +9407,11 @@ impl MonitoringDaemon {
                 MountState::Idle if replenish_level == PressureLevel::Green => {
                     replenish_mounts.insert(refill_mount, mount.clone());
                 }
-                MountState::Recovery if decision.release_ballast && !entered_recovery => {
+                MountState::Recovery
+                    if !entered_recovery
+                        && (decision.release_ballast
+                            || self.ballast_releaser.busy_mount(&refill_mount)) =>
+                {
                     files_released = self.release_recovery_ballast(&mount, &tick.response);
                 }
                 MountState::Recovery | MountState::Idle => {}
@@ -9390,11 +9428,12 @@ impl MonitoringDaemon {
                     self.logger_handle.send(ActivityEvent::Emergency {
                         details: format!(
                             "critical pressure on {} ({:.1}% free, urgency={:.2}): released {} \
-                             ballast file(s), controller={}",
+                             ballast file(s), reserve request pending={}, controller={}",
                             mount.display(),
                             tick.response.free_pct,
                             tick.response.urgency,
                             files_released,
+                            self.ballast_releaser.requested(&self.pool_mount(&mount)),
                             decision.state,
                         ),
                         free_pct: tick.response.free_pct,
@@ -9405,12 +9444,38 @@ impl MonitoringDaemon {
             }
         }
 
+        // Collect Green predictive intents before starting any worker or
+        // admitting same-pool cleanup. A queued request alone never holds a scan.
+        for tick in &responses {
+            let Some(mount) = predictive_cleanup_mount(tick) else {
+                continue;
+            };
+            let pool = self.pool_mount(mount);
+            if tick.predictive_action.should_release_ballast()
+                && tick.imminent_danger
+                && !ballast_release_attempted.contains(&pool)
+                && !recovery_pools.contains(&pool)
+            {
+                let _ = self.release_ballast(mount, &tick.filesystem_response);
+            }
+        }
+        self.start_ballast_releases(Instant::now());
+
         // Aliases share one reserve and one cooldown observation per tick.
         // The most pressured view wins regardless of mount iteration order.
         for (pool, level) in refill_levels {
             self.release_controller.observe_level(&pool, level);
         }
-        replenish_mounts.retain(|pool, _| !refill_refused.contains(pool));
+        replenish_mounts.retain(|pool, _| {
+            !refill_refused.contains(pool)
+                && !self.ballast_releaser.busy_mount(pool)
+                && !self.ballast_releaser.requested(pool)
+        });
+        for (pool, blockers) in &mut self.ballast_refill_blockers {
+            if self.ballast_releaser.busy_mount(pool) || self.ballast_releaser.requested(pool) {
+                blockers.push(BallastRefillBlocker::WorkerBusy);
+            }
+        }
         for blockers in self.ballast_refill_blockers.values_mut() {
             for (blocked, reason) in [
                 (
@@ -9462,9 +9527,9 @@ impl MonitoringDaemon {
             }
         }
 
-        // Ballast has already had first priority. Refresh existing holds even
-        // when compression is disabled or stopping, so live emergencies also
-        // release older batches scored at a lower pressure level.
+        // Ballast workers have a finite first chance before new same-pool
+        // scans. Refresh compression holds even when that tier is stopping,
+        // so live emergencies release older batches scored at a lower level.
         let mount_levels: HashMap<PathBuf, PressureLevel> = responses
             .iter()
             .map(|tick| {
@@ -9520,9 +9585,10 @@ impl MonitoringDaemon {
             .into_iter()
             .partition(|(response, _, _, _, _)| response.level >= PressureLevel::Red);
         for (response, paths, catalog, ram_reclaim, inode_reclaim) in emergency_scans {
-            if self
-                .quarantine_sweeper
-                .resource_scan_waits(&response.causing_mount)
+            if self.ballast_release_waits(&response.causing_mount)
+                || self
+                    .quarantine_sweeper
+                    .resource_scan_waits(&response.causing_mount)
             {
                 continue;
             }
@@ -9559,9 +9625,10 @@ impl MonitoringDaemon {
             .start(QuarantineSweepContext::new(self), Instant::now(), false);
         let mut green_scan_attempted = HashSet::new();
         for (response, paths, catalog, ram_reclaim, inode_reclaim) in pending_scans {
-            if self
-                .quarantine_sweeper
-                .resource_scan_waits(&response.causing_mount)
+            if self.ballast_release_waits(&response.causing_mount)
+                || self
+                    .quarantine_sweeper
+                    .resource_scan_waits(&response.causing_mount)
             {
                 continue;
             }
@@ -9725,21 +9792,12 @@ impl MonitoringDaemon {
                 let Some(mount) = predictive_cleanup_mount(tick) else {
                     continue;
                 };
-                let physical = &tick.filesystem_response;
-                if tick.predictive_action.should_release_ballast()
-                    && tick.imminent_danger
-                    && !ballast_release_attempted.contains(&self.pool_mount(mount))
-                    && !recovery_pools.contains(&self.pool_mount(mount))
-                {
-                    self.last_tick_cleanup_ran |= self
-                        .release_ballast(mount, physical)
-                        .is_ok_and(|released| released > 0);
-                }
                 // A Reclaim controller may have queued its predictive pass
                 // already. FallbackSafe uses the recovery pass below; neither
                 // path may bypass a mount's recovery hold or empty-pass backoff.
                 if scan_allowed
                     && !in_fallback
+                    && !self.ballast_release_waits(mount)
                     && !green_scan_attempted.contains(mount)
                     && self.mount_controllers.get(mount).is_some_and(|controller| {
                         matches!(
@@ -9769,6 +9827,7 @@ impl MonitoringDaemon {
                         tick.response.level == PressureLevel::Green
                             && tick.filesystem_response.level == PressureLevel::Green
                             && !green_scan_attempted.contains(&tick.response.causing_mount)
+                            && !self.ballast_release_waits(&tick.response.causing_mount)
                             && self
                                 .mount_controllers
                                 .get(&tick.response.causing_mount)
@@ -10146,6 +10205,7 @@ impl MonitoringDaemon {
         responses
             .iter()
             .any(|tick| tick.response.causing_mount == stats.mount_point)
+            && !self.ballast_release_waits(&stats.mount_point)
             && self
                 .mount_controllers
                 .get(&stats.mount_point)
@@ -10192,8 +10252,8 @@ impl MonitoringDaemon {
         }
         let message = format!(
             "mount {} ({fs_type}) refused writes (read-only or out of metadata space) at {:.1}% \
-             free: released {released} ballast file(s); deletions on it are paused until a probe \
-             write succeeds. Next: {}",
+             free: eligible ballast relief runs in the background; deletions on it are paused \
+             until a probe write succeeds. Next: {}",
             mount.display(),
             response.free_pct,
             commands.join(" ; ")
@@ -10216,54 +10276,24 @@ impl MonitoringDaemon {
     /// manager identity checks and the nonblocking pool lock remain authoritative.
     fn release_recovery_ballast(&mut self, mount: &Path, response: &PressureResponse) -> usize {
         let pool_mount = self.pool_mount(mount);
-        self.ballast_replenisher.cancel_mount(&pool_mount);
-        if self.config.policy.kill_switch
-            || self.config.scanner.dry_run
-            || self.signal_handler.should_shutdown()
-        {
-            return 0;
-        }
-        let available = self.ballast_available_for_release(mount);
-        if available == 0 {
+        if self.ballast_available_for_release(mount) == 0 {
             return 0;
         }
         let now = Instant::now();
-        let recovery_aliases: Vec<_> = self
-            .mount_controllers
-            .iter()
-            .filter(|(alias, controller)| {
-                controller.state() == MountState::Recovery && self.pool_mount(alias) == pool_mount
+        // A running request needs fresh evidence even after its retry clock
+        // was spent. A queued request spends that clock only when it starts.
+        if !self.ballast_releaser.busy_mount(&pool_mount)
+            && self.mount_controllers.iter().any(|(alias, controller)| {
+                controller.state() == MountState::Recovery
+                    && self.pool_mount(alias) == pool_mount
+                    && !controller.recovery_release_due(now)
             })
-            .map(|(alias, _)| alias.clone())
-            .collect();
-        if recovery_aliases
-            .iter()
-            .any(|alias| !self.mount_controllers[alias].recovery_release_due(now))
         {
             return 0;
         }
-        if let Some(pool) = self.ballast_coordinator.pool_for_mount(mount) {
-            self.release_controller
-                .bind_pool(&pool_mount, &pool.ballast_dir);
-        }
-        for alias in recovery_aliases {
-            if let Some(controller) = self.mount_controllers.get_mut(&alias) {
-                controller.note_recovery_release_attempt(now);
-            }
-        }
-        self.ballast_reserve_monitor.invalidate(&pool_mount);
-        let Ok(Some(report)) = self.ballast_coordinator.release_for_mount(mount, available) else {
-            return 0;
-        };
-        for warning in &report.warnings {
-            eprintln!("[SBH-RECOVERY] {warning}");
-        }
-        self.release_controller
-            .on_released(&pool_mount, report.files_released);
-        self.reconcile_ballast_inventory(&pool_mount);
-        self.log_ballast_releases(&report.released, response);
-        self.last_tick_cleanup_ran |= report.files_released > 0;
-        report.files_released
+        let _ = self.request_ballast_release(mount, response, true);
+        // Completion, inventory and released-byte credit arrive via the worker.
+        0
     }
 
     /// Feed observed candidates to the per-mount controllers. An empty result
@@ -10366,6 +10396,15 @@ impl MonitoringDaemon {
         // An alias mount's inventory row is skipped and names its keeper's
         // default directory: pace the pool under its own mount instead.
         let pool_mount = self.pool_mount(mount);
+        if self.ballast_releaser.busy_mount(&pool_mount)
+            || self.ballast_releaser.requested(&pool_mount)
+        {
+            self.ballast_refill_blockers
+                .entry(pool_mount)
+                .or_default()
+                .push(BallastRefillBlocker::WorkerBusy);
+            return false;
+        }
         let Some(pool) = self.ballast_coordinator.pool_for_mount(&pool_mount) else {
             return false;
         };
@@ -10493,61 +10532,206 @@ impl MonitoringDaemon {
             });
     }
 
-    /// Helper to release ballast from the causing mount using the global controller logic.
-    fn release_ballast(
+    /// Queue a graduated release using only the collector's complete evidence.
+    /// The production collector is background-only; native pool validation and
+    /// release accounting happen on a retained worker and its completed receipt.
+    fn release_ballast(&mut self, mount: &Path, response: &PressureResponse) -> Result<usize> {
+        self.request_ballast_release(mount, response, false)?;
+        Ok(0)
+    }
+
+    fn request_ballast_release(
         &mut self,
-        mount: &std::path::Path,
-        response: &crate::monitor::pid::PressureResponse,
-    ) -> Result<usize> {
-        let available = self.ballast_available_for_release(mount);
-        let Some(pool) = self.ballast_coordinator.pool_for_mount(mount) else {
-            return Ok(0);
-        };
-        let expected = pool.expected_count();
-        // A same-filesystem alias mount shares its keeper's pool; release
-        // history lives under the pool's own mount, the key it is saved and
-        // restored under across restarts.
-        let pool_mount = pool.mount_point.clone();
+        mount: &Path,
+        response: &PressureResponse,
+        recovery: bool,
+    ) -> Result<bool> {
+        let pool_mount = self.pool_mount(mount);
+        if self.config.policy.kill_switch
+            || self.config.scanner.dry_run
+            || self.signal_handler.should_shutdown()
+        {
+            self.ballast_releaser.cancel_mount(&pool_mount);
+            return Ok(false);
+        }
+        if self.ballast_coordinator.pool_for_mount(mount).is_none() {
+            return Ok(false);
+        }
         self.ballast_replenisher.cancel_mount(&pool_mount);
-        self.release_controller
-            .bind_pool(&pool_mount, &pool.ballast_dir);
-        let count =
-            self.release_controller
-                .files_to_release(&pool_mount, response, available, expected);
+        // A cancelled allocation retains ownership until its native call
+        // returns. Releasing another pool remains independently admissible.
+        if self.ballast_replenisher.worker_mount() == Some(pool_mount.as_path()) {
+            return Ok(false);
+        }
+        let sample = self.fs_collector.collect_admission_sample(mount)?;
+        let stats = &sample.stats;
+        // A read-only bind of the pressured filesystem can still reach its
+        // writable same-device keeper. The worker validates the pool itself.
+        if sample.mount_owner().path != mount
+            || stats.total_bytes == 0
+            || stats.free_bytes > stats.total_bytes
+            || stats.available_bytes > stats.free_bytes
+        {
+            return Ok(false);
+        }
+        let Some(device_id) = sample.mount_device_id() else {
+            return Ok(false);
+        };
+        self.ballast_releaser.request(ReleaseRequest {
+            pool: pool_mount,
+            response: response.clone(),
+            recovery,
+            available_hint: self.ballast_available_for_release(mount),
+            observed_at: sample.collected_at,
+            max_age: Self::filesystem_observation_max_age(&self.config),
+            policy_transitions: self.policy_engine.lock().transitions_total(),
+            device_id,
+        });
+        Ok(true)
+    }
 
-        let mut released = 0;
-        if count > 0 {
-            self.ballast_reserve_monitor.invalidate(&pool_mount);
-            let free_before = self
-                .fs_collector
-                .collect(mount)
-                .map_or(0, |s| s.available_bytes);
-            if let Some(report) = self.ballast_coordinator.release_for_mount(mount, count)? {
-                for warning in &report.warnings {
-                    eprintln!("[sbh] warning: {warning}");
+    fn ballast_release_waits(&self, mount: &Path) -> bool {
+        self.ballast_releaser
+            .waits_mount(&self.pool_mount(mount), Instant::now())
+    }
+
+    /// Renew every pool after collecting all aliases, then start bounded work.
+    fn start_ballast_releases(&mut self, now: Instant) {
+        let context = ReleaseContext {
+            platform: Arc::clone(&self.platform),
+            policy: Arc::clone(&self.policy_engine),
+            scanner: Arc::clone(&self.shared_scanner_config),
+            shutdown: self.signal_handler.shutdown_token(),
+        };
+        for start in self.ballast_releaser.start_pending(
+            &mut self.ballast_coordinator,
+            &self.release_controller,
+            context,
+            now,
+        ) {
+            match start {
+                Ok(start) => {
+                    self.ballast_reserve_monitor.invalidate(&start.pool);
+                    if start.recovery {
+                        let aliases: Vec<_> = self
+                            .mount_controllers
+                            .iter()
+                            .filter(|(mount, controller)| {
+                                controller.state() == MountState::Recovery
+                                    && self.pool_mount(mount) == start.pool
+                            })
+                            .map(|(mount, _)| mount.clone())
+                            .collect();
+                        for alias in aliases {
+                            if let Some(controller) = self.mount_controllers.get_mut(&alias) {
+                                controller.note_recovery_release_attempt(now);
+                            }
+                        }
+                    }
                 }
+                Err((pool, error)) => {
+                    eprintln!(
+                        "[SBH-BALLAST] release worker could not start for {}: {error}",
+                        pool.display()
+                    );
+                }
+            }
+        }
+    }
 
-                released = report.files_released;
+    /// Audit actual removals even if reload superseded the worker. Only an
+    /// identity- and revision-current receipt may replace live inventory/history.
+    fn poll_ballast_releases(&mut self) -> usize {
+        let mut released = 0;
+        for completed in self.ballast_releaser.poll() {
+            let Ok(completed) = completed else {
+                eprintln!(
+                    "[SBH-BALLAST] release worker panicked; the next paced attempt will revalidate the pool"
+                );
+                continue;
+            };
+            let pool_mount = completed.task.mount().to_path_buf();
+            let observations = completed.task.observations();
+            let unbound = completed.task.unbound_observations();
+            let budget = completed.task.release_budget();
+            let budget_current = self
+                .ballast_coordinator
+                .release_budget_is_current(&completed.task);
+            let current = self.ballast_coordinator.finish_release(completed.task);
+            let report = completed.report;
+            for warning in &report.warnings {
+                eprintln!("[SBH-BALLAST] {warning}");
+            }
+            for error in &report.errors {
+                eprintln!(
+                    "[SBH-BALLAST] release incomplete for {}: {error}",
+                    pool_mount.display()
+                );
+            }
+            self.log_ballast_releases(&report.released, &completed.request.response);
+            released += report.files_released;
+            self.last_tick_cleanup_ran |= report.files_released > 0;
+            if !current {
+                if budget_current
+                    && let Some(budget) = budget
+                {
+                    // A failed post-inventory read cannot erase successful
+                    // removals from the graduated release allowance. This is
+                    // accounting only, never fresh native inventory.
+                    self.release_controller
+                        .apply_release_budget(&pool_mount, budget);
+                }
+                if budget_current && report.files_released > 0 {
+                    // An observer may have sampled between admission and the
+                    // actual unlinks. Retire it even when no fresh inventory
+                    // can be published from this release.
+                    self.ballast_coordinator
+                        .invalidate_pool_inventory(&pool_mount);
+                    self.ballast_reserve_monitor.invalidate(&pool_mount);
+                }
+                continue;
+            }
+            self.ballast_reserve_monitor.invalidate(&pool_mount);
+            if let Some((before, _)) = observations {
+                self.release_controller
+                    .observe_pool_inventory(&pool_mount, before);
+            } else if let Some((ref origin, before, _)) = unbound {
+                self.release_controller
+                    .observe_unbound_pool_inventory(&pool_mount, origin, before);
+            }
+            if report.files_released > 0 {
+                // Stranded reserve can have a complete receipt while its
+                // managed directory is absent. Actual release still starts
+                // the cooldown without inventing a managed directory identity.
                 self.release_controller
                     .on_released(&pool_mount, report.files_released);
-                self.reconcile_ballast_inventory(&pool_mount);
+            }
+            if let Some((_, after)) = observations {
+                self.release_controller
+                    .observe_pool_inventory(&pool_mount, after);
+            } else if let Some((ref origin, _, after)) = unbound {
+                self.release_controller
+                    .observe_unbound_pool_inventory(&pool_mount, origin, after);
+            }
+            if report.files_released == 0 {
+                continue;
+            }
+            if let Some(free_before) = completed.free_before {
                 self.release_controller.record_release(
                     &pool_mount,
                     report.bytes_freed,
                     free_before,
-                    Instant::now(),
+                    completed.completed_at,
                 );
-                self.log_ballast_releases(&report.released, response);
-
-                self.notification_manager
-                    .notify(&NotificationEvent::BallastReleased {
-                        mount: mount.to_string_lossy().to_string(),
-                        files_released: report.files_released,
-                        bytes_freed: report.bytes_freed,
-                    });
             }
+            self.notification_manager
+                .notify(&NotificationEvent::BallastReleased {
+                    mount: completed.request.response.causing_mount.display().to_string(),
+                    files_released: report.files_released,
+                    bytes_freed: report.bytes_freed,
+                });
         }
-        Ok(released)
+        released
     }
 
     /// One `ballast_release` activity event per removed file, tagged with
@@ -11509,6 +11693,7 @@ impl MonitoringDaemon {
                     self.flush_pending_state_write_failure();
                     self.uncovered_checked_at = None;
                     self.ballast_replenisher.cancel();
+                    self.ballast_releaser.cancel();
                     self.initial_provision.clear();
                     if self.discovery.is_some() {
                         self.ballast_coordinator.retain_release_only(
@@ -12014,6 +12199,7 @@ impl MonitoringDaemon {
         self.recovery_probes.cancel_all();
         self.process_io_history.stop();
         self.ballast_replenisher.cancel();
+        self.ballast_releaser.cancel();
         self.quarantine_sweeper.cancel();
         self.compress_tier.stop_running_pass();
         self.rch_staging.stop_running_pass();
@@ -18125,6 +18311,41 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn wait_for_ballast_release_evidence(daemon: &MonitoringDaemon, mount: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if daemon
+                .fs_collector
+                .collect_admission_sample(mount)
+                .is_ok_and(|sample| {
+                    sample.mount_owner().path == mount && sample.mount_device_id().is_some()
+                })
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "complete release evidence for {} did not arrive",
+                mount.display()
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    fn finish_ballast_releases(daemon: &mut MonitoringDaemon) -> usize {
+        daemon.start_ballast_releases(Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut released = 0;
+        while daemon.ballast_releaser.busy() {
+            released += daemon.poll_ballast_releases();
+            assert!(Instant::now() < deadline, "ballast release worker did not finish");
+            thread::yield_now();
+        }
+        released
+    }
+
+    #[cfg(unix)]
     fn wait_for_ballast_observation(
         daemon: &mut MonitoringDaemon,
         mount: &Path,
@@ -18157,8 +18378,72 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn recovery_reserve_fixture() -> RegretDaemonFixture {
-        let mut fixture = RegretDaemonFixture::new();
+    fn ballast_release_platform(mount: &Path) -> MockPlatform {
+        let mut system_stats = MockPlatform::healthy().fs_stats(Path::new("/")).unwrap();
+        let mut pool_stats = system_stats.clone();
+        pool_stats.mount_point = mount.to_path_buf();
+        // Keep unrelated host paths on a distinct, read-only mock filesystem.
+        // Discovery must never provision or adopt a reserve outside the fixture.
+        system_stats.is_readonly = true;
+        disk_pressure_platform(vec![system_stats, pool_stats])
+            .with_home(mount)
+            .with_temp_dirs(Vec::new())
+            .with_cache_roots(Vec::new())
+    }
+
+    #[cfg(unix)]
+    fn ballast_release_fixture() -> (RegretDaemonFixture, PathBuf) {
+        use crate::core::config::PathsConfig;
+        use crate::platform::types::{OpenFile, OpenFileKind, OpenFileMode};
+
+        let directory = tempfile::tempdir().unwrap();
+        // Use the platform's lookup spelling (including macOS firmlinks) while
+        // keeping the logical mount on the actual native temporary filesystem.
+        let mount = MockPlatform::healthy()
+            .mount_lookup_path(directory.path())
+            .unwrap();
+        let paths = PathsConfig {
+            config_file: mount.join("config.toml"),
+            ballast_dir: mount.join("ballast"),
+            state_file: mount.join("state.json"),
+            sqlite_db: mount.join("activity.sqlite3"),
+            jsonl_log: mount.join("activity.jsonl"),
+        };
+        let mut config = Config::with_paths(paths);
+        let project = mount.join("project");
+        std::fs::create_dir(&project).unwrap();
+        config.scanner.root_paths = vec![project.clone()];
+        config.ballast.auto_provision = false;
+        config.ballast.file_count = 2;
+        config.ballast.file_size_bytes = 8192;
+        config.scoring.regret_window_minutes = 1;
+        let platform = ballast_release_platform(&mount).with_open_file(OpenFile {
+            pid: 42,
+            path: project.join("Cargo.toml"),
+            fd: Some(3),
+            kind: OpenFileKind::Regular,
+            mode: OpenFileMode::Read,
+        });
+        let daemon = MonitoringDaemon::init_with_platform(
+            config,
+            &DaemonArgs::default(),
+            Arc::new(platform),
+        )
+        .unwrap();
+        assert_eq!(daemon.ballast_coordinator.pool_count(), 1);
+        let pool = daemon.ballast_coordinator.pool_for_mount(&mount).unwrap();
+        assert!(
+            pool.stranded_files()
+                .iter()
+                .all(|(path, _)| path.starts_with(&mount)),
+            "native reserve operations must remain inside the fixture"
+        );
+        (RegretDaemonFixture { daemon, directory }, mount)
+    }
+
+    #[cfg(unix)]
+    fn recovery_reserve_fixture() -> (RegretDaemonFixture, PathBuf) {
+        let (mut fixture, mount) = ballast_release_fixture();
         let daemon = &mut fixture.daemon;
         daemon.config.ballast.file_count = 2;
         daemon.config.ballast.file_size_bytes = 8192;
@@ -18173,20 +18458,21 @@ mod tests {
             MemoryPressureLevel::Normal,
             PressureLevel::Critical,
         );
-        // Until the monitor has a native mount observation, a recovery probe
-        // has no permission to clear the hold. Reserve release still has its
-        // independent manager binding and native lock.
+        // Release admission needs complete background evidence. Keep it out
+        // of mount_monitors so the independent recovery probe cannot clear the
+        // hold merely because the mock capacity sample is healthy.
         daemon.enable_background_filesystem_observations();
+        wait_for_ballast_release_evidence(daemon, &mount);
         daemon.mount_monitors.clear();
-        fixture
+        (fixture, mount)
     }
 
     #[cfg(unix)]
     #[test]
     fn recovery_ballast_releases_external_reserve_after_the_entry_tick() {
-        let mut fixture = recovery_reserve_fixture();
+        let (mut fixture, mount) = recovery_reserve_fixture();
         let daemon = &mut fixture.daemon;
-        let mount = Path::new("/");
+        let mount = mount.as_path();
         let tick = quarantine_tick(PressureLevel::Critical, mount);
         let (scan_tx, scan_rx) = bounded(4);
         let (del_tx, _del_rx) = bounded(4);
@@ -18238,6 +18524,7 @@ mod tests {
             daemon.mount_controllers[mount].state(),
             MountState::Recovery
         );
+        assert_eq!(finish_ballast_releases(daemon), 2);
         assert!(
             scan_rx.is_empty(),
             "an unconfirmed write probe still holds scanning"
@@ -18281,9 +18568,9 @@ mod tests {
         use rustix::fs::{FlockOperation, flock};
 
         for inode_pressure in [false, true] {
-            let mut fixture = recovery_reserve_fixture();
+            let (mut fixture, mount) = recovery_reserve_fixture();
             let daemon = &mut fixture.daemon;
-            let mount = Path::new("/");
+            let mount = mount.as_path();
             assert_eq!(
                 daemon
                     .ballast_coordinator
@@ -18315,6 +18602,7 @@ mod tests {
                 daemon.mount_controllers[mount].state(),
                 MountState::Recovery
             );
+            assert_eq!(finish_ballast_releases(daemon), 0);
             assert_eq!(daemon.ballast_available_for_release(mount), 2);
             assert!(!daemon.last_tick_cleanup_ran);
             flock(&lock, FlockOperation::Unlock).unwrap();
@@ -18337,8 +18625,10 @@ mod tests {
                         .checked_sub(crate::daemon::mount_controller::RECOVERY_POLL_INTERVAL)
                         .unwrap(),
                 );
+            daemon.ballast_releaser.elapse_retry_interval(mount);
             daemon.mount_responses = vec![tick.clone()];
             daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+            assert_eq!(finish_ballast_releases(daemon), 2);
             assert_eq!(
                 daemon.mount_controllers[mount].state(),
                 MountState::Recovery
@@ -18358,12 +18648,12 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn recovery_reserve_alias_fixture() -> (RegretDaemonFixture, PathBuf, PathBuf) {
+    fn recovery_reserve_alias_fixture() -> (RegretDaemonFixture, PathBuf, PathBuf, PathBuf) {
         use crate::platform::pal::{MountPoint, PlatformPaths};
 
-        let mut fixture = recovery_reserve_fixture();
-        let alias = fixture.directory.path().join("bind-alias");
-        let observed_alias = fixture.directory.path().join("writable-alias");
+        let (mut fixture, mount) = recovery_reserve_fixture();
+        let alias = mount.join("bind-alias");
+        let observed_alias = mount.join("writable-alias");
         std::fs::create_dir(&alias).unwrap();
         std::fs::create_dir(&observed_alias).unwrap();
         let daemon = &mut fixture.daemon;
@@ -18375,10 +18665,12 @@ mod tests {
             initial_mode: ActiveMode::Observe,
             ..PolicyConfig::default()
         });
-        let mount = Path::new("/");
-        let stats = daemon.platform.fs_stats(mount).unwrap();
+        let system_stats = daemon.platform.fs_stats(Path::new("/")).unwrap();
+        assert!(system_stats.is_readonly);
+        let stats = daemon.platform.fs_stats(&mount).unwrap();
         let mut alias_stats = stats.clone();
         alias_stats.mount_point.clone_from(&alias);
+        alias_stats.is_readonly = true;
         let mut observed_alias_stats = stats.clone();
         observed_alias_stats.mount_point.clone_from(&observed_alias);
         let memory = daemon.platform.memory_info().unwrap();
@@ -18390,26 +18682,177 @@ mod tests {
         };
         daemon.platform = Arc::new(
             MockPlatform::new(
-                vec![entry(mount), entry(&alias), entry(&observed_alias)],
+                vec![
+                    MountPoint {
+                        path: PathBuf::from("/"),
+                        device: "/dev/mock-system".to_string(),
+                        fs_type: "mockfs".to_string(),
+                        is_ram_backed: false,
+                    },
+                    entry(&mount),
+                    entry(&alias),
+                    entry(&observed_alias),
+                ],
                 HashMap::from([
-                    (mount.to_path_buf(), stats),
+                    (PathBuf::from("/"), system_stats),
+                    (mount.clone(), stats),
                     (alias.clone(), alias_stats),
                     (observed_alias.clone(), observed_alias_stats),
                 ]),
                 memory,
                 PlatformPaths::default(),
             )
-            .with_home(fixture.directory.path())
+            .with_home(mount.as_path())
             .with_temp_dirs(Vec::new())
             .with_cache_roots(Vec::new()),
         );
         daemon.ballast_coordinator = DiscoverySnapshot::collect(&daemon.config, &daemon.platform)
             .unwrap()
             .ballast_coordinator;
+        assert_eq!(daemon.ballast_coordinator.pool_count(), 1);
         daemon.enable_background_filesystem_observations();
-        assert_eq!(daemon.pool_mount(&alias), mount);
-        assert_eq!(daemon.pool_mount(&observed_alias), mount);
-        (fixture, alias, observed_alias)
+        for observed in [mount.as_path(), alias.as_path(), observed_alias.as_path()] {
+            wait_for_ballast_release_evidence(daemon, observed);
+        }
+        assert_eq!(daemon.pool_mount(&alias), mount.as_path());
+        assert_eq!(daemon.pool_mount(&observed_alias), mount.as_path());
+        (fixture, mount, alias, observed_alias)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_pressure_alias_releases_its_writable_shared_reserve() {
+        let (mut fixture, mount, alias, _) = recovery_reserve_alias_fixture();
+        let daemon = &mut fixture.daemon;
+        assert!(
+            daemon
+                .fs_collector
+                .collect_admission_sample(&alias)
+                .unwrap()
+                .stats
+                .is_readonly
+        );
+        assert_eq!(daemon.pool_mount(&alias), mount.as_path());
+        assert_eq!(
+            daemon
+                .ballast_coordinator
+                .provision_all(daemon.platform.as_ref())
+                .unwrap()
+                .total_files_created(),
+            2
+        );
+        let response = quarantine_tick(PressureLevel::Critical, &alias).response;
+        assert_eq!(daemon.release_ballast(&alias, &response).unwrap(), 0);
+        assert_eq!(daemon.ballast_available_for_release(&alias), 2);
+        assert_eq!(finish_ballast_releases(daemon), 2);
+        assert_eq!(daemon.ballast_available_for_release(&alias), 0);
+        assert_eq!(daemon.policy_engine.lock().mode(), ActiveMode::Observe);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_recovery_release_renews_without_blocking_pressure_and_cancels_before_unlink() {
+        for cancel in [false, true] {
+            let (mut fixture, mount) = recovery_reserve_fixture();
+            let daemon = &mut fixture.daemon;
+            let mount = mount.as_path();
+            assert_eq!(
+                daemon
+                    .ballast_coordinator
+                    .provision_all(daemon.platform.as_ref())
+                    .unwrap()
+                    .total_files_created(),
+                2
+            );
+            *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+                initial_mode: ActiveMode::Observe,
+                ..PolicyConfig::default()
+            });
+            let ordinary_platform = Arc::clone(&daemon.platform);
+            let (entered_tx, entered_rx) = bounded(1);
+            let (release_tx, release_rx) = bounded(1);
+            daemon.platform = Arc::new(BackgroundOnlyFilesystemPlatform {
+                inner: ballast_release_platform(mount),
+                control_thread: thread::current().id(),
+                blocked: mount.to_path_buf(),
+                started: entered_tx,
+                release: release_rx,
+            });
+            let tick = quarantine_tick(PressureLevel::Critical, mount);
+            let (scan_tx, scan_rx) = bounded(4);
+            let (del_tx, _del_rx) = bounded(4);
+            daemon.pending_recovery.insert(mount.to_path_buf());
+            daemon.mount_responses = vec![tick.clone()];
+            daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Only the retained release context keeps the blocked native probe;
+            // discovery and the independent capacity collector use ordinary I/O.
+            daemon.platform = ordinary_platform;
+            assert!(daemon.ballast_releaser.busy_mount(mount));
+            assert!(!daemon.mount_controllers[mount].recovery_release_due(Instant::now()));
+            assert!(!daemon.last_tick_cleanup_ran);
+            assert_eq!(daemon.ballast_available_for_release(mount), 2);
+
+            // Spending the retry clock must not suppress fresh permission for
+            // an already-running recovery request on the next monitor tick.
+            daemon.mount_responses = vec![tick.clone()];
+            daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+            assert!(!daemon.maybe_replenish_pool(mount, PressureLevel::Green, Instant::now()));
+            assert!(scan_rx.is_empty());
+            if !cancel {
+                // Actual completion proves renewal without relying on the
+                // wall-clock duration of the separate first-chance scan hold.
+                release_tx.send(()).unwrap();
+                assert_eq!(finish_ballast_releases(daemon), 2);
+                assert_eq!(daemon.ballast_available_for_release(mount), 0);
+                assert!(daemon.last_tick_cleanup_ran);
+                continue;
+            }
+
+            let error = daemon
+                .execute_ballast_action(&ControlBallastAction::Release {
+                    mount: Some(mount.to_path_buf()),
+                    count: 2,
+                })
+                .unwrap_err();
+            assert!(error.contains("still finishing native I/O"));
+            assert!(daemon.ballast_releaser.busy_mount(mount));
+            assert!(!daemon.ballast_release_waits(mount));
+
+            let mut discovery = RetainedDiscovery::default();
+            discovery.request();
+            daemon.discovery = Some(discovery);
+            for _ in 0..3 {
+                assert_eq!(daemon.check_pressure().unwrap().level, PressureLevel::Green);
+                daemon.poll_discovery();
+                assert!(daemon.discovery_pending());
+                assert!(!daemon.discovery.as_ref().unwrap().occupied());
+            }
+            assert!(daemon.ballast_releaser.take_forecast_intervention());
+            release_tx.send(()).unwrap();
+            assert_eq!(finish_ballast_releases(daemon), 0);
+            assert_eq!(daemon.ballast_available_for_release(mount), 2);
+            assert!(daemon.ballast_releaser.take_forecast_intervention());
+            assert!(!daemon.ballast_releaser.take_forecast_intervention());
+            for index in 1..=2 {
+                assert!(
+                    daemon
+                        .config
+                        .paths
+                        .ballast_dir
+                        .join(format!("SBH_BALLAST_FILE_{index:05}.dat"))
+                        .exists()
+                );
+            }
+            daemon.poll_discovery();
+            assert!(daemon.discovery.as_ref().unwrap().occupied());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while daemon.discovery_pending() {
+                daemon.poll_discovery();
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -18417,9 +18860,9 @@ mod tests {
     fn recovery_ballast_aliases_share_retry_deadline_and_cannot_bypass_it() {
         use rustix::fs::{FlockOperation, flock};
 
-        let (mut fixture, alias, observed_alias) = recovery_reserve_alias_fixture();
+        let (mut fixture, mount, alias, observed_alias) = recovery_reserve_alias_fixture();
         let daemon = &mut fixture.daemon;
-        let mount = Path::new("/");
+        let mount = mount.as_path();
         assert_eq!(
             daemon
                 .ballast_coordinator
@@ -18454,6 +18897,7 @@ mod tests {
             !daemon.quarantine_sweeper.forecast_intervention(),
             "inventory-only quarantine work cannot censor the reserve retry fixture"
         );
+        assert_eq!(finish_ballast_releases(daemon), 0);
         flock(&lock, FlockOperation::Unlock).unwrap();
 
         // The recovering mount need not be sampled alongside its alias. Both
@@ -18499,8 +18943,10 @@ mod tests {
         // view still is. Once the shared deadline passes it must carry the
         // reserve retry without requiring its own write failure first.
         let observed_tick = quarantine_tick(PressureLevel::Critical, &observed_alias);
+        daemon.ballast_releaser.elapse_retry_interval(mount);
         daemon.mount_responses = vec![observed_tick.clone()];
         daemon.handle_pressure(&observed_tick.response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(finish_ballast_releases(daemon), 2);
         assert_eq!(
             daemon.mount_controllers[&observed_alias].state(),
             MountState::Reclaim
@@ -18527,9 +18973,9 @@ mod tests {
     #[test]
     fn recovery_ballast_holds_preserve_reserve_and_do_not_spend_the_retry() {
         for hold in ["dry-run", "kill-switch", "shutdown"] {
-            let mut fixture = recovery_reserve_fixture();
+            let (mut fixture, mount) = recovery_reserve_fixture();
             let daemon = &mut fixture.daemon;
-            let mount = Path::new("/");
+            let mount = mount.as_path();
             assert_eq!(
                 daemon
                     .ballast_coordinator
@@ -18574,6 +19020,7 @@ mod tests {
             daemon.config.policy.kill_switch = false;
             daemon.mount_responses = vec![tick.clone()];
             daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+            assert_eq!(finish_ballast_releases(daemon), 2);
             assert_eq!(
                 daemon.mount_controllers[mount].state(),
                 MountState::Recovery
@@ -18591,7 +19038,7 @@ mod tests {
     #[test]
     fn externally_provisioned_ballast_wakes_idle_reclaim_and_mount_recovery() {
         for recovery in [false, true] {
-            let mut fixture = RegretDaemonFixture::new();
+            let (mut fixture, mount) = ballast_release_fixture();
             let daemon = &mut fixture.daemon;
             daemon.config.ballast.file_count = 2;
             daemon.config.ballast.file_size_bytes = 8192;
@@ -18600,7 +19047,7 @@ mod tests {
                     .unwrap()
                     .ballast_coordinator;
             daemon.ballast_reserve_monitor = BallastReserveMonitor::default();
-            let mount = Path::new("/");
+            let mount = mount.as_path();
             let tick = quarantine_tick(PressureLevel::Critical, mount);
             let now = Instant::now();
             let mut controller =
@@ -18666,6 +19113,7 @@ mod tests {
                 daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
                 assert_eq!(daemon.mount_controllers[mount].state(), MountState::Reclaim);
             }
+            assert_eq!(finish_ballast_releases(daemon), 2);
             for index in 1..=2 {
                 assert!(
                     !daemon
@@ -18693,7 +19141,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn observed_external_depletion_satisfies_orange_release_budget() {
-        let mut fixture = RegretDaemonFixture::new();
+        let (mut fixture, mount) = ballast_release_fixture();
         let daemon = &mut fixture.daemon;
         daemon.config.ballast.file_count = 3;
         daemon.config.ballast.file_size_bytes = 8192;
@@ -18708,7 +19156,7 @@ mod tests {
                 .total_files_created(),
             3
         );
-        let mount = Path::new("/");
+        let mount = mount.as_path();
         daemon.reconcile_ballast_inventory(mount);
         daemon.ballast_reserve_monitor = BallastReserveMonitor::default();
         let directory = daemon.config.paths.ballast_dir.clone();
@@ -18743,7 +19191,9 @@ mod tests {
         response.urgency = 0.3;
         response.release_ballast_files = 1;
         for _ in 0..2 {
+            daemon.ballast_releaser.elapse_retry_interval(mount);
             assert_eq!(daemon.release_ballast(mount, &response).unwrap(), 0);
+            assert_eq!(finish_ballast_releases(daemon), 0);
         }
         assert_eq!(daemon.ballast_available_for_release(mount), 2);
         let history = serde_json::to_value(
@@ -18769,7 +19219,7 @@ mod tests {
     #[test]
     fn final_release_and_accepted_refill_update_cached_history_without_another_recommendation() {
         for action in ["automatic", "recovery", "operator"] {
-            let mut fixture = RegretDaemonFixture::new();
+            let (mut fixture, mount) = ballast_release_fixture();
             let daemon = &mut fixture.daemon;
             daemon.config.ballast.file_count = 2;
             daemon.config.ballast.file_size_bytes = 8192;
@@ -18781,11 +19231,17 @@ mod tests {
                 .ballast_coordinator
                 .provision_all(daemon.platform.as_ref())
                 .unwrap();
-            let mount = Path::new("/");
+            let mount = mount.as_path();
             let response = quarantine_tick(PressureLevel::Critical, mount).response;
             match action {
-                "automatic" => assert_eq!(daemon.release_ballast(mount, &response).unwrap(), 2),
-                "recovery" => assert_eq!(daemon.enter_mount_recovery(mount, &response), 2),
+                "automatic" => {
+                    assert_eq!(daemon.release_ballast(mount, &response).unwrap(), 0);
+                    assert_eq!(finish_ballast_releases(daemon), 2);
+                }
+                "recovery" => {
+                    assert_eq!(daemon.enter_mount_recovery(mount, &response), 0);
+                    assert_eq!(finish_ballast_releases(daemon), 2);
+                }
                 "operator" => {
                     daemon
                         .execute_ballast_action(&ControlBallastAction::Release {
@@ -18901,8 +19357,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn completed_discovery_cannot_restore_inventory_released_while_it_was_running() {
-        let mut fixture = RegretDaemonFixture::new();
+        let (mut fixture, mount) = ballast_release_fixture();
         let daemon = &mut fixture.daemon;
+        let mount = mount.as_path();
         daemon.config.ballast.file_count = 2;
         daemon.config.ballast.file_size_bytes = 8192;
         let first = DiscoverySnapshot::collect(&daemon.config, &daemon.platform).unwrap();
@@ -18914,7 +19371,7 @@ mod tests {
         assert_eq!(
             daemon
                 .ballast_coordinator
-                .pool_for_mount(Path::new("/"))
+                .pool_for_mount(mount)
                 .unwrap()
                 .available_count(),
             2
@@ -18933,10 +19390,12 @@ mod tests {
         });
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         daemon.discovery = Some(discovery);
-        daemon
-            .ballast_coordinator
-            .release_for_mount(Path::new("/"), 1)
-            .unwrap();
+        let mut response = quarantine_tick(PressureLevel::Orange, mount).response;
+        response.urgency = 0.3;
+        response.release_ballast_files = 1;
+        assert!(daemon.discovery_pending());
+        assert_eq!(daemon.release_ballast(mount, &response).unwrap(), 0);
+        assert_eq!(finish_ballast_releases(daemon), 1);
         release_tx.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while daemon.discovery.as_ref().unwrap().generation() == 1 {
@@ -18951,7 +19410,7 @@ mod tests {
         assert_eq!(
             daemon
                 .ballast_coordinator
-                .pool_for_mount(Path::new("/"))
+                .pool_for_mount(mount)
                 .unwrap()
                 .available_count(),
             1
@@ -23528,6 +23987,7 @@ mod tests {
             let (scan_tx, scan_rx) = bounded(8);
             let (del_tx, _del_rx) = bounded(2);
             daemon.handle_pressure(&worst.response, &scan_tx, &scan_rx, &del_tx);
+            assert!(finish_ballast_releases(daemon) >= 1);
             for (mount, expected) in [(&filling, 1), (&steady, 2)] {
                 assert_eq!(
                     daemon
@@ -23603,6 +24063,11 @@ mod tests {
                 daemon.mount_responses.push(tick);
             }
             daemon.handle_pressure(&worst.response, &scan_tx, &scan_rx, &del_tx);
+            assert_eq!(
+                finish_ballast_releases(daemon),
+                usize::from(case == "confirmed"),
+                "{case}: only actual completed release earns credit"
+            );
             assert_eq!(available(daemon, &steady), 2, "{case}: peer keeps reserve");
             assert_eq!(available(daemon, &other), 2, "{case}: peer keeps reserve");
             assert_eq!(
@@ -28598,8 +29063,9 @@ mod tests {
         };
         assert_eq!(
             daemon.release_ballast(&mount, &old_alert_response).unwrap(),
-            2
+            0
         );
+        assert_eq!(finish_ballast_releases(&mut daemon), 2);
         assert_eq!(available(&daemon), 0);
 
         daemon.logger_handle.shutdown();

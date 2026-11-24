@@ -214,6 +214,15 @@ mod unix {
     }
 
     impl StrandedReserve {
+        /// A newly mounted filesystem cannot spend reserve adopted from the
+        /// previous device, even when its managed directory uses the same path.
+        pub(in super::super) fn matches_device(&self, expected: u64) -> bool {
+            self.snapshots.values().all(|snapshot| {
+                snapshot.directory.device == expected
+                    && snapshot.file.identity.device == expected
+            })
+        }
+
         pub(in super::super) fn discover(dirs: &[PathBuf], managed: &Path, mount: &Path) -> Self {
             let mut reserve = Self::default();
             let Ok(mount_meta) = fs::metadata(mount) else {
@@ -345,22 +354,40 @@ mod unix {
         /// Missing/replaced entries revoke the cached authority and do not
         /// consume the quota. A busy directory cannot block a healthy sibling.
         pub(in super::super) fn release(&mut self, count: usize) -> ReleaseReport {
+            self.release_guarded(count, &|| true)
+        }
+
+        /// Renew the daemon's live permission after all native validation and
+        /// immediately before each unlink. Refusal keeps the remaining reserve.
+        pub(in super::super) fn release_guarded(
+            &mut self,
+            count: usize,
+            still_allowed: &dyn Fn() -> bool,
+        ) -> ReleaseReport {
             let mut report = super::empty_report();
+            if count == 0 || !still_allowed() {
+                return report;
+            }
             let mut kept = Vec::new();
+            let mut revoked = false;
             for (path, size) in std::mem::take(&mut self.files) {
-                if report.files_released >= count {
+                if report.files_released >= count || revoked {
                     kept.push((path, size));
                     continue;
                 }
                 let Some(snapshot) = self.snapshots.get(&path) else {
                     continue;
                 };
-                match release_one(&path, snapshot) {
-                    Ok(()) => {
+                match release_one(&path, snapshot, still_allowed) {
+                    Ok(true) => {
                         self.snapshots.remove(&path);
                         report.files_released += 1;
                         report.bytes_freed = report.bytes_freed.saturating_add(size);
                         report.released.push((path, size));
+                    }
+                    Ok(false) => {
+                        revoked = true;
+                        kept.push((path, size));
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         self.snapshots.remove(&path);
@@ -423,11 +450,11 @@ mod unix {
         })
     }
 
-    fn with_validated_candidate(
+    fn with_validated_candidate<T>(
         path: &Path,
         snapshot: &Snapshot,
-        action: impl FnOnce(&File, &OsStr) -> io::Result<()>,
-    ) -> io::Result<()> {
+        action: impl FnOnce(&File, &OsStr) -> io::Result<T>,
+    ) -> io::Result<T> {
         let parent = path
             .parent()
             .ok_or_else(|| invalid("ballast has no parent"))?;
@@ -449,12 +476,20 @@ mod unix {
         action(&directory, name)
     }
 
-    fn release_one(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
+    fn release_one(
+        path: &Path,
+        snapshot: &Snapshot,
+        still_allowed: &dyn Fn() -> bool,
+    ) -> io::Result<bool> {
         with_validated_candidate(path, snapshot, |directory, name| {
             // Cooperating CLI/daemon writers hold .lock; anchoring the unlink to
             // the open directory also prevents an ancestor rename redirecting it.
+            // A blocked open or header read cannot retain stale permission.
+            if !still_allowed() {
+                return Ok(false);
+            }
             unlinkat(directory, name, AtFlags::empty())?;
-            Ok(())
+            Ok(true)
         })
     }
 
@@ -553,6 +588,9 @@ pub(super) struct StrandedReserve;
 
 #[cfg(not(unix))]
 impl StrandedReserve {
+    pub(super) fn matches_device(&self, _expected: u64) -> bool {
+        true
+    }
     pub(super) fn discover(_dirs: &[PathBuf], _managed: &Path, _mount: &Path) -> Self {
         Self
     }
@@ -569,6 +607,13 @@ impl StrandedReserve {
         Vec::new()
     }
     pub(super) fn release(&mut self, _count: usize) -> ReleaseReport {
+        empty_report()
+    }
+    pub(super) fn release_guarded(
+        &mut self,
+        _count: usize,
+        _still_allowed: &dyn Fn() -> bool,
+    ) -> ReleaseReport {
         empty_report()
     }
 }
@@ -669,6 +714,65 @@ mod release_tests {
 
     fn discover(root: &Path, dirs: &[PathBuf]) -> StrandedReserve {
         StrandedReserve::discover(dirs, &root.join("managed"), root)
+    }
+
+    #[test]
+    fn guarded_stranded_release_retains_a_revoked_reserve_without_locking() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("legacy");
+        let path = ballast(&dir, 1);
+        let mut reserve = discover(temp.path(), std::slice::from_ref(&dir));
+        let before = fs::read(&path).unwrap();
+        let lock = File::open(dir.join(".lock")).unwrap();
+        flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+        let report = reserve.release_guarded(1, &|| false);
+        assert_eq!(report.files_released, 0);
+        assert_eq!(report.bytes_freed, 0);
+        assert!(report.errors.is_empty());
+        assert!(report.warnings.is_empty());
+        assert_eq!(reserve.files().len(), 1);
+        assert_eq!(fs::read(path).unwrap(), before);
+        flock(&lock, FlockOperation::Unlock).unwrap();
+    }
+
+    #[test]
+    fn guarded_stranded_release_renews_before_unlink_and_preserves_cancelled_inventory() {
+        use std::cell::Cell;
+
+        for permitted_files in [0, 1] {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = temp.path().join("legacy");
+            for index in 1..=3 {
+                ballast(&dir, index);
+            }
+            let mut reserve = discover(temp.path(), std::slice::from_ref(&dir));
+            let calls = Cell::new(0);
+            let reject_at = permitted_files + 2;
+            let report = reserve.release_guarded(3, &|| {
+                calls.set(calls.get() + 1);
+                calls.get() != reject_at
+            });
+            assert_eq!(calls.get(), reject_at);
+            assert_eq!(report.files_released, permitted_files);
+            assert_eq!(
+                report.bytes_freed,
+                u64::try_from(permitted_files).unwrap() * (HEADER_SIZE as u64) * 2
+            );
+            assert!(report.errors.is_empty());
+            assert!(report.warnings.is_empty());
+            assert_eq!(reserve.files().len(), 3 - permitted_files);
+            assert_eq!(
+                reserve.bytes(),
+                u64::try_from(3 - permitted_files).unwrap() * (HEADER_SIZE as u64) * 2
+            );
+            for index in 1..=3 {
+                assert_eq!(
+                    dir.join(format!("SBH_BALLAST_FILE_{index:05}.dat")).exists(),
+                    index <= 3 - permitted_files
+                );
+            }
+            assert_eq!(reserve.release(3).files_released, 3 - permitted_files);
+        }
     }
 
     #[test]

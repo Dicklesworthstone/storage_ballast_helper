@@ -919,7 +919,18 @@ impl BallastManager {
     /// removals consume the quota, including verified surplus after a target
     /// change. A busy pool can be retried on a later tick.
     pub fn release(&mut self, count: usize) -> Result<ReleaseReport> {
-        emergency::release(self, count)
+        emergency::release(self, count, &|| true)
+    }
+
+    /// Renew live daemon authority immediately before each verified unlink.
+    /// Revocation retains the remaining reserve without claiming a failure or
+    /// speculative freed bytes. Explicit CLI release uses its own consent.
+    pub(crate) fn release_guarded(
+        &mut self,
+        count: usize,
+        still_allowed: &dyn Fn() -> bool,
+    ) -> Result<ReleaseReport> {
+        emergency::release(self, count, still_allowed)
     }
 
     fn local_snapshot_release_warnings(&self) -> Vec<String> {
@@ -1143,6 +1154,12 @@ impl BallastManager {
 
     fn scan_existing(&mut self) {
         self.inventory = observation::inventory(self);
+    }
+
+    /// Refresh cached inventory without changing the reserve on disk.
+    /// Automatic release workers call this before publishing their receipt.
+    pub(crate) fn refresh_inventory(&mut self) {
+        self.scan_existing();
     }
 
     fn verify_single_file(

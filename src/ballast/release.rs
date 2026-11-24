@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::ballast::manager::{BallastManager, ReleaseReport};
@@ -32,6 +33,26 @@ pub struct BallastReleaseHistory {
     identity: PoolIdentity,
     available: usize,
     release_credit: usize,
+}
+
+/// In-memory accounting for adopted reserve while the managed directory is
+/// absent. This is scoped to one coordinator generation, never persisted or
+/// represented as a native directory identity.
+#[derive(Debug, Clone)]
+pub(crate) struct BallastUnboundReleaseHistory {
+    origin: Arc<()>,
+    available: usize,
+    release_credit: usize,
+}
+
+/// Accounting-only evidence: a complete native before snapshot plus confirmed
+/// unlinks. Its derived remainder is not an authoritative post-I/O inventory.
+#[derive(Clone)]
+pub(crate) struct BallastReleaseBudgetReceipt {
+    pub(crate) observation: Option<BallastInventoryObservation>,
+    pub(crate) origin: Arc<()>,
+    pub(crate) available_before: usize,
+    pub(crate) released: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -55,6 +76,10 @@ impl BallastInventoryObservation {
             identity: BallastReleaseHistory::pool_identity(directory)?,
             available,
         })
+    }
+
+    pub(crate) fn same_pool(self, other: Self) -> bool {
+        self.identity == other.identity
     }
 }
 
@@ -107,6 +132,8 @@ pub struct PendingRelease {
 struct MountReleaseState {
     /// The physical directory supplying this mount's observations.
     pool_identity: Option<PoolIdentity>,
+    /// Adopted reserve accounting is valid only within this coordinator.
+    unbound_origin: Option<Arc<()>>,
     /// When we last released ballast (for cooldown calculation).
     last_release_time: Option<Instant>,
     /// When pressure first returned to Green (for replenishment cooldown).
@@ -123,7 +150,8 @@ struct MountReleaseState {
     /// is rebuilding, not a cap on replenishment (a reserve short for any
     /// other reason is rebuilt too).
     released_since_green: usize,
-    /// Last physical inventory supplied by the pool, not configured capacity.
+    /// Last physical inventory, adjusted for confirmed unlinks when a complete
+    /// post-I/O observation is unavailable; never configured capacity.
     last_available_count: Option<usize>,
     /// Net observed inventory depletion, used for the cumulative release
     /// target. Files never provisioned do not count as releases.
@@ -139,6 +167,7 @@ impl Default for MountReleaseState {
     fn default() -> Self {
         Self {
             pool_identity: None,
+            unbound_origin: None,
             last_release_time: None,
             green_since: None,
             last_replenish_time: None,
@@ -223,9 +252,10 @@ impl BallastReleaseController {
         observation: BallastInventoryObservation,
     ) {
         let state = self.states.entry(mount_path.to_path_buf()).or_default();
-        if state
-            .pool_identity
-            .is_some_and(|old| old != observation.identity)
+        if state.unbound_origin.is_some()
+            || state
+                .pool_identity
+                .is_some_and(|old| old != observation.identity)
         {
             *state = MountReleaseState::default();
         }
@@ -244,6 +274,89 @@ impl BallastReleaseController {
         })
     }
 
+    /// Reconcile independently verified adopted reserve without inventing a
+    /// managed directory identity. The caller first validates the task receipt.
+    pub(crate) fn observe_unbound_pool_inventory(
+        &mut self,
+        mount_path: &Path,
+        origin: &Arc<()>,
+        available: usize,
+    ) {
+        let state = self.states.entry(mount_path.to_path_buf()).or_default();
+        if state.pool_identity.is_some()
+            || state
+                .unbound_origin
+                .as_ref()
+                .is_none_or(|old| !Arc::ptr_eq(old, origin))
+        {
+            *state = MountReleaseState::default();
+        }
+        state.unbound_origin = Some(Arc::clone(origin));
+        state.observe_inventory(available);
+    }
+
+    /// Preserve actual release debt when native post-inventory is incomplete.
+    /// The coordinator must first validate this task's origin and revision.
+    /// This updates only release accounting; no actuator inventory is published.
+    pub(crate) fn apply_release_budget(
+        &mut self,
+        mount_path: &Path,
+        receipt: BallastReleaseBudgetReceipt,
+    ) {
+        if let Some(before) = receipt.observation {
+            self.observe_pool_inventory(mount_path, before);
+        } else {
+            self.observe_unbound_pool_inventory(
+                mount_path,
+                &receipt.origin,
+                receipt.available_before,
+            );
+        }
+        if receipt.released > 0 {
+            self.on_released(mount_path, receipt.released);
+        }
+        let state = self.states.get_mut(mount_path).expect("release budget state");
+        // Advancing the baseline prevents a later real native observation from
+        // charging these same confirmed removals to the cumulative target twice.
+        state.observe_inventory(receipt.available_before.saturating_sub(receipt.released));
+    }
+
+    pub(crate) fn cached_unbound_pool_history(
+        &self,
+        mount_path: &Path,
+    ) -> Option<BallastUnboundReleaseHistory> {
+        let state = self.states.get(mount_path)?;
+        if state.pool_identity.is_some() {
+            return None;
+        }
+        Some(BallastUnboundReleaseHistory {
+            origin: Arc::clone(state.unbound_origin.as_ref()?),
+            available: state.last_available_count?,
+            release_credit: state.release_credit,
+        })
+    }
+
+    pub(crate) fn restore_unbound_pool_history(
+        &mut self,
+        mount_path: &Path,
+        origin: &Arc<()>,
+        history: &BallastUnboundReleaseHistory,
+    ) -> bool {
+        if !Arc::ptr_eq(origin, &history.origin)
+            || history.available.checked_add(history.release_credit).is_none()
+        {
+            return false;
+        }
+        let state = self.states.entry(mount_path.to_path_buf()).or_default();
+        if state.last_available_count.is_some() || state.pool_identity.is_some() {
+            return false;
+        }
+        state.unbound_origin = Some(Arc::clone(origin));
+        state.last_available_count = Some(history.available);
+        state.release_credit = history.release_credit;
+        true
+    }
+
     fn state_for_pool(
         &mut self,
         mount_path: &Path,
@@ -251,7 +364,9 @@ impl BallastReleaseController {
     ) -> Option<&mut MountReleaseState> {
         let identity = BallastReleaseHistory::pool_identity(directory)?;
         let state = self.states.entry(mount_path.to_path_buf()).or_default();
-        if state.pool_identity.is_some_and(|old| old != identity) {
+        if state.unbound_origin.is_some()
+            || state.pool_identity.is_some_and(|old| old != identity)
+        {
             *state = MountReleaseState::default();
         }
         state.pool_identity = Some(identity);
@@ -633,6 +748,37 @@ mod tests {
     use super::*;
     use crate::ballast::manager::BallastManager;
     use crate::core::config::BallastConfig;
+
+
+    #[cfg(unix)]
+    #[test]
+    fn unbound_history_is_generation_scoped_and_never_becomes_physical_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mount = directory.path();
+        let origin = Arc::new(());
+        let replacement = Arc::new(());
+        let mut controller = BallastReleaseController::new(0);
+        controller.observe_unbound_pool_inventory(mount, &origin, 5);
+        controller.on_released(mount, 1);
+        controller.observe_unbound_pool_inventory(mount, &origin, 4);
+        let history = controller.cached_unbound_pool_history(mount).unwrap();
+        assert!(controller.cached_pool_history(mount).is_none());
+
+        let mut worker = BallastReleaseController::new(0);
+        assert!(!worker.restore_unbound_pool_history(mount, &replacement, &history));
+        assert!(worker.restore_unbound_pool_history(mount, &origin, &history));
+        assert_eq!(worker.states[mount].release_credit, 1);
+
+        controller.observe_unbound_pool_inventory(mount, &replacement, 4);
+        assert_eq!(controller.states[mount].release_credit, 0);
+        controller.observe_pool_inventory(
+            mount,
+            BallastInventoryObservation::capture(directory.path(), 4).unwrap(),
+        );
+        assert!(controller.cached_unbound_pool_history(mount).is_none());
+        assert!(controller.cached_pool_history(mount).is_some());
+        assert_eq!(controller.states[mount].release_credit, 0);
+    }
 
     fn test_config() -> BallastConfig {
         BallastConfig {

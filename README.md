@@ -1145,11 +1145,32 @@ cannot prevent a newer policy from being read and applied. While a new policy
 or pool plan is pending, new ballast allocations are deferred. Previously
 verified pools remain available for release unless the new configuration
 disables or redirects them. Blocked jobs keep their slots across reloads.
-Rediscovery also waits for any cancelled allocation worker to exit, so a late
-native write cannot change a pool after its replacement inventory was captured.
+Rediscovery also waits for occupied allocation and release workers to exit,
+including cancelled workers, so late native work cannot invalidate a replacement
+inventory after it was captured.
+
+Automatic ballast release runs on at most two retained workers, with one worker
+per physical pool. A blocked filesystem keeps its slot; the monitor can still
+sample other filesystems and admit release on another pool. Ordinary pressure,
+imminent forecasts and write recovery use the same path. Each unlink renews
+permission against the original filesystem evidence, current policy, dry-run and
+shutdown state. A weaker pressure request cancels an older release-all attempt.
+Read-only mount aliases can reach their writable same-device pool, and Observe
+mode still permits release of sacrificial ballast.
+
+An active release gets up to two seconds before new scans on its own pool;
+renewal and retries do not extend that first chance. Queued requests do not hold
+scans. Refill waits for that pool's release worker to exit. Only confirmed
+removals update release totals, and only complete, current receipts replace native
+inventory. Confirmed removals retain their graduated release credit even if a
+post-release inventory read fails. A receipt superseded by reload or a filesystem
+change remains audit evidence without replacing newer state. If post-release
+inventory I/O stalls, its receipt remains pending. Manual
+daemon ballast controls report a busy pool while an automatic worker finishes.
+
 Required configuration, liveness and persisted-state access during initialization,
-state-file writes, emergency release and explicit filesystem mutations still
-include synchronous operations.
+state-file writes, standalone emergency commands and explicit filesystem mutations
+still include synchronous operations.
 
 Write-recovery probes use at most four retained workers. Pending results keep
 only the affected mounts in Recovery. Each new probe write requires a fresh
