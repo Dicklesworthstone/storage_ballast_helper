@@ -6839,6 +6839,9 @@ impl MonitoringDaemon {
                 self.ballast_coordinator
                     .inventory_cached()
                     .into_iter()
+                    // Folded bind mounts are status rows. Resolving them again
+                    // would spend the operator's count twice on the same pool.
+                    .filter(|pool| !pool.skipped)
                     .map(|pool| pool.mount_point)
                     .collect()
             },
@@ -6878,6 +6881,7 @@ impl MonitoringDaemon {
                     self.ballast_replenisher.cancel_mount(&pool_mount);
                     match self.ballast_coordinator.release_for_mount(&mount, *count) {
                         Ok(Some(report)) => {
+                            self.last_tick_cleanup_ran |= report.files_released > 0;
                             self.release_controller
                                 .on_released(&pool_mount, report.files_released);
                             self.reconcile_ballast_inventory(&pool_mount);
@@ -18849,6 +18853,53 @@ mod tests {
                 thread::yield_now();
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_ballast_applies_all_mount_actions_once_per_physical_pool() {
+        let (mut fixture, mount, alias, _) = recovery_reserve_alias_fixture();
+        let daemon = &mut fixture.daemon;
+        daemon.config.scanner.root_paths.push(alias.clone());
+        daemon.ballast_coordinator = DiscoverySnapshot::collect(&daemon.config, &daemon.platform)
+            .unwrap()
+            .ballast_coordinator;
+        assert!(
+            daemon
+                .ballast_coordinator
+                .inventory_cached()
+                .iter()
+                .any(|pool| { pool.mount_point == alias && pool.skipped })
+        );
+        assert_eq!(
+            daemon
+                .ballast_coordinator
+                .provision_all(daemon.platform.as_ref())
+                .unwrap()
+                .total_files_created(),
+            2
+        );
+        for selected in [None, Some(alias)] {
+            daemon.last_tick_cleanup_ran = false;
+            let result = daemon
+                .execute_ballast_action(&ControlBallastAction::Release {
+                    mount: selected,
+                    count: 1,
+                })
+                .unwrap();
+            let pools = result["pools"].as_array().unwrap();
+            assert_eq!(pools.len(), 1);
+            assert_eq!(pools[0]["released"], 1);
+            assert!(daemon.last_tick_cleanup_ran);
+        }
+        assert_eq!(daemon.ballast_available_for_release(&mount), 0);
+        let result = daemon
+            .execute_ballast_action(&ControlBallastAction::Replenish { mount: None })
+            .unwrap();
+        let pools = result["pools"].as_array().unwrap();
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0]["created"], 1);
+        assert_eq!(daemon.ballast_available_for_release(&mount), 1);
     }
 
     #[cfg(unix)]
