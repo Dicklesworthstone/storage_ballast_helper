@@ -30,6 +30,8 @@ pub mod policy;
 #[cfg(feature = "daemon")]
 pub mod predictive_reclaim;
 #[cfg(feature = "daemon")]
+mod pressure_notifications;
+#[cfg(feature = "daemon")]
 pub mod process_io_history;
 #[cfg(feature = "daemon")]
 pub mod ram_reclaim;

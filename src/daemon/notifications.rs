@@ -88,6 +88,23 @@ pub enum NotificationEvent {
         mount: String,
         free_pct: f64,
     },
+    /// Finite filesystem inode capacity, independently of free bytes.
+    InodePressureChanged {
+        from: String,
+        to: String,
+        mount: String,
+        total_inodes: u64,
+        available_inodes: u64,
+        free_pct: f64,
+    },
+    /// Host swap backing capacity, independently of every tmpfs mount's size.
+    SwapPressureChanged {
+        from: String,
+        to: String,
+        swap_total_bytes: u64,
+        swap_free_bytes: u64,
+        free_pct: f64,
+    },
     PredictiveWarning {
         mount: String,
         minutes_remaining: f64,
@@ -169,7 +186,9 @@ impl NotificationEvent {
             | Self::DaemonStopped { .. }
             | Self::BallastReplenished { .. } => NotificationLevel::Info,
 
-            Self::PressureChanged { to, .. } => match to.as_str() {
+            Self::PressureChanged { to, .. }
+            | Self::InodePressureChanged { to, .. }
+            | Self::SwapPressureChanged { to, .. } => match to.as_str() {
                 "Critical" | "critical" => NotificationLevel::Critical,
                 "Red" | "red" => NotificationLevel::Red,
                 "Orange" | "orange" => NotificationLevel::Orange,
@@ -267,6 +286,8 @@ impl NotificationEvent {
     pub fn type_key(&self) -> &'static str {
         match self {
             Self::PressureChanged { .. } => "pressure_changed",
+            Self::InodePressureChanged { .. } => "inode_pressure_changed",
+            Self::SwapPressureChanged { .. } => "swap_pressure_changed",
             Self::PredictiveWarning { .. } => "predictive_warning",
             Self::CleanupCompleted { .. } => "cleanup_completed",
             Self::BallastReleased { .. } => "ballast_released",
@@ -294,6 +315,7 @@ impl NotificationEvent {
     fn throttle_scope(&self) -> &str {
         match self {
             Self::PressureChanged { mount, .. }
+            | Self::InodePressureChanged { mount, .. }
             | Self::PredictiveWarning { mount, .. }
             | Self::CleanupCompleted { mount, .. }
             | Self::BallastReleased { mount, .. }
@@ -301,7 +323,8 @@ impl NotificationEvent {
             | Self::BallastReserveChanged { mount, .. }
             | Self::ReclaimUnavailable { mount, .. } => mount,
             Self::Error { code, .. } => code,
-            Self::BehaviorEmergency { .. }
+            Self::SwapPressureChanged { .. }
+            | Self::BehaviorEmergency { .. }
             | Self::DaemonStarted { .. }
             | Self::DaemonStopped { .. }
             | Self::CpuBudgetExceeded { .. }
@@ -319,6 +342,25 @@ impl NotificationEvent {
                 mount,
                 free_pct,
             } => format!("Pressure {from} -> {to} on {mount} ({free_pct:.1}% free)"),
+            Self::InodePressureChanged {
+                from,
+                to,
+                mount,
+                total_inodes,
+                available_inodes,
+                free_pct,
+            } => format!(
+                "Inode pressure {from} -> {to} on {mount} ({available_inodes}/{total_inodes} inodes available, {free_pct:.1}% free)"
+            ),
+            Self::SwapPressureChanged {
+                from,
+                to,
+                swap_total_bytes,
+                swap_free_bytes,
+                free_pct,
+            } => format!(
+                "Host swap pressure {from} -> {to} ({swap_free_bytes}/{swap_total_bytes} bytes free, {free_pct:.1}% free)"
+            ),
             Self::PredictiveWarning {
                 mount,
                 minutes_remaining,
@@ -852,7 +894,13 @@ impl WebhookChannel {
         let (mount, free_pct) = match event {
             NotificationEvent::PressureChanged {
                 mount, free_pct, ..
+            }
+            | NotificationEvent::InodePressureChanged {
+                mount, free_pct, ..
             } => (mount.clone(), format!("{free_pct:.1}")),
+            NotificationEvent::SwapPressureChanged { free_pct, .. } => {
+                ("host swap".into(), format!("{free_pct:.1}"))
+            }
             NotificationEvent::BallastReserveChanged { mount, reserve, .. } => (
                 mount.clone(),
                 reserve.headroom.as_ref().map_or_else(
@@ -2200,6 +2248,27 @@ mod tests {
         }
     }
 
+    fn inode_event(mount: &str) -> NotificationEvent {
+        NotificationEvent::InodePressureChanged {
+            from: "Green".into(),
+            to: "Critical".into(),
+            mount: mount.into(),
+            total_inodes: 10_000,
+            available_inodes: 50,
+            free_pct: 0.5,
+        }
+    }
+
+    fn swap_event() -> NotificationEvent {
+        NotificationEvent::SwapPressureChanged {
+            from: "Green".into(),
+            to: "Critical".into(),
+            swap_total_bytes: 64 << 30,
+            swap_free_bytes: 0,
+            free_pct: 0.0,
+        }
+    }
+
     fn reserve_event(mount: &str, bytes: u64, authoritative: bool) -> NotificationEvent {
         use crate::ballast::coordinator::BallastRefillBlocker;
 
@@ -2258,6 +2327,100 @@ mod tests {
             .map(|record| record["level"].as_str().unwrap())
             .collect();
         assert_eq!(levels, ["warning", "red", "critical"]);
+    }
+
+    #[test]
+    fn inode_pressure_rendering_preserves_inode_capacity_and_mount() {
+        let (_directory, config, mut manager) = notification_fixture();
+        let event = inode_event("/data");
+        manager.notify(&pressure_event("/data", NotificationLevel::Critical));
+        manager.notify(&event);
+        let records = recorded_notifications(&config, &manager);
+        assert_eq!(records.len(), 2, "byte pressure cannot silence inode pressure");
+        let inode = &records[1];
+        assert_eq!(inode["type"], "inode_pressure_changed");
+        assert_eq!(inode["level"], "critical");
+        assert_eq!(inode["mount"], "/data");
+        assert_eq!(inode["total_inodes"], 10_000);
+        assert_eq!(inode["available_inodes"], 50);
+        assert_eq!(inode["free_pct"], 0.5);
+        assert!(event.summary().contains("50/10000 inodes available"));
+
+        let channel = WebhookChannel::new(&WebhookConfig {
+            template: "{\"mount\":\"${MOUNT}\",\"free\":\"${FREE_PCT}\",\"message\":\"${SUMMARY}\"}".into(),
+            ..WebhookConfig::default()
+        });
+        let body: serde_json::Value = serde_json::from_str(&channel.render_body(&event)).unwrap();
+        assert_eq!(body["mount"], "/data");
+        assert_eq!(body["free"], "0.5");
+        assert!(body["message"].as_str().unwrap().contains("inodes available"));
+    }
+
+    #[test]
+    fn swap_pressure_rendering_identifies_host_backing_without_a_fake_mount() {
+        let (_directory, config, mut manager) = notification_fixture();
+        let event = swap_event();
+        manager.notify(&event);
+        let records = recorded_notifications(&config, &manager);
+        assert_eq!(records.len(), 1);
+        let swap = &records[0];
+        assert_eq!(swap["type"], "swap_pressure_changed");
+        assert_eq!(swap["level"], "critical");
+        assert_eq!(swap["swap_total_bytes"], 64_u64 << 30);
+        assert_eq!(swap["swap_free_bytes"], 0);
+        assert_eq!(swap["free_pct"], 0.0);
+        assert!(swap.get("mount").is_none());
+        assert!(event.summary().contains("Host swap pressure"));
+        assert!(event.summary().contains("0/68719476736 bytes free"));
+
+        let channel = WebhookChannel::new(&WebhookConfig {
+            template: "{\"mount\":\"${MOUNT}\",\"free\":\"${FREE_PCT}\"}".into(),
+            ..WebhookConfig::default()
+        });
+        let body: serde_json::Value = serde_json::from_str(&channel.render_body(&event)).unwrap();
+        assert_eq!(body["mount"], "host swap");
+        assert_eq!(body["free"], "0.0");
+    }
+
+    #[test]
+    fn resource_pressure_retries_after_full_queue_without_consuming_cooldowns() {
+        let (_directory, _config, mut manager) = notification_fixture();
+        let (release, wait) = bounded(1);
+        let delivered = install_probe(&mut manager, "file", Some(wait));
+        manager.notify(&pressure_event("/data", NotificationLevel::Critical));
+        assert_eq!(delivered.recv_timeout(Duration::from_secs(5)).unwrap(), "/data");
+        for index in 0..CHANNEL_QUEUE_CAPACITY {
+            manager.notify(&pressure_event(
+                &format!("/queued-{index}"),
+                NotificationLevel::Critical,
+            ));
+        }
+        let events = [inode_event("/data"), swap_event()];
+        let now = Instant::now();
+        for event in &events {
+            assert_eq!(manager.notify_at(event, now), NotificationDispatchOutcome::Unavailable);
+            assert!(!manager.last_send_by_scope.contains_key(&(
+                event.type_key(),
+                event.throttle_scope().into(),
+            )));
+        }
+        assert_eq!(manager.dropped_count(), 2);
+        drop(release);
+        assert!(manager.drain(Duration::from_secs(5)));
+        assert_eq!(delivered.try_iter().count(), CHANNEL_QUEUE_CAPACITY);
+        for event in &events {
+            assert_eq!(
+                manager.notify_at(event, now + Duration::from_secs(1)),
+                NotificationDispatchOutcome::Accepted
+            );
+            assert_eq!(
+                manager.notify_at(event, now + Duration::from_secs(2)),
+                NotificationDispatchOutcome::Throttled
+            );
+        }
+        assert!(manager.drain(Duration::from_secs(5)));
+        assert_eq!(delivered.try_iter().collect::<Vec<_>>(), ["/data", ""]);
+        assert_eq!(manager.dropped_count(), 2);
     }
 
     #[test]

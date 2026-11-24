@@ -64,6 +64,7 @@ use crate::daemon::policy::{
 use crate::daemon::predictive_reclaim::{
     PredictiveObservation, PredictiveReclaimPolicy, PredictiveScanAdmission,
 };
+use crate::daemon::pressure_notifications::{PressureNotifications, PressureObservation};
 use crate::daemon::process_io_history::{ProcessIoHistory, ProcessIoSampler};
 use crate::daemon::ram_reclaim::RamReclaimRequest;
 use crate::daemon::rch_staging::RchStagingTier;
@@ -3892,11 +3893,12 @@ pub struct MonitoringDaemon {
     shared_scanner_config: Arc<RwLock<crate::core::config::ScannerConfig>>,
     start_time: Instant,
     last_pressure_level: PressureLevel,
-    /// Highest pressure level that was notified within the cooldown window.
-    /// Used to suppress oscillation noise: after notifying at Orange, we won't
-    /// re-notify at Yellow even if pressure dips to Green and comes back up.
-    last_notified_pressure_level: PressureLevel,
-    last_pressure_notify_time: Option<Instant>,
+    /// Physical filesystem transitions are independent of the aggregate
+    /// control level; one full volume cannot hide another volume's escalation.
+    pressure_notifications: PressureNotifications,
+    /// Host swap evidence from this tick's existing memory sample. It is a
+    /// resource observation, never a synthetic filesystem free percentage.
+    swap_pressure_observation: Option<PressureObservation>,
     last_special_scan: HashMap<PathBuf, Instant>,
     /// Per-special-location alert episode: (highest level notified in it, when
     /// its alert was last seen). See [`special_episode_step`] and
@@ -6140,8 +6142,8 @@ impl MonitoringDaemon {
             shared_scanner_config,
             start_time,
             last_pressure_level: PressureLevel::Green,
-            last_notified_pressure_level: PressureLevel::Green,
-            last_pressure_notify_time: None,
+            pressure_notifications: PressureNotifications::default(),
+            swap_pressure_observation: None,
             last_special_scan: HashMap::new(),
             last_special_notify: HashMap::new(),
             last_predictive_warning: HashMap::new(),
@@ -7800,33 +7802,10 @@ impl MonitoringDaemon {
                 .collect();
             self.watchdog.maybe_notify("pressure checked");
 
-            // 4. Log pressure transitions.
-            if response.level != self.last_pressure_level {
-                // Suppress oscillation noise (e.g., Green→Orange→Green→Yellow→Green→Yellow).
-                // Within a 5-minute cooldown window, only notify if the new level
-                // exceeds the highest level already notified. This prevents:
-                // - After Green→Orange notification, repeated Green→Yellow noise
-                // - After Green→Red, repeated Green→Yellow→Green→Yellow cycling
-                let in_cooldown = self
-                    .last_pressure_notify_time
-                    .is_some_and(|t| t.elapsed() < Duration::from_mins(5));
-                let should_notify = if in_cooldown {
-                    // Only notify if this level exceeds what we already notified about.
-                    response.level > self.last_notified_pressure_level
-                } else {
-                    // Cooldown expired — reset and notify any change.
-                    self.last_notified_pressure_level = PressureLevel::Green;
-                    true
-                };
-                if should_notify {
-                    self.log_pressure_change(&response);
-                    self.last_pressure_notify_time = Some(Instant::now());
-                    if response.level > self.last_notified_pressure_level {
-                        self.last_notified_pressure_level = response.level;
-                    }
-                }
-                self.last_pressure_level = response.level;
-            }
+            // 4. Record every filesystem's actual transition. Queue rejection
+            // remains retryable even when aggregate level never changes.
+            self.report_pressure_changes(Instant::now());
+            self.last_pressure_level = response.level;
 
             self.update_behavior_mode(
                 self.behavior_state.latest_memory_level(),
@@ -8385,6 +8364,7 @@ impl MonitoringDaemon {
         self.target_tier.withdraw_pressure();
         self.scan_now_queue.lock().withdraw_pressure();
         self.mount_responses.clear();
+        self.swap_pressure_observation = None;
         self.last_predictive_action = PredictiveAction::Clear;
         for monitor in self.mount_monitors.values_mut() {
             monitor.prediction_scorecard.discard_pending();
@@ -8580,15 +8560,15 @@ impl MonitoringDaemon {
         // evidence leaves filesystem control unchanged; an empty swap device
         // is not an exhausted one. macOS /tmp is disk-backed and this Linux
         // tmpfs relief policy does not reinterpret its dynamic swap supply.
-        let swap_pressure = if cfg!(target_os = "linux") {
-            self.platform
-                .memory_info()
-                .ok()
-                .as_ref()
-                .and_then(swap_reclaim_pressure)
+        let swap_memory = if cfg!(target_os = "linux") {
+            self.platform.memory_info().ok()
         } else {
             None
         };
+        let swap_pressure = swap_memory.as_ref().and_then(swap_reclaim_pressure);
+        self.swap_pressure_observation = swap_memory.as_ref().and_then(|memory| {
+            PressureObservation::swap(memory, self.config.pressure.free_pct_thresholds(), now)
+        });
         let background_observations = self.fs_collector.is_background();
         // Resource relief needs the configured directory identities as well
         // as the mount's pressure. Resolve them on the existing bounded
@@ -9111,41 +9091,39 @@ impl MonitoringDaemon {
         })
     }
 
-    fn log_pressure_change(&mut self, response: &crate::monitor::pid::PressureResponse) {
-        // Use the causing mount so the log entry reflects the mount that
-        // actually drove the pressure level change, not the primary path.
-        let (free_pct, mount, total, free) =
-            if let Ok(stats) = self.fs_collector.collect(&response.causing_mount) {
-                #[allow(clippy::cast_possible_wrap)]
-                (
-                    stats.free_pct(),
-                    stats.mount_point.to_string_lossy().to_string(),
-                    stats.total_bytes as i64,
-                    stats.available_bytes as i64,
-                )
-            } else {
-                (0.0, "/".to_string(), 0, 0)
+    fn report_pressure_changes(&mut self, now: Instant) {
+        let mut observations = Vec::with_capacity(self.mount_responses.len() * 2 + 1);
+        for tick in &self.mount_responses {
+            let Some(observation) = self
+                .mount_monitors
+                .get(&tick.filesystem_response.causing_mount)
+                .and_then(|monitor| monitor.last_observation.as_ref())
+            else {
+                continue;
             };
-
-        self.logger_handle.send(ActivityEvent::PressureChanged {
-            from: format!("{:?}", self.last_pressure_level),
-            to: format!("{:?}", response.level),
-            free_pct,
-            rate_bps: None,
-            mount_point: mount.clone(),
-            total_bytes: total,
-            free_bytes: free,
-            ewma_rate: None,
-            pid_output: Some(response.urgency),
-        });
-
-        self.notification_manager
-            .notify(&NotificationEvent::PressureChanged {
-                from: format!("{:?}", self.last_pressure_level),
-                to: format!("{:?}", response.level),
-                mount,
-                free_pct,
-            });
+            observations.extend(PressureObservation::filesystem(
+                &tick.filesystem_response,
+                &observation.sample.stats,
+                observation.sample.collected_at,
+                tick.device_id,
+                tick.rate.bytes_per_sec,
+            ));
+            observations.extend(tick.inode_pressure.as_ref().and_then(|pressure| {
+                PressureObservation::inodes(
+                    &tick.filesystem_response.causing_mount,
+                    pressure,
+                    observation.sample.collected_at,
+                    tick.device_id,
+                )
+            }));
+        }
+        observations.extend(self.swap_pressure_observation.clone());
+        self.pressure_notifications.observe(
+            &observations,
+            now,
+            |event| self.logger_handle.send(event),
+            |event| self.notification_manager.notify_with_outcome(event),
+        );
     }
 
     // ──────────────────── pressure response ────────────────────
@@ -20423,6 +20401,194 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn pressure_transition_reporting_uses_each_ticks_evidence_and_retries_delivery() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let notifications = fixture.directory.path().join("pressure-notifications.jsonl");
+        let daemon = &mut fixture.daemon;
+        let mut notify_config = NotificationConfig {
+            enabled: false,
+            channels: vec!["file".into()],
+            file: FileConfig {
+                path: notifications.clone(),
+            },
+            ..NotificationConfig::default()
+        };
+        daemon.notification_manager = NotificationManager::from_config(&notify_config);
+        daemon.config.scanner.root_paths = vec![
+            PathBuf::from("/pressure-first"),
+            PathBuf::from("/pressure-second"),
+        ];
+        daemon.config.pressure.prediction.enabled = false;
+        let mut aggregate_levels = Vec::new();
+        for second_free in [50 << 30, 1 << 30] {
+            let platform: Arc<dyn Platform> = Arc::new(disk_pressure_platform(vec![
+                disk_pressure_sample("/", 100 << 30, 50 << 30),
+                disk_pressure_sample("/pressure-first", 100 << 30, 1 << 30),
+                disk_pressure_sample("/pressure-second", 100 << 30, second_free),
+            ]));
+            daemon.fs_collector = FsStatsCollector::new(platform, Duration::ZERO);
+            aggregate_levels.push(daemon.check_pressure().unwrap().level);
+            // The sample is now the only source of those mounts' capacities.
+            // A repeat lookup would fail and used to invent '/' with 0% free.
+            daemon.fs_collector =
+                FsStatsCollector::new(Arc::new(MockPlatform::healthy()), Duration::ZERO);
+            if second_free == 1 << 30 {
+                notify_config.enabled = true;
+                daemon.notification_manager.update_config(&notify_config);
+            }
+            daemon.report_pressure_changes(Instant::now());
+        }
+        daemon.report_pressure_changes(Instant::now());
+        assert_eq!(aggregate_levels, [PressureLevel::Critical; 2]);
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        let mut delivered: Vec<Value> = std::fs::read_to_string(&notifications)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        delivered.sort_by_key(|event| event["mount"].as_str().unwrap().to_owned());
+        assert_eq!(delivered.len(), 2, "{delivered:?}");
+        for (event, mount) in delivered.iter().zip(["/pressure-first", "/pressure-second"]) {
+            assert_eq!(event["mount"], mount);
+            assert_eq!(event["from"], "Green");
+            assert_eq!(event["to"], "Critical");
+            assert_eq!(event["free_pct"], 1.0);
+        }
+
+        fixture.flush_logger();
+        let transitions: Vec<Value> =
+            std::fs::read_to_string(fixture.directory.path().join("activity.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter(|event| event["event"] == "pressure_change")
+                .collect();
+        assert_eq!(
+            transitions.len(),
+            2,
+            "retries do not duplicate transition records"
+        );
+        assert!(
+            transitions
+                .iter()
+                .all(|event| { event["mount_point"] != "/" && event["free_pct"] == 1.0 })
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn swap_only_pressure_is_not_reported_as_filesystem_byte_exhaustion() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let notifications = fixture.directory.path().join("swap-notifications.jsonl");
+        fixture.daemon.notification_manager =
+            NotificationManager::from_config(&NotificationConfig {
+                channels: vec!["file".into()],
+                file: FileConfig {
+                    path: notifications.clone(),
+                },
+                ..NotificationConfig::default()
+            });
+        install_tmpfs_pressure_probe(
+            &mut fixture,
+            exhausted_swap_sample(),
+            "tmpfs",
+            70 << 30,
+            false,
+        );
+        assert_eq!(
+            fixture.daemon.check_pressure().unwrap().level,
+            PressureLevel::Critical
+        );
+        fixture.daemon.report_pressure_changes(Instant::now());
+        fixture.daemon.report_pressure_changes(Instant::now());
+        assert!(
+            fixture
+                .daemon
+                .notification_manager
+                .drain(Duration::from_secs(2))
+        );
+        let notices: Vec<Value> = std::fs::read_to_string(&notifications)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0]["type"], "swap_pressure_changed");
+        assert_eq!(notices[0]["to"], "Critical");
+        assert_eq!(notices[0]["swap_total_bytes"], 64_u64 << 30);
+        assert_eq!(notices[0]["swap_free_bytes"], 0);
+        assert_eq!(notices[0]["free_pct"], 0.0);
+        assert!(notices[0].get("mount").is_none());
+        fixture.flush_logger();
+        let transitions: Vec<Value> =
+            std::fs::read_to_string(fixture.directory.path().join("activity.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter(|event| event["event"] == "pressure_change")
+                .collect();
+        assert!(transitions.is_empty(), "{transitions:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inode_only_pressure_is_reported_with_inode_capacity() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+        use crate::platform::pal::InodeStats;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let notifications = fixture.directory.path().join("inode-notifications.jsonl");
+        fixture.daemon.notification_manager =
+            NotificationManager::from_config(&NotificationConfig {
+                channels: vec!["file".into()],
+                file: FileConfig {
+                    path: notifications.clone(),
+                },
+                ..NotificationConfig::default()
+            });
+        let (mount, _) =
+            install_inode_pressure_probe(&mut fixture, InodeStats::new(10_000, 50, 50));
+        assert_eq!(
+            fixture.daemon.check_pressure().unwrap().level,
+            PressureLevel::Critical
+        );
+        fixture.daemon.report_pressure_changes(Instant::now());
+        fixture.daemon.report_pressure_changes(Instant::now());
+        assert!(
+            fixture
+                .daemon
+                .notification_manager
+                .drain(Duration::from_secs(2))
+        );
+        let notices: Vec<Value> = std::fs::read_to_string(&notifications)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0]["type"], "inode_pressure_changed");
+        assert_eq!(notices[0]["mount"], mount.to_string_lossy().as_ref());
+        assert_eq!(notices[0]["to"], "Critical");
+        assert_eq!(notices[0]["total_inodes"], 10_000);
+        assert_eq!(notices[0]["available_inodes"], 50);
+        assert_eq!(notices[0]["free_pct"], 0.5);
+        fixture.flush_logger();
+        let logs =
+            std::fs::read_to_string(fixture.directory.path().join("activity.jsonl")).unwrap();
+        assert!(logs.contains("50/10000 inodes available"));
+        assert!(
+            logs.lines()
+                .all(|line| serde_json::from_str::<Value>(line).unwrap()["event"]
+                    != "pressure_change")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn background_pressure_reaches_healthy_scan_dispatch_while_another_mount_is_stalled() {
         let mut fixture = RegretDaemonFixture::new();
         let healthy = fixture.directory.path().join("healthy-mount");
@@ -20480,7 +20646,7 @@ mod tests {
 
         // The response path used to perform fresh native probes for logging,
         // root ownership and state output after check_pressure had succeeded.
-        daemon.log_pressure_change(&response);
+        daemon.report_pressure_changes(Instant::now());
         let (scan_tx, scan_rx) = bounded(4);
         let (del_tx, _del_rx) = bounded(4);
         assert!(!MonitoringDaemon::trigger_forced_scan(
