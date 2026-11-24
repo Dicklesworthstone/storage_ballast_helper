@@ -14,6 +14,12 @@ pub struct Observation<V> {
     pub collected_at: Instant,
 }
 
+/// Admission status and configuration generation of one batched lookup.
+pub(super) struct BatchRequest<K> {
+    key: K,
+    epoch: Result<u64, String>,
+}
+
 struct Pending<V> {
     epoch: u64,
     started_at: Instant,
@@ -41,6 +47,28 @@ impl<V> Entry<V> {
             error: None,
             priority,
         }
+    }
+
+    fn current(&self, now: Instant, max_age: Duration) -> Option<&Observation<V>> {
+        self.observation.as_ref().filter(|observation| {
+            now.checked_duration_since(observation.collected_at)
+                .is_some_and(|age| age <= max_age)
+        })
+    }
+
+    fn result(&self, now: Instant, max_age: Duration) -> Result<Observation<V>, String>
+    where
+        V: Clone,
+    {
+        self.current(now, max_age).cloned().ok_or_else(|| {
+            self.error.clone().unwrap_or_else(|| {
+                if self.pending.is_some() {
+                    "filesystem observation pending".to_string()
+                } else {
+                    "filesystem probe worker limit reached".to_string()
+                }
+            })
+        })
     }
 }
 
@@ -159,6 +187,24 @@ where
     }
 
     fn observe_at(&self, key: &K, priority: bool, now: Instant) -> Result<Observation<V>, String> {
+        let state = self.request_at(key, priority, now)?;
+        state.entries[key].result(now, state.max_age)
+    }
+
+    /// Request a key whose result a batch will read later.
+    pub(super) fn request(&self, key: K, priority: bool) -> BatchRequest<K> {
+        let epoch = self
+            .request_at(&key, priority, Instant::now())
+            .map(|state| state.epoch.expect("request admitted to a live epoch"));
+        BatchRequest { key, epoch }
+    }
+
+    fn request_at(
+        &self,
+        key: &K,
+        priority: bool,
+        now: Instant,
+    ) -> Result<std::sync::MutexGuard<'_, State<K, V>>, String> {
         let mut state = self
             .state
             .lock()
@@ -185,7 +231,6 @@ where
         }
 
         let refresh_after = state.refresh_after;
-        let max_age = state.max_age;
         let entry = state.entries.get_mut(key).expect("requested entry exists");
         entry.last_requested = now;
         entry.priority |= priority;
@@ -199,25 +244,74 @@ where
         }
         self.start_waiting(&mut state, epoch, now);
 
-        let entry = state.entries.get_mut(key).expect("requested entry exists");
-        let result = if let Some(observation) = &entry.observation
-            && now
-                .checked_duration_since(observation.collected_at)
-                .is_some_and(|age| age <= max_age)
-        {
-            Ok(observation.clone())
-        } else {
-            entry.observation = None;
-            Err(entry.error.clone().unwrap_or_else(|| {
-                if entry.pending.is_some() {
-                    "filesystem observation pending".to_string()
-                } else {
-                    "filesystem probe worker limit reached".to_string()
-                }
-            }))
-        };
-        drop(state);
-        result
+        Ok(state)
+    }
+
+    /// Finish a batch of already requested keys. A lookup for *any* key may
+    /// receive a peer's completed probe. A missing pending handle therefore
+    /// cannot distinguish a refused request from a result ready in the cache.
+    /// Read every result under one lock at the same cutoff, including keys
+    /// whose earlier evidence expired or whose refresh failed while waiting.
+    pub(super) fn finish_batch(
+        &self,
+        requests: &[BatchRequest<K>],
+        started: Instant,
+        grace: Duration,
+        poll: Duration,
+    ) -> (Vec<Result<Observation<V>, String>>, Duration) {
+        let mut waited = Duration::ZERO;
+        loop {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = Instant::now();
+            state.receive_ready(now);
+            if let Some(epoch) = state.epoch
+                && !state.waiting.is_empty()
+                && requests
+                    .iter()
+                    .any(|request| request.epoch.as_ref() == Ok(&epoch))
+            {
+                self.start_waiting(&mut state, epoch, now);
+            }
+            let remaining = grace.saturating_sub(now.saturating_duration_since(started));
+            let waiting = !remaining.is_zero()
+                && requests.iter().any(|request| {
+                    state.epoch.is_some_and(|epoch| request.epoch == Ok(epoch))
+                        && state.entries.get(&request.key).is_some_and(|entry| {
+                            entry.current(now, state.max_age).is_none()
+                                && entry.pending.as_ref().is_some_and(|probe| {
+                                    probe.started_at >= started && Some(probe.epoch) == state.epoch
+                                })
+                        })
+                });
+            if !waiting {
+                let results = requests
+                    .iter()
+                    .map(|request| {
+                        let epoch = request.epoch.as_ref().map_err(Clone::clone)?;
+                        if Some(*epoch) != state.epoch {
+                            return Err(
+                                "filesystem observation invalidated during collection".into()
+                            );
+                        }
+                        state
+                            .entries
+                            .get(&request.key)
+                            .ok_or_else(|| {
+                                "filesystem observation capacity is occupied".to_string()
+                            })?
+                            .result(now, state.max_age)
+                    })
+                    .collect();
+                return (results, waited);
+            }
+            drop(state);
+            let sleeping = Instant::now();
+            std::thread::sleep(poll.min(remaining));
+            waited += sleeping.elapsed();
+        }
     }
 
     fn start_waiting(&self, state: &mut State<K, V>, epoch: u64, now: Instant) {
@@ -287,7 +381,8 @@ where
     /// exists. A probe that finished but whose result has not been received
     /// still counts: its result is taken only by the next `observe`, so the
     /// caller that waits for it does not miss it. Nothing starts or waits.
-    pub fn pending_since(&self, key: &K) -> Option<Instant> {
+    #[cfg(test)]
+    fn pending_since(&self, key: &K) -> Option<Instant> {
         let state = self
             .state
             .lock()
@@ -429,6 +524,97 @@ mod tests {
             assert!(Instant::now() < deadline, "probe did not exit");
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn pressure_batch_keeps_a_fast_mount_delivered_by_a_peer_lookup() {
+        let observer = BoundedObserver::new(
+            Arc::new(|key: &String| Ok(if key == "ssd" { 1 } else { 80 })),
+            CACHE,
+            CACHE,
+            3,
+            4,
+        );
+        let started = Instant::now();
+        let ssd = observer.request("ssd".to_string(), false);
+        // Exactly the race in the old tick: the first lookup returned
+        // pending, then a later path (or the metadata request on macOS)
+        // received the SSD result while scheduling its own probe.
+        let deadline = Instant::now() + WAIT;
+        while !observer.state.lock().unwrap().entries["ssd"]
+            .pending
+            .as_ref()
+            .unwrap()
+            .worker
+            .is_finished()
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let system = observer.request("system".to_string(), true);
+        assert_eq!(observer.pending_since(&ssd.key), None);
+        let (samples, _) =
+            observer.finish_batch(&[ssd, system], started, WAIT, Duration::from_millis(1));
+        assert_eq!(samples[0].as_ref().unwrap().value, 1);
+        assert_eq!(samples[1].as_ref().unwrap().value, 80);
+    }
+
+    #[test]
+    fn pressure_batch_drops_a_cache_hit_revoked_before_its_cutoff() {
+        let attempts = AtomicUsize::new(0);
+        let observer = BoundedObserver::new(
+            Arc::new(move |_: &String| {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(1)
+                } else {
+                    Err("mount disconnected".into())
+                }
+            }),
+            CACHE,
+            CACHE * 2,
+            2,
+            4,
+        );
+        let key = "ssd".to_string();
+        let first = await_value(&observer, &key, false);
+        // Make the existing observation refreshable without a real sleep.
+        observer
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(&key)
+            .unwrap()
+            .last_attempt = first.collected_at.checked_sub(CACHE);
+        let started = Instant::now();
+        let request = observer.request(key, false);
+        assert_eq!(
+            observer.state.lock().unwrap().entries["ssd"]
+                .observation
+                .as_ref()
+                .unwrap()
+                .value,
+            1
+        );
+        await_idle(&observer, Instant::now());
+        let (samples, waited) =
+            observer.finish_batch(&[request], started, WAIT, Duration::from_millis(1));
+        assert_eq!(samples[0].as_ref().unwrap_err(), "mount disconnected");
+        assert_eq!(waited, Duration::ZERO);
+    }
+
+    #[test]
+    fn pressure_batch_rejects_evidence_from_a_later_generation() {
+        let observer = BoundedObserver::new(Arc::new(|_: &String| Ok(80)), CACHE, CACHE, 2, 4);
+        let started = Instant::now();
+        let old = observer.request("ssd".to_string(), false);
+        await_idle(&observer, started);
+        observer.set_max_age(CACHE * 2);
+        let _ = await_value(&observer, "ssd", false);
+        let (samples, waited) =
+            observer.finish_batch(&[old], started, WAIT, Duration::from_millis(1));
+        assert!(samples[0].as_ref().unwrap_err().contains("invalidated"));
+        assert_eq!(waited, Duration::ZERO);
     }
 
     #[test]

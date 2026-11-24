@@ -344,12 +344,59 @@ impl FsStatsCollector {
         self.collect_sample(path).map(|sample| sample.stats)
     }
 
-    /// When a background probe of `path` that is still running started, so a
-    /// failed lookup can tell a refresh it just asked for from a stalled one.
-    pub(crate) fn sample_pending_since(&self, path: &Path) -> Option<Instant> {
-        self.background.as_ref().and_then(|background| {
-            background.pending_since(&ProbeRequest::Filesystem(path.to_path_buf()))
-        })
+    /// Schedule each root once, then take the pressure tick's observations
+    /// together. Waiting never renews a failed request, even at zero TTL.
+    pub(crate) fn pressure_samples(
+        &self,
+        paths: &[PathBuf],
+        grace: Duration,
+        poll: Duration,
+    ) -> (Vec<Result<FsStatsSample>>, Duration) {
+        let Some(background) = &self.background else {
+            return (
+                paths.iter().map(|path| self.collect_sample(path)).collect(),
+                Duration::ZERO,
+            );
+        };
+        let started = Instant::now();
+        let requests: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                background.request(ProbeRequest::Filesystem(path.clone()), is_system_root(path))
+            })
+            .collect();
+        if self.platform.has_capacity_metadata() {
+            background.request(ProbeRequest::CapacityMetadata, false);
+        }
+        let (results, waited) = background.finish_batch(&requests, started, grace, poll);
+        (
+            paths
+                .iter()
+                .zip(results)
+                .map(|(path, observation)| Self::filesystem_sample(path, observation))
+                .collect(),
+            waited,
+        )
+    }
+
+    fn filesystem_sample(
+        path: &Path,
+        observation: std::result::Result<background::Observation<ProbeValue>, String>,
+    ) -> Result<FsStatsSample> {
+        let observation = observation.map_err(|details| SbhError::FsStats {
+            path: path.to_path_buf(),
+            details,
+        })?;
+        match observation.value {
+            ProbeValue::Filesystem(mut sample) => {
+                // A delayed receiver cannot manufacture fresh rate evidence.
+                sample.collected_at = observation.collected_at;
+                Ok(*sample)
+            }
+            ProbeValue::MountInventory(_) | ProbeValue::CapacityMetadata => {
+                unreachable!("filesystem request has filesystem result")
+            }
+        }
     }
 
     /// Retain provenance for consumers that derive rates between readings.
@@ -365,21 +412,7 @@ impl FsStatsCollector {
                 // The same key deduplicates this with inventory requests.
                 let _ = background.observe(&ProbeRequest::CapacityMetadata, false);
             }
-            let observation = observation.map_err(|details| SbhError::FsStats {
-                path: path.to_path_buf(),
-                details,
-            })?;
-            return match observation.value {
-                ProbeValue::Filesystem(mut sample) => {
-                    // Keep the original scheduling time: a slow worker or a
-                    // delayed receiver cannot manufacture fresh rate evidence.
-                    sample.collected_at = observation.collected_at;
-                    Ok(*sample)
-                }
-                ProbeValue::MountInventory(_) | ProbeValue::CapacityMetadata => {
-                    unreachable!("filesystem request has filesystem result")
-                }
-            };
+            return Self::filesystem_sample(path, observation);
         }
         let mounts = self.cached_mounts()?;
         let lookup_path = self.platform.mount_lookup_path(path)?;

@@ -8139,58 +8139,28 @@ impl MonitoringDaemon {
         // delivers. A refused probe, one still stalled from an earlier tick,
         // and any later refresh (an immediate refresh_after restarts a failing
         // probe on every lookup) are not.
-        let started = Instant::now();
-        let deadline = started + PRESSURE_SAMPLE_GRACE;
-        let mut awaited: HashMap<PathBuf, Instant> = HashMap::new();
-        let mut waiting_since: Option<Instant> = None;
-        let mut remaining: Vec<&PathBuf> = paths.iter().collect();
-        let failures: Vec<String> = loop {
-            let mut failed = Vec::new();
-            for path in remaining {
-                match self.fs_collector.collect_sample(path) {
-                    Ok(sample) => {
-                        // Collection can span cache expiry. Keep the newest native
-                        // reading if several configured roots share this mount.
-                        stats_by_mount
-                            .entry(sample.stats.mount_point.clone())
-                            .and_modify(|previous| {
-                                if sample.collected_at > previous.collected_at {
-                                    *previous = sample.clone();
-                                }
-                            })
-                            .or_insert(sample);
-                    }
-                    Err(error) => failed.push((path, error)),
+        let (samples, waited) =
+            self.fs_collector
+                .pressure_samples(&paths, PRESSURE_SAMPLE_GRACE, PRESSURE_SAMPLE_POLL);
+        let mut failures = Vec::new();
+        for (path, sample) in paths.iter().zip(samples) {
+            match sample {
+                Ok(sample) => {
+                    // Keep the newest native reading if configured roots share a mount.
+                    stats_by_mount
+                        .entry(sample.stats.mount_point.clone())
+                        .and_modify(|previous| {
+                            if sample.collected_at > previous.collected_at {
+                                *previous = sample.clone();
+                            }
+                        })
+                        .or_insert(sample);
                 }
+                Err(error) => failures.push(sample_failure(path, &error)),
             }
-            let mut wait = false;
-            if Instant::now() < deadline {
-                for (path, _) in &failed {
-                    // A probe stalled from an earlier tick is never awaited,
-                    // nor recorded: when it delivers mid-tick, the refresh
-                    // that replaces it is this tick's first.
-                    let Some(since) = self
-                        .fs_collector
-                        .sample_pending_since(path)
-                        .filter(|since| *since >= started)
-                    else {
-                        continue;
-                    };
-                    wait |= *awaited.entry((*path).clone()).or_insert(since) == since;
-                }
-            }
-            if !wait {
-                break failed
-                    .iter()
-                    .map(|(path, error)| sample_failure(path, error))
-                    .collect();
-            }
-            remaining = failed.into_iter().map(|(path, _)| path).collect();
-            waiting_since.get_or_insert_with(Instant::now);
-            thread::sleep(PRESSURE_SAMPLE_POLL);
-        };
+        }
         // The wait is not the daemon's own work; the tick throttle excludes it.
-        self.pressure_sample_wait = waiting_since.map_or(Duration::ZERO, |since| since.elapsed());
+        self.pressure_sample_wait = waited;
 
         let none_observed = stats_by_mount.is_empty();
         self.evaluate_pressure_samples(stats_by_mount, Instant::now())
@@ -17907,11 +17877,17 @@ mod tests {
         }
         for _ in 0..2 {
             thread::sleep(max_age * 3);
-            let response = daemon.check_pressure();
-            assert!(response.is_ok(), "{response:?}");
-            // It did wait, and for less than the grace: the throttle is
-            // told how long, so the wait cannot make the tick look slow.
-            assert!(daemon.pressure_sample_wait > Duration::ZERO);
+            let started = Instant::now();
+            let response = daemon
+                .check_pressure()
+                .expect("fresh observation after sleep");
+            // A fast worker may finish before the tick needs to sleep. The
+            // response must come from a probe started by this tick either way.
+            let accepted = daemon.mount_monitors[&response.causing_mount]
+                .last_observation
+                .as_ref()
+                .unwrap();
+            assert!(accepted.sample.collected_at >= started);
             assert!(daemon.pressure_sample_wait < PRESSURE_SAMPLE_GRACE);
         }
     }
