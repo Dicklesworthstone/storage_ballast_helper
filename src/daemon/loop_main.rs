@@ -150,6 +150,10 @@ use crate::scanner::walker::{
 mod quarantine_worker;
 use quarantine_worker::{QuarantineFirst, QuarantineSweepContext, QuarantineSweeper};
 
+#[path = "scan_backoff.rs"]
+mod scan_backoff;
+use scan_backoff::ScanBackoffs;
+
 // ──────────────────── channel capacities ────────────────────
 
 /// Monitor → Scanner: bounded(2), one buffered request while the scanner
@@ -13705,31 +13709,10 @@ fn scanner_thread_main(
     let mut maintenance_keeps = MaintenanceKeepLog::default();
     let mut last_scanner_engine_mode: Option<ScannerEngineMode> = None;
 
-    // B6: inter-pass cooldown. When a pass dispatches nothing reclaimable,
-    // re-scanning immediately under sustained pressure just pins a core. We
-    // record when the last empty pass finished and skip subsequent pressure-
-    // driven passes until the (exponentially backed-off) rescan interval has
-    // elapsed. `consecutive_empty_passes` grows the interval while the disk
-    // stays pressured with nothing to reclaim, and resets on a productive pass.
-    let mut last_empty_pass_at: Option<Instant> = None;
-    let mut consecutive_empty_passes: u32 = 0;
-    // Timed-out empty passes since the last conclusive one (`record_empty_pass`).
-    let mut inconclusive_empty_passes: u32 = 0;
-    // bd-8aeq: the executor's reclaim counter as it stood when the last
-    // dispatching pass started. Confirmed at the next pass start: if the
-    // counter has not moved, those dispatches reclaimed nothing (dry-run,
-    // observe mode, every candidate dampened or failed) and the pass is paced
-    // like an empty one instead of rescanning every tick.
-    let mut unconfirmed_dispatch: Option<(u64, Option<PredictiveScanAdmission>)> = None;
-    // Whether the last confirmed dispatch reclaimed nothing (#36). Kept across
-    // requests: the request that notices arms the cooldown and is itself
-    // skipped, so the verdict must reach the pass that eventually runs.
-    let mut last_dispatch_reclaimed_nothing = false;
-    // The level of the last completed pass: a rise since then is new
-    // information and clears the pacing (`pressure_escalated`).
-    let mut last_pass_level: Option<PressureLevel> = None;
-    // The highest level a recent pass found nothing at (`note_empty_pass_level`).
-    let mut empty_level_peak: Option<(PressureLevel, Instant)> = None;
+    // Empty results only pace the exact scope and resource objective that
+    // produced them. A barren mount cannot delay another mount or a newly
+    // dirty subtree. CPU and duty-cycle pacing below remain process-wide.
+    let mut scan_backoffs = ScanBackoffs::default();
 
     // #15: duty-cycle limiter. The empty-pass cooldown above only paces passes
     // that reclaimed nothing; a chronically-full host reclaims a trickle every
@@ -13933,86 +13916,24 @@ fn scanner_thread_main(
             event_request_templates.remember(&request, &current_scanner_config);
         }
 
-        let mut dispatch_confirmed_empty = false;
-        if let Some((reclaim_before, prediction)) = unconfirmed_dispatch.take() {
-            let outcome = confirm_scanner_dispatch(
-                reclaim_before,
-                prediction.as_ref(),
-                executor_config,
-                Instant::now(),
-            );
-            // A batch withdrawn while queued proves nothing about whether
-            // its roots contain reclaimable work. Only confirmed permission
-            // can turn the lack of executor progress into an empty result.
-            dispatch_confirmed_empty = outcome == Some(false);
-            last_dispatch_reclaimed_nothing = dispatch_confirmed_empty;
-            if outcome == Some(true) {
-                // A confirmed reclaim ends the streak that earlier fruitless
-                // dispatches built; the empty passes that follow it start
-                // from the base interval again.
-                record_dispatching_pass(
-                    false,
-                    &mut consecutive_empty_passes,
-                    &mut inconclusive_empty_passes,
-                    &mut last_empty_pass_at,
-                );
-            }
-        }
-        if dispatch_confirmed_empty {
-            record_empty_pass(
-                &mut consecutive_empty_passes,
-                &mut inconclusive_empty_passes,
-                false,
-            );
-            last_empty_pass_at = Some(Instant::now());
-            if let Some(level) = last_pass_level {
-                note_empty_pass_level(&mut empty_level_peak, level, Instant::now());
-            }
-            eprintln!(
-                "[SBH-SCANNER] the last pass dispatched candidates but nothing was reclaimed (dry-run, observe, dampened or failed); pacing it as an empty pass (consecutive={consecutive_empty_passes})"
-            );
-        }
-
-        // A rise in pressure since the last pass is new information: the
-        // pacing built up by routine empty passes on a calm mount (routine
-        // maintenance on a healthy host saturates the backoff within hours)
-        // must not hold the first Orange scan for the backed-off interval.
-        if pressure_escalated(last_pass_level, &request)
-            && last_empty_pass_at.is_some()
-            && !rise_already_scanned_empty(empty_level_peak, request.pressure_level, Instant::now())
-        {
-            eprintln!(
-                "[SBH-SCANNER] pressure rose to {:?} since the last pass; empty-pass backoff reset (was consecutive={consecutive_empty_passes})",
-                request.pressure_level
-            );
-            last_empty_pass_at = None;
-            consecutive_empty_passes = 0;
-            inconclusive_empty_passes = 0;
-        }
+        scan_backoffs.reconfigure(&current_scanner_config, &configured_scoring);
+        // Confirm each pending pass against its originating scope before
+        // selecting this request. An unrelated request must not inherit its
+        // predecessor's empty result or consume its escalation history.
+        scan_backoffs.confirm_dispatches(executor_config, Instant::now());
+        let backoff = scan_backoffs.for_request(&request, Instant::now());
+        backoff.reset_on_escalation(&request, Instant::now());
         let request_level = request.pressure_level;
         let request_background = request.maintenance || request_from_events;
 
-        // B6: skip this pressure-driven pass if recent passes dispatched
-        // nothing reclaimable and the (backed-off) cooldown has not elapsed.
-        // Operator/forced scans, config reloads, and Red/Critical pressure
-        // always run.
-        // An event-triggered pass carries new information (something under a
-        // project changed), so it waits out the base interval only, not the
-        // exponential backoff that blind rescans earn.
-        if request_from_events {
-            let base = Duration::from_secs(current_scanner_config.min_rescan_interval_secs.max(1));
-            if last_empty_pass_at.is_some_and(|last| last.elapsed() < base) {
-                continue;
-            }
-        } else if empty_pass_cooldown_active(
-            last_empty_pass_at,
-            Instant::now(),
-            effective_empty_pass_cooldown(
-                current_scanner_config.min_rescan_interval_secs,
-                consecutive_empty_passes,
-            ),
+        // A scope with no reclaimable progress waits out its own cooldown.
+        // Dirty events wait only the base interval; forced/operator and
+        // maintenance passes keep their existing pacing exemptions.
+        if backoff.cooldown_active(
             &request,
-            consecutive_empty_passes,
+            request_from_events,
+            current_scanner_config.min_rescan_interval_secs,
+            Instant::now(),
         ) {
             if let Some(claim) = &mut operator_claim {
                 claim.defer(WORKER_SHUTDOWN_POLL_INTERVAL);
@@ -14645,8 +14566,11 @@ fn scanner_thread_main(
                             ),
                         });
                     }
-                    unconfirmed_dispatch =
-                        Some((reclaim_at_pass_start, request.predictive_reclaim.clone()));
+                    backoff.record_dispatch(
+                        reclaim_at_pass_start,
+                        request.predictive_reclaim.clone(),
+                    );
+                    backoff.last_pass_level = Some(request_level);
                     continue;
                 }
             }
@@ -15201,32 +15125,24 @@ fn scanner_thread_main(
             // CPU-minutes in 6.4 h, nothing to reclaim).
             if !permission_withdrawn {
                 if dispatched_this_pass.count == 0 {
-                    record_empty_pass(
-                        &mut consecutive_empty_passes,
-                        &mut inconclusive_empty_passes,
-                        true,
-                    );
-                    last_empty_pass_at = Some(Instant::now());
-                    note_empty_pass_level(&mut empty_level_peak, request_level, Instant::now());
+                    backoff.record_empty(true, request_level, Instant::now());
                 } else {
-                    record_dispatching_pass(
-                        last_dispatch_reclaimed_nothing,
-                        &mut consecutive_empty_passes,
-                        &mut inconclusive_empty_passes,
-                        &mut last_empty_pass_at,
+                    backoff.record_dispatch(
+                        reclaim_at_pass_start,
+                        request.predictive_reclaim.clone(),
                     );
-                    unconfirmed_dispatch =
-                        Some((reclaim_at_pass_start, request.predictive_reclaim.clone()));
                 }
             } else if dispatched_this_pass.count > 0 {
                 // Earlier authorized mutations still count; withdrawal only
                 // makes an unchanged reclaim counter inconclusive.
-                unconfirmed_dispatch =
-                    Some((reclaim_at_pass_start, request.predictive_reclaim.clone()));
+                backoff.record_pending(
+                    reclaim_at_pass_start,
+                    request.predictive_reclaim.clone(),
+                );
             }
             last_pass_duration = pass_started_at.elapsed();
             last_pass_finished_at = Some(Instant::now());
-            last_pass_level = Some(request_level);
+            backoff.last_pass_level = Some(request_level);
             continue;
         }
         if let Some(target_bytes) = v2_candidate_byte_target
@@ -15276,17 +15192,10 @@ fn scanner_thread_main(
             }
             // The pre-scan alone met the byte target: a productive pass, which
             // still owes the duty cycle its cost (bd-os02).
-            record_dispatching_pass(
-                last_dispatch_reclaimed_nothing,
-                &mut consecutive_empty_passes,
-                &mut inconclusive_empty_passes,
-                &mut last_empty_pass_at,
-            );
-            unconfirmed_dispatch =
-                Some((reclaim_at_pass_start, request.predictive_reclaim.clone()));
+            backoff.record_dispatch(reclaim_at_pass_start, request.predictive_reclaim.clone());
             last_pass_duration = pass_started_at.elapsed();
             last_pass_finished_at = Some(Instant::now());
-            last_pass_level = Some(request_level);
+            backoff.last_pass_level = Some(request_level);
             continue;
         }
 
@@ -16067,38 +15976,23 @@ fn scanner_thread_main(
         }
         if !permission_withdrawn {
             if dispatched_this_pass.count == 0 {
-                record_empty_pass(
-                    &mut consecutive_empty_passes,
-                    &mut inconclusive_empty_passes,
-                    scan_timed_out,
-                );
-                last_empty_pass_at = Some(Instant::now());
-                note_empty_pass_level(&mut empty_level_peak, request_level, Instant::now());
-                let next_secs = effective_empty_pass_cooldown(
-                    current_scanner_config.min_rescan_interval_secs,
-                    consecutive_empty_passes,
-                )
-                .as_secs();
+                backoff.record_empty(scan_timed_out, request_level, Instant::now());
+                let next_secs = backoff
+                    .cooldown(current_scanner_config.min_rescan_interval_secs)
+                    .as_secs();
                 if next_secs > 0 {
+                    let consecutive_empty_passes = backoff.consecutive_empty();
                     eprintln!(
                         "[SBH-SCANNER] no reclaimable progress this pass ({candidates_found} candidates, {held_by_certainty} held below {pass_min_certainty}, 0 dispatched, timed_out={scan_timed_out}); backing off rescans (consecutive={consecutive_empty_passes}, next pressure-driven scan in ≥{next_secs}s)"
                     );
                 }
             } else {
-                record_dispatching_pass(
-                    last_dispatch_reclaimed_nothing,
-                    &mut consecutive_empty_passes,
-                    &mut inconclusive_empty_passes,
-                    &mut last_empty_pass_at,
-                );
-                unconfirmed_dispatch =
-                    Some((reclaim_at_pass_start, request.predictive_reclaim.clone()));
+                backoff.record_dispatch(reclaim_at_pass_start, request.predictive_reclaim.clone());
             }
         } else if dispatched_this_pass.count > 0 {
             // Keep confirmation of earlier mutations without classifying
             // this interrupted pass as empty or complete.
-            unconfirmed_dispatch =
-                Some((reclaim_at_pass_start, request.predictive_reclaim.clone()));
+            backoff.record_pending(reclaim_at_pass_start, request.predictive_reclaim.clone());
         }
 
         // #15: record this pass's cost so the next pressure-driven pass owes
@@ -16106,7 +16000,7 @@ fn scanner_thread_main(
         // the productive case is the one that used to pin a core.
         last_pass_duration = pass_started_at.elapsed();
         last_pass_finished_at = Some(Instant::now());
-        last_pass_level = Some(request_level);
+        backoff.last_pass_level = Some(request_level);
 
         if scanner_should_exit {
             break;
@@ -38986,6 +38880,144 @@ mod tests {
         assert!(
             !run_pass(temp.path(), &roots, &root_a, None, "again"),
             "a refused candidate is not re-dispatched while its backoff runs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn scanner_empty_pass_backoff_stays_with_its_roots() {
+        let temp = temp_root_scratch_dir();
+        let empty = temp.path().join("empty-root");
+        let reclaimable = temp.path().join("reclaimable-root");
+        std::fs::create_dir(&empty).unwrap();
+        let cache = reclaimable.join("srw");
+        let deep = cache.join("a/b");
+        std::fs::create_dir_all(&deep).unwrap();
+        write_cargo_cachedir_tag(&cache);
+        std::fs::write(deep.join("blob.bin"), vec![7_u8; 512 * 1024]).unwrap();
+        let old = SystemTime::now() - Duration::from_hours(6);
+        for path in [
+            deep.join("blob.bin"),
+            cache.join("CACHEDIR.TAG"),
+            deep.clone(),
+            cache.join("a"),
+            cache.clone(),
+        ] {
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![empty.clone(), reclaimable.clone()];
+        config.scanner.parallelism = 1;
+        config.scanner.min_file_age_minutes = 0;
+        config.scanner.active_reference_min_size_bytes = u64::MAX;
+        config.scanner.scan_time_budget_secs = 30;
+        config.scanner.min_rescan_interval_secs = 300;
+        config.scanner.log_truncation.enabled = false;
+        // Isolate empty-pass pacing from the shared elapsed-time budgets.
+        // The production scanner still uses one duty/CPU budget for all roots.
+        config.scanner.max_scan_duty_cycle_pct = 100;
+        config.scoring.min_score = 0.0;
+        let (index_path, cursor_path) = scanner_state_paths(temp.path());
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: temp.path().join("activity.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 128,
+            run_id: None,
+        })
+        .unwrap();
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(4);
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(16);
+        let (report_tx, report_rx) = bounded::<WorkerReport>(8);
+        let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        let executor_config = Arc::new(SharedExecutorConfig::new(
+            false, 10, 0.0, 60, 3600, false, 0,
+        ));
+        executor_config.set_min_certainty(ArtifactCertainty::Definite);
+
+        // The duplicate before B must be paced, and serving B must preserve
+        // A's empty evidence for the duplicate afterward.
+        for root in [&empty, &empty, &reclaimable, &empty] {
+            let mut request =
+                event_test_request_for_config(vec![root.clone()], &config.scanner);
+            request.pressure_level = PressureLevel::Orange;
+            request.free_pct = Some(9.0);
+            request.urgency = 0.9;
+            assert!(!request.bypass_scan_pacing());
+            scan_tx.send(request).unwrap();
+        }
+        drop(scan_tx);
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        scanner_thread_main(
+            &scan_rx,
+            &del_tx,
+            &logger,
+            &Arc::new(RwLock::new(config.scoring.clone())),
+            &Arc::new(RwLock::new(config.scanner.clone())),
+            &platform,
+            &heartbeat_for_test(),
+            &report_tx,
+            &Arc::new(AtomicBool::new(false)),
+            &index_path,
+            &cursor_path,
+            &feedback_rx,
+            &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+            &executor_config,
+            &Arc::new(SharedRegret::new(&config)),
+            None,
+            &Mutex::new(PolicyEngine::new(PolicyConfig::default())),
+        );
+        logger.shutdown();
+        logger_join.join().unwrap();
+
+        let completed: Vec<_> = report_rx
+            .try_iter()
+            .map(|report| {
+                let WorkerReport::ScanCompleted {
+                    root_stats,
+                    candidates,
+                    timed_out,
+                    ..
+                } = report
+                else {
+                    panic!("expected scanner completion report");
+                };
+                assert!(!timed_out, "the bounded fixture must finish its walk");
+                (
+                    root_stats.into_iter().map(|root| root.path).collect::<Vec<_>>(),
+                    candidates,
+                )
+            })
+            .collect();
+        assert_eq!(completed.len(), 2, "{completed:?}");
+        assert_eq!(completed[0], (vec![empty], 0));
+        assert_eq!(completed[1].0, vec![reclaimable.clone()]);
+        assert!(completed[1].1 > 0, "{completed:?}");
+        let dispatched: Vec<_> = del_rx
+            .try_iter()
+            .flat_map(|batch| batch.candidates)
+            .collect();
+        let candidate = dispatched
+            .iter()
+            .find(|candidate| candidate.path == cache)
+            .unwrap_or_else(|| {
+                panic!("the second root's tagged cache must be dispatched: {dispatched:?}")
+            });
+        assert_eq!(candidate.decision.certainty, ArtifactCertainty::Definite);
+        assert!(
+            dispatched
+                .iter()
+                .all(|candidate| candidate.path.starts_with(&reclaimable))
         );
     }
 

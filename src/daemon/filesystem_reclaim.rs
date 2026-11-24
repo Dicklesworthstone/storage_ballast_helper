@@ -14,7 +14,7 @@ use crate::scanner::deletion::SkipReason;
 use crate::scanner::scoring::CandidacyScore;
 use crate::scanner::walker::{FsEntryKind, identity_for_path};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AdmittedRoot {
     selected: ObservedDirectory,
     configured: Option<ObservedDirectory>,
@@ -126,6 +126,20 @@ impl FilesystemReclaimScope {
         sample.mount_owner() == self.owner
             && sample.mount_directory() == Some(&self.mount_directory)
             && sample.resolved_mount() == self.mount_lookup
+    }
+
+    /// Whether completed scans inspected the same native scope. This is a
+    /// pacing comparison, never mutation authority: a replacement mount or
+    /// directory invalidates old empty-pass evidence even at the same path.
+    pub(super) fn same_scan_scope(&self, other: &Self) -> bool {
+        self.owner == other.owner
+            && self.mount_directory == other.mount_directory
+            && self.mount_lookup == other.mount_lookup
+            && self.cross_devices == other.cross_devices
+            && self.follow_symlinks == other.follow_symlinks
+            && self.catalog == other.catalog
+            && self.roots.len() == other.roots.len()
+            && self.roots.iter().all(|root| other.roots.contains(root))
     }
 
     /// Pure monitor-side selection; never resolve a path on the control loop.
@@ -551,6 +565,56 @@ mod tests {
             .collect::<Vec<_>>();
         FilesystemReclaimScope::from_observed_roots(&mounted, paths, &samples, scanner, catalog)
             .unwrap()
+    }
+
+    #[test]
+    fn scan_pacing_identity_ignores_root_order_but_not_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        let paths = vec![a.clone(), b.clone()];
+        let config = scanner(&paths);
+        let platform = platform(temp.path(), "original", false);
+        let scope = capture(Arc::clone(&platform), temp.path(), &paths, &config, false);
+
+        let reversed = vec![b.clone(), a.clone()];
+        let reordered = capture(
+            Arc::clone(&platform),
+            temp.path(),
+            &reversed,
+            &config,
+            false,
+        );
+        assert!(scope.same_scan_scope(&reordered));
+
+        let narrowed = capture(
+            Arc::clone(&platform),
+            temp.path(),
+            std::slice::from_ref(&a),
+            &config,
+            false,
+        );
+        assert!(!scope.same_scan_scope(&narrowed));
+
+        let mut changed_config = config.clone();
+        changed_config.cross_devices = !config.cross_devices;
+        let changed_policy = capture(
+            Arc::clone(&platform),
+            temp.path(),
+            &paths,
+            &changed_config,
+            false,
+        );
+        assert!(!scope.same_scan_scope(&changed_policy));
+
+        // Keep the old inode alive so replacement cannot accidentally reuse
+        // its identity. The path alone is insufficient evidence for pacing.
+        fs::rename(&a, temp.path().join("old-a")).unwrap();
+        fs::create_dir(&a).unwrap();
+        let replacement = capture(platform, temp.path(), &paths, &config, false);
+        assert!(!scope.same_scan_scope(&replacement));
     }
 
     #[test]
