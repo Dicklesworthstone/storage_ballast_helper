@@ -746,13 +746,18 @@ fn note_opaque_signal(
             _ => {}
         }
     }
+    // Linked worktrees and submodules have a .git file instead of a
+    // directory. Either spelling on a case-insensitive volume must veto
+    // reclaim of the opaque ancestor.
+    if depth <= 2 && name.eq_ignore_ascii_case(".git") {
+        signals.has_git = true;
+    }
     if depth <= 2 && is_dir {
         match name {
             "incremental" => signals.has_incremental = true,
             "deps" => signals.has_deps = true,
             "build" => signals.has_build = true,
             ".fingerprint" => signals.has_fingerprint = true,
-            ".git" => signals.has_git = true,
             _ => {}
         }
     }
@@ -896,6 +901,41 @@ pub const TREE_IDLE_PROBE_MAX_DEPTH: usize = 3;
 /// verdict on a truncated sample is only as strong as the sample.
 #[must_use]
 pub fn tree_newest_mtime(root: &Path, max_entries: usize, max_depth: usize) -> OpaqueTreeProbe {
+    sample_tree_activity(root, max_entries, max_depth, |_, _, _| true)
+}
+
+/// Renew an indexed opaque candidate's build markers with the same bounded
+/// breadth-first pass that measures its idleness. Evidence from descendants
+/// on another device cannot qualify a same-filesystem reclaim request.
+pub(crate) fn replay_opaque_tree_probe(
+    root: &Path,
+    root_meta: &fs::Metadata,
+    cross_devices: bool,
+) -> OpaqueTreeProbe {
+    let root_device = device_id(root_meta);
+    let mut signals = StructuralSignals::default();
+    let mut probe = sample_tree_activity(
+        root,
+        TREE_IDLE_PROBE_MAX_ENTRIES,
+        TREE_IDLE_PROBE_MAX_DEPTH,
+        |depth, entry, meta| {
+            if !cross_devices && device_id(meta) != root_device {
+                return false;
+            }
+            note_opaque_signal(&mut signals, depth, entry, meta.is_dir());
+            true
+        },
+    );
+    probe.signals = signals;
+    probe
+}
+
+fn sample_tree_activity(
+    root: &Path,
+    max_entries: usize,
+    max_depth: usize,
+    mut visit: impl FnMut(usize, &fs::DirEntry, &fs::Metadata) -> bool,
+) -> OpaqueTreeProbe {
     let mut newest: Option<SystemTime> = None;
     let mut allocated: u64 = 0;
     let mut seen: usize = 0;
@@ -926,7 +966,7 @@ pub fn tree_newest_mtime(root: &Path, max_entries: usize, max_depth: usize) -> O
                 complete = false;
                 continue;
             };
-            if meta.file_type().is_symlink() {
+            if meta.file_type().is_symlink() || !visit(depth, &entry, &meta) {
                 continue;
             }
             allocated = allocated.saturating_add(allocated_size(&meta));
@@ -4853,6 +4893,32 @@ mod tests {
             filetime::set_file_mtime(dir, old_ft).unwrap();
         }
         (tree, old, fresh)
+    }
+
+    #[test]
+    fn opaque_replay_renews_nested_markers_and_linked_worktree_veto() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let profile = target.join("debug");
+        for marker in ["deps", "incremental"] {
+            fs::create_dir_all(profile.join(marker)).unwrap();
+        }
+        let before = fs::metadata(&target).unwrap();
+        let observe = || replay_opaque_tree_probe(&target, &before, false);
+        assert!(observe().signals.has_strong_signal());
+
+        // Descendant changes need not touch the indexed root or its mtime.
+        fs::rename(profile.join("deps"), profile.join("Deps-old")).unwrap();
+        fs::rename(profile.join("incremental"), profile.join("sources")).unwrap();
+        fs::write(profile.join("sources/.git"), "gitdir: /elsewhere").unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        let renewed = observe();
+        assert!(renewed.complete);
+        assert!(!renewed.signals.has_strong_signal());
+        assert!(renewed.signals.has_git);
     }
 
     #[test]

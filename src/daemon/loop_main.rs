@@ -12768,14 +12768,14 @@ fn replay_indexed_record(
     logger: &ActivityLoggerHandle,
 ) -> std::result::Result<CandidacyScore, ReplayDrop> {
     use crate::scanner::active_lease::path_is_actively_leased;
-    use crate::scanner::index::{IndexedIdentity, IndexedPruneDecision};
+    use crate::scanner::index::IndexedIdentity;
     use crate::scanner::patterns::{
         ArtifactCategory, OpaqueTreeDisposition, classify_opaque_tree_at,
     };
     use crate::scanner::scoring::{CandidateInput, DecisionAction};
     use crate::scanner::walker::{
-        TREE_IDLE_PROBE_MAX_DEPTH, TREE_IDLE_PROBE_MAX_ENTRIES, identity_for_path,
-        is_path_open_by_ancestor, structural_signals_for_path, tree_newest_mtime,
+        identity_for_path, is_path_open_by_ancestor, replay_opaque_tree_probe,
+        structural_signals_for_path,
     };
 
     let path = &record.path;
@@ -12812,21 +12812,19 @@ fn replay_indexed_record(
         )));
     }
     let mut signals = structural_signals_for_path(path);
-    if signals.has_git || signals.has_cargo_toml {
+    // A bounded renewal may miss a marker previously found by the full
+    // walk. Keep recorded source vetoes until a new walk replaces them.
+    if signals.has_git
+        || signals.has_cargo_toml
+        || record.structural_signals.has_git
+        || record.structural_signals.has_cargo_toml
+    {
         return Err(ReplayDrop::Vetoed("source tree markers".to_string()));
     }
-    // bd-8aeq: a record the walker pruned as an opaque candidate is
-    // re-classified the way the walker classified it (name plus parent
-    // context) and scored with the structural evidence of its subtree, not
-    // with the root directory's own entries. Without this a definite cargo
-    // `target/` (markers under `debug/`) replayed as `unclear` and could never
-    // pass an Orange cell's certainty gate, however many times it was replayed.
-    let (classification, classified_tree_modified) = match classify_opaque_tree_at(path) {
+    let opaque = classify_opaque_tree_at(path);
+    let renew_structure = opaque.is_some();
+    let (classification, classified_tree_modified) = match opaque {
         Some(opaque) if opaque.disposition == OpaqueTreeDisposition::CandidateOpaque => {
-            if record.prune_decision == IndexedPruneDecision::CandidateOpaque {
-                // Only the opaque walk measured and recorded the subtree.
-                signals = record.structural_signals;
-            }
             (opaque.classification, opaque.tree_last_modified)
         }
         // As the walk would classify it now (bd-10yj): a tree it only
@@ -12852,14 +12850,31 @@ fn replay_indexed_record(
     if let Ok(created) = meta.created() {
         newest = newest.max(created);
     }
-    if meta.is_dir()
-        && let Some(modified) = classified_tree_modified
-    {
-        newest = newest.max(modified);
-    } else if meta.is_dir() && classification.category.is_regenerable_tree() {
-        let probe = tree_newest_mtime(path, TREE_IDLE_PROBE_MAX_ENTRIES, TREE_IDLE_PROBE_MAX_DEPTH);
-        if let Some(tree_newest) = probe.newest_mtime {
-            newest = newest.max(tree_newest);
+    let cross_devices = scanner_config.cross_devices
+        && request.filesystem_reclaim.is_none()
+        && request.predictive_reclaim.is_none()
+        && !request.has_resource_reclaim();
+    if meta.is_dir() {
+        let mut tree_modified = classified_tree_modified;
+        if renew_structure
+            || (tree_modified.is_none() && classification.category.is_regenerable_tree())
+        {
+            // Removing debug/deps can leave the root identity, timestamps
+            // and event generation intact. Renew structural permission in
+            // the same bounded pass that measures recent tree activity.
+            let probe = replay_opaque_tree_probe(path, &meta, cross_devices);
+            if probe.signals.has_git || probe.signals.has_cargo_toml {
+                return Err(ReplayDrop::Vetoed("source tree markers".to_string()));
+            }
+            if renew_structure {
+                let root_venv = signals.has_pyvenv_cfg;
+                signals = probe.signals;
+                signals.has_pyvenv_cfg |= root_venv || record.structural_signals.has_pyvenv_cfg;
+            }
+            tree_modified = tree_modified.max(probe.newest_mtime);
+        }
+        if let Some(modified) = tree_modified {
+            newest = newest.max(modified);
         }
     }
     let age = SystemTime::now()
@@ -12880,7 +12895,7 @@ fn replay_indexed_record(
     {
         prescan_dir_size(
             path,
-            scanner_config.cross_devices && !request.has_resource_reclaim(),
+            cross_devices,
             &AtomicBool::new(false),
         )
     } else {
@@ -31423,6 +31438,66 @@ mod tests {
             assert_eq!(score.identity, Some(identity));
             assert!(!score.vetoed);
         }
+
+        let mut measured_target = record(3);
+        measured_target.structural_signals.has_deps = true;
+        measured_target.structural_signals.has_incremental = true;
+        let critical = ScanRequest {
+            urgency: 1.0,
+            pressure_level: PressureLevel::Critical,
+            ..event_test_request_for_config(config.scanner.root_paths.clone(), &config.scanner)
+        };
+        let scored = |r: &CandidateIndexRecord, protection: &mut ProtectionRegistry| {
+            replay_indexed_record(
+                r,
+                3,
+                &registry,
+                &engine,
+                &config.scanner,
+                &critical,
+                protection,
+                &sacred,
+                &open_files,
+                None,
+                &logger,
+            )
+            .map(|s| (s.factors.structure.to_bits(), s.decision.certainty))
+        };
+        let intact = scored(&measured_target, &mut protection).unwrap();
+        let saved = temp.path().join("old-layout");
+        std::fs::create_dir(&saved).unwrap();
+        let profile = target.join("debug");
+        let markers = ["deps", "incremental", "build", ".fingerprint"];
+        for marker in markers {
+            std::fs::rename(profile.join(marker), saved.join(marker)).unwrap();
+        }
+        let renewed = scored(&measured_target, &mut protection);
+        assert_eq!(renewed, scored(&record(3), &mut protection));
+        match renewed {
+            Ok((structure, _)) => assert!(structure < intact.0),
+            Err(ReplayDrop::NotDelete(_)) => {}
+            other => panic!("expected lower structural score or a held candidate: {other:?}"),
+        }
+        for marker in markers {
+            std::fs::rename(saved.join(marker), profile.join(marker)).unwrap();
+        }
+        // The bounded probe may veto on new evidence but cannot erase a
+        // historical source veto simply because it saw no marker this time.
+        let mut previously_protected = measured_target.clone();
+        previously_protected.structural_signals.has_git = true;
+        assert!(matches!(
+            replay(&previously_protected, 3, &mut protection),
+            Err(ReplayDrop::Vetoed(_))
+        ));
+        let git_file = target.join("debug/deps/.git");
+        std::fs::write(&git_file, "gitdir: /elsewhere").unwrap();
+        let mut nested_protection = ProtectionRegistry::new(None).unwrap();
+        measured_target.structural_signals.has_cachedir_tag = true;
+        assert!(matches!(
+            replay(&measured_target, 3, &mut nested_protection),
+            Err(ReplayDrop::Vetoed(_))
+        ));
+        std::fs::rename(git_file, temp.path().join("old-git-file")).unwrap();
 
         // Persisted candidates cannot bypass an excluded ancestor or remove
         // an opaque tree that contains an excluded descendant. The index's

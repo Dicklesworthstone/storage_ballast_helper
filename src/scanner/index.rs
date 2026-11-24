@@ -170,9 +170,8 @@ pub struct CandidateIndexRecord {
     pub cooldown_until_nanos: Option<u128>,
     pub event_generation: u64,
     /// The structural evidence the walk found under the candidate (markers
-    /// under `debug/`, a `CACHEDIR.TAG`, object files). A replay scores with
-    /// this instead of re-walking the subtree or, worse, looking only at the
-    /// root's own entries and downgrading a definite target to `unclear`.
+    /// under `debug/`, a `CACHEDIR.TAG`, object files). These describe the
+    /// indexed observation. Reclaim replay renews evidence on disk.
     #[serde(default)]
     pub structural_signals: StructuralSignals,
 }
