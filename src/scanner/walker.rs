@@ -24,7 +24,7 @@ use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::Platform;
 use crate::scanner::patterns::{
     ArtifactClassification, ArtifactPatternRegistry, OpaqueTreeClassification, OpaqueTreeContext,
-    OpaqueTreeDisposition, StructuralSignals, classify_opaque_tree,
+    OpaqueTreeDisposition, StructuralSignals, classify_opaque_tree, classify_opaque_tree_at,
 };
 use crate::scanner::protection::ProtectionRegistry;
 use crate::scanner::scoring::ActiveReferenceSummary;
@@ -1033,7 +1033,7 @@ pub fn classify_dir_as_walked(
     path: &Path,
     signals: StructuralSignals,
 ) -> Option<(ArtifactClassification, Option<SystemTime>)> {
-    match classify_opaque_tree(path, opaque_context_for_path(path)) {
+    match classify_opaque_tree_at(path) {
         Some(opaque) => (opaque.disposition == OpaqueTreeDisposition::CandidateOpaque)
             .then_some((opaque.classification, opaque.tree_last_modified)),
         None => Some(registry.classify_with_freshness(path, signals)),

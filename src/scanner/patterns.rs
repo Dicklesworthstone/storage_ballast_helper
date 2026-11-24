@@ -223,6 +223,22 @@ pub fn classify_opaque_tree(
     path: &Path,
     context: OpaqueTreeContext,
 ) -> Option<OpaqueTreeClassification> {
+    classify_opaque_tree_with_context(path, || context)
+}
+
+/// Classify a path outside the live walk, where parent evidence requires
+/// enumerating siblings. Most rules need no parent manifest. Looking it up
+/// eagerly for every candidate in a wide root can make replay quadratic.
+pub(crate) fn classify_opaque_tree_at(path: &Path) -> Option<OpaqueTreeClassification> {
+    classify_opaque_tree_with_context(path, || {
+        crate::scanner::walker::opaque_context_for_path(path)
+    })
+}
+
+fn classify_opaque_tree_with_context(
+    path: &Path,
+    context: impl FnOnce() -> OpaqueTreeContext,
+) -> Option<OpaqueTreeClassification> {
     let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
 
     if name == ".git" {
@@ -301,11 +317,17 @@ pub fn classify_opaque_tree(
     }
 
     if is_cargo_target_name(&name) {
-        return Some(classify_cargo_target_name(path, &name, context, tmp_like));
+        let beside_manifest = name == "target" && context().parent_has_cargo_toml;
+        return Some(classify_cargo_target_name(
+            path,
+            &name,
+            beside_manifest,
+            tmp_like,
+        ));
     }
 
     if name == "node_modules" {
-        if context.parent_has_node_manifest || tmp_like {
+        if tmp_like || context().parent_has_node_manifest {
             return Some(OpaqueTreeClassification::candidate(
                 "node_modules with package manifest or temp context",
                 "opaque-node-modules",
@@ -336,10 +358,11 @@ pub fn classify_opaque_tree(
         ));
     }
 
-    if matches!(name.as_str(), ".next" | "dist" | "build")
-        && (context.parent_has_node_manifest || tmp_like)
-    {
-        return Some(classify_build_output_name(path, &name, context));
+    if matches!(name.as_str(), ".next" | "dist" | "build") {
+        let context = context();
+        if context.parent_has_node_manifest || tmp_like {
+            return Some(classify_build_output_name(path, &name, context));
+        }
     }
 
     None
@@ -399,15 +422,15 @@ fn classify_code_sign_clone_area(path: &Path) -> Option<OpaqueTreeClassification
 fn classify_cargo_target_name(
     path: &Path,
     name: &str,
-    context: OpaqueTreeContext,
+    beside_manifest: bool,
     tmp_like: bool,
 ) -> OpaqueTreeClassification {
     let needs_markers = has_broad_target_prefix(name)
         || has_descriptive_target_suffix(name)
-        || (name == "target" && !context.parent_has_cargo_toml);
+        || (name == "target" && !beside_manifest);
     let has_markers = needs_markers && has_cargo_target_root_markers(path);
     let tmp_promotes = tmp_like && (!needs_markers || has_markers);
-    if (name == "target" && context.parent_has_cargo_toml)
+    if beside_manifest
         || tmp_promotes
         || is_agent_build_target_name(name)
         // A descriptive suffix name WITH cargo's root markers is a
@@ -2091,6 +2114,35 @@ mod tests {
     };
     use crate::platform::{linux, macos};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn only_manifest_dependent_opaque_rules_inspect_the_parent() {
+        use super::classify_opaque_tree_with_context;
+        let context = OpaqueTreeContext {
+            parent_has_cargo_toml: true,
+            parent_has_node_manifest: true,
+        };
+        for name in ["ordinary-project", "rch_target_staging", ".git"] {
+            let path = Path::new("/workspace/project").join(name);
+            let result = classify_opaque_tree_with_context(&path, || {
+                panic!("{name} must not enumerate its siblings")
+            });
+            assert_eq!(result, classify_opaque_tree(&path, context));
+        }
+        for name in ["node_modules", "target", "build", "dist", ".next"] {
+            let path = Path::new("/workspace/project").join(name);
+            let mut consulted = false;
+            let result = classify_opaque_tree_with_context(&path, || {
+                consulted = true;
+                context
+            });
+            assert!(consulted, "{name} needs the parent manifest");
+            assert_eq!(
+                result.unwrap().disposition,
+                OpaqueTreeDisposition::CandidateOpaque
+            );
+        }
+    }
 
     #[test]
     fn darwin_user_temp_dir_is_a_temp_root() {

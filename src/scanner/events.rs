@@ -18,8 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::core::config::{ScannerConfig, ScannerEventSourceMode};
 use crate::scanner::index::ScannerCandidateIndex;
-use crate::scanner::patterns::classify_opaque_tree;
-use crate::scanner::walker::opaque_context_for_path;
+use crate::scanner::patterns::classify_opaque_tree_at;
 
 #[cfg(any(target_os = "macos", test))]
 mod fsevents;
@@ -1210,8 +1209,7 @@ fn event_scan_root(root: &Path, path: &Path, memo: &mut BTreeMap<PathBuf, PathBu
     let project = root.join(first.as_os_str());
     memo.entry(project.clone())
         .or_insert_with(|| {
-            let is_artifact =
-                classify_opaque_tree(&project, opaque_context_for_path(&project)).is_some();
+            let is_artifact = classify_opaque_tree_at(&project).is_some();
             if is_artifact {
                 root.to_path_buf()
             } else {

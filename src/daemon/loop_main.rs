@@ -12685,12 +12685,13 @@ fn replay_indexed_record(
 ) -> std::result::Result<CandidacyScore, ReplayDrop> {
     use crate::scanner::active_lease::path_is_actively_leased;
     use crate::scanner::index::{IndexedIdentity, IndexedPruneDecision};
-    use crate::scanner::patterns::{ArtifactCategory, OpaqueTreeDisposition, classify_opaque_tree};
+    use crate::scanner::patterns::{
+        ArtifactCategory, OpaqueTreeDisposition, classify_opaque_tree_at,
+    };
     use crate::scanner::scoring::{CandidateInput, DecisionAction};
     use crate::scanner::walker::{
         TREE_IDLE_PROBE_MAX_DEPTH, TREE_IDLE_PROBE_MAX_ENTRIES, identity_for_path,
-        is_path_open_by_ancestor, opaque_context_for_path, structural_signals_for_path,
-        tree_newest_mtime,
+        is_path_open_by_ancestor, structural_signals_for_path, tree_newest_mtime,
     };
 
     let path = &record.path;
@@ -12736,23 +12737,22 @@ fn replay_indexed_record(
     // with the root directory's own entries. Without this a definite cargo
     // `target/` (markers under `debug/`) replayed as `unclear` and could never
     // pass an Orange cell's certainty gate, however many times it was replayed.
-    let opaque = (record.prune_decision == IndexedPruneDecision::CandidateOpaque)
-        .then(|| classify_opaque_tree(path, opaque_context_for_path(path)))
-        .flatten()
-        .filter(|opaque| opaque.disposition == OpaqueTreeDisposition::CandidateOpaque);
-    let (classification, classified_tree_modified) = match opaque {
-        Some(opaque) => {
-            // The evidence the walk's subtree probe found, persisted in the
-            // record; the size estimate below comes from the same probe.
-            signals = record.structural_signals;
+    let (classification, classified_tree_modified) = match classify_opaque_tree_at(path) {
+        Some(opaque) if opaque.disposition == OpaqueTreeDisposition::CandidateOpaque => {
+            if record.prune_decision == IndexedPruneDecision::CandidateOpaque {
+                // Only the opaque walk measured and recorded the subtree.
+                signals = record.structural_signals;
+            }
             (opaque.classification, opaque.tree_last_modified)
         }
         // As the walk would classify it now (bd-10yj): a tree it only
         // descends into or protects is not replayed on its name.
-        None => crate::scanner::walker::classify_dir_as_walked(registry, path, signals)
-            .ok_or_else(|| {
-                ReplayDrop::Vetoed("the walk declines it (opaque verdict)".to_string())
-            })?,
+        Some(_) => {
+            return Err(ReplayDrop::Vetoed(
+                "the walk declines it (opaque verdict)".to_string(),
+            ));
+        }
+        None => registry.classify_with_freshness(path, signals),
     };
     if classification.category == ArtifactCategory::Unknown {
         return Err(ReplayDrop::Vetoed(
