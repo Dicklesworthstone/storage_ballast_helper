@@ -5819,6 +5819,9 @@ impl MonitoringDaemon {
         {
             let _ = self.fs_collector.collect_sample(path);
         }
+        for path in self.target_tier.observation_paths() {
+            let _ = self.fs_collector.collect_sample(&path);
+        }
         let _ = self.fs_collector.mount_points();
     }
 
@@ -8192,6 +8195,12 @@ impl MonitoringDaemon {
                 .filter(|path| **path != system_root && path.as_path() != Path::new("/"))
                 .cloned(),
         );
+        // Target-only roots can cover a different volume from the ordinary
+        // scanner. Their worker expands patterns; these paths only request
+        // the same fresh pressure observations used by every other mount.
+        for path in self.target_tier.observation_paths() {
+            push_unique_path(&mut paths, path);
+        }
         // A failed nested filesystem can be outside the ordinary observation
         // set. Keep its existing incident/recovery controller observable until
         // a fresh write probe decides whether it may resume.
@@ -32825,6 +32834,90 @@ mod tests {
             scanner,
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_only_volume_enters_pressure_monitoring_without_an_ordinary_scan_root() {
+        use crate::core::paths::resolve_absolute_path;
+        use crate::daemon::target_tier::tests::{feedback_root, scheduling::finish};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let (_scratch, root) = feedback_root(&["session/target"]);
+        let root = resolve_absolute_path(&root);
+        let alias = root.parent().unwrap().join("claude-link");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let daemon = &mut fixture.daemon;
+        daemon.config.scanner.target_only_roots = vec![root.parent().unwrap().join("claude-*")];
+        daemon.config.scanner.target_only_idle_hours = 0;
+        daemon.config.scanner.min_file_age_minutes = 0;
+        daemon.config.pressure.prediction.enabled = false;
+        daemon.platform = Arc::new(disk_pressure_platform(vec![
+            disk_pressure_sample("/", 100 << 30, 50 << 30),
+            disk_pressure_sample(&root.to_string_lossy(), 100 << 30, 0),
+        ]));
+        daemon.enable_background_filesystem_observations();
+        let initial = daemon.initial_pressure_check().unwrap();
+        assert_eq!(initial.level, PressureLevel::Green);
+        assert!(
+            daemon
+                .mount_responses
+                .iter()
+                .all(|tick| tick.response.causing_mount != root)
+        );
+        let (send, receive) = bounded(1);
+        let mounts = daemon.filesystem_tier_mounts(&daemon.mount_responses, Instant::now());
+        daemon.target_tier.tick(
+            Instant::now(),
+            &daemon.config,
+            &daemon.platform,
+            &mounts,
+            &send,
+            &daemon.logger_handle,
+        );
+        finish(&mut daemon.target_tier);
+        assert!(receive.try_recv().is_err());
+        assert_eq!(daemon.target_tier.observation_paths(), vec![root.clone()]);
+
+        // A temporary observation outage revokes cleanup permission while
+        // retaining the roots that the collector needs to recover coverage.
+        daemon.withdraw_pressure_authority();
+        assert_eq!(daemon.target_tier.observation_paths(), vec![root.clone()]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let response = loop {
+            let response = daemon.check_pressure().unwrap();
+            if response.causing_mount == root {
+                break response;
+            }
+            assert!(Instant::now() < deadline, "target volume was not observed");
+            thread::yield_now();
+        };
+        assert_eq!(response.causing_mount, root);
+        assert_eq!(response.level, PressureLevel::Critical);
+        let mounts = daemon.filesystem_tier_mounts(&daemon.mount_responses, Instant::now());
+        assert_eq!(mounts[&root].0, PressureLevel::Critical);
+        daemon.target_tier.tick(
+            Instant::now(),
+            &daemon.config,
+            &daemon.platform,
+            &mounts,
+            &send,
+            &daemon.logger_handle,
+        );
+        finish(&mut daemon.target_tier);
+        let batch = receive
+            .try_recv()
+            .expect("observed target volume is reclaimable");
+        assert_eq!(batch.pressure_level, PressureLevel::Critical);
+        assert_eq!(batch.target_only_root.as_ref(), Some(&root));
+        assert_eq!(batch.candidates.len(), 1);
+        assert!(batch.candidates[0].path.starts_with(&root));
+
+        daemon.config.scanner.target_only_roots.clear();
+        daemon.target_tier.update_config(&daemon.config.scanner);
+        assert!(daemon.target_tier.observation_paths().is_empty());
+        assert!(!target_only_consent_current(&batch, &daemon.config.scanner));
+        assert_eq!(daemon.check_pressure().unwrap().level, PressureLevel::Green);
     }
 
     #[cfg(unix)]

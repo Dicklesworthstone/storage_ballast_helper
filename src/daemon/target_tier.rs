@@ -1367,6 +1367,10 @@ pub struct TargetTier {
     /// A probe which finds no due roots must not spend the pass cooldown.
     started: Option<Receiver<Instant>>,
     pressure: Arc<RwLock<MountPressure>>,
+    /// Expanded roots are observation hints for the monitor. Each scanner
+    /// generation owns its publication slot so a retired expansion cannot
+    /// restore paths removed by a reload.
+    expanded_roots: Arc<Mutex<Vec<PathBuf>>>,
     last_start: Option<Instant>,
     /// When the roots were last expanded to see whether one is due.
     last_probe: Option<Instant>,
@@ -1403,6 +1407,13 @@ impl TargetTier {
         tier
     }
 
+    /// Paths discovered by the tier worker that need normal filesystem
+    /// pressure observations, including volumes outside ordinary scan roots.
+    /// A hint grants no cleanup authority and performs no native I/O here.
+    pub(super) fn observation_paths(&self) -> Vec<PathBuf> {
+        self.expanded_roots.lock().clone()
+    }
+
     /// Withdraw all previously granted target-only authority when the monitor
     /// cannot establish current pressure. A later healthy sample starts a new
     /// generation; it cannot revive a blocked worker or an already queued batch.
@@ -1432,6 +1443,7 @@ impl TargetTier {
             self.started = None;
             self.last_probe = None;
             self.last_start = None;
+            self.expanded_roots = Arc::default();
             // A blocked old worker can finish later. Its hints belong to its
             // old scope and must not overwrite the replacement's progress.
             self.retire_discovery_progress();
@@ -1550,6 +1562,7 @@ impl TargetTier {
         let logger = logger.clone();
         let revoked = Arc::clone(&self.revoked);
         let pressure = Arc::clone(&self.pressure);
+        let expanded_roots = Arc::clone(&self.expanded_roots);
         let survey_progress = Arc::clone(&self.survey_progress);
         let regret = self.regret.clone();
         let (started_tx, started_rx) = crossbeam_channel::bounded(1);
@@ -1561,6 +1574,10 @@ impl TargetTier {
                     return;
                 }
                 let mut roots = expand_roots(&config.scanner.target_only_roots);
+                // Publish before requiring pressure: a dedicated target root
+                // may be the only configured path on its filesystem. The
+                // monitor obtains fresh samples through its normal collector.
+                *expanded_roots.lock() = roots.clone();
                 let mut progress_by_root = std::mem::take(&mut *survey_progress.lock());
                 progress_by_root.retain(|root, _| roots.binary_search(root).is_ok());
                 order_discovery_roots(&mut roots, &progress_by_root);
@@ -3124,6 +3141,8 @@ pub(super) mod tests {
             tier.last_start = Some(Instant::now());
             tier.last_probe = Some(Instant::now());
             let old_progress = Arc::clone(&tier.survey_progress);
+            let old_roots = Arc::clone(&tier.expanded_roots);
+            *old_roots.lock() = vec![root.to_path_buf()];
             old_progress.lock().insert(
                 root.to_path_buf(),
                 SurveyProgress {
@@ -3147,6 +3166,9 @@ pub(super) mod tests {
             );
             assert!(tier.last_start.is_none(), "{label}");
             assert!(tier.last_probe.is_none(), "{label}");
+            assert!(tier.observation_paths().is_empty(), "{label}");
+            *old_roots.lock() = vec![root.join("late-old-expansion")];
+            assert!(tier.observation_paths().is_empty(), "{label}");
             assert!(
                 !Arc::ptr_eq(&old_progress, &tier.survey_progress),
                 "{label}"
@@ -3555,7 +3577,7 @@ pub(super) mod tests {
             config
         }
 
-        fn finish(tier: &mut TargetTier) {
+        pub(in crate::daemon) fn finish(tier: &mut TargetTier) {
             let deadline = Instant::now() + Duration::from_secs(5);
             while tier.worker.is_some() {
                 tier.poll_worker();
@@ -3587,6 +3609,7 @@ pub(super) mod tests {
                 );
             });
             fixture.requested(&root);
+            assert_eq!(tier.observation_paths(), vec![root.clone()]);
             assert!(tier.running.load(Ordering::Acquire));
             let platform = Arc::clone(&fixture.platform);
             let handle = logger.handle.clone();
@@ -3795,6 +3818,7 @@ pub(super) mod tests {
             assert!(!queued.permits(&bound_root, &config.scanner));
             assert!(tier.pressure.read().observed_at.is_none());
             assert!(tier.pressure.read().mounts.is_empty());
+            assert_eq!(tier.observation_paths(), vec![root.clone()]);
             assert!(tier.running.load(Ordering::Acquire));
             assert!(!Arc::ptr_eq(&old_progress, &tier.survey_progress));
 
