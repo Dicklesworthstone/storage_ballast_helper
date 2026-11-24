@@ -23,7 +23,7 @@ pub fn install_path() -> Option<&'static Path> {
     INSTALL_PATH.get()?.as_deref()
 }
 
-/// Acquire exclusive ownership of a Linux CLI update/rollback transaction.
+/// Acquire exclusive ownership of a Unix CLI update/rollback transaction.
 ///
 /// Hold the returned file until backup, publication, and service activation have
 /// all finished. The installation directory, not the replaceable executable,
@@ -34,7 +34,7 @@ pub fn install_path() -> Option<&'static Path> {
 /// replacement for privilege checks or post-restart image verification. It
 /// creates no lockfile, never removes a stale lock, and does not wait for another
 /// transaction. The kernel releases ownership when the handle/process closes.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn acquire_update_lock(install_path: &Path) -> std::io::Result<std::fs::File> {
     use std::fs::{OpenOptions, TryLockError};
     use std::io::{Error, ErrorKind};
@@ -105,7 +105,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 mod transaction_lock_tests {
     use super::*;
     use std::fs;

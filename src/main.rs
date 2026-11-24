@@ -62,7 +62,7 @@ fn main() {
     // Locking only during rename permits a second update to replace the image
     // the first transaction is still trying to activate. No lock is acquired
     // for read-only update commands or unrelated service controls.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     let _update_lock = match lock_update_command(&matches) {
         Ok(guard) => guard,
         Err(error) => {
@@ -85,7 +85,7 @@ fn main() {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 fn update_mutates_binary(matches: &clap::ArgMatches) -> bool {
     let Some(("update", update)) = matches.subcommand() else {
         return false;
@@ -101,7 +101,7 @@ fn update_mutates_binary(matches: &clap::ArgMatches) -> bool {
     !update.contains_id("prune") && !update.get_flag("check") && !update.get_flag("dry_run")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn lock_update_command(matches: &clap::ArgMatches) -> std::io::Result<Option<std::fs::File>> {
     if !update_mutates_binary(matches) {
         return Ok(None);
@@ -111,7 +111,7 @@ fn lock_update_command(matches: &clap::ArgMatches) -> std::io::Result<Option<std
     storage_ballast_helper::update_handoff::acquire_update_lock(path).map(Some)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn report_update_lock_failure(matches: &clap::ArgMatches, error: &std::io::Error) {
     if matches.get_flag("json") {
         use std::io::Write as _;
@@ -218,7 +218,7 @@ mod entrypoint_tests {
 }
 
 // Rollback shares one transaction on every platform: preview before mutation,
-// then restore and activate the selected service. On Linux the entrypoint's
+// then restore and activate the selected service. On Unix the entrypoint's
 // update lock remains held throughout. BackupStore remains a file-only API.
 mod rollback {
     use std::io::{self, Write as _};

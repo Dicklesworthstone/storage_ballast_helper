@@ -917,3 +917,103 @@ mod truncate_logs {
         assert_eq!(fs::read(&log).unwrap(), contents);
     }
 }
+
+/// Transaction ownership applies to every supported Unix CLI, including macOS.
+/// The copied binary chooses its own parent as the update destination; the test
+/// never locks or updates the Cargo build directory or an installed host binary.
+#[cfg(unix)]
+#[test]
+fn update_transactions_refuse_contention_but_allow_read_only_commands() {
+    use std::os::unix::fs::MetadataExt as _;
+    use storage_ballast_helper::update_handoff::acquire_update_lock;
+
+    let dir = disk_tempdir();
+    let config = config_in(dir.path());
+    let home = dir.path().join("home");
+    let install = dir.path().join("installation");
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&install).unwrap();
+    let binary = install.join("sbh");
+    fs::copy(common::sbh_bin_path(), &binary).unwrap();
+    let before = fs::metadata(&binary).unwrap();
+    let missing_bundle = dir.path().join("missing-bundle.json");
+    let invoke = |args: &[&str]| {
+        let mut command = Command::new(&binary);
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .arg("--config")
+            .arg(&config)
+            .args(["--json", "update"])
+            .args(args);
+        for key in [
+            "LD_LIBRARY_PATH",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_FALLBACK_LIBRARY_PATH",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command.output().unwrap()
+    };
+    let guard = acquire_update_lock(&binary).unwrap();
+    let applies: &[&[&str]] = &[
+        &["--force", "--offline", missing_bundle.to_str().unwrap()],
+        &["--rollback"],
+    ];
+    for args in applies {
+        let output = invoke(args);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["applied"], false);
+        assert_eq!(report["success"], false);
+        assert_eq!(report["exit_code"], 2);
+        assert!(report["service_restart"].is_null());
+        assert!(
+            report["error"]
+                .as_str()
+                .unwrap()
+                .contains("another sbh update or rollback"),
+            "{report}"
+        );
+        assert_eq!(
+            fs::canonicalize(report["install_path"].as_str().unwrap()).unwrap(),
+            fs::canonicalize(&binary).unwrap()
+        );
+    }
+    let inventory = invoke(&["--list-backups"]);
+    assert!(inventory.status.success(), "{inventory:?}");
+    let inventory: serde_json::Value = serde_json::from_slice(&inventory.stdout).unwrap();
+    assert!(inventory["backups"].as_array().unwrap().is_empty());
+    for preview in ["--dry-run", "--check"] {
+        let output = invoke(&["--rollback", preview]);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["applied"], false);
+        assert_eq!(report["dry_run"], preview == "--dry-run");
+        assert_eq!(report["check_only"], preview == "--check");
+        assert!(
+            report["error"]
+                .as_str()
+                .unwrap()
+                .contains("no backups available"),
+            "{report}"
+        );
+    }
+    assert!(!home.join(".local/share/sbh/backups").exists());
+    guard.unlock().unwrap();
+    drop(guard);
+    let output = invoke(&["--force", "--offline", missing_bundle.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        !stdout(&output).contains("another sbh update or rollback"),
+        "{output:?}"
+    );
+    assert!(acquire_update_lock(&binary).is_ok());
+    let after = fs::metadata(&binary).unwrap();
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+    assert_eq!(after.len(), before.len());
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+}
