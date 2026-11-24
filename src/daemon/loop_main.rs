@@ -27,12 +27,18 @@ use crossbeam_channel::{
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
-use crate::ballast::coordinator::{BallastPoolCoordinator, BallastRefillBlocker};
+use crate::ballast::coordinator::{
+    BallastPoolCoordinator, BallastRefillBlocker, BallastRelease, BallastReplenishment,
+};
+use crate::ballast::manager::ProvisionReport;
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::{
     Config, InodePressureConfig, PredictionConfig, ScannerConfig, ScannerEngineMode, ScoringConfig,
 };
 use crate::core::errors::{Result, SbhError};
+use crate::daemon::ballast_control::{
+    BallastControlWorkers, ControlBallastOutcome, ControlBallastTask,
+};
 use crate::daemon::ballast_release::{BallastReleaser, ReleaseContext, ReleaseRequest};
 use crate::daemon::ballast_replenish::BallastReplenisher;
 use crate::daemon::ballast_reserve::BallastReserveMonitor;
@@ -2118,6 +2124,19 @@ enum MainLoopCommand {
     },
 }
 
+/// Pending operator batches own their reply until all started native work has
+/// finished. Unstarted pools remain available to automatic pressure relief.
+struct PendingBallastControl {
+    id: u64,
+    action: ControlBallastAction,
+    admission: Arc<ControlAdmission>,
+    reply: Sender<ControlResponse>,
+    remaining: VecDeque<(PathBuf, PathBuf)>,
+    running: HashMap<PathBuf, PathBuf>,
+    results: Vec<Value>,
+    error: Option<String>,
+}
+
 /// The daemon side of the control socket: signal-flag commands and ledger
 /// lookups are answered on the connection thread, everything else goes to
 /// the main loop through [`MainLoopCommand`].
@@ -3850,6 +3869,9 @@ pub struct MonitoringDaemon {
     ballast_releaser: BallastReleaser,
     /// One retained worker keeps reserve allocation off the pressure monitor.
     ballast_replenisher: BallastReplenisher,
+    /// Explicit operator work shares the pool exclusion and publication rules
+    /// while retaining separate, bounded native workers.
+    ballast_control: BallastControlWorkers,
     /// Read-only availability is independent of the actuator's cached inventory.
     ballast_reserve_monitor: BallastReserveMonitor,
     /// Reasons from the existing per-pool admission path on the latest tick.
@@ -3950,6 +3972,8 @@ pub struct MonitoringDaemon {
     control_rx: Receiver<MainLoopCommand>,
     control_server: Option<ControlServer>,
     pending_control: Vec<MainLoopCommand>,
+    pending_ballast_control: Vec<PendingBallastControl>,
+    next_ballast_control_id: u64,
     pending_state_replies: Vec<Sender<()>>,
     behavior_state: PressureBehaviorState,
     /// A swap-raised behavior cell still needs its filesystem-only certainty
@@ -6100,6 +6124,7 @@ impl MonitoringDaemon {
             initial_provision: HashSet::new(),
             ballast_releaser: BallastReleaser::default(),
             ballast_replenisher: BallastReplenisher::default(),
+            ballast_control: BallastControlWorkers::default(),
             ballast_reserve_monitor: BallastReserveMonitor::default(),
             ballast_refill_blockers: HashMap::new(),
             release_controller,
@@ -6160,6 +6185,8 @@ impl MonitoringDaemon {
             control_rx,
             control_server: None,
             pending_control: Vec::new(),
+            pending_ballast_control: Vec::new(),
+            next_ballast_control_id: 0,
             pending_state_replies: Vec::new(),
             behavior_state,
             ram_reclaim_behavior: RamReclaimBehavior::FilesystemOnly,
@@ -6243,7 +6270,10 @@ impl MonitoringDaemon {
         // Cancellation cannot interrupt native allocation or release. Keep
         // monitoring while those retained workers finish before collecting a
         // replacement plan; an old result cannot advance its mutation witness.
-        let completed = if self.ballast_replenisher.busy() || self.ballast_releaser.busy() {
+        let completed = if self.ballast_replenisher.busy()
+            || self.ballast_releaser.busy()
+            || self.ballast_control.busy()
+        {
             None
         } else {
             discovery.poll(Instant::now(), move || {
@@ -6270,6 +6300,7 @@ impl MonitoringDaemon {
             } else {
                 self.ballast_replenisher.cancel();
                 self.ballast_releaser.cancel();
+                self.cancel_ballast_control("ballast discovery changed during the command");
                 self.ballast_reserve_monitor.invalidate_all();
                 self.initial_provision.clear();
                 if self.initial_discovery {
@@ -6768,6 +6799,10 @@ impl MonitoringDaemon {
                 // No new event will come for a deferred target; retry it
                 // so it applies when its hysteresis window ends.
                 default(wait) => {
+                    // A worker's wake can arrive just before its thread exits.
+                    // Retry completion without waiting for the next pressure
+                    // tick or spawning another worker over the occupied slot.
+                    self.poll_ballast_control();
                     if self.behavior_state.has_pending_target() {
                         self.update_behavior_mode(
                             self.behavior_state.latest_memory_level(),
@@ -6871,18 +6906,11 @@ impl MonitoringDaemon {
                     admission,
                     reply,
                 } => {
-                    let result = if admission.try_start() {
-                        match self.execute_ballast_action(&action) {
-                            Ok(result) => ControlResponse::success(result),
-                            Err(error) => ControlResponse::failure("failed", error),
-                        }
-                    } else {
-                        ControlAdmission::expired_response()
-                    };
-                    let _ = reply.try_send(result);
+                    self.queue_ballast_control(action, admission, reply);
                 }
             }
         }
+        self.poll_ballast_control();
     }
 
     /// Answer the `status` requests that waited for this tick's state write.
@@ -6892,24 +6920,39 @@ impl MonitoringDaemon {
         }
     }
 
-    fn execute_ballast_action(
+    fn queue_ballast_control(
         &mut self,
-        action: &ControlBallastAction,
-    ) -> std::result::Result<Value, String> {
-        if self.discovery_pending() && matches!(action, ControlBallastAction::Replenish { .. }) {
-            return Err("ballast discovery is pending for the current configuration; retry replenishment after discovery completes".into());
+        action: ControlBallastAction,
+        admission: Arc<ControlAdmission>,
+        reply: Sender<ControlResponse>,
+    ) {
+        if !admission.try_start() {
+            let _ = reply.try_send(ControlAdmission::expired_response());
+            return;
         }
-        let requested = match action {
+        if self.pending_ballast_control.len() >= CONTROL_CHANNEL_CAP {
+            let _ = reply.try_send(ControlResponse::failure(
+                "busy",
+                "the pending ballast command queue is full",
+            ));
+            return;
+        }
+        if self.discovery_pending() && matches!(action, ControlBallastAction::Replenish { .. }) {
+            let _ = reply.try_send(ControlResponse::failure(
+                "failed",
+                "ballast discovery is pending; retry replenishment after discovery completes",
+            ));
+            return;
+        }
+        let requested = match &action {
             ControlBallastAction::Release { mount, .. }
             | ControlBallastAction::Replenish { mount } => mount.clone(),
         };
-        let mounts: Vec<PathBuf> = requested.map_or_else(
+        let mounts: Vec<_> = requested.map_or_else(
             || {
                 self.ballast_coordinator
                     .inventory_cached()
                     .into_iter()
-                    // Folded bind mounts are status rows. Resolving them again
-                    // would spend the operator's count twice on the same pool.
                     .filter(|pool| !pool.skipped)
                     .map(|pool| pool.mount_point)
                     .collect()
@@ -6917,94 +6960,270 @@ impl MonitoringDaemon {
             |mount| vec![mount],
         );
         if mounts.is_empty() {
-            return Err("no ballast pool is configured".to_string());
+            let _ = reply.try_send(ControlResponse::failure(
+                "failed",
+                "no ballast pool is configured",
+            ));
+            return;
         }
-        self.poll_ballast_releases();
+        let Some(id) = self.next_ballast_control_id.checked_add(1) else {
+            let _ = reply.try_send(ControlResponse::failure(
+                "unavailable",
+                "ballast command identifiers exhausted; restart the daemon",
+            ));
+            return;
+        };
+        self.next_ballast_control_id = id;
+        let remaining = mounts
+            .into_iter()
+            .map(|mount| {
+                let pool = self.pool_mount(&mount);
+                (mount, pool)
+            })
+            .collect();
+        self.pending_ballast_control.push(PendingBallastControl {
+            id,
+            action,
+            admission,
+            reply,
+            remaining,
+            running: HashMap::new(),
+            results: Vec::new(),
+            error: None,
+        });
+    }
+
+    /// Consume receipts and dispatch only into free native slots. Every lookup
+    /// here uses cached routing; the task owns all native validation and I/O.
+    fn poll_ballast_control(&mut self) {
+        // A cancelled automatic worker can finish between pressure ticks.
+        // Reap its receipt during the short control wake interval so queued
+        // operator work need not wait for the next long Green/Recovery tick.
         self.poll_ballast_replenishment();
-        for mount in &mounts {
-            let pool = self.pool_mount(mount);
-            self.ballast_releaser.cancel_mount(&pool);
-            self.ballast_replenisher.cancel_mount(&pool);
-            if self.ballast_releaser.busy_mount(&pool)
-                || self.ballast_replenisher.worker_mount() == Some(pool.as_path())
-            {
-                return Err(format!(
-                    "ballast worker for {} is still finishing native I/O; retry after it exits",
-                    pool.display()
-                ));
-            }
-        }
-        let mut pools = Vec::new();
-        for mount in mounts {
-            let pool_mount = self.pool_mount(&mount);
-            self.ballast_reserve_monitor.invalidate(&pool_mount);
-            if let Some(pool) = self.ballast_coordinator.pool_for_mount(&mount) {
-                self.release_controller
-                    .bind_pool(&pool_mount, &pool.ballast_dir);
-            }
-            // Operator-driven changes are logged like the daemon's own so the
-            // Timeline and `sbh stats` see them; the release controller is
-            // told too, so an operator's release is not refilled at once.
-            let outcome = match action {
-                ControlBallastAction::Release { count, .. } => {
-                    self.ballast_replenisher.cancel_mount(&pool_mount);
-                    match self.ballast_coordinator.release_for_mount(&mount, *count) {
-                        Ok(Some(report)) => {
-                            self.last_tick_cleanup_ran |= report.files_released > 0;
-                            self.release_controller
-                                .on_released(&pool_mount, report.files_released);
-                            self.reconcile_ballast_inventory(&pool_mount);
-                            self.log_control_ballast_release(&mount, &report.released);
-                            Ok(json!({
-                                "mount": mount,
-                                "released": report.files_released,
-                                "bytes_freed": report.bytes_freed,
-                                "warnings": report.warnings,
-                                "errors": report.errors,
-                            }))
-                        }
-                        Ok(None) => Ok(
-                            json!({ "mount": mount, "released": 0, "bytes_freed": 0, "note": "no pool or nothing to release" }),
-                        ),
-                        Err(error) => Err(error),
-                    }
+        self.poll_ballast_releases();
+        for completed in self.ballast_control.poll() {
+            let requested = completed.requested_mount;
+            let result = match completed.outcome {
+                Ok(ControlBallastOutcome::Refused(reason)) => Err(reason),
+                Ok(ControlBallastOutcome::Release { task, report }) => {
+                    self.last_tick_cleanup_ran |= report.files_released > 0;
+                    self.log_control_ballast_release(&completed.pool_mount, &report.released);
+                    self.finish_ballast_release(task, report.files_released);
+                    Ok(json!({
+                        "mount": requested,
+                        "released": report.files_released,
+                        "bytes_freed": report.bytes_freed,
+                        "warnings": report.warnings,
+                        "errors": report.errors,
+                    }))
                 }
-                ControlBallastAction::Replenish { .. } => {
-                    match self.ballast_coordinator.replenish_for_mount(&mount, None) {
-                        Ok(Some(report)) => {
-                            if report.files_created > 0 {
-                                self.release_controller
-                                    .on_replenished(&pool_mount, report.files_created);
-                            }
-                            self.reconcile_ballast_inventory(&pool_mount);
-                            for (path, size_bytes) in &report.created {
-                                self.logger_handle.send(ActivityEvent::BallastReplenished {
-                                    path: path.display().to_string(),
-                                    size_bytes: *size_bytes,
-                                });
-                            }
-                            Ok(json!({
-                                "mount": mount,
+                Ok(ControlBallastOutcome::Replenish { task, result }) => {
+                    self.finish_ballast_replenishment(task, &result);
+                    result
+                        .map(|report| {
+                            json!({
+                                "mount": requested,
                                 "created": report.files_created,
                                 "skipped": report.files_skipped,
                                 "skipped_for_floor": report.skipped_for_floor,
                                 "bytes": report.total_bytes,
                                 "errors": report.errors,
-                            }))
-                        }
-                        Ok(None) => Ok(
-                            json!({ "mount": mount, "created": 0, "note": "no pool on this mount" }),
-                        ),
-                        Err(error) => Err(error),
-                    }
+                            })
+                        })
+                        .map_err(|error| error.to_string())
+                }
+                Err(_) => {
+                    self.ballast_coordinator
+                        .invalidate_pool_inventory(&completed.pool_mount);
+                    self.ballast_reserve_monitor
+                        .invalidate(&completed.pool_mount);
+                    Err("ballast worker panicked; its outcome is unknown, inspect status before retrying".into())
                 }
             };
-            match outcome {
-                Ok(value) => pools.push(value),
-                Err(error) => return Err(format!("{}: {error}", mount.display())),
+            if let Some(command) = self
+                .pending_ballast_control
+                .iter_mut()
+                .find(|command| command.id == completed.command_id)
+            {
+                command.running.remove(&requested);
+                match result {
+                    Ok(row) => command.results.push(row),
+                    Err(error) => {
+                        command.error.get_or_insert(error);
+                        command.remaining.clear();
+                        self.ballast_control.cancel_command(command.id);
+                    }
+                }
             }
         }
-        Ok(json!({ "pools": pools }))
+
+        let commands = std::mem::take(&mut self.pending_ballast_control);
+        for mut command in commands {
+            if command.admission.expired() {
+                command.error.get_or_insert_with(|| {
+                    "ballast command deadline expired; inspect status before retrying".into()
+                });
+                command.remaining.clear();
+                self.ballast_control.cancel_command(command.id);
+            }
+            let candidates = command.remaining.len();
+            for _ in 0..candidates {
+                if !self.ballast_control.capacity_available() || command.error.is_some() {
+                    break;
+                }
+                let Some((requested, pool_mount)) = command.remaining.pop_front() else {
+                    break;
+                };
+                if self.pool_mount(&requested) != pool_mount {
+                    command.error =
+                        Some("the requested ballast mount changed during the command".into());
+                    command.remaining.clear();
+                    self.ballast_control.cancel_command(command.id);
+                    break;
+                }
+                if !self.ballast_coordinator.has_pool(&requested) {
+                    command.results.push(match command.action {
+                        ControlBallastAction::Release { .. } => json!({
+                            "mount": requested, "released": 0, "bytes_freed": 0,
+                            "note": "no pool or nothing to release",
+                        }),
+                        ControlBallastAction::Replenish { .. } => json!({
+                            "mount": requested, "created": 0, "note": "no pool on this mount",
+                        }),
+                    });
+                    continue;
+                }
+                self.ballast_releaser.cancel_mount(&pool_mount);
+                self.ballast_replenisher.cancel_mount(&pool_mount);
+                if self.ballast_releaser.busy_mount(&pool_mount)
+                    || self.ballast_replenisher.worker_mount() == Some(pool_mount.as_path())
+                    || self.ballast_control.busy_mount(&pool_mount)
+                {
+                    // A blocked pool retains its native owner while another
+                    // pool in the same operator batch can use the other slot.
+                    command.remaining.push_back((requested, pool_mount));
+                    continue;
+                }
+                self.ballast_reserve_monitor.invalidate(&pool_mount);
+                let task = match command.action {
+                    ControlBallastAction::Release { count, .. } => self
+                        .ballast_coordinator
+                        .prepare_release(&pool_mount)
+                        .map(|task| ControlBallastTask::Release { task, count }),
+                    ControlBallastAction::Replenish { .. } => {
+                        self.ballast_coordinator
+                            .invalidate_pool_inventory(&pool_mount);
+                        self.ballast_coordinator
+                            .prepare_replenishment(&pool_mount)
+                            .map(ControlBallastTask::Replenish)
+                    }
+                };
+                let Some(task) = task else {
+                    command.error = Some("the requested ballast pool became unavailable".into());
+                    command.remaining.clear();
+                    self.ballast_control.cancel_command(command.id);
+                    break;
+                };
+                let wake = self.control_tx.clone();
+                match self.ballast_control.start(
+                    command.id,
+                    requested.clone(),
+                    task,
+                    self.signal_handler.shutdown_token(),
+                    command.admission.deadline,
+                    move || {
+                        let _ = wake.try_send(MainLoopCommand::Wake);
+                    },
+                ) {
+                    Ok(true) => {
+                        command.running.insert(requested, pool_mount);
+                    }
+                    Ok(false) => {
+                        command.remaining.push_front((requested, pool_mount));
+                        break;
+                    }
+                    Err(error) => {
+                        command.error = Some(format!("could not start ballast worker: {error}"));
+                        command.remaining.clear();
+                        self.ballast_control.cancel_command(command.id);
+                        break;
+                    }
+                }
+            }
+            if command.remaining.is_empty() && command.running.is_empty() {
+                command
+                    .results
+                    .sort_by(|left, right| left["mount"].as_str().cmp(&right["mount"].as_str()));
+                let result = json!({ "pools": command.results });
+                let response = match command.error {
+                    Some(error) => {
+                        let mut response = ControlResponse::failure("failed", error);
+                        response.result = result;
+                        response
+                    }
+                    None => ControlResponse::success(result),
+                };
+                let _ = command.reply.try_send(response);
+            } else {
+                self.pending_ballast_control.push(command);
+            }
+        }
+    }
+
+    fn cancel_ballast_control(&mut self, reason: &str) {
+        self.ballast_control.cancel();
+        for command in &mut self.pending_ballast_control {
+            command.remaining.clear();
+            command.error.get_or_insert_with(|| reason.to_string());
+        }
+    }
+
+    fn cancel_ballast_control_mount(
+        commands: &mut [PendingBallastControl],
+        workers: &BallastControlWorkers,
+        pool_mount: &Path,
+        reason: &str,
+    ) {
+        workers.cancel_mount(pool_mount);
+        for command in commands {
+            if command.remaining.iter().any(|(_, pool)| pool == pool_mount)
+                || command.running.values().any(|pool| pool == pool_mount)
+            {
+                command.remaining.clear();
+                command.error.get_or_insert_with(|| reason.to_string());
+                workers.cancel_command(command.id);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn execute_ballast_action(
+        &mut self,
+        action: &ControlBallastAction,
+    ) -> std::result::Result<Value, String> {
+        let (reply, response) = bounded(1);
+        self.pending_control.push(MainLoopCommand::Ballast {
+            action: action.clone(),
+            admission: Arc::new(ControlAdmission::new(Duration::from_secs(10))),
+            reply,
+        });
+        self.drain_control_commands();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            self.poll_ballast_control();
+            if let Ok(response) = response.try_recv() {
+                return if response.ok {
+                    Ok(response.result)
+                } else {
+                    Err(response.error.expect("control failure detail").message)
+                };
+            }
+            assert!(
+                Instant::now() < deadline,
+                "control ballast worker did not finish"
+            );
+            thread::yield_now();
+        }
     }
 
     /// Activity events for a release the operator asked for over the control
@@ -8325,6 +8544,7 @@ impl MonitoringDaemon {
             self.target_tier.take_forecast_intervention(),
             self.quarantine_sweeper.forecast_intervention(),
             self.ballast_releaser.take_forecast_intervention(),
+            self.ballast_control.take_forecast_intervention(),
         ]
         .into_iter()
         .any(|intervention| intervention);
@@ -8426,7 +8646,14 @@ impl MonitoringDaemon {
                     .map_or_else(|| mount_path.clone(), |pool| pool.mount_point.clone());
                 self.ballast_releaser.cancel_mount(&pool_mount);
                 self.ballast_replenisher.cancel_mount(&pool_mount);
-                self.ballast_coordinator.invalidate_pool_inventory(&pool_mount);
+                Self::cancel_ballast_control_mount(
+                    &mut self.pending_ballast_control,
+                    &self.ballast_control,
+                    &pool_mount,
+                    "filesystem binding changed during the command",
+                );
+                self.ballast_coordinator
+                    .invalidate_pool_inventory(&pool_mount);
                 // Manual and automatic requests must stop resolving this
                 // mount to its former pool while native discovery runs.
                 if binding_changed {
@@ -9030,6 +9257,7 @@ impl MonitoringDaemon {
         scan_rx: &Receiver<ScanRequest>,
         del_tx: &Sender<DeletionBatch>,
     ) -> Duration {
+        self.poll_ballast_control();
         self.poll_ballast_replenishment();
         self.poll_ballast_releases();
         self.ballast_releaser.begin_tick();
@@ -10455,8 +10683,9 @@ impl MonitoringDaemon {
             .unwrap_or_else(|| pool.available_count())
     }
 
-    /// Only native release/control actions call this. Periodic state output
-    /// reads the resulting cached history and never probes the directory.
+    /// Test fixture reconciliation. Production completion receipts carry
+    /// inventory without native probes on the monitoring thread.
+    #[cfg(test)]
     fn reconcile_ballast_inventory(&mut self, mount: &Path) {
         if let Some(observation) = self.ballast_coordinator.observe_pool_inventory(mount) {
             self.release_controller
@@ -10485,6 +10714,7 @@ impl MonitoringDaemon {
         let pool_mount = self.pool_mount(mount);
         if self.ballast_releaser.busy_mount(&pool_mount)
             || self.ballast_releaser.requested(&pool_mount)
+            || self.ballast_control.busy_mount(&pool_mount)
         {
             self.ballast_refill_blockers
                 .entry(pool_mount)
@@ -10557,6 +10787,16 @@ impl MonitoringDaemon {
             );
             return;
         };
+        self.finish_ballast_replenishment(task, &result);
+    }
+
+    /// Account a native refill receipt through the same revision checks for
+    /// automatic and operator requests. Native inventory stays on the worker.
+    fn finish_ballast_replenishment(
+        &mut self,
+        task: BallastReplenishment,
+        result: &Result<ProvisionReport>,
+    ) {
         let pool_mount = task.mount().to_path_buf();
         let initial = task.is_initial_provision();
         let observation = task.inventory_observation();
@@ -10650,6 +10890,23 @@ impl MonitoringDaemon {
         if self.ballast_replenisher.worker_mount() == Some(pool_mount.as_path()) {
             return Ok(false);
         }
+        if self.ballast_control.busy_mount(&pool_mount) {
+            // Preserve the operator's exact release count. Pressure relief
+            // may revoke a refill at its next guard, but either native task
+            // keeps ownership until it returns.
+            for command in &mut self.pending_ballast_control {
+                if matches!(command.action, ControlBallastAction::Replenish { .. })
+                    && command.running.values().any(|pool| pool == &pool_mount)
+                {
+                    command.remaining.clear();
+                    command.error.get_or_insert_with(|| {
+                        "automatic pressure relief superseded replenishment".into()
+                    });
+                    self.ballast_control.cancel_command(command.id);
+                }
+            }
+            return Ok(false);
+        }
         let sample = self.fs_collector.collect_admission_sample(mount)?;
         let stats = &sample.stats;
         // A read-only bind of the pressured filesystem can still reach its
@@ -10725,6 +10982,51 @@ impl MonitoringDaemon {
         }
     }
 
+    /// Reconcile an automatic or operator release without native I/O. A stale
+    /// receipt still accounts its spent allowance, but cannot replace newer
+    /// inventory or attach old cooldown history to a replacement pool.
+    fn finish_ballast_release(&mut self, task: BallastRelease, released: usize) -> bool {
+        let pool_mount = task.mount().to_path_buf();
+        let observations = task.observations();
+        let unbound = task.unbound_observations();
+        let budget = task.release_budget();
+        let budget_current = self.ballast_coordinator.release_budget_is_current(&task);
+        let current = self.ballast_coordinator.finish_release(task);
+        if !current {
+            if budget_current && let Some(budget) = budget {
+                self.release_controller
+                    .apply_release_budget(&pool_mount, budget);
+            }
+            if budget_current && released > 0 {
+                self.ballast_coordinator
+                    .invalidate_pool_inventory(&pool_mount);
+                self.ballast_reserve_monitor.invalidate(&pool_mount);
+            }
+            return false;
+        }
+        self.ballast_reserve_monitor.invalidate(&pool_mount);
+        if let Some((before, _)) = observations {
+            self.release_controller
+                .observe_pool_inventory(&pool_mount, before);
+        } else if let Some((ref origin, before, _)) = unbound {
+            self.release_controller
+                .observe_unbound_pool_inventory(&pool_mount, origin, before);
+        }
+        if released > 0 {
+            // A stranded-only receipt can start cooldown without inventing
+            // an identity for an absent managed directory.
+            self.release_controller.on_released(&pool_mount, released);
+        }
+        if let Some((_, after)) = observations {
+            self.release_controller
+                .observe_pool_inventory(&pool_mount, after);
+        } else if let Some((ref origin, _, after)) = unbound {
+            self.release_controller
+                .observe_unbound_pool_inventory(&pool_mount, origin, after);
+        }
+        true
+    }
+
     /// Audit actual removals even if reload superseded the worker. Only an
     /// identity- and revision-current receipt may replace live inventory/history.
     fn poll_ballast_releases(&mut self) -> usize {
@@ -10737,13 +11039,6 @@ impl MonitoringDaemon {
                 continue;
             };
             let pool_mount = completed.task.mount().to_path_buf();
-            let observations = completed.task.observations();
-            let unbound = completed.task.unbound_observations();
-            let budget = completed.task.release_budget();
-            let budget_current = self
-                .ballast_coordinator
-                .release_budget_is_current(&completed.task);
-            let current = self.ballast_coordinator.finish_release(completed.task);
             let report = completed.report;
             for warning in &report.warnings {
                 eprintln!("[SBH-BALLAST] {warning}");
@@ -10757,47 +11052,8 @@ impl MonitoringDaemon {
             self.log_ballast_releases(&report.released, &completed.request.response);
             released += report.files_released;
             self.last_tick_cleanup_ran |= report.files_released > 0;
-            if !current {
-                if budget_current
-                    && let Some(budget) = budget
-                {
-                    // A failed post-inventory read cannot erase successful
-                    // removals from the graduated release allowance. This is
-                    // accounting only, never fresh native inventory.
-                    self.release_controller
-                        .apply_release_budget(&pool_mount, budget);
-                }
-                if budget_current && report.files_released > 0 {
-                    // An observer may have sampled between admission and the
-                    // actual unlinks. Retire it even when no fresh inventory
-                    // can be published from this release.
-                    self.ballast_coordinator
-                        .invalidate_pool_inventory(&pool_mount);
-                    self.ballast_reserve_monitor.invalidate(&pool_mount);
-                }
+            if !self.finish_ballast_release(completed.task, report.files_released) {
                 continue;
-            }
-            self.ballast_reserve_monitor.invalidate(&pool_mount);
-            if let Some((before, _)) = observations {
-                self.release_controller
-                    .observe_pool_inventory(&pool_mount, before);
-            } else if let Some((ref origin, before, _)) = unbound {
-                self.release_controller
-                    .observe_unbound_pool_inventory(&pool_mount, origin, before);
-            }
-            if report.files_released > 0 {
-                // Stranded reserve can have a complete receipt while its
-                // managed directory is absent. Actual release still starts
-                // the cooldown without inventing a managed directory identity.
-                self.release_controller
-                    .on_released(&pool_mount, report.files_released);
-            }
-            if let Some((_, after)) = observations {
-                self.release_controller
-                    .observe_pool_inventory(&pool_mount, after);
-            } else if let Some((ref origin, _, after)) = unbound {
-                self.release_controller
-                    .observe_unbound_pool_inventory(&pool_mount, origin, after);
             }
             if report.files_released == 0 {
                 continue;
@@ -10812,7 +11068,12 @@ impl MonitoringDaemon {
             }
             self.notification_manager
                 .notify(&NotificationEvent::BallastReleased {
-                    mount: completed.request.response.causing_mount.display().to_string(),
+                    mount: completed
+                        .request
+                        .response
+                        .causing_mount
+                        .display()
+                        .to_string(),
                     files_released: report.files_released,
                     bytes_freed: report.bytes_freed,
                 });
@@ -11780,6 +12041,7 @@ impl MonitoringDaemon {
                     self.uncovered_checked_at = None;
                     self.ballast_replenisher.cancel();
                     self.ballast_releaser.cancel();
+                    self.cancel_ballast_control("configuration changed during the command");
                     self.initial_provision.clear();
                     if self.discovery.is_some() {
                         self.ballast_coordinator.retain_release_only(
@@ -12265,6 +12527,18 @@ impl MonitoringDaemon {
         exit_reason: &str,
     ) {
         let uptime_secs = self.start_time.elapsed().as_secs();
+
+        // Revoke native operator work before waiting for socket handlers.
+        // Waiting clients receive a bounded failure even if a native call is
+        // stuck and must retain its worker slot until process exit.
+        self.signal_handler.request_shutdown();
+        self.cancel_ballast_control("daemon is shutting down");
+        for command in self.pending_ballast_control.drain(..) {
+            let _ = command.reply.try_send(ControlResponse::failure(
+                "ballast_failed",
+                "daemon is shutting down; an in-flight native outcome may be unknown",
+            ));
+        }
 
         // The control socket goes first: a client must not reach a daemon
         // that is draining, and the socket file must be gone when we exit.
@@ -12901,11 +13175,7 @@ fn replay_indexed_record(
     let size_estimate = if meta.is_dir()
         && record.size_estimate_bytes == crate::scanner::walker::OPAQUE_CANDIDATE_SIZE_FLOOR
     {
-        prescan_dir_size(
-            path,
-            cross_devices,
-            &AtomicBool::new(false),
-        )
+        prescan_dir_size(path, cross_devices, &AtomicBool::new(false))
     } else {
         record.size_estimate_bytes
     };
@@ -18446,7 +18716,10 @@ mod tests {
         let mut released = 0;
         while daemon.ballast_releaser.busy() {
             released += daemon.poll_ballast_releases();
-            assert!(Instant::now() < deadline, "ballast release worker did not finish");
+            assert!(
+                Instant::now() < deadline,
+                "ballast release worker did not finish"
+            );
             thread::yield_now();
         }
         released
@@ -18988,15 +19261,23 @@ mod tests {
                 continue;
             }
 
-            let error = daemon
-                .execute_ballast_action(&ControlBallastAction::Release {
+            let (reply, result) = bounded(1);
+            daemon.pending_control.push(MainLoopCommand::Ballast {
+                action: ControlBallastAction::Release {
                     mount: Some(mount.to_path_buf()),
                     count: 2,
-                })
-                .unwrap_err();
-            assert!(error.contains("still finishing native I/O"));
+                },
+                admission: Arc::new(ControlAdmission::new(Duration::from_secs(60))),
+                reply,
+            });
+            daemon.drain_control_commands();
+            assert!(result.is_empty(), "the reply waits for native ownership");
+            assert!(!daemon.ballast_control.busy());
             assert!(daemon.ballast_releaser.busy_mount(mount));
             assert!(!daemon.ballast_release_waits(mount));
+            daemon.cancel_ballast_control("operator request withdrawn before dispatch");
+            daemon.poll_ballast_control();
+            assert!(!result.try_recv().unwrap().ok);
 
             let mut discovery = RetainedDiscovery::default();
             discovery.request();
@@ -19040,25 +19321,35 @@ mod tests {
         const GIB: u64 = 1 << 30;
         let (mut fixture, keeper, alias, sibling) = recovery_reserve_alias_fixture();
         let daemon = &mut fixture.daemon;
-        daemon.ballast_coordinator.provision_all(daemon.platform.as_ref()).unwrap();
+        daemon
+            .ballast_coordinator
+            .provision_all(daemon.platform.as_ref())
+            .unwrap();
         assert_eq!(daemon.ballast_available_for_release(&keeper), 2);
         let start = Instant::now();
         let observe = |daemon: &mut MonitoringDaemon, mount: &Path, device, capacity, seconds| {
             let now = start + Duration::from_secs(seconds);
             let sample = native_pressure_sample(mount, device, capacity, 20 * GIB, now);
-            daemon.evaluate_pressure_samples(HashMap::from([(mount.to_path_buf(), sample)]), now).unwrap();
+            daemon
+                .evaluate_pressure_samples(HashMap::from([(mount.to_path_buf(), sample)]), now)
+                .unwrap();
         };
         observe(daemon, &alias, "disk-a", 100 * GIB, 0);
         observe(daemon, &alias, "disk-a", 110 * GIB, 1);
-        assert!(daemon.ballast_coordinator.has_pool(&alias), "resizing preserves the binding");
+        assert!(
+            daemon.ballast_coordinator.has_pool(&alias),
+            "resizing preserves the binding"
+        );
         observe(daemon, &alias, "disk-b", 110 * GIB, 2);
         assert!(daemon.discovery_pending());
         assert!(!daemon.ballast_coordinator.has_pool(&alias));
         assert!(daemon.ballast_coordinator.has_pool(&sibling));
-        let result = daemon.execute_ballast_action(&ControlBallastAction::Release {
-            mount: Some(alias.clone()),
-            count: 1,
-        }).unwrap();
+        let result = daemon
+            .execute_ballast_action(&ControlBallastAction::Release {
+                mount: Some(alias.clone()),
+                count: 1,
+            })
+            .unwrap();
         assert_eq!(result["pools"][0]["released"], 0);
         assert_eq!(daemon.ballast_available_for_release(&keeper), 2);
 
@@ -19077,14 +19368,24 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while daemon.discovery_pending() {
             daemon.poll_discovery();
-            assert!(Instant::now() < deadline, "replacement plan was not adopted");
+            assert!(
+                Instant::now() < deadline,
+                "replacement plan was not adopted"
+            );
             thread::yield_now();
         }
         assert!(daemon.ballast_coordinator.has_pool(&keeper));
         assert!(!daemon.ballast_coordinator.has_pool(&alias));
         assert!(!daemon.ballast_coordinator.has_pool(&sibling));
         for n in 1..=2 {
-            assert!(daemon.config.paths.ballast_dir.join(format!("SBH_BALLAST_FILE_{n:05}.dat")).exists());
+            assert!(
+                daemon
+                    .config
+                    .paths
+                    .ballast_dir
+                    .join(format!("SBH_BALLAST_FILE_{n:05}.dat"))
+                    .exists()
+            );
         }
     }
 
@@ -19105,9 +19406,15 @@ mod tests {
         assert!(
             cancellation
                 .close_wait(crossbeam_channel::RecvTimeoutError::Timeout)
-                .error.unwrap().message.contains("before it started")
+                .error
+                .unwrap()
+                .message
+                .contains("before it started")
         );
-        for admission in [cancellation, Arc::new(ControlAdmission::new(Duration::ZERO))] {
+        for admission in [
+            cancellation,
+            Arc::new(ControlAdmission::new(Duration::ZERO)),
+        ] {
             let (reply, result) = bounded(1);
             daemon.pending_control.push(MainLoopCommand::Ballast {
                 action: ControlBallastAction::Release {
@@ -19137,8 +19444,220 @@ mod tests {
         assert!(
             admitted
                 .close_wait(crossbeam_channel::RecvTimeoutError::Timeout)
-                .error.unwrap().message.contains("outcome is unknown")
+                .error
+                .unwrap()
+                .message
+                .contains("outcome is unknown")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_ballast_keeps_control_and_sibling_pools_responsive_while_refill_blocks() {
+        let (mut fixture, mount) = ballast_release_fixture();
+        let sibling = mount.join("sibling-mount");
+        std::fs::create_dir(&sibling).unwrap();
+        let daemon = &mut fixture.daemon;
+        let system = daemon.platform.fs_stats(Path::new("/")).unwrap();
+        let primary = daemon.platform.fs_stats(&mount).unwrap();
+        let mut sibling_stats = primary.clone();
+        sibling_stats.mount_point = sibling.clone();
+        daemon.platform = Arc::new(
+            disk_pressure_platform(vec![system, primary, sibling_stats])
+                .with_home(&mount)
+                .with_temp_dirs(Vec::new())
+                .with_cache_roots(Vec::new()),
+        );
+        daemon.fs_collector = FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::ZERO);
+        let armed = Arc::new(AtomicBool::new(false));
+        let worker_armed = Arc::clone(&armed);
+        let control_thread = thread::current().id();
+        let (entered_tx, entered_rx) = bounded(1);
+        let (resume_tx, resume_rx) = bounded(1);
+        let manager_platform: Arc<dyn Platform> = Arc::new(ReloadProbePlatform {
+            inner: Arc::clone(&daemon.platform),
+            before_probe: Box::new(move || {
+                if worker_armed.swap(false, Ordering::AcqRel) {
+                    assert_ne!(thread::current().id(), control_thread);
+                    entered_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+                }
+            }),
+        });
+        daemon.ballast_coordinator = BallastPoolCoordinator::discover_inner(
+            &daemon.config.ballast,
+            &[mount.clone(), sibling.clone()],
+            daemon.platform.as_ref(),
+            &manager_platform,
+            Some(&daemon.config.paths.ballast_dir),
+        )
+        .unwrap();
+        assert_eq!(daemon.ballast_coordinator.pool_count(), 2);
+        assert_eq!(
+            daemon
+                .ballast_coordinator
+                .provision_all(daemon.platform.as_ref())
+                .unwrap()
+                .total_files_created(),
+            4,
+        );
+        assert_eq!(
+            daemon
+                .ballast_coordinator
+                .release_for_mount(&mount, 1)
+                .unwrap()
+                .unwrap()
+                .files_released,
+            1,
+        );
+
+        armed.store(true, Ordering::Release);
+        let (refill_reply, refill_result) = bounded(1);
+        daemon.pending_control.push(MainLoopCommand::Ballast {
+            action: ControlBallastAction::Replenish {
+                mount: Some(mount.clone()),
+            },
+            admission: Arc::new(ControlAdmission::new(Duration::from_secs(60))),
+            reply: refill_reply,
+        });
+        daemon.drain_control_commands();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(daemon.ballast_control.busy_mount(&mount));
+        assert!(refill_result.is_empty());
+
+        let (state_reply, _state_result) = bounded(1);
+        let (sibling_reply, sibling_result) = bounded(1);
+        daemon
+            .pending_control
+            .push(MainLoopCommand::WriteState(state_reply));
+        daemon.pending_control.push(MainLoopCommand::Ballast {
+            action: ControlBallastAction::Release {
+                mount: Some(sibling.clone()),
+                count: 1,
+            },
+            admission: Arc::new(ControlAdmission::new(Duration::from_secs(60))),
+            reply: sibling_reply,
+        });
+        daemon.drain_control_commands();
+        assert_eq!(daemon.pending_state_replies.len(), 1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let sibling_response = loop {
+            daemon.poll_ballast_control();
+            if let Ok(response) = sibling_result.try_recv() {
+                break response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "healthy sibling waited for blocked refill"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(sibling_response.ok);
+        assert_eq!(sibling_response.result["pools"][0]["released"], 1);
+        assert!(daemon.ballast_control.busy_mount(&mount));
+        assert!(refill_result.is_empty());
+
+        // Pressure withdraws growth but cannot reuse its physical slot until
+        // the blocked native call returns. A new explicit release queues.
+        let pressure = quarantine_tick(PressureLevel::Critical, &mount).response;
+        assert!(
+            !daemon
+                .request_ballast_release(&mount, &pressure, false)
+                .unwrap()
+        );
+        let (release_reply, release_result) = bounded(1);
+        daemon.pending_control.push(MainLoopCommand::Ballast {
+            action: ControlBallastAction::Release {
+                mount: Some(mount.clone()),
+                count: 1,
+            },
+            admission: Arc::new(ControlAdmission::new(Duration::from_secs(60))),
+            reply: release_reply,
+        });
+        daemon.drain_control_commands();
+        assert!(daemon.ballast_control.busy_mount(&mount));
+        assert!(refill_result.is_empty());
+        assert!(release_result.is_empty());
+        assert_eq!(daemon.pending_ballast_control.len(), 2);
+        assert_eq!(daemon.pending_ballast_control[1].running.len(), 0);
+        resume_tx.send(()).unwrap();
+        while daemon.ballast_control.busy() || !daemon.pending_ballast_control.is_empty() {
+            daemon.poll_ballast_control();
+            assert!(
+                Instant::now() < deadline,
+                "cancelled native ownership did not drain"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let refill = refill_result.try_recv().unwrap();
+        assert!(!refill.ok);
+        assert_eq!(refill.result["pools"][0]["created"], 0);
+        let release = release_result.try_recv().unwrap();
+        assert!(release.ok);
+        assert_eq!(release.result["pools"][0]["released"], 1);
+        assert_eq!(
+            daemon
+                .ballast_coordinator
+                .pool_for_mount(&mount)
+                .unwrap()
+                .available_count(),
+            0
+        );
+        assert_eq!(
+            daemon
+                .ballast_coordinator
+                .pool_for_mount(&sibling)
+                .unwrap()
+                .available_count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_ballast_explicit_release_is_not_cancelled_by_automatic_pressure() {
+        let (mut fixture, mount) = recovery_reserve_fixture();
+        let daemon = &mut fixture.daemon;
+        assert_eq!(
+            daemon
+                .ballast_coordinator
+                .provision_all(daemon.platform.as_ref())
+                .unwrap()
+                .total_files_created(),
+            2,
+        );
+        let (reply, result) = bounded(1);
+        daemon.pending_control.push(MainLoopCommand::Ballast {
+            action: ControlBallastAction::Release {
+                mount: Some(mount.clone()),
+                count: 2,
+            },
+            admission: Arc::new(ControlAdmission::new(Duration::from_secs(60))),
+            reply,
+        });
+        daemon.drain_control_commands();
+        assert!(daemon.ballast_control.busy_mount(&mount));
+        // The slot persists even if native unlinks finished just before this
+        // tick. Automatic pressure must preserve the operator's exact count.
+        let pressure = quarantine_tick(PressureLevel::Orange, &mount).response;
+        assert!(
+            !daemon
+                .request_ballast_release(&mount, &pressure, false)
+                .unwrap()
+        );
+        assert!(daemon.pending_ballast_control[0].error.is_none());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let response = loop {
+            daemon.poll_ballast_control();
+            if let Ok(response) = result.try_recv() {
+                break response;
+            }
+            assert!(Instant::now() < deadline, "explicit release did not finish");
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(response.ok);
+        assert_eq!(response.result["pools"][0]["released"], 2);
+        assert_eq!(daemon.ballast_available_for_release(&mount), 0);
     }
 
     #[cfg(unix)]

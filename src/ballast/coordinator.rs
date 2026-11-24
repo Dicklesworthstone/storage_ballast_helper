@@ -560,7 +560,9 @@ enum ReleaseDirectory {
 
 impl ReleaseDirectory {
     fn capture(path: &Path, available: usize) -> Option<Self> {
-        if let Some(identity) = super::release::BallastInventoryObservation::capture(path, available) {
+        if let Some(identity) =
+            super::release::BallastInventoryObservation::capture(path, available)
+        {
             return Some(Self::Present(identity));
         }
         std::fs::symlink_metadata(path)
@@ -601,6 +603,11 @@ pub(crate) struct BallastReleasePlan {
     pub device_id: u64,
 }
 
+enum ReleaseCount<'a> {
+    Automatic(&'a BallastReleasePlan),
+    Operator(usize),
+}
+
 impl BallastRelease {
     pub(crate) fn mount(&self) -> &Path {
         &self.pool.mount_point
@@ -611,10 +618,8 @@ impl BallastRelease {
     /// observations merely because a release was cancelled before native I/O.
     fn observe_inventory(&self) -> Option<ReleaseInventory> {
         let first = ReleaseDirectory::capture(&self.pool.ballast_dir, 0)?;
-        let managed = BallastAvailability::observe(
-            &self.pool.ballast_dir,
-            self.pool.manager.config(),
-        );
+        let managed =
+            BallastAvailability::observe(&self.pool.ballast_dir, self.pool.manager.config());
         let (stranded_count, stranded_bytes, stranded_unreadable) = self.pool.stranded.observe();
         if managed.unreadable_count > 0 || stranded_unreadable > 0 {
             return None;
@@ -643,7 +648,7 @@ impl BallastRelease {
             && before.bytes == after.bytes
             && after.available == self.pool.available_count()
             && after.bytes == self.pool.releasable_bytes())
-            .then_some(after)
+        .then_some(after)
     }
 
     pub(crate) fn run(
@@ -651,14 +656,79 @@ impl BallastRelease {
         plan: &BallastReleasePlan,
         still_allowed: &dyn Fn() -> bool,
     ) -> ReleaseReport {
+        self.run_scoped(plan.device_id, ReleaseCount::Automatic(plan), still_allowed)
+    }
+
+    /// Execute an operator's exact count with the same native identity and
+    /// cancellation checks as automatic release. Native observation stays on
+    /// the worker, including when a pool had no files at discovery.
+    pub(crate) fn run_manual(
+        &mut self,
+        count: usize,
+        still_allowed: &dyn Fn() -> bool,
+    ) -> ReleaseReport {
+        if count == 0 || !still_allowed() {
+            return stranded::empty_report();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            match std::fs::metadata(&self.pool.mount_point) {
+                Ok(metadata) => {
+                    self.run_scoped(metadata.dev(), ReleaseCount::Operator(count), still_allowed)
+                }
+                Err(error) => {
+                    let mut report = stranded::empty_report();
+                    report.errors.push(format!(
+                        "ballast mount {}: {error}",
+                        self.pool.mount_point.display()
+                    ));
+                    report
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let mut report = stranded::empty_report();
+            report
+                .errors
+                .push("native ballast release is unavailable on this platform".into());
+            report
+        }
+    }
+
+    fn run_scoped(
+        &mut self,
+        device_id: u64,
+        requested: ReleaseCount<'_>,
+        still_allowed: &dyn Fn() -> bool,
+    ) -> ReleaseReport {
         let mut report = stranded::empty_report();
+        let operator = matches!(&requested, ReleaseCount::Operator(_));
         let directory = self.pool.ballast_dir.clone();
         let mount = self.pool.mount_point.clone();
-        let device_matches = self.pool.stranded.matches_device(plan.device_id);
+        let device_matches = self.pool.stranded.matches_device(device_id);
         if !device_matches || !still_allowed() {
+            if operator {
+                report.errors.push(if device_matches {
+                    "operator ballast release was cancelled before it started".into()
+                } else {
+                    format!(
+                        "ballast reserve for {} belongs to a different filesystem",
+                        mount.display()
+                    )
+                });
+            }
             return report;
         }
         let Some(admitted_directory) = ReleaseDirectory::capture(&directory, 0) else {
+            if operator {
+                report.errors.push(format!(
+                    "cannot verify ballast directory {} before operator release",
+                    directory.display()
+                ));
+            }
             return report;
         };
         let scope_current = || {
@@ -672,13 +742,12 @@ impl BallastRelease {
                 // The mount and every present managed directory must still
                 // belong to the observed filesystem. A missing managed pool
                 // can retain separately identity-bound stranded reserve.
-                std::fs::metadata(&mount)
-                    .is_ok_and(|metadata| metadata.dev() == plan.device_id)
+                std::fs::metadata(&mount).is_ok_and(|metadata| metadata.dev() == device_id)
                     && match std::fs::symlink_metadata(&directory) {
                         Ok(metadata) => {
                             metadata.is_dir()
                                 && !metadata.file_type().is_symlink()
-                                && metadata.dev() == plan.device_id
+                                && metadata.dev() == device_id
                         }
                         Err(error) => error.kind() == std::io::ErrorKind::NotFound,
                     }
@@ -689,6 +758,12 @@ impl BallastRelease {
         };
         let native_scope_current = || device_current() && scope_current() && still_allowed();
         if !native_scope_current() {
+            if operator {
+                report.errors.push(
+                    "ballast filesystem or directory changed, or operator release was cancelled"
+                        .into(),
+                );
+            }
             return report;
         }
         let revoked = std::cell::Cell::new(false);
@@ -722,6 +797,11 @@ impl BallastRelease {
             self.inventory_current = false;
             self.after = None;
             self.unbound_counts = None;
+            if operator {
+                report.errors.push(
+                    "operator ballast release was cancelled or its native scope changed".into(),
+                );
+            }
             return report;
         }
 
@@ -729,49 +809,60 @@ impl BallastRelease {
         // first attempt. Otherwise an unpublishable result could repeatedly
         // grant a fresh Orange quota to a healthy sibling directory.
         // Emergency/recovery release-all still attempts every known reserve.
-        let emergency = plan.release_all
-            || plan.response.level == crate::monitor::pid::PressureLevel::Critical
-            || plan.response.urgency >= 0.9;
-        let count = if emergency {
-            // Release-all is an intent, not an inventory estimate. Each
-            // actuator enumerates and validates its own slots under its lock.
-            // A busy retired pool must not cap release on the writable pool.
-            usize::MAX
-        } else if let Some(inventory) = observed {
-            let mut controller = super::release::BallastReleaseController::new(0);
-            let restored = match inventory.directory {
-                ReleaseDirectory::Absent => plan.unbound_history.as_ref().is_some_and(|history| {
-                    controller.restore_unbound_pool_history(
+        let count = match requested {
+            ReleaseCount::Operator(count) => count,
+            ReleaseCount::Automatic(plan) => {
+                let emergency = plan.release_all
+                    || plan.response.level == crate::monitor::pid::PressureLevel::Critical
+                    || plan.response.urgency >= 0.9;
+                if emergency {
+                    // Each actuator enumerates its own eligible slots under
+                    // its lock, including externally provisioned reserve.
+                    usize::MAX
+                } else if let Some(inventory) = observed {
+                    let mut controller = super::release::BallastReleaseController::new(0);
+                    let restored = match inventory.directory {
+                        ReleaseDirectory::Absent => {
+                            plan.unbound_history.as_ref().is_some_and(|history| {
+                                controller.restore_unbound_pool_history(
+                                    &self.pool.mount_point,
+                                    &self.origin,
+                                    history,
+                                )
+                            })
+                        }
+                        ReleaseDirectory::Present(_) => plan.history.is_some_and(|history| {
+                            controller.restore_pool_history(
+                                &self.pool.mount_point,
+                                &self.pool.ballast_dir,
+                                history,
+                            )
+                        }),
+                    };
+                    if restored {
+                        controller.set_release_efficiency(&self.pool.mount_point, plan.efficiency);
+                    }
+                    controller.bind_pool(&self.pool.mount_point, &self.pool.ballast_dir);
+                    controller.files_to_release(
                         &self.pool.mount_point,
-                        &self.origin,
-                        history,
+                        &plan.response,
+                        inventory.available,
+                        self.pool.expected_count(),
                     )
-                }),
-                ReleaseDirectory::Present(_) => plan.history.is_some_and(|history| {
-                    controller.restore_pool_history(
-                        &self.pool.mount_point,
-                        &self.pool.ballast_dir,
-                        history,
-                    )
-                }),
-            };
-            if restored {
-                controller.set_release_efficiency(&self.pool.mount_point, plan.efficiency);
+                } else {
+                    return report;
+                }
             }
-            controller.bind_pool(&self.pool.mount_point, &self.pool.ballast_dir);
-            controller.files_to_release(
-                &self.pool.mount_point,
-                &plan.response,
-                inventory.available,
-                self.pool.expected_count(),
-            )
-        } else {
-            return report;
         };
         if !allowed() {
             self.inventory_current = false;
             self.after = None;
             self.unbound_counts = None;
+            if operator {
+                report.errors.push(
+                    "operator ballast release was cancelled or its native scope changed".into(),
+                );
+            }
             return report;
         }
         if count == 0 {
@@ -794,8 +885,10 @@ impl BallastRelease {
                     report.released.extend(managed.released);
                 }
                 Err(error) => {
-                    let message =
-                        format!("managed ballast {}: {error}", self.pool.ballast_dir.display());
+                    let message = format!(
+                        "managed ballast {}: {error}",
+                        self.pool.ballast_dir.display()
+                    );
                     report.warnings.push(message.clone());
                     report.errors.push(message);
                 }
@@ -820,9 +913,7 @@ impl BallastRelease {
         report
     }
 
-    pub(crate) fn release_budget(
-        &self,
-    ) -> Option<super::release::BallastReleaseBudgetReceipt> {
+    pub(crate) fn release_budget(&self) -> Option<super::release::BallastReleaseBudgetReceipt> {
         self.release_budget.clone()
     }
 
@@ -1541,9 +1632,15 @@ impl BallastPoolCoordinator {
     /// an incomplete post-observation, but never after a newer pool mutation.
     pub(crate) fn release_budget_is_current(&self, task: &BallastRelease) -> bool {
         Arc::ptr_eq(&task.origin, &self.worker_origin)
-            && self.pool_revisions.get(&task.pool.mount_point).copied().unwrap_or(0)
+            && self
+                .pool_revisions
+                .get(&task.pool.mount_point)
+                .copied()
+                .unwrap_or(0)
                 == task.revision
-            && self.pools.get(&task.pool.mount_point)
+            && self
+                .pools
+                .get(&task.pool.mount_point)
                 .is_some_and(|pool| pool.ballast_dir == task.pool.ballast_dir)
     }
 
@@ -2340,7 +2437,6 @@ mod tests {
         )
     }
 
-
     #[cfg(unix)]
     mod automatic_release {
         use super::*;
@@ -2350,7 +2446,9 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         use std::time::Duration;
 
-        fn fixture(with_stranded: bool) -> (tempfile::TempDir, BallastPoolCoordinator, MockPlatform) {
+        fn fixture(
+            with_stranded: bool,
+        ) -> (tempfile::TempDir, BallastPoolCoordinator, MockPlatform) {
             let mount = tempfile::tempdir().unwrap();
             let configured = mount.path().join("active");
             let mut manager =
@@ -2383,7 +2481,11 @@ mod tests {
         fn plan(mount: &Path, critical: bool) -> BallastReleasePlan {
             BallastReleasePlan {
                 response: PressureResponse {
-                    level: if critical { PressureLevel::Critical } else { PressureLevel::Orange },
+                    level: if critical {
+                        PressureLevel::Critical
+                    } else {
+                        PressureLevel::Orange
+                    },
                     urgency: if critical { 1.0 } else { 0.4 },
                     scan_interval: Duration::from_secs(1),
                     release_ballast_files: 0,
@@ -2402,6 +2504,28 @@ mod tests {
         }
 
         #[test]
+        fn manual_ballast_release_explains_replaced_directory_refusal() {
+            let (mount, mut coordinator, _) = fixture(false);
+            let mut task = coordinator.prepare_release(mount.path()).unwrap();
+            let managed = mount.path().join("active");
+            let moved = mount.path().join("moved");
+            fs::rename(&managed, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &managed).unwrap();
+
+            let report = task.run_manual(usize::MAX, &|| true);
+
+            assert_eq!(report.files_released, 0);
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("cannot verify ballast directory"))
+            );
+            assert!(moved.join("SBH_BALLAST_FILE_00001.dat").exists());
+            assert!(!coordinator.finish_release(task));
+        }
+
+        #[test]
         fn zero_release_reconciles_external_depletion_and_revokes_old_observer() {
             let (mount, mut coordinator, platform) = fixture(false);
             let mut controller = BallastReleaseController::new(0);
@@ -2413,11 +2537,12 @@ mod tests {
             plan.history = controller.cached_pool_history(mount.path());
             let stale_observer = coordinator.prepare_reserve_observation().run(&platform);
             let mut task = coordinator.prepare_release(mount.path()).unwrap();
-            assert!(coordinator.accept_reserve_observation(stale_observer).is_empty());
-            fs::remove_file(
-                mount.path().join("active/SBH_BALLAST_FILE_00003.dat"),
-            )
-            .unwrap();
+            assert!(
+                coordinator
+                    .accept_reserve_observation(stale_observer)
+                    .is_empty()
+            );
+            fs::remove_file(mount.path().join("active/SBH_BALLAST_FILE_00003.dat")).unwrap();
 
             // One externally removed file already satisfies this cumulative
             // Orange target. The no-op still publishes the refreshed cache.
@@ -2425,21 +2550,34 @@ mod tests {
             assert_eq!(report.files_released, 0);
             assert!(task.observations().is_some());
             assert!(coordinator.finish_release(task));
-            assert_eq!(coordinator.pool_for_mount(mount.path()).unwrap().actual_count(), 2);
-            assert_eq!(coordinator.pool_for_mount(mount.path()).unwrap().available_count(), 2);
+            assert_eq!(
+                coordinator
+                    .pool_for_mount(mount.path())
+                    .unwrap()
+                    .actual_count(),
+                2
+            );
+            assert_eq!(
+                coordinator
+                    .pool_for_mount(mount.path())
+                    .unwrap()
+                    .available_count(),
+                2
+            );
         }
 
         #[test]
         fn stranded_only_release_publishes_fresh_managed_inventory() {
             let (mount, mut coordinator, _) = fixture(true);
             let mut task = coordinator.prepare_release(mount.path()).unwrap();
-            fs::remove_file(
-                mount.path().join("active/SBH_BALLAST_FILE_00003.dat"),
-            )
-            .unwrap();
+            fs::remove_file(mount.path().join("active/SBH_BALLAST_FILE_00003.dat")).unwrap();
             let report = task.run(&plan(mount.path(), false), &|| true);
             assert_eq!(report.files_released, 1);
-            assert!(report.released[0].0.starts_with(mount.path().join(BALLAST_SUBDIR)));
+            assert!(
+                report.released[0]
+                    .0
+                    .starts_with(mount.path().join(BALLAST_SUBDIR))
+            );
             assert!(task.observations().is_some());
             assert!(coordinator.finish_release(task));
             let pool = coordinator.pool_for_mount(mount.path()).unwrap();
@@ -2447,7 +2585,6 @@ mod tests {
             assert_eq!(pool.stranded_files().len(), 2);
             assert_eq!(pool.available_count(), 4);
         }
-
 
         #[test]
         fn absent_managed_directory_can_publish_completed_stranded_inventory() {
@@ -2457,19 +2594,27 @@ mod tests {
             let mut task = coordinator.prepare_release(mount.path()).unwrap();
             let report = task.run(&plan(mount.path(), true), &|| true);
             assert_eq!(report.files_released, 3);
-            assert!(report.released.iter().all(|(path, _)| {
-                path.starts_with(mount.path().join(BALLAST_SUBDIR))
-            }));
-            assert!(task.observations().is_none(), "absence invents no directory identity");
+            assert!(
+                report
+                    .released
+                    .iter()
+                    .all(|(path, _)| { path.starts_with(mount.path().join(BALLAST_SUBDIR)) })
+            );
+            assert!(
+                task.observations().is_none(),
+                "absence invents no directory identity"
+            );
             assert!(coordinator.finish_release(task));
             let pool = coordinator.pool_for_mount(mount.path()).unwrap();
             assert_eq!(pool.actual_count(), 0);
             assert!(pool.stranded_files().is_empty());
             assert_eq!(pool.available_count(), 0);
             assert_eq!(pool.releasable_bytes(), 0);
-            assert!(!managed.exists(), "release does not provision its missing directory");
+            assert!(
+                !managed.exists(),
+                "release does not provision its missing directory"
+            );
         }
-
 
         #[test]
         fn missing_managed_pool_keeps_one_cumulative_orange_release_window() {
@@ -2503,21 +2648,44 @@ mod tests {
                     expected,
                 );
             }
-            assert_eq!(coordinator.pool_for_mount(mount.path()).unwrap().available_count(), 2);
+            assert_eq!(
+                coordinator
+                    .pool_for_mount(mount.path())
+                    .unwrap()
+                    .available_count(),
+                2
+            );
             fs::remove_file(
-                mount.path().join(BALLAST_SUBDIR).join("SBH_BALLAST_FILE_00002.dat"),
+                mount
+                    .path()
+                    .join(BALLAST_SUBDIR)
+                    .join("SBH_BALLAST_FILE_00002.dat"),
             )
             .unwrap();
-            assert_eq!(cycle(&mut coordinator, &mut controller, PressureLevel::Orange), 0);
+            assert_eq!(
+                cycle(&mut coordinator, &mut controller, PressureLevel::Orange),
+                0
+            );
             // The real external loss also counts toward the stronger target:
             // one worker release plus one external removal leaves one to free.
-            assert_eq!(cycle(&mut coordinator, &mut controller, PressureLevel::Red), 1);
-            assert_eq!(coordinator.pool_for_mount(mount.path()).unwrap().available_count(), 0);
+            assert_eq!(
+                cycle(&mut coordinator, &mut controller, PressureLevel::Red),
+                1
+            );
+            assert_eq!(
+                coordinator
+                    .pool_for_mount(mount.path())
+                    .unwrap()
+                    .available_count(),
+                0
+            );
 
             // A newly provisioned managed directory owns a new physical
             // release window; old unbound depletion cannot strand its reserve.
             BallastManager::new_unfloored(managed, tiny_ballast_config())
-                .unwrap().provision(None).unwrap();
+                .unwrap()
+                .provision(None)
+                .unwrap();
             let mut request = plan(mount.path(), false);
             request.unbound_history = controller.cached_unbound_pool_history(mount.path());
             let mut task = coordinator.prepare_release(mount.path()).unwrap();
@@ -2526,7 +2694,6 @@ mod tests {
             assert!(task.unbound_observations().is_none());
             assert!(coordinator.finish_release(task));
         }
-
 
         #[test]
         fn incomplete_adopted_inventory_cannot_reset_orange_quota_on_a_healthy_sibling() {
@@ -2538,7 +2705,9 @@ mod tests {
             let first = mount.path().join(BALLAST_SUBDIR);
             let second = mount.path().join("other-retired");
             BallastManager::new_unfloored(second.clone(), tiny_ballast_config())
-                .unwrap().provision(None).unwrap();
+                .unwrap()
+                .provision(None)
+                .unwrap();
             coordinator.pools.get_mut(mount.path()).unwrap().stranded =
                 StrandedReserve::discover(&[first.clone(), second.clone()], &managed, mount.path());
 
@@ -2560,16 +2729,25 @@ mod tests {
                 let mut task = coordinator.prepare_release(mount.path()).unwrap();
                 let report = task.run(&request, &|| true);
                 assert_eq!(report.files_released, 0);
-                assert!(task.unbound_observations().is_none(), "busy is not fresh inventory");
-                assert!(task.release_budget().is_none(), "no complete before witness");
+                assert!(
+                    task.unbound_observations().is_none(),
+                    "busy is not fresh inventory"
+                );
+                assert!(
+                    task.release_budget().is_none(),
+                    "no complete before witness"
+                );
                 assert!(!coordinator.finish_release(task));
                 for slot in 1..=3 {
-                    assert!(second.join(format!("SBH_BALLAST_FILE_{slot:05}.dat")).exists());
+                    assert!(
+                        second
+                            .join(format!("SBH_BALLAST_FILE_{slot:05}.dat"))
+                            .exists()
+                    );
                 }
             }
             flock(&lock, FlockOperation::Unlock).unwrap();
         }
-
 
         #[test]
         fn incomplete_emergency_inventory_still_releases_every_verified_managed_slot() {
@@ -2595,11 +2773,20 @@ mod tests {
                 let mut task = coordinator.prepare_release(mount.path()).unwrap();
                 let report = task.run(&request, &|| true);
                 assert_eq!(report.files_released, 9);
-                assert!(report.released.iter().all(|(path, _)| path.starts_with(&managed)));
+                assert!(
+                    report
+                        .released
+                        .iter()
+                        .all(|(path, _)| path.starts_with(&managed))
+                );
                 assert!(task.release_budget().is_none());
                 assert!(!coordinator.finish_release(task));
                 for slot in 1..=3 {
-                    assert!(retired.join(format!("SBH_BALLAST_FILE_{slot:05}.dat")).exists());
+                    assert!(
+                        retired
+                            .join(format!("SBH_BALLAST_FILE_{slot:05}.dat"))
+                            .exists()
+                    );
                 }
             }
         }
@@ -2636,7 +2823,11 @@ mod tests {
             assert!(!coordinator.finish_release(task));
             for directory in [original, managed] {
                 for slot in 1..=3 {
-                    assert!(directory.join(format!("SBH_BALLAST_FILE_{slot:05}.dat")).exists());
+                    assert!(
+                        directory
+                            .join(format!("SBH_BALLAST_FILE_{slot:05}.dat"))
+                            .exists()
+                    );
                 }
             }
         }
@@ -2649,7 +2840,9 @@ mod tests {
             let first = mount.path().join(BALLAST_SUBDIR);
             let second = mount.path().join("other-retired");
             BallastManager::new_unfloored(second.clone(), tiny_ballast_config())
-                .unwrap().provision(None).unwrap();
+                .unwrap()
+                .provision(None)
+                .unwrap();
             coordinator.pools.get_mut(mount.path()).unwrap().stranded =
                 StrandedReserve::discover(&[first.clone(), second.clone()], &managed, mount.path());
             let cached_available = coordinator
@@ -2681,7 +2874,10 @@ mod tests {
             assert!(coordinator.release_budget_is_current(&task));
             assert!(!coordinator.finish_release(task));
             assert_eq!(
-                coordinator.pool_for_mount(mount.path()).unwrap().available_count(),
+                coordinator
+                    .pool_for_mount(mount.path())
+                    .unwrap()
+                    .available_count(),
                 cached_available,
             );
 
@@ -2704,9 +2900,14 @@ mod tests {
                 }
                 controller.observe_unbound_pool_inventory(mount.path(), &origin, after);
             }
-            assert_eq!(coordinator.pool_for_mount(mount.path()).unwrap().available_count(), 3);
+            assert_eq!(
+                coordinator
+                    .pool_for_mount(mount.path())
+                    .unwrap()
+                    .available_count(),
+                3
+            );
         }
-
 
         #[test]
         fn changed_managed_identity_requires_a_new_task_before_the_first_unlink() {
@@ -2745,13 +2946,21 @@ mod tests {
                 assert!(task.unbound_observations().is_none());
                 assert!(!coordinator.finish_release(task));
                 for slot in 1..=3 {
-                    assert!(managed.join(format!("SBH_BALLAST_FILE_{slot:05}.dat")).exists());
+                    assert!(
+                        managed
+                            .join(format!("SBH_BALLAST_FILE_{slot:05}.dat"))
+                            .exists()
+                    );
                     let prior = if previously_absent {
                         mount.path().join(BALLAST_SUBDIR)
                     } else {
                         retired.clone()
                     };
-                    assert!(prior.join(format!("SBH_BALLAST_FILE_{slot:05}.dat")).exists());
+                    assert!(
+                        prior
+                            .join(format!("SBH_BALLAST_FILE_{slot:05}.dat"))
+                            .exists()
+                    );
                 }
             }
         }
@@ -2759,7 +2968,9 @@ mod tests {
         #[test]
         fn refusal_in_stranded_release_cannot_reauthorize_the_managed_pass() {
             let (mount, mut coordinator, _) = fixture(true);
-            let retired_last = mount.path().join(BALLAST_SUBDIR)
+            let retired_last = mount
+                .path()
+                .join(BALLAST_SUBDIR)
                 .join("SBH_BALLAST_FILE_00003.dat");
             let refused_once = Cell::new(false);
             let mut task = coordinator.prepare_release(mount.path()).unwrap();
@@ -2774,7 +2985,11 @@ mod tests {
             assert!(task.observations().is_some());
             assert!(coordinator.finish_release(task));
             let pool = coordinator.pool_for_mount(mount.path()).unwrap();
-            assert_eq!(pool.actual_count(), 3, "managed files retain no revived authority");
+            assert_eq!(
+                pool.actual_count(),
+                3,
+                "managed files retain no revived authority"
+            );
             assert_eq!(pool.stranded_files().len(), 2);
         }
 

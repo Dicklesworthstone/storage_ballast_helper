@@ -3,6 +3,8 @@
 
 pub mod attribution;
 #[cfg(feature = "daemon")]
+mod ballast_control;
+#[cfg(feature = "daemon")]
 mod ballast_release;
 #[cfg(feature = "daemon")]
 mod ballast_replenish;
