@@ -30,8 +30,8 @@ use storage_ballast_helper::cli::update::{
     verify_binary_trust,
 };
 use storage_ballast_helper::core::config::{
-    Config, PathsConfig, ScannerEngineMode, load_sacred_config, sacred_config_path_for,
-    write_sacred_config,
+    Config, ConfigWriteTransaction, PathsConfig, ScannerEngineMode, sacred_config_path_for,
+    update_sacred_config,
 };
 use storage_ballast_helper::daemon::loop_main::{
     DaemonArgs as RuntimeDaemonArgs, MonitoringDaemon,
@@ -7762,10 +7762,13 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
     let config_backup_path = if config_recs.is_empty() {
         None
     } else {
-        let mut toml_value: toml::Value = if config_path.exists() {
-            let raw = std::fs::read_to_string(&config_path)
-                .map_err(|e| CliError::Runtime(format!("read config: {e}")))?;
-            toml::from_str(&raw).map_err(|e| CliError::Runtime(format!("parse config: {e}")))?
+        let transaction = ConfigWriteTransaction::acquire(&config_path)
+            .map_err(|e| CliError::Runtime(format!("write config: {e}")))?;
+        let mut toml_value: toml::Value = if let Some(raw) = transaction
+            .contents()
+            .map_err(|e| CliError::Runtime(format!("read config: {e}")))?
+        {
+            toml::from_str(raw).map_err(|e| CliError::Runtime(format!("parse config: {e}")))?
         } else {
             toml::Value::Table(toml::map::Map::new())
         };
@@ -7774,17 +7777,14 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
         }
         let toml_str = toml::to_string_pretty(&toml_value)
             .map_err(|e| CliError::Runtime(format!("serialize config: {e}")))?;
-        storage_ballast_helper::core::config::write_config_atomic(
-            &config_path,
-            &toml_str,
-            |staged| {
+        transaction
+            .publish(&toml_str, |staged| {
                 let raw = std::fs::read_to_string(staged)?;
                 Config::validate_for_write(&config_path, &raw)
                     .map(|_| ())
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-            },
-        )
-        .map_err(|e| CliError::Runtime(format!("write config: {e}")))?
+            })
+            .map_err(|e| CliError::Runtime(format!("write config: {e}")))?
     };
 
     // Apply kernel-writeback tuning (root-gated; never touches config.toml).
@@ -8104,11 +8104,15 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
             let resolved = Config::resolve_config_write_path(cli.config.as_deref());
             let config_path = resolved.path.clone();
 
-            // Read existing TOML or start from empty table.
-            let mut toml_value: toml::Value = if config_path.exists() {
-                let raw = std::fs::read_to_string(&config_path)
-                    .map_err(|e| CliError::Runtime(format!("read config: {e}")))?;
-                toml::from_str(&raw).map_err(|e| CliError::Runtime(format!("parse config: {e}")))?
+            // Own the complete read-modify-write, so a retry starts from every
+            // previously accepted edit rather than publishing a stale document.
+            let transaction = ConfigWriteTransaction::acquire(&config_path)
+                .map_err(|e| CliError::Runtime(format!("write config: {e}")))?;
+            let mut toml_value: toml::Value = if let Some(raw) = transaction
+                .contents()
+                .map_err(|e| CliError::Runtime(format!("read config: {e}")))?
+            {
+                toml::from_str(raw).map_err(|e| CliError::Runtime(format!("parse config: {e}")))?
             } else {
                 toml::Value::Table(toml::map::Map::new())
             };
@@ -8122,7 +8126,7 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
             // Validate this invocation's exclusively created staging file in
             // the real destination's context, then publish the complete file.
             // A unique backup retains the configuration being replaced.
-            let backup_path = write_config_atomic(&config_path, &toml_str, |staged| {
+            let backup_path = transaction.publish(&toml_str, |staged| {
                 let raw = std::fs::read_to_string(staged)?;
                 Config::validate_for_write(&config_path, &raw)
                     .map(|_| ())
@@ -13405,32 +13409,25 @@ fn default_protection_metadata() -> protection::ProtectionMetadata {
     }
 }
 
-fn add_sacred_protected_path(config: &Config, path: &Path) -> Result<(PathBuf, bool), CliError> {
-    let sacred_config_path = sacred_config_path_for(&config.paths.config_file);
-    let mut sacred =
-        load_sacred_config(&sacred_config_path).map_err(|e| CliError::Runtime(e.to_string()))?;
-    let changed = sacred.add_protected_path(path.to_string_lossy().to_string());
-    if changed || !sacred_config_path.exists() {
-        write_sacred_config(&sacred_config_path, &sacred)
-            .map_err(|e| CliError::Runtime(e.to_string()))?;
-    }
-    Ok((sacred_config_path, changed))
+fn add_sacred_protected_path(
+    transaction: ConfigWriteTransaction,
+    path: &Path,
+) -> Result<bool, CliError> {
+    update_sacred_config(transaction, |sacred| {
+        sacred.add_protected_path(path.to_string_lossy().to_string())
+    })
+    .map_err(|error| CliError::Runtime(error.to_string()))
 }
 
 fn remove_sacred_protected_path(config: &Config, path: &Path) -> Result<(PathBuf, bool), CliError> {
     let sacred_config_path = sacred_config_path_for(&config.paths.config_file);
-    if !sacred_config_path.exists() {
-        return Ok((sacred_config_path, false));
-    }
-
-    let mut sacred =
-        load_sacred_config(&sacred_config_path).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let transaction = ConfigWriteTransaction::acquire(&sacred_config_path)
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
     let protected_path = path.to_string_lossy().to_string();
-    let removed = sacred.remove_protected_path(&protected_path);
-    if removed {
-        write_sacred_config(&sacred_config_path, &sacred)
-            .map_err(|e| CliError::Runtime(e.to_string()))?;
-    }
+    let removed = update_sacred_config(transaction, |sacred| {
+        sacred.remove_protected_path(&protected_path)
+    })
+    .map_err(|error| CliError::Runtime(error.to_string()))?;
     Ok((sacred_config_path, removed))
 }
 
@@ -13604,7 +13601,8 @@ fn apply_protect_create(cli: &Cli, report: &mut ProtectCreateReport) -> Result<(
     // configuration validation or write a different, daemon-invisible file.
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
-    report.sacred_config = Some(sacred_config_path_for(&config.paths.config_file));
+    let sacred_config_path = sacred_config_path_for(&config.paths.config_file);
+    report.sacred_config = Some(sacred_config_path.clone());
     let canonical = report.path.canonicalize().map_err(|e| {
         CliError::User(format!(
             "cannot resolve path {}: {e}",
@@ -13621,6 +13619,12 @@ fn apply_protect_create(cli: &Cli, report: &mut ProtectCreateReport) -> Result<(
 
     report.path = canonical;
     report.marker = report.path.join(protection::MARKER_FILENAME);
+    // Refuse a contended policy transaction before creating any marker. Keep
+    // ownership through registration so another accepted path edit cannot be lost.
+    let transaction = ConfigWriteTransaction::acquire(&sacred_config_path).map_err(|error| {
+        report.sacred_config_error = Some(error.to_string());
+        CliError::Runtime(error.to_string())
+    })?;
     match protection::create_marker(&report.path, Some(&default_protection_metadata())) {
         Ok(created) => {
             report.marker_created = Some(created);
@@ -13647,8 +13651,8 @@ fn apply_protect_create(cli: &Cli, report: &mut ProtectCreateReport) -> Result<(
         }
     }
 
-    match add_sacred_protected_path(&config, &report.path) {
-        Ok((_, added)) => {
+    match add_sacred_protected_path(transaction, &report.path) {
+        Ok(added) => {
             report.sacred_config_added = added;
             report.sacred_config_registered = Some(true);
             Ok(())
@@ -13695,9 +13699,19 @@ fn run_unprotect(cli: &Cli, args: &UnprotectArgs) -> Result<(), CliError> {
         .canonicalize()
         .map_err(|e| CliError::User(format!("cannot resolve path {}: {e}", args.path.display())))?;
 
-    let removed =
-        protection::remove_marker(&canonical).map_err(|e| CliError::Runtime(e.to_string()))?;
+    // Keep marker protection intact if ownership, parsing or publication of
+    // the persistent policy fails. Remove the marker only after that succeeds.
     let (sacred_config_path, sacred_removed) = remove_sacred_protected_path(&config, &canonical)?;
+    let removed = protection::remove_marker(&canonical).map_err(|error| {
+        if sacred_removed {
+            CliError::Partial(format!(
+                "persistent protection was removed from {}, but marker removal failed: {error}",
+                sacred_config_path.display()
+            ))
+        } else {
+            CliError::Runtime(error.to_string())
+        }
+    })?;
 
     match output_mode(cli) {
         OutputMode::Human => {
@@ -19274,7 +19288,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use storage_ballast_helper::ballast::coordinator::BallastRefillBlocker;
-    use storage_ballast_helper::core::config::SacredConfig;
+    use storage_ballast_helper::core::config::{
+        SacredConfig, load_sacred_config, write_sacred_config,
+    };
     use storage_ballast_helper::core::errors::Result as PalResult;
     use storage_ballast_helper::platform::pal::{FsStats, MockPlatform, MountPoint, PlatformPaths};
     use storage_ballast_helper::platform::types::{
@@ -25514,6 +25530,131 @@ mod tests {
     }
 
     // TUI is always compiled in — no feature-gated fallback test needed.
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_contention_precedes_cli_config_and_marker_mutations() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let sacred_path = sacred_config_path_for(&config_path);
+        let existing = temp.path().join("existing");
+        let additional = temp.path().join("additional");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::create_dir(&additional).unwrap();
+        let existing = existing.canonicalize().unwrap();
+        let additional = additional.canonicalize().unwrap();
+        let original_config = "[ballast]\nauto_provision = false\n";
+        std::fs::write(&config_path, original_config).unwrap();
+        let original_policy = format!(
+            "protected_paths = [\"{}\"]\noperator_note = \"preserve me\"\n",
+            existing.display()
+        );
+        std::fs::write(&sacred_path, &original_policy).unwrap();
+        protection::create_marker(&existing, None).unwrap();
+        let owner = ConfigWriteTransaction::acquire(&sacred_path).unwrap();
+
+        let set = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config_path.to_str().unwrap(),
+            "config",
+            "set",
+            "scanner.max_depth",
+            "7",
+        ])
+        .unwrap();
+        let error = run(&set).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("another configuration update"));
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original_config);
+
+        let protect = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config_path.to_str().unwrap(),
+            "protect",
+            additional.to_str().unwrap(),
+        ])
+        .unwrap();
+        let mut report = ProtectCreateReport::new(&additional);
+        let error = apply_protect_create(&protect, &mut report).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(!additional.join(protection::MARKER_FILENAME).exists());
+        assert!(report.sacred_config_error.is_some());
+
+        let unprotect = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config_path.to_str().unwrap(),
+            "unprotect",
+            existing.to_str().unwrap(),
+        ])
+        .unwrap();
+        let error = run(&unprotect).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(existing.join(protection::MARKER_FILENAME).exists());
+        assert_eq!(std::fs::read_to_string(&sacred_path).unwrap(), original_policy);
+
+        drop(owner);
+        let mut report = ProtectCreateReport::new(&additional);
+        apply_protect_create(&protect, &mut report).unwrap();
+        assert_eq!(report.sacred_config_registered, Some(true));
+        assert!(additional.join(protection::MARKER_FILENAME).exists());
+        let paths = load_sacred_config(&sacred_path).unwrap().protected_paths;
+        assert_eq!(
+            paths,
+            vec![
+                existing.to_string_lossy().to_string(),
+                additional.to_string_lossy().to_string(),
+            ]
+        );
+        run(&unprotect).unwrap();
+        assert!(!existing.join(protection::MARKER_FILENAME).exists());
+        assert!(additional.join(protection::MARKER_FILENAME).exists());
+        assert_eq!(
+            load_sacred_config(&sacred_path).unwrap().protected_paths,
+            vec![additional.to_string_lossy().to_string()]
+        );
+        let policy: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&sacred_path).unwrap()).unwrap();
+        assert_eq!(policy["operator_note"].as_str(), Some("preserve me"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unprotect_reports_partial_when_marker_removal_fails_after_policy_publication() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let protected = temp.path().join("protected");
+        std::fs::create_dir(&protected).unwrap();
+        let protected = protected.canonicalize().unwrap();
+        std::fs::write(&config_path, "[ballast]\nauto_provision = false\n").unwrap();
+        let sacred_path = sacred_config_path_for(&config_path);
+        write_sacred_config(
+            &sacred_path,
+            &SacredConfig {
+                protected_paths: vec![protected.to_string_lossy().to_string()],
+            },
+        )
+        .unwrap();
+        // Presence remains protective, but remove_file must refuse a directory.
+        let marker = protected.join(protection::MARKER_FILENAME);
+        std::fs::create_dir(&marker).unwrap();
+        let cli = Cli::try_parse_from([
+            "sbh",
+            "--config",
+            config_path.to_str().unwrap(),
+            "unprotect",
+            protected.to_str().unwrap(),
+        ])
+        .unwrap();
+        let error = run(&cli).unwrap_err();
+        assert!(matches!(&error, CliError::Partial(_)));
+        assert_eq!(error.exit_code(), 4);
+        assert!(error.to_string().contains("marker removal failed"));
+        assert!(load_sacred_config(&sacred_path).unwrap().protected_paths.is_empty());
+        assert!(marker.is_dir());
+    }
 
     #[test]
     fn protect_requires_path_or_list() {

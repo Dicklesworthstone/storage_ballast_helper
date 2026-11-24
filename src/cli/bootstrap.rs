@@ -1893,12 +1893,14 @@ fn apply_copy_legacy_config(action: &MigrationAction) -> std::io::Result<()> {
         ));
     };
 
-    copy_file_without_overwrite(&action.target, &destination)?;
+    crate::core::config::ConfigWriteTransaction::acquire(&destination)?
+        .copy_if_absent(&action.target)?;
 
     let source_sacred = sacred_config_path_for(&action.target);
     if source_sacred.exists() {
         let destination_sacred = sacred_config_path_for(&destination);
-        copy_file_without_overwrite(&source_sacred, &destination_sacred)?;
+        crate::core::config::ConfigWriteTransaction::acquire(&destination_sacred)?
+            .copy_if_absent(&source_sacred)?;
     }
 
     Ok(())

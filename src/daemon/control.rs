@@ -803,9 +803,13 @@ pub fn persist_policy_mode(config_path: &Path, mode: &str) -> Result<Option<Path
         path: path.to_path_buf(),
         source,
     };
-    let mut document: toml::Value = if config_path.exists() {
-        let raw = std::fs::read_to_string(config_path).map_err(|e| io(config_path, e))?;
-        toml::from_str(&raw).map_err(|e| SbhError::Serialization {
+    let transaction = crate::core::config::ConfigWriteTransaction::acquire(config_path)
+        .map_err(|error| io(config_path, error))?;
+    let mut document: toml::Value = if let Some(raw) = transaction
+        .contents()
+        .map_err(|error| io(config_path, error))?
+    {
+        toml::from_str(raw).map_err(|e| SbhError::Serialization {
             context: "config",
             details: e.to_string(),
         })?
@@ -835,21 +839,22 @@ pub fn persist_policy_mode(config_path: &Path, mode: &str) -> Result<Option<Path
         context: "config",
         details: e.to_string(),
     })?;
-    crate::core::config::write_config_atomic(config_path, &rendered, |staged| {
-        let raw = std::fs::read_to_string(staged)?;
-        crate::core::config::Config::validate_for_write(config_path, &raw)
-            .map(|_| ())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    })
-    .map_err(|error| {
-        if error.kind() == std::io::ErrorKind::InvalidData {
-            SbhError::Runtime {
-                details: format!("refusing to write a config that does not load: {error}"),
+    transaction
+        .publish(&rendered, |staged| {
+            let raw = std::fs::read_to_string(staged)?;
+            crate::core::config::Config::validate_for_write(config_path, &raw)
+                .map(|_| ())
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                SbhError::Runtime {
+                    details: format!("refusing to write a config that does not load: {error}"),
+                }
+            } else {
+                io(config_path, error)
             }
-        } else {
-            io(config_path, error)
-        }
-    })
+        })
 }
 
 #[cfg(test)]
@@ -1136,6 +1141,38 @@ mod tests {
         let previous = std::fs::read(&config).unwrap();
         assert!(persist_policy_mode(&config, "invalid-mode").is_err());
         assert_eq!(std::fs::read(&config).unwrap(), previous);
+    }
+
+    #[test]
+    fn persist_policy_mode_retries_against_the_latest_accepted_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let original = "[policy]\ninitial_mode = \"observe\"\n";
+        std::fs::write(&path, original).unwrap();
+        let owner = crate::core::config::ConfigWriteTransaction::acquire(&path).unwrap();
+        let error = persist_policy_mode(&path, "canary").unwrap_err();
+        assert!(matches!(
+            error,
+            SbhError::Io { source, .. } if source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let accepted = concat!(
+            "[policy]\ninitial_mode = \"observe\"\n",
+            "[scanner]\nmax_depth = 7\n",
+            "[operator]\nnote = \"keep this accepted edit\"\n",
+        );
+        owner.publish(accepted, |_| Ok(())).unwrap();
+
+        let backup = persist_policy_mode(&path, "canary").unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), accepted);
+        let document: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(document["policy"]["initial_mode"].as_str(), Some("canary"));
+        assert_eq!(document["scanner"]["max_depth"].as_integer(), Some(7));
+        assert_eq!(
+            document["operator"]["note"].as_str(),
+            Some("keep this accepted edit")
+        );
     }
 
     #[test]
