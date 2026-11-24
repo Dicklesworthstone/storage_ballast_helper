@@ -10575,7 +10575,6 @@ impl MonitoringDaemon {
             pool: pool_mount,
             response: response.clone(),
             recovery,
-            available_hint: self.ballast_available_for_release(mount),
             observed_at: sample.collected_at,
             max_age: Self::filesystem_observation_max_age(&self.config),
             policy_transitions: self.policy_engine.lock().transitions_total(),

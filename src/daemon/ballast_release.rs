@@ -33,7 +33,6 @@ pub(super) struct ReleaseRequest {
     pub pool: PathBuf,
     pub response: PressureResponse,
     pub recovery: bool,
-    pub available_hint: usize,
     pub observed_at: Instant,
     pub max_age: Duration,
     pub policy_transitions: u64,
@@ -257,7 +256,6 @@ impl BallastReleaser {
             let plan = BallastReleasePlan {
                 response: request.response.clone(),
                 release_all: request.recovery,
-                available_hint: request.available_hint,
                 history: controller.cached_pool_history(&pool),
                 unbound_history: controller.cached_unbound_pool_history(&pool),
                 efficiency: controller.release_efficiency(&pool),
@@ -560,7 +558,6 @@ mod tests {
                 device_id: fs::metadata(&pool).unwrap().dev(),
                 pool,
                 recovery: false,
-                available_hint: 2,
                 observed_at: Instant::now(),
                 max_age: Duration::from_secs(60),
                 policy_transitions: self.context.policy.lock().transitions_total(),
