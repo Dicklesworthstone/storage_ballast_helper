@@ -3904,10 +3904,11 @@ pub struct MonitoringDaemon {
     /// resource observation, never a synthetic filesystem free percentage.
     swap_pressure_observation: Option<PressureObservation>,
     last_special_scan: HashMap<PathBuf, Instant>,
-    /// Per-special-location alert episode: (highest level notified in it, when
-    /// its alert was last seen). See [`special_episode_step`] and
+    /// Per-special-location alert episode: (highest level accepted by a
+    /// notification channel, when its alert was last seen). Green means no
+    /// channel has accepted an alert yet. See [`special_episode_step`] and
     /// [`special_episode_over`]; prevents the oscillation spam the main
-    /// pressure loop also suppresses.
+    /// pressure loop also suppresses without losing rejected alerts.
     last_special_notify: HashMap<PathBuf, (PressureLevel, Instant)>,
     /// A forecast on one filesystem cannot mute another filesystem's alert.
     last_predictive_warning: HashMap<PredictiveWarningKey, (NotificationLevel, Instant)>,
@@ -3921,7 +3922,10 @@ pub struct MonitoringDaemon {
     /// Time the last pressure check spent waiting for filesystem refreshes
     /// it started; excluded from the tick throttle's tick duration.
     pressure_sample_wait: Duration,
+    /// Activity-log cadence is independent of notification queue acceptance.
     last_swap_thrash_warning: Option<Instant>,
+    /// Only accepted alerts start the delivery cooldown for the current episode.
+    last_swap_thrash_notification: Option<Instant>,
     swap_thrash_active: bool,
     last_scan_channel_warn: Option<Instant>,
     /// Last accepted automatic request per mount. Deferred mounts keep their
@@ -4275,9 +4279,10 @@ fn path_is_same_or_descendant(candidate: &Path, ancestor: &Path) -> bool {
 /// One tick of a special location's alert episode. `previous` is the level
 /// notified so far in the episode and when its alert was last seen. Returns
 /// the level to notify from (`None`: stay quiet) and the episode's notified
-/// level afterwards. A new episode notifies from Green; inside one only an
-/// escalation notifies, so a level that wobbles with the write rate is one
-/// alert instead of one per wobble.
+/// level if that attempt is accepted. A rejected attempt must keep the old
+/// level (Green before the first acceptance). A new episode notifies from
+/// Green; inside one only an escalation notifies, so a level that wobbles
+/// with the write rate is one alert instead of one per wobble.
 fn special_episode_step(
     previous: Option<(PressureLevel, Instant)>,
     level: PressureLevel,
@@ -6157,6 +6162,7 @@ impl MonitoringDaemon {
             last_tick_cleanup_ran: false,
             pressure_sample_wait: Duration::ZERO,
             last_swap_thrash_warning: None,
+            last_swap_thrash_notification: None,
             swap_thrash_active: false,
             last_scan_channel_warn: None,
             last_scan_admission: HashMap::new(),
@@ -11604,6 +11610,8 @@ impl MonitoringDaemon {
     }
 
     fn check_swap_thrash(&mut self) {
+        use crate::daemon::notifications::NotificationDispatchOutcome;
+
         let Ok(memory) = self.platform.memory_info() else {
             return;
         };
@@ -11612,6 +11620,7 @@ impl MonitoringDaemon {
         let thrash_risk = is_swap_thrash_risk(&memory);
         if !thrash_risk {
             self.swap_thrash_active = false;
+            self.last_swap_thrash_notification = None;
             return;
         }
 
@@ -11619,11 +11628,13 @@ impl MonitoringDaemon {
             || self
                 .last_swap_thrash_warning
                 .is_none_or(|last| now.duration_since(last) >= SWAP_THRASH_WARNING_COOLDOWN);
+        let should_notify = self
+            .last_swap_thrash_notification
+            .is_none_or(|last| now.duration_since(last) >= SWAP_THRASH_WARNING_COOLDOWN);
         self.swap_thrash_active = true;
-        if !should_warn {
+        if !should_warn && !should_notify {
             return;
         }
-        self.last_swap_thrash_warning = Some(now);
 
         let swap_used_bytes = memory
             .swap_total_bytes
@@ -11635,14 +11646,24 @@ impl MonitoringDaemon {
             memory.swap_total_bytes, memory.available_bytes
         );
 
-        self.logger_handle.send(ActivityEvent::Error {
-            code: "SBH-2010".to_string(),
-            message: message.clone(),
-        });
-        self.notification_manager.notify(&NotificationEvent::Error {
-            code: "SBH-2010".to_string(),
-            message,
-        });
+        if should_warn {
+            self.last_swap_thrash_warning = Some(now);
+            self.logger_handle.send(ActivityEvent::Error {
+                code: "SBH-2010".to_string(),
+                message: message.clone(),
+            });
+        }
+        if should_notify
+            && self
+                .notification_manager
+                .notify_with_outcome(&NotificationEvent::Error {
+                    code: "SBH-2010".to_string(),
+                    message,
+                })
+                == NotificationDispatchOutcome::Accepted
+        {
+            self.last_swap_thrash_notification = Some(now);
+        }
     }
 
     // ──────────────────── special locations ────────────────────
@@ -11653,6 +11674,8 @@ impl MonitoringDaemon {
         scan_tx: &Sender<ScanRequest>,
         scan_rx: &Receiver<ScanRequest>,
     ) {
+        use crate::daemon::notifications::NotificationDispatchOutcome;
+
         let now = Instant::now();
         let locations = self.special_locations.all().to_vec();
         self.special_rates.retain(&self.special_locations);
@@ -11750,16 +11773,23 @@ impl MonitoringDaemon {
                     _ if urgency >= 0.75 => PressureLevel::Orange,
                     _ => PressureLevel::Yellow,
                 };
-                let (notify_from, notified) = special_episode_step(previous, pressure_level);
+                let (notify_from, mut notified) = special_episode_step(previous, pressure_level);
                 if let Some(from) = notify_from {
-                    self.notification_manager
-                        .notify(&NotificationEvent::PressureChanged {
+                    let outcome = self.notification_manager.notify_with_outcome(
+                        &NotificationEvent::PressureChanged {
                             from: format!("{from:?}"),
                             to: format!("{pressure_level:?}"),
                             mount: location.path.to_string_lossy().into_owned(),
                             free_pct: stats.free_pct(),
-                        });
+                        },
+                    );
+                    if outcome != NotificationDispatchOutcome::Accepted {
+                        notified = from;
+                    }
                 }
+                // An observed alert keeps the episode alive even when no
+                // channel accepts it. Only successful enqueues advance its
+                // high-water mark, so initial alerts and escalations retry.
                 self.last_special_notify
                     .insert(location.path.clone(), (notified, now));
 
@@ -14566,10 +14596,8 @@ fn scanner_thread_main(
                             ),
                         });
                     }
-                    backoff.record_dispatch(
-                        reclaim_at_pass_start,
-                        request.predictive_reclaim.clone(),
-                    );
+                    backoff
+                        .record_dispatch(reclaim_at_pass_start, request.predictive_reclaim.clone());
                     backoff.last_pass_level = Some(request_level);
                     continue;
                 }
@@ -15127,18 +15155,13 @@ fn scanner_thread_main(
                 if dispatched_this_pass.count == 0 {
                     backoff.record_empty(true, request_level, Instant::now());
                 } else {
-                    backoff.record_dispatch(
-                        reclaim_at_pass_start,
-                        request.predictive_reclaim.clone(),
-                    );
+                    backoff
+                        .record_dispatch(reclaim_at_pass_start, request.predictive_reclaim.clone());
                 }
             } else if dispatched_this_pass.count > 0 {
                 // Earlier authorized mutations still count; withdrawal only
                 // makes an unchanged reclaim counter inconclusive.
-                backoff.record_pending(
-                    reclaim_at_pass_start,
-                    request.predictive_reclaim.clone(),
-                );
+                backoff.record_pending(reclaim_at_pass_start, request.predictive_reclaim.clone());
             }
             last_pass_duration = pass_started_at.elapsed();
             last_pass_finished_at = Some(Instant::now());
@@ -20299,7 +20322,10 @@ mod tests {
         use crate::daemon::notifications::{FileConfig, NotificationConfig};
 
         let mut fixture = RegretDaemonFixture::new();
-        let notifications = fixture.directory.path().join("pressure-notifications.jsonl");
+        let notifications = fixture
+            .directory
+            .path()
+            .join("pressure-notifications.jsonl");
         let daemon = &mut fixture.daemon;
         let mut notify_config = NotificationConfig {
             enabled: false,
@@ -20344,7 +20370,10 @@ mod tests {
             .collect();
         delivered.sort_by_key(|event| event["mount"].as_str().unwrap().to_owned());
         assert_eq!(delivered.len(), 2, "{delivered:?}");
-        for (event, mount) in delivered.iter().zip(["/pressure-first", "/pressure-second"]) {
+        for (event, mount) in delivered
+            .iter()
+            .zip(["/pressure-first", "/pressure-second"])
+        {
             assert_eq!(event["mount"], mount);
             assert_eq!(event["from"], "Green");
             assert_eq!(event["to"], "Critical");
@@ -30104,6 +30133,145 @@ mod tests {
         assert!(special_episode_over(orange, t0 + interval, interval));
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn special_location_episodes_retry_rejected_initial_and_escalated_notifications() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let mount = fixture.directory.path().to_path_buf();
+        let notifications = mount.join("special-notifications.jsonl");
+        let daemon = &mut fixture.daemon;
+        let special = daemon.config.scanner.root_paths[0].clone();
+        daemon.config.scanner.root_paths.clear();
+        // Keep the same current filesystem observation across notification
+        // retries; rate-estimator behavior is covered by its own fixtures.
+        daemon.config.pressure.poll_interval_ms = 60_000;
+        daemon.special_locations = SpecialLocationRegistry::new(vec![SpecialLocation {
+            path: special.clone(),
+            kind: SpecialKind::UserTmp,
+            buffer_pct: 15,
+            scan_interval: Duration::ZERO,
+            priority: 160,
+        }]);
+        let set_free = |daemon: &mut MonitoringDaemon, free_bytes| {
+            daemon.platform = Arc::new(
+                disk_pressure_platform(vec![disk_pressure_sample(
+                    &mount.to_string_lossy(),
+                    100 << 30,
+                    free_bytes,
+                )])
+                .with_home(&mount),
+            );
+            daemon.fs_collector =
+                FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::from_mins(1));
+            daemon.special_rates.forget(&special);
+            daemon.special_rates.begin_tick();
+        };
+        set_free(daemon, 10 << 30);
+        let mut notify_config = NotificationConfig {
+            enabled: false,
+            channels: vec!["file".into()],
+            // Deduplication must come from the episode, not the manager's
+            // cooldown hiding repeated successful enqueue attempts.
+            min_notify_interval_secs: 0,
+            urgent_notify_interval_secs: 0,
+            file: FileConfig {
+                path: notifications.clone(),
+            },
+            ..NotificationConfig::default()
+        };
+        daemon.notification_manager = NotificationManager::from_config(&notify_config);
+        let (scan_tx, scan_rx) = bounded(4);
+
+        for (rate, enabled, expected_level, expected_count) in [
+            (0.0, false, PressureLevel::Green, 0),
+            (0.0, true, PressureLevel::Yellow, 1),
+            (100_000_000.0, false, PressureLevel::Yellow, 1),
+            (100_000_000.0, true, PressureLevel::Orange, 2),
+            (0.0, true, PressureLevel::Orange, 2),
+            (100_000_000.0, true, PressureLevel::Orange, 2),
+        ] {
+            notify_config.enabled = enabled;
+            daemon.notification_manager.update_config(&notify_config);
+            let sample = daemon.fs_collector.collect_sample(&special).unwrap();
+            daemon.special_rates.record_mount(&sample, rate);
+            for _ in 0..2 {
+                let observed_at = Instant::now();
+                daemon.check_special_locations(&scan_tx, &scan_rx);
+                let (notified, last_seen) = daemon.last_special_notify[&special];
+                assert_eq!(notified, expected_level, "rate={rate} enabled={enabled}");
+                assert!(
+                    last_seen >= observed_at,
+                    "an observed alert must refresh its episode even when delivery is rejected"
+                );
+            }
+            assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+            if expected_count == 0 {
+                assert!(
+                    !notifications.exists(),
+                    "disabled alerts were not delivered"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(&notifications)
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    expected_count,
+                    "rate={rate} enabled={enabled}"
+                );
+            }
+        }
+
+        // A brief recovery retains the accepted high-water mark. Only a
+        // whole clear interval ends the episode and permits a fresh alert.
+        set_free(daemon, 50 << 30);
+        daemon.check_special_locations(&scan_tx, &scan_rx);
+        assert_eq!(
+            daemon.last_special_notify[&special].0,
+            PressureLevel::Orange
+        );
+        let alert_interval = Duration::from_mins(
+            daemon
+                .config
+                .special_locations
+                .alert_interval_minutes
+                .max(1),
+        );
+        daemon.last_special_notify.get_mut(&special).unwrap().1 = Instant::now()
+            .checked_sub(alert_interval)
+            .expect("special-location fixture needs one prior alert interval");
+        daemon.check_special_locations(&scan_tx, &scan_rx);
+        assert!(!daemon.last_special_notify.contains_key(&special));
+        set_free(daemon, 10 << 30);
+        daemon.check_special_locations(&scan_tx, &scan_rx);
+        daemon.check_special_locations(&scan_tx, &scan_rx);
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        let delivered: Vec<Value> = std::fs::read_to_string(&notifications)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(delivered.len(), 3, "{delivered:?}");
+        for (event, (from, to)) in delivered.iter().zip([
+            ("Green", "Yellow"),
+            ("Yellow", "Orange"),
+            ("Green", "Yellow"),
+        ]) {
+            assert_eq!(event["type"], "pressure_changed");
+            assert_eq!(event["mount"], special.to_string_lossy().as_ref());
+            assert_eq!(event["from"], from);
+            assert_eq!(event["to"], to);
+            assert_eq!(event["free_pct"], 10.0);
+        }
+        assert!(
+            scan_rx.is_empty(),
+            "notification retries admit no scan roots"
+        );
+    }
+
     /// A special location under pressure queues a scan but releases no
     /// ballast. Its own mount releases on its own pressure level; before, an
     /// Orange "filling fast" alert on a disk-backed /tmp released the whole
@@ -30361,9 +30529,12 @@ mod tests {
 
         let mut fixture = RegretDaemonFixture::new();
         let special = fixture.directory.path().join("special-only");
+        let notifications = fixture.directory.path().join("special-notifications.jsonl");
         std::fs::create_dir(&special).unwrap();
         let daemon = &mut fixture.daemon;
-        daemon.config.notifications.enabled = false;
+        daemon.config.notifications.enabled = true;
+        daemon.config.notifications.channels = vec!["file".into()];
+        daemon.config.notifications.file.path = notifications.clone();
         daemon
             .notification_manager
             .update_config(&daemon.config.notifications);
@@ -30453,6 +30624,14 @@ mod tests {
         );
         assert!(scan_rx.is_empty());
         assert_eq!(daemon.config.scanner.root_paths, configured_roots);
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        let delivered: Vec<Value> = std::fs::read_to_string(&notifications)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        assert_eq!(delivered[0]["to"], "Red");
     }
 
     #[cfg(unix)]
@@ -38948,8 +39127,7 @@ mod tests {
         // The duplicate before B must be paced, and serving B must preserve
         // A's empty evidence for the duplicate afterward.
         for root in [&empty, &empty, &reclaimable, &empty] {
-            let mut request =
-                event_test_request_for_config(vec![root.clone()], &config.scanner);
+            let mut request = event_test_request_for_config(vec![root.clone()], &config.scanner);
             request.pressure_level = PressureLevel::Orange;
             request.free_pct = Some(9.0);
             request.urgency = 0.9;
@@ -38994,7 +39172,10 @@ mod tests {
                 };
                 assert!(!timed_out, "the bounded fixture must finish its walk");
                 (
-                    root_stats.into_iter().map(|root| root.path).collect::<Vec<_>>(),
+                    root_stats
+                        .into_iter()
+                        .map(|root| root.path)
+                        .collect::<Vec<_>>(),
                     candidates,
                 )
             })
@@ -45010,6 +45191,111 @@ mod tests {
             ..not_risky
         };
         assert!(is_swap_thrash_risk_inner(&risky, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn swap_thrash_retries_rejected_alerts_without_repeating_activity_logs() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+        use crate::platform::pal::PlatformPaths;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let notifications = fixture.directory.path().join("swap-thrash.jsonl");
+        let risky_platform = || -> Arc<dyn Platform> {
+            Arc::new(MockPlatform::new(
+                Vec::new(),
+                HashMap::new(),
+                MemoryInfo {
+                    total_bytes: 64 << 30,
+                    available_bytes: 2 << 30,
+                    swap_total_bytes: 8 << 30,
+                    swap_free_bytes: 1 << 30,
+                },
+                PlatformPaths::default(),
+            ))
+        };
+        let mut config = NotificationConfig {
+            enabled: false,
+            channels: vec!["file".into()],
+            file: FileConfig {
+                path: notifications.clone(),
+            },
+            min_notify_interval_secs: 0,
+            urgent_notify_interval_secs: 0,
+            ..NotificationConfig::default()
+        };
+        let daemon = &mut fixture.daemon;
+        daemon.platform = risky_platform();
+        daemon.notification_manager = NotificationManager::from_config(&config);
+        daemon.check_swap_thrash();
+        let first_log = daemon.last_swap_thrash_warning;
+        assert!(first_log.is_some());
+        assert!(daemon.swap_thrash_active);
+        assert_eq!(daemon.last_swap_thrash_notification, None);
+        for _ in 0..3 {
+            daemon.check_swap_thrash();
+        }
+        assert_eq!(daemon.last_swap_thrash_warning, first_log);
+
+        // Delivery becomes available during the same episode. Its first
+        // alert must not wait out the earlier failed attempt's 15 minutes.
+        config.enabled = true;
+        daemon.notification_manager.update_config(&config);
+        daemon.check_swap_thrash();
+        let first_accepted = daemon.last_swap_thrash_notification;
+        assert!(first_accepted.is_some());
+        assert_eq!(daemon.last_swap_thrash_warning, first_log);
+        daemon.check_swap_thrash();
+        assert_eq!(daemon.last_swap_thrash_notification, first_accepted);
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+
+        // A rejected reminder also remains due. Logging has its own clock,
+        // so repeated delivery attempts cannot turn into an activity storm.
+        let expired = Instant::now() - SWAP_THRASH_WARNING_COOLDOWN;
+        daemon.last_swap_thrash_warning = Some(expired);
+        daemon.last_swap_thrash_notification = Some(expired);
+        config.enabled = false;
+        daemon.notification_manager.update_config(&config);
+        daemon.check_swap_thrash();
+        let reminder_log = daemon.last_swap_thrash_warning;
+        assert!(reminder_log > Some(expired));
+        assert_eq!(daemon.last_swap_thrash_notification, Some(expired));
+        daemon.check_swap_thrash();
+        assert_eq!(daemon.last_swap_thrash_warning, reminder_log);
+        config.enabled = true;
+        daemon.notification_manager.update_config(&config);
+        daemon.check_swap_thrash();
+        assert!(daemon.last_swap_thrash_notification > Some(expired));
+        assert_eq!(daemon.last_swap_thrash_warning, reminder_log);
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+
+        // Observed recovery clears the episode's delivery receipt. A new
+        // bout of thrashing gets a fresh alert even inside the old cooldown.
+        daemon.platform = Arc::new(MockPlatform::healthy());
+        daemon.check_swap_thrash();
+        assert!(!daemon.swap_thrash_active);
+        assert_eq!(daemon.last_swap_thrash_notification, None);
+        daemon.platform = risky_platform();
+        daemon.check_swap_thrash();
+        daemon.check_swap_thrash();
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        let notices: Vec<Value> = std::fs::read_to_string(&notifications)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(notices.len(), 3, "{notices:?}");
+        assert!(notices.iter().all(|event| event["code"] == "SBH-2010"));
+
+        fixture.flush_logger();
+        let log_count = std::fs::read_to_string(fixture.directory.path().join("activity.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["error_code"] == "SBH-2010")
+            .count();
+        assert_eq!(log_count, 3, "only episode starts and the due reminder log");
     }
 
     // ──────────────────── repeat deletion dampening ────────────────────
