@@ -2364,6 +2364,14 @@ events. Shutdown gives pending notifications one shared one-second delivery
 window. This is best-effort delivery, and other synchronous daemon diagnostics
 can still wait on service-log I/O.
 
+Special-location alerts, swap-thrash warnings, and combined critical memory/disk
+alerts remain eligible for retry while their incident continues if no channel
+accepts them. Episode suppression and delivery cooldowns begin after a successful
+enqueue; activity-log throttling remains independent. A pending combined emergency
+is discarded after the effective behavior recovers or the configured cell stops
+requesting emergency notifications. A recovery still waiting for its hysteresis
+window does not clear the active emergency.
+
 On macOS, the desktop channel uses `osascript -e 'display notification ...'` as the
 first supported user-notification path. The root LaunchDaemon runs it in the
 console user's session (`launchctl asuser`), and does nothing when nobody is

@@ -3986,6 +3986,9 @@ pub struct MonitoringDaemon {
     next_ballast_control_id: u64,
     pending_state_replies: Vec<Sender<()>>,
     behavior_state: PressureBehaviorState,
+    /// Keep one live emergency until the notification queue accepts it.
+    /// Applied recovery cancels it; a deferred recovery is still an emergency.
+    pending_behavior_emergency: Option<NotificationEvent>,
     /// A swap-raised behavior cell still needs its filesystem-only certainty
     /// floor until recovery hysteresis has caught up with physical pressure.
     ram_reclaim_behavior: RamReclaimBehavior,
@@ -5476,10 +5479,7 @@ fn behavior_emergency_event(
     source: &str,
     transition: &BehaviorTransition,
 ) -> Option<NotificationEvent> {
-    if transition.to_memory != MemoryPressureLevel::Critical
-        || transition.to_disk != PressureLevel::Critical
-        || transition.to_mode.notification_priority != NotificationPriority::Emergency
-    {
+    if !behavior_is_emergency(transition.to_memory, transition.to_disk, transition.to_mode) {
         return None;
     }
 
@@ -5489,6 +5489,16 @@ fn behavior_emergency_event(
         disk_level: format!("{:?}", transition.to_disk),
         action: behavior_mode_summary(transition.to_mode),
     })
+}
+
+fn behavior_is_emergency(
+    memory: MemoryPressureLevel,
+    disk: PressureLevel,
+    mode: BehaviorMode,
+) -> bool {
+    memory == MemoryPressureLevel::Critical
+        && disk == PressureLevel::Critical
+        && mode.notification_priority == NotificationPriority::Emergency
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -6201,6 +6211,7 @@ impl MonitoringDaemon {
             next_ballast_control_id: 0,
             pending_state_replies: Vec::new(),
             behavior_state,
+            pending_behavior_emergency: None,
             ram_reclaim_behavior: RamReclaimBehavior::FilesystemOnly,
             scanner_heartbeat,
             executor_heartbeat,
@@ -6643,9 +6654,7 @@ impl MonitoringDaemon {
                 );
                 eprintln!("[SBH-DAEMON] {message}");
                 self.logger_handle.send(ActivityEvent::Info { message });
-                if let Some(event) = behavior_emergency_event(source, &transition) {
-                    self.notification_manager.notify(&event);
-                }
+                self.note_behavior_emergency_transition(source, &transition);
             }
             BehaviorUpdate::Deferred {
                 direction,
@@ -6661,10 +6670,53 @@ impl MonitoringDaemon {
             }
             BehaviorUpdate::Deferred { repeated: true, .. } | BehaviorUpdate::Unchanged => {}
         }
+        self.retry_behavior_emergency();
         self.shared_executor_config.inode_cleanup_enabled.store(
             behavior_allows_delete_dispatch(self.behavior_state.mode),
             Ordering::Release,
         );
+    }
+
+    fn note_behavior_emergency_transition(
+        &mut self,
+        source: &str,
+        transition: &BehaviorTransition,
+    ) {
+        if !behavior_is_emergency(transition.to_memory, transition.to_disk, transition.to_mode) {
+            self.pending_behavior_emergency = None;
+        } else if !behavior_is_emergency(
+            transition.from_memory,
+            transition.from_disk,
+            transition.from_mode,
+        ) {
+            self.pending_behavior_emergency = behavior_emergency_event(source, transition);
+        }
+    }
+
+    fn retry_behavior_emergency(&mut self) {
+        use crate::daemon::notifications::NotificationDispatchOutcome;
+
+        if !behavior_is_emergency(
+            self.behavior_state.memory_level,
+            self.behavior_state.disk_level,
+            self.behavior_state.mode,
+        ) {
+            self.pending_behavior_emergency = None;
+            return;
+        }
+        let Some(event) = self.pending_behavior_emergency.as_mut() else {
+            return;
+        };
+        // A reloaded matrix can change the action while this same emergency
+        // awaits delivery. Report the current action, preserving its origin.
+        if let NotificationEvent::BehaviorEmergency { action, .. } = event {
+            *action = behavior_mode_summary(self.behavior_state.mode);
+        }
+        if self.notification_manager.notify_with_outcome(event)
+            == NotificationDispatchOutcome::Accepted
+        {
+            self.pending_behavior_emergency = None;
+        }
     }
 
     fn drain_memory_pressure_events(
@@ -12161,6 +12213,7 @@ impl MonitoringDaemon {
                     if new_config.behavior != self.config.behavior {
                         let table = behavior_table_from_config(&new_config);
                         if let Some(transition) = self.behavior_state.replace_table(table) {
+                            self.note_behavior_emergency_transition("config_reload", &transition);
                             self.shared_executor_config
                                 .set_min_certainty(min_certainty_for(
                                     transition.to_mode.cleanup_action,
@@ -39674,6 +39727,302 @@ mod tests {
             .expect("warning behavior should transition");
 
         assert!(behavior_emergency_event("memory_pressure", &transition).is_none());
+    }
+
+    #[cfg(unix)]
+    fn behavior_emergency_fixture() -> (
+        RegretDaemonFixture,
+        crate::daemon::notifications::NotificationConfig,
+    ) {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let config = NotificationConfig {
+            enabled: false,
+            channels: vec!["file".into()],
+            // Exercise the daemon's episode tracking without a second throttle
+            // hiding duplicate sends or delaying a genuinely new emergency.
+            min_notify_interval_secs: 0,
+            urgent_notify_interval_secs: 0,
+            file: FileConfig {
+                path: fixture
+                    .directory
+                    .path()
+                    .join("behavior-notifications.jsonl"),
+            },
+            ..NotificationConfig::default()
+        };
+        fixture.daemon.notification_manager = NotificationManager::from_config(&config);
+        fixture.daemon.config.pressure.behavior_hysteresis_secs = 0;
+        fixture.daemon.behavior_state = PressureBehaviorState::new(
+            BehaviorDispatchTable::default(),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+        );
+        (fixture, config)
+    }
+
+    #[cfg(unix)]
+    fn reload_behavior_emergency_cell(
+        daemon: &mut MonitoringDaemon,
+        notifications: &crate::daemon::notifications::NotificationConfig,
+        scan: ScanAggressiveness,
+        notify: NotificationPriority,
+    ) {
+        use crate::daemon::policy::{BehaviorCellConfig, BehaviorPreset};
+
+        let mut config = daemon.config.clone();
+        config.behavior.preset = BehaviorPreset::Custom;
+        config.behavior.cells.insert(
+            "critical_critical".into(),
+            BehaviorCellConfig {
+                scan,
+                cleanup: CleanupAction::AnyDefiniteCandidate,
+                ballast: BallastAction::ReleaseFirst,
+                notify,
+            },
+        );
+        config.notifications = notifications.clone();
+        daemon.apply_config_reload(Ok(config));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn behavior_emergency_retries_rejected_delivery_without_repeating_transition() {
+        let (mut fixture, mut config) = behavior_emergency_fixture();
+        let daemon = &mut fixture.daemon;
+        for source in ["emergency_entry", "emergency_retry"] {
+            daemon.update_behavior_mode(
+                MemoryPressureLevel::Critical,
+                PressureLevel::Critical,
+                source,
+                Duration::ZERO,
+            );
+            assert!(daemon.pending_behavior_emergency.is_some());
+        }
+
+        // A policy reload while delivery is unavailable changes the action,
+        // but this remains the same emergency originating at emergency_entry.
+        reload_behavior_emergency_cell(
+            daemon,
+            &config,
+            ScanAggressiveness::Light,
+            NotificationPriority::Emergency,
+        );
+        let current_action = behavior_mode_summary(daemon.behavior_state.mode);
+        config.enabled = true;
+        daemon.notification_manager.update_config(&config);
+        for _ in 0..3 {
+            daemon.update_behavior_mode(
+                MemoryPressureLevel::Critical,
+                PressureLevel::Critical,
+                "emergency_retry",
+                Duration::ZERO,
+            );
+            assert!(daemon.pending_behavior_emergency.is_none());
+        }
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        let delivered: Vec<Value> = std::fs::read_to_string(&config.file.path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        assert_eq!(delivered[0]["type"], "behavior_emergency");
+        assert_eq!(delivered[0]["source"], "emergency_entry");
+        assert_eq!(delivered[0]["memory_level"], "Critical");
+        assert_eq!(delivered[0]["disk_level"], "Critical");
+        assert_eq!(delivered[0]["action"], current_action);
+
+        fixture.flush_logger();
+        let transitions = std::fs::read_to_string(fixture.directory.path().join("activity.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| {
+                event["details"].as_str().is_some_and(|message| {
+                    message.starts_with("behavior mode changed source=emergency_")
+                })
+            })
+            .count();
+        assert_eq!(transitions, 1, "retries do not repeat the transition log");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn behavior_emergency_recovery_discards_pending_and_rearms_next_episode() {
+        let (mut fixture, mut config) = behavior_emergency_fixture();
+        let daemon = &mut fixture.daemon;
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            PressureLevel::Critical,
+            "undelivered_episode",
+            Duration::ZERO,
+        );
+        assert!(daemon.pending_behavior_emergency.is_some());
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+            "recovery",
+            Duration::ZERO,
+        );
+        assert!(daemon.pending_behavior_emergency.is_none());
+
+        config.enabled = true;
+        daemon.notification_manager.update_config(&config);
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+            "recovered",
+            Duration::ZERO,
+        );
+        for source in ["new_episode", "next_episode"] {
+            for _ in 0..2 {
+                daemon.update_behavior_mode(
+                    MemoryPressureLevel::Critical,
+                    PressureLevel::Critical,
+                    source,
+                    Duration::ZERO,
+                );
+                assert!(daemon.pending_behavior_emergency.is_none());
+            }
+            daemon.update_behavior_mode(
+                MemoryPressureLevel::Normal,
+                PressureLevel::Green,
+                "recovery",
+                Duration::ZERO,
+            );
+        }
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        let delivered: Vec<Value> = std::fs::read_to_string(&config.file.path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(delivered.len(), 2, "{delivered:?}");
+        assert_eq!(delivered[0]["source"], "new_episode");
+        assert_eq!(delivered[1]["source"], "next_episode");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn behavior_emergency_retries_while_recovery_is_only_deferred() {
+        let (mut fixture, mut config) = behavior_emergency_fixture();
+        let daemon = &mut fixture.daemon;
+        daemon.config.pressure.behavior_hysteresis_secs = 3600;
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            PressureLevel::Critical,
+            "emergency_entry",
+            Duration::ZERO,
+        );
+        assert!(daemon.pending_behavior_emergency.is_some());
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+            "recovery_pending",
+            Duration::ZERO,
+        );
+        assert!(daemon.behavior_state.has_pending_target());
+        assert!(daemon.pending_behavior_emergency.is_some());
+
+        config.enabled = true;
+        daemon.notification_manager.update_config(&config);
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+            "recovery_pending",
+            Duration::ZERO,
+        );
+        assert!(daemon.behavior_state.has_pending_target());
+        assert_eq!(
+            daemon.behavior_state.memory_level,
+            MemoryPressureLevel::Critical
+        );
+        assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Critical);
+        assert!(daemon.pending_behavior_emergency.is_none());
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        let delivered: Vec<Value> = std::fs::read_to_string(&config.file.path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        assert_eq!(delivered[0]["source"], "emergency_entry");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn behavior_emergency_retry_respects_effective_notification_priority() {
+        let (mut fixture, mut config) = behavior_emergency_fixture();
+        let daemon = &mut fixture.daemon;
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            PressureLevel::Critical,
+            "disabled_by_policy",
+            Duration::ZERO,
+        );
+        assert!(daemon.pending_behavior_emergency.is_some());
+        reload_behavior_emergency_cell(
+            daemon,
+            &config,
+            ScanAggressiveness::DefiniteOnly,
+            NotificationPriority::High,
+        );
+        assert!(daemon.pending_behavior_emergency.is_none());
+        config.enabled = true;
+        daemon.notification_manager.update_config(&config);
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            PressureLevel::Critical,
+            "policy_changed",
+            Duration::ZERO,
+        );
+        assert!(daemon.pending_behavior_emergency.is_none());
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        assert!(
+            std::fs::read_to_string(&config.file.path)
+                .unwrap_or_default()
+                .is_empty(),
+            "a non-emergency cell cancels the alert"
+        );
+
+        // Entering the emergency cell again can notify, but changing its scan
+        // action after acceptance does not create another emergency episode.
+        reload_behavior_emergency_cell(
+            daemon,
+            &config,
+            ScanAggressiveness::DefiniteOnly,
+            NotificationPriority::Emergency,
+        );
+        assert!(daemon.pending_behavior_emergency.is_some());
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            PressureLevel::Critical,
+            "policy_emergency",
+            Duration::ZERO,
+        );
+        reload_behavior_emergency_cell(
+            daemon,
+            &config,
+            ScanAggressiveness::Light,
+            NotificationPriority::Emergency,
+        );
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            PressureLevel::Critical,
+            "policy_action_changed",
+            Duration::ZERO,
+        );
+        assert!(daemon.pending_behavior_emergency.is_none());
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        let delivered: Vec<Value> = std::fs::read_to_string(&config.file.path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        assert_eq!(delivered[0]["source"], "config_reload");
     }
 
     #[test]
