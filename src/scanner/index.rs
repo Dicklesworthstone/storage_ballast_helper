@@ -534,7 +534,12 @@ impl ScannerCandidateIndex {
             return;
         };
         record.fail_count = record.fail_count.saturating_add(1);
-        record.safety_state = CandidateSafetyState::Failed;
+        // Executor feedback may arrive after a newer walk observed a veto or
+        // event invalidation revoked this hint. Failure is retry state, never
+        // permission to replace that stronger safety evidence.
+        if record.safety_state == CandidateSafetyState::Safe {
+            record.safety_state = CandidateSafetyState::Failed;
+        }
 
         let shift = record.fail_count.saturating_sub(1).min(31);
         let multiplier = 1_u32.checked_shl(shift).unwrap_or(u32::MAX);

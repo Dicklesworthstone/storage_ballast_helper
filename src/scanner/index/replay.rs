@@ -54,9 +54,9 @@ impl ScannerCandidateIndex {
 
 fn revoke(record: &mut CandidateIndexRecord) -> bool {
     let changed = record.score.is_some() || record.safety_state != CandidateSafetyState::Unknown;
-    // Clearing only the safety state is insufficient: executor feedback from
-    // a batch already in flight can subsequently set it to Failed (retryable).
-    // No positive score survives to make that stale evidence replayable.
+    // Revoke the positive score as well as the safety state. A retained
+    // record is historical evidence until a new walk scores it, even when
+    // delayed executor feedback updates its failure backoff.
     record.score = None;
     record.safety_state = CandidateSafetyState::Unknown;
     // Keep identity, observed metadata, structural evidence, and backoff as
@@ -494,6 +494,117 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    #[test]
+    fn delayed_failure_feedback_preserves_fresh_safety_vetoes() {
+        for state in [
+            CandidateSafetyState::Unknown,
+            CandidateSafetyState::ActiveReference,
+            CandidateSafetyState::Vetoed,
+        ] {
+            for (earlier_failure, retry_secs, failures) in [(false, 10, 1), (true, 20, 2)] {
+                let mut index = index();
+                let mut current = record(1);
+                index.upsert(current.clone());
+                if earlier_failure {
+                    index.record_failure(
+                        current.identity,
+                        UNIX_EPOCH,
+                        Duration::from_secs(10),
+                        Duration::from_secs(60),
+                    );
+                    assert_eq!(
+                        index.get(current.identity).unwrap().safety_state,
+                        CandidateSafetyState::Failed
+                    );
+                }
+
+                // A newer walk sees protected or uncertain evidence while an
+                // earlier executor attempt is still waiting to report failure.
+                current.safety_state = state;
+                index.upsert(current.clone());
+                index.record_failure(
+                    current.identity,
+                    UNIX_EPOCH,
+                    Duration::from_secs(10),
+                    Duration::from_secs(60),
+                );
+                let rejected = index.get(current.identity).unwrap();
+                assert_eq!(rejected.safety_state, state);
+                assert_eq!(rejected.score, current.score);
+                assert_eq!(rejected.fail_count, failures);
+                let cooldown = rejected.cooldown_until_nanos;
+                let retry_at = UNIX_EPOCH + Duration::from_secs(retry_secs);
+                assert!(
+                    index.ranked_records(retry_at, 1).is_empty(),
+                    "expiry must not make a fresh veto replayable"
+                );
+
+                // Only new positive scoring evidence may restore the hint.
+                // It must still honor the queued attempt's accumulated backoff.
+                current.safety_state = CandidateSafetyState::Safe;
+                index.upsert(current.clone());
+                let refreshed = index.get(current.identity).unwrap();
+                assert_eq!(refreshed.safety_state, CandidateSafetyState::Safe);
+                assert_eq!(refreshed.fail_count, failures);
+                assert_eq!(refreshed.cooldown_until_nanos, cooldown);
+                assert!(
+                    index
+                        .ranked_records(retry_at - Duration::from_nanos(1), 1)
+                        .is_empty()
+                );
+                let ranked = index.ranked_records(retry_at, 1);
+                assert_eq!(ranked.len(), 1);
+                assert_eq!(ranked[0].identity, current.identity);
+                assert_eq!(ranked[0].fail_count, failures);
+            }
+        }
+    }
+
+    #[test]
+    fn delayed_failure_cannot_restore_vetoed_replay_after_checkpoint_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkpoint = temp.path().join("index.json");
+        let mut index = index();
+        for (inode, state) in [
+            (1, CandidateSafetyState::Unknown),
+            (2, CandidateSafetyState::ActiveReference),
+            (3, CandidateSafetyState::Vetoed),
+        ] {
+            let mut current = record(inode);
+            current.safety_state = state;
+            index.upsert(current.clone());
+            index.record_failure(
+                current.identity,
+                UNIX_EPOCH,
+                Duration::from_secs(10),
+                Duration::from_secs(60),
+            );
+        }
+        index.save_checkpoint(&checkpoint).unwrap();
+        let (mut loaded, status) =
+            ScannerCandidateIndex::load_checkpoint(&checkpoint, index.context().clone());
+        assert_eq!(status, ScannerIndexLoadStatus::Loaded);
+        assert_eq!(loaded.len(), 3);
+        assert!(
+            loaded
+                .ranked_records(UNIX_EPOCH + Duration::from_secs(11), usize::MAX)
+                .is_empty()
+        );
+
+        // A new walk can reopen one candidate without reviving its peers.
+        let fresh = record(2);
+        loaded.upsert(fresh.clone());
+        assert!(
+            loaded
+                .ranked_records(UNIX_EPOCH + Duration::from_secs(9), usize::MAX)
+                .is_empty()
+        );
+        let ranked = loaded.ranked_records(UNIX_EPOCH + Duration::from_secs(10), usize::MAX);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].identity, fresh.identity);
+        assert_eq!(ranked[0].fail_count, 1);
     }
 
     #[test]
