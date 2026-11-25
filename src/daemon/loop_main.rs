@@ -11599,6 +11599,39 @@ impl MonitoringDaemon {
         }
     }
 
+    /// New destinations have not received this daemon's ongoing conditions.
+    /// Rearm delivery cursors without inventing observations or log transitions.
+    fn reload_notification_config(
+        &mut self,
+        config: &crate::daemon::notifications::NotificationConfig,
+    ) {
+        if !self.notification_manager.update_config(config) {
+            return;
+        }
+        self.pressure_notifications.rearm_notifications();
+        for (notified, _) in self.last_special_notify.values_mut() {
+            *notified = PressureLevel::Green;
+        }
+        self.last_predictive_warning.clear();
+        self.last_swap_thrash_notification = None;
+        if behavior_is_emergency(
+            self.behavior_state.memory_level,
+            self.behavior_state.disk_level,
+            self.behavior_state.mode,
+        ) {
+            if self.pending_behavior_emergency.is_none() {
+                self.pending_behavior_emergency = Some(NotificationEvent::BehaviorEmergency {
+                    source: "config_reload".into(),
+                    memory_level: format!("{:?}", self.behavior_state.memory_level),
+                    disk_level: format!("{:?}", self.behavior_state.disk_level),
+                    action: behavior_mode_summary(self.behavior_state.mode),
+                });
+            }
+        } else {
+            self.pending_behavior_emergency = None;
+        }
+    }
+
     fn check_predictive_warnings(&mut self, responses: &[MountTickResponse], now: Instant) {
         use crate::daemon::notifications::NotificationDispatchOutcome;
 
@@ -12242,9 +12275,9 @@ impl MonitoringDaemon {
                     self.predictive_policy =
                         PredictiveActionPolicy::from_config(new_config.pressure.prediction.clone());
 
-                    // Propagate notification config (channels, webhook URLs, cooldowns).
-                    self.notification_manager
-                        .update_config(&new_config.notifications);
+                    // Propagate destinations and rearm ongoing conditions only
+                    // when their previous queue acceptance no longer applies.
+                    self.reload_notification_config(&new_config.notifications);
                     {
                         let mut budget = self.cpu_budget.lock();
                         budget.set_pct(paced_pct(
@@ -20450,6 +20483,144 @@ mod tests {
             transitions
                 .iter()
                 .all(|event| { event["mount_point"] != "/" && event["free_pct"] == 1.0 })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn notification_destination_reload_rearms_live_conditions_without_fake_transitions() {
+        let (mut fixture, mut notifications) = behavior_emergency_fixture();
+        notifications.enabled = true;
+        notifications.min_notify_interval_secs = 900;
+        notifications.urgent_notify_interval_secs = 300;
+        let original_path = notifications.file.path.clone();
+        let daemon = &mut fixture.daemon;
+        daemon.config.notifications = notifications.clone();
+        daemon.notification_manager = NotificationManager::from_config(&notifications);
+        daemon.config.scanner.root_paths = vec![PathBuf::from("/pressure")];
+        daemon.config.pressure.prediction.enabled = false;
+        let platform: Arc<dyn Platform> = Arc::new(disk_pressure_platform(vec![
+            disk_pressure_sample("/", 100 << 30, 50 << 30),
+            disk_pressure_sample("/pressure", 100 << 30, 1 << 30),
+        ]));
+        daemon.fs_collector = FsStatsCollector::new(platform, Duration::ZERO);
+        assert_eq!(
+            daemon.check_pressure().unwrap().level,
+            PressureLevel::Critical
+        );
+        daemon.report_pressure_changes(Instant::now());
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            PressureLevel::Critical,
+            "initial_emergency",
+            Duration::ZERO,
+        );
+        assert!(daemon.pending_behavior_emergency.is_none());
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        assert_eq!(
+            std::fs::read_to_string(&original_path).unwrap().lines().count(),
+            2
+        );
+
+        let observed_at = Instant::now();
+        let special = PathBuf::from("/special");
+        daemon
+            .last_special_notify
+            .insert(special.clone(), (PressureLevel::Red, observed_at));
+        daemon.last_swap_thrash_notification = Some(observed_at);
+        let forecast_key = PredictiveWarningKey::of(
+            daemon
+                .mount_responses
+                .iter()
+                .find(|tick| tick.response.causing_mount == Path::new("/pressure"))
+                .unwrap(),
+        );
+        daemon
+            .last_predictive_warning
+            .insert(forecast_key, (NotificationLevel::Critical, observed_at));
+
+        // A real reload which changes only pacing must not replay delivered
+        // episodes. Exercise the production reload path, not just the manager.
+        let mut reloaded = daemon.config.clone();
+        reloaded.notifications.urgent_notify_interval_secs += 60;
+        daemon.apply_config_reload(Ok(reloaded.clone()));
+        daemon.report_pressure_changes(Instant::now());
+        daemon.retry_behavior_emergency();
+        assert_eq!(
+            daemon.last_special_notify[&special],
+            (PressureLevel::Red, observed_at)
+        );
+        assert_eq!(daemon.last_predictive_warning.len(), 1);
+        assert_eq!(daemon.last_swap_thrash_notification, Some(observed_at));
+        assert!(daemon.pending_behavior_emergency.is_none());
+
+        reloaded.notifications.file.path =
+            original_path.with_file_name("new-notification-destination.jsonl");
+        let replacement_path = reloaded.notifications.file.path.clone();
+        daemon.apply_config_reload(Ok(reloaded.clone()));
+        assert_eq!(
+            daemon.last_special_notify[&special],
+            (PressureLevel::Green, observed_at),
+            "delivery is rearmed without expiring the observed episode"
+        );
+        assert!(daemon.last_predictive_warning.is_empty());
+        assert_eq!(daemon.last_swap_thrash_notification, None);
+        assert!(daemon.pending_behavior_emergency.is_some());
+        for _ in 0..2 {
+            daemon.report_pressure_changes(Instant::now());
+            daemon.retry_behavior_emergency();
+            daemon.apply_config_reload(Ok(reloaded.clone()));
+        }
+        assert!(daemon.pending_behavior_emergency.is_none());
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        let delivered: Vec<Value> = std::fs::read_to_string(&replacement_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(delivered.len(), 2, "{delivered:?}");
+        assert!(
+            delivered
+                .iter()
+                .any(|event| event["type"] == "behavior_emergency")
+        );
+        assert!(
+            delivered
+                .iter()
+                .any(|event| event["type"] == "pressure_changed")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&original_path).unwrap().lines().count(),
+            2,
+            "unchanged destinations never repeated the original conditions"
+        );
+
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+            "recovery",
+            Duration::ZERO,
+        );
+        reloaded.notifications.file.path =
+            original_path.with_file_name("after-recovery.jsonl");
+        daemon.apply_config_reload(Ok(reloaded));
+        assert!(
+            daemon.pending_behavior_emergency.is_none(),
+            "reloading destinations cannot resurrect a recovered emergency"
+        );
+
+        fixture.flush_logger();
+        let transitions = std::fs::read_to_string(fixture.directory.path().join("activity.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["event"] == "pressure_change")
+            .count();
+        assert_eq!(
+            transitions,
+            1,
+            "delivery changes do not invent pressure transitions"
         );
     }
 

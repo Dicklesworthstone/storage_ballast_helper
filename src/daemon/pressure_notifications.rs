@@ -238,6 +238,18 @@ pub(super) struct PressureNotifications {
 }
 
 impl PressureNotifications {
+    /// An accepted alert only acknowledges the destinations that accepted it.
+    /// Preserve observed transitions and their timestamps while rearming active
+    /// pressure for a replacement destination. Delivery still needs a current
+    /// observation; absent filesystems and healthy initial states stay silent.
+    pub(super) fn rearm_notifications(&mut self) {
+        for state in self.filesystems.values_mut() {
+            state.notified = None;
+            state.pending_from =
+                (state.level != PressureLevel::Green).then_some(PressureLevel::Green);
+        }
+    }
+
     pub(super) fn observe(
         &mut self,
         observations: &[PressureObservation],
@@ -398,6 +410,96 @@ mod tests {
             swap_total_bytes: 1_000,
             swap_free_bytes: free_bytes,
         }
+    }
+
+    #[test]
+    fn rearmed_conditions_need_current_evidence_and_keep_transition_history() {
+        let now = Instant::now();
+        let pressured = Sample::new("/data", Some(7), 10, now).observation();
+        let healthy = Sample::new("/healthy", Some(8), 500, now).observation();
+        let inode_pressure = inode_observation("/data", 50, now);
+        let swap_pressure =
+            PressureObservation::swap(&swap_memory(0), [20.0, 15.0, 10.0, 5.0], now).unwrap();
+        let observations = [pressured, healthy, inode_pressure, swap_pressure];
+        let mut tracker = PressureNotifications::default();
+        let mut logs = Vec::new();
+        let mut notices = Vec::new();
+        tracker.observe(
+            &observations,
+            now,
+            |event| logs.push(event),
+            |event| {
+                notices.push(event.clone());
+                NotificationDispatchOutcome::Accepted
+            },
+        );
+        assert_eq!((logs.len(), notices.len()), (3, 3));
+
+        tracker.rearm_notifications();
+        tracker.observe(
+            &[],
+            now + Duration::from_secs(1),
+            |event| logs.push(event),
+            |event| {
+                notices.push(event.clone());
+                NotificationDispatchOutcome::Accepted
+            },
+        );
+        assert_eq!(notices.len(), 3, "rearming cannot deliver absent evidence");
+        for (seconds, outcome) in [
+            (2, NotificationDispatchOutcome::Unavailable),
+            (3, NotificationDispatchOutcome::Accepted),
+            (4, NotificationDispatchOutcome::Accepted),
+        ] {
+            tracker.observe(
+                &observations,
+                now + Duration::from_secs(seconds),
+                |event| logs.push(event),
+                |event| {
+                    notices.push(event.clone());
+                    outcome
+                },
+            );
+        }
+        assert_eq!(
+            logs.len(),
+            3,
+            "a new destination is not a new pressure transition"
+        );
+        assert_eq!(
+            notices.len(),
+            9,
+            "each active resource retries until accepted once"
+        );
+        assert!(
+            notices.iter().all(|event| {
+                !matches!(event, NotificationEvent::PressureChanged { mount, .. }
+                    if mount == "/healthy")
+            }),
+            "a healthy filesystem needs no initial alert"
+        );
+
+        tracker.rearm_notifications();
+        let recovered = Sample::new("/data", Some(7), 500, now + Duration::from_secs(5));
+        tracker.observe(
+            &[recovered.observation()],
+            now + Duration::from_secs(5),
+            |event| logs.push(event),
+            |event| {
+                notices.push(event.clone());
+                NotificationDispatchOutcome::Accepted
+            },
+        );
+        assert_eq!(logs.len(), 4);
+        assert_eq!(
+            notices.len(),
+            10,
+            "absent inode and swap pressure stay pending"
+        );
+        assert_eq!(
+            transition(notices.last().unwrap()),
+            ("/data", "Critical", "Green")
+        );
     }
 
     #[test]

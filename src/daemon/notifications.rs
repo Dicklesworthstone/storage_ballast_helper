@@ -1187,10 +1187,15 @@ impl NotificationManager {
 
     /// Replace this manager's configuration (e.g., after SIGHUP config reload).
     ///
-    /// Preserves scoped throttle history and occupied worker slots. Queued
-    /// deliveries using a changed or disabled channel are revoked; an already
-    /// executing native operation may still complete under its old settings.
-    pub fn update_config(&mut self, config: &NotificationConfig) {
+    /// Preserves occupied worker slots and, for unchanged destinations, scoped
+    /// throttle history. Queued deliveries using a changed or disabled channel
+    /// are revoked; an executing native operation may finish under old settings.
+    ///
+    /// Returns whether delivery destinations or their eligibility changed.
+    /// Callers must rearm ongoing conditions when true: an old destination's
+    /// acceptance cannot acknowledge an alert for its replacement. Cooldown-only
+    /// changes preserve delivery history and return false.
+    pub fn update_config(&mut self, config: &NotificationConfig) -> bool {
         let configured = ChannelSettings::configured(config);
         let destinations_changed = self.enabled != config.enabled
             || self
@@ -1208,6 +1213,9 @@ impl NotificationManager {
                 })
             });
         if destinations_changed {
+            // Accepted deliveries for the old destinations may now be revoked.
+            // They cannot suppress a current alert for the replacement.
+            self.last_send_by_scope.clear();
             // The daemon retries its latest reserve transition. A newly
             // enabled or replaced destination needs that current condition,
             // even if an older destination already accepted the same state.
@@ -1233,6 +1241,7 @@ impl NotificationManager {
         self.enabled = config.enabled;
         self.min_interval = Duration::from_secs(config.min_notify_interval_secs);
         self.urgent_min_interval = Duration::from_secs(config.urgent_notify_interval_secs);
+        destinations_changed
     }
 
     /// Create a disabled (no-op) manager.
@@ -2092,6 +2101,79 @@ mod tests {
         );
         assert!(!old_path.exists());
         assert_eq!(manager.dropped_count(), 0);
+    }
+
+    #[test]
+    fn destination_reload_retries_revoked_alerts_and_preserves_unchanged_pacing() {
+        let (_directory, mut config, mut manager) = notification_fixture();
+        let (release, wait) = bounded(1);
+        let old_events = install_probe(&mut manager, "file", Some(wait));
+        let now = Instant::now();
+        let blocker = pressure_event("/blocker", NotificationLevel::Critical);
+        let pressure = pressure_event("/data", NotificationLevel::Critical);
+        assert_eq!(
+            manager.notify_at(&blocker, now),
+            NotificationDispatchOutcome::Accepted
+        );
+        assert_eq!(
+            old_events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "/blocker"
+        );
+        assert_eq!(
+            manager.notify_at(&pressure, now),
+            NotificationDispatchOutcome::Accepted
+        );
+        assert!(!manager.update_config(&config));
+        config.urgent_notify_interval_secs += 60;
+        assert!(!manager.update_config(&config));
+        assert_eq!(
+            manager.notify_at(&pressure, now + Duration::from_secs(1)),
+            NotificationDispatchOutcome::Throttled,
+            "unchanged destinations retain their successful history"
+        );
+
+        let old_path = config.file.path.clone();
+        let revoked = Arc::clone(&manager.channels[0].target.as_ref().unwrap().revoked);
+        config.file.path = old_path.with_file_name("replacement-notifications.jsonl");
+        assert!(manager.update_config(&config));
+        assert!(revoked.load(Ordering::Acquire));
+        assert_eq!(
+            manager.channels.len(),
+            1,
+            "the blocked worker slot is retained"
+        );
+        assert_eq!(
+            manager.notify_at(&pressure, now + Duration::from_secs(2)),
+            NotificationDispatchOutcome::Accepted,
+            "a revoked acceptance cannot silence the replacement destination"
+        );
+        assert!(!manager.update_config(&config));
+        assert_eq!(
+            manager.notify_at(&pressure, now + Duration::from_secs(3)),
+            NotificationDispatchOutcome::Throttled
+        );
+
+        release.send(()).unwrap();
+        let records = recorded_notifications(&config, &manager);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["mount"], "/data");
+        assert!(old_events.is_empty(), "the old queued alert was revoked");
+        assert!(!old_path.exists());
+        assert_eq!(manager.dropped_count(), 0);
+
+        config.enabled = false;
+        assert!(manager.update_config(&config));
+        assert_eq!(
+            manager.notify_at(&pressure, now + Duration::from_secs(4)),
+            NotificationDispatchOutcome::Unavailable
+        );
+        config.enabled = true;
+        assert!(manager.update_config(&config));
+        assert_eq!(
+            manager.notify_at(&pressure, now + Duration::from_secs(5)),
+            NotificationDispatchOutcome::Accepted
+        );
+        assert_eq!(recorded_notifications(&config, &manager).len(), 2);
     }
 
     #[test]
