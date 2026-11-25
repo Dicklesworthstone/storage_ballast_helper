@@ -29,7 +29,6 @@ struct AdmittedForecast {
     prediction: PredictionConfig,
     scoring: ScoringConfig,
     min_score: f64,
-    runway_deadline: Instant,
     life: Mutex<ForecastLife>,
     revoked: AtomicBool,
 }
@@ -38,6 +37,7 @@ struct AdmittedForecast {
 struct ForecastLife {
     last_collected_at: Instant,
     fresh_until: Instant,
+    runway_deadline: Instant,
 }
 
 /// A gated action paired with the actual filesystem sample that produced it.
@@ -297,10 +297,10 @@ impl PredictiveScanAdmission {
                 prediction: prediction.clone(),
                 scoring: scoring.clone(),
                 min_score,
-                runway_deadline,
                 life: Mutex::new(ForecastLife {
                     last_collected_at: observed_at,
                     fresh_until,
+                    runway_deadline,
                 }),
                 revoked: AtomicBool::new(false),
             }),
@@ -361,17 +361,17 @@ impl PredictiveScanAdmission {
         {
             return false;
         }
-        let deadline = self
-            .admitted
-            .runway_deadline
-            .min(observation.runway_deadline);
+        // A newer sample may renew freshness, but cannot restore runway
+        // already withdrawn from this pass. Keep the earliest observed
+        // deadline with the shared lifetime so every queued clone retains it.
+        life.runway_deadline = life.runway_deadline.min(observation.runway_deadline);
         if observation.collected_at > life.last_collected_at {
             life.last_collected_at = observation.collected_at;
-            life.fresh_until = observation.fresh_until.min(deadline);
+            life.fresh_until = observation.fresh_until.min(life.runway_deadline);
         } else {
             // A cached or out-of-order sample cannot extend freshness. A
             // shorter current runway remains a conservative stop condition.
-            life.fresh_until = life.fresh_until.min(deadline);
+            life.fresh_until = life.fresh_until.min(life.runway_deadline);
         }
         now < life.fresh_until
     }
@@ -1167,6 +1167,98 @@ mod tests {
             policy.authorize(&queued, started + Duration::from_secs(11)),
             Err(SkipReason::PolicyChanged),
             "the newer six-second runway ends at t=11s"
+        );
+    }
+
+    #[test]
+    fn newer_samples_cannot_restore_a_shortened_runway_to_queued_clones() {
+        let started = Instant::now();
+        for (collected, observed, renewed, deadline) in [(5, 5, 8, 11), (0, 2, 4, 6)] {
+            let mut policy = policy();
+            let original = policy
+                .admit(&imminent(1.0), started, Duration::from_secs(10), started)
+                .unwrap();
+            let queued = original.clone();
+            let observed_at = started + Duration::from_secs(observed);
+            policy.observe_samples(
+                &[observation(
+                    imminent(0.1),
+                    started + Duration::from_secs(collected),
+                    10,
+                )],
+                observed_at,
+            );
+            assert!(policy.authorize(&queued, observed_at).is_ok());
+
+            let renewed_at = started + Duration::from_secs(renewed);
+            policy.observe_samples(
+                &[observation(imminent(1.5), renewed_at, 10)],
+                renewed_at,
+            );
+            assert!(
+                policy
+                    .authorize(&queued, started + Duration::from_secs(deadline - 1))
+                    .is_ok()
+            );
+            let expired_at = started + Duration::from_secs(deadline);
+            assert_eq!(
+                policy.authorize(&original, expired_at),
+                Err(SkipReason::PolicyChanged),
+                "fresh or cached shorter evidence must remain binding"
+            );
+            assert_eq!(
+                policy.authorize(&queued, expired_at),
+                Err(SkipReason::PolicyChanged),
+                "every queued clone shares the shortened deadline"
+            );
+
+            let fresh = policy
+                .admit(
+                    &imminent(1.5),
+                    expired_at,
+                    Duration::from_secs(10),
+                    expired_at,
+                )
+                .unwrap();
+            assert!(
+                policy.authorize(&fresh, expired_at).is_ok(),
+                "new evidence may admit a new pass without reviving old work"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_renewals_cannot_extend_a_relaxed_pass_beyond_its_shortened_runway() {
+        let started = Instant::now();
+        let mut policy = policy();
+        let queued = policy
+            .admit(&action(0.3), started, Duration::from_secs(60), started)
+            .unwrap();
+        let mut shorter = action(0.3);
+        if let PredictiveAction::PreemptiveCleanup {
+            minutes_remaining, ..
+        } = &mut shorter
+        {
+            *minutes_remaining = 6.0;
+        }
+        let shortened_at = started + Duration::from_secs(30);
+        policy.observe_samples(&[observation(shorter, shortened_at, 60)], shortened_at);
+
+        for elapsed in [60, 100, 140, 180, 220, 260, 300, 340, 380] {
+            let now = started + Duration::from_secs(elapsed);
+            policy.observe_samples(&[observation(action(0.2), now, 60)], now);
+            assert!(policy.authorize(&queued, now).is_ok(), "at {elapsed}s");
+            assert_eq!(queued.min_score(), 0.3);
+        }
+        assert!(
+            policy
+                .authorize(&queued, started + Duration::from_secs(389))
+                .is_ok()
+        );
+        assert_eq!(
+            policy.authorize(&queued, started + Duration::from_secs(390)),
+            Err(SkipReason::PolicyChanged),
+            "the six-minute forecast observed at t=30s binds the relaxed pass"
         );
     }
 
