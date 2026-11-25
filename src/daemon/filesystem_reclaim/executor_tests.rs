@@ -62,6 +62,7 @@ impl Fixture {
     fn batch(&self, candidates: Vec<CandidacyScore>) -> DeletionBatch {
         DeletionBatch {
             candidates,
+            reclaim_progress: None,
             admitted_scanner: Arc::new(self.scanner.clone()),
             pressure_level: PressureLevel::Green,
             urgency: 0.5,

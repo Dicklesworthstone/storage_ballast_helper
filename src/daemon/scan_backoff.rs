@@ -7,12 +7,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{
     ScanRequest, SharedExecutorConfig, confirm_scanner_dispatch, effective_empty_pass_cooldown,
-    empty_pass_cooldown_active, note_empty_pass_level, pressure_escalated,
-    record_dispatching_pass, record_empty_pass, rise_already_scanned_empty,
+    empty_pass_cooldown_active, note_empty_pass_level, pressure_escalated, record_dispatching_pass,
+    record_empty_pass, rise_already_scanned_empty,
 };
 use crate::core::config::{ScannerConfig, ScoringConfig};
 use crate::daemon::filesystem_reclaim::FilesystemReclaimScope;
@@ -23,6 +24,59 @@ use crate::platform::cleanup_catalog::ExpandedCatalogRoot;
 /// Event subtrees can change indefinitely; forgetting pacing is safe, whereas
 /// retaining unbounded path histories would turn monitoring into a memory leak.
 const MAX_SCOPES: usize = 256;
+
+/// Actual executor outcomes for one scanner pass, never shared with a peer
+/// filesystem or with a later pass over the same roots.
+#[derive(Debug, Default)]
+pub(super) struct ScanDispatchProgress {
+    pending: AtomicUsize,
+    reclaimed: AtomicBool,
+}
+
+impl ScanDispatchProgress {
+    pub(super) fn receipt(self: &Arc<Self>) -> ScanDispatchReceipt {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        ScanDispatchReceipt {
+            progress: Arc::clone(self),
+        }
+    }
+
+    pub(super) fn is_complete(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == 0
+    }
+
+    /// Read after the acquire observation of zero pending receipts, so the
+    /// final executor's successful removal cannot race with an empty verdict.
+    pub(super) fn reclaimed(&self) -> bool {
+        self.reclaimed.load(Ordering::Acquire)
+    }
+}
+
+/// A queued or executing batch's ownership of its pass's completion.
+/// Dropping a refused send, an early-returned batch or its last queued copy
+/// always retires the corresponding pending work.
+#[derive(Debug)]
+pub(crate) struct ScanDispatchReceipt {
+    progress: Arc<ScanDispatchProgress>,
+}
+
+impl ScanDispatchReceipt {
+    pub(super) fn note_reclaim(&self) {
+        self.progress.reclaimed.store(true, Ordering::Release);
+    }
+}
+
+impl Clone for ScanDispatchReceipt {
+    fn clone(&self) -> Self {
+        self.progress.receipt()
+    }
+}
+
+impl Drop for ScanDispatchReceipt {
+    fn drop(&mut self) {
+        self.progress.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 struct ScanScope {
     paths: Vec<PathBuf>,
@@ -39,9 +93,8 @@ impl ScanScope {
         paths.sort();
         paths.dedup();
         let mut catalog_roots = request.catalog_roots.clone();
-        catalog_roots.sort_by(|left, right| {
-            left.path.cmp(&right.path).then(left.rule.cmp(right.rule))
-        });
+        catalog_roots
+            .sort_by(|left, right| left.path.cmp(&right.path).then(left.rule.cmp(right.rule)));
         catalog_roots.dedup();
         Self {
             paths,
@@ -84,9 +137,13 @@ pub(super) struct ScanBackoffs {
 
 impl ScanBackoffs {
     pub(super) fn reconfigure(&mut self, scanner: &ScannerConfig, scoring: &ScoringConfig) {
-        if self.policy.as_ref().is_none_or(|(old_scanner, old_scoring)| {
-            old_scanner != scanner || old_scoring != scoring
-        }) {
+        if self
+            .policy
+            .as_ref()
+            .is_none_or(|(old_scanner, old_scoring)| {
+                old_scanner != scanner || old_scoring != scoring
+            })
+        {
             // A changed classifier, threshold or traversal policy can expose
             // candidates that the old policy held. Old emptiness is no proof.
             self.scopes.clear();
@@ -102,7 +159,11 @@ impl ScanBackoffs {
 
     pub(super) fn for_request(&mut self, request: &ScanRequest, now: Instant) -> &mut ScanBackoff {
         let scope = ScanScope::new(request);
-        if let Some(index) = self.scopes.iter().position(|entry| entry.scope.matches(&scope)) {
+        if let Some(index) = self
+            .scopes
+            .iter()
+            .position(|entry| entry.scope.matches(&scope))
+        {
             self.scopes[index].last_used = now;
             return &mut self.scopes[index].state;
         }
@@ -129,14 +190,21 @@ pub(super) struct ScanBackoff {
     last_empty_at: Option<Instant>,
     consecutive_empty: u32,
     inconclusive_empty: u32,
-    pending_dispatch: Option<(u64, Option<PredictiveScanAdmission>)>,
-    last_dispatch_empty: bool,
+    pending_dispatch: Option<(Arc<ScanDispatchProgress>, Option<PredictiveScanAdmission>)>,
     pub(super) last_pass_level: Option<PressureLevel>,
     empty_level_peak: Option<(PressureLevel, Instant)>,
 }
 
 impl ScanBackoff {
+    /// A forced replacement may supersede outstanding work. Forget its
+    /// receipt only after the new pass actually starts, never while a CPU or
+    /// duty-cycle gate merely defers a dequeued request.
+    pub(super) fn begin_pass(&mut self) {
+        self.pending_dispatch = None;
+    }
+
     pub(super) fn record_empty(&mut self, timed_out: bool, level: PressureLevel, now: Instant) {
+        self.pending_dispatch = None;
         record_empty_pass(
             &mut self.consecutive_empty,
             &mut self.inconclusive_empty,
@@ -148,32 +216,23 @@ impl ScanBackoff {
 
     pub(super) fn record_dispatch(
         &mut self,
-        reclaim_before: u64,
+        progress: Arc<ScanDispatchProgress>,
         prediction: Option<PredictiveScanAdmission>,
     ) {
-        record_dispatching_pass(
-            self.last_dispatch_empty,
-            &mut self.consecutive_empty,
-            &mut self.inconclusive_empty,
-            &mut self.last_empty_at,
-        );
-        self.record_pending(reclaim_before, prediction);
-    }
-
-    pub(super) fn record_pending(
-        &mut self,
-        reclaim_before: u64,
-        prediction: Option<PredictiveScanAdmission>,
-    ) {
-        self.pending_dispatch = Some((reclaim_before, prediction));
+        // Queue acceptance alone is not reclaim. Preserve the empty streak
+        // until this pass's executor receipts actually confirm progress.
+        self.pending_dispatch = Some((progress, prediction));
     }
 
     fn confirm_dispatch(&mut self, config: &SharedExecutorConfig, now: Instant) {
-        let Some((reclaim_before, prediction)) = self.pending_dispatch.take() else {
+        let Some((progress, _)) = self.pending_dispatch.as_ref() else {
             return;
         };
-        let outcome = confirm_scanner_dispatch(reclaim_before, prediction.as_ref(), config, now);
-        self.last_dispatch_empty = outcome == Some(false);
+        if !progress.is_complete() {
+            return;
+        }
+        let (progress, prediction) = self.pending_dispatch.take().expect("pending pass exists");
+        let outcome = confirm_scanner_dispatch(&progress, prediction.as_ref(), config, now);
         if outcome == Some(true) {
             record_dispatching_pass(
                 false,
@@ -221,6 +280,16 @@ impl ScanBackoff {
         interval_secs: u64,
         now: Instant,
     ) -> bool {
+        // A delayed executor is not an empty filesystem. Avoid redispatching
+        // the same scope while its previous batches are still in flight.
+        // Explicit pacing overrides can replace that pass's evidence.
+        if self.pending_dispatch.is_some()
+            && !request.bypass_scan_pacing()
+            && request.config_update.is_none()
+            && request.free_pct.is_some()
+        {
+            return true;
+        }
         if from_events {
             let base = Duration::from_secs(interval_secs.max(1));
             return self
@@ -293,10 +362,26 @@ mod tests {
             let peer = request("/peer", level);
             let subtree = request("/empty/changed", level);
             exhaust(&mut backoffs, &empty, now);
-            assert!(backoffs.for_request(&empty, now).cooldown_active(&empty, false, 90, now));
-            assert!(!backoffs.for_request(&peer, now).cooldown_active(&peer, false, 90, now));
-            assert!(!backoffs.for_request(&subtree, now).cooldown_active(&subtree, true, 90, now));
-            assert!(backoffs.for_request(&empty, now).cooldown_active(&empty, false, 90, now));
+            assert!(
+                backoffs
+                    .for_request(&empty, now)
+                    .cooldown_active(&empty, false, 90, now)
+            );
+            assert!(
+                !backoffs
+                    .for_request(&peer, now)
+                    .cooldown_active(&peer, false, 90, now)
+            );
+            assert!(
+                !backoffs
+                    .for_request(&subtree, now)
+                    .cooldown_active(&subtree, true, 90, now)
+            );
+            assert!(
+                backoffs
+                    .for_request(&empty, now)
+                    .cooldown_active(&empty, false, 90, now)
+            );
         }
     }
 
@@ -310,11 +395,19 @@ mod tests {
         let mut reordered = original.clone();
         reordered.paths.reverse();
         reordered.paths.push(PathBuf::from("/a"));
-        assert!(backoffs.for_request(&reordered, now).cooldown_active(&reordered, false, 90, now));
+        assert!(
+            backoffs
+                .for_request(&reordered, now)
+                .cooldown_active(&reordered, false, 90, now)
+        );
 
         let mut expanded = original.clone();
         expanded.paths.push(PathBuf::from("/c"));
-        assert!(!backoffs.for_request(&expanded, now).cooldown_active(&expanded, false, 90, now));
+        assert!(
+            !backoffs
+                .for_request(&expanded, now)
+                .cooldown_active(&expanded, false, 90, now)
+        );
 
         let mut inode = original.clone();
         inode.inode_reclaim = Some(InodeReclaimRequest::from_observed_roots(
@@ -326,7 +419,11 @@ mod tests {
             &InodePressureConfig::default(),
             &[],
         ));
-        assert!(!backoffs.for_request(&inode, now).cooldown_active(&inode, false, 90, now));
+        assert!(
+            !backoffs
+                .for_request(&inode, now)
+                .cooldown_active(&inode, false, 90, now)
+        );
 
         let mut catalog = original.clone();
         catalog.catalog_roots.push(ExpandedCatalogRoot {
@@ -335,7 +432,11 @@ mod tests {
             confidence: crate::platform::cleanup_catalog::CleanupConfidence::Definite,
             min_age: Duration::ZERO,
         });
-        assert!(!backoffs.for_request(&catalog, now).cooldown_active(&catalog, false, 90, now));
+        assert!(
+            !backoffs
+                .for_request(&catalog, now)
+                .cooldown_active(&catalog, false, 90, now)
+        );
     }
 
     #[test]
@@ -345,20 +446,127 @@ mod tests {
         let shared = SharedExecutorConfig::new(false, 10, 0.0, 60, 3600, false, 0);
         let original = request("/a", PressureLevel::Orange);
         let peer = request("/b", PressureLevel::Orange);
-        let state = backoffs.for_request(&original, now);
-        state.last_pass_level = Some(original.pressure_level);
-        state.record_dispatch(shared.reclaim_events(), None);
-        backoffs.confirm_dispatches(&shared, now);
-        assert_eq!(backoffs.for_request(&original, now).consecutive_empty(), 1);
-        assert!(!backoffs.for_request(&peer, now).cooldown_active(&peer, false, 90, now));
-
-        backoffs.for_request(&original, now).record_dispatch(shared.reclaim_events(), None);
-        backoffs.confirm_dispatches(&shared, now);
-        assert_eq!(backoffs.for_request(&original, now).consecutive_empty(), 2);
-        backoffs.for_request(&original, now).record_dispatch(shared.reclaim_events(), None);
-        shared.note_reclaim();
+        for expected_empty in 1..=2 {
+            let progress = Arc::new(ScanDispatchProgress::default());
+            let receipt = progress.receipt();
+            let state = backoffs.for_request(&original, now);
+            state.begin_pass();
+            state.last_pass_level = Some(original.pressure_level);
+            state.record_dispatch(progress, None);
+            drop(receipt);
+            backoffs.confirm_dispatches(&shared, now);
+            assert_eq!(
+                backoffs.for_request(&original, now).consecutive_empty(),
+                expected_empty
+            );
+            assert!(
+                !backoffs
+                    .for_request(&peer, now)
+                    .cooldown_active(&peer, false, 90, now)
+            );
+        }
+        let progress = Arc::new(ScanDispatchProgress::default());
+        let receipt = progress.receipt();
+        backoffs
+            .for_request(&original, now)
+            .record_dispatch(progress, None);
+        receipt.note_reclaim();
+        drop(receipt);
         backoffs.confirm_dispatches(&shared, now);
         assert_eq!(backoffs.for_request(&original, now).consecutive_empty(), 0);
+    }
+
+    #[test]
+    fn successful_peer_cannot_confirm_a_delayed_or_empty_scope() {
+        let now = Instant::now();
+        let shared = SharedExecutorConfig::new(false, 10, 0.0, 60, 3600, false, 0);
+        let mut backoffs = ScanBackoffs::default();
+        let empty = request("/empty", PressureLevel::Critical);
+        let peer = request("/peer", PressureLevel::Critical);
+        exhaust(&mut backoffs, &empty, now);
+        let before = backoffs.for_request(&empty, now).consecutive_empty();
+        let progress = Arc::new(ScanDispatchProgress::default());
+        let waiting = progress.receipt();
+        backoffs
+            .for_request(&empty, now)
+            .record_dispatch(progress, None);
+
+        let peer_progress = Arc::new(ScanDispatchProgress::default());
+        let completed = peer_progress.receipt();
+        backoffs
+            .for_request(&peer, now)
+            .record_dispatch(peer_progress, None);
+        completed.note_reclaim();
+        drop(completed);
+        backoffs.confirm_dispatches(&shared, now);
+        assert_eq!(backoffs.for_request(&peer, now).consecutive_empty(), 0);
+        assert_eq!(
+            backoffs.for_request(&empty, now).consecutive_empty(),
+            before
+        );
+        assert!(
+            backoffs
+                .for_request(&empty, now)
+                .cooldown_active(&empty, false, 0, now),
+            "pending executor work stays pending even with no empty-pass interval"
+        );
+
+        drop(waiting);
+        backoffs.confirm_dispatches(&shared, now);
+        assert_eq!(
+            backoffs.for_request(&empty, now).consecutive_empty(),
+            before + 1,
+            "peer success cannot reset this scope's accumulated empty evidence"
+        );
+    }
+
+    #[test]
+    fn every_queued_batch_and_clone_must_finish_before_confirming_the_pass() {
+        let now = Instant::now();
+        let shared = SharedExecutorConfig::new(false, 10, 0.0, 60, 3600, false, 0);
+        let mut state = ScanBackoff::default();
+        state.record_empty(false, PressureLevel::Orange, now);
+        let progress = Arc::new(ScanDispatchProgress::default());
+        let first = progress.receipt();
+        let queued_copy = first.clone();
+        let second = progress.receipt();
+        state.record_dispatch(Arc::clone(&progress), None);
+        first.note_reclaim();
+        drop(first);
+        state.confirm_dispatch(&shared, now);
+        assert_eq!(state.consecutive_empty(), 1);
+        drop(second);
+        state.confirm_dispatch(&shared, now);
+        assert_eq!(state.consecutive_empty(), 1);
+        assert!(!progress.is_complete());
+        drop(queued_copy);
+        state.confirm_dispatch(&shared, now);
+        assert!(progress.is_complete());
+        assert_eq!(state.consecutive_empty(), 0);
+        assert!(state.pending_dispatch.is_none());
+    }
+
+    #[test]
+    fn a_forced_replacement_cannot_inherit_its_predecessors_late_success() {
+        let now = Instant::now();
+        let shared = SharedExecutorConfig::new(false, 10, 0.0, 60, 3600, false, 0);
+        let mut state = ScanBackoff::default();
+        let original = request("/root", PressureLevel::Orange);
+        let progress = Arc::new(ScanDispatchProgress::default());
+        let delayed = progress.receipt();
+        state.record_dispatch(progress, None);
+        assert!(state.cooldown_active(&original, false, 90, now));
+
+        let mut forced = original.clone();
+        forced.force_full_scan = true;
+        assert!(!state.cooldown_active(&forced, false, 90, now));
+        state.begin_pass();
+        state.record_empty(false, forced.pressure_level, now);
+        delayed.note_reclaim();
+        drop(delayed);
+        state.confirm_dispatch(&shared, now);
+        assert_eq!(state.consecutive_empty(), 1);
+        assert!(state.cooldown_active(&original, false, 90, now));
     }
 
     #[test]
@@ -370,16 +578,32 @@ mod tests {
         let peer = request("/b", PressureLevel::Orange);
         exhaust(&mut backoffs, &orange, now);
         exhaust(&mut backoffs, &peer, now);
-        backoffs.for_request(&red, now).reset_on_escalation(&red, now);
-        assert!(!backoffs.for_request(&red, now).cooldown_active(&red, false, 90, now));
-        assert!(backoffs.for_request(&peer, now).cooldown_active(&peer, false, 90, now));
+        backoffs
+            .for_request(&red, now)
+            .reset_on_escalation(&red, now);
+        assert!(
+            !backoffs
+                .for_request(&red, now)
+                .cooldown_active(&red, false, 90, now)
+        );
+        assert!(
+            backoffs
+                .for_request(&peer, now)
+                .cooldown_active(&peer, false, 90, now)
+        );
 
         exhaust(&mut backoffs, &red, now);
         let state = backoffs.for_request(&orange, now);
         state.record_empty(false, orange.pressure_level, now);
         state.last_pass_level = Some(orange.pressure_level);
-        backoffs.for_request(&red, now).reset_on_escalation(&red, now);
-        assert!(backoffs.for_request(&red, now).cooldown_active(&red, false, 90, now));
+        backoffs
+            .for_request(&red, now)
+            .reset_on_escalation(&red, now);
+        assert!(
+            backoffs
+                .for_request(&red, now)
+                .cooldown_active(&red, false, 90, now)
+        );
     }
 
     #[test]
@@ -392,15 +616,27 @@ mod tests {
         backoffs.reconfigure(&scanner, &scoring);
         exhaust(&mut backoffs, &original, now);
         backoffs.reconfigure(&scanner, &scoring);
-        assert!(backoffs.for_request(&original, now).cooldown_active(&original, false, 90, now));
+        assert!(
+            backoffs
+                .for_request(&original, now)
+                .cooldown_active(&original, false, 90, now)
+        );
         scoring.min_score += 0.01;
         backoffs.reconfigure(&scanner, &scoring);
-        assert!(!backoffs.for_request(&original, now).cooldown_active(&original, false, 90, now));
+        assert!(
+            !backoffs
+                .for_request(&original, now)
+                .cooldown_active(&original, false, 90, now)
+        );
         for i in 0..MAX_SCOPES + 10 {
             let dynamic = request(&format!("/changed/{i}"), PressureLevel::Orange);
             backoffs.for_request(&dynamic, now + Duration::from_secs(i as u64));
         }
         assert_eq!(backoffs.scopes.len(), MAX_SCOPES);
-        assert!(!backoffs.for_request(&original, now).cooldown_active(&original, false, 90, now));
+        assert!(
+            !backoffs
+                .for_request(&original, now)
+                .cooldown_active(&original, false, 90, now)
+        );
     }
 }

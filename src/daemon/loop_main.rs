@@ -152,7 +152,8 @@ use quarantine_worker::{QuarantineFirst, QuarantineSweepContext, QuarantineSweep
 
 #[path = "scan_backoff.rs"]
 mod scan_backoff;
-use scan_backoff::ScanBackoffs;
+pub(crate) use scan_backoff::ScanDispatchReceipt;
+use scan_backoff::{ScanBackoffs, ScanDispatchProgress};
 
 // ──────────────────── channel capacities ────────────────────
 
@@ -280,9 +281,6 @@ struct SharedExecutorConfig {
     /// Layer 7: Green batches quarantine instead of removing.
     quarantine_enabled: AtomicBool,
     quarantine_ttl_secs: AtomicU64,
-    /// bd-8aeq: batches that actually removed something; see
-    /// [`Self::reclaim_events`].
-    reclaim_events: AtomicU64,
     /// W1 planner: the risk budget table and one false-positive loss.
     planner: RwLock<(RiskBudgetByLevel, f64)>,
     /// A live, bounded first chance for lossless reclaim on a pressured mount.
@@ -326,7 +324,6 @@ impl SharedExecutorConfig {
             inode_cleanup_enabled: AtomicBool::new(true),
             quarantine_enabled: AtomicBool::new(quarantine_enabled),
             quarantine_ttl_secs: AtomicU64::new(quarantine_ttl_secs),
-            reclaim_events: AtomicU64::new(0),
             planner: RwLock::new((RiskBudgetByLevel::default(), 50.0)),
             compression_first: Arc::new(CompressionFirst::default()),
             quarantine_first: Arc::new(QuarantineFirst::default()),
@@ -385,19 +382,6 @@ impl SharedExecutorConfig {
                 self.ram_reclaim_certainty_floor.load(Ordering::Relaxed),
             ))
         }
-    }
-
-    /// Number of executor batches that removed at least one item for real
-    /// (not dry-run). The scanner compares it across passes: a pass whose
-    /// dispatches moved this counter made progress, one whose dispatches did
-    /// not (dry-run, observe mode, every candidate dampened or failed) is
-    /// paced like an empty pass.
-    fn reclaim_events(&self) -> u64 {
-        self.reclaim_events.load(Ordering::Relaxed)
-    }
-
-    fn note_reclaim(&self) {
-        self.reclaim_events.fetch_add(1, Ordering::Relaxed);
     }
 
     fn set_min_certainty(&self, certainty: ArtifactCertainty) {
@@ -1734,9 +1718,8 @@ fn record_empty_pass(
     *consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
 }
 
-/// A pass that dispatched candidates. Its dispatch is unconfirmed until the
-/// next pass sees the executor's reclaim counter move, so it resets the
-/// empty-pass streak only when the previous dispatch did reclaim something.
+/// Reset an empty-pass streak only on confirmed reclaim from that pass's
+/// executor receipts. Queue acceptance alone is never evidence of progress.
 /// Resetting on every dispatch capped the streak at one (#36): a host whose
 /// dispatches never reclaim (dry-run, observe, every candidate failing)
 /// rescanned at the base interval forever instead of backing off toward
@@ -1805,6 +1788,9 @@ fn scan_reason_for_request(request: &ScanRequest) -> &'static str {
 #[derive(Debug, Clone)]
 pub struct DeletionBatch {
     pub candidates: Vec<CandidacyScore>,
+    /// Completion and real reclaim belong to the originating scanner pass.
+    /// Non-scanner tiers must not confirm another pass's empty-work evidence.
+    pub(crate) reclaim_progress: Option<ScanDispatchReceipt>,
     /// The scanner admission that produced these candidates, shared by every
     /// batch from the pass and checked before policy and each mutation.
     pub admitted_scanner: Arc<ScannerConfig>,
@@ -5102,16 +5088,19 @@ fn finish_authorized_scanner_walk(
     None
 }
 
-/// Confirm actual reclaim before judging a previous dispatch as empty.
-/// `None` means its forecast was withdrawn while queued: lack of mutation
-/// cannot establish that the filesystem had no useful cleanup work.
+/// Confirm only this pass's actual reclaim after every queued copy retires.
+/// Pending work and a forecast withdrawn while queued are inconclusive:
+/// lack of mutation cannot establish that the filesystem had no useful work.
 fn confirm_scanner_dispatch(
-    reclaim_before: u64,
+    progress: &ScanDispatchProgress,
     prediction: Option<&PredictiveScanAdmission>,
     config: &SharedExecutorConfig,
     now: Instant,
 ) -> Option<bool> {
-    if config.reclaim_events() != reclaim_before {
+    if !progress.is_complete() {
+        return None;
+    }
+    if progress.reclaimed() {
         return Some(true);
     }
     prediction
@@ -12763,8 +12752,10 @@ fn join_worker_with_timeout(name: &str, handle: thread::JoinHandle<()>, timeout:
 /// What one scan pass has handed to the executor.
 #[derive(Debug, Default)]
 struct PassDispatch {
-    /// Candidates dispatched this pass (the inter-pass cooldown's signal).
+    /// Candidates handed to the executor, not a claim of actual reclaim.
     count: usize,
+    /// Receipts are exposed to backoff only after the last dispatch.
+    progress: Arc<ScanDispatchProgress>,
     /// Their paths. The pre-scan and the walk can nominate the same tree in
     /// one pass; a second batch for it arrives right after the first one
     /// deleted it, and a tree recreated in between can reuse the freed inode
@@ -12885,6 +12876,7 @@ fn dispatch_top_candidates(
 
     let mut batch = DeletionBatch {
         candidates: Vec::new(),
+        reclaim_progress: None,
         admitted_scanner: Arc::clone(&request.admitted_scanner),
         filesystem_reclaim: request.filesystem_reclaim.clone(),
         predictive_reclaim: request.predictive_reclaim.clone(),
@@ -12924,6 +12916,10 @@ fn dispatch_top_candidates(
     let batch_bytes = batch.candidates.iter().fold(0u64, |bytes, candidate| {
         bytes.saturating_add(candidate.size_bytes)
     });
+
+    // The receipt starts before publication. A refused send drops it with
+    // the batch, and every executor return retires it without a separate ack.
+    batch.reclaim_progress = Some(dispatched.progress.receipt());
 
     // Non-blocking send preserves scanner progress and avoids deadlock when
     // executor is slow. If channel is full, re-queue candidates locally so the
@@ -14443,12 +14439,12 @@ fn scanner_thread_main(
         // pass — the signal for whether the pass made reclaim progress (drives
         // the B6 empty-pass cooldown). A pass can surface many candidates yet
         // dispatch zero when they are all protected/dampened.
+        backoff.begin_pass();
         let mut dispatched_this_pass = PassDispatch::default();
         // Replay and the priority pre-scan may find more useful candidates
         // than fit one batch. Carry those alternatives into the walk instead
         // of discarding them when a stage hands off its first batch.
         let mut deferred_candidates = Vec::new();
-        let reclaim_at_pass_start = executor_config.reclaim_events();
         let mut scanner_should_exit = false;
         let mut scan_timed_out = false;
         let v2_candidate_byte_target = if scanner_index_enabled {
@@ -14682,8 +14678,10 @@ fn scanner_thread_main(
                             ),
                         });
                     }
-                    backoff
-                        .record_dispatch(reclaim_at_pass_start, request.predictive_reclaim.clone());
+                    backoff.record_dispatch(
+                        Arc::clone(&dispatched_this_pass.progress),
+                        request.predictive_reclaim.clone(),
+                    );
                     backoff.last_pass_level = Some(request_level);
                     continue;
                 }
@@ -15241,13 +15239,18 @@ fn scanner_thread_main(
                 if dispatched_this_pass.count == 0 {
                     backoff.record_empty(true, request_level, Instant::now());
                 } else {
-                    backoff
-                        .record_dispatch(reclaim_at_pass_start, request.predictive_reclaim.clone());
+                    backoff.record_dispatch(
+                        Arc::clone(&dispatched_this_pass.progress),
+                        request.predictive_reclaim.clone(),
+                    );
                 }
             } else if dispatched_this_pass.count > 0 {
                 // Earlier authorized mutations still count; withdrawal only
-                // makes an unchanged reclaim counter inconclusive.
-                backoff.record_pending(reclaim_at_pass_start, request.predictive_reclaim.clone());
+                // makes an unsuccessful completed pass inconclusive.
+                backoff.record_dispatch(
+                    Arc::clone(&dispatched_this_pass.progress),
+                    request.predictive_reclaim.clone(),
+                );
             }
             last_pass_duration = pass_started_at.elapsed();
             last_pass_finished_at = Some(Instant::now());
@@ -15301,7 +15304,10 @@ fn scanner_thread_main(
             }
             // The pre-scan alone met the byte target: a productive pass, which
             // still owes the duty cycle its cost (bd-os02).
-            backoff.record_dispatch(reclaim_at_pass_start, request.predictive_reclaim.clone());
+            backoff.record_dispatch(
+                Arc::clone(&dispatched_this_pass.progress),
+                request.predictive_reclaim.clone(),
+            );
             last_pass_duration = pass_started_at.elapsed();
             last_pass_finished_at = Some(Instant::now());
             backoff.last_pass_level = Some(request_level);
@@ -16096,12 +16102,18 @@ fn scanner_thread_main(
                     );
                 }
             } else {
-                backoff.record_dispatch(reclaim_at_pass_start, request.predictive_reclaim.clone());
+                backoff.record_dispatch(
+                    Arc::clone(&dispatched_this_pass.progress),
+                    request.predictive_reclaim.clone(),
+                );
             }
         } else if dispatched_this_pass.count > 0 {
             // Keep confirmation of earlier mutations without classifying
             // this interrupted pass as empty or complete.
-            backoff.record_pending(reclaim_at_pass_start, request.predictive_reclaim.clone());
+            backoff.record_dispatch(
+                Arc::clone(&dispatched_this_pass.progress),
+                request.predictive_reclaim.clone(),
+            );
         }
 
         // #15: record this pass's cost so the next pressure-driven pass owes
@@ -17516,8 +17528,11 @@ fn executor_thread_main(
 
         // Record deletions for repeat-deletion dampening.
         tracker.record_deletions(&report.deleted_paths);
-        if !report.dry_run && report.items_deleted > 0 {
-            shared_config.note_reclaim();
+        if !report.dry_run
+            && report.items_deleted > 0
+            && let Some(receipt) = &batch.reclaim_progress
+        {
+            receipt.note_reclaim();
         }
 
         if report.dry_run {
@@ -20519,7 +20534,10 @@ mod tests {
         assert!(daemon.pending_behavior_emergency.is_none());
         assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
         assert_eq!(
-            std::fs::read_to_string(&original_path).unwrap().lines().count(),
+            std::fs::read_to_string(&original_path)
+                .unwrap()
+                .lines()
+                .count(),
             2
         );
 
@@ -20591,7 +20609,10 @@ mod tests {
                 .any(|event| event["type"] == "pressure_changed")
         );
         assert_eq!(
-            std::fs::read_to_string(&original_path).unwrap().lines().count(),
+            std::fs::read_to_string(&original_path)
+                .unwrap()
+                .lines()
+                .count(),
             2,
             "unchanged destinations never repeated the original conditions"
         );
@@ -20602,8 +20623,7 @@ mod tests {
             "recovery",
             Duration::ZERO,
         );
-        reloaded.notifications.file.path =
-            original_path.with_file_name("after-recovery.jsonl");
+        reloaded.notifications.file.path = original_path.with_file_name("after-recovery.jsonl");
         daemon.apply_config_reload(Ok(reloaded));
         assert!(
             daemon.pending_behavior_emergency.is_none(),
@@ -20618,8 +20638,7 @@ mod tests {
             .filter(|event| event["event"] == "pressure_change")
             .count();
         assert_eq!(
-            transitions,
-            1,
+            transitions, 1,
             "delivery changes do not invent pressure transitions"
         );
     }
@@ -34182,6 +34201,7 @@ mod tests {
             Some(crate::scanner::walker::identity_for_path(&target, false).unwrap());
         let batch = DeletionBatch {
             candidates: vec![candidate],
+            reclaim_progress: None,
             admitted_scanner: Arc::new(scanner.clone()),
             pressure_level: PressureLevel::Red,
             urgency: 0.8,
@@ -34339,6 +34359,7 @@ mod tests {
         let live_scanner = RwLock::new(scanner.clone());
         let mut batch = DeletionBatch {
             candidates,
+            reclaim_progress: None,
             admitted_scanner: Arc::new(scanner.clone()),
             pressure_level: PressureLevel::Critical,
             urgency: 0.9,
@@ -34629,6 +34650,7 @@ mod tests {
             let (send, receive) = crossbeam_channel::bounded(1);
             send.send(DeletionBatch {
                 candidates: vec![candidate],
+                reclaim_progress: None,
                 admitted_scanner: Arc::new(scanner.clone()),
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.9,
@@ -34754,6 +34776,7 @@ mod tests {
         };
         let run = |paths: &[&PathBuf], target_only_root: Option<&Path>| {
             let mut batch = DeletionBatch {
+                reclaim_progress: None,
                 admitted_scanner: Arc::new(scanner.clone()),
                 candidates: paths
                     .iter()
@@ -35157,6 +35180,7 @@ mod tests {
         };
         let mut batch = DeletionBatch {
             candidates,
+            reclaim_progress: None,
             admitted_scanner: Arc::new(scanner.clone()),
             pressure_level: PressureLevel::Critical,
             urgency: 0.9,
@@ -35270,6 +35294,7 @@ mod tests {
         };
         let batch = |target_only_root: Option<PathBuf>| DeletionBatch {
             candidates: candidates(),
+            reclaim_progress: None,
             admitted_scanner: Arc::new(scanner.clone()),
             pressure_level: PressureLevel::Critical,
             urgency: 0.9,
@@ -35359,6 +35384,7 @@ mod tests {
         del_tx
             .send(DeletionBatch {
                 candidates,
+                reclaim_progress: None,
                 admitted_scanner: Arc::new(fixture.daemon.shared_scanner_config.read().clone()),
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.9,
@@ -35430,6 +35456,7 @@ mod tests {
         del_tx
             .send(DeletionBatch {
                 candidates,
+                reclaim_progress: None,
                 admitted_scanner: Arc::new(fixture.daemon.shared_scanner_config.read().clone()),
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.9,
@@ -35466,6 +35493,7 @@ mod tests {
     #[test]
     fn zero_byte_candidates_are_dropped_and_counted() {
         let mut batch = DeletionBatch {
+            reclaim_progress: None,
             admitted_scanner: test_scanner_admission(&[PathBuf::from("/data/tmp")]),
             candidates: vec![
                 test_candidate("/data/tmp/a/node_modules", 2.0),
@@ -35566,6 +35594,7 @@ mod tests {
             let expected = usize::from(mode == "inode");
             let mut batch = DeletionBatch {
                 candidates: candidates.clone(),
+                reclaim_progress: None,
                 admitted_scanner: Arc::new(scanner.clone()),
                 pressure_level: request.pressure_level,
                 urgency: request.urgency,
@@ -41406,8 +41435,10 @@ mod tests {
         let (send, receive) = bounded(1);
         let (reports, _report_rx) = bounded(8);
         let (feedback, _feedback_rx) = bounded(8);
+        let progress = Arc::new(ScanDispatchProgress::default());
         send.send(DeletionBatch {
             candidates: vec![candidate],
+            reclaim_progress: Some(progress.receipt()),
             admitted_scanner: Arc::new(fixture.daemon.shared_scanner_config.read().clone()),
             pressure_level: PressureLevel::Critical,
             urgency: 1.0,
@@ -41437,6 +41468,11 @@ mod tests {
         fixture.flush_logger();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"retained");
+        assert!(
+            progress.is_complete(),
+            "an executor early return retires its batch"
+        );
+        assert!(!progress.reclaimed(), "a held batch made no actual reclaim");
         let events = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
         assert!(
             events.contains("queued pressure Critical no longer confirmed"),
@@ -42263,6 +42299,7 @@ mod tests {
         // Send a deletion batch.
         let batch = DeletionBatch {
             candidates: Vec::new(),
+            reclaim_progress: None,
             admitted_scanner: Arc::clone(&received.admitted_scanner),
             pressure_level: PressureLevel::Orange,
             urgency: 0.5,
@@ -45123,19 +45160,25 @@ mod tests {
             test_candidate("/tmp/mid", 0.5),
         ];
 
+        let mut dispatched = PassDispatch::default();
         assert!(dispatch_top_candidates(
             &mut scored,
             &request,
             &del_tx,
-            &mut PassDispatch::default(),
+            &mut dispatched,
             &test_dispatch_config(),
         ));
+        assert!(!dispatched.progress.is_complete());
         let batch = del_rx.recv().expect("batch should be dispatched");
         assert_eq!(batch.candidates.len(), 1);
         assert_eq!(batch.candidates[0].path, Path::new("/tmp/high"));
         assert_eq!(scored.len(), 2);
         assert!(scored.iter().any(|c| c.path == Path::new("/tmp/mid")));
         assert!(scored.iter().any(|c| c.path == Path::new("/tmp/low")));
+        assert!(batch.reclaim_progress.is_some());
+        drop(batch);
+        assert!(dispatched.progress.is_complete());
+        assert!(!dispatched.progress.reclaimed());
     }
 
     #[test]
@@ -45162,6 +45205,7 @@ mod tests {
         del_tx
             .send(DeletionBatch {
                 candidates: vec![test_candidate("/tmp/already-queued", 0.2)],
+                reclaim_progress: None,
                 admitted_scanner: Arc::clone(&request.admitted_scanner),
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.5,
@@ -45194,6 +45238,10 @@ mod tests {
         assert_eq!((dispatched.count, dispatched.bytes), (0, 0));
         assert!(dispatched.paths.is_empty());
         assert!(dispatched.identities.is_empty());
+        assert!(
+            dispatched.progress.is_complete(),
+            "a refused queue send cannot leave an outstanding receipt"
+        );
 
         // Existing queued batch should still be the one currently in the channel.
         let queued = del_rx.recv().expect("prefilled batch still queued");

@@ -1712,6 +1712,7 @@ fn run_root(
     }
     let batch = DeletionBatch {
         candidates: selection.candidates,
+        reclaim_progress: None,
         admitted_scanner: Arc::new(config.scanner.clone()),
         filesystem_reclaim: None,
         predictive_reclaim: None,

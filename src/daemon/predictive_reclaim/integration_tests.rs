@@ -187,6 +187,7 @@ fn platform(mounts: &[PathBuf]) -> MockPlatform {
 fn batch(request: &ScanRequest, candidates: Vec<CandidacyScore>) -> DeletionBatch {
     DeletionBatch {
         candidates,
+        reclaim_progress: None,
         admitted_scanner: Arc::clone(&request.admitted_scanner),
         filesystem_reclaim: request.filesystem_reclaim.clone(),
         predictive_reclaim: request.predictive_reclaim.clone(),
@@ -540,25 +541,35 @@ fn withdrawn_queued_dispatch_is_not_confirmed_as_an_empty_pass() {
     let fixture = Fixture::new();
     let request = fixture.request(true);
     let admission = request.predictive_reclaim.as_ref();
-    let before = fixture.shared.reclaim_events();
+    let progress = Arc::new(ScanDispatchProgress::default());
+    let receipt = progress.receipt();
     assert_eq!(
-        confirm_scanner_dispatch(before, admission, &fixture.shared, Instant::now()),
+        confirm_scanner_dispatch(&progress, admission, &fixture.shared, Instant::now()),
+        None,
+        "queued work has not yet established an empty result",
+    );
+    drop(receipt);
+    assert_eq!(
+        confirm_scanner_dispatch(&progress, admission, &fixture.shared, Instant::now()),
         Some(false),
     );
     fixture.shared.predictive_reclaim.write().revoke_all();
     assert_eq!(
-        confirm_scanner_dispatch(before, admission, &fixture.shared, Instant::now()),
+        confirm_scanner_dispatch(&progress, admission, &fixture.shared, Instant::now()),
         None,
         "withdrawn queue authority is inconclusive, not an empty-pass escalation",
     );
     assert_eq!(
-        confirm_scanner_dispatch(before, None, &fixture.shared, Instant::now()),
+        confirm_scanner_dispatch(&progress, None, &fixture.shared, Instant::now()),
         Some(false),
         "ordinary dispatch confirmation keeps its existing behavior",
     );
-    fixture.shared.note_reclaim();
+    let completed = Arc::new(ScanDispatchProgress::default());
+    let receipt = completed.receipt();
+    receipt.note_reclaim();
+    drop(receipt);
     assert_eq!(
-        confirm_scanner_dispatch(before, admission, &fixture.shared, Instant::now()),
+        confirm_scanner_dispatch(&completed, admission, &fixture.shared, Instant::now()),
         Some(true),
         "actual reclaim still counts even if the forecast is later withdrawn",
     );
