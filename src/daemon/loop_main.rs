@@ -6731,12 +6731,18 @@ impl MonitoringDaemon {
         } else {
             Duration::from_secs(self.config.pressure.behavior_hysteresis_secs)
         };
+        let previous_memory_level = self.behavior_state.memory_level;
         let update = self.behavior_state.update_with_hysteresis(
             memory_level,
             disk_level,
             Instant::now(),
             hysteresis,
         );
+        if previous_memory_level != self.behavior_state.memory_level {
+            // A memory event can change a peer's cleanup permission while
+            // the monitor sleeps. Revoke old direct-prune authority first.
+            self.rch_staging.stop_running_pass();
+        }
         self.shared_executor_config.set_behavior_policy(
             self.behavior_state.table(),
             self.behavior_state.memory_level,
@@ -10435,11 +10441,16 @@ impl MonitoringDaemon {
         responses
             .iter()
             .filter(|tick| {
-                !self.shared_executor_config.compression_first.defers_mount(
-                    &tick.filesystem_response.causing_mount,
-                    tick.filesystem_response.level,
-                    now,
-                )
+                // These tiers have no RAM/inode exception. A pressured peer
+                // cannot authorize direct pruning through a held local cell.
+                self.shared_executor_config
+                    .dispatch_certainty_for(tick.filesystem_response.level, false, false)
+                    .is_ok()
+                    && !self.shared_executor_config.compression_first.defers_mount(
+                        &tick.filesystem_response.causing_mount,
+                        tick.filesystem_response.level,
+                        now,
+                    )
             })
             .map(|tick| {
                 (
@@ -22320,6 +22331,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn applied_memory_changes_revoke_staging_without_a_new_disk_tick() {
+        let mut fixture = RegretDaemonFixture::new();
+        fixture.daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            PressureLevel::Critical,
+            "startup",
+            Duration::ZERO,
+        );
+        let mut withdraw = |tier: &mut crate::daemon::rch_staging::RchStagingTier| {
+            std::mem::swap(&mut fixture.daemon.rch_staging, tier);
+            fixture.daemon.update_behavior_mode(
+                MemoryPressureLevel::Warn,
+                PressureLevel::Critical,
+                "startup",
+                Duration::ZERO,
+            );
+            // Returning to the admitted row cannot revive the old worker.
+            fixture.daemon.update_behavior_mode(
+                MemoryPressureLevel::Normal,
+                PressureLevel::Critical,
+                "startup",
+                Duration::ZERO,
+            );
+            std::mem::swap(&mut fixture.daemon.rch_staging, tier);
+        };
+        crate::daemon::rch_staging::tests::assert_monitor_withdraws_probe(&mut withdraw);
+        crate::daemon::rch_staging::tests::assert_monitor_withdraws_pass(&mut withdraw);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn failed_pressure_sampling_revokes_staging_probes_and_running_commands() {
         let mut fixture = RegretDaemonFixture::new();
         fixture.daemon.fs_collector = unavailable_pressure_collector();
@@ -28369,6 +28411,66 @@ mod tests {
                 .filesystem_tier_mounts(&[], Instant::now())
                 .is_empty()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dedicated_cleanup_tiers_honor_each_filesystems_applied_behavior_cell() {
+        use crate::daemon::policy::{BehaviorCellConfig, BehaviorConfig, BehaviorPreset};
+
+        let fixture = RegretDaemonFixture::new();
+        let daemon = &fixture.daemon;
+        let peer = fixture.directory.path().join("peer");
+        let critical = fixture.directory.path().join("critical");
+        let mut peer_tick = quarantine_tick(PressureLevel::Orange, &peer);
+        // Resource promotion must not grant these byte-only tiers an exception.
+        peer_tick.response.level = PressureLevel::Critical;
+        peer_tick.ram_reclaim = Some(RamReclaimRequest::new(
+            peer.clone(),
+            17,
+            100,
+            std::slice::from_ref(&peer),
+        ));
+        let responses = vec![
+            peer_tick,
+            quarantine_tick(PressureLevel::Critical, &critical),
+        ];
+        for cleanup in [CleanupAction::None, CleanupAction::IdentifyOnly] {
+            let mut config = BehaviorConfig {
+                preset: BehaviorPreset::Custom,
+                memory_never_reduces_cleanup: false,
+                ..BehaviorConfig::default()
+            };
+            config.cells.insert(
+                "normal_orange".to_string(),
+                BehaviorCellConfig {
+                    scan: ScanAggressiveness::Normal,
+                    cleanup,
+                    ballast: BallastAction::None,
+                    notify: NotificationPriority::Low,
+                },
+            );
+            let table = BehaviorDispatchTable::from_config(&config).unwrap();
+            daemon.shared_executor_config.set_behavior_policy(
+                &table,
+                MemoryPressureLevel::Normal,
+                PressureLevel::Critical,
+            );
+            let mounts = daemon.filesystem_tier_mounts(&responses, Instant::now());
+            assert!(!mounts.contains_key(&peer), "{cleanup:?}");
+            assert_eq!(mounts[&critical].0, PressureLevel::Critical);
+
+            // The applied memory row selects the permission; the held normal
+            // row cannot suppress a peer allowed by the current warn row.
+            daemon.shared_executor_config.set_behavior_policy(
+                &table,
+                MemoryPressureLevel::Warn,
+                PressureLevel::Critical,
+            );
+            let mounts = daemon.filesystem_tier_mounts(&responses, Instant::now());
+            assert_eq!(mounts[&peer].0, PressureLevel::Orange);
+            assert_eq!(mounts[&critical].0, PressureLevel::Critical);
+        }
     }
 
     #[cfg(unix)]

@@ -48,7 +48,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::core::config::{Config, PressureConfig, ScannerConfig};
-use crate::daemon::policy::{ActiveMode, PolicyConfig};
+use crate::daemon::policy::{ActiveMode, BehaviorConfig, PolicyConfig};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle};
 use crate::monitor::pid::PressureLevel;
 use crate::platform::pal::Platform;
@@ -639,11 +639,13 @@ fn run_base(
 
 /// Configuration that authorizes a pass. Keep the complete scanner settings
 /// so a newly added safety or idle-age setting cannot silently escape reload
-/// revocation. Pressure thresholds and policy settings also affect admission.
+/// revocation. Pressure thresholds, behavior cells, and policy settings also
+/// affect admission.
 #[derive(Debug)]
 struct PassScope {
     scanner: ScannerConfig,
     pressure: PressureConfig,
+    behavior: BehaviorConfig,
     policy: PolicyConfig,
 }
 
@@ -651,6 +653,7 @@ impl PassScope {
     fn matches(&self, config: &Config) -> bool {
         self.scanner == config.scanner
             && self.pressure == config.pressure
+            && self.behavior == config.behavior
             && self.policy == config.policy
     }
 }
@@ -760,6 +763,7 @@ impl RchStagingTier {
             self.scope = Some(PassScope {
                 scanner: config.scanner.clone(),
                 pressure: config.pressure.clone(),
+                behavior: config.behavior.clone(),
                 policy: config.policy.clone(),
             });
         }
@@ -1788,6 +1792,7 @@ pub(super) mod tests {
             "disabled",
             "kill_switch",
             "pressure",
+            "behavior",
         ] {
             let mut pass = PausedPass::new(PressureLevel::Red);
             let original = pass.config.clone();
@@ -1806,6 +1811,18 @@ pub(super) mod tests {
                 "disabled" => changed.scanner.rch_staging_bases.clear(),
                 "kill_switch" => changed.policy.kill_switch = true,
                 "pressure" => changed.pressure.green_min_free_pct += 1.0,
+                "behavior" => {
+                    changed.behavior.preset = crate::daemon::policy::BehaviorPreset::Custom;
+                    changed.behavior.cells.insert(
+                        "normal_red".to_string(),
+                        crate::daemon::policy::BehaviorCellConfig {
+                            scan: crate::daemon::policy::ScanAggressiveness::Normal,
+                            cleanup: crate::daemon::policy::CleanupAction::IdentifyOnly,
+                            ballast: crate::daemon::policy::BallastAction::None,
+                            notify: crate::daemon::policy::NotificationPriority::Low,
+                        },
+                    );
+                }
                 _ => unreachable!(),
             }
             let old_stop = Arc::clone(&pass.tier.stop);
