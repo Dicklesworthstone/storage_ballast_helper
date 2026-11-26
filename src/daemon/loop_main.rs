@@ -424,6 +424,7 @@ impl SharedExecutorConfig {
         }
 
         let mode = policy.0.mode_for(policy.1, level);
+        drop(policy);
         if !behavior_allows_delete_dispatch(mode) {
             return Err(SkipReason::PolicyChanged);
         }
@@ -1918,8 +1919,13 @@ impl DeletionBatch {
         shared: &SharedExecutorConfig,
         now: Instant,
     ) -> std::result::Result<(), SkipReason> {
-        let min_score = self.min_score(shared, now)?;
+        let mut min_score = self.min_score(shared, now)?;
         let min_certainty = self.min_certainty(shared)?;
+        if self.predictive_reclaim.is_none() {
+            // Certainty renewal can wait behind a behavior-policy writer. An
+            // ordinary score floor tightened during that wait must apply now.
+            min_score = shared.min_score();
+        }
         if !min_score.is_finite()
             || !candidate.total_score.is_finite()
             || candidate.total_score < min_score
