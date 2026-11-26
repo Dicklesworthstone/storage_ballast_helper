@@ -109,6 +109,9 @@ pub enum NotificationEvent {
         mount: String,
         minutes_remaining: f64,
         confidence: f64,
+        /// Tier selected by the configured predictive policy that admitted
+        /// this warning. Delivery may cap it for low confidence.
+        action_level: NotificationLevel,
     },
     CleanupCompleted {
         items_deleted: usize,
@@ -197,27 +200,14 @@ impl NotificationEvent {
             },
 
             Self::PredictiveWarning {
-                minutes_remaining,
+                action_level,
                 confidence,
                 ..
             } => {
-                // Determine severity from time-to-exhaustion.
-                // Thresholds must match check_predictive_warning() in loop_main.rs
-                // to avoid level-mismatch where the journal shows [CRIT] but the
-                // cooldown logic considers the event Red, causing back-to-back CRITs.
-                // Defaults: critical < 2 min, red < 5 min, orange < 30 min.
-                let time_level = if *minutes_remaining < 2.0 {
-                    NotificationLevel::Critical
-                } else if *minutes_remaining < 5.0 {
-                    NotificationLevel::Red
-                } else if *minutes_remaining < 30.0 {
-                    NotificationLevel::Orange
-                } else {
-                    NotificationLevel::Warning
-                };
-
-                // Cap severity when confidence is low to avoid CRIT spam from
-                // unreliable predictions (e.g. 1% confidence → Info, suppressed).
+                // The admitted action already reflects configured horizons and
+                // their inclusive boundaries. Reclassifying its runway against
+                // defaults could hide a Critical action from urgent channels.
+                // Keep confidence caps independent of that time-pressure tier.
                 let confidence_cap = if *confidence < 0.3 {
                     NotificationLevel::Info
                 } else if *confidence < 0.5 {
@@ -228,12 +218,7 @@ impl NotificationEvent {
                     NotificationLevel::Critical // no cap
                 };
 
-                // Take the lesser of time-based and confidence-capped levels.
-                if time_level <= confidence_cap {
-                    time_level
-                } else {
-                    confidence_cap
-                }
+                (*action_level).min(confidence_cap)
             }
 
             Self::CleanupCompleted {
@@ -365,6 +350,7 @@ impl NotificationEvent {
                 mount,
                 minutes_remaining,
                 confidence,
+                ..
             } => {
                 let pct = confidence * 100.0;
                 format!(
@@ -1514,22 +1500,22 @@ mod tests {
 
     #[test]
     fn event_level_predictive_warning_imminent() {
-        // 1.5 min < 2 min critical threshold → Critical
         let event = NotificationEvent::PredictiveWarning {
             mount: "/data".to_string(),
             minutes_remaining: 1.5,
             confidence: 0.92,
+            action_level: NotificationLevel::Critical,
         };
         assert_eq!(event.level(), NotificationLevel::Critical);
     }
 
     #[test]
     fn event_level_predictive_warning_red_zone() {
-        // 3 min: >= 2 (not critical) but < 5 (imminent) → Red
         let event = NotificationEvent::PredictiveWarning {
             mount: "/data".to_string(),
             minutes_remaining: 3.0,
             confidence: 0.92,
+            action_level: NotificationLevel::Red,
         };
         assert_eq!(event.level(), NotificationLevel::Red);
     }
@@ -1540,39 +1526,53 @@ mod tests {
             mount: "/data".to_string(),
             minutes_remaining: 25.0,
             confidence: 0.85,
+            action_level: NotificationLevel::Orange,
         };
         assert_eq!(event.level(), NotificationLevel::Orange);
     }
 
     #[test]
     fn event_level_predictive_warning_low_confidence_caps_to_info() {
-        // confidence 0.10 (10%) < 0.3 → cap at Info, even though time says Critical.
+        // Confidence 0.10 caps the admitted Critical tier at Info.
         let event = NotificationEvent::PredictiveWarning {
             mount: "/".to_string(),
             minutes_remaining: 0.5,
             confidence: 0.10,
+            action_level: NotificationLevel::Critical,
         };
         assert_eq!(event.level(), NotificationLevel::Info);
     }
 
     #[test]
     fn event_level_predictive_warning_medium_confidence_caps_to_warning() {
-        // confidence 0.40 → cap at Warning, time says Critical.
+        // Confidence 0.40 caps the admitted Critical tier at Warning.
         let event = NotificationEvent::PredictiveWarning {
             mount: "/".to_string(),
             minutes_remaining: 1.0,
             confidence: 0.40,
+            action_level: NotificationLevel::Critical,
         };
         assert_eq!(event.level(), NotificationLevel::Warning);
     }
 
     #[test]
+    fn event_level_predictive_warning_elevated_confidence_caps_to_orange() {
+        let event = NotificationEvent::PredictiveWarning {
+            mount: "/".to_string(),
+            minutes_remaining: 8.0,
+            confidence: 0.60,
+            action_level: NotificationLevel::Critical,
+        };
+        assert_eq!(event.level(), NotificationLevel::Orange);
+    }
+
+    #[test]
     fn event_level_predictive_warning_high_confidence_no_cap() {
-        // confidence 0.92 → no cap, Critical from time stays.
         let event = NotificationEvent::PredictiveWarning {
             mount: "/".to_string(),
             minutes_remaining: 1.0,
             confidence: 0.92,
+            action_level: NotificationLevel::Critical,
         };
         assert_eq!(event.level(), NotificationLevel::Critical);
     }
@@ -1583,6 +1583,7 @@ mod tests {
             mount: "/data".to_string(),
             minutes_remaining: 3.0,
             confidence: 0.92,
+            action_level: NotificationLevel::Red,
         };
         let summary = event.summary();
         // 0.92 * 100 = 92.0 → "92%"
@@ -1590,6 +1591,34 @@ mod tests {
             summary.contains("92%"),
             "expected '92%' in summary: {summary}"
         );
+    }
+
+    #[test]
+    fn predictive_warning_record_preserves_action_tier_and_confidence_cap() {
+        let event = NotificationEvent::PredictiveWarning {
+            mount: "/filling".into(),
+            minutes_remaining: 8.0,
+            confidence: 0.60,
+            action_level: NotificationLevel::Critical,
+        };
+        let record = NotificationRecord {
+            ts: "2026-11-26T00:00:00Z".into(),
+            level: event.level(),
+            summary: event.summary(),
+            event,
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["action_level"], "critical");
+        assert_eq!(value["level"], "orange");
+        let decoded: NotificationEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.level(), NotificationLevel::Orange);
+        assert!(matches!(
+            decoded,
+            NotificationEvent::PredictiveWarning {
+                action_level: NotificationLevel::Critical,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2032,6 +2061,49 @@ mod tests {
     }
 
     #[test]
+    fn predictive_action_tier_controls_channel_filtering_and_cooldown() {
+        let config = NotificationConfig {
+            channels: vec!["journal".into()],
+            journal: JournalConfig {
+                min_level: NotificationLevel::Critical,
+            },
+            ..NotificationConfig::default()
+        };
+        let mut manager = NotificationManager::from_config(&config);
+        let delivered = install_probe(&mut manager, "journal", None);
+        let now = Instant::now();
+        let critical = NotificationEvent::PredictiveWarning {
+            mount: "/filling".into(),
+            minutes_remaining: 8.0,
+            confidence: 0.95,
+            action_level: NotificationLevel::Critical,
+        };
+        assert_eq!(
+            manager.notify_at(&critical, now),
+            NotificationDispatchOutcome::Accepted
+        );
+        assert_eq!(
+            manager.notify_at(&critical, now + Duration::from_secs(1)),
+            NotificationDispatchOutcome::Throttled
+        );
+
+        // Narrower configured horizons may put a short runway in an early
+        // warning tier. A channel must not promote it using default horizons.
+        let warning = NotificationEvent::PredictiveWarning {
+            mount: "/early".into(),
+            minutes_remaining: 1.5,
+            confidence: 0.95,
+            action_level: NotificationLevel::Warning,
+        };
+        assert_eq!(
+            manager.notify_at(&warning, now),
+            NotificationDispatchOutcome::Unavailable
+        );
+        assert!(manager.drain(Duration::from_secs(5)));
+        assert_eq!(delivered.try_iter().collect::<Vec<_>>(), vec!["/filling"]);
+    }
+
+    #[test]
     fn blocked_delivery_does_not_block_notify_reload_or_another_channel() {
         let (_directory, mut config, _) = notification_fixture();
         config.channels = vec!["file".into(), "journal".into()];
@@ -2418,7 +2490,11 @@ mod tests {
         manager.notify(&pressure_event("/data", NotificationLevel::Critical));
         manager.notify(&event);
         let records = recorded_notifications(&config, &manager);
-        assert_eq!(records.len(), 2, "byte pressure cannot silence inode pressure");
+        assert_eq!(
+            records.len(),
+            2,
+            "byte pressure cannot silence inode pressure"
+        );
         let inode = &records[1];
         assert_eq!(inode["type"], "inode_pressure_changed");
         assert_eq!(inode["level"], "critical");
@@ -2429,13 +2505,20 @@ mod tests {
         assert!(event.summary().contains("50/10000 inodes available"));
 
         let channel = WebhookChannel::new(&WebhookConfig {
-            template: "{\"mount\":\"${MOUNT}\",\"free\":\"${FREE_PCT}\",\"message\":\"${SUMMARY}\"}".into(),
+            template:
+                "{\"mount\":\"${MOUNT}\",\"free\":\"${FREE_PCT}\",\"message\":\"${SUMMARY}\"}"
+                    .into(),
             ..WebhookConfig::default()
         });
         let body: serde_json::Value = serde_json::from_str(&channel.render_body(&event)).unwrap();
         assert_eq!(body["mount"], "/data");
         assert_eq!(body["free"], "0.5");
-        assert!(body["message"].as_str().unwrap().contains("inodes available"));
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("inodes available")
+        );
     }
 
     #[test]
@@ -2470,7 +2553,10 @@ mod tests {
         let (release, wait) = bounded(1);
         let delivered = install_probe(&mut manager, "file", Some(wait));
         manager.notify(&pressure_event("/data", NotificationLevel::Critical));
-        assert_eq!(delivered.recv_timeout(Duration::from_secs(5)).unwrap(), "/data");
+        assert_eq!(
+            delivered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "/data"
+        );
         for index in 0..CHANNEL_QUEUE_CAPACITY {
             manager.notify(&pressure_event(
                 &format!("/queued-{index}"),
@@ -2480,11 +2566,15 @@ mod tests {
         let events = [inode_event("/data"), swap_event()];
         let now = Instant::now();
         for event in &events {
-            assert_eq!(manager.notify_at(event, now), NotificationDispatchOutcome::Unavailable);
-            assert!(!manager.last_send_by_scope.contains_key(&(
-                event.type_key(),
-                event.throttle_scope().into(),
-            )));
+            assert_eq!(
+                manager.notify_at(event, now),
+                NotificationDispatchOutcome::Unavailable
+            );
+            assert!(
+                !manager
+                    .last_send_by_scope
+                    .contains_key(&(event.type_key(), event.throttle_scope().into(),))
+            );
         }
         assert_eq!(manager.dropped_count(), 2);
         drop(release);
@@ -2677,6 +2767,7 @@ mod tests {
             mount: "/filling".into(),
             minutes_remaining: 1.0,
             confidence: 0.95,
+            action_level: NotificationLevel::Critical,
         };
         let now = Instant::now();
         assert_eq!(
@@ -2730,6 +2821,7 @@ mod tests {
                 mount: mount.into(),
                 minutes_remaining: 1.0,
                 confidence: 0.95,
+                action_level: NotificationLevel::Critical,
             };
             assert_eq!(manager.notify_at(&event, now), expected);
         }

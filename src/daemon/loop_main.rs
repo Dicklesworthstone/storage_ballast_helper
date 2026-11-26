@@ -2815,25 +2815,44 @@ fn predictive_warning_event(
     } else {
         &tick.predictive_action
     };
-    let (mount, minutes_remaining, confidence) = match action {
+    let (mount, minutes_remaining, confidence, action_level) = match action {
         PredictiveAction::Clear => return None,
         PredictiveAction::EarlyWarning {
             mount,
             minutes_remaining,
             confidence,
             ..
-        }
-        | PredictiveAction::PreemptiveCleanup {
+        } => (
+            mount,
+            *minutes_remaining,
+            *confidence,
+            NotificationLevel::Warning,
+        ),
+        PredictiveAction::PreemptiveCleanup {
             mount,
             minutes_remaining,
             confidence,
             ..
-        } => (mount, *minutes_remaining, *confidence),
+        } => (
+            mount,
+            *minutes_remaining,
+            *confidence,
+            NotificationLevel::Orange,
+        ),
         PredictiveAction::ImminentDanger {
             mount,
             minutes_remaining,
-            ..
-        } => (mount, *minutes_remaining, tick.rate.confidence),
+            critical,
+        } => (
+            mount,
+            *minutes_remaining,
+            tick.rate.confidence,
+            if *critical {
+                NotificationLevel::Critical
+            } else {
+                NotificationLevel::Red
+            },
+        ),
     };
     // A collapsed bound cannot substantiate an immediate-exhaustion notice.
     // Only the separate, unadjusted policy evaluation can supply a deadline
@@ -2852,6 +2871,7 @@ fn predictive_warning_event(
         mount: mount.to_string_lossy().into_owned(),
         minutes_remaining,
         confidence,
+        action_level,
     })
 }
 
@@ -25552,6 +25572,98 @@ mod tests {
             warnings
                 .iter()
                 .all(|event| { event["mount"] == "/filling" && event["level"] == "critical" })
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_predictive_warning_levels(
+        config: &PredictionConfig,
+        cases: &[(u32, NotificationLevel)],
+    ) {
+        use crate::monitor::ewma::{BurstState, Trend};
+
+        let policy = PredictiveActionPolicy::from_config(config.clone());
+        let mount = Path::new("/filling");
+        for &(seconds, expected) in cases {
+            let estimate = RateEstimate {
+                bytes_per_second: 1_000.0,
+                forecast_rate_bytes_per_second: Some(1_000.0),
+                acceleration: 0.0,
+                seconds_to_exhaustion: f64::from(seconds),
+                seconds_to_threshold: f64::from(seconds) / 2.0,
+                sample_count: 100,
+                confidence: 0.95,
+                trend: Trend::Stable,
+                alpha_used: 0.3,
+                fallback_active: false,
+                burst_state: BurstState::default(),
+                free_bytes: u64::from(seconds) * 1_000,
+            };
+            let mut tick = predictive_warning_tick(mount, f64::from(seconds) / 60.0);
+            tick.rate.confidence = estimate.confidence;
+            tick.predictive_action = policy.evaluate(&estimate, 12.0, mount.to_path_buf());
+            let event = predictive_warning_event(&tick, config)
+                .expect("a reliable forecast inside the warning horizon must produce an alert");
+            assert_eq!(
+                event.level(),
+                expected,
+                "runway={seconds}s, action={:?}",
+                tick.predictive_action
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn predictive_warning_levels_include_default_policy_boundaries() {
+        assert_predictive_warning_levels(
+            &PredictionConfig::default(),
+            &[
+                (120, NotificationLevel::Critical),
+                (121, NotificationLevel::Red),
+                (300, NotificationLevel::Red),
+                (301, NotificationLevel::Orange),
+                (1_800, NotificationLevel::Orange),
+                (1_801, NotificationLevel::Warning),
+                (3_600, NotificationLevel::Warning),
+            ],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn predictive_warning_levels_follow_configured_action_horizons() {
+        assert_predictive_warning_levels(
+            &PredictionConfig {
+                critical_danger_minutes: 10.0,
+                imminent_danger_minutes: 15.0,
+                action_horizon_minutes: 45.0,
+                warning_horizon_minutes: 90.0,
+                ..PredictionConfig::default()
+            },
+            &[
+                (480, NotificationLevel::Critical),
+                (600, NotificationLevel::Critical),
+                (720, NotificationLevel::Red),
+                (900, NotificationLevel::Red),
+                (2_400, NotificationLevel::Orange),
+                (2_700, NotificationLevel::Orange),
+                (3_600, NotificationLevel::Warning),
+            ],
+        );
+        assert_predictive_warning_levels(
+            &PredictionConfig {
+                critical_danger_minutes: 0.25,
+                imminent_danger_minutes: 0.5,
+                action_horizon_minutes: 1.0,
+                ..PredictionConfig::default()
+            },
+            &[
+                (12, NotificationLevel::Critical),
+                (24, NotificationLevel::Red),
+                (45, NotificationLevel::Orange),
+                (90, NotificationLevel::Warning),
+            ],
         );
     }
 
