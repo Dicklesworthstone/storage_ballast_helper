@@ -623,7 +623,12 @@ impl QuarantineSweepContext {
         self.authorize_mutation(approved_mode)?;
         // A still-unidentified incident holds overlapping paths, not every
         // store under the mount. Device holds are resolved from this store.
-        self.executor.authorize_recovery_path(mutation_path, None)
+        self.executor.authorize_recovery_path(mutation_path, None)?;
+        // TTL/cap selects held entries but cannot override this filesystem's
+        // live None/IdentifyOnly cell. Certainty applies to fresh candidates,
+        // so do not rescore historical quarantine manifests here.
+        self.executor.dispatch_certainty_for(level, false, false)?;
+        Ok(())
     }
 
     pub(super) fn authorize_pressure(
@@ -684,7 +689,15 @@ impl QuarantineSweepContext {
         {
             return Err(SkipReason::CompressionFirst);
         }
-        self.executor.authorize_recovery_path(store.root(), None)
+        self.executor.authorize_recovery_path(store.root(), None)?;
+        // Native probes may block while the behavior table changes. Renew the
+        // selected filesystem's permission, retaining separate RAM/inode scope.
+        self.executor.dispatch_certainty_for(
+            level,
+            tick.ram_reclaim.is_some(),
+            tick.inode_reclaim.is_some(),
+        )?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -882,11 +895,19 @@ impl QuarantineSweepContext {
 mod tests {
     use super::*;
     use crate::core::config::PathsConfig;
+    use crate::daemon::inode_reclaim::InodeReclaimRequest;
     use crate::daemon::loop_main::DaemonArgs;
+    use crate::daemon::policy::{
+        BehaviorCellConfig, BehaviorConfig, BehaviorDispatchTable, BehaviorPreset, CleanupAction,
+    };
+    use crate::daemon::ram_reclaim::RamReclaimRequest;
     use crate::daemon::self_monitor::MountRateState;
     use crate::monitor::pid::PressureResponse;
     use crate::monitor::predictive::PredictiveAction;
-    use crate::platform::pal::{FsStats, MemoryInfo, MockPlatform, MountPoint, PlatformPaths};
+    use crate::platform::pal::{
+        FsStats, InodeStats, MemoryInfo, MockPlatform, MountPoint, PlatformPaths,
+    };
+    use crate::platform::types::MemoryPressureLevel;
     use crate::scanner::regret::Outcome;
     use crate::scanner::scoring::ArtifactCertainty;
     use std::fs;
@@ -899,6 +920,10 @@ mod tests {
 
     impl Fixture {
         fn new(pressured: bool) -> Self {
+            Self::with_available(if pressured { 1 << 30 } else { 90 << 30 })
+        }
+
+        fn with_available(available: u64) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let base = directory.path();
             let root = base.join("scan");
@@ -916,7 +941,6 @@ mod tests {
             config.scanner.quarantine_max_bytes_pct = 0;
             config.ballast.auto_provision = false;
             config.policy.initial_mode = ActiveMode::Enforce;
-            let available = if pressured { 1 << 30 } else { 90 << 30 };
             let platform = MockPlatform::new(
                 vec![MountPoint {
                     path: PathBuf::from("/"),
@@ -974,23 +998,27 @@ mod tests {
                 .unwrap()
         }
 
-        fn sweep(&self, pressured: bool) -> QuarantineSweepCompletion {
+        fn hold_legacy(&self, id: &str, ttl: Duration) -> QuarantineRecord {
+            let source = self.root.join(id);
+            fs::write(&source, b"retained").unwrap();
+            QuarantineStore::under(&self.root)
+                .quarantine(&source, id, 8, ttl, None)
+                .unwrap()
+        }
+
+        fn tick(&self, level: PressureLevel, mount: &Path) -> MountTickResponse {
             let response = PressureResponse {
-                level: if pressured {
-                    PressureLevel::Critical
-                } else {
-                    PressureLevel::Green
-                },
+                level,
                 urgency: 0.7,
                 scan_interval: Duration::from_secs(1),
                 release_ballast_files: 0,
                 max_delete_batch: 10,
                 fallback_active: false,
-                causing_mount: PathBuf::from("/"),
-                free_pct: if pressured { 1.0 } else { 90.0 },
+                causing_mount: mount.to_path_buf(),
+                free_pct: self.daemon.platform.fs_stats(mount).unwrap().free_pct(),
                 predicted_seconds: None,
             };
-            let tick = MountTickResponse {
+            MountTickResponse {
                 filesystem_response: response.clone(),
                 response,
                 backing_pressure: None,
@@ -1004,7 +1032,19 @@ mod tests {
                 imminent_danger: false,
                 rate: MountRateState::default(),
                 device_id: None,
-            };
+            }
+        }
+
+        fn sweep(&self, pressured: bool) -> QuarantineSweepCompletion {
+            self.sweep_at(if pressured {
+                PressureLevel::Critical
+            } else {
+                PressureLevel::Green
+            })
+        }
+
+        fn sweep_at(&self, level: PressureLevel) -> QuarantineSweepCompletion {
+            let tick = self.tick(level, Path::new("/"));
             QuarantineSweepContext::new(&self.daemon).run_inline(
                 &tick,
                 vec![self.root.clone()],
@@ -1019,6 +1059,311 @@ mod tests {
             self.daemon.logger_handle.shutdown();
             if let Some(logger) = self.daemon.logger_join.take() {
                 let _ = logger.join();
+            }
+        }
+    }
+
+    fn peer_behavior(level: PressureLevel, cleanup: CleanupAction) -> BehaviorConfig {
+        let mut config = BehaviorConfig {
+            preset: BehaviorPreset::Custom,
+            memory_never_reduces_cleanup: false,
+            ..BehaviorConfig::default()
+        };
+        let key = match level {
+            PressureLevel::Green => "normal_green",
+            PressureLevel::Orange => "normal_orange",
+            _ => panic!("fixture uses only Green and Orange peers"),
+        };
+        let mode = BehaviorDispatchTable::default().mode_for(MemoryPressureLevel::Normal, level);
+        config.cells.insert(
+            key.into(),
+            BehaviorCellConfig {
+                scan: mode.scan_aggressiveness,
+                cleanup,
+                ballast: mode.ballast_action,
+                notify: mode.notification_priority,
+            },
+        );
+        config
+    }
+
+    fn resource_platform(root: &Path, ram: bool) -> MockPlatform {
+        let fs_type = if ram { "tmpfs" } else { "mockfs" };
+        MockPlatform::new(
+            vec![MountPoint {
+                path: root.to_path_buf(),
+                device: "mock-resource".into(),
+                fs_type: fs_type.into(),
+                is_ram_backed: ram,
+            }],
+            HashMap::from([(
+                root.to_path_buf(),
+                FsStats {
+                    total_bytes: 100_000,
+                    free_bytes: 90_000,
+                    available_bytes: 90_000,
+                    fs_type: fs_type.into(),
+                    mount_point: root.to_path_buf(),
+                    is_readonly: false,
+                },
+            )]),
+            MemoryInfo {
+                total_bytes: 64_000,
+                available_bytes: 32_000,
+                swap_total_bytes: 8_000,
+                swap_free_bytes: 0,
+            },
+            PlatformPaths::default(),
+        )
+        .with_inode_stats(HashMap::from([(
+            root.to_path_buf(),
+            InodeStats {
+                total: 10_000,
+                free: 100,
+                available: 100,
+            },
+        )]))
+    }
+
+    #[test]
+    fn quarantine_sweeps_respect_each_mounts_behavior_cell() {
+        for mode in ["pressure", "ttl", "cap"] {
+            for cleanup in [CleanupAction::None, CleanupAction::IdentifyOnly] {
+                let pressured = mode == "pressure";
+                let level = if pressured {
+                    PressureLevel::Orange
+                } else {
+                    PressureLevel::Green
+                };
+                let mut fixture =
+                    Fixture::with_available(if pressured { 12 << 30 } else { 90 << 30 });
+                let ttl = if mode == "ttl" {
+                    Duration::ZERO
+                } else {
+                    Duration::from_hours(24)
+                };
+                let record = fixture.hold("held", "RustTarget", ttl);
+                let mut config = fixture.daemon.config.clone();
+                config.behavior = peer_behavior(level, cleanup);
+                fixture.daemon.apply_config_reload(Ok(config));
+                fixture.daemon.update_behavior_mode(
+                    MemoryPressureLevel::Normal,
+                    PressureLevel::Critical,
+                    "startup",
+                    Duration::ZERO,
+                );
+                let global_mode = fixture.daemon.behavior_state.mode;
+                assert_eq!(
+                    global_mode.cleanup_action,
+                    CleanupAction::AnyDefiniteCandidate
+                );
+                assert_eq!(
+                    fixture.daemon.shared_executor_config.min_certainty(),
+                    ArtifactCertainty::Unclear
+                );
+
+                let completion = fixture.sweep_at(level);
+                assert!(completion.attempted);
+                assert_eq!(completion.held_bytes, Some(8), "{mode}: {cleanup:?}");
+                assert_eq!(
+                    fs::read(record.quarantine_path.join("payload.bin")).unwrap(),
+                    b"retained"
+                );
+                let store = QuarantineStore::under(&fixture.root);
+                assert_eq!(store.record("held").unwrap(), Some(record));
+                assert!(store.stuck_entries().unwrap().is_empty());
+                let restored = store.restore("held", false).unwrap();
+                assert_eq!(
+                    fs::read(restored.restored_to.join("payload.bin")).unwrap(),
+                    b"retained"
+                );
+
+                // An allowed peer still honors TTL/cap and the original quarantine
+                // decision, including a legacy manifest without scoring evidence.
+                let mut config = fixture.daemon.config.clone();
+                config.behavior = BehaviorConfig::default();
+                fixture.daemon.apply_config_reload(Ok(config));
+                assert_eq!(fixture.daemon.behavior_state.mode, global_mode);
+                let legacy = fixture.hold_legacy("legacy", ttl);
+                assert_eq!(fixture.sweep_at(level).held_bytes, Some(0));
+                assert!(!legacy.quarantine_path.exists());
+                assert!(store.record("legacy").unwrap().is_none());
+                assert!(store.stuck_entries().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn quarantine_purges_renew_peer_behavior_after_manifest_admission() {
+        for mode in ["pressure", "ttl", "cap"] {
+            for cleanup in [CleanupAction::None, CleanupAction::IdentifyOnly] {
+                let pressured = mode == "pressure";
+                let level = if pressured {
+                    PressureLevel::Orange
+                } else {
+                    PressureLevel::Green
+                };
+                let mut fixture =
+                    Fixture::with_available(if pressured { 12 << 30 } else { 90 << 30 });
+                let ttl = if mode == "ttl" {
+                    Duration::ZERO
+                } else {
+                    Duration::from_hours(24)
+                };
+                let record = fixture.hold("late", "RustTarget", ttl);
+                let store = QuarantineStore::under(&fixture.root);
+                fixture.daemon.update_behavior_mode(
+                    MemoryPressureLevel::Normal,
+                    PressureLevel::Critical,
+                    "startup",
+                    Duration::ZERO,
+                );
+                let global_mode = fixture.daemon.behavior_state.mode;
+                let context = QuarantineSweepContext::new(&fixture.daemon);
+                let tick = fixture.tick(level, Path::new("/"));
+                let mut calls = 0usize;
+                let gate = |record: &QuarantineRecord| {
+                    calls += 1;
+                    if calls == 2 {
+                        // First admission succeeded. Reload the peer cell after
+                        // durable purge intent, before the first payload unlink.
+                        let mut config = fixture.daemon.config.clone();
+                        config.behavior = peer_behavior(level, cleanup);
+                        fixture.daemon.apply_config_reload(Ok(config));
+                        assert_eq!(fixture.daemon.behavior_state.mode, global_mode);
+                        assert_eq!(
+                            fixture.daemon.shared_executor_config.min_certainty(),
+                            ArtifactCertainty::Unclear
+                        );
+                    }
+                    if pressured {
+                        context
+                            .authorize_pressure(&tick, &store, record, ActiveMode::Enforce)
+                            .is_ok()
+                    } else {
+                        context
+                            .authorize_maintenance(
+                                Path::new("/"),
+                                store.root(),
+                                level,
+                                ActiveMode::Enforce,
+                            )
+                            .is_ok()
+                    }
+                };
+                let now = if mode == "ttl" {
+                    record.expires_at
+                } else {
+                    record.quarantined_at
+                };
+                let swept = if pressured {
+                    store.sweep_with_pressure_gate(now, QuarantineSweepMode::Pressure, gate)
+                } else {
+                    store.sweep_with_gates(
+                        now,
+                        QuarantineSweepMode::Maintenance { cap_bytes: Some(0) },
+                        |_| panic!("maintenance cannot borrow resource selection"),
+                        |_| panic!("maintenance cannot borrow pressure authority"),
+                        gate,
+                    )
+                }
+                .unwrap();
+                assert_eq!(calls, 2, "{mode}: {cleanup:?}");
+                assert_eq!(swept.drained.counts(), (0, 0));
+                assert_eq!(swept.held_bytes, 8);
+                assert_eq!(swept.drained.deferred_entries, 1);
+                assert!(swept.drained.completed.is_empty());
+                assert!(swept.drained.failures.is_empty());
+                assert!(!swept.drained.budget_exhausted);
+                assert!(store.stuck_entries().unwrap().is_empty());
+                assert_eq!(
+                    fs::read(record.quarantine_path.join("payload.bin")).unwrap(),
+                    b"retained"
+                );
+                let restored = store.restore("late", false).unwrap();
+                assert_eq!(
+                    fs::read(restored.restored_to.join("payload.bin")).unwrap(),
+                    b"retained"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quarantine_resource_relief_retains_its_own_authority_and_allowance() {
+        for ram in [false, true] {
+            for cleanup in [CleanupAction::None, CleanupAction::IdentifyOnly] {
+                let mut fixture = Fixture::new(false);
+                let legacy = fixture.hold_legacy("a-legacy", Duration::from_hours(24));
+                let approved = fixture.hold("b-approved", "RustTarget", Duration::from_hours(24));
+                fixture.daemon.platform = Arc::new(resource_platform(&fixture.root, ram));
+                let table = BehaviorDispatchTable::from_config(&peer_behavior(
+                    PressureLevel::Orange,
+                    cleanup,
+                ))
+                .unwrap();
+                fixture.daemon.shared_executor_config.set_behavior_policy(
+                    &table,
+                    MemoryPressureLevel::Normal,
+                    PressureLevel::Critical,
+                );
+                assert_eq!(
+                    fixture.daemon.shared_executor_config.dispatch_certainty_for(
+                        PressureLevel::Orange,
+                        false,
+                        false,
+                    ),
+                    Err(SkipReason::PolicyChanged),
+                );
+                let mut tick = fixture.tick(PressureLevel::Orange, &fixture.root);
+                tick.filesystem_response.level = PressureLevel::Green;
+                if ram {
+                    tick.ram_reclaim = Some(RamReclaimRequest::new(
+                        fixture.root.clone(),
+                        approved.device_id,
+                        8,
+                        std::slice::from_ref(&fixture.root),
+                    ));
+                } else {
+                    let mut policy = fixture
+                        .daemon
+                        .shared_executor_config
+                        .inode_pressure
+                        .read()
+                        .clone();
+                    policy.enabled = true;
+                    *fixture.daemon.shared_executor_config.inode_pressure.write() = policy.clone();
+                    tick.inode_reclaim = Some(InodeReclaimRequest::new(
+                        fixture.root.clone(),
+                        approved.device_id,
+                        10_000,
+                        2_000,
+                        1,
+                        &policy,
+                        std::slice::from_ref(&fixture.root),
+                    ));
+                }
+                let completion = QuarantineSweepContext::new(&fixture.daemon).run_inline(
+                    &tick,
+                    vec![fixture.root.clone()],
+                    &fixture.daemon.config,
+                );
+                assert!(completion.attempted);
+                assert_eq!(completion.held_bytes, Some(8), "ram={ram}: {cleanup:?}");
+                assert!(!approved.quarantine_path.exists());
+                assert_eq!(fs::read(&legacy.quarantine_path).unwrap(), b"retained");
+                let store = QuarantineStore::under(&fixture.root);
+                assert_eq!(store.record("a-legacy").unwrap(), Some(legacy));
+                assert!(store.record("b-approved").unwrap().is_none());
+                assert!(store.stuck_entries().unwrap().is_empty());
+                if let Some(relief) = &tick.ram_reclaim {
+                    assert_eq!(relief.remaining_bytes(), 0);
+                }
+                if let Some(relief) = &tick.inode_reclaim {
+                    assert_eq!(relief.remaining_artifacts(), 0);
+                }
+                let restored = store.restore("a-legacy", false).unwrap();
+                assert_eq!(fs::read(restored.restored_to).unwrap(), b"retained");
             }
         }
     }
