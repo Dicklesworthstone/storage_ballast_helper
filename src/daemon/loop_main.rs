@@ -72,7 +72,8 @@ use crate::daemon::recovery_probe::{BackgroundProbes, RecoveryGeneration, Recove
 use crate::daemon::scan_now::{ScanNowClaim, ScanNowQueue, ScanNowScope};
 use crate::daemon::self_monitor::{
     DaemonLock, DiscoveryState, LoggingState, MountPressure, MountRateState, PolicyStateRecord,
-    SelfMonitor, SelfMonitorTick, ThreadHeartbeat, ThreadState, ThreadStatus, ThreadsState,
+    PressureObservationGap, SelfMonitor, SelfMonitorTick, ThreadHeartbeat, ThreadState, ThreadStatus,
+    ThreadsState,
 };
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat, resolve_watchdog_sec};
 use crate::daemon::target_tier::TargetTier;
@@ -266,6 +267,9 @@ struct SharedExecutorConfig {
     /// Effective matrix and applied memory row for each batch's own disk
     /// pressure. A critical peer must not broaden ordinary cleanup here.
     behavior_policy: RwLock<(BehaviorDispatchTable, MemoryPressureLevel)>,
+    /// Unresolved observations may restrict a custom cell but never expand
+    /// mutation permission. RAM relief retains its separate live authority.
+    observation_gap_blocks_deletion: AtomicBool,
     /// Live discovery posture. Memory pressure narrows scanning without
     /// revoking the cleanup authority of already-known candidates.
     scan_posture: RwLock<ScanAggressiveness>,
@@ -323,6 +327,7 @@ impl SharedExecutorConfig {
                 BehaviorDispatchTable::default(),
                 MemoryPressureLevel::Unknown,
             )),
+            observation_gap_blocks_deletion: AtomicBool::new(false),
             scan_posture: RwLock::new(ScanAggressiveness::Normal),
             ram_reclaim_certainty_floor: AtomicU8::new(ArtifactCertainty::Unclear.rank()),
             ram_reclaim_blocks_ordinary_deletion: AtomicBool::new(false),
@@ -368,7 +373,8 @@ impl SharedExecutorConfig {
         ram_reclaim: bool,
         inode_reclaim: bool,
     ) -> std::result::Result<(), SkipReason> {
-        if (inode_reclaim && !self.inode_cleanup_enabled.load(Ordering::Acquire))
+        if (!ram_reclaim && self.observation_gap_blocks_deletion.load(Ordering::Acquire))
+            || (inode_reclaim && !self.inode_cleanup_enabled.load(Ordering::Acquire))
             || (!ram_reclaim
                 && !inode_reclaim
                 && self
@@ -397,14 +403,24 @@ impl SharedExecutorConfig {
         memory: MemoryPressureLevel,
         disk: PressureLevel,
     ) {
-        // Publish the global floor and peer cells under one lock. Mixing an
-        // old global floor with a newly relaxed peer cell could weaken both
-        // complete policies during a custom-matrix transition.
+        self.set_behavior_policy_mode(table, memory, table.mode_for(memory, disk), false);
+    }
+
+    fn set_behavior_policy_mode(
+        &self,
+        table: &BehaviorDispatchTable,
+        memory: MemoryPressureLevel,
+        mode: BehaviorMode,
+        observation_gap_blocks_deletion: bool,
+    ) {
+        // Publish the global floor, missing-observation veto and peer cells
+        // together. A reader must not combine a new cell with an older cap.
         let mut policy = self.behavior_policy.write();
-        let mode = table.mode_for(memory, disk);
         self.set_min_certainty(min_certainty_for(mode.cleanup_action));
         self.inode_cleanup_enabled
             .store(behavior_allows_delete_dispatch(mode), Ordering::Release);
+        self.observation_gap_blocks_deletion
+            .store(observation_gap_blocks_deletion, Ordering::Release);
         *policy = (table.clone(), memory);
     }
 
@@ -2508,6 +2524,194 @@ enum RamReclaimBehavior {
     Recovering,
 }
 
+/// Filesystem identity used only to remember unresolved pressure. It carries
+/// no statistics, cleanup scope, directory descriptor or mutation permission.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PressureObservationKey {
+    Device { device: u64, fs_type: String },
+    Owner {
+        path: PathBuf,
+        device: String,
+        fs_type: String,
+        is_ram_backed: bool,
+    },
+}
+
+impl PressureObservationKey {
+    fn of(sample: &FsStatsSample) -> Self {
+        let owner = sample.mount_owner();
+        sample.mount_device_id().map_or_else(
+            || Self::Owner {
+                path: owner.path.clone(),
+                device: owner.device.clone(),
+                fs_type: owner.fs_type.clone(),
+                is_ram_backed: owner.is_ram_backed,
+            },
+            |device| Self::Device {
+                device,
+                fs_type: owner.fs_type.clone(),
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PressureObservationSource {
+    key: PressureObservationKey,
+    mount: PathBuf,
+    observed_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RememberedPressure {
+    level: PressureLevel,
+    observed_at: Instant,
+}
+
+/// Missing observations can hold recovery, never authorize work. Requested
+/// paths retain only their last owner and native observation time. A removed
+/// watch path or a successful rebinding retires that ownership; a failed probe
+/// does not mean that the filesystem recovered or disappeared.
+#[derive(Default)]
+struct PressureObservationRecovery {
+    initialized: bool,
+    sources: HashMap<PathBuf, PressureObservationSource>,
+    known: HashMap<PressureObservationKey, RememberedPressure>,
+    failed: HashMap<PathBuf, String>,
+    current: HashMap<PressureObservationKey, RememberedPressure>,
+    observed_level: Option<PressureLevel>,
+    gaps: Vec<PressureObservationGap>,
+    recovery_floor: Option<PressureLevel>,
+}
+
+impl PressureObservationRecovery {
+    fn begin_tick(&mut self, paths: &[PathBuf]) {
+        self.initialized = true;
+        self.sources.retain(|path, _| paths.contains(path));
+        self.failed.clear();
+        self.current.clear();
+        self.observed_level = None;
+    }
+
+    fn observe_source(&mut self, path: &Path, sample: &FsStatsSample) -> bool {
+        // A delayed result must not restore a superseded owner.
+        if self
+            .sources
+            .get(path)
+            .is_some_and(|source| source.observed_at > sample.collected_at)
+        {
+            return false;
+        }
+        self.sources.insert(
+            path.to_path_buf(),
+            PressureObservationSource {
+                key: PressureObservationKey::of(sample),
+                mount: sample.stats.mount_point.clone(),
+                observed_at: sample.collected_at,
+            },
+        );
+        true
+    }
+
+    fn fail_source(&mut self, path: &Path, reason: String) {
+        self.failed.insert(path.to_path_buf(), reason);
+    }
+
+    fn observe_level(&mut self, sample: &FsStatsSample, level: PressureLevel) {
+        self.observed_level = Some(self.observed_level.map_or(level, |old| old.max(level)));
+        let observation = RememberedPressure {
+            level,
+            observed_at: sample.collected_at,
+        };
+        self.current
+            .entry(PressureObservationKey::of(sample))
+            .and_modify(|old| {
+                if observation.observed_at > old.observed_at {
+                    *old = observation;
+                } else if observation.observed_at == old.observed_at {
+                    old.level = old.level.max(level);
+                }
+            })
+            .or_insert(observation);
+    }
+
+    fn finish_tick(&mut self, now: Instant) {
+        let watched: HashSet<_> = self.sources.values().map(|source| source.key.clone()).collect();
+        self.known.retain(|key, _| watched.contains(key));
+        let failed_keys: HashSet<_> = self
+            .failed
+            .keys()
+            .filter_map(|path| self.sources.get(path).map(|source| source.key.clone()))
+            .collect();
+        let mut unresolved = HashSet::new();
+        for key in &failed_keys {
+            let Some(known) = self.known.get(key) else {
+                continue;
+            };
+            // A current alias may confirm recovery for this filesystem, but
+            // an older alias cannot erase newer pressure. Equal-time cached
+            // readings can confirm the same level, not prove recovery while
+            // another query of the filesystem is failing.
+            let resolved = self.current.get(key).is_some_and(|current| {
+                current.observed_at > known.observed_at
+                    || (current.observed_at == known.observed_at
+                        && current.level >= known.level)
+            });
+            if !resolved && known.level > PressureLevel::Green {
+                unresolved.insert(key.clone());
+            }
+        }
+        for (key, current) in &self.current {
+            if watched.contains(key) && !unresolved.contains(key) {
+                self.known.insert(key.clone(), *current);
+            }
+        }
+
+        self.gaps.clear();
+        self.recovery_floor = None;
+        for key in unresolved {
+            let known = self.known[&key];
+            self.recovery_floor = Some(
+                self.recovery_floor.map_or(known.level, |level| level.max(known.level)),
+            );
+            let mut sources: Vec<_> = self
+                .failed
+                .iter()
+                .filter_map(|(path, reason)| {
+                    self.sources
+                        .get(path)
+                        .filter(|source| source.key == key)
+                        .map(|source| (source.mount.clone(), reason.clone()))
+                })
+                .collect();
+            sources.sort();
+            let Some((mount, _)) = sources.first() else {
+                continue;
+            };
+            self.gaps.push(PressureObservationGap {
+                mount: mount.display().to_string(),
+                last_known_level: format!("{:?}", known.level),
+                observation_age_secs: now.saturating_duration_since(known.observed_at).as_secs(),
+                query_failures: sources.into_iter().map(|(_, reason)| reason).collect(),
+            });
+        }
+        self.gaps.sort_by(|a, b| a.mount.cmp(&b.mount));
+    }
+
+    fn holds_recovery(&self) -> bool {
+        self.recovery_floor.is_some_and(|floor| {
+            self.observed_level.is_none_or(|observed| floor > observed)
+        })
+    }
+
+    fn disk_for_behavior(&self, observed: PressureLevel, applied: PressureLevel) -> PressureLevel {
+        // History can prevent a downward transition, never escalate a cell
+        // that had not already been applied from real observations.
+        self.recovery_floor
+            .map_or(observed, |floor| observed.max(floor.min(applied)))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PressureBehaviorState {
     table: BehaviorDispatchTable,
@@ -4083,9 +4287,13 @@ pub struct MonitoringDaemon {
     next_ballast_control_id: u64,
     pending_state_replies: Vec<Sender<()>>,
     behavior_state: PressureBehaviorState,
+    pressure_observation_recovery: PressureObservationRecovery,
     /// Keep one live emergency until the notification queue accepts it.
     /// Applied recovery cancels it; a deferred recovery is still an emergency.
     pending_behavior_emergency: Option<NotificationEvent>,
+    /// A new combined episode must await current disk confirmation when
+    /// its memory transition occurred during a missing-observation hold.
+    deferred_behavior_emergency: bool,
     /// A swap-raised behavior cell still needs its filesystem-only certainty
     /// floor until recovery hysteresis has caught up with physical pressure.
     ram_reclaim_behavior: RamReclaimBehavior,
@@ -5565,6 +5773,60 @@ fn behavior_should_release_ballast(mode: BehaviorMode) -> bool {
     )
 }
 
+/// A missing pressured filesystem cannot broaden a custom behavior matrix.
+/// Keep the restrictive side of each work permission; notification severity
+/// describes current evidence rather than the remembered recovery hold.
+fn intersect_observation_behavior(held: BehaviorMode, current: BehaviorMode) -> BehaviorMode {
+    let scan_aggressiveness = if matches!(
+        (held.scan_aggressiveness, current.scan_aggressiveness),
+        (ScanAggressiveness::Skip, _) | (_, ScanAggressiveness::Skip)
+    ) {
+        ScanAggressiveness::Skip
+    } else if matches!(
+        (held.scan_aggressiveness, current.scan_aggressiveness),
+        (ScanAggressiveness::DefiniteOnly, _) | (_, ScanAggressiveness::DefiniteOnly)
+    ) {
+        // DefiniteOnly has Light's CPU pacing and a narrower discovery scope.
+        ScanAggressiveness::DefiniteOnly
+    } else if matches!(
+        (held.scan_aggressiveness, current.scan_aggressiveness),
+        (ScanAggressiveness::Light, _) | (_, ScanAggressiveness::Light)
+    ) {
+        ScanAggressiveness::Light
+    } else if matches!(
+        (held.scan_aggressiveness, current.scan_aggressiveness),
+        (ScanAggressiveness::Normal, _) | (_, ScanAggressiveness::Normal)
+    ) {
+        ScanAggressiveness::Normal
+    } else {
+        ScanAggressiveness::Aggressive
+    };
+    let cleanup_action = if held.cleanup_action == CleanupAction::None
+        || current.cleanup_action == CleanupAction::None
+    {
+        CleanupAction::None
+    } else if held.cleanup_action == CleanupAction::IdentifyOnly
+        || current.cleanup_action == CleanupAction::IdentifyOnly
+    {
+        CleanupAction::IdentifyOnly
+    } else if min_certainty_for(held.cleanup_action) > min_certainty_for(current.cleanup_action) {
+        held.cleanup_action
+    } else {
+        current.cleanup_action
+    };
+    let ballast_action = match (held.ballast_action, current.ballast_action) {
+        (BallastAction::None, _) | (_, BallastAction::None) => BallastAction::None,
+        (BallastAction::ReleaseFirst, BallastAction::ReleaseFirst) => BallastAction::ReleaseFirst,
+        _ => BallastAction::Release,
+    };
+    BehaviorMode {
+        scan_aggressiveness,
+        cleanup_action,
+        ballast_action,
+        notification_priority: current.notification_priority,
+    }
+}
+
 fn behavior_mode_summary(mode: BehaviorMode) -> String {
     format!(
         "scan={:?} cleanup={:?} ballast={:?} notify={:?}",
@@ -6316,7 +6578,9 @@ impl MonitoringDaemon {
             next_ballast_control_id: 0,
             pending_state_replies: Vec::new(),
             behavior_state,
+            pressure_observation_recovery: PressureObservationRecovery::default(),
             pending_behavior_emergency: None,
+            deferred_behavior_emergency: false,
             ram_reclaim_behavior: RamReclaimBehavior::FilesystemOnly,
             scanner_heartbeat,
             executor_heartbeat,
@@ -6719,6 +6983,65 @@ impl MonitoringDaemon {
         });
     }
 
+    fn action_behavior_mode(&self) -> BehaviorMode {
+        let observations = &self.pressure_observation_recovery;
+        if observations.initialized && observations.observed_level.is_none() {
+            return BehaviorMode {
+                scan_aggressiveness: ScanAggressiveness::Skip,
+                cleanup_action: CleanupAction::None,
+                ballast_action: BallastAction::None,
+                notification_priority: NotificationPriority::None,
+            };
+        }
+        if observations.holds_recovery()
+            && let Some(observed) = observations.observed_level
+        {
+            return intersect_observation_behavior(
+                self.behavior_state.mode,
+                self.behavior_state
+                    .table()
+                    .mode_for(self.behavior_state.memory_level, observed),
+            );
+        }
+        self.behavior_state.mode
+    }
+
+    fn publish_behavior_policy(&mut self) {
+        let mode = self.action_behavior_mode();
+        let observations = &self.pressure_observation_recovery;
+        let gap_blocks_deletion = (observations.holds_recovery()
+            || (observations.initialized && observations.observed_level.is_none()))
+            && !behavior_allows_delete_dispatch(mode);
+        let previous_memory_level = self.shared_executor_config.behavior_policy.read().1;
+        let new_gap_veto = gap_blocks_deletion
+            && !self.shared_executor_config
+                .observation_gap_blocks_deletion
+                .load(Ordering::Acquire);
+        if previous_memory_level != self.behavior_state.memory_level || new_gap_veto {
+            // Neither a memory event nor newly unresolved pressure may leave
+            // an old direct-prune pass authorized until the next disk tick.
+            self.rch_staging.stop_running_pass();
+        }
+        self.shared_executor_config.set_behavior_policy_mode(
+            self.behavior_state.table(),
+            self.behavior_state.memory_level,
+            mode,
+            gap_blocks_deletion,
+        );
+        self.shared_executor_config
+            .set_scan_posture(mode.scan_aggressiveness);
+        self.cpu_budget.lock().set_pct(paced_pct(
+            self.config.telemetry.cpu_budget_pct,
+            mode.scan_aggressiveness,
+        ));
+    }
+
+    fn behavior_emergency_lacks_observation(&self) -> bool {
+        let observations = &self.pressure_observation_recovery;
+        observations.holds_recovery()
+            || (observations.initialized && observations.observed_level.is_none())
+    }
+
     fn update_behavior_mode(
         &mut self,
         memory_level: MemoryPressureLevel,
@@ -6731,31 +7054,24 @@ impl MonitoringDaemon {
         } else {
             Duration::from_secs(self.config.pressure.behavior_hysteresis_secs)
         };
-        let previous_memory_level = self.behavior_state.memory_level;
+        let disk_level = self
+            .pressure_observation_recovery
+            .disk_for_behavior(disk_level, self.behavior_state.disk_level);
+        let last_confirmed_at = self.behavior_state.last_confirmed_at;
         let update = self.behavior_state.update_with_hysteresis(
             memory_level,
             disk_level,
             Instant::now(),
             hysteresis,
         );
-        if previous_memory_level != self.behavior_state.memory_level {
-            // A memory event can change a peer's cleanup permission while
-            // the monitor sleeps. Revoke old direct-prune authority first.
-            self.rch_staging.stop_running_pass();
+        if self.behavior_emergency_lacks_observation() {
+            // Retaining an unresolved level is not a fresh confirmation.
+            // Recovery dwell remains anchored to the last real observation.
+            self.behavior_state.last_confirmed_at = last_confirmed_at;
         }
-        self.shared_executor_config.set_behavior_policy(
-            self.behavior_state.table(),
-            self.behavior_state.memory_level,
-            self.behavior_state.disk_level,
-        );
+        self.publish_behavior_policy();
         match update {
             BehaviorUpdate::Applied(transition) => {
-                self.shared_executor_config
-                    .set_scan_posture(transition.to_mode.scan_aggressiveness);
-                self.cpu_budget.lock().set_pct(paced_pct(
-                    self.config.telemetry.cpu_budget_pct,
-                    transition.to_mode.scan_aggressiveness,
-                ));
                 let message = format!(
                     "behavior mode changed source={source} latency_ms={} memory={:?}->{:?} \
                      disk={:?}->{:?} mode=({}) -> ({})",
@@ -6793,8 +7109,30 @@ impl MonitoringDaemon {
         source: &str,
         transition: &BehaviorTransition,
     ) {
+        if self.behavior_emergency_lacks_observation()
+            && transition.to_memory == MemoryPressureLevel::Critical
+        {
+            // Keep an already pending incident, but never combine a new
+            // memory escalation with an unobserved disk to create one.
+            if self.pending_behavior_emergency.is_none()
+                && behavior_is_emergency(
+                    transition.to_memory,
+                    transition.to_disk,
+                    transition.to_mode,
+                )
+                && !behavior_is_emergency(
+                    transition.from_memory,
+                    transition.from_disk,
+                    transition.from_mode,
+                )
+            {
+                self.deferred_behavior_emergency = true;
+            }
+            return;
+        }
         if !behavior_is_emergency(transition.to_memory, transition.to_disk, transition.to_mode) {
             self.pending_behavior_emergency = None;
+            self.deferred_behavior_emergency = false;
         } else if !behavior_is_emergency(
             transition.from_memory,
             transition.from_disk,
@@ -6807,13 +7145,32 @@ impl MonitoringDaemon {
     fn retry_behavior_emergency(&mut self) {
         use crate::daemon::notifications::NotificationDispatchOutcome;
 
+        if self.behavior_emergency_lacks_observation()
+            && self.behavior_state.memory_level == MemoryPressureLevel::Critical
+        {
+            return;
+        }
         if !behavior_is_emergency(
             self.behavior_state.memory_level,
             self.behavior_state.disk_level,
             self.behavior_state.mode,
         ) {
             self.pending_behavior_emergency = None;
+            self.deferred_behavior_emergency = false;
             return;
+        }
+        if self.deferred_behavior_emergency
+            && self.pressure_observation_recovery.observed_level == Some(PressureLevel::Critical)
+        {
+            self.deferred_behavior_emergency = false;
+            if self.pending_behavior_emergency.is_none() {
+                self.pending_behavior_emergency = Some(NotificationEvent::BehaviorEmergency {
+                    source: "observations_restored".into(),
+                    memory_level: format!("{:?}", self.behavior_state.memory_level),
+                    disk_level: "Critical".into(),
+                    action: behavior_mode_summary(self.action_behavior_mode()),
+                });
+            }
         }
         let Some(event) = self.pending_behavior_emergency.as_mut() else {
             return;
@@ -7455,7 +7812,7 @@ impl MonitoringDaemon {
             ballast_total,
             memory_info: memory_info.as_ref(),
             policy_mode: self.policy_engine.lock().mode().to_string(),
-            behavior_mode: self.behavior_state.mode,
+            behavior_mode: self.action_behavior_mode(),
             last_predictive_action: format!("{:?}", self.last_predictive_action),
             last_ewma_confidence: self.last_ewma_confidence,
             guard: guard.as_ref(),
@@ -7550,19 +7907,27 @@ impl MonitoringDaemon {
         }
     }
 
+    fn maybe_write_self_monitor_state(&mut self, response: &PressureResponse) -> SelfMonitorTick {
+        self.maybe_write_pressure_state(Some(response))
+    }
+
     // One tick's worth of bookkeeping in program order; splitting it would
     // only scatter the state-file fields it fills.
     #[allow(clippy::too_many_lines)]
-    fn maybe_write_self_monitor_state(&mut self, response: &PressureResponse) -> SelfMonitorTick {
-        // Use the causing mount from the worst response so the state file
-        // reflects the mount that actually drove the pressure level, not the
-        // primary path which may be healthy.
-        let state_path = &response.causing_mount;
-        let free_pct = self
-            .fs_collector
-            .collect(state_path)
-            .map_or(0.0, |s| s.free_pct());
-        let mount_str = state_path.to_string_lossy().into_owned();
+    fn maybe_write_pressure_state(&mut self, response: Option<&PressureResponse>) -> SelfMonitorTick {
+        // No successful observation means unknown pressure. Do not fabricate
+        // a response or run another filesystem probe while reporting failure.
+        let observed_pressure = response.map(|response| {
+            let free_pct = self
+                .fs_collector
+                .collect(&response.causing_mount)
+                .map_or(0.0, |stats| stats.free_pct());
+            (
+                response.level,
+                free_pct,
+                response.causing_mount.to_string_lossy().into_owned(),
+            )
+        });
         let ballast_available = self
             .ballast_coordinator
             .inventory_cached()
@@ -7765,7 +8130,7 @@ impl MonitoringDaemon {
                 Arc::clone(&self.executor_heartbeat),
             ],
             THREAD_STALL_THRESHOLD,
-            response.level,
+            response.map_or(self.last_pressure_level, |observed| observed.level),
         );
         let worker = |index: usize| {
             health
@@ -7806,15 +8171,24 @@ impl MonitoringDaemon {
             },
         );
 
-        self.self_monitor.maybe_write_state(
-            response.level,
-            free_pct,
-            &mount_str,
-            ballast_available,
-            ballast_total,
-            dropped_log_events,
-            &policy_mode,
-        )
+        if let Some((level, free_pct, mount)) = observed_pressure {
+            self.self_monitor.maybe_write_state(
+                level,
+                free_pct,
+                &mount,
+                ballast_available,
+                ballast_total,
+                dropped_log_events,
+                &policy_mode,
+            )
+        } else {
+            self.self_monitor.maybe_write_state_unknown(
+                ballast_available,
+                ballast_total,
+                dropped_log_events,
+                &policy_mode,
+            )
+        }
     }
 
     /// Run the monitoring loop until shutdown is requested.
@@ -7956,6 +8330,15 @@ impl MonitoringDaemon {
                     // check_pressure has already withdrawn the old tick's
                     // authority before any diagnostic or retry can block.
                     self.report_ballast_reserves_without_pressure(Instant::now());
+                    let self_monitor_tick = self.maybe_write_pressure_state(None);
+                    if !self_monitor_tick.state_write_failed {
+                        self.flush_state_replies();
+                    }
+                    self.note_state_write_failure(self_monitor_tick);
+                    if self_monitor_tick.should_exit_for_rss_hard_limit() {
+                        shutdown_result = Err(self.rss_hard_limit_error(self_monitor_tick));
+                        break;
+                    }
                     self.sleep_with_memory_pressure_events(
                         &memory_pressure_rx,
                         self.last_pressure_level,
@@ -8610,6 +8993,7 @@ impl MonitoringDaemon {
         // delivers. A refused probe, one still stalled from an earlier tick,
         // and any later refresh (an immediate refresh_after restarts a failing
         // probe on every lookup) are not.
+        self.pressure_observation_recovery.begin_tick(&paths);
         let (samples, waited) =
             self.fs_collector
                 .pressure_samples(&paths, PRESSURE_SAMPLE_GRACE, PRESSURE_SAMPLE_POLL);
@@ -8617,6 +9001,16 @@ impl MonitoringDaemon {
         for (path, sample) in paths.iter().zip(samples) {
             match sample {
                 Ok(sample) => {
+                    if !self.pressure_observation_recovery.observe_source(path, &sample) {
+                        let reason = format!(
+                            "{}: native observation predates its previous owner evidence",
+                            path.display()
+                        );
+                        self.pressure_observation_recovery
+                            .fail_source(path, reason.clone());
+                        failures.push(reason);
+                        continue;
+                    }
                     // Keep the newest native reading if configured roots share a mount.
                     stats_by_mount
                         .entry(sample.stats.mount_point.clone())
@@ -8627,7 +9021,12 @@ impl MonitoringDaemon {
                         })
                         .or_insert(sample);
                 }
-                Err(error) => failures.push(sample_failure(path, &error)),
+                Err(error) => {
+                    let reason = sample_failure(path, &error);
+                    self.pressure_observation_recovery
+                        .fail_source(path, reason.clone());
+                    failures.push(reason);
+                }
             }
         }
         // The wait is not the daemon's own work; the tick throttle excludes it.
@@ -8657,6 +9056,8 @@ impl MonitoringDaemon {
         stats_by_mount: HashMap<PathBuf, FsStatsSample>,
         now: Instant,
     ) -> Result<PressureResponse> {
+        self.pressure_observation_recovery.current.clear();
+        self.pressure_observation_recovery.observed_level = None;
         self.special_rates.begin_tick();
         self.recovery_probes
             .retain_mounts(|mount| stats_by_mount.contains_key(mount));
@@ -8669,6 +9070,11 @@ impl MonitoringDaemon {
             self.invalidate_logging_ram_observations();
         }
         if stats_by_mount.is_empty() {
+            self.pressure_observation_recovery.finish_tick(now);
+            self.publish_behavior_policy();
+            self.self_monitor.set_pressure_observation_gaps(
+                self.pressure_observation_recovery.gaps.clone(),
+            );
             // The normal pressure handler renews and revokes tier permission,
             // but the error path skips it. Revoke here as part of sampling so
             // callers cannot accidentally retain an earlier successful tick.
@@ -9136,6 +9542,8 @@ impl MonitoringDaemon {
                     stats.total_bytes.saturating_sub(stats.available_bytes),
                 );
             }
+            self.pressure_observation_recovery
+                .observe_level(&sample, response.level);
             self.note_logging_mount_level(&mount_path, filesystem_response.level);
             self.mount_responses.push(MountTickResponse {
                 response: response.clone(),
@@ -9254,6 +9662,14 @@ impl MonitoringDaemon {
             }
         }
         *self.shared_guard_diagnostics.write() = worst_guard_diag;
+
+        // Recovery history is metadata only. All current responses above
+        // continue to contain exclusively this tick's successful observations.
+        self.pressure_observation_recovery.finish_tick(now);
+        self.publish_behavior_policy();
+        self.self_monitor.set_pressure_observation_gaps(
+            self.pressure_observation_recovery.gaps.clone(),
+        );
 
         // Clean up monitors for unmounted/disappeared volumes?
         // For now we keep them; volume churn is rare in typical operation.
@@ -9427,7 +9843,7 @@ impl MonitoringDaemon {
             .write()
             .update(&self.config.pressure.prediction, &self.config.scoring);
 
-        let behavior = self.behavior_state.mode;
+        let behavior = self.action_behavior_mode();
         let scan_allowed = behavior_allows_scan(behavior);
         let release_ballast = behavior_should_release_ballast(behavior);
         let base_poll = Duration::from_millis(self.config.pressure.poll_interval_ms.max(1));
@@ -10231,7 +10647,7 @@ impl MonitoringDaemon {
                     pressure_level: response.level,
                     free_pct: Some(response.free_pct),
                     max_delete_batch: behavior_delete_batch_limit(
-                        self.behavior_state.mode,
+                        self.action_behavior_mode(),
                         response.max_delete_batch,
                     ),
                     force_full_scan: false,
@@ -11368,7 +11784,7 @@ impl MonitoringDaemon {
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
             max_delete_batch: behavior_delete_batch_limit(
-                self.behavior_state.mode,
+                self.action_behavior_mode(),
                 response.max_delete_batch,
             ),
             force_full_scan: inode_reclaim.is_some(),
@@ -11540,7 +11956,7 @@ impl MonitoringDaemon {
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
             max_delete_batch: behavior_delete_batch_limit(
-                self.behavior_state.mode,
+                self.action_behavior_mode(),
                 response.max_delete_batch,
             ),
             force_full_scan: false,
@@ -11730,6 +12146,19 @@ impl MonitoringDaemon {
         }
         self.last_predictive_warning.clear();
         self.last_swap_thrash_notification = None;
+        if (self.behavior_emergency_lacks_observation()
+            || (self.deferred_behavior_emergency
+                && self.pressure_observation_recovery.observed_level != Some(PressureLevel::Critical)))
+            && self.behavior_state.memory_level == MemoryPressureLevel::Critical
+        {
+            self.deferred_behavior_emergency |= self.pending_behavior_emergency.is_none()
+                && behavior_is_emergency(
+                    self.behavior_state.memory_level,
+                    self.behavior_state.disk_level,
+                    self.behavior_state.mode,
+                );
+            return;
+        }
         if behavior_is_emergency(
             self.behavior_state.memory_level,
             self.behavior_state.disk_level,
@@ -12364,11 +12793,7 @@ impl MonitoringDaemon {
                         let transition = self.behavior_state.replace_table(table);
                         // A peer mount's cell can change while the global cell
                         // stays identical. Publish before reporting either case.
-                        self.shared_executor_config.set_behavior_policy(
-                            self.behavior_state.table(),
-                            self.behavior_state.memory_level,
-                            self.behavior_state.disk_level,
-                        );
+                        self.publish_behavior_policy();
                         if let Some(transition) = transition {
                             self.note_behavior_emergency_transition("config_reload", &transition);
                             let message = format!(
@@ -12384,8 +12809,7 @@ impl MonitoringDaemon {
                         }
                         self.log_behavior_matrix("config_reload");
                     }
-                    self.shared_executor_config
-                        .set_scan_posture(self.behavior_state.mode.scan_aggressiveness);
+                    self.publish_behavior_policy();
 
                     // Rebuild predictive policy with new thresholds.
                     self.predictive_policy =
@@ -12398,7 +12822,7 @@ impl MonitoringDaemon {
                         let mut budget = self.cpu_budget.lock();
                         budget.set_pct(paced_pct(
                             new_config.telemetry.cpu_budget_pct,
-                            self.behavior_state.mode.scan_aggressiveness,
+                            self.action_behavior_mode().scan_aggressiveness,
                         ));
                         budget.set_burst_secs(new_config.telemetry.cpu_budget_burst_secs);
                     }
@@ -22206,6 +22630,547 @@ mod tests {
             assert!(store.stuck_entries().unwrap().is_empty());
             assert!(!first.holds_mount(&first_mount));
         }
+    }
+
+    #[cfg(unix)]
+    fn pressure_observation_gap_fixture() -> RegretDaemonFixture {
+        let mut fixture = RegretDaemonFixture::new();
+        fixture.daemon.config.scanner.root_paths = vec![PathBuf::from("/missing-pressure")];
+        fixture.daemon.config.pressure.behavior_hysteresis_secs = 0;
+        fixture.daemon.config.pressure.green_min_free_pct = 20.0;
+        fixture.daemon.config.pressure.yellow_min_free_pct = 15.0;
+        fixture.daemon.config.pressure.orange_min_free_pct = 10.0;
+        fixture.daemon.config.pressure.red_min_free_pct = 5.0;
+        fixture.daemon.config.pressure.green_min_free_bytes = 0;
+        fixture.daemon.config.pressure.yellow_min_free_bytes = 0;
+        fixture.daemon.config.pressure.orange_min_free_bytes = 0;
+        fixture.daemon.config.pressure.red_min_free_bytes = 0;
+        fixture
+    }
+
+    #[cfg(unix)]
+    fn pressure_observation_gap_collector(
+        owner: &str,
+        critical_free_pct: Option<u64>,
+        peer_free_pct: Option<u64>,
+    ) -> FsStatsCollector {
+        use crate::platform::pal::{FsStats, MountPoint, PlatformPaths};
+
+        let total = 1_000_u64 << 30;
+        let mut stats = HashMap::new();
+        for (mount, available) in [
+            ("/missing-pressure", critical_free_pct),
+            ("/", peer_free_pct),
+        ] {
+            if let Some(available) = available {
+                stats.insert(
+                    PathBuf::from(mount),
+                    FsStats {
+                        total_bytes: total,
+                        free_bytes: total / 100 * available,
+                        available_bytes: total / 100 * available,
+                        fs_type: "ext4".into(),
+                        mount_point: PathBuf::from(mount),
+                        is_readonly: false,
+                    },
+                );
+            }
+        }
+        FsStatsCollector::new(
+            Arc::new(MockPlatform::new(
+                vec![
+                    MountPoint {
+                        path: PathBuf::from("/"),
+                        device: "peer".into(),
+                        fs_type: "ext4".into(),
+                        is_ram_backed: false,
+                    },
+                    MountPoint {
+                        path: PathBuf::from("/missing-pressure"),
+                        device: owner.into(),
+                        fs_type: "ext4".into(),
+                        is_ram_backed: false,
+                    },
+                ],
+                stats,
+                MockPlatform::healthy().memory_info().unwrap(),
+                PlatformPaths::default(),
+            )),
+            Duration::ZERO,
+        )
+    }
+
+    #[cfg(unix)]
+    fn observe_pressure_gap_start(daemon: &mut MonitoringDaemon) {
+        daemon.fs_collector = pressure_observation_gap_collector("original", Some(1), Some(17));
+        let response = daemon.check_pressure().unwrap();
+        assert_eq!(response.level, PressureLevel::Critical);
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            response.level,
+            "startup",
+            Duration::ZERO,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_observation_gap_holds_recovery_without_borrowing_mount_authority() {
+        let mut fixture = pressure_observation_gap_fixture();
+        let daemon = &mut fixture.daemon;
+        observe_pressure_gap_start(daemon);
+        let confirmed = daemon.behavior_state.last_confirmed_at;
+        let mut peer_observed_at = daemon.mount_monitors[Path::new("/")]
+            .last_observation
+            .as_ref()
+            .unwrap()
+            .sample
+            .collected_at;
+
+        for _ in 0..3 {
+            daemon.fs_collector = pressure_observation_gap_collector("original", None, Some(17));
+            let response = daemon.check_pressure().unwrap();
+            assert_eq!(response.level, PressureLevel::Yellow);
+            assert_eq!(daemon.mount_responses.len(), 1);
+            assert_eq!(daemon.mount_responses[0].response.causing_mount, Path::new("/"));
+            assert!(daemon.mount_responses[0].ram_reclaim.is_none());
+            assert!(daemon.mount_responses[0].inode_reclaim.is_none());
+            let peer = daemon.mount_monitors[Path::new("/")]
+                .last_observation
+                .as_ref()
+                .unwrap();
+            assert!(peer.sample.collected_at >= peer_observed_at);
+            peer_observed_at = peer.sample.collected_at;
+            daemon.update_behavior_mode(
+                MemoryPressureLevel::Normal,
+                response.level,
+                "disk_pressure",
+                Duration::ZERO,
+            );
+            assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Critical);
+            assert_eq!(daemon.behavior_state.last_confirmed_at, confirmed);
+            assert_eq!(daemon.pressure_observation_recovery.gaps.len(), 1);
+            assert_eq!(
+                daemon.pressure_observation_recovery.gaps[0].mount,
+                "/missing-pressure"
+            );
+            assert!(!daemon.pressure_observation_recovery.gaps[0].query_failures.is_empty());
+            assert!(!behavior_should_release_ballast(daemon.action_behavior_mode()));
+            assert_eq!(
+                daemon.shared_executor_config.dispatch_certainty_for(
+                    PressureLevel::Yellow,
+                    false,
+                    false,
+                ),
+                Ok(ArtifactCertainty::Definite)
+            );
+            assert_eq!(
+                daemon.filesystem_tier_mounts(&daemon.mount_responses, Instant::now()).len(),
+                1,
+                "the observed peer retains its own allowed work"
+            );
+        }
+
+        // Removing a watch scope is an explicit retirement, not evidence of
+        // recovery. It releases the global hold without restoring old ticks.
+        daemon.config.scanner.root_paths.clear();
+        let response = daemon.check_pressure().unwrap();
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        assert!(daemon.pressure_observation_recovery.gaps.is_empty());
+        assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Yellow);
+        assert_eq!(daemon.mount_responses.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_observation_gap_rebinding_retires_the_old_owner() {
+        let mut fixture = pressure_observation_gap_fixture();
+        let daemon = &mut fixture.daemon;
+        observe_pressure_gap_start(daemon);
+        daemon.fs_collector = pressure_observation_gap_collector("original", None, Some(17));
+        let response = daemon.check_pressure().unwrap();
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        assert!(daemon.pressure_observation_recovery.holds_recovery());
+
+        daemon.fs_collector = pressure_observation_gap_collector("replacement", Some(50), Some(17));
+        let response = daemon.check_pressure().unwrap();
+        assert_eq!(response.level, PressureLevel::Yellow);
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Yellow);
+        assert!(daemon.pressure_observation_recovery.gaps.is_empty());
+        assert!(daemon.pressure_observation_recovery.known.keys().all(|key| {
+            !matches!(key, PressureObservationKey::Owner { device, .. } if device == "original")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_observation_gap_all_failed_keeps_history_and_revokes_actions() {
+        let mut fixture = pressure_observation_gap_fixture();
+        let daemon = &mut fixture.daemon;
+        observe_pressure_gap_start(daemon);
+        let confirmed = daemon.behavior_state.last_confirmed_at;
+        daemon.fs_collector = pressure_observation_gap_collector("original", None, None);
+        assert!(daemon.check_pressure().is_err());
+        assert!(daemon.mount_responses.is_empty());
+        assert!(daemon.worst_filesystem_response().is_none());
+        assert!(daemon.pressure_observation_recovery.observed_level.is_none());
+        assert!(!daemon.pressure_observation_recovery.gaps.is_empty());
+        daemon.self_monitor.force_next_write();
+        let tick = daemon.maybe_write_pressure_state(None);
+        assert!(!tick.state_write_failed);
+        let state = SelfMonitor::read_state(&daemon.config.paths.state_file).unwrap();
+        assert_eq!(state.pressure.overall, "unknown");
+        assert!(state.pressure.mounts.is_empty());
+        assert!(state.rates.is_empty());
+        assert!(state.mount_controllers.is_empty());
+        assert!(!state.pressure_observation_gaps.is_empty());
+        let (reply, received) = bounded(1);
+        daemon.pending_state_replies.push(reply);
+        daemon.flush_state_replies();
+        assert!(received.try_recv().is_ok());
+        assert!(!behavior_allows_scan(daemon.action_behavior_mode()));
+        assert!(!behavior_should_release_ballast(daemon.action_behavior_mode()));
+        assert!(!behavior_allows_delete_dispatch(daemon.action_behavior_mode()));
+        assert!(daemon.shared_executor_config.dispatch_certainty_for(
+            PressureLevel::Critical,
+            false,
+            false,
+        ).is_err());
+
+        // The same common callback used by the sleep/event path must not
+        // substitute last_pressure_level for a missing current observation.
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            PressureLevel::Critical,
+            "memory_pressure",
+            Duration::ZERO,
+        );
+        assert_eq!(daemon.behavior_state.memory_level, MemoryPressureLevel::Critical);
+        assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Critical);
+        assert_eq!(daemon.behavior_state.last_confirmed_at, confirmed);
+        assert!(daemon.pending_behavior_emergency.is_none());
+        assert!(daemon.deferred_behavior_emergency);
+        assert!(!behavior_allows_delete_dispatch(daemon.action_behavior_mode()));
+
+        // A later successful peer must not erase the all-failed incident.
+        daemon.fs_collector = pressure_observation_gap_collector("original", None, Some(17));
+        let response = daemon.check_pressure().unwrap();
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        assert_eq!(response.level, PressureLevel::Yellow);
+        assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Critical);
+        assert!(daemon.pressure_observation_recovery.holds_recovery());
+        assert!(daemon.pending_behavior_emergency.is_none());
+
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            response.level,
+            "memory_pressure",
+            Duration::ZERO,
+        );
+        assert_eq!(daemon.behavior_state.memory_level, MemoryPressureLevel::Normal);
+        assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Critical);
+        assert!(!daemon.deferred_behavior_emergency);
+        assert!(daemon.pending_behavior_emergency.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_observation_gap_cannot_relax_custom_cleanup_policy() {
+        for cleanup in [
+            CleanupAction::None,
+            CleanupAction::IdentifyOnly,
+            CleanupAction::HighConfidenceCandidates,
+        ] {
+            let mut fixture = pressure_observation_gap_fixture();
+            let daemon = &mut fixture.daemon;
+            let permissive = BehaviorMode {
+                scan_aggressiveness: ScanAggressiveness::Aggressive,
+                cleanup_action: CleanupAction::AnyDefiniteCandidate,
+                ballast_action: BallastAction::ReleaseFirst,
+                notification_priority: NotificationPriority::Normal,
+            };
+            let restricted = BehaviorMode {
+                scan_aggressiveness: ScanAggressiveness::DefiniteOnly,
+                cleanup_action: cleanup,
+                ballast_action: BallastAction::None,
+                notification_priority: NotificationPriority::High,
+            };
+            let mut cells = [[permissive; 5]; 3];
+            cells[0][4] = restricted;
+            daemon.behavior_state = PressureBehaviorState::new(
+                BehaviorDispatchTable::new(cells),
+                MemoryPressureLevel::Normal,
+                PressureLevel::Green,
+            );
+            observe_pressure_gap_start(daemon);
+            daemon.fs_collector = pressure_observation_gap_collector("original", None, Some(17));
+            let response = daemon.check_pressure().unwrap();
+            daemon.update_behavior_mode(
+                MemoryPressureLevel::Normal,
+                response.level,
+                "disk_pressure",
+                Duration::ZERO,
+            );
+            let mode = daemon.action_behavior_mode();
+            assert_eq!(mode.cleanup_action, cleanup);
+            assert_eq!(mode.scan_aggressiveness, ScanAggressiveness::DefiniteOnly);
+            assert_eq!(mode.ballast_action, BallastAction::None);
+            let ordinary = daemon.shared_executor_config.dispatch_certainty_for(
+                PressureLevel::Yellow,
+                false,
+                false,
+            );
+            if matches!(cleanup, CleanupAction::None | CleanupAction::IdentifyOnly) {
+                assert!(ordinary.is_err());
+                assert!(daemon.shared_executor_config.dispatch_certainty_for(
+                    PressureLevel::Critical,
+                    false,
+                    true,
+                ).is_err());
+                assert!(daemon.filesystem_tier_mounts(
+                    &daemon.mount_responses,
+                    Instant::now(),
+                ).is_empty());
+            } else {
+                assert_eq!(ordinary, Ok(ArtifactCertainty::Definite));
+            }
+            assert_eq!(
+                daemon.shared_executor_config.dispatch_certainty_for(
+                    PressureLevel::Critical,
+                    true,
+                    false,
+                ),
+                Ok(ArtifactCertainty::Definite),
+                "fresh explicitly scoped RAM relief retains its existing exception"
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_observation_gap_aliases_require_current_native_proof() {
+        let start = Instant::now();
+        let mount = Path::new("/owner");
+        let first = PathBuf::from("/owner/first");
+        let alias = PathBuf::from("/owner/alias");
+        let paths = [first.clone(), alias.clone()];
+        let critical = native_pressure_sample(mount, "device", 1_000, 1, start);
+        let mut observations = PressureObservationRecovery::default();
+        observations.begin_tick(&paths);
+        assert!(observations.observe_source(&first, &critical));
+        assert!(observations.observe_source(&alias, &critical));
+        observations.observe_level(&critical, PressureLevel::Critical);
+        observations.finish_tick(start);
+
+        // Equal-time data can be re-evaluated by a controller, but cannot
+        // clear a missing sibling's newer critical-pressure observation.
+        observations.begin_tick(&paths);
+        observations.fail_source(&first, "first: unavailable".into());
+        assert!(observations.observe_source(&alias, &critical));
+        observations.observe_level(&critical, PressureLevel::Green);
+        observations.finish_tick(start + Duration::from_secs(10));
+        assert!(observations.holds_recovery());
+        assert_eq!(observations.gaps[0].observation_age_secs, 10);
+        assert_eq!(
+            observations.disk_for_behavior(PressureLevel::Green, PressureLevel::Yellow),
+            PressureLevel::Yellow,
+            "missing evidence cannot escalate an unapplied disk cell"
+        );
+
+        let mut recovered = critical.clone();
+        recovered.collected_at = start + Duration::from_secs(11);
+        observations.begin_tick(&paths);
+        observations.fail_source(&first, "first: unavailable".into());
+        assert!(observations.observe_source(&alias, &recovered));
+        observations.observe_level(&recovered, PressureLevel::Green);
+        observations.finish_tick(recovered.collected_at);
+        assert!(observations.gaps.is_empty());
+        assert!(!observations.holds_recovery());
+
+        // The synchronous collector can return an old cached owner after a
+        // rebind. That is rejected, not silently treated as current success.
+        assert!(!observations.observe_source(&alias, &critical));
+        assert_eq!(observations.sources[&alias].observed_at, recovered.collected_at);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pressure_observation_gap_defers_new_emergency_until_current_confirmation() {
+        let (mut fixture, mut notifications) = behavior_emergency_fixture();
+        let daemon = &mut fixture.daemon;
+        daemon.config.scanner.root_paths = vec![PathBuf::from("/missing-pressure")];
+        observe_pressure_gap_start(daemon);
+        daemon.fs_collector = pressure_observation_gap_collector("original", None, Some(17));
+        let response = daemon.check_pressure().unwrap();
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            response.level,
+            "memory_pressure",
+            Duration::ZERO,
+        );
+        assert_eq!(daemon.behavior_state.memory_level, MemoryPressureLevel::Critical);
+        assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Critical);
+        assert!(daemon.pending_behavior_emergency.is_none());
+        assert!(daemon.deferred_behavior_emergency);
+
+        notifications.min_notify_interval_secs += 1;
+        daemon.reload_notification_config(&notifications);
+        daemon.retry_behavior_emergency();
+        assert!(daemon.pending_behavior_emergency.is_none());
+        assert!(daemon.deferred_behavior_emergency);
+
+        // The historical cell is unchanged when the missing observation
+        // returns. Its first genuinely confirmed emergency still must arm.
+        daemon.fs_collector = pressure_observation_gap_collector("original", Some(1), Some(17));
+        let response = daemon.check_pressure().unwrap();
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        assert!(!daemon.deferred_behavior_emergency);
+        assert!(matches!(
+            &daemon.pending_behavior_emergency,
+            Some(NotificationEvent::BehaviorEmergency { source, .. })
+                if source == "observations_restored"
+        ));
+
+        // A pending event survives uncertainty, but configuration rearming
+        // and retry must not send it using the remembered disk level.
+        daemon.fs_collector = pressure_observation_gap_collector("original", None, Some(17));
+        let response = daemon.check_pressure().unwrap();
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        notifications.enabled = true;
+        daemon.reload_notification_config(&notifications);
+        daemon.retry_behavior_emergency();
+        assert!(daemon.pending_behavior_emergency.is_some());
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        assert!(
+            std::fs::read_to_string(&notifications.file.path)
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+        );
+
+        daemon.fs_collector = pressure_observation_gap_collector("original", Some(1), Some(17));
+        let response = daemon.check_pressure().unwrap();
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        assert!(daemon.pending_behavior_emergency.is_none());
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+
+        // An accepted pre-gap episode is not a new episode when observations
+        // return again. Only the deferred, previously unconfirmed entry arms.
+        daemon.fs_collector = pressure_observation_gap_collector("original", None, Some(17));
+        let response = daemon.check_pressure().unwrap();
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        assert!(!daemon.deferred_behavior_emergency);
+        daemon.fs_collector = pressure_observation_gap_collector("original", Some(1), Some(17));
+        let response = daemon.check_pressure().unwrap();
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        let delivered: Vec<Value> = std::fs::read_to_string(&notifications.file.path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0]["source"], "observations_restored");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_observation_gap_keeps_deferred_emergency_through_recovery_dwell() {
+        let (mut fixture, mut notifications) = behavior_emergency_fixture();
+        let daemon = &mut fixture.daemon;
+        daemon.config.scanner.root_paths = vec![PathBuf::from("/missing-pressure")];
+        observe_pressure_gap_start(daemon);
+        daemon.fs_collector = pressure_observation_gap_collector("original", None, Some(17));
+        let response = daemon.check_pressure().unwrap();
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            response.level,
+            "memory_pressure",
+            Duration::ZERO,
+        );
+        assert!(daemon.deferred_behavior_emergency);
+        assert!(daemon.pending_behavior_emergency.is_none());
+
+        // A verified healthy replacement clears uncertainty. The normal
+        // behavior dwell still retains the applied combined Critical cell.
+        daemon.config.pressure.behavior_hysteresis_secs = 3600;
+        daemon.fs_collector = pressure_observation_gap_collector("replacement", Some(50), Some(17));
+        let response = daemon.check_pressure().unwrap();
+        assert_eq!(response.level, PressureLevel::Yellow);
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        assert!(!daemon.pressure_observation_recovery.holds_recovery());
+        assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Critical);
+        assert!(daemon.deferred_behavior_emergency);
+        assert!(daemon.pending_behavior_emergency.is_none());
+        notifications.min_notify_interval_secs += 1;
+        daemon.reload_notification_config(&notifications);
+        assert!(daemon.deferred_behavior_emergency);
+        assert!(daemon.pending_behavior_emergency.is_none());
+
+        // A later actual Critical observation confirms that unchanged cell.
+        // The intermediate Yellow reading must not lose its deferred alert.
+        daemon.fs_collector = pressure_observation_gap_collector("replacement", Some(1), Some(17));
+        let response = daemon.check_pressure().unwrap();
+        assert_eq!(response.level, PressureLevel::Critical);
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Critical,
+            response.level,
+            "disk_pressure",
+            Duration::ZERO,
+        );
+        assert!(!daemon.deferred_behavior_emergency);
+        assert!(daemon.pending_behavior_emergency.is_some());
     }
 
     #[cfg(unix)]

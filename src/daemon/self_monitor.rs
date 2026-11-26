@@ -542,6 +542,10 @@ pub struct DaemonState {
     pub uptime_seconds: u64,
     pub last_updated: String,
     pub pressure: PressureState,
+    /// Missing filesystem observations that retain a previous pressure level.
+    /// These records explain a hold; they never provide cleanup authority.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pressure_observation_gaps: Vec<PressureObservationGap>,
     pub ballast: BallastState,
     /// Every pool the daemon manages, one record per mount (empty from a
     /// daemon older than this field).
@@ -992,6 +996,19 @@ pub struct PressureState {
     pub mounts: Vec<MountPressure>,
 }
 
+/// A monitored filesystem whose current pressure observation is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PressureObservationGap {
+    /// Filesystem mount whose last observation is being retained.
+    pub mount: String,
+    /// Last observed pressure level, not a new measurement.
+    pub last_known_level: String,
+    /// Age of the last successful observation when this state was written.
+    pub observation_age_secs: u64,
+    /// Current failures or pending probes for the mount's observation paths.
+    pub query_failures: Vec<String>,
+}
+
 /// Pressure info for a single mount.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MountPressure {
@@ -1208,6 +1225,8 @@ pub struct SelfMonitor {
     scan_duration_total: Duration,
     /// Latest per-mount pressure readings, set by the main loop each tick.
     mount_snapshot: Vec<MountPressure>,
+    /// Missing pressure evidence retained separately from current readings.
+    pressure_observation_gaps_snapshot: Vec<PressureObservationGap>,
     /// Latest per-mount controller records, set by the main loop each tick.
     controller_snapshot: Vec<MountStateRecord>,
     /// Latest per-mount rate estimates, set by the main loop each tick.
@@ -1244,8 +1263,8 @@ impl SelfMonitor {
     }
 
     /// Record the per-mount readings and controller states the next state
-    /// file write should carry. An empty `mounts` keeps the single
-    /// causing-mount entry the writer builds itself.
+    /// file write should carry. When both mounts and observation gaps are
+    /// empty, the writer keeps its legacy single-causing-mount fallback.
     pub fn set_mount_snapshot(
         &mut self,
         mounts: Vec<MountPressure>,
@@ -1253,6 +1272,12 @@ impl SelfMonitor {
     ) {
         self.mount_snapshot = mounts;
         self.controller_snapshot = controllers;
+    }
+
+    /// Record missing filesystem evidence for the next state write without
+    /// turning a retained pressure level into a current mount observation.
+    pub fn set_pressure_observation_gaps(&mut self, gaps: Vec<PressureObservationGap>) {
+        self.pressure_observation_gaps_snapshot = gaps;
     }
 
     /// Record the per-mount rate estimates and thread health the next state
@@ -1404,6 +1429,7 @@ impl SelfMonitor {
             rss_hard_limit_bytes,
             rss_warned: None,
             mount_snapshot: Vec::new(),
+            pressure_observation_gaps_snapshot: Vec::new(),
             controller_snapshot: Vec::new(),
             rate_snapshot: std::collections::BTreeMap::new(),
             threads_snapshot: ThreadsState::default(),
@@ -1445,6 +1471,44 @@ impl SelfMonitor {
         dropped_log_events: u64,
         policy_mode: &str,
     ) -> SelfMonitorTick {
+        self.maybe_write_state_snapshot(
+            Some((pressure_level, free_pct, mount_path)),
+            ballast_available,
+            ballast_total,
+            dropped_log_events,
+            policy_mode,
+        )
+    }
+
+    /// Persist current daemon state when no filesystem observation succeeded.
+    ///
+    /// Pressure remains explicitly unknown. Previously cached mount readings,
+    /// rates and controllers are omitted; held levels remain gap metadata.
+    /// RSS limits and the normal state-write cadence still apply.
+    pub fn maybe_write_state_unknown(
+        &mut self,
+        ballast_available: usize,
+        ballast_total: usize,
+        dropped_log_events: u64,
+        policy_mode: &str,
+    ) -> SelfMonitorTick {
+        self.maybe_write_state_snapshot(
+            None,
+            ballast_available,
+            ballast_total,
+            dropped_log_events,
+            policy_mode,
+        )
+    }
+
+    fn maybe_write_state_snapshot(
+        &mut self,
+        pressure: Option<(PressureLevel, f64, &str)>,
+        ballast_available: usize,
+        ballast_total: usize,
+        dropped_log_events: u64,
+        policy_mode: &str,
+    ) -> SelfMonitorTick {
         let now = Instant::now();
         let rss = self.current_rss_bytes();
         let mut tick = SelfMonitorTick {
@@ -1478,19 +1542,8 @@ impl SelfMonitor {
             started_at: self.started_at_iso.clone(),
             uptime_seconds: self.start_time.elapsed().as_secs(),
             last_updated: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            pressure: PressureState {
-                overall: format!("{pressure_level:?}").to_lowercase(),
-                mounts: if self.mount_snapshot.is_empty() {
-                    vec![MountPressure {
-                        path: mount_path.to_string(),
-                        free_pct,
-                        level: format!("{pressure_level:?}").to_lowercase(),
-                        rate_bps: None,
-                    }]
-                } else {
-                    self.mount_snapshot.clone()
-                },
-            },
+            pressure: self.pressure_snapshot(pressure),
+            pressure_observation_gaps: self.pressure_observation_gaps_snapshot.clone(),
             ballast: BallastState {
                 available: ballast_available,
                 total: ballast_total,
@@ -1512,10 +1565,18 @@ impl SelfMonitor {
             },
             memory_rss_bytes: rss,
             policy_mode: policy_mode.to_string(),
-            mount_controllers: self.controller_snapshot.clone(),
+            mount_controllers: if pressure.is_some() {
+                self.controller_snapshot.clone()
+            } else {
+                Vec::new()
+            },
             schema_version: STATE_SCHEMA_VERSION,
             run_id: self.run_id.clone(),
-            rates: self.rate_snapshot.clone(),
+            rates: if pressure.is_some() {
+                self.rate_snapshot.clone()
+            } else {
+                std::collections::BTreeMap::new()
+            },
             threads: self.threads_snapshot.clone(),
             cpu_secs_total: self.current_cpu_secs(),
             cpu_budget: self.budget_snapshot.clone(),
@@ -1552,6 +1613,30 @@ impl SelfMonitor {
         self.last_write = Some(now);
 
         tick
+    }
+
+    fn pressure_snapshot(&self, pressure: Option<(PressureLevel, f64, &str)>) -> PressureState {
+        let Some((pressure_level, free_pct, mount_path)) = pressure else {
+            return PressureState {
+                overall: "unknown".to_string(),
+                mounts: Vec::new(),
+            };
+        };
+        PressureState {
+            overall: format!("{pressure_level:?}").to_lowercase(),
+            mounts: if self.mount_snapshot.is_empty()
+                && self.pressure_observation_gaps_snapshot.is_empty()
+            {
+                vec![MountPressure {
+                    path: mount_path.to_string(),
+                    free_pct,
+                    level: format!("{pressure_level:?}").to_lowercase(),
+                    rate_bps: None,
+                }]
+            } else {
+                self.mount_snapshot.clone()
+            },
+        }
     }
 
     /// Build a status string suitable for sd_notify STATUS.
@@ -2410,6 +2495,166 @@ mod tests {
             path,
             Arc::new(MockPlatform::healthy().with_self_stats(test_self_stats(44_040_192))),
         )
+    }
+
+    #[test]
+    fn pressure_observation_gaps_roundtrip_and_keep_legacy_state_compatible() {
+        let legacy: DaemonState =
+            serde_json::from_str(r#"{"pressure":{"overall":"yellow","mounts":[]}}"#).unwrap();
+        assert!(legacy.pressure_observation_gaps.is_empty());
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("pressure_observation_gaps")
+                .is_none()
+        );
+        let gap = PressureObservationGap {
+            mount: "/offline".into(),
+            last_known_level: "critical".into(),
+            observation_age_secs: 61,
+            query_failures: vec!["/offline/cache: filesystem observation pending".into()],
+        };
+        let state = DaemonState {
+            pressure_observation_gaps: vec![gap.clone()],
+            ..legacy
+        };
+        let value = serde_json::to_value(&state).unwrap();
+        assert_eq!(value["pressure"]["overall"], "yellow");
+        assert_eq!(value["pressure_observation_gaps"][0]["last_known_level"], "critical");
+        assert_eq!(value["pressure_observation_gaps"][0]["observation_age_secs"], 61);
+        let parsed: DaemonState = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.pressure_observation_gaps, vec![gap]);
+        assert_eq!(parsed, state);
+    }
+
+    #[test]
+    fn self_monitor_keeps_observation_gaps_separate_from_current_mounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut monitor = test_monitor(path.clone());
+        let gap = PressureObservationGap {
+            mount: "/offline".into(),
+            last_known_level: "critical".into(),
+            observation_age_secs: 90,
+            query_failures: vec!["/offline: filesystem observation failed".into()],
+        };
+        for mounts in [
+            Vec::new(),
+            vec![MountPressure {
+                path: "/observed".into(),
+                free_pct: 15.0,
+                level: "yellow".into(),
+                rate_bps: None,
+            }],
+        ] {
+            let expected_mounts = mounts.clone();
+            monitor.set_mount_snapshot(mounts, Vec::new());
+            monitor.set_pressure_observation_gaps(vec![gap.clone()]);
+            monitor.force_next_write();
+            let tick =
+                monitor.maybe_write_state(PressureLevel::Critical, 1.0, "/offline", 0, 0, 0, "enforce");
+            assert!(!tick.state_write_failed);
+            let state = SelfMonitor::read_state(&path).unwrap();
+            assert_eq!(state.pressure_observation_gaps, vec![gap.clone()]);
+            assert_eq!(state.pressure.mounts, expected_mounts);
+        }
+
+        // Recovery removes the diagnostic; old callers without either
+        // snapshot still get the original causing-mount fallback.
+        monitor.set_pressure_observation_gaps(Vec::new());
+        monitor.set_mount_snapshot(Vec::new(), Vec::new());
+        monitor.force_next_write();
+        let tick =
+            monitor.maybe_write_state(PressureLevel::Yellow, 15.0, "/observed", 0, 0, 0, "enforce");
+        assert!(!tick.state_write_failed);
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(value.get("pressure_observation_gaps").is_none());
+        let recovered = SelfMonitor::read_state(&path).unwrap();
+        assert!(recovered.pressure_observation_gaps.is_empty());
+        assert_eq!(recovered.pressure.mounts.len(), 1);
+        assert_eq!(recovered.pressure.mounts[0].path, "/observed");
+        assert_eq!(recovered.pressure.mounts[0].level, "yellow");
+    }
+
+    #[test]
+    fn unknown_pressure_state_does_not_republish_previous_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut monitor = test_monitor(path.clone());
+        let controller: MountStateRecord = serde_json::from_value(serde_json::json!({
+            "mount": "/offline", "state": "reclaim", "surface": "configured",
+            "level": "critical", "urgency": 1.0,
+        }))
+        .unwrap();
+        monitor.set_mount_snapshot(
+            vec![MountPressure {
+                path: "/offline".into(),
+                free_pct: 1.0,
+                level: "critical".into(),
+                rate_bps: Some(1_000.0),
+            }],
+            vec![controller],
+        );
+        monitor.set_runtime_snapshot(
+            std::collections::BTreeMap::from([(
+                "/offline".into(),
+                MountRateState {
+                    bytes_per_sec: 1_000.0,
+                    ..Default::default()
+                },
+            )]),
+            ThreadsState::default(),
+        );
+        let tick =
+            monitor.maybe_write_state(PressureLevel::Critical, 1.0, "/offline", 1, 2, 0, "enforce");
+        assert!(!tick.state_write_failed);
+        let observed = fs::read_to_string(&path).unwrap();
+        let gap = PressureObservationGap {
+            mount: "/offline".into(),
+            last_known_level: "critical".into(),
+            observation_age_secs: 90,
+            query_failures: vec!["/offline: filesystem observation failed".into()],
+        };
+        monitor.set_pressure_observation_gaps(vec![gap.clone()]);
+        monitor.record_error();
+
+        // Missing observations do not bypass the ordinary write cadence.
+        monitor.write_interval = Duration::MAX;
+        let tick = monitor.maybe_write_state_unknown(1, 2, 3, "enforce");
+        assert!(!tick.state_write_failed);
+        assert_eq!(fs::read_to_string(&path).unwrap(), observed);
+
+        // An explicit status request can force a current, honest snapshot.
+        monitor.force_next_write();
+        let tick = monitor.maybe_write_state_unknown(1, 2, 3, "enforce");
+        assert!(!tick.state_write_failed);
+        let state = SelfMonitor::read_state(&path).unwrap();
+        assert_eq!(state.pressure.overall, "unknown");
+        assert!(state.pressure.mounts.is_empty());
+        assert!(state.rates.is_empty());
+        assert!(state.mount_controllers.is_empty());
+        assert_eq!(state.pressure_observation_gaps, vec![gap]);
+        assert_eq!(state.memory_rss_bytes, tick.rss_bytes);
+        assert_eq!(state.counters.errors, 1);
+        assert_eq!(state.counters.dropped_log_events, 3);
+        assert_eq!(state.ballast.available, 1);
+        assert_eq!(state.ballast.total, 2);
+    }
+
+    #[test]
+    fn unknown_pressure_state_needs_no_prior_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut monitor = test_monitor(path.clone());
+        let tick = monitor.maybe_write_state_unknown(0, 0, 0, "enforce");
+        assert!(!tick.state_write_failed);
+        let state = SelfMonitor::read_state(&path).unwrap();
+        assert_eq!(state.pressure.overall, "unknown");
+        assert!(state.pressure.mounts.is_empty());
+        assert!(state.pressure_observation_gaps.is_empty());
+        assert!(state.rates.is_empty());
+        assert!(state.mount_controllers.is_empty());
     }
 
     #[test]

@@ -41,8 +41,8 @@ use storage_ballast_helper::daemon::mount_controller::{
 };
 use storage_ballast_helper::daemon::process_io_history::ProcessIoHistory;
 use storage_ballast_helper::daemon::self_monitor::{
-    BallastPoolState, DAEMON_STATE_STALE_THRESHOLD_SECS, assess_logging_placement,
-    detect_daemon_liveness,
+    BallastPoolState, DAEMON_STATE_STALE_THRESHOLD_SECS, PressureObservationGap,
+    assess_logging_placement, detect_daemon_liveness,
 };
 use storage_ballast_helper::daemon::service::{
     LAUNCHD_LABEL_ENV, LaunchdConfig, LaunchdServiceManager, LaunchdStatusReport,
@@ -11879,6 +11879,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     // document and clock. Old controller rows may still describe configuration
     // when the daemon is unavailable, but cannot restore inventory authority.
     let controller_state = live_reserve_state.as_ref().or(daemon_state.as_ref());
+    let pressure_observation_gaps: Vec<PressureObservationGap> = controller_state
+        .and_then(|state| state.get("pressure_observation_gaps"))
+        .and_then(|gaps| serde_json::from_value(gaps.clone()).ok())
+        .unwrap_or_default();
 
     // Open SQLite database for recent activity (optional, read-only).
     let db_stats = if config.paths.sqlite_db.exists() {
@@ -11941,6 +11945,13 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     "  Daemon: NOT running ({}, {age}) — degraded mode",
                     liveness.reason
                 );
+            }
+
+            for line in pressure_observation_gap_status_lines(
+                &pressure_observation_gaps,
+                live_reserve_state.is_some(),
+            ) {
+                println!("{line}");
             }
 
             if let Some(warning) = reserve_status.warning_summary() {
@@ -12430,6 +12441,9 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 }
                 mounts_json.push(mount_payload);
             }
+            if mounts_json.is_empty() {
+                overall_level = "unknown";
+            }
 
             let recent = db_stats.as_ref().map(|s| {
                 json!({
@@ -12442,7 +12456,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 })
             });
 
-            let payload = json!({
+            let mut payload = json!({
                 "command": "status",
                 "schema_version": 2,
                 "version": version,
@@ -12554,6 +12568,9 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 "recent_hour": recent,
                 "policy_mode": daemon_state.as_ref().and_then(|s| s.get("policy_mode")).and_then(|v| v.as_str()),
             });
+            if !pressure_observation_gaps.is_empty() {
+                payload["pressure_observation_gaps"] = json!(pressure_observation_gaps);
+            }
             write_json_line(&payload)?;
         }
     }
@@ -13251,6 +13268,39 @@ fn space_report_status_lines(reports: &Result<Vec<SpaceReport>, String>) -> Vec<
     lines.push(
         "  Sizes are observations of where the bytes are, never deletion authority.".to_string(),
     );
+    lines
+}
+
+/// Missing observations are retained as diagnostic evidence, never fresh
+/// filesystem samples. An old state file cannot describe a current hold.
+fn pressure_observation_gap_status_lines(
+    gaps: &[PressureObservationGap],
+    current: bool,
+) -> Vec<String> {
+    if gaps.is_empty() {
+        return Vec::new();
+    }
+    let source = if current {
+        "current daemon snapshot"
+    } else {
+        "recorded state; current evidence unavailable"
+    };
+    let mut lines = vec![format!(
+        "  Pressure observations WARNING ({source}): {} missing filesystem observation{}",
+        gaps.len(),
+        if gaps.len() == 1 { "" } else { "s" },
+    )];
+    for gap in gaps {
+        lines.push(format!(
+            "    {}: last known {}; last observation {}s before this snapshot",
+            gap.mount.escape_debug(),
+            gap.last_known_level.to_uppercase().escape_debug(),
+            gap.observation_age_secs,
+        ));
+        for reason in &gap.query_failures {
+            lines.push(format!("      {}", reason.escape_debug()));
+        }
+    }
     lines
 }
 
@@ -28273,6 +28323,33 @@ mod tests {
             swap_free_bytes: 10 * 1024 * 1024 * 1024,
         };
         assert!(is_swap_thrash_risk(&thrashing));
+    }
+
+    #[test]
+    fn status_reports_observation_gaps_without_claiming_fresh_samples() {
+        let gap = PressureObservationGap {
+            mount: "/offline\nspoof".into(),
+            last_known_level: "critical".into(),
+            observation_age_secs: 73,
+            query_failures: vec!["probe pending\nblocked\u{1b}[2J".into()],
+        };
+        for current in [true, false] {
+            let lines = pressure_observation_gap_status_lines(std::slice::from_ref(&gap), current);
+            let rendered = lines.join("\n");
+            assert!(rendered.contains("Pressure observations WARNING"));
+            assert!(rendered.contains("last known CRITICAL"));
+            assert!(rendered.contains("73s before this snapshot"));
+            assert!(rendered.contains("probe pending\\nblocked"));
+            assert!(lines.iter().all(|line| !line.contains(['\n', '\u{1b}'])));
+            if current {
+                assert!(rendered.contains("current daemon snapshot"));
+            } else {
+                assert!(rendered.contains("recorded state; current evidence unavailable"));
+                assert!(!rendered.contains("current daemon snapshot"));
+            }
+        }
+        assert!(pressure_observation_gap_status_lines(&[], true).is_empty());
+        assert!(pressure_observation_gap_status_lines(&[], false).is_empty());
     }
 
     /// A pressure warning retains its missing-evidence reasons and both ages.
