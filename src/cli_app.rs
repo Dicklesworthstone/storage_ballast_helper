@@ -793,6 +793,10 @@ struct EmergencyArgs {
     /// Target free percentage to recover immediately.
     #[arg(long, default_value_t = 10.0, value_name = "PERCENT", value_parser = parse_free_percentage)]
     target_free: f64,
+    /// Also recover this percentage of available filesystem inodes. Requires
+    /// finite inode accounting; stops only when both recovery targets are met.
+    #[arg(long, value_name = "PERCENT", value_parser = parse_free_percentage)]
+    target_free_inodes: Option<f64>,
     /// Skip confirmation prompt.
     #[arg(long)]
     yes: bool,
@@ -808,6 +812,7 @@ impl Default for EmergencyArgs {
         Self {
             paths: Vec::new(),
             target_free: 10.0,
+            target_free_inodes: None,
             yes: false,
             min_age: 5,
         }
@@ -8126,19 +8131,20 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
             // Validate this invocation's exclusively created staging file in
             // the real destination's context, then publish the complete file.
             // A unique backup retains the configuration being replaced.
-            let backup_path = transaction.publish(&toml_str, |staged| {
-                let raw = std::fs::read_to_string(staged)?;
-                Config::validate_for_write(&config_path, &raw)
-                    .map(|_| ())
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-            })
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::InvalidData {
-                    CliError::User(format!("refusing to write invalid config: {error}"))
-                } else {
-                    CliError::Runtime(format!("write config: {error}"))
-                }
-            })?;
+            let backup_path = transaction
+                .publish(&toml_str, |staged| {
+                    let raw = std::fs::read_to_string(staged)?;
+                    Config::validate_for_write(&config_path, &raw)
+                        .map(|_| ())
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                })
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::InvalidData {
+                        CliError::User(format!("refusing to write invalid config: {error}"))
+                    } else {
+                        CliError::Runtime(format!("write config: {error}"))
+                    }
+                })?;
 
             // A changed root/ballast/data path must also be writable inside
             // the systemd sandbox, or the daemon will report every deletion
@@ -16492,12 +16498,24 @@ fn run_confirmed_cleanup(
     input: &mut impl io::BufRead,
     output: &mut impl Write,
 ) -> Result<DeletionReport, DeletionConfirmationError<CliError>> {
+    let pressure_check =
+        |path: &Path| target_free.and_then(|target| target_free_skip(collector, path, target));
+    run_confirmed_cleanup_with_check(executor, plan, &pressure_check, input, output)
+}
+
+/// Share consent and renewed mutation checks across byte-only cleanup and
+/// emergency recovery with an explicitly requested inode target.
+fn run_confirmed_cleanup_with_check(
+    executor: &DeletionExecutor,
+    plan: &DeletionPlan,
+    pressure_check: SkipCheck<'_>,
+    input: &mut impl io::BufRead,
+    output: &mut impl Write,
+) -> Result<DeletionReport, DeletionConfirmationError<CliError>> {
     let mut answer = String::new();
     let mut accept_remaining = false;
     let mut introduced = false;
-    let pressure_check =
-        |path: &Path| target_free.and_then(|target| target_free_skip(collector, path, target));
-    executor.execute_confirmed(plan, Some(&pressure_check), |index, candidate| {
+    executor.execute_confirmed(plan, Some(pressure_check), |index, candidate| {
         if accept_remaining {
             return Ok(DeletionConfirmation::Accept);
         }
@@ -17898,6 +17916,162 @@ fn require_emergency_authorization(yes: bool, interactive: bool) -> Result<(), C
     Ok(())
 }
 
+/// An inode target is an additional explicit recovery goal. Byte-only clean
+/// and emergency commands keep their existing stopping rule.
+fn emergency_pressure_skip(
+    collector: &FsStatsCollector,
+    platform: &dyn Platform,
+    path: &Path,
+    args: &EmergencyArgs,
+) -> Option<SkipReason> {
+    let Some(target_inodes) = args.target_free_inodes else {
+        return target_free_skip(collector, path, args.target_free);
+    };
+    if !(0.0..=100.0).contains(&args.target_free) || !(0.0..=100.0).contains(&target_inodes) {
+        return Some(SkipReason::PressureUnavailable);
+    }
+    let Ok((stats, inodes)) = emergency_inode_snapshot(collector, platform, path) else {
+        return Some(SkipReason::PressureUnavailable);
+    };
+    (stats.free_pct() >= args.target_free
+        && inodes.available >= emergency_inode_target(inodes.total, target_inodes))
+    .then_some(SkipReason::TargetFreeReached)
+}
+
+/// Round the finite counter goal upward: one available inode cannot satisfy
+/// a target requiring a fraction more than one. Exact endpoints avoid losing
+/// a last inode to float rounding on an unusually large finite filesystem.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn emergency_inode_target(total: u64, percentage: f64) -> u64 {
+    if percentage >= 100.0 {
+        total
+    } else {
+        ((total as f64 * percentage / 100.0).ceil() as u64).min(total)
+    }
+}
+
+/// Bind fresh byte and inode readings to the same live filesystem. Neither a
+/// cached low reading nor a replaced path can authorize an inode-only unlink.
+fn emergency_inode_snapshot(
+    collector: &FsStatsCollector,
+    platform: &dyn Platform,
+    path: &Path,
+) -> Result<(FsStats, InodeStats), String> {
+    use storage_ballast_helper::scanner::walker::identity_for_path;
+
+    let resolved = path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve recovery path: {error}"))?;
+    let identity = identity_for_path(&resolved, false)
+        .map_err(|error| format!("cannot identify recovery path: {error}"))?;
+    collector.invalidate_observations();
+    let before = collector
+        .collect(path)
+        .map_err(|error| format!("byte capacity unavailable: {error}"))?;
+    let owner_path = before
+        .mount_point
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve filesystem owner: {error}"))?;
+    let owner = identity_for_path(&owner_path, false)
+        .map_err(|error| format!("cannot identify filesystem owner: {error}"))?;
+    if before.is_readonly
+        || before.total_bytes == 0
+        || before.available_bytes > before.free_bytes
+        || before.free_bytes > before.total_bytes
+        || identity.device_id != owner.device_id
+        || !resolved.starts_with(&owner_path)
+    {
+        return Err("filesystem is read-only or its capacity/ownership is inconsistent".into());
+    }
+    let inodes = platform
+        .inode_stats(&resolved)
+        .map_err(|error| format!("inode capacity unavailable: {error}"))?
+        .and_then(InodeStats::validated)
+        .ok_or_else(|| "finite, consistent inode accounting is unavailable".to_string())?;
+    collector.invalidate_observations();
+    let after = collector
+        .collect(path)
+        .map_err(|error| format!("cannot renew filesystem capacity: {error}"))?;
+    if after.is_readonly
+        || after.total_bytes != before.total_bytes
+        || after.fs_type != before.fs_type
+        || after.mount_point != before.mount_point
+        || after.available_bytes > after.free_bytes
+        || after.free_bytes > after.total_bytes
+        || path.canonicalize().ok().as_ref() != Some(&resolved)
+        || identity_for_path(&resolved, false).ok() != Some(identity)
+        || before.mount_point.canonicalize().ok().as_ref() != Some(&owner_path)
+        || identity_for_path(&owner_path, false).ok() != Some(owner)
+    {
+        return Err("filesystem identity or capacity changed during recovery observation".into());
+    }
+    Ok((after, inodes))
+}
+
+#[derive(Debug, Serialize)]
+struct EmergencyRecoveryGoal {
+    path: PathBuf,
+    target_free_pct: f64,
+    target_free_inodes_pct: f64,
+    free_pct: Option<f64>,
+    total_inodes: Option<u64>,
+    available_inodes: Option<u64>,
+    target_available_inodes: Option<u64>,
+    targets_met: bool,
+    issue: Option<String>,
+}
+
+fn emergency_recovery_goals(
+    roots: &[PathBuf],
+    args: &EmergencyArgs,
+    collector: &FsStatsCollector,
+    platform: &dyn Platform,
+) -> Vec<EmergencyRecoveryGoal> {
+    let Some(target_inodes) = args.target_free_inodes else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    roots
+        .iter()
+        .filter(|root| seen.insert((*root).clone()))
+        .map(|root| {
+            let mut goal = EmergencyRecoveryGoal {
+                path: root.clone(),
+                target_free_pct: args.target_free,
+                target_free_inodes_pct: target_inodes,
+                free_pct: None,
+                total_inodes: None,
+                available_inodes: None,
+                target_available_inodes: None,
+                targets_met: false,
+                issue: None,
+            };
+            if !(0.0..=100.0).contains(&args.target_free) || !(0.0..=100.0).contains(&target_inodes)
+            {
+                goal.issue = Some("recovery percentages must be finite and within 0..=100".into());
+                return goal;
+            }
+            match emergency_inode_snapshot(collector, platform, root) {
+                Ok((stats, inodes)) => {
+                    let target = emergency_inode_target(inodes.total, target_inodes);
+                    goal.free_pct = Some(stats.free_pct());
+                    goal.total_inodes = Some(inodes.total);
+                    goal.available_inodes = Some(inodes.available);
+                    goal.target_available_inodes = Some(target);
+                    goal.targets_met =
+                        stats.free_pct() >= args.target_free && inodes.available >= target;
+                }
+                Err(issue) => goal.issue = Some(issue),
+            }
+            goal
+        })
+        .collect()
+}
+
 fn confirm_emergency_quarantine(
     root: &Path,
     records: &[QuarantineRecord],
@@ -17944,7 +18118,7 @@ fn drain_emergency_quarantine(
     roots: &[PathBuf],
     args: &EmergencyArgs,
     ledger: &Path,
-    collector: &FsStatsCollector,
+    pressure_check: SkipCheck<'_>,
     mut confirm: impl FnMut(&Path, &[QuarantineRecord]) -> Result<bool, CliError>,
 ) -> Result<EmergencyQuarantineReport, CliError> {
     let started = std::time::Instant::now();
@@ -17968,7 +18142,7 @@ fn drain_emergency_quarantine(
         if records.is_empty() {
             continue;
         }
-        if let Some(reason) = target_free_skip(collector, root, args.target_free) {
+        if let Some(reason) = pressure_check(root) {
             for _ in &records {
                 report.skips.record(reason);
             }
@@ -17999,7 +18173,7 @@ fn drain_emergency_quarantine(
                     .is_some_and(|reviewed| confirmed_quarantine_record(reviewed, fresh))
             },
             |_| {
-                pressure_hold = target_free_skip(collector, root, args.target_free);
+                pressure_hold = pressure_check(root);
                 pressure_hold.is_none()
             },
         );
@@ -18062,6 +18236,7 @@ fn empty_emergency_report() -> DeletionReport {
     executor.execute(&executor.plan(Vec::new()), None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_emergency_report(
     cli: &Cli,
     plan: &DeletionPlan,
@@ -18069,8 +18244,14 @@ fn finish_emergency_report(
     quarantine: &EmergencyQuarantineReport,
     dir_count: usize,
     scan_elapsed: Duration,
+    goals: &[EmergencyRecoveryGoal],
+    confirmation_error: Option<CliError>,
 ) -> Result<(), CliError> {
     quarantine.merge_into(&mut report);
+    let result = confirmation_error.map_or_else(
+        || emergency_completion_result(&report, quarantine, goals),
+        Err,
+    );
     match output_mode(cli) {
         OutputMode::Human => {
             print_clean_summary(&report);
@@ -18086,14 +18267,45 @@ fn finish_emergency_report(
                     "  Quarantine work remains; rerun emergency recovery to continue the bounded drain."
                 );
             }
+            for goal in goals {
+                if let Some(issue) = &goal.issue {
+                    println!(
+                        "  Recovery on {}: unverified ({issue}).",
+                        goal.path.display()
+                    );
+                } else {
+                    println!(
+                        "  Recovery on {}: {:.2}% bytes free (target {:.2}%), {} / {} inodes available (target {}); targets {}.",
+                        goal.path.display(),
+                        goal.free_pct.unwrap_or_default(),
+                        goal.target_free_pct,
+                        goal.available_inodes.unwrap_or_default(),
+                        goal.total_inodes.unwrap_or_default(),
+                        goal.target_available_inodes.unwrap_or_default(),
+                        if goal.targets_met { "met" } else { "unmet" },
+                    );
+                }
+            }
         }
         OutputMode::Json => {
             let mut payload =
                 clean_report_payload(plan, &report, dir_count, scan_elapsed, 0, "emergency", None);
             payload["quarantine_drain"] = quarantine.payload();
+            if !goals.is_empty() {
+                payload["recovery_goals"] = serde_json::to_value(goals)?;
+            }
+            payload["exit_code"] = json!(result.as_ref().err().map_or(0, CliError::exit_code));
             write_json_line(&payload)?;
         }
     }
+    result
+}
+
+fn emergency_completion_result(
+    report: &DeletionReport,
+    quarantine: &EmergencyQuarantineReport,
+    goals: &[EmergencyRecoveryGoal],
+) -> Result<(), CliError> {
     if report.items_failed > 0 {
         return Err(CliError::Partial(format!(
             "{} emergency removal(s) failed; {} completed",
@@ -18109,6 +18321,24 @@ fn finish_emergency_report(
         return Err(CliError::User(
             "user cancelled — no items deleted".to_string(),
         ));
+    }
+    if goals.iter().any(|goal| goal.issue.is_some()) {
+        let message = "emergency recovery targets could not be verified; inspect the per-filesystem recovery report".to_string();
+        return Err(if report.items_deleted > 0 {
+            CliError::Partial(message)
+        } else {
+            CliError::Runtime(message)
+        });
+    }
+    if goals.iter().any(|goal| !goal.targets_met) {
+        let message =
+            "emergency recovery targets remain unmet; no more eligible artifacts were reclaimed"
+                .to_string();
+        return Err(if report.items_deleted > 0 {
+            CliError::Partial(message)
+        } else {
+            CliError::User(message)
+        });
     }
     Ok(())
 }
@@ -18131,18 +18361,23 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         args.paths.clone()
     };
 
-    let root_paths: Vec<PathBuf> = raw_roots
-        .into_iter()
-        .filter_map(|p| match p.canonicalize() {
-            Ok(abs) => Some(abs),
-            Err(e) => {
-                if output_mode(cli) == OutputMode::Human {
-                    eprintln!("Warning: skipping invalid path {}: {}", p.display(), e);
-                }
-                None
+    let mut root_paths = Vec::new();
+    for path in raw_roots {
+        match path.canonicalize() {
+            Ok(resolved) => root_paths.push(resolved),
+            Err(error) if args.target_free_inodes.is_some() => {
+                return Err(CliError::Runtime(format!(
+                    "cannot verify emergency recovery path {}: {error}",
+                    path.display(),
+                )));
             }
-        })
-        .collect();
+            Err(error) => {
+                if output_mode(cli) == OutputMode::Human {
+                    eprintln!("Warning: skipping invalid path {}: {error}", path.display());
+                }
+            }
+        }
+    }
 
     if root_paths.is_empty() {
         return Err(CliError::User("no valid scan paths found".to_string()));
@@ -18151,12 +18386,14 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     // Quarantine goes first, but a reversible cleanup decision is not consent
     // to discard its undo copy. Authorize the reviewed entries before purging.
     let platform = detect_platform().map_err(|error| CliError::Runtime(error.to_string()))?;
-    let collector = std::sync::Arc::new(FsStatsCollector::new(platform, Duration::ZERO));
+    let collector = FsStatsCollector::new(std::sync::Arc::clone(&platform), Duration::ZERO);
+    let pressure_check =
+        |path: &Path| emergency_pressure_skip(&collector, platform.as_ref(), path, args);
     let quarantine = drain_emergency_quarantine(
         &root_paths,
         args,
         &config.paths.sqlite_db,
-        &collector,
+        &pressure_check,
         |root, records| {
             confirm_emergency_quarantine(
                 root,
@@ -18296,6 +18533,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                 "Config-level protections are not active in emergency mode. Only .sbh-protect marker files are honored."
             );
         }
+        let goals = emergency_recovery_goals(&root_paths, args, &collector, platform.as_ref());
         return finish_emergency_report(
             cli,
             &plan,
@@ -18303,6 +18541,8 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             &quarantine,
             dir_count,
             scan_elapsed,
+            &goals,
+            None,
         );
     }
 
@@ -18332,14 +18572,10 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     }
 
     let (report, confirmation_error) = if args.yes {
-        let pressure_check = build_pressure_check(Some(args.target_free), collector);
-        (
-            executor.execute(&plan, pressure_check.as_ref().map(|f| f as SkipCheck)),
-            None,
-        )
+        (executor.execute(&plan, Some(&pressure_check)), None)
     } else {
         let result =
-            run_interactive_emergency(&executor, &plan, args, &collector, &mut io::stdin().lock());
+            run_interactive_emergency(&executor, &plan, &pressure_check, &mut io::stdin().lock());
         match result {
             Ok(report) => (report, None),
             Err(failure) => (*failure.report, Some(failure.error)),
@@ -18360,8 +18596,17 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             report.items_failed.saturating_add(quarantine.errors.len()),
         )
     });
-    let result = finish_emergency_report(cli, &plan, report, &quarantine, dir_count, scan_elapsed);
-    confirmation_error.map_or(result, Err)
+    let goals = emergency_recovery_goals(&root_paths, args, &collector, platform.as_ref());
+    finish_emergency_report(
+        cli,
+        &plan,
+        report,
+        &quarantine,
+        dir_count,
+        scan_elapsed,
+        &goals,
+        confirmation_error,
+    )
 }
 
 fn ongoing_protection_install_hint() -> &'static str {
@@ -18372,15 +18617,13 @@ fn ongoing_protection_install_hint() -> &'static str {
 fn run_interactive_emergency(
     executor: &DeletionExecutor,
     plan: &DeletionPlan,
-    args: &EmergencyArgs,
-    collector: &FsStatsCollector,
+    pressure_check: SkipCheck<'_>,
     input: &mut impl io::BufRead,
 ) -> Result<DeletionReport, DeletionConfirmationError<CliError>> {
-    run_confirmed_cleanup(
+    run_confirmed_cleanup_with_check(
         executor,
         plan,
-        Some(args.target_free),
-        collector,
+        pressure_check,
         input,
         &mut io::stderr().lock(),
     )
@@ -22526,6 +22769,436 @@ mod tests {
         }
     }
 
+    #[test]
+    fn emergency_inode_target_is_explicit_and_validated() {
+        let cli = Cli::try_parse_from(["sbh", "emergency", "--yes"]).unwrap();
+        let Command::Emergency(args) = cli.command else {
+            panic!("expected emergency");
+        };
+        assert_eq!(args.target_free_inodes, None);
+        for percentage in ["0", "0.1", "34", "100"] {
+            let cli = Cli::try_parse_from(["sbh", "emergency", "--target-free-inodes", percentage])
+                .unwrap();
+            let Command::Emergency(args) = cli.command else {
+                panic!("expected emergency");
+            };
+            assert_eq!(
+                args.target_free_inodes,
+                Some(percentage.parse::<f64>().unwrap())
+            );
+        }
+        for invalid in ["-1", "101", "NaN", "inf", "not-a-percentage"] {
+            assert!(
+                Cli::try_parse_from(["sbh", "emergency", "--target-free-inodes", invalid]).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(Cli::try_parse_from(["sbh", "clean", "--target-free-inodes", "10"]).is_err());
+        assert_eq!(emergency_inode_target(3, 34.0), 2);
+        assert_eq!(emergency_inode_target(3, 0.1), 1);
+        assert_eq!(emergency_inode_target(3, 0.0), 0);
+        assert_eq!(emergency_inode_target(u64::MAX - 1, 100.0), u64::MAX - 1);
+    }
+
+    #[test]
+    fn emergency_inode_help_explains_additional_goal() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("emergency")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--target-free-inodes <PERCENT>"), "{help}");
+        assert!(help.contains("both recovery targets"), "{help}");
+    }
+
+    #[test]
+    fn emergency_inode_goal_rejects_an_unobservable_requested_root_before_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let cli = Cli::try_parse_from([
+            "sbh",
+            "emergency",
+            directory.path().to_str().unwrap(),
+            missing.to_str().unwrap(),
+            "--target-free-inodes",
+            "10",
+            "--yes",
+        ])
+        .unwrap();
+        let Command::Emergency(args) = &cli.command else {
+            panic!("expected emergency");
+        };
+        assert_eq!(run_emergency(&cli, args).unwrap_err().exit_code(), 2);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    struct EmergencyInodePlatform {
+        inventory: MockPlatform,
+        stats: parking_lot::Mutex<FsStats>,
+        inodes: parking_lot::Mutex<Option<InodeStats>>,
+        after_inode: parking_lot::Mutex<Option<FsStats>>,
+    }
+
+    #[cfg(unix)]
+    impl EmergencyInodePlatform {
+        fn new(root: &Path) -> Self {
+            let stats = FsStats {
+                total_bytes: 1000,
+                free_bytes: 500,
+                available_bytes: 500,
+                fs_type: "ext4".into(),
+                mount_point: root.to_path_buf(),
+                is_readonly: false,
+            };
+            Self {
+                inventory: MockPlatform::new(
+                    vec![MountPoint {
+                        path: root.to_path_buf(),
+                        device: root.display().to_string(),
+                        fs_type: "ext4".into(),
+                        is_ram_backed: false,
+                    }],
+                    HashMap::from([(root.to_path_buf(), stats.clone())]),
+                    MockPlatform::healthy().memory_info().unwrap(),
+                    PlatformPaths::default(),
+                ),
+                stats: parking_lot::Mutex::new(stats),
+                inodes: parking_lot::Mutex::new(InodeStats::new(3, 0, 0)),
+                after_inode: parking_lot::Mutex::new(None),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Platform for EmergencyInodePlatform {
+        fn fs_stats(&self, _path: &Path) -> PalResult<FsStats> {
+            Ok(self.stats.lock().clone())
+        }
+
+        fn inode_stats(&self, _path: &Path) -> PalResult<Option<InodeStats>> {
+            if let Some(stats) = self.after_inode.lock().take() {
+                *self.stats.lock() = stats;
+            }
+            Ok(*self.inodes.lock())
+        }
+
+        fn mount_points(&self) -> PalResult<Vec<MountPoint>> {
+            self.inventory.mount_points()
+        }
+
+        fn is_ram_backed(&self, path: &Path) -> PalResult<bool> {
+            self.inventory.is_ram_backed(path)
+        }
+
+        fn default_paths(&self) -> PlatformPaths {
+            self.inventory.default_paths()
+        }
+
+        fn memory_info(&self) -> PalResult<MemoryInfo> {
+            self.inventory.memory_info()
+        }
+
+        fn service_manager(&self) -> Box<dyn ServiceManager> {
+            self.inventory.service_manager()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emergency_inode_goal_reclaims_zero_byte_artifacts_and_stops_on_fresh_evidence() {
+        for evidence_lost in [false, true] {
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let first = root.join("first.o");
+            let second = root.join("second.o");
+            std::fs::write(&first, []).unwrap();
+            std::fs::write(&second, []).unwrap();
+            let platform = std::sync::Arc::new(EmergencyInodePlatform::new(&root));
+            let collector = FsStatsCollector::new(platform.clone(), Duration::from_hours(1));
+            let args = EmergencyArgs {
+                target_free_inodes: Some(34.0),
+                yes: true,
+                ..EmergencyArgs::default()
+            };
+            assert_eq!(
+                emergency_pressure_skip(
+                    &collector,
+                    platform.as_ref(),
+                    &first,
+                    &EmergencyArgs::default(),
+                ),
+                Some(SkipReason::TargetFreeReached),
+                "ample bytes retain the default byte-only behavior",
+            );
+            let after_deletion = platform.clone();
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    check_open_files: false,
+                    require_identity: true,
+                    ..DeletionConfig::default()
+                },
+                None,
+            )
+            .with_activity_observer(move |event| {
+                if matches!(event, ActivityEvent::ArtifactDeleted { .. }) {
+                    *after_deletion.inodes.lock() = if evidence_lost {
+                        None
+                    } else {
+                        InodeStats::new(3, 2, 2)
+                    };
+                }
+            });
+            let mut candidates = vec![
+                clean_receipt_candidate(&first),
+                clean_receipt_candidate(&second),
+            ];
+            for candidate in &mut candidates {
+                candidate.size_bytes = 0;
+            }
+            let mut plan = executor.plan(candidates);
+            plan.candidates
+                .sort_by_key(|candidate| candidate.path != first);
+            assert_eq!(plan.candidates.len(), 2);
+            let check =
+                |path: &Path| emergency_pressure_skip(&collector, platform.as_ref(), path, &args);
+            let report = executor.execute(&plan, Some(&check));
+            assert_eq!(report.items_deleted, 1);
+            assert_eq!(report.bytes_freed, 0);
+            assert_eq!(report.items_failed, 0);
+            let reason = if evidence_lost {
+                "pressure_unavailable"
+            } else {
+                "target_free_reached"
+            };
+            assert_eq!(report.skipped_by_reason.get(reason), Some(&1));
+            assert!(!first.exists());
+            assert!(second.exists());
+            let goals = emergency_recovery_goals(
+                std::slice::from_ref(&root),
+                &args,
+                &collector,
+                platform.as_ref(),
+            );
+            assert_eq!(goals[0].targets_met, !evidence_lost);
+            let result =
+                emergency_completion_result(&report, &EmergencyQuarantineReport::default(), &goals);
+            if evidence_lost {
+                assert_eq!(result.unwrap_err().exit_code(), 4);
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emergency_inode_goal_refuses_unknown_invalid_or_changed_filesystems() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let unrelated = tempfile::tempdir_in("/tmp").unwrap();
+        let args = EmergencyArgs {
+            target_free_inodes: Some(34.0),
+            ..EmergencyArgs::default()
+        };
+        for refusal in [
+            "unknown-inodes",
+            "invalid-inodes",
+            "read-only",
+            "invalid-bytes",
+            "resized",
+            "changed-owner",
+        ] {
+            let platform = std::sync::Arc::new(EmergencyInodePlatform::new(&root));
+            match refusal {
+                "unknown-inodes" => *platform.inodes.lock() = None,
+                "invalid-inodes" => {
+                    *platform.inodes.lock() = Some(InodeStats {
+                        total: 3,
+                        free: 1,
+                        available: 2,
+                    });
+                }
+                "read-only" => platform.stats.lock().is_readonly = true,
+                "invalid-bytes" => platform.stats.lock().total_bytes = 0,
+                "resized" | "changed-owner" => {
+                    let mut after = platform.stats.lock().clone();
+                    if refusal == "resized" {
+                        after.total_bytes *= 2;
+                    } else {
+                        after.mount_point = unrelated.path().canonicalize().unwrap();
+                    }
+                    *platform.after_inode.lock() = Some(after);
+                }
+                _ => unreachable!(),
+            }
+            let collector = FsStatsCollector::new(platform.clone(), Duration::from_hours(1));
+            assert_eq!(
+                emergency_pressure_skip(&collector, platform.as_ref(), &root, &args),
+                Some(SkipReason::PressureUnavailable),
+                "{refusal}",
+            );
+        }
+        let platform = std::sync::Arc::new(EmergencyInodePlatform::new(&root));
+        let collector = FsStatsCollector::new(platform.clone(), Duration::ZERO);
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 101.0] {
+            let invalid_args = EmergencyArgs {
+                target_free_inodes: Some(invalid),
+                ..EmergencyArgs::default()
+            };
+            assert_eq!(
+                emergency_pressure_skip(&collector, platform.as_ref(), &root, &invalid_args),
+                Some(SkipReason::PressureUnavailable),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emergency_inode_goal_is_renewed_after_candidate_and_quarantine_confirmation() {
+        struct RecoveryDuringConfirmation {
+            platform: std::sync::Arc<EmergencyInodePlatform>,
+            answer: io::Cursor<&'static [u8]>,
+        }
+
+        impl io::Read for RecoveryDuringConfirmation {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                *self.platform.inodes.lock() = InodeStats::new(3, 2, 2);
+                io::Read::read(&mut self.answer, buffer)
+            }
+        }
+
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let target = root.join("old.o");
+        std::fs::write(&target, "obj").unwrap();
+        let platform = std::sync::Arc::new(EmergencyInodePlatform::new(&root));
+        let collector = FsStatsCollector::new(platform.clone(), Duration::from_hours(1));
+        let args = EmergencyArgs {
+            target_free_inodes: Some(34.0),
+            ..EmergencyArgs::default()
+        };
+        let check =
+            |path: &Path| emergency_pressure_skip(&collector, platform.as_ref(), path, &args);
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                require_identity: true,
+                ..DeletionConfig::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![clean_receipt_candidate(&target)]);
+        assert_eq!(plan.candidates.len(), 1);
+        let mut input = io::BufReader::new(RecoveryDuringConfirmation {
+            platform: platform.clone(),
+            answer: io::Cursor::new(b"y\n"),
+        });
+        let mut output = Vec::new();
+        let report =
+            run_confirmed_cleanup_with_check(&executor, &plan, &check, &mut input, &mut output)
+                .unwrap();
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(
+            report.skipped_by_reason.get("target_free_reached"),
+            Some(&1)
+        );
+        assert!(target.exists());
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Proceed with cleanup?")
+        );
+
+        *platform.inodes.lock() = InodeStats::new(3, 0, 0);
+        let (store, _) = undo_fixture(&root, "held", RecoveryState::Intact);
+        let record = store.record("held").unwrap().unwrap();
+        let ledger = root.join("activity.sqlite3");
+        let report = drain_emergency_quarantine(
+            std::slice::from_ref(&root),
+            &args,
+            &ledger,
+            &check,
+            |_, records| {
+                assert_eq!(records.len(), 1);
+                *platform.inodes.lock() = InodeStats::new(3, 2, 2);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(report.removals.is_empty());
+        assert!(!report.unfinished);
+        assert_eq!(store.record("held").unwrap().unwrap(), record);
+        assert!(!ledger.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emergency_inode_goal_reports_unmet_and_unavailable_recovery() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let platform = std::sync::Arc::new(EmergencyInodePlatform::new(&root));
+        let collector = FsStatsCollector::new(platform.clone(), Duration::from_hours(1));
+        let args = EmergencyArgs {
+            target_free_inodes: Some(34.0),
+            ..EmergencyArgs::default()
+        };
+        let quarantine = EmergencyQuarantineReport::default();
+        for unavailable in [false, true] {
+            if unavailable {
+                *platform.inodes.lock() = None;
+            }
+            let goals = emergency_recovery_goals(
+                std::slice::from_ref(&root),
+                &args,
+                &collector,
+                platform.as_ref(),
+            );
+            assert_eq!(goals.len(), 1);
+            assert!(!goals[0].targets_met);
+            assert_eq!(goals[0].issue.is_some(), unavailable);
+            assert_eq!(
+                serde_json::to_value(&goals).unwrap()[0]["targets_met"],
+                false
+            );
+            let mut report = empty_emergency_report();
+            assert_eq!(
+                emergency_completion_result(&report, &quarantine, &goals)
+                    .unwrap_err()
+                    .exit_code(),
+                if unavailable { 2 } else { 1 },
+            );
+            report.items_deleted = 1;
+            assert_eq!(
+                emergency_completion_result(&report, &quarantine, &goals)
+                    .unwrap_err()
+                    .exit_code(),
+                4,
+            );
+        }
+        *platform.inodes.lock() = InodeStats::new(3, 2, 2);
+        {
+            let mut stats = platform.stats.lock();
+            stats.free_bytes = 50;
+            stats.available_bytes = 50;
+        }
+        assert_eq!(
+            emergency_pressure_skip(&collector, platform.as_ref(), &root, &args),
+            None,
+            "meeting the inode goal must not abandon the byte goal",
+        );
+        {
+            let mut stats = platform.stats.lock();
+            stats.free_bytes = 500;
+            stats.available_bytes = 500;
+        }
+        assert_eq!(
+            emergency_pressure_skip(&collector, platform.as_ref(), &root, &args),
+            Some(SkipReason::TargetFreeReached),
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn interactive_cleanup_preserves_decline_all_quit_and_eof() {
@@ -22707,7 +23380,7 @@ mod tests {
                 std::slice::from_ref(&root),
                 &EmergencyArgs::default(),
                 &ledger,
-                &collector,
+                &|path| target_free_skip(&collector, path, 10.0),
                 |root, records| {
                     confirm_emergency_quarantine(root, records, &mut input, &mut prompt)
                 },
@@ -22747,7 +23420,7 @@ mod tests {
             std::slice::from_ref(&root),
             &args,
             &ledger,
-            &collector,
+            &|path| target_free_skip(&collector, path, args.target_free),
             |_, _| panic!("unavailable pressure must be held before prompting"),
         )
         .unwrap();
@@ -22768,8 +23441,13 @@ mod tests {
         let plan = executor.plan(vec![clean_receipt_candidate(&root)]);
         assert_eq!(plan.candidates.len(), 1);
         let mut input = io::Cursor::new("y\n");
-        let report =
-            run_interactive_emergency(&executor, &plan, &args, &collector, &mut input).unwrap();
+        let report = run_interactive_emergency(
+            &executor,
+            &plan,
+            &|path| target_free_skip(&collector, path, args.target_free),
+            &mut input,
+        )
+        .unwrap();
         assert_eq!(
             report.skipped_by_reason.get("pressure_unavailable"),
             Some(&1)
@@ -22789,7 +23467,7 @@ mod tests {
             std::slice::from_ref(&root),
             &EmergencyArgs::default(),
             &root.join("activity.sqlite3"),
-            &collector,
+            &|path| target_free_skip(&collector, path, 10.0),
             |root, records| {
                 assert_eq!(records.len(), 1);
                 undo_fixture(root, "arrived-after-prompt", RecoveryState::Intact);
@@ -22838,7 +23516,7 @@ mod tests {
                 ..EmergencyArgs::default()
             },
             &root.join("activity.sqlite3"),
-            &collector,
+            &|path| target_free_skip(&collector, path, 10.0),
             |_, _| panic!("--yes must not prompt"),
         )
         .unwrap();
@@ -22875,7 +23553,7 @@ mod tests {
                 ..EmergencyArgs::default()
             },
             &root.join("activity.sqlite3"),
-            &collector,
+            &|path| target_free_skip(&collector, path, 10.0),
             |_, _| panic!("--yes must not prompt"),
         )
         .unwrap();
@@ -22899,8 +23577,7 @@ mod tests {
         let report = run_interactive_emergency(
             &executor,
             &plan,
-            &EmergencyArgs::default(),
-            &collector,
+            &|path| target_free_skip(&collector, path, 10.0),
             &mut input,
         )
         .unwrap();
@@ -25566,7 +26243,10 @@ mod tests {
         let error = run(&set).unwrap_err();
         assert_eq!(error.exit_code(), 2);
         assert!(error.to_string().contains("another configuration update"));
-        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original_config);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            original_config
+        );
 
         let protect = Cli::try_parse_from([
             "sbh",
@@ -25593,7 +26273,10 @@ mod tests {
         let error = run(&unprotect).unwrap_err();
         assert_eq!(error.exit_code(), 2);
         assert!(existing.join(protection::MARKER_FILENAME).exists());
-        assert_eq!(std::fs::read_to_string(&sacred_path).unwrap(), original_policy);
+        assert_eq!(
+            std::fs::read_to_string(&sacred_path).unwrap(),
+            original_policy
+        );
 
         drop(owner);
         let mut report = ProtectCreateReport::new(&additional);
@@ -25652,7 +26335,12 @@ mod tests {
         assert!(matches!(&error, CliError::Partial(_)));
         assert_eq!(error.exit_code(), 4);
         assert!(error.to_string().contains("marker removal failed"));
-        assert!(load_sacred_config(&sacred_path).unwrap().protected_paths.is_empty());
+        assert!(
+            load_sacred_config(&sacred_path)
+                .unwrap()
+                .protected_paths
+                .is_empty()
+        );
         assert!(marker.is_dir());
     }
 

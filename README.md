@@ -441,7 +441,7 @@ including `--auto --dry-run --json`.
 | `sbh clean` | Manual cleanup with confirmation/dry-run |
 | `sbh undo` | Restore quarantined entries (`<decision-id>`, `--path`, `--all-since`, `--list`) |
 | `sbh relocate` | Report dormant protected scratch, apply verified backup relocation, or restore a relocated tree ([guide](docs/relocation.md)) |
-| `sbh emergency` | Immediate recovery on critically full disks |
+| `sbh emergency` | Immediate recovery on critically full disks; optional `--target-free-inodes PERCENT` for inode exhaustion |
 
 ### Ballast and Protection
 
@@ -2405,6 +2405,22 @@ When a disk is at 99%+ utilization, normal operations may fail because they need
 After a quarantine drain physically removes payloads and finalizes their recovery records, the command tries to save completion receipts in the default activity ledger. Payloads left partial, absent, restored, or refused produce no success receipt. A drain without completions never opens the ledger; a receipt-write failure warns and does not stop recovery. The scan-and-delete executor remains independent of the ledger.
 
 The emergency command scans the specified paths, scores candidates using the standard multi-factor engine, and presents them for immediate deletion. With `--yes`, it executes deletions immediately without interactive confirmation, prioritizing the highest-scoring candidates until the target free space is reached or all candidates are exhausted. Because no config is read, `--min-age <MINUTES>` (default 5) is the only age floor: artifacts modified more recently are left alone, and `--min-age 0` reclaims fresh builds too. Every candidate is printed with its decision id (`id <hex>` in the plan, `candidates[].decision_id` in `--json`), the same id `sbh scan` and `sbh clean` would record, so a later `sbh explain --id` can be matched against what emergency acted on.
+
+If files cannot be created because the filesystem has exhausted its inodes,
+request an inode recovery target even when plenty of bytes remain:
+
+```bash
+sbh emergency /data --target-free-inodes 10 --yes
+```
+
+`--target-free-inodes PERCENT` adds an available-inode goal to the existing
+`--target-free` byte goal; cleanup stops on each filesystem only when both are
+met. It requires fresh, finite, consistent inode accounting and holds cleanup
+when that evidence is unavailable. The final human report shows the remaining
+capacity; `--json` includes `recovery_goals` with observed inode counts and
+target outcomes. An unmet or unverifiable explicit goal produces a nonzero
+exit status, including partial success when artifacts were reclaimed. Omitting
+the flag keeps the usual byte-only stopping rule.
 
 **Emergency escalation:** unlike `sbh clean`, emergency mode also acts on candidates whose decision-theoretic outcome is `Review` (score cleared the threshold and nothing vetoed them, but the keep-vs-delete loss margin was too ambiguous for unattended deletion). `Review` means "a human should look" — in emergency mode the human *is* looking, via the interactive confirmation or an explicit `--yes`. Without this escalation, a candidate corpus that is 100% `Review` would make the last line of defence a silent no-op on a critically full disk. Unambiguous `Delete` decisions are still executed first; every hard safety rail (vetoes, sacred paths, `.sbh-protect` markers, and the `.git`/Cargo-manifest/source-tree/open-file/active-lease pre-flight checks) applies unchanged.
 
