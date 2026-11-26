@@ -263,6 +263,9 @@ struct SharedExecutorConfig {
     /// Minimum [`ArtifactCertainty`] rank the current behavior cell dispatches
     /// (set from the cleanup action on every behavior transition).
     min_certainty_rank: AtomicU8,
+    /// Effective matrix and applied memory row for each batch's own disk
+    /// pressure. A critical peer must not broaden ordinary cleanup here.
+    behavior_policy: RwLock<(BehaviorDispatchTable, MemoryPressureLevel)>,
     /// Live discovery posture. Memory pressure narrows scanning without
     /// revoking the cleanup authority of already-known candidates.
     scan_posture: RwLock<ScanAggressiveness>,
@@ -316,6 +319,10 @@ impl SharedExecutorConfig {
             repeat_base_cooldown_secs: AtomicU64::new(repeat_base_cooldown),
             repeat_max_cooldown_secs: AtomicU64::new(repeat_max_cooldown),
             min_certainty_rank: AtomicU8::new(ArtifactCertainty::Unclear.rank()),
+            behavior_policy: RwLock::new((
+                BehaviorDispatchTable::default(),
+                MemoryPressureLevel::Unknown,
+            )),
             scan_posture: RwLock::new(ScanAggressiveness::Normal),
             ram_reclaim_certainty_floor: AtomicU8::new(ArtifactCertainty::Unclear.rank()),
             ram_reclaim_blocks_ordinary_deletion: AtomicBool::new(false),
@@ -382,6 +389,45 @@ impl SharedExecutorConfig {
                 self.ram_reclaim_certainty_floor.load(Ordering::Relaxed),
             ))
         }
+    }
+
+    fn set_behavior_policy(
+        &self,
+        table: &BehaviorDispatchTable,
+        memory: MemoryPressureLevel,
+        disk: PressureLevel,
+    ) {
+        // Publish the global floor and peer cells under one lock. Mixing an
+        // old global floor with a newly relaxed peer cell could weaken both
+        // complete policies during a custom-matrix transition.
+        let mut policy = self.behavior_policy.write();
+        let mode = table.mode_for(memory, disk);
+        self.set_min_certainty(min_certainty_for(mode.cleanup_action));
+        self.inode_cleanup_enabled
+            .store(behavior_allows_delete_dispatch(mode), Ordering::Release);
+        *policy = (table.clone(), memory);
+    }
+
+    fn dispatch_certainty_for(
+        &self,
+        level: PressureLevel,
+        ram_reclaim: bool,
+        inode_reclaim: bool,
+    ) -> std::result::Result<ArtifactCertainty, SkipReason> {
+        let policy = self.behavior_policy.read();
+        self.authorize_dispatch(ram_reclaim, inode_reclaim)?;
+        let certainty = self.dispatch_certainty(ram_reclaim || inode_reclaim);
+        if ram_reclaim || inode_reclaim {
+            // Resource relief has separate scope and definite-only authority.
+            // Byte pressure cannot revoke it; the inode behavior hold still can.
+            return Ok(certainty);
+        }
+
+        let mode = policy.0.mode_for(policy.1, level);
+        if !behavior_allows_delete_dispatch(mode) {
+            return Err(SkipReason::PolicyChanged);
+        }
+        Ok(certainty.max(min_certainty_for(mode.cleanup_action)))
     }
 
     fn set_min_certainty(&self, certainty: ArtifactCertainty) {
@@ -1845,16 +1891,22 @@ impl DeletionBatch {
         Ok(admission.min_score())
     }
 
-    fn min_certainty(&self, shared: &SharedExecutorConfig) -> ArtifactCertainty {
-        shared
-            .dispatch_certainty(self.ram_reclaim.is_some() || self.inode_reclaim.is_some())
-            .max(
-                self.scan_now
-                    .as_ref()
-                    .map_or(ArtifactCertainty::Unclear, |scope| {
-                        scope.certainty_floor(self.pressure_level)
-                    }),
-            )
+    fn min_certainty(
+        &self,
+        shared: &SharedExecutorConfig,
+    ) -> std::result::Result<ArtifactCertainty, SkipReason> {
+        let certainty = shared.dispatch_certainty_for(
+            self.pressure_level,
+            self.ram_reclaim.is_some(),
+            self.inode_reclaim.is_some(),
+        )?;
+        Ok(certainty.max(
+            self.scan_now
+                .as_ref()
+                .map_or(ArtifactCertainty::Unclear, |scope| {
+                    scope.certainty_floor(self.pressure_level)
+                }),
+        ))
     }
 
     /// A queued plan cannot retain a lower score or certainty floor after a
@@ -1867,10 +1919,11 @@ impl DeletionBatch {
         now: Instant,
     ) -> std::result::Result<(), SkipReason> {
         let min_score = self.min_score(shared, now)?;
+        let min_certainty = self.min_certainty(shared)?;
         if !min_score.is_finite()
             || !candidate.total_score.is_finite()
             || candidate.total_score < min_score
-            || candidate.decision.certainty < self.min_certainty(shared)
+            || candidate.decision.certainty < min_certainty
         {
             return Err(SkipReason::PolicyChanged);
         }
@@ -6117,6 +6170,11 @@ impl MonitoringDaemon {
             MemoryPressureLevel::Unknown,
             PressureLevel::Green,
         );
+        shared_executor_config.set_behavior_policy(
+            behavior_state.table(),
+            behavior_state.memory_level,
+            behavior_state.disk_level,
+        );
         shared_executor_config.set_scan_posture(behavior_state.mode.scan_aggressiveness);
 
         let prediction_config = config.pressure.prediction.clone();
@@ -6667,17 +6725,21 @@ impl MonitoringDaemon {
         } else {
             Duration::from_secs(self.config.pressure.behavior_hysteresis_secs)
         };
-        match self.behavior_state.update_with_hysteresis(
+        let update = self.behavior_state.update_with_hysteresis(
             memory_level,
             disk_level,
             Instant::now(),
             hysteresis,
-        ) {
+        );
+        self.shared_executor_config.set_behavior_policy(
+            self.behavior_state.table(),
+            self.behavior_state.memory_level,
+            self.behavior_state.disk_level,
+        );
+        match update {
             BehaviorUpdate::Applied(transition) => {
                 self.shared_executor_config
                     .set_scan_posture(transition.to_mode.scan_aggressiveness);
-                self.shared_executor_config
-                    .set_min_certainty(min_certainty_for(transition.to_mode.cleanup_action));
                 self.cpu_budget.lock().set_pct(paced_pct(
                     self.config.telemetry.cpu_budget_pct,
                     transition.to_mode.scan_aggressiveness,
@@ -6712,10 +6774,6 @@ impl MonitoringDaemon {
             BehaviorUpdate::Deferred { repeated: true, .. } | BehaviorUpdate::Unchanged => {}
         }
         self.retry_behavior_emergency();
-        self.shared_executor_config.inode_cleanup_enabled.store(
-            behavior_allows_delete_dispatch(self.behavior_state.mode),
-            Ordering::Release,
-        );
     }
 
     fn note_behavior_emergency_transition(
@@ -12286,16 +12344,16 @@ impl MonitoringDaemon {
                     // Rebuild the behavior matrix; re-resolve the current cell.
                     if new_config.behavior != self.config.behavior {
                         let table = behavior_table_from_config(&new_config);
-                        if let Some(transition) = self.behavior_state.replace_table(table) {
+                        let transition = self.behavior_state.replace_table(table);
+                        // A peer mount's cell can change while the global cell
+                        // stays identical. Publish before reporting either case.
+                        self.shared_executor_config.set_behavior_policy(
+                            self.behavior_state.table(),
+                            self.behavior_state.memory_level,
+                            self.behavior_state.disk_level,
+                        );
+                        if let Some(transition) = transition {
                             self.note_behavior_emergency_transition("config_reload", &transition);
-                            self.shared_executor_config
-                                .set_min_certainty(min_certainty_for(
-                                    transition.to_mode.cleanup_action,
-                                ));
-                            self.shared_executor_config.inode_cleanup_enabled.store(
-                                behavior_allows_delete_dispatch(transition.to_mode),
-                                Ordering::Release,
-                            );
                             let message = format!(
                                 "behavior mode changed source=config_reload memory={:?} \
                                  disk={:?} mode=({}) -> ({})",
@@ -12862,7 +12920,8 @@ fn dispatch_with_behavior_gate(
     executor_config: &SharedExecutorConfig,
 ) -> bool {
     if executor_config
-        .authorize_dispatch(
+        .dispatch_certainty_for(
+            request.pressure_level,
             request.ram_reclaim.is_some(),
             request.inode_reclaim.is_some(),
         )
@@ -14029,7 +14088,8 @@ fn scanner_thread_main(
             continue;
         }
         if executor_config
-            .authorize_dispatch(
+            .dispatch_certainty_for(
+                request.pressure_level,
                 request.ram_reclaim.is_some(),
                 request.inode_reclaim.is_some(),
             )
@@ -14513,7 +14573,15 @@ fn scanner_thread_main(
         // cooldown. Measured before this: 574 zero-duration replay passes in
         // five minutes, each re-dispatching the same two `unclear` records.
         let pass_min_certainty = executor_config
-            .dispatch_certainty(request.has_resource_reclaim())
+            .dispatch_certainty_for(
+                request.pressure_level,
+                request.ram_reclaim.is_some(),
+                request.inode_reclaim.is_some(),
+            )
+            .unwrap_or_else(|_| {
+                request.max_delete_batch = 0;
+                ArtifactCertainty::Definite
+            })
             .max(
                 request
                     .scan_now
@@ -16845,7 +16913,11 @@ fn executor_thread_main(
         batch_count += 1;
 
         if shared_config
-            .authorize_dispatch(batch.ram_reclaim.is_some(), batch.inode_reclaim.is_some())
+            .dispatch_certainty_for(
+                batch.pressure_level,
+                batch.ram_reclaim.is_some(),
+                batch.inode_reclaim.is_some(),
+            )
             .is_err()
         {
             continue;
@@ -17111,7 +17183,9 @@ fn executor_thread_main(
         // Behavior-cell certainty gate (v0.6 matrix): Green/Yellow cells dispatch
         // only structurally definite artifacts; Orange adds likely ones; Red and
         // Critical dispatch every Delete verdict.
-        let min_certainty = batch.min_certainty(shared_config);
+        let Ok(min_certainty) = batch.min_certainty(shared_config) else {
+            continue;
+        };
         let (mut approved_candidates, held_back_by_certainty) =
             retain_dispatchable_by_certainty(approved_candidates, min_certainty);
         if held_back_by_certainty > 0 {
@@ -17425,7 +17499,8 @@ fn executor_thread_main(
                     return Err(SkipReason::PolicyChanged);
                 }
                 authorize_scanner_mutation_scope(&batch, shared_scanner_config)?;
-                shared_config.authorize_dispatch(
+                shared_config.dispatch_certainty_for(
+                    batch.pressure_level,
                     batch.ram_reclaim.is_some(),
                     batch.inode_reclaim.is_some(),
                 )?;
@@ -41111,6 +41186,226 @@ mod tests {
         assert_eq!(kept.len(), 3);
     }
 
+    fn test_ordinary_scoring_batch(
+        candidate: CandidacyScore,
+        pressure_level: PressureLevel,
+    ) -> DeletionBatch {
+        DeletionBatch {
+            candidates: vec![candidate],
+            reclaim_progress: None,
+            admitted_scanner: Arc::new(ScannerConfig::default()),
+            filesystem_reclaim: None,
+            predictive_reclaim: None,
+            pressure_level,
+            urgency: 1.0,
+            scan_now: None,
+            target_bytes: None,
+            ram_reclaim: None,
+            inode_reclaim: None,
+            target_only_root: None,
+            target_only_consent: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn test_peer_behavior_config() -> crate::daemon::policy::BehaviorConfig {
+        use crate::daemon::policy::{BehaviorCellConfig, BehaviorConfig, BehaviorPreset};
+
+        let mut config = BehaviorConfig {
+            preset: BehaviorPreset::Custom,
+            memory_never_reduces_cleanup: false,
+            ..BehaviorConfig::default()
+        };
+        let cell = BehaviorCellConfig {
+            scan: ScanAggressiveness::Normal,
+            cleanup: CleanupAction::MostPromisingCandidates,
+            ballast: BallastAction::None,
+            notify: NotificationPriority::Low,
+        };
+        config.cells.insert("normal_yellow".into(), cell);
+        config.cells.insert(
+            "warn_yellow".into(),
+            BehaviorCellConfig {
+                cleanup: CleanupAction::IdentifyOnly,
+                ..cell
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn mixed_mount_batches_keep_their_own_certainty_floor() {
+        let shared = test_dispatch_config();
+        let table = BehaviorDispatchTable::default();
+        shared.set_behavior_policy(&table, MemoryPressureLevel::Normal, PressureLevel::Critical);
+        assert_eq!(shared.min_certainty(), ArtifactCertainty::Unclear);
+
+        // One critical filesystem keeps the global floor permissive while
+        // ordinary work on each peer retains that peer's cleanup policy.
+        let mut candidate = test_candidate("/tmp/peer/target", 0.8);
+        let mut batch = test_ordinary_scoring_batch(candidate.clone(), PressureLevel::Critical);
+        for (level, floor) in [
+            (PressureLevel::Green, ArtifactCertainty::Definite),
+            (PressureLevel::Yellow, ArtifactCertainty::Definite),
+            (PressureLevel::Orange, ArtifactCertainty::Likely),
+            (PressureLevel::Red, ArtifactCertainty::Unclear),
+            (PressureLevel::Critical, ArtifactCertainty::Unclear),
+        ] {
+            batch.pressure_level = level;
+            assert_eq!(
+                shared.dispatch_certainty_for(level, false, false),
+                Ok(floor),
+            );
+            for certainty in [
+                ArtifactCertainty::Unclear,
+                ArtifactCertainty::Likely,
+                ArtifactCertainty::Definite,
+            ] {
+                candidate.decision.certainty = certainty;
+                assert_eq!(
+                    batch.authorize_scoring(&candidate, &shared, Instant::now()),
+                    if certainty >= floor {
+                        Ok(())
+                    } else {
+                        Err(SkipReason::PolicyChanged)
+                    },
+                    "global critical, peer {level:?}, candidate {certainty:?}",
+                );
+            }
+        }
+
+        // Resource authority remains separate from byte-only None cells.
+        let legacy =
+            BehaviorDispatchTable::from_preset(crate::daemon::policy::BehaviorPreset::V0_5);
+        shared.set_behavior_policy(
+            &legacy,
+            MemoryPressureLevel::Normal,
+            PressureLevel::Critical,
+        );
+        shared.set_ram_reclaim_physical_mode(Some(
+            legacy.mode_for(MemoryPressureLevel::Normal, PressureLevel::Green),
+        ));
+        assert_eq!(
+            shared.dispatch_certainty_for(PressureLevel::Green, false, false),
+            Err(SkipReason::PolicyChanged),
+        );
+        for (ram, inode) in [(true, false), (false, true)] {
+            assert_eq!(
+                shared.dispatch_certainty_for(PressureLevel::Green, ram, inode),
+                Ok(ArtifactCertainty::Definite),
+            );
+        }
+        shared.inode_cleanup_enabled.store(false, Ordering::Release);
+        assert_eq!(
+            shared.dispatch_certainty_for(PressureLevel::Green, false, true),
+            Err(SkipReason::PolicyChanged),
+        );
+        assert_eq!(
+            shared.dispatch_certainty_for(PressureLevel::Green, true, false),
+            Ok(ArtifactCertainty::Definite),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn peer_behavior_reload_applies_without_global_mode_change() {
+        let mut fixture = RegretDaemonFixture::new();
+        let daemon = &mut fixture.daemon;
+        let mut config = daemon.config.clone();
+        config.behavior = test_peer_behavior_config();
+        daemon.apply_config_reload(Ok(config));
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            PressureLevel::Critical,
+            "startup",
+            Duration::ZERO,
+        );
+        let mut candidate = test_candidate("/tmp/peer/target", 0.8);
+        candidate.decision.certainty = ArtifactCertainty::Likely;
+        let batch = test_ordinary_scoring_batch(candidate.clone(), PressureLevel::Yellow);
+        assert!(
+            batch
+                .authorize_scoring(&candidate, &daemon.shared_executor_config, Instant::now())
+                .is_ok(),
+            "the configured normal-memory Yellow cell admits likely artifacts",
+        );
+
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Warn,
+            PressureLevel::Critical,
+            "startup",
+            Duration::ZERO,
+        );
+        assert_eq!(
+            daemon.shared_executor_config.min_certainty(),
+            ArtifactCertainty::Unclear,
+        );
+        assert_eq!(
+            batch.authorize_scoring(&candidate, &daemon.shared_executor_config, Instant::now()),
+            Err(SkipReason::PolicyChanged),
+            "the applied memory row makes this peer identify-only",
+        );
+        daemon.update_behavior_mode(
+            MemoryPressureLevel::Normal,
+            PressureLevel::Critical,
+            "startup",
+            Duration::ZERO,
+        );
+        assert!(
+            batch
+                .authorize_scoring(&candidate, &daemon.shared_executor_config, Instant::now())
+                .is_ok(),
+        );
+
+        let global_mode = daemon.behavior_state.mode;
+        candidate.decision.certainty = ArtifactCertainty::Definite;
+        for action in [CleanupAction::IdentifyOnly, CleanupAction::None] {
+            let mut config = daemon.config.clone();
+            config
+                .behavior
+                .cells
+                .get_mut("normal_yellow")
+                .unwrap()
+                .cleanup = action;
+            daemon.apply_config_reload(Ok(config));
+            assert_eq!(daemon.behavior_state.mode, global_mode);
+            assert_eq!(
+                daemon.shared_executor_config.min_certainty(),
+                ArtifactCertainty::Unclear,
+            );
+            assert_eq!(
+                batch.authorize_scoring(&candidate, &daemon.shared_executor_config, Instant::now()),
+                Err(SkipReason::PolicyChanged),
+                "{action:?} must revoke even definite queued peer candidates",
+            );
+            assert_eq!(
+                daemon.shared_executor_config.dispatch_certainty_for(
+                    PressureLevel::Critical,
+                    false,
+                    false,
+                ),
+                Ok(ArtifactCertainty::Unclear),
+            );
+
+            let mut request = event_test_request(vec![PathBuf::from("/tmp/peer")]);
+            request.pressure_level = PressureLevel::Yellow;
+            let (send, receive) = bounded(1);
+            let mut scored = vec![candidate.clone()];
+            let mut dispatched = PassDispatch::default();
+            assert!(dispatch_with_behavior_gate(
+                &mut scored,
+                &request,
+                &send,
+                &mut dispatched,
+                &daemon.shared_executor_config,
+            ));
+            assert!(receive.try_recv().is_err());
+            assert_eq!(dispatched.count, 0);
+            assert_eq!(scored.len(), 1);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -41122,9 +41417,12 @@ mod tests {
                 "score",
                 "certainty",
                 "physical-certainty",
+                "peer-certainty",
+                "peer-identify-only",
                 "equal-score",
                 "unchanged",
             ] {
+                let peer_change = matches!(change, "peer-certainty" | "peer-identify-only");
                 let scratch = temp_root_scratch_dir();
                 let mut candidate = target_mutation_candidate(scratch.path(), "target", 0.8);
                 candidate.decision.certainty = ArtifactCertainty::Likely;
@@ -41135,7 +41433,11 @@ mod tests {
                     admitted_scanner: Arc::new(ScannerConfig::default()),
                     filesystem_reclaim: None,
                     predictive_reclaim: None,
-                    pressure_level: PressureLevel::Critical,
+                    pressure_level: if peer_change {
+                        PressureLevel::Yellow
+                    } else {
+                        PressureLevel::Critical
+                    },
                     urgency: 1.0,
                     scan_now: None,
                     target_bytes: None,
@@ -41145,6 +41447,14 @@ mod tests {
                     target_only_consent: None,
                 };
                 let shared = test_dispatch_config();
+                let peer_policy = test_peer_behavior_config();
+                if peer_change {
+                    shared.set_behavior_policy(
+                        &BehaviorDispatchTable::from_config(&peer_policy).unwrap(),
+                        MemoryPressureLevel::Normal,
+                        PressureLevel::Critical,
+                    );
+                }
                 let executor = DeletionExecutor::new(
                     DeletionConfig {
                         mode,
@@ -41180,6 +41490,21 @@ mod tests {
                             "certainty" => shared.set_min_certainty(ArtifactCertainty::Definite),
                             "physical-certainty" => {
                                 shared.set_ram_reclaim_certainty_floor(ArtifactCertainty::Definite);
+                            }
+                            "peer-certainty" | "peer-identify-only" => {
+                                let mut policy = peer_policy.clone();
+                                policy.cells.get_mut("normal_yellow").unwrap().cleanup =
+                                    if change == "peer-certainty" {
+                                        CleanupAction::HighConfidenceCandidates
+                                    } else {
+                                        CleanupAction::IdentifyOnly
+                                    };
+                                shared.set_behavior_policy(
+                                    &BehaviorDispatchTable::from_config(&policy).unwrap(),
+                                    MemoryPressureLevel::Normal,
+                                    PressureLevel::Critical,
+                                );
+                                assert_eq!(shared.min_certainty(), ArtifactCertainty::Unclear);
                             }
                             "equal-score" => shared.set_min_score(candidate.total_score),
                             "unchanged" => {}
@@ -41220,16 +41545,19 @@ mod tests {
                     shared.set_min_score(0.0);
                     shared.set_min_certainty(ArtifactCertainty::Unclear);
                     shared.set_ram_reclaim_certainty_floor(ArtifactCertainty::Unclear);
+                    if peer_change {
+                        shared.set_behavior_policy(
+                            &BehaviorDispatchTable::from_config(&peer_policy).unwrap(),
+                            MemoryPressureLevel::Normal,
+                            PressureLevel::Critical,
+                        );
+                    }
                     let resumed = executor.execute_with_guard(
                         &plan,
                         None,
                         Some(&|item| batch.authorize_scoring(item, &shared, Instant::now())),
                     );
-                    assert_eq!(
-                        resumed.items_deleted,
-                        1,
-                        "{mode:?}: {change}: {resumed:?}"
-                    );
+                    assert_eq!(resumed.items_deleted, 1, "{mode:?}: {change}: {resumed:?}");
                 }
                 assert!(!candidate.path.exists());
                 if mode == DeletionMode::Quarantine {
