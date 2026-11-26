@@ -1845,6 +1845,38 @@ impl DeletionBatch {
         Ok(admission.min_score())
     }
 
+    fn min_certainty(&self, shared: &SharedExecutorConfig) -> ArtifactCertainty {
+        shared
+            .dispatch_certainty(self.ram_reclaim.is_some() || self.inode_reclaim.is_some())
+            .max(
+                self.scan_now
+                    .as_ref()
+                    .map_or(ArtifactCertainty::Unclear, |scope| {
+                        scope.certainty_floor(self.pressure_level)
+                    }),
+            )
+    }
+
+    /// A queued plan cannot retain a lower score or certainty floor after a
+    /// config reload or behavior transition. Renew both after native probes
+    /// and again when the executor reaches its final mutation boundary.
+    fn authorize_scoring(
+        &self,
+        candidate: &CandidacyScore,
+        shared: &SharedExecutorConfig,
+        now: Instant,
+    ) -> std::result::Result<(), SkipReason> {
+        let min_score = self.min_score(shared, now)?;
+        if !min_score.is_finite()
+            || !candidate.total_score.is_finite()
+            || candidate.total_score < min_score
+            || candidate.decision.certainty < self.min_certainty(shared)
+        {
+            return Err(SkipReason::PolicyChanged);
+        }
+        Ok(())
+    }
+
     /// Both dispatch selection and execution use the same objective and live
     /// risk table. Resource allowances are read here and charged only after
     /// successful mutations, never when candidates are queued.
@@ -17079,16 +17111,7 @@ fn executor_thread_main(
         // Behavior-cell certainty gate (v0.6 matrix): Green/Yellow cells dispatch
         // only structurally definite artifacts; Orange adds likely ones; Red and
         // Critical dispatch every Delete verdict.
-        let min_certainty = shared_config
-            .dispatch_certainty(batch.ram_reclaim.is_some() || batch.inode_reclaim.is_some())
-            .max(
-                batch
-                    .scan_now
-                    .as_ref()
-                    .map_or(ArtifactCertainty::Unclear, |scope| {
-                        scope.certainty_floor(batch.pressure_level)
-                    }),
-            );
+        let min_certainty = batch.min_certainty(shared_config);
         let (mut approved_candidates, held_back_by_certainty) =
             retain_dispatchable_by_certainty(approved_candidates, min_certainty);
         if held_back_by_certainty > 0 {
@@ -17412,20 +17435,22 @@ fn executor_thread_main(
                 }
             }
             regret.authorize_deletion(candidate, logger)?;
-            // This is the last live gate, including the executor's renewal
-            // after recursive inspection. A previously configured lower
-            // score floor cannot survive revocation, expiry or policy reload.
-            let current_min_score = batch.min_score(shared_config, Instant::now())?;
-            if batch.predictive_reclaim.is_some()
-                && (!candidate.total_score.is_finite() || candidate.total_score < current_min_score)
-            {
-                return Err(SkipReason::PolicyChanged);
-            }
-            if !dry_run {
-                // Native surveys and policy callbacks above can outlive a
-                // newly published filesystem refusal. Every mutation lane
-                // renews the shared hold at this final authority boundary.
+            // Preview batches keep their admitted counts, while predictive
+            // previews still require their original forecast permission.
+            if dry_run {
+                let current_min_score = batch.min_score(shared_config, Instant::now())?;
+                if batch.predictive_reclaim.is_some()
+                    && (!candidate.total_score.is_finite()
+                        || candidate.total_score < current_min_score)
+                {
+                    return Err(SkipReason::PolicyChanged);
+                }
+            } else {
+                // Recovery may need a native identity lookup. Renew scoring
+                // only after it, so a blocked lookup cannot preserve an older
+                // score or certainty floor at the final mutation boundary.
                 shared_config.authorize_recovery(candidate)?;
+                batch.authorize_scoring(candidate, shared_config, Instant::now())?;
             }
             Ok(())
         };
@@ -41084,6 +41109,141 @@ mod tests {
         let (kept, held) = retain_dispatchable_by_certainty(batch, ArtifactCertainty::Unclear);
         assert_eq!(held, 0);
         assert_eq!(kept.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn live_scoring_restrictions_at_final_authorization_preserve_artifacts() {
+        use std::cell::Cell;
+
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for change in [
+                "score",
+                "certainty",
+                "physical-certainty",
+                "equal-score",
+                "unchanged",
+            ] {
+                let scratch = temp_root_scratch_dir();
+                let mut candidate = target_mutation_candidate(scratch.path(), "target", 0.8);
+                candidate.decision.certainty = ArtifactCertainty::Likely;
+                let identity = candidate.identity.unwrap();
+                let batch = DeletionBatch {
+                    candidates: vec![candidate.clone()],
+                    reclaim_progress: None,
+                    admitted_scanner: Arc::new(ScannerConfig::default()),
+                    filesystem_reclaim: None,
+                    predictive_reclaim: None,
+                    pressure_level: PressureLevel::Critical,
+                    urgency: 1.0,
+                    scan_now: None,
+                    target_bytes: None,
+                    ram_reclaim: None,
+                    inode_reclaim: None,
+                    target_only_root: None,
+                    target_only_consent: None,
+                };
+                let shared = test_dispatch_config();
+                let executor = DeletionExecutor::new(
+                    DeletionConfig {
+                        mode,
+                        min_score: shared.min_score(),
+                        check_open_files: false,
+                        require_identity: true,
+                        quarantine_roots: vec![scratch.path().to_path_buf()],
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .with_platform(Arc::new(MockPlatform::healthy()));
+                let plan = executor.plan(batch.candidates.clone());
+                assert_eq!(plan.estimated_items, 1);
+                assert!(
+                    batch
+                        .authorize_scoring(&candidate, &shared, Instant::now())
+                        .is_ok()
+                );
+                let calls = Cell::new(0);
+                let final_call = if mode == DeletionMode::Quarantine {
+                    3
+                } else {
+                    2
+                };
+                let authorize = |item: &CandidacyScore| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == final_call {
+                        // A reload or behavior recovery lands after preflight,
+                        // including quarantine's durable-store preparation.
+                        match change {
+                            "score" => shared.set_min_score(0.9),
+                            "certainty" => shared.set_min_certainty(ArtifactCertainty::Definite),
+                            "physical-certainty" => {
+                                shared.set_ram_reclaim_certainty_floor(ArtifactCertainty::Definite);
+                            }
+                            "equal-score" => shared.set_min_score(candidate.total_score),
+                            "unchanged" => {}
+                            _ => unreachable!(),
+                        }
+                    }
+                    batch.authorize_scoring(item, &shared, Instant::now())
+                };
+                let report = executor.execute_with_guard(&plan, None, Some(&authorize));
+                let held = !matches!(change, "equal-score" | "unchanged");
+                assert_eq!(calls.get(), final_call, "{mode:?}: {change}");
+                assert_eq!(
+                    report.items_deleted,
+                    usize::from(!held),
+                    "{mode:?}: {change}: {report:?}"
+                );
+                assert_eq!(report.items_failed, 0);
+                assert!(report.backoff_candidates.is_empty());
+                if held {
+                    assert_eq!(report.items_skipped, 1);
+                    assert_eq!(report.skipped_by_reason.get("policy_changed"), Some(&1));
+                    assert_eq!(report.bytes_freed, 0);
+                    assert_eq!(report.bytes_quarantined, 0);
+                    assert_eq!(
+                        crate::scanner::walker::identity_for_path(&candidate.path, false).unwrap(),
+                        identity,
+                    );
+                    assert_eq!(
+                        std::fs::read(candidate.path.join("debug/deps/libdemo.rlib")).unwrap(),
+                        [7_u8; 64],
+                    );
+                    let store = QuarantineStore::under(scratch.path());
+                    if store.root().exists() {
+                        assert!(store.records().unwrap().is_empty());
+                    }
+
+                    // A policy hold must not poison a later valid attempt.
+                    shared.set_min_score(0.0);
+                    shared.set_min_certainty(ArtifactCertainty::Unclear);
+                    shared.set_ram_reclaim_certainty_floor(ArtifactCertainty::Unclear);
+                    let resumed = executor.execute_with_guard(
+                        &plan,
+                        None,
+                        Some(&|item| batch.authorize_scoring(item, &shared, Instant::now())),
+                    );
+                    assert_eq!(
+                        resumed.items_deleted,
+                        1,
+                        "{mode:?}: {change}: {resumed:?}"
+                    );
+                }
+                assert!(!candidate.path.exists());
+                if mode == DeletionMode::Quarantine {
+                    let store = QuarantineStore::under(scratch.path());
+                    let records = store.records().unwrap();
+                    assert_eq!(records.len(), 1);
+                    store.restore(&records[0].decision_id, false).unwrap();
+                    assert_eq!(
+                        std::fs::read(candidate.path.join("debug/deps/libdemo.rlib")).unwrap(),
+                        [7_u8; 64],
+                    );
+                }
+            }
+        }
     }
 
     #[test]
