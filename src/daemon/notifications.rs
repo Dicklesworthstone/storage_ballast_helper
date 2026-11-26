@@ -2563,7 +2563,15 @@ mod tests {
                 NotificationLevel::Critical,
             ));
         }
-        let events = [inode_event("/data"), swap_event()];
+        let events = [
+            inode_event("/data"),
+            swap_event(),
+            NotificationEvent::ReclaimUnavailable {
+                mount: "/unprotected".into(),
+                level: "critical".into(),
+                reason: "no reclaim surface".into(),
+            },
+        ];
         let now = Instant::now();
         for event in &events {
             assert_eq!(
@@ -2576,7 +2584,7 @@ mod tests {
                     .contains_key(&(event.type_key(), event.throttle_scope().into(),))
             );
         }
-        assert_eq!(manager.dropped_count(), 2);
+        assert_eq!(manager.dropped_count(), 3);
         drop(release);
         assert!(manager.drain(Duration::from_secs(5)));
         assert_eq!(delivered.try_iter().count(), CHANNEL_QUEUE_CAPACITY);
@@ -2591,8 +2599,11 @@ mod tests {
             );
         }
         assert!(manager.drain(Duration::from_secs(5)));
-        assert_eq!(delivered.try_iter().collect::<Vec<_>>(), ["/data", ""]);
-        assert_eq!(manager.dropped_count(), 2);
+        assert_eq!(
+            delivered.try_iter().collect::<Vec<_>>(),
+            ["/data", "", "/unprotected"]
+        );
+        assert_eq!(manager.dropped_count(), 3);
     }
 
     #[test]

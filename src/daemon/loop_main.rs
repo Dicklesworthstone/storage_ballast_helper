@@ -72,8 +72,8 @@ use crate::daemon::recovery_probe::{BackgroundProbes, RecoveryGeneration, Recove
 use crate::daemon::scan_now::{ScanNowClaim, ScanNowQueue, ScanNowScope};
 use crate::daemon::self_monitor::{
     DaemonLock, DiscoveryState, LoggingState, MountPressure, MountRateState, PolicyStateRecord,
-    PressureObservationGap, SelfMonitor, SelfMonitorTick, ThreadHeartbeat, ThreadState, ThreadStatus,
-    ThreadsState,
+    PressureObservationGap, SelfMonitor, SelfMonitorTick, ThreadHeartbeat, ThreadState,
+    ThreadStatus, ThreadsState,
 };
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat, resolve_watchdog_sec};
 use crate::daemon::target_tier::TargetTier;
@@ -2528,7 +2528,10 @@ enum RamReclaimBehavior {
 /// no statistics, cleanup scope, directory descriptor or mutation permission.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum PressureObservationKey {
-    Device { device: u64, fs_type: String },
+    Device {
+        device: u64,
+        fs_type: String,
+    },
     Owner {
         path: PathBuf,
         device: String,
@@ -2636,7 +2639,11 @@ impl PressureObservationRecovery {
     }
 
     fn finish_tick(&mut self, now: Instant) {
-        let watched: HashSet<_> = self.sources.values().map(|source| source.key.clone()).collect();
+        let watched: HashSet<_> = self
+            .sources
+            .values()
+            .map(|source| source.key.clone())
+            .collect();
         self.known.retain(|key, _| watched.contains(key));
         let failed_keys: HashSet<_> = self
             .failed
@@ -2654,8 +2661,7 @@ impl PressureObservationRecovery {
             // another query of the filesystem is failing.
             let resolved = self.current.get(key).is_some_and(|current| {
                 current.observed_at > known.observed_at
-                    || (current.observed_at == known.observed_at
-                        && current.level >= known.level)
+                    || (current.observed_at == known.observed_at && current.level >= known.level)
             });
             if !resolved && known.level > PressureLevel::Green {
                 unresolved.insert(key.clone());
@@ -2672,7 +2678,8 @@ impl PressureObservationRecovery {
         for key in unresolved {
             let known = self.known[&key];
             self.recovery_floor = Some(
-                self.recovery_floor.map_or(known.level, |level| level.max(known.level)),
+                self.recovery_floor
+                    .map_or(known.level, |level| level.max(known.level)),
             );
             let mut sources: Vec<_> = self
                 .failed
@@ -2699,9 +2706,8 @@ impl PressureObservationRecovery {
     }
 
     fn holds_recovery(&self) -> bool {
-        self.recovery_floor.is_some_and(|floor| {
-            self.observed_level.is_none_or(|observed| floor > observed)
-        })
+        self.recovery_floor
+            .is_some_and(|floor| self.observed_level.is_none_or(|observed| floor > observed))
     }
 
     fn disk_for_behavior(&self, observed: PressureLevel, applied: PressureLevel) -> PressureLevel {
@@ -4103,8 +4109,11 @@ pub struct MonitoringDaemon {
     /// Mounts whose last provision or replenish pass stopped at the headroom
     /// floor: their reserve is short by plan, not by release.
     floor_limited: HashSet<PathBuf>,
-    /// Once-per-epoch throttle for the "nothing to reclaim here" alert.
+    /// Observation/log throttle for the "nothing to reclaim here" alert.
     reclaim_alerts: AlertThrottle,
+    /// Successfully enqueued reclaim-unavailable alerts, separate from log
+    /// cadence so rejected alerts and full-level escalations remain eligible.
+    last_reclaim_notify: HashMap<PathBuf, (PressureLevel, Instant)>,
     /// Watchable volumes no scanner root covers, with their last level
     /// (`coverage`), re-measured every `UNCOVERED_REFRESH_INTERVAL`. They
     /// feed only the ReclaimUnavailable alert, never policy.
@@ -6490,6 +6499,7 @@ impl MonitoringDaemon {
             policy_transitions_seen: 0,
             floor_limited: HashSet::new(),
             reclaim_alerts: AlertThrottle::default(),
+            last_reclaim_notify: HashMap::new(),
             uncovered_levels: HashMap::new(),
             uncovered_checked_at: None,
             catalog_root_cache: HashMap::new(),
@@ -7021,7 +7031,8 @@ impl MonitoringDaemon {
             && !behavior_allows_delete_dispatch(mode);
         let previous_memory_level = self.shared_executor_config.behavior_policy.read().1;
         let new_gap_veto = gap_blocks_deletion
-            && !self.shared_executor_config
+            && !self
+                .shared_executor_config
                 .observation_gap_blocks_deletion
                 .load(Ordering::Acquire);
         if previous_memory_level != self.behavior_state.memory_level || new_gap_veto {
@@ -7921,7 +7932,10 @@ impl MonitoringDaemon {
     // One tick's worth of bookkeeping in program order; splitting it would
     // only scatter the state-file fields it fills.
     #[allow(clippy::too_many_lines)]
-    fn maybe_write_pressure_state(&mut self, response: Option<&PressureResponse>) -> SelfMonitorTick {
+    fn maybe_write_pressure_state(
+        &mut self,
+        response: Option<&PressureResponse>,
+    ) -> SelfMonitorTick {
         // No successful observation means unknown pressure. Do not fabricate
         // a response or run another filesystem probe while reporting failure.
         let observed_pressure = response.map(|response| {
@@ -9013,7 +9027,10 @@ impl MonitoringDaemon {
         for (path, sample) in paths.iter().zip(samples) {
             match sample {
                 Ok(sample) => {
-                    if !self.pressure_observation_recovery.observe_source(path, &sample) {
+                    if !self
+                        .pressure_observation_recovery
+                        .observe_source(path, &sample)
+                    {
                         let reason = format!(
                             "{}: native observation predates its previous owner evidence",
                             path.display()
@@ -9084,9 +9101,8 @@ impl MonitoringDaemon {
         if stats_by_mount.is_empty() {
             self.pressure_observation_recovery.finish_tick(now);
             self.publish_behavior_policy();
-            self.self_monitor.set_pressure_observation_gaps(
-                self.pressure_observation_recovery.gaps.clone(),
-            );
+            self.self_monitor
+                .set_pressure_observation_gaps(self.pressure_observation_recovery.gaps.clone());
             // The normal pressure handler renews and revokes tier permission,
             // but the error path skips it. Revoke here as part of sampling so
             // callers cannot accidentally retain an earlier successful tick.
@@ -9679,9 +9695,8 @@ impl MonitoringDaemon {
         // continue to contain exclusively this tick's successful observations.
         self.pressure_observation_recovery.finish_tick(now);
         self.publish_behavior_policy();
-        self.self_monitor.set_pressure_observation_gaps(
-            self.pressure_observation_recovery.gaps.clone(),
-        );
+        self.self_monitor
+            .set_pressure_observation_gaps(self.pressure_observation_recovery.gaps.clone());
 
         // Clean up monitors for unmounted/disappeared volumes?
         // For now we keep them; volume churn is rare in typical operation.
@@ -11035,63 +11050,93 @@ impl MonitoringDaemon {
         unprotected: &HashMap<PathBuf, PressureLevel>,
         now: Instant,
     ) {
+        use crate::daemon::notifications::NotificationDispatchOutcome;
+
         let interval = Duration::from_secs(
             self.config
                 .special_locations
                 .alert_interval_minutes
                 .saturating_mul(60),
         );
-        let mounts: Vec<PathBuf> = self
+        let mut mounts: Vec<PathBuf> = self
             .mount_controllers
             .keys()
             .chain(self.uncovered_levels.keys())
             .cloned()
             .collect();
+        mounts.sort();
+        mounts.dedup();
+        self.last_reclaim_notify.retain(|mount, _| {
+            unprotected
+                .get(mount)
+                .is_some_and(|level| *level != PressureLevel::Green)
+        });
         for mount in mounts {
-            let level = unprotected.get(&mount).copied();
+            let level = unprotected
+                .get(&mount)
+                .copied()
+                .filter(|level| *level != PressureLevel::Green);
             let severity = match level {
                 None | Some(PressureLevel::Green) => SpecialAlert::None,
                 Some(PressureLevel::Yellow | PressureLevel::Orange) => SpecialAlert::Warning,
                 Some(PressureLevel::Red | PressureLevel::Critical) => SpecialAlert::Critical,
             };
-            if !self
+            let emit = self
                 .reclaim_alerts
-                .should_emit(&mount, severity, now, interval)
-            {
-                continue;
-            }
+                .should_emit(&mount, severity, now, interval);
             let Some(level) = level else {
-                let message = format!(
-                    "pressure on {} cleared, or sbh gained a reclaim surface there",
-                    mount.display()
-                );
-                eprintln!("[SBH-DAEMON] {message}");
-                self.logger_handle.send(ActivityEvent::Info { message });
+                if emit {
+                    let message = format!(
+                        "pressure on {} cleared, or sbh gained a reclaim surface there",
+                        mount.display()
+                    );
+                    eprintln!("[SBH-DAEMON] {message}");
+                    self.logger_handle.send(ActivityEvent::Info { message });
+                }
                 continue;
             };
+            let should_notify =
+                self.last_reclaim_notify
+                    .get(&mount)
+                    .is_none_or(|(previous, at)| {
+                        level > *previous || now.saturating_duration_since(*at) >= interval
+                    });
+            if !emit && !should_notify {
+                continue;
+            }
             let level_name = format!("{level:?}").to_lowercase();
             let reason = format!(
                 "no root_path, catalog root, cross_devices fallback or releasable ballast on \
                  this device (idle_reason={})",
                 IdleReason::NoSurface.as_str()
             );
-            let message = format!(
-                "reclaim unavailable: pressure {level_name} on {} and nothing sbh can reclaim \
-                 there ({reason}). Next: add a scanner.root_path on this device, set \
-                 scanner.catalog_roots_on_pressured_device = true, or run `sbh ballast provision`",
-                mount.display()
-            );
-            eprintln!("[SBH-DAEMON] {message}");
-            self.logger_handle.send(ActivityEvent::Warning {
-                code: "SBH-2006".to_string(),
-                message,
-            });
-            self.notification_manager
-                .notify(&NotificationEvent::ReclaimUnavailable {
-                    mount: mount.to_string_lossy().into_owned(),
-                    level: level_name,
-                    reason,
+            if emit {
+                let message = format!(
+                    "reclaim unavailable: pressure {level_name} on {} and nothing sbh can reclaim \
+                     there ({reason}). Next: add a scanner.root_path on this device, set \
+                     scanner.catalog_roots_on_pressured_device = true, or run `sbh ballast provision`",
+                    mount.display()
+                );
+                eprintln!("[SBH-DAEMON] {message}");
+                self.logger_handle.send(ActivityEvent::Warning {
+                    code: "SBH-2006".to_string(),
+                    message,
                 });
+            }
+            if should_notify
+                && self.notification_manager.notify_with_outcome(
+                    &NotificationEvent::ReclaimUnavailable {
+                        mount: mount.to_string_lossy().into_owned(),
+                        level: level_name,
+                        reason,
+                    },
+                ) == NotificationDispatchOutcome::Accepted
+            {
+                // A rejected first alert, escalation or reminder remains due
+                // on the next tick without duplicating its activity-log event.
+                // Keep the accepted high-water level through brief oscillations.
+                self.last_reclaim_notify.insert(mount, (level, now));
+            }
         }
     }
 
@@ -12153,6 +12198,7 @@ impl MonitoringDaemon {
             return;
         }
         self.pressure_notifications.rearm_notifications();
+        self.last_reclaim_notify.clear();
         for (notified, _) in self.last_special_notify.values_mut() {
             *notified = PressureLevel::Green;
         }
@@ -12160,7 +12206,8 @@ impl MonitoringDaemon {
         self.last_swap_thrash_notification = None;
         if (self.behavior_emergency_lacks_observation()
             || (self.deferred_behavior_emergency
-                && self.pressure_observation_recovery.observed_level != Some(PressureLevel::Critical)))
+                && self.pressure_observation_recovery.observed_level
+                    != Some(PressureLevel::Critical)))
             && self.behavior_state.memory_level == MemoryPressureLevel::Critical
         {
             self.deferred_behavior_emergency |= self.pending_behavior_emergency.is_none()
@@ -22744,7 +22791,10 @@ mod tests {
             let response = daemon.check_pressure().unwrap();
             assert_eq!(response.level, PressureLevel::Yellow);
             assert_eq!(daemon.mount_responses.len(), 1);
-            assert_eq!(daemon.mount_responses[0].response.causing_mount, Path::new("/"));
+            assert_eq!(
+                daemon.mount_responses[0].response.causing_mount,
+                Path::new("/")
+            );
             assert!(daemon.mount_responses[0].ram_reclaim.is_none());
             assert!(daemon.mount_responses[0].inode_reclaim.is_none());
             let peer = daemon.mount_monitors[Path::new("/")]
@@ -22766,8 +22816,14 @@ mod tests {
                 daemon.pressure_observation_recovery.gaps[0].mount,
                 "/missing-pressure"
             );
-            assert!(!daemon.pressure_observation_recovery.gaps[0].query_failures.is_empty());
-            assert!(!behavior_should_release_ballast(daemon.action_behavior_mode()));
+            assert!(
+                !daemon.pressure_observation_recovery.gaps[0]
+                    .query_failures
+                    .is_empty()
+            );
+            assert!(!behavior_should_release_ballast(
+                daemon.action_behavior_mode()
+            ));
             assert_eq!(
                 daemon.shared_executor_config.dispatch_certainty_for(
                     PressureLevel::Yellow,
@@ -22777,7 +22833,9 @@ mod tests {
                 Ok(ArtifactCertainty::Definite)
             );
             assert_eq!(
-                daemon.filesystem_tier_mounts(&daemon.mount_responses, Instant::now()).len(),
+                daemon
+                    .filesystem_tier_mounts(&daemon.mount_responses, Instant::now())
+                    .len(),
                 1,
                 "the observed peer retains its own allowed work"
             );
@@ -22841,7 +22899,12 @@ mod tests {
         assert!(daemon.check_pressure().is_err());
         assert!(daemon.mount_responses.is_empty());
         assert!(daemon.worst_filesystem_response().is_none());
-        assert!(daemon.pressure_observation_recovery.observed_level.is_none());
+        assert!(
+            daemon
+                .pressure_observation_recovery
+                .observed_level
+                .is_none()
+        );
         assert!(!daemon.pressure_observation_recovery.gaps.is_empty());
         daemon.self_monitor.force_next_write();
         let tick = daemon.maybe_write_pressure_state(None);
@@ -22857,13 +22920,18 @@ mod tests {
         daemon.flush_state_replies();
         assert!(received.try_recv().is_ok());
         assert!(!behavior_allows_scan(daemon.action_behavior_mode()));
-        assert!(!behavior_should_release_ballast(daemon.action_behavior_mode()));
-        assert!(!behavior_allows_delete_dispatch(daemon.action_behavior_mode()));
-        assert!(daemon.shared_executor_config.dispatch_certainty_for(
-            PressureLevel::Critical,
-            false,
-            false,
-        ).is_err());
+        assert!(!behavior_should_release_ballast(
+            daemon.action_behavior_mode()
+        ));
+        assert!(!behavior_allows_delete_dispatch(
+            daemon.action_behavior_mode()
+        ));
+        assert!(
+            daemon
+                .shared_executor_config
+                .dispatch_certainty_for(PressureLevel::Critical, false, false,)
+                .is_err()
+        );
 
         // The same common callback used by the sleep/event path must not
         // substitute last_pressure_level for a missing current observation.
@@ -22873,12 +22941,17 @@ mod tests {
             "memory_pressure",
             Duration::ZERO,
         );
-        assert_eq!(daemon.behavior_state.memory_level, MemoryPressureLevel::Critical);
+        assert_eq!(
+            daemon.behavior_state.memory_level,
+            MemoryPressureLevel::Critical
+        );
         assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Critical);
         assert_eq!(daemon.behavior_state.last_confirmed_at, confirmed);
         assert!(daemon.pending_behavior_emergency.is_none());
         assert!(daemon.deferred_behavior_emergency);
-        assert!(!behavior_allows_delete_dispatch(daemon.action_behavior_mode()));
+        assert!(!behavior_allows_delete_dispatch(
+            daemon.action_behavior_mode()
+        ));
 
         // A later successful peer must not erase the all-failed incident.
         daemon.fs_collector = pressure_observation_gap_collector("original", None, Some(17));
@@ -22900,7 +22973,10 @@ mod tests {
             "memory_pressure",
             Duration::ZERO,
         );
-        assert_eq!(daemon.behavior_state.memory_level, MemoryPressureLevel::Normal);
+        assert_eq!(
+            daemon.behavior_state.memory_level,
+            MemoryPressureLevel::Normal
+        );
         assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Critical);
         assert!(!daemon.deferred_behavior_emergency);
         assert!(daemon.pending_behavior_emergency.is_none());
@@ -22955,15 +23031,17 @@ mod tests {
             );
             if matches!(cleanup, CleanupAction::None | CleanupAction::IdentifyOnly) {
                 assert!(ordinary.is_err());
-                assert!(daemon.shared_executor_config.dispatch_certainty_for(
-                    PressureLevel::Critical,
-                    false,
-                    true,
-                ).is_err());
-                assert!(daemon.filesystem_tier_mounts(
-                    &daemon.mount_responses,
-                    Instant::now(),
-                ).is_empty());
+                assert!(
+                    daemon
+                        .shared_executor_config
+                        .dispatch_certainty_for(PressureLevel::Critical, false, true,)
+                        .is_err()
+                );
+                assert!(
+                    daemon
+                        .filesystem_tier_mounts(&daemon.mount_responses, Instant::now(),)
+                        .is_empty()
+                );
             } else {
                 assert_eq!(ordinary, Ok(ArtifactCertainty::Definite));
             }
@@ -23022,7 +23100,10 @@ mod tests {
         // The synchronous collector can return an old cached owner after a
         // rebind. That is rejected, not silently treated as current success.
         assert!(!observations.observe_source(&alias, &critical));
-        assert_eq!(observations.sources[&alias].observed_at, recovered.collected_at);
+        assert_eq!(
+            observations.sources[&alias].observed_at,
+            recovered.collected_at
+        );
     }
 
     #[cfg(unix)]
@@ -23041,7 +23122,10 @@ mod tests {
             "memory_pressure",
             Duration::ZERO,
         );
-        assert_eq!(daemon.behavior_state.memory_level, MemoryPressureLevel::Critical);
+        assert_eq!(
+            daemon.behavior_state.memory_level,
+            MemoryPressureLevel::Critical
+        );
         assert_eq!(daemon.behavior_state.disk_level, PressureLevel::Critical);
         assert!(daemon.pending_behavior_emergency.is_none());
         assert!(daemon.deferred_behavior_emergency);
@@ -31676,6 +31760,211 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[allow(clippy::too_many_lines)]
+    fn reclaim_unavailable_retries_delivery_without_repeating_activity_logs() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let notifications = fixture.directory.path().join("reclaim-notifications.jsonl");
+        let daemon = &mut fixture.daemon;
+        let mount = PathBuf::from("/unprotected");
+        daemon
+            .uncovered_levels
+            .insert(mount.clone(), PressureLevel::Yellow);
+        let mut notify_config = NotificationConfig {
+            enabled: false,
+            channels: vec!["file".into()],
+            // The daemon must suppress accepted duplicates itself, not rely
+            // on the manager's category cooldown hiding repeated enqueues.
+            min_notify_interval_secs: 0,
+            urgent_notify_interval_secs: 0,
+            file: FileConfig {
+                path: notifications.clone(),
+            },
+            ..NotificationConfig::default()
+        };
+        daemon.notification_manager = NotificationManager::from_config(&notify_config);
+        let now = Instant::now();
+        let mut unprotected = HashMap::new();
+        for (seconds, level, enabled, expected_count) in [
+            (0, PressureLevel::Yellow, false, 0),
+            (1, PressureLevel::Yellow, false, 0),
+            (2, PressureLevel::Yellow, true, 1),
+            (3, PressureLevel::Yellow, true, 1),
+            (4, PressureLevel::Orange, false, 1),
+            (5, PressureLevel::Orange, true, 2),
+            (6, PressureLevel::Orange, true, 2),
+            (7, PressureLevel::Red, false, 2),
+            (8, PressureLevel::Red, true, 3),
+            (9, PressureLevel::Critical, false, 3),
+            (10, PressureLevel::Critical, true, 4),
+            (11, PressureLevel::Red, true, 4),
+            (12, PressureLevel::Critical, true, 4),
+        ] {
+            notify_config.enabled = enabled;
+            daemon.notification_manager.update_config(&notify_config);
+            unprotected.insert(mount.clone(), level);
+            let previously_accepted = daemon.last_reclaim_notify.get(&mount).copied();
+            for _ in 0..2 {
+                daemon.emit_reclaim_unavailable(&unprotected, now + Duration::from_secs(seconds));
+            }
+            if !enabled {
+                assert_eq!(
+                    daemon.last_reclaim_notify.get(&mount).copied(),
+                    previously_accepted
+                );
+            }
+            assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+            let delivered = std::fs::read_to_string(&notifications).unwrap_or_default();
+            assert_eq!(
+                delivered.lines().count(),
+                expected_count,
+                "level={level:?} enabled={enabled}"
+            );
+        }
+
+        // A rejected reminder also remains due, independently of the log's
+        // already-consumed interval. Its next accepted enqueue starts the
+        // notification clock, rather than the original rejected attempt.
+        let interval = Duration::from_mins(daemon.config.special_locations.alert_interval_minutes);
+        let reminder = now + interval + Duration::from_secs(10);
+        notify_config.enabled = false;
+        daemon.notification_manager.update_config(&notify_config);
+        daemon.emit_reclaim_unavailable(&unprotected, reminder);
+        daemon.emit_reclaim_unavailable(&unprotected, reminder);
+        assert_eq!(
+            daemon.last_reclaim_notify[&mount],
+            (PressureLevel::Critical, now + Duration::from_secs(10))
+        );
+        notify_config.enabled = true;
+        daemon.notification_manager.update_config(&notify_config);
+        daemon.emit_reclaim_unavailable(&unprotected, reminder + Duration::from_secs(1));
+        daemon.emit_reclaim_unavailable(&unprotected, reminder + Duration::from_secs(2));
+
+        // Recovery and monitoring removal end the episode; neither produces
+        // a bogus "reclaim unavailable at green" notification.
+        unprotected.insert(mount.clone(), PressureLevel::Green);
+        daemon.emit_reclaim_unavailable(&unprotected, reminder + Duration::from_secs(3));
+        assert!(!daemon.last_reclaim_notify.contains_key(&mount));
+        unprotected.insert(mount.clone(), PressureLevel::Yellow);
+        daemon.emit_reclaim_unavailable(&unprotected, reminder + Duration::from_secs(4));
+        daemon.uncovered_levels.remove(&mount);
+        unprotected.clear();
+        daemon.emit_reclaim_unavailable(&unprotected, reminder + Duration::from_secs(5));
+        assert!(daemon.last_reclaim_notify.is_empty());
+        daemon
+            .uncovered_levels
+            .insert(mount.clone(), PressureLevel::Yellow);
+        unprotected.insert(mount.clone(), PressureLevel::Yellow);
+        daemon.emit_reclaim_unavailable(&unprotected, reminder + Duration::from_secs(6));
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        let delivered: Vec<Value> = std::fs::read_to_string(&notifications)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let levels: Vec<_> = delivered
+            .iter()
+            .map(|event| event["level"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            levels,
+            [
+                "yellow", "orange", "red", "critical", "critical", "yellow", "yellow"
+            ]
+        );
+        assert!(delivered.iter().all(|event| {
+            event["type"] == "reclaim_unavailable" && event["mount"] == "/unprotected"
+        }));
+
+        fixture.flush_logger();
+        let logs: Vec<Value> =
+            std::fs::read_to_string(fixture.directory.path().join("activity.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(
+            logs.iter()
+                .filter(|event| event["error_code"] == "SBH-2006")
+                .count(),
+            4,
+            "retries and full-level escalations retain the original observation/log cadence: {logs:?}"
+        );
+        assert_eq!(
+            logs.iter()
+                .filter(|event| event["details"].as_str().is_some_and(|message| {
+                    message.contains("cleared, or sbh gained a reclaim surface")
+                }))
+                .count(),
+            1,
+            "recovery is logged once: {logs:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_unavailable_rearms_destination_changes_without_resetting_log_cadence() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let original = fixture.directory.path().join("original-reclaim.jsonl");
+        let replacement = fixture.directory.path().join("replacement-reclaim.jsonl");
+        let daemon = &mut fixture.daemon;
+        let mut notify_config = NotificationConfig {
+            channels: vec!["file".into()],
+            file: FileConfig {
+                path: original.clone(),
+            },
+            ..NotificationConfig::default()
+        };
+        daemon.notification_manager = NotificationManager::from_config(&notify_config);
+        let unprotected = HashMap::from([
+            (PathBuf::from("/first"), PressureLevel::Critical),
+            (PathBuf::from("/second"), PressureLevel::Critical),
+        ]);
+        daemon.uncovered_levels = unprotected.clone();
+        let now = Instant::now();
+        daemon.emit_reclaim_unavailable(&unprotected, now);
+        // Pacing-only changes acknowledge the same destination and cannot
+        // replay ongoing conditions, even after the manager is reconfigured.
+        notify_config.urgent_notify_interval_secs += 60;
+        daemon.reload_notification_config(&notify_config);
+        daemon.emit_reclaim_unavailable(&unprotected, now + Duration::from_secs(1));
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        assert_eq!(
+            std::fs::read_to_string(&original).unwrap().lines().count(),
+            2
+        );
+        notify_config.file.path = replacement.clone();
+        daemon.reload_notification_config(&notify_config);
+        for seconds in [2, 3] {
+            daemon.emit_reclaim_unavailable(&unprotected, now + Duration::from_secs(seconds));
+        }
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        let delivered: Vec<Value> = std::fs::read_to_string(&replacement)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(delivered.len(), 2, "{delivered:?}");
+        assert_eq!(delivered[0]["mount"], "/first");
+        assert_eq!(delivered[1]["mount"], "/second");
+        fixture.flush_logger();
+        let warnings = std::fs::read_to_string(fixture.directory.path().join("activity.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["error_code"] == "SBH-2006")
+            .count();
+        assert_eq!(
+            warnings, 2,
+            "destination changes never create observation transitions"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn special_location_episodes_retry_rejected_initial_and_escalated_notifications() {
         use crate::daemon::notifications::{FileConfig, NotificationConfig};
 
@@ -35407,11 +35696,7 @@ mod tests {
         let base = base.canonicalize().unwrap();
         let daemon = &mut fixture.daemon;
         let ordinary_roots = daemon.config.scanner.root_paths.clone();
-        assert!(
-            ordinary_roots
-                .iter()
-                .all(|root| !base.starts_with(root))
-        );
+        assert!(ordinary_roots.iter().all(|root| !base.starts_with(root)));
         assert!(daemon.discovery.is_none());
         daemon.config.scanner.target_only_roots.clear();
         daemon.target_tier.update_config(&daemon.config.scanner);
