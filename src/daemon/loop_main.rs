@@ -6213,21 +6213,28 @@ impl MonitoringDaemon {
     }
 
     fn prime_filesystem_observations(&self) {
-        // Prime the system root as check_pressure observes it.
-        let system_root = system_root_observation_path();
-        for path in std::iter::once(system_root.as_path())
-            .chain(self.config.scanner.root_paths.iter().map(PathBuf::as_path))
+        // Prime configured roots and dedicated tiers once per query path.
+        let mut paths = vec![system_root_observation_path()];
+        for path in self
+            .config
+            .scanner
+            .root_paths
+            .iter()
+            .chain(&self.config.scanner.rch_staging_bases)
             .chain(
                 self.special_locations
                     .all()
                     .iter()
-                    .map(|location| location.path.as_path()),
+                    .map(|location| &location.path),
             )
         {
-            let _ = self.fs_collector.collect_sample(path);
+            push_unique_path(&mut paths, path.clone());
         }
         for path in self.target_tier.observation_paths() {
-            let _ = self.fs_collector.collect_sample(&path);
+            push_unique_path(&mut paths, path);
+        }
+        for path in &paths {
+            let _ = self.fs_collector.collect_sample(path);
         }
         let _ = self.fs_collector.mount_points();
     }
@@ -8955,6 +8962,11 @@ impl MonitoringDaemon {
         // the same fresh pressure observations used by every other mount.
         for path in self.target_tier.observation_paths() {
             push_unique_path(&mut paths, path);
+        }
+        // Configured RCH staging bases can live on volumes outside ordinary
+        // roots. Observe their own pressure without expanding scanner scope.
+        for path in &self.config.scanner.rch_staging_bases {
+            push_unique_path(&mut paths, path.clone());
         }
         // A failed nested filesystem can be outside the ordinary observation
         // set. Keep its existing incident/recovery controller observable until
@@ -35382,6 +35394,70 @@ mod tests {
             scanner,
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rch_staging_volume_is_observed_without_expanding_ordinary_scan_roots() {
+        let mut fixture = RegretDaemonFixture::new();
+        let volume = fixture.directory.path().join("staging-volume");
+        let base = volume.join("rch");
+        std::fs::create_dir_all(&base).unwrap();
+        let volume = volume.canonicalize().unwrap();
+        let base = base.canonicalize().unwrap();
+        let daemon = &mut fixture.daemon;
+        let ordinary_roots = daemon.config.scanner.root_paths.clone();
+        assert!(
+            ordinary_roots
+                .iter()
+                .all(|root| !base.starts_with(root))
+        );
+        assert!(daemon.discovery.is_none());
+        daemon.config.scanner.target_only_roots.clear();
+        daemon.target_tier.update_config(&daemon.config.scanner);
+        daemon.config.pressure.prediction.enabled = false;
+        daemon.platform = Arc::new(disk_pressure_platform(vec![
+            disk_pressure_sample("/", 100 << 30, 50 << 30),
+            disk_pressure_sample(&volume.to_string_lossy(), 100 << 30, 0),
+        ]));
+        daemon.enable_background_filesystem_observations();
+        assert_eq!(
+            daemon.initial_pressure_check().unwrap().level,
+            PressureLevel::Green
+        );
+        assert!(
+            daemon
+                .mount_responses
+                .iter()
+                .all(|tick| tick.response.causing_mount != volume)
+        );
+
+        // This explicitly configured tier is the only observation seed for
+        // the second volume; ordinary roots and reserve discovery omit it.
+        daemon.config.scanner.rch_staging_bases = vec![base];
+        daemon.prime_filesystem_observations();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let response = loop {
+            let response = daemon.check_pressure().unwrap();
+            if response.causing_mount == volume {
+                break response;
+            }
+            assert!(Instant::now() < deadline, "staging volume was not observed");
+            thread::yield_now();
+        };
+        assert_eq!(response.level, PressureLevel::Critical);
+        let mounts = daemon.filesystem_tier_mounts(&daemon.mount_responses, Instant::now());
+        assert_eq!(mounts[&volume].0, PressureLevel::Critical);
+        assert_eq!(daemon.config.scanner.root_paths, ordinary_roots);
+
+        // Removing the tier's explicit scope also removes its pressure seed;
+        // a cached observation must not keep the volume admitted.
+        daemon.config.scanner.rch_staging_bases.clear();
+        daemon.rch_staging.update_config(&daemon.config);
+        assert_eq!(daemon.check_pressure().unwrap().level, PressureLevel::Green);
+        let mounts = daemon.filesystem_tier_mounts(&daemon.mount_responses, Instant::now());
+        assert!(!mounts.contains_key(&volume));
+        assert_eq!(daemon.config.scanner.root_paths, ordinary_roots);
     }
 
     #[cfg(unix)]
