@@ -1608,15 +1608,39 @@ impl<'a> LocalRestoreBackup<'a> {
         Ok(backup)
     }
 
+    fn matches_path(&self, path: &Path) -> io::Result<bool> {
+        let current = rustix::fs::statat(rustix::fs::CWD, path, AtFlags::empty())?;
+        Ok(same_restore_identity(
+            &current,
+            &rustix::fs::fstat(&self.directory)?,
+        ))
+    }
+
     fn check_location(&self) -> io::Result<()> {
-        let current = rustix::fs::statat(rustix::fs::CWD, self.path, AtFlags::empty())?;
-        if same_restore_identity(&current, &rustix::fs::fstat(&self.directory)?) {
+        if self.matches_path(self.path)? {
             Ok(())
         } else {
             Err(restore_invalid(
                 "local restore backup path was replaced or moved",
             ))
         }
+    }
+
+    fn recovery_note(&self) -> String {
+        if self.matches_path(self.path).unwrap_or(false) {
+            return format!("backup remains at {}", self.path.display());
+        }
+        // A detached descriptor may resolve to a name ending in " (deleted)".
+        // Even a real, accessible directory at that name could be unrelated.
+        if let Ok(current) = fs::read_link(descriptor_path(&self.directory))
+            && self.matches_path(&current).unwrap_or(false)
+        {
+            return format!("backup remains at {}", current.display());
+        }
+        format!(
+            "backup location unverified (recorded path {})",
+            self.path.display()
+        )
     }
 }
 
@@ -1746,11 +1770,17 @@ fn restore_with_hooks(stub: &Path, hooks: &RestoreHooks<'_>) -> Result<Restored,
     restore_parent_current(&parent, parent_path).map_err(|error| error.to_string())?;
     let workspace = RestoreWorkspace::create(&parent, parent_path)
         .map_err(|error| format!("creating private restore staging: {error}"))?;
+    let backup_note = || {
+        backup.as_ref().map_or_else(
+            || format!("backup remains at {}", record.destination),
+            LocalRestoreBackup::recovery_note,
+        )
+    };
     let retained = |reason: String| {
         format!(
-            "{reason}; restore data retained at {}; backup remains at {}",
+            "{reason}; restore data retained at {}; {}",
             workspace.location().display(),
-            record.destination
+            backup_note(),
         )
     };
     let payload = fs::File::from(
@@ -1907,10 +1937,10 @@ fn restore_with_hooks(stub: &Path, hooks: &RestoreHooks<'_>) -> Result<Restored,
         let actual_parent = fs::read_link(format!("/proc/self/fd/{}", parent.as_raw_fd()))
             .unwrap_or_else(|_| parent_path.to_path_buf());
         format!(
-            "restored tree was installed at {}, but completion could not be confirmed: {reason}; previous stub retained at {}; backup remains at {}",
+            "restored tree was installed at {}, but completion could not be confirmed: {reason}; previous stub retained at {}; {}",
             actual_parent.join(name).display(),
             workspace.location().join("stub").display(),
-            record.destination,
+            backup_note(),
         )
     };
     let published = rustix::fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)
@@ -3459,6 +3489,14 @@ mod tests {
             };
             let error = restore_with_hooks(&stub, &hooks).unwrap_err();
             assert!(error.contains("backup path was replaced"), "{error}");
+            assert!(
+                error.ends_with(&format!("backup remains at {}", retained.display())),
+                "{error}"
+            );
+            assert!(
+                error.contains(&staging.borrow().display().to_string()),
+                "{error}"
+            );
             assert!(stub.join(RECORD_FILENAME).is_file());
             assert!(!stub.join("data").exists());
             assert_eq!(
@@ -3467,6 +3505,30 @@ mod tests {
             );
             assert_eq!(fs::read(backup.join("data")).unwrap(), b"unrelated backup");
         }
+    }
+
+    #[test]
+    fn restore_does_not_claim_an_unlinked_backup_survives_at_another_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = tmp.path().join("stub");
+        let backup = tmp.path().join("backup");
+        fs::create_dir(&stub).unwrap();
+        fs::create_dir(&backup).unwrap();
+        let pinned = LocalRestoreBackup::open(&backup, &stub).unwrap();
+        assert_eq!(
+            pinned.recovery_note(),
+            format!("backup remains at {}", backup.display())
+        );
+        fs::remove_dir(&backup).unwrap();
+        fs::create_dir(&backup).unwrap();
+        fs::create_dir(tmp.path().join("backup (deleted)")).unwrap();
+        assert_eq!(
+            pinned.recovery_note(),
+            format!(
+                "backup location unverified (recorded path {})",
+                backup.display()
+            )
+        );
     }
 
     #[test]
