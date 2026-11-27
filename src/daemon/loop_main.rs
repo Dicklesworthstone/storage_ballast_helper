@@ -7203,6 +7203,8 @@ impl MonitoringDaemon {
         if !behavior_is_emergency(transition.to_memory, transition.to_disk, transition.to_mode) {
             self.pending_behavior_emergency = None;
             self.deferred_behavior_emergency = false;
+            self.notification_manager
+                .forget_pending("behavior_emergency", "");
         } else if !behavior_is_emergency(
             transition.from_memory,
             transition.from_disk,
@@ -7227,6 +7229,8 @@ impl MonitoringDaemon {
         ) {
             self.pending_behavior_emergency = None;
             self.deferred_behavior_emergency = false;
+            self.notification_manager
+                .forget_pending("behavior_emergency", "");
             return;
         }
         if self.deferred_behavior_emergency
@@ -11131,6 +11135,8 @@ impl MonitoringDaemon {
                 .reclaim_alerts
                 .should_emit(&mount, severity, now, interval);
             let Some(level) = level else {
+                self.notification_manager
+                    .forget_pending("reclaim_unavailable", &mount.to_string_lossy());
                 if emit {
                     let message = format!(
                         "pressure on {} cleared, or sbh gained a reclaim surface there",
@@ -12378,6 +12384,18 @@ impl MonitoringDaemon {
                 None => per_filesystem.push((key, level, mount, event)),
             }
         }
+        // A currently observed filesystem with no eligible warning has ended
+        // its pending episode. Preserve successful cooldowns and wait until
+        // every alias has been considered before clearing partial receipts.
+        for tick in responses {
+            let key = PredictiveWarningKey::of(tick);
+            if !per_filesystem.iter().any(|entry| entry.0 == key) {
+                self.notification_manager.forget_pending(
+                    "predictive_warning",
+                    &tick.response.causing_mount.to_string_lossy(),
+                );
+            }
+        }
         for (key, level, _, event) in per_filesystem {
             if self
                 .last_predictive_warning
@@ -12409,6 +12427,8 @@ impl MonitoringDaemon {
         if !thrash_risk {
             self.swap_thrash_active = false;
             self.last_swap_thrash_notification = None;
+            self.notification_manager
+                .forget_pending("error", "SBH-2010");
             return;
         }
 
@@ -12549,8 +12569,11 @@ impl MonitoringDaemon {
 
             let previous = self.last_special_notify.get(&location.path).copied();
             if assessment.alert == SpecialAlert::None {
-                if special_episode_over(previous, now, alert_interval) {
-                    self.last_special_notify.remove(&location.path);
+                if special_episode_over(previous, now, alert_interval)
+                    && self.last_special_notify.remove(&location.path).is_some()
+                {
+                    self.notification_manager
+                        .forget_pending("pressure_changed", &location.path.to_string_lossy());
                 }
                 continue;
             }
@@ -48156,6 +48179,83 @@ mod tests {
             ..not_risky
         };
         assert!(is_swap_thrash_risk_inner(&risky, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swap_thrash_reentry_rearms_a_partially_accepted_notification() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+        use crate::platform::pal::PlatformPaths;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let notifications = fixture.directory.path().join("partial-swap-thrash.jsonl");
+        let risky_platform = || -> Arc<dyn Platform> {
+            Arc::new(MockPlatform::new(
+                Vec::new(),
+                HashMap::new(),
+                MemoryInfo {
+                    total_bytes: 64 << 30,
+                    available_bytes: 2 << 30,
+                    swap_total_bytes: 8 << 30,
+                    swap_free_bytes: 1 << 30,
+                },
+                PlatformPaths::default(),
+            ))
+        };
+        let config = NotificationConfig {
+            channels: vec!["file".into(), "journal".into()],
+            file: FileConfig {
+                path: notifications.clone(),
+            },
+            min_notify_interval_secs: 0,
+            urgent_notify_interval_secs: 0,
+            ..NotificationConfig::default()
+        };
+        let daemon = &mut fixture.daemon;
+        daemon.platform = risky_platform();
+        daemon.notification_manager = NotificationManager::from_config(&config);
+        daemon
+            .notification_manager
+            .disconnect_channel_for_test("journal");
+        daemon.check_swap_thrash();
+        daemon.check_swap_thrash();
+        assert!(daemon.swap_thrash_active);
+        assert_eq!(daemon.last_swap_thrash_notification, None);
+        assert!(
+            daemon
+                .notification_manager
+                .drain_channel_for_test("file", Duration::from_secs(2),)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&notifications)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        // The rejected journal enqueue leaves a partial file acknowledgment.
+        // Recovery must retire it before a new episode, even at zero cooldown.
+        daemon.platform = Arc::new(MockPlatform::healthy());
+        daemon.check_swap_thrash();
+        assert!(!daemon.swap_thrash_active);
+        daemon.platform = risky_platform();
+        daemon.check_swap_thrash();
+        daemon.check_swap_thrash();
+        assert!(daemon.swap_thrash_active);
+        assert_eq!(daemon.last_swap_thrash_notification, None);
+        assert!(
+            daemon
+                .notification_manager
+                .drain_channel_for_test("file", Duration::from_secs(2),)
+        );
+        let notices: Vec<Value> = std::fs::read_to_string(&notifications)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(notices.iter().all(|event| event["code"] == "SBH-2010"));
     }
 
     #[cfg(unix)]

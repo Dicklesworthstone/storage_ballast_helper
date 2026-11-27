@@ -1126,15 +1126,36 @@ impl ChannelWorker {
     }
 }
 
+type NotificationScope = (&'static str, String);
+type ChannelCooldowns = HashMap<&'static str, BTreeMap<NotificationLevel, Instant>>;
+
+/// A currently retried condition, independent of its changing measurements.
+struct PendingNotification {
+    level: NotificationLevel,
+    accepted_channels: HashSet<&'static str>,
+    last_attempt: Instant,
+}
+
+/// Keep the latest observed state even before every destination accepts it:
+/// a partial recovery must still rearm the next exhaustion.
+struct ReserveNotification {
+    state: BallastReserveState,
+    accepted_channels: HashSet<&'static str>,
+    completed: bool,
+    last_attempt: Option<Instant>,
+}
+
 /// The synchronous result of trying to enqueue an alert, not its eventual
 /// delivery by a channel worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotificationDispatchOutcome {
-    /// At least one eligible channel accepted the notification.
+    /// Every eligible channel accepted this notification, including earlier
+    /// successful enqueues during the same retry.
     Accepted,
-    /// Existing successful history or a reserve retry interval suppressed it.
+    /// A completed condition, a destination's successful history, or a
+    /// reserve retry interval suppressed further dispatch.
     Throttled,
-    /// Disabled, filtered by every channel, or rejected by every eligible queue.
+    /// Disabled, filtered by every channel, or rejected by at least one queue.
     Unavailable,
 }
 
@@ -1148,16 +1169,17 @@ pub struct NotificationManager {
     channels: Vec<ChannelWorker>,
     enabled: bool,
     dropped: AtomicU64,
-    /// Dispatch history by category, affected scope and severity. Lower-level
-    /// events cannot hide an escalation or reset a previous urgent cooldown.
-    last_send_by_scope: HashMap<(&'static str, String), BTreeMap<NotificationLevel, Instant>>,
-    /// Reserve transitions are episode events: a confirmed recovery or a new
-    /// exhaustion must be visible even within the previous alert's cooldown.
-    /// Retain the last state so duplicate observations never become reminders.
-    reserve_states: HashMap<(String, PathBuf), BallastReserveState>,
-    /// Last failed enqueue attempt per pool and reserve band. The daemon can
-    /// retry each tick without producing a matching stream of drop notices.
-    reserve_retries: HashMap<(String, PathBuf), (BallastReserveState, Instant)>,
+    /// Each destination has its own successful cooldown history. Acceptance
+    /// by a log channel cannot suppress an unseen alert for the operator.
+    last_send_by_scope: HashMap<NotificationScope, ChannelCooldowns>,
+    /// Partial state-alert enqueues. Successful destinations are skipped on
+    /// retries, even with zero cooldown. Inactive entries expire; at most one
+    /// queue's worth of scopes is retained. Expiry/eviction may resend an
+    /// accepted alert, but never acknowledges a rejected destination.
+    pending_notifications: HashMap<NotificationScope, PendingNotification>,
+    /// Reserve observations and per-destination enqueue acknowledgments.
+    /// Completed states stay silent; changed states start a new episode.
+    reserve_notifications: HashMap<(String, PathBuf), ReserveNotification>,
     min_interval: Duration,
     urgent_min_interval: Duration,
 }
@@ -1205,8 +1227,8 @@ impl NotificationManager {
             // The daemon retries its latest reserve transition. A newly
             // enabled or replaced destination needs that current condition,
             // even if an older destination already accepted the same state.
-            self.reserve_states.clear();
-            self.reserve_retries.clear();
+            self.pending_notifications.clear();
+            self.reserve_notifications.clear();
         }
         for worker in &mut self.channels {
             worker.update(
@@ -1238,8 +1260,8 @@ impl NotificationManager {
             enabled: false,
             dropped: AtomicU64::new(0),
             last_send_by_scope: HashMap::new(),
-            reserve_states: HashMap::new(),
-            reserve_retries: HashMap::new(),
+            pending_notifications: HashMap::new(),
+            reserve_notifications: HashMap::new(),
             min_interval: Duration::ZERO,
             urgent_min_interval: Duration::ZERO,
         }
@@ -1259,9 +1281,7 @@ impl NotificationManager {
                 )
             })
             .collect();
-        self.reserve_states
-            .retain(|scope, _| retained.contains(scope));
-        self.reserve_retries
+        self.reserve_notifications
             .retain(|scope, _| retained.contains(scope));
     }
 
@@ -1275,11 +1295,15 @@ impl NotificationManager {
     /// Reserve availability uses state transitions instead: unchanged states
     /// are silent indefinitely, and a recovery or renewed depletion is immediate.
     pub fn notify(&mut self, event: &NotificationEvent) {
-        self.notify_at(event, Instant::now());
+        // Independent one-shot events do not inherit a partial state-alert
+        // cursor. Reserve observations always retain their transition cursor.
+        self.dispatch_at(event, Instant::now(), false);
     }
 
-    /// Report queue acceptance so callers do not consume their own successful
-    /// alert cooldown after a throttle or a full/unavailable channel queue.
+    /// Report acceptance by every eligible queue. Callers can retry an ongoing
+    /// condition without duplicating successful enqueues, even at zero cooldown.
+    /// Same-category, same-scope, same-severity retries use current measurements;
+    /// a severity change supersedes the unfinished condition.
     #[must_use]
     pub(crate) fn notify_with_outcome(
         &mut self,
@@ -1288,105 +1312,261 @@ impl NotificationManager {
         self.notify_at(event, Instant::now())
     }
 
+    /// End a caller's condition without erasing destination cooldowns. A new
+    /// episode must not inherit partial acknowledgments from the old one.
+    pub(crate) fn forget_pending(&mut self, category: &'static str, scope: &str) {
+        self.pending_notifications
+            .remove(&(category, scope.to_owned()));
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn disconnect_channel_for_test(&mut self, name: &str) {
+        let worker = self
+            .channels
+            .iter_mut()
+            .find(|worker| worker.name == name)
+            .expect("test channel must be configured");
+        let (send, receive) = bounded(1);
+        drop(receive);
+        worker.send = send;
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn drain_channel_for_test(&self, name: &str, timeout: Duration) -> bool {
+        let worker = self
+            .channels
+            .iter()
+            .find(|worker| worker.name == name)
+            .expect("test channel must be configured");
+        let deadline = Instant::now() + timeout;
+        let (acknowledge, completed) = bounded(1);
+        worker
+            .send
+            .send_timeout(
+                Dispatch::Drain(acknowledge),
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .is_ok()
+            && completed
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .is_ok()
+    }
+
     fn notify_at(
         &mut self,
         event: &NotificationEvent,
         now: Instant,
     ) -> NotificationDispatchOutcome {
+        self.dispatch_at(event, now, true)
+    }
+
+    fn dispatch_at(
+        &mut self,
+        event: &NotificationEvent,
+        now: Instant,
+        retain_partial: bool,
+    ) -> NotificationDispatchOutcome {
         if !self.enabled {
             return NotificationDispatchOutcome::Unavailable;
         }
 
-        // Mounts can disappear or change names. Retain only history that can
-        // still throttle an event, rather than accumulating obsolete scopes.
         let retention = self.min_interval.max(self.urgent_min_interval);
-        self.last_send_by_scope.retain(|_, levels| {
-            levels.retain(|_, sent| now.saturating_duration_since(*sent) < retention);
-            !levels.is_empty()
+        self.last_send_by_scope.retain(|_, channels| {
+            channels.retain(|_, levels| {
+                levels.retain(|_, sent| now.saturating_duration_since(*sent) < retention);
+                !levels.is_empty()
+            });
+            !channels.is_empty()
         });
+        let key = (event.type_key(), event.throttle_scope().to_owned());
+        let retry_retention =
+            retention.max(Duration::from_secs(DEFAULT_URGENT_NOTIFY_INTERVAL_SECS));
+        self.pending_notifications.retain(|_, pending| {
+            now.saturating_duration_since(pending.last_attempt) < retry_retention
+        });
+
+        if let NotificationEvent::BallastReserveChanged { mount, reserve, .. } = event {
+            return self.notify_reserve_at(
+                event,
+                (mount.clone(), reserve.ballast_dir.clone()),
+                reserve.state,
+                now,
+            );
+        }
+        self.notify_ordinary_at(event, key, now, retain_partial)
+    }
+
+    fn notify_ordinary_at(
+        &mut self,
+        event: &NotificationEvent,
+        key: NotificationScope,
+        now: Instant,
+        retain_partial: bool,
+    ) -> NotificationDispatchOutcome {
         let level = event.level();
         let interval = if level >= NotificationLevel::Red {
             self.urgent_min_interval
         } else {
             self.min_interval
         };
-        let mut ordinary_key = None;
-        let reserve_transition =
-            if let NotificationEvent::BallastReserveChanged { mount, reserve, .. } = event {
-                let key = (mount.clone(), reserve.ballast_dir.clone());
-                if self.reserve_states.get(&key) == Some(&reserve.state) {
-                    return NotificationDispatchOutcome::Throttled;
-                }
-                if self
-                    .reserve_retries
-                    .get(&key)
-                    .is_some_and(|(state, attempted)| {
-                        *state == reserve.state
-                            && now.saturating_duration_since(*attempted) < RESERVE_RETRY_INTERVAL
-                    })
-                {
-                    return NotificationDispatchOutcome::Throttled;
-                }
-                Some((key, reserve.state))
-            } else {
-                let key = (event.type_key(), event.throttle_scope().to_owned());
-                if !interval.is_zero()
-                    && self.last_send_by_scope.get(&key).is_some_and(|history| {
-                        history
-                            .range(level..)
-                            .any(|(_, sent)| now.saturating_duration_since(*sent) < interval)
-                    })
-                {
-                    return NotificationDispatchOutcome::Throttled;
-                }
-
-                ordinary_key = Some(key);
-                None
-            };
+        let mut pending = self
+            .pending_notifications
+            .remove(&key)
+            .filter(|pending| retain_partial && pending.level == level)
+            .unwrap_or_else(|| PendingNotification {
+                level,
+                accepted_channels: HashSet::new(),
+                last_attempt: now,
+            });
+        pending.last_attempt = now;
 
         let event = Arc::new(event.clone());
-        let mut accepted = false;
-        let mut eligible = false;
+        let mut eligible = 0;
+        let mut accepted = 0;
+        let mut rejected = false;
         for worker in &self.channels {
             let Some(target) = &worker.target else {
                 continue;
             };
-            if target.settings.accepts(level) {
-                eligible = true;
-                match worker.send.try_send(Dispatch::Event(Delivery {
+            if !target.settings.accepts(level) {
+                continue;
+            }
+            eligible += 1;
+            if pending.accepted_channels.contains(worker.name) {
+                accepted += 1;
+                continue;
+            }
+            if !interval.is_zero()
+                && self
+                    .last_send_by_scope
+                    .get(&key)
+                    .and_then(|channels| channels.get(worker.name))
+                    .is_some_and(|history| {
+                        history
+                            .range(level..)
+                            .any(|(_, sent)| now.saturating_duration_since(*sent) < interval)
+                    })
+            {
+                // A prior, different alert's cooldown is not acknowledgment
+                // of this condition. Keep the caller eligible to retry later.
+                continue;
+            }
+            if worker
+                .send
+                .try_send(Dispatch::Event(Delivery {
                     event: Arc::clone(&event),
                     channel: Arc::clone(&target.channel),
                     revoked: Arc::clone(&target.revoked),
-                })) {
-                    Ok(()) => accepted = true,
-                    Err(_) => {
-                        self.dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-        if let Some((key, state)) = reserve_transition {
-            if accepted || !eligible {
-                // A deliberately filtered recovery advances semantic state,
-                // so a later exhaustion is a new alert rather than a duplicate.
-                self.reserve_retries.remove(&key);
-                self.reserve_states.insert(key, state);
-            } else {
-                // Full queues do not consume the transition. Pace its retries
-                // to avoid turning each monitor tick into another drop notice.
-                self.reserve_retries.insert(key, (state, now));
-            }
-        }
-        if accepted {
-            if let Some(key) = ordinary_key {
-                // Throttle accepted alerts only. A total queue rejection
-                // must leave a retry eligible when capacity returns, while
-                // preserving any earlier successful alert's history.
+                }))
+                .is_ok()
+            {
+                accepted += 1;
+                pending.accepted_channels.insert(worker.name);
                 self.last_send_by_scope
-                    .entry(key)
+                    .entry(key.clone())
+                    .or_default()
+                    .entry(worker.name)
                     .or_default()
                     .insert(level, now);
+            } else {
+                rejected = true;
+                self.dropped.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        if eligible > 0 && accepted == eligible {
+            return NotificationDispatchOutcome::Accepted;
+        }
+        if retain_partial && !pending.accepted_channels.is_empty() {
+            self.remember_partial(key, pending);
+        }
+        if rejected || eligible == 0 {
+            NotificationDispatchOutcome::Unavailable
+        } else {
+            NotificationDispatchOutcome::Throttled
+        }
+    }
+
+    fn remember_partial(&mut self, key: NotificationScope, pending: PendingNotification) {
+        if self.pending_notifications.len() >= CHANNEL_QUEUE_CAPACITY {
+            let oldest = self
+                .pending_notifications
+                .iter()
+                .min_by(|(left_key, left), (right_key, right)| {
+                    left.last_attempt
+                        .cmp(&right.last_attempt)
+                        .then_with(|| left_key.cmp(right_key))
+                })
+                .map(|(scope, _)| scope.clone());
+            if let Some(oldest) = oldest {
+                self.pending_notifications.remove(&oldest);
+            }
+        }
+        self.pending_notifications.insert(key, pending);
+    }
+
+    fn notify_reserve_at(
+        &mut self,
+        event: &NotificationEvent,
+        key: (String, PathBuf),
+        state: BallastReserveState,
+        now: Instant,
+    ) -> NotificationDispatchOutcome {
+        let pending =
+            self.reserve_notifications
+                .entry(key)
+                .or_insert_with(|| ReserveNotification {
+                    state,
+                    accepted_channels: HashSet::new(),
+                    completed: false,
+                    last_attempt: None,
+                });
+        if pending.state != state {
+            pending.state = state;
+            pending.accepted_channels.clear();
+            pending.completed = false;
+            pending.last_attempt = None;
+        }
+        if pending.completed
+            || pending.last_attempt.is_some_and(|attempted| {
+                now.saturating_duration_since(attempted) < RESERVE_RETRY_INTERVAL
+            })
+        {
+            return NotificationDispatchOutcome::Throttled;
+        }
+
+        let event = Arc::new(event.clone());
+        let mut eligible = 0;
+        let mut accepted = 0;
+        for worker in &self.channels {
+            let Some(target) = &worker.target else {
+                continue;
+            };
+            if !target.settings.accepts(event.level()) {
+                continue;
+            }
+            eligible += 1;
+            if pending.accepted_channels.contains(worker.name) {
+                accepted += 1;
+            } else if worker
+                .send
+                .try_send(Dispatch::Event(Delivery {
+                    event: Arc::clone(&event),
+                    channel: Arc::clone(&target.channel),
+                    revoked: Arc::clone(&target.revoked),
+                }))
+                .is_ok()
+            {
+                accepted += 1;
+                pending.accepted_channels.insert(worker.name);
+            } else {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // A deliberately filtered recovery still advances the observed state,
+        // so a later exhaustion is a new episode.
+        pending.completed = accepted == eligible;
+        pending.last_attempt = (!pending.completed).then_some(now);
+        if eligible > 0 && pending.completed {
             NotificationDispatchOutcome::Accepted
         } else {
             NotificationDispatchOutcome::Unavailable
@@ -2547,6 +2727,438 @@ mod tests {
         assert_eq!(body["free"], "0.0");
     }
 
+    /// No worker is spawned: each receiver is the destination's controlled
+    /// queue, so rejection/recovery and enqueue counts are deterministic.
+    fn queued_notification_manager(
+        config: &NotificationConfig,
+    ) -> (
+        NotificationManager,
+        Vec<crossbeam_channel::Receiver<Dispatch>>,
+    ) {
+        let mut manager = NotificationManager::disabled();
+        manager.enabled = config.enabled;
+        manager.min_interval = Duration::from_secs(config.min_notify_interval_secs);
+        manager.urgent_min_interval = Duration::from_secs(config.urgent_notify_interval_secs);
+        let mut queues = Vec::new();
+        for settings in ChannelSettings::configured(config) {
+            let (send, receive) = bounded(1);
+            manager.channels.push(ChannelWorker {
+                name: settings.name(),
+                send,
+                target: Some(ChannelTarget::new(settings)),
+            });
+            queues.push(receive);
+        }
+        (manager, queues)
+    }
+
+    fn partial_notification_config() -> NotificationConfig {
+        NotificationConfig {
+            channels: vec!["file".into(), "webhook".into()],
+            min_notify_interval_secs: 0,
+            urgent_notify_interval_secs: 0,
+            webhook: WebhookConfig {
+                enabled: true,
+                url: "https://example.invalid/notify".into(),
+                min_level: NotificationLevel::Info,
+                ..WebhookConfig::default()
+            },
+            ..NotificationConfig::default()
+        }
+    }
+
+    fn occupy_notification_queue(manager: &NotificationManager, index: usize) {
+        let (acknowledge, _) = bounded(1);
+        assert!(
+            manager.channels[index]
+                .send
+                .try_send(Dispatch::Drain(acknowledge))
+                .is_ok()
+        );
+    }
+
+    fn take_notification(queue: &crossbeam_channel::Receiver<Dispatch>) -> Arc<NotificationEvent> {
+        let Dispatch::Event(delivery) = queue.try_recv().unwrap() else {
+            panic!("expected a queued notification");
+        };
+        assert!(!delivery.revoked.load(Ordering::Acquire));
+        delivery.event
+    }
+
+    #[test]
+    fn partial_enqueue_retries_only_missing_destinations_even_without_cooldowns() {
+        let config = partial_notification_config();
+        let (mut manager, queues) = queued_notification_manager(&config);
+        occupy_notification_queue(&manager, 1);
+        let now = Instant::now();
+        let mut event = pressure_event("/data", NotificationLevel::Critical);
+        assert_eq!(
+            manager.notify_at(&event, now),
+            NotificationDispatchOutcome::Unavailable
+        );
+        assert_eq!(
+            take_notification(&queues[0]).level(),
+            NotificationLevel::Critical
+        );
+
+        if let NotificationEvent::PressureChanged { free_pct, .. } = &mut event {
+            *free_pct = 0.25;
+        }
+        for seconds in [1, 2] {
+            assert_eq!(
+                manager.notify_at(&event, now + Duration::from_secs(seconds)),
+                NotificationDispatchOutcome::Unavailable
+            );
+            assert!(
+                queues[0].is_empty(),
+                "the healthy destination is not duplicated"
+            );
+        }
+        assert_eq!(manager.dropped_count(), 3);
+        assert!(matches!(queues[1].try_recv().unwrap(), Dispatch::Drain(_)));
+        assert_eq!(
+            manager.notify_at(&event, now + Duration::from_secs(3)),
+            NotificationDispatchOutcome::Accepted
+        );
+        let retried = take_notification(&queues[1]);
+        let NotificationEvent::PressureChanged { free_pct, .. } = retried.as_ref() else {
+            panic!("expected the current pressure measurement");
+        };
+        assert!((*free_pct - 0.25).abs() < f64::EPSILON);
+        assert!(queues[0].is_empty());
+
+        // A completed call ends the retry. Zero cooldown still allows an
+        // intentional subsequent event, rather than suppressing it forever.
+        assert_eq!(
+            manager.notify_at(&event, now + Duration::from_secs(3)),
+            NotificationDispatchOutcome::Accepted
+        );
+        assert_eq!(
+            take_notification(&queues[0]).level(),
+            NotificationLevel::Critical
+        );
+        assert_eq!(
+            take_notification(&queues[1]).level(),
+            NotificationLevel::Critical
+        );
+    }
+
+    #[test]
+    fn escalation_and_recovery_supersede_partial_notifications() {
+        let config = partial_notification_config();
+        let (mut manager, queues) = queued_notification_manager(&config);
+        occupy_notification_queue(&manager, 1);
+        let now = Instant::now();
+        for (seconds, level) in [
+            (0, NotificationLevel::Warning),
+            (1, NotificationLevel::Critical),
+            (2, NotificationLevel::Info),
+        ] {
+            assert_eq!(
+                manager.notify_at(
+                    &pressure_event("/data", level),
+                    now + Duration::from_secs(seconds),
+                ),
+                NotificationDispatchOutcome::Unavailable
+            );
+            assert_eq!(take_notification(&queues[0]).level(), level);
+        }
+        assert!(matches!(queues[1].try_recv().unwrap(), Dispatch::Drain(_)));
+        assert_eq!(
+            manager.notify_at(
+                &pressure_event("/data", NotificationLevel::Info),
+                now + Duration::from_secs(3),
+            ),
+            NotificationDispatchOutcome::Accepted
+        );
+        assert_eq!(
+            take_notification(&queues[1]).level(),
+            NotificationLevel::Info
+        );
+        assert!(
+            queues[0].is_empty(),
+            "the recovery already reached this queue"
+        );
+        assert_eq!(manager.dropped_count(), 3);
+    }
+
+    #[test]
+    fn previous_channel_cooldown_does_not_acknowledge_a_new_condition() {
+        let mut config = partial_notification_config();
+        config.min_notify_interval_secs = 60;
+        config.urgent_notify_interval_secs = 300;
+        let (mut manager, queues) = queued_notification_manager(&config);
+        occupy_notification_queue(&manager, 1);
+        let now = Instant::now();
+        assert_eq!(
+            manager.notify_at(&pressure_event("/data", NotificationLevel::Critical), now,),
+            NotificationDispatchOutcome::Unavailable
+        );
+        assert_eq!(
+            take_notification(&queues[0]).level(),
+            NotificationLevel::Critical
+        );
+        assert!(matches!(queues[1].try_recv().unwrap(), Dispatch::Drain(_)));
+
+        let recovery = pressure_event("/data", NotificationLevel::Orange);
+        assert_eq!(
+            manager.notify_at(&recovery, now + Duration::from_secs(1)),
+            NotificationDispatchOutcome::Throttled,
+            "the file channel has not acknowledged the new condition"
+        );
+        assert_eq!(
+            take_notification(&queues[1]).level(),
+            NotificationLevel::Orange
+        );
+        assert!(queues[0].is_empty());
+        assert_eq!(
+            manager.notify_at(&recovery, now + Duration::from_secs(2)),
+            NotificationDispatchOutcome::Throttled
+        );
+        assert!(
+            queues[1].is_empty(),
+            "a partial acknowledgment survives throttling"
+        );
+        assert_eq!(
+            manager.notify_at(&recovery, now + Duration::from_secs(60)),
+            NotificationDispatchOutcome::Accepted
+        );
+        assert_eq!(
+            take_notification(&queues[0]).level(),
+            NotificationLevel::Orange
+        );
+        assert!(queues[1].is_empty());
+    }
+
+    #[test]
+    fn partial_reserve_notifications_retry_and_rearm_after_partial_recovery() {
+        let config = partial_notification_config();
+        let (mut manager, queues) = queued_notification_manager(&config);
+        occupy_notification_queue(&manager, 1);
+        let now = Instant::now();
+        let exhausted = reserve_event("/data", 0, true);
+        assert_eq!(
+            manager.dispatch_at(&exhausted, now, false),
+            NotificationDispatchOutcome::Unavailable
+        );
+        assert_eq!(
+            take_notification(&queues[0]).level(),
+            NotificationLevel::Red
+        );
+        assert_eq!(
+            manager.notify_at(&exhausted, now + Duration::from_secs(4)),
+            NotificationDispatchOutcome::Throttled
+        );
+        assert!(matches!(queues[1].try_recv().unwrap(), Dispatch::Drain(_)));
+        assert_eq!(
+            manager.notify_at(&exhausted, now + RESERVE_RETRY_INTERVAL),
+            NotificationDispatchOutcome::Accepted
+        );
+        assert_eq!(
+            take_notification(&queues[1]).level(),
+            NotificationLevel::Red
+        );
+        assert!(queues[0].is_empty());
+
+        occupy_notification_queue(&manager, 1);
+        assert_eq!(
+            manager.notify_at(
+                &reserve_event("/data", 1000, true),
+                now + Duration::from_secs(6),
+            ),
+            NotificationDispatchOutcome::Unavailable
+        );
+        assert_eq!(
+            take_notification(&queues[0]).level(),
+            NotificationLevel::Info
+        );
+        assert_eq!(
+            manager.notify_at(&exhausted, now + Duration::from_secs(7)),
+            NotificationDispatchOutcome::Unavailable,
+            "a partial recovery still rearms renewed exhaustion immediately"
+        );
+        assert_eq!(
+            take_notification(&queues[0]).level(),
+            NotificationLevel::Red
+        );
+        assert!(matches!(queues[1].try_recv().unwrap(), Dispatch::Drain(_)));
+        assert_eq!(
+            manager.notify_at(&exhausted, now + Duration::from_secs(11)),
+            NotificationDispatchOutcome::Throttled
+        );
+        assert_eq!(
+            manager.notify_at(&exhausted, now + Duration::from_secs(12)),
+            NotificationDispatchOutcome::Accepted
+        );
+        assert_eq!(
+            take_notification(&queues[1]).level(),
+            NotificationLevel::Red
+        );
+        assert_eq!(
+            manager.notify_at(&exhausted, now + Duration::from_secs(3600)),
+            NotificationDispatchOutcome::Throttled
+        );
+        assert!(queues.iter().all(crossbeam_channel::Receiver::is_empty));
+        assert_eq!(manager.dropped_count(), 3);
+    }
+
+    #[test]
+    fn destination_change_cannot_inherit_partial_acknowledgments() {
+        let mut config = partial_notification_config();
+        let (mut manager, queues) = queued_notification_manager(&config);
+        occupy_notification_queue(&manager, 1);
+        let now = Instant::now();
+        let event = pressure_event("/data", NotificationLevel::Critical);
+        assert_eq!(
+            manager.notify_at(&event, now),
+            NotificationDispatchOutcome::Unavailable
+        );
+        let Dispatch::Event(old) = queues[0].try_recv().unwrap() else {
+            panic!("expected a queued notification");
+        };
+        config.file.path = config.file.path.with_file_name("replacement.jsonl");
+        assert!(manager.update_config(&config));
+        assert!(old.revoked.load(Ordering::Acquire));
+        assert_eq!(
+            manager.notify_at(&event, now + Duration::from_secs(1)),
+            NotificationDispatchOutcome::Unavailable
+        );
+        assert_eq!(
+            take_notification(&queues[0]).level(),
+            NotificationLevel::Critical
+        );
+        assert!(matches!(queues[1].try_recv().unwrap(), Dispatch::Drain(_)));
+        assert_eq!(
+            manager.notify_at(&event, now + Duration::from_secs(2)),
+            NotificationDispatchOutcome::Accepted
+        );
+        assert_eq!(
+            take_notification(&queues[1]).level(),
+            NotificationLevel::Critical
+        );
+        assert!(queues[0].is_empty());
+    }
+
+    #[test]
+    fn ended_episode_discards_partial_receipts_but_preserves_channel_cooldowns() {
+        for interval in [0, 300] {
+            let mut config = partial_notification_config();
+            config.urgent_notify_interval_secs = interval;
+            let (mut manager, queues) = queued_notification_manager(&config);
+            occupy_notification_queue(&manager, 1);
+            let now = Instant::now();
+            let event = pressure_event("/data", NotificationLevel::Critical);
+            assert_eq!(
+                manager.notify_at(&event, now),
+                NotificationDispatchOutcome::Unavailable
+            );
+            take_notification(&queues[0]);
+
+            manager.forget_pending("pressure_changed", "/data");
+            assert!(manager.pending_notifications.is_empty());
+            assert!(matches!(queues[1].try_recv().unwrap(), Dispatch::Drain(_)));
+            let expected = if interval == 0 {
+                NotificationDispatchOutcome::Accepted
+            } else {
+                NotificationDispatchOutcome::Throttled
+            };
+            assert_eq!(
+                manager.notify_at(&event, now + Duration::from_secs(1)),
+                expected
+            );
+            assert_eq!(
+                take_notification(&queues[1]).level(),
+                NotificationLevel::Critical
+            );
+            if interval > 0 {
+                assert!(
+                    queues[0].is_empty(),
+                    "ending an episode preserves normal pacing"
+                );
+                assert_eq!(
+                    manager.notify_at(&event, now + Duration::from_secs(interval)),
+                    NotificationDispatchOutcome::Accepted
+                );
+                assert!(queues[1].is_empty());
+            }
+            assert_eq!(
+                take_notification(&queues[0]).level(),
+                NotificationLevel::Critical
+            );
+        }
+    }
+
+    #[test]
+    fn partial_notification_cursors_are_bounded_and_inactive_scopes_expire() {
+        let config = partial_notification_config();
+        let (mut manager, queues) = queued_notification_manager(&config);
+        occupy_notification_queue(&manager, 1);
+        let now = Instant::now();
+        for index in 0..=CHANNEL_QUEUE_CAPACITY {
+            assert_eq!(
+                manager.notify_at(
+                    &pressure_event(&format!("/scope-{index}"), NotificationLevel::Critical),
+                    now + Duration::from_secs(u64::try_from(index).unwrap()),
+                ),
+                NotificationDispatchOutcome::Unavailable
+            );
+            take_notification(&queues[0]);
+        }
+        assert_eq!(manager.pending_notifications.len(), CHANNEL_QUEUE_CAPACITY);
+        assert!(
+            !manager
+                .pending_notifications
+                .contains_key(&("pressure_changed", "/scope-0".into()))
+        );
+
+        let event = pressure_event("/still-active", NotificationLevel::Critical);
+        assert_eq!(
+            manager.notify_at(&event, now + Duration::from_secs(1000)),
+            NotificationDispatchOutcome::Unavailable
+        );
+        take_notification(&queues[0]);
+        assert_eq!(manager.pending_notifications.len(), 1);
+        assert_eq!(
+            manager.notify_at(&event, now + Duration::from_secs(1001)),
+            NotificationDispatchOutcome::Unavailable
+        );
+        assert!(queues[0].is_empty());
+        assert_eq!(manager.pending_notifications.len(), 1);
+
+        // After inactivity the same scope can describe a new incident. Its
+        // first notification must not inherit an expired acknowledgment,
+        // even when no intervening dispatch ran the expiry sweep.
+        assert!(matches!(queues[1].try_recv().unwrap(), Dispatch::Drain(_)));
+        assert_eq!(
+            manager.notify_at(&event, now + Duration::from_secs(2000)),
+            NotificationDispatchOutcome::Accepted
+        );
+        assert_eq!(
+            take_notification(&queues[0]).level(),
+            NotificationLevel::Critical
+        );
+        assert_eq!(
+            take_notification(&queues[1]).level(),
+            NotificationLevel::Critical
+        );
+        assert!(manager.pending_notifications.is_empty());
+
+        // Independent one-shot events keep their existing semantics, including
+        // when both intervals are zero and another destination is unavailable.
+        occupy_notification_queue(&manager, 1);
+        for _ in 0..2 {
+            assert_eq!(
+                manager.dispatch_at(&event, now + Duration::from_secs(2001), false),
+                NotificationDispatchOutcome::Unavailable
+            );
+            assert_eq!(
+                take_notification(&queues[0]).level(),
+                NotificationLevel::Critical
+            );
+        }
+        assert!(manager.pending_notifications.is_empty());
+    }
+
     #[test]
     fn resource_pressure_retries_after_full_queue_without_consuming_cooldowns() {
         let (_directory, _config, mut manager) = notification_fixture();
@@ -2866,7 +3478,10 @@ mod tests {
             manager.notify_at(&event, now + Duration::from_millis(millis));
         }
         assert_eq!(manager.dropped_count(), 1);
-        assert!(manager.reserve_states.is_empty());
+        let pending = &manager.reserve_notifications
+            [&("/reserve".into(), PathBuf::from("/reserve/.sbh/ballast"))];
+        assert!(!pending.completed);
+        assert!(pending.accepted_channels.is_empty());
 
         // A different reserve band attempts immediately, before five seconds.
         let changed = reserve_event("/reserve", 100, true);
@@ -2881,7 +3496,12 @@ mod tests {
         manager.notify_at(&changed, changed_at + RESERVE_RETRY_INTERVAL);
         assert!(manager.drain(Duration::from_secs(5)));
         assert_eq!(manager.dropped_count(), 2);
-        assert!(manager.reserve_retries.is_empty());
+        assert!(
+            manager
+                .reserve_notifications
+                .values()
+                .all(|pending| pending.completed && pending.last_attempt.is_none())
+        );
         assert_eq!(
             delivered
                 .try_iter()
