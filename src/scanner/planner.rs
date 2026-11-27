@@ -81,11 +81,11 @@ pub fn admit_candidates(candidates: Vec<CandidacyScore>) -> Vec<CandidacyScore> 
         .collect()
 }
 
-fn hard_veto(candidate: &CandidacyScore) -> bool {
-    candidate.vetoed || candidate.decision.category_suspended
+pub(super) fn hard_veto(candidate: &CandidacyScore) -> bool {
+    candidate.vetoed || candidate.veto_reason.is_some() || candidate.decision.category_suspended
 }
 
-fn has_path_aliases(candidates: &[CandidacyScore]) -> bool {
+fn has_path_aliases<'a>(candidates: impl IntoIterator<Item = &'a CandidacyScore>) -> bool {
     let mut identities: HashMap<FsIdentity, &Path> = HashMap::new();
     for candidate in candidates {
         if let Some(identity) = candidate.identity
@@ -98,20 +98,22 @@ fn has_path_aliases(candidates: &[CandidacyScore]) -> bool {
     false
 }
 
-fn rejected_observations(candidates: &[CandidacyScore]) -> Vec<bool> {
+pub(super) fn rejected_observations<'a>(
+    candidates: impl IntoIterator<Item = &'a CandidacyScore, IntoIter: Clone>,
+) -> Vec<bool> {
+    let candidates = candidates.into_iter();
     // Most walks observe each physical entry at one path. Do not materialize
     // every path prefix and graph edge just because one candidate is protected.
     // Keep/invalid-score observations still participate in alias detection.
-    if has_path_aliases(candidates) {
+    if has_path_aliases(candidates.clone()) {
         return rejected_with_aliases(candidates);
     }
     let scopes: BTreeSet<_> = candidates
-        .iter()
+        .clone()
         .filter(|candidate| hard_veto(candidate))
         .map(|candidate| candidate.path.clone())
         .collect();
     candidates
-        .iter()
         .map(|candidate| {
             let path = candidate.path.as_path();
             path.ancestors().any(|ancestor| scopes.contains(ancestor))
@@ -194,13 +196,16 @@ fn mark_reachable(marked: &mut [bool], edges: &[Vec<usize>]) {
     }
 }
 
-fn rejected_with_aliases(candidates: &[CandidacyScore]) -> Vec<bool> {
+fn rejected_with_aliases<'a>(
+    candidates: impl IntoIterator<Item = &'a CandidacyScore, IntoIter: Clone>,
+) -> Vec<bool> {
     // The finite prefix trie is bounded by the input's total path components,
     // not by the filesystem's size or the number of spellings an alias cycle
     // could produce. Native components are never converted through UTF-8.
+    let candidates = candidates.into_iter();
     let mut paths: BTreeMap<&Path, usize> = BTreeMap::new();
-    let mut observations = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
+    let mut observations = Vec::with_capacity(candidates.size_hint().0);
+    for candidate in candidates.clone() {
         let next = paths.len();
         observations.push(*paths.entry(candidate.path.as_path()).or_insert(next));
         for ancestor in candidate.path.ancestors().skip(1) {
@@ -218,7 +223,7 @@ fn rejected_with_aliases(candidates: &[CandidacyScore]) -> Vec<bool> {
         }
     }
     let mut identities: HashMap<FsIdentity, usize> = HashMap::new();
-    for (candidate, &index) in candidates.iter().zip(&observations) {
+    for (candidate, &index) in candidates.clone().zip(&observations) {
         if let Some(identity) = candidate.identity
             && let Some(previous) = identities.insert(identity, index)
         {
@@ -235,7 +240,7 @@ fn rejected_with_aliases(candidates: &[CandidacyScore]) -> Vec<bool> {
         }
     }
     let mut rejected = vec![false; paths.len()];
-    for (candidate, &index) in candidates.iter().zip(&observations) {
+    for (candidate, &index) in candidates.zip(&observations) {
         if hard_veto(candidate) {
             rejected[roots[index]] = true;
         }

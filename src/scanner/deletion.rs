@@ -40,6 +40,7 @@ use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, StructuralSignals,
     is_obvious_build_artifact_basename_given,
 };
+use crate::scanner::planner::{hard_veto, rejected_observations};
 use crate::scanner::protection::{self, StowawayScanConfig};
 use crate::scanner::quarantine::{self, QuarantineStore, QuarantineUnavailable};
 use crate::scanner::scoring::{CandidacyScore, DecisionAction, ScoreFactors};
@@ -170,6 +171,21 @@ pub struct DeletionPlan {
 }
 
 impl DeletionPlan {
+    /// A public plan can contain unfiltered observations, including vetoes
+    /// after the batch limit and alias evidence in the refused list. Resolve
+    /// the whole graph before the first prompt, process survey, or mutation.
+    /// An empty mask means there was no supplied veto to propagate.
+    fn scope_vetoes(&self) -> Vec<bool> {
+        let observations = self
+            .candidates
+            .iter()
+            .chain(self.refused.iter().map(|(candidate, _)| candidate));
+        if self.candidates.is_empty() || !observations.clone().any(hard_veto) {
+            return Vec::new();
+        }
+        rejected_observations(observations)
+    }
+
     /// Refused candidates that must be backed off, by the same rule
     /// `execute` applies. A caller that skips `execute` because nothing was
     /// admitted still owes the scanner this feedback; otherwise the same
@@ -515,6 +531,11 @@ impl DeletionReport {
     fn record_skip(&mut self, reason: SkipReason) {
         self.items_skipped += 1;
         *self.skipped_by_reason.entry(reason.as_str()).or_insert(0) += 1;
+    }
+
+    fn record_scope_veto(&mut self, candidate: &CandidacyScore) {
+        self.record_skip(SkipReason::Vetoed);
+        self.backoff_candidates.push(candidate.clone());
     }
 
     /// Accumulate disjoint executions from the same executor. Exhaustively
@@ -1018,10 +1039,23 @@ impl DeletionExecutor {
         // Use the same eligibility rule as execution. A public plan is not
         // a capability to bypass vetoes or the receiving executor's policy.
         let mut refused = Vec::new();
-        let mut candidates: Vec<CandidacyScore> = candidates
+        let candidates: Vec<_> = candidates
             .into_iter()
             .map(incremental::bind_owned)
-            .filter_map(|candidate| {
+            .collect();
+        let vetoes = if candidates.iter().any(hard_veto) {
+            rejected_observations(&candidates)
+        } else {
+            Vec::new()
+        };
+        let mut candidates: Vec<CandidacyScore> = candidates
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, candidate)| {
+                if vetoes.get(index) == Some(&true) {
+                    refused.push((candidate, SkipReason::Vetoed));
+                    return None;
+                }
                 match incremental::check_mode(&candidate, self.config.mode)
                     .and_then(|()| eligibility::check(&candidate, &self.config))
                 {
@@ -1107,6 +1141,7 @@ impl DeletionExecutor {
         };
         let mut report = self.execute(&empty, None);
         let limit = plan.candidates.len().min(self.config.max_batch_size);
+        let vetoes = plan.scope_vetoes();
         let mut consecutive_failures: u32 = 0;
         for (index, candidate) in plan.candidates.iter().take(limit).enumerate() {
             if consecutive_failures >= self.config.circuit_breaker_threshold {
@@ -1118,6 +1153,11 @@ impl DeletionExecutor {
                     ),
                 });
                 break;
+            }
+            if vetoes.get(index) == Some(&true) {
+                report.record_scope_veto(candidate);
+                consecutive_failures = 0;
+                continue;
             }
             let bound_candidate = incremental::bind(candidate);
             let candidate = bound_candidate.as_ref();
@@ -1252,16 +1292,20 @@ impl DeletionExecutor {
             report.duration = start.elapsed();
             return report;
         }
+        let vetoes = plan.scope_vetoes();
+        let batch = plan.candidates.iter().take(limit).enumerate();
         // Build an open-path ancestor index once per mutating batch to avoid
         // deep per-candidate inode-tree scans on large artifact directories.
         // Dry-run never mutates, so it must not pay a global process-fd scan
         // or fail a planning report because live process visibility was partial.
-        let open_paths = if self.config.check_open_files && !self.config.dry_run {
-            let roots = plan
-                .candidates
-                .iter()
-                .take(limit)
-                .map(|candidate| candidate.path.clone())
+        let all_vetoed = vetoes
+            .get(..limit)
+            .is_some_and(|mask| !mask.contains(&false));
+        let open_paths = if self.config.check_open_files && !self.config.dry_run && !all_vetoed {
+            let roots = batch
+                .clone()
+                .filter(|(index, _)| vetoes.get(*index) != Some(&true))
+                .map(|(_, candidate)| candidate.path.clone())
                 .collect::<Vec<_>>();
             let (paths, complete) = self.platform.as_ref().map_or_else(
                 || {
@@ -1289,8 +1333,12 @@ impl DeletionExecutor {
                 // (SBH-2005 "delete_error") on busy hosts that had deleted
                 // nothing wrong (css, 2026-09-24).
                 report.duration = start.elapsed();
-                for _ in plan.candidates.iter().take(limit) {
-                    report.record_skip(SkipReason::OpenScanIncomplete);
+                for (index, candidate) in batch {
+                    if vetoes.get(index) == Some(&true) {
+                        report.record_scope_veto(candidate);
+                    } else {
+                        report.record_skip(SkipReason::OpenScanIncomplete);
+                    }
                 }
                 return report;
             }
@@ -1299,7 +1347,7 @@ impl DeletionExecutor {
             None
         };
 
-        for candidate in plan.candidates.iter().take(limit) {
+        for (index, candidate) in batch {
             // Circuit breaker: stop immediately on consecutive failures.
             // The daemon's next scan cycle can retry with fresh candidates.
             if consecutive_failures >= self.config.circuit_breaker_threshold {
@@ -1314,6 +1362,11 @@ impl DeletionExecutor {
                 break;
             }
 
+            if vetoes.get(index) == Some(&true) {
+                report.record_scope_veto(candidate);
+                consecutive_failures = 0;
+                continue;
+            }
             let bound_candidate = incremental::bind(candidate);
             let candidate = bound_candidate.as_ref();
 

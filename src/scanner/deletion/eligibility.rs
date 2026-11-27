@@ -13,7 +13,7 @@ use crate::scanner::protection;
 
 pub(super) fn check(candidate: &CandidacyScore, config: &DeletionConfig) -> Result<(), SkipReason> {
     let decision = &candidate.decision;
-    if candidate.vetoed || candidate.veto_reason.is_some() || decision.category_suspended {
+    if crate::scanner::planner::hard_veto(candidate) {
         return Err(SkipReason::Vetoed);
     }
     if !config.min_score.is_finite()
@@ -308,6 +308,89 @@ mod tests {
             CheckedDeletion::Skipped(SkipReason::SacredStowaway)
         );
         assert!(item.path.exists());
+    }
+
+    #[test]
+    fn observed_veto_protects_an_enclosing_artifact_through_an_alias() {
+        let dir = scratch();
+        let tree = dir.path().join("target");
+        fs::create_dir(&tree).unwrap();
+        let member = tree.join("in-use.o");
+        let alias = dir.path().join("other-name.o");
+        let sibling = tree.join("unused.o");
+        fs::write(&member, PAYLOAD).unwrap();
+        fs::hard_link(&member, &alias).unwrap();
+        fs::write(&sibling, PAYLOAD).unwrap();
+
+        let mut held = candidate(&alias);
+        // A reason alone is veto evidence even in a malformed public score.
+        held.veto_reason = Some("active producer".into());
+        let observations = vec![
+            candidate(&tree),
+            candidate(&member),
+            candidate(&sibling),
+            held,
+        ];
+        let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+        let plan = executor.plan(observations.clone());
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].path, sibling);
+        assert_eq!(plan.total_reclaimable_bytes, plan.candidates[0].size_bytes);
+        assert_eq!(plan.refusals_to_back_off().len(), 3);
+        let admitted = crate::scanner::planner::admit_candidates(observations);
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].path, sibling);
+    }
+
+    #[test]
+    fn public_plans_resolve_vetoes_before_limits_prompts_and_mutations() {
+        use crate::scanner::deletion::DeletionConfirmation;
+
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for interactive in [false, true] {
+                for already_refused in [false, true] {
+                    let dir = scratch();
+                    let tree = dir.path().join("target");
+                    fs::create_dir(&tree).unwrap();
+                    let member = tree.join("in-use.o");
+                    let sibling = tree.join("unused.o");
+                    fs::write(&member, PAYLOAD).unwrap();
+                    fs::write(&sibling, PAYLOAD).unwrap();
+                    let mut held = candidate(&member);
+                    held.decision.category_suspended = true;
+                    let mut plan = raw_plan(&candidate(&tree), mode);
+                    plan.candidates.push(candidate(&sibling));
+                    if already_refused {
+                        plan.refused.push((held, SkipReason::Vetoed));
+                    } else {
+                        plan.candidates.push(held);
+                    }
+                    let mut cfg = config(dir.path(), mode);
+                    cfg.max_batch_size = 2;
+                    let executor = DeletionExecutor::new(cfg, None);
+                    let report = if interactive {
+                        let mut prompted = Vec::new();
+                        let report = executor
+                            .execute_confirmed(&plan, None, |index, item| {
+                                prompted.push((index, item.path.clone()));
+                                Ok::<_, ()>(DeletionConfirmation::Accept)
+                            })
+                            .unwrap();
+                        assert_eq!(prompted, [(1, sibling.clone())]);
+                        report
+                    } else {
+                        executor.execute(&plan, None)
+                    };
+                    assert_eq!(report.deleted_paths, [sibling.clone()]);
+                    assert_eq!(
+                        report.skipped_by_reason.get("vetoed"),
+                        Some(&(1 + usize::from(already_refused)))
+                    );
+                    assert_eq!(fs::read(&member).unwrap(), PAYLOAD);
+                    assert!(!sibling.exists());
+                }
+            }
+        }
     }
 
     #[test]
