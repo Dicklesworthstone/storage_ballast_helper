@@ -72,6 +72,9 @@ pub struct BallastPool {
     pub ballast_dir: PathBuf,
     pub fs_type: String,
     pub strategy: ProvisionStrategy,
+    /// Device observed during discovery. A later refill cannot rebind the
+    /// plan by looking up its mount name after the filesystem disappears.
+    refill_device: Option<u64>,
     manager: BallastManager,
     /// Verified, identity-bound reserve outside the managed directory. Release
     /// retired files first; never provision into a former installation's pool.
@@ -506,6 +509,7 @@ pub(crate) struct BallastReplenishment {
     origin: Arc<()>,
     revision: u64,
     initial_provision: bool,
+    inventory_current: bool,
     inventory_observation: Option<super::release::BallastInventoryObservation>,
 }
 
@@ -515,15 +519,51 @@ impl BallastReplenishment {
     }
 
     pub(crate) fn run(&mut self, still_allowed: &dyn Fn() -> bool) -> Result<ProvisionReport> {
-        let result = if self.initial_provision {
-            provision::provision_guarded(&mut self.pool, None, still_allowed)
-        } else {
-            provision::replenish_one_guarded(&mut self.pool, still_allowed)
+        let mount = self.pool.mount_point.clone();
+        let directory = self.pool.ballast_dir.clone();
+        let device = self.pool.refill_device;
+        let revoked = std::cell::Cell::new(false);
+        let scope_current = || {
+            if revoked.get() {
+                return false;
+            }
+            let current = device.is_some_and(|expected| {
+                provision::refill_device_matches(&mount, &directory, expected)
+            });
+            revoked.set(!current);
+            current
         };
-        self.inventory_observation = super::release::BallastInventoryObservation::capture(
-            &self.pool.ballast_dir,
-            self.pool.available_count(),
-        );
+        // Either native lookup can stall. Check live authority again before
+        // the provisioner may allocate or repair the next chunk.
+        let allowed = || still_allowed() && scope_current() && still_allowed();
+        let mut result = if self.initial_provision {
+            provision::provision_guarded(&mut self.pool, None, &allowed)
+        } else {
+            provision::replenish_one_guarded(&mut self.pool, &allowed)
+        };
+        self.inventory_observation = if scope_current() {
+            super::release::BallastInventoryObservation::capture(
+                &directory,
+                self.pool.available_count(),
+            )
+        } else {
+            None
+        };
+        self.inventory_current = scope_current();
+        if !self.inventory_current {
+            let details = format!(
+                "cannot verify the discovered filesystem for ballast refill at {} on {}",
+                directory.display(),
+                mount.display()
+            );
+            // Preserve any completed slot receipts, without publishing
+            // inventory from a replacement filesystem.
+            match &mut result {
+                Ok(report) => report.errors.push(details),
+                Err(error) => *error = crate::core::errors::SbhError::Runtime { details },
+            }
+            self.inventory_observation = None;
+        }
         result
     }
 
@@ -1132,6 +1172,7 @@ impl BallastPoolCoordinator {
         } = Self::plan_pools(config, watched_paths, platform, configured_ballast_dir)?;
         let mut pools = HashMap::new();
         for plan in planned {
+            let refill_device = provision::mount_device(&plan.mount_point);
             let mut manager = match BallastManager::with_platform(
                 plan.ballast_dir.clone(),
                 plan.config,
@@ -1165,6 +1206,7 @@ impl BallastPoolCoordinator {
             pools.insert(
                 plan.mount_point.clone(),
                 BallastPool {
+                    refill_device,
                     mount_point: plan.mount_point,
                     ballast_dir: plan.ballast_dir,
                     fs_type: plan.fs_type,
@@ -1614,6 +1656,7 @@ impl BallastPoolCoordinator {
                 ballast_dir: pool.ballast_dir.clone(),
                 fs_type: pool.fs_type.clone(),
                 strategy: pool.strategy,
+                refill_device: pool.refill_device,
                 manager: pool.manager.worker_snapshot(),
                 stranded: pool.stranded.clone(),
                 unreachable_reserve: pool.unreachable_reserve.clone(),
@@ -1677,6 +1720,7 @@ impl BallastPoolCoordinator {
                 ballast_dir: pool.ballast_dir.clone(),
                 fs_type: pool.fs_type.clone(),
                 strategy: pool.strategy,
+                refill_device: pool.refill_device,
                 manager: pool.manager.worker_snapshot(),
                 stranded: pool.stranded.clone(),
                 unreachable_reserve: pool.unreachable_reserve.clone(),
@@ -1684,6 +1728,7 @@ impl BallastPoolCoordinator {
             origin: Arc::clone(&self.worker_origin),
             revision: self.pool_revisions.get(key).copied().unwrap_or(0),
             initial_provision: false,
+            inventory_current: false,
             inventory_observation: None,
         })
     }
@@ -1703,7 +1748,8 @@ impl BallastPoolCoordinator {
     /// A release, reload or another refill keeps its newer inventory intact.
     pub(crate) fn finish_replenishment(&mut self, task: BallastReplenishment) -> bool {
         let key = &task.pool.mount_point;
-        if !Arc::ptr_eq(&task.origin, &self.worker_origin)
+        if !task.inventory_current
+            || !Arc::ptr_eq(&task.origin, &self.worker_origin)
             || self.pool_revisions.get(key).copied().unwrap_or(0) != task.revision
         {
             return false;
@@ -3727,6 +3773,79 @@ mod tests {
                 tiny_ballast_config().file_size_bytes
             );
             assert_eq!(pool.expected_count(), 3);
+        }
+
+        #[test]
+        fn refill_rejects_a_lost_mount_device_before_creating_or_repairing_slots() {
+            for initial in [true, false] {
+                let (temp, _platform, mut coordinator) = fixture();
+                let mount = temp.path().join("first");
+                let mut task = if initial {
+                    coordinator.prepare_initial_provision(&mount).unwrap()
+                } else {
+                    coordinator.prepare_replenishment(&mount).unwrap()
+                };
+                let directory = task.pool.ballast_dir.clone();
+                let file = directory.join("SBH_BALLAST_FILE_00001.dat");
+                if !initial {
+                    fs::create_dir_all(&directory).unwrap();
+                    fs::write(&file, b"existing damaged reserve").unwrap();
+                }
+                // Model an earlier discovery of a different device at the
+                // same path, without mounting over a host filesystem.
+                task.pool.refill_device = Some(task.pool.refill_device.unwrap() ^ 1);
+                assert!(task.run(&|| true).is_err());
+                assert!(!coordinator.finish_replenishment(task));
+                if initial {
+                    assert!(!directory.exists(), "even the pool lock would be a write");
+                } else {
+                    assert_eq!(fs::read(&file).unwrap(), b"existing damaged reserve");
+                    assert!(!directory.join(".lock").exists());
+                }
+
+                // A task with a current witness can still create the missing
+                // nested pool, and ordinary refill can repair the damaged slot.
+                let mut fresh = if initial {
+                    coordinator.prepare_initial_provision(&mount).unwrap()
+                } else {
+                    coordinator.prepare_replenishment(&mount).unwrap()
+                };
+                let report = fresh.run(&|| true).unwrap();
+                assert!(report.errors.is_empty(), "{report:?}");
+                assert_eq!(report.files_created, if initial { 3 } else { 1 });
+                assert!(coordinator.finish_replenishment(fresh));
+                assert_eq!(fs::metadata(file).unwrap().len(), 8192);
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn refill_rejects_a_redirected_parent_on_another_device() {
+            let (temp, _platform, mut coordinator) = fixture();
+            let mount = temp.path().join("first");
+            let Ok(destination) = tempfile::tempdir_in("/dev/shm") else {
+                return;
+            };
+            if provision::mount_device(destination.path()) == provision::mount_device(&mount) {
+                return;
+            }
+            // Both directories are private fixtures. No mount privileges
+            // are needed to cross this real filesystem boundary.
+            std::os::unix::fs::symlink(destination.path(), mount.join(".sbh")).unwrap();
+            let directory = destination.path().join("ballast");
+            let mut initial = coordinator.prepare_initial_provision(&mount).unwrap();
+            assert!(initial.run(&|| true).is_err());
+            assert!(!directory.exists());
+            assert!(!coordinator.finish_replenishment(initial));
+
+            fs::create_dir(&directory).unwrap();
+            let file = directory.join("SBH_BALLAST_FILE_00001.dat");
+            fs::write(&file, b"foreign damaged reserve").unwrap();
+            let mut refill = coordinator.prepare_replenishment(&mount).unwrap();
+            assert!(refill.run(&|| true).is_err());
+            assert_eq!(fs::read(file).unwrap(), b"foreign damaged reserve");
+            assert!(!directory.join(".lock").exists());
+            assert!(!coordinator.finish_replenishment(refill));
         }
 
         #[test]

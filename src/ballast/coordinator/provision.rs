@@ -5,9 +5,48 @@
 //! Credit verified bytes, never legacy file counts or a temporary smaller config:
 //! lowering file_count would make the manager prune valid high-index files.
 
+use std::path::Path;
+
 use super::BallastPool;
 use crate::ballast::manager::{BallastManager, ProvisionReport};
 use crate::core::errors::{Result, SbhError};
+
+fn directory_device(meta: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.is_dir().then(|| meta.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+pub(super) fn mount_device(mount: &Path) -> Option<u64> {
+    directory_device(&std::fs::metadata(mount).ok()?)
+}
+
+/// A new reserve may need several directories. Verify the device that
+/// would receive them, then verify the managed directory itself once it
+/// exists. Follow an ancestor alias, but never a replaced final entry.
+pub(super) fn refill_device_matches(mount: &Path, directory: &Path, expected: u64) -> bool {
+    if mount_device(mount) != Some(expected) {
+        return false;
+    }
+    for path in directory.ancestors() {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if path != directory && meta.is_symlink() => {
+                return mount_device(path) == Some(expected);
+            }
+            Ok(meta) => return directory_device(&meta) == Some(expected),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
 
 pub(super) fn provision(
     pool: &mut BallastPool,
@@ -208,6 +247,7 @@ mod tests {
         let mut manager = BallastManager::new(active.clone(), config(count, size)).unwrap();
         manager.set_provision_floor(0.0);
         let pool = BallastPool {
+            refill_device: mount_device(temp.path()),
             mount_point: temp.path().to_path_buf(),
             ballast_dir: active,
             fs_type: "ext4".to_string(),
