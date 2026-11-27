@@ -12570,7 +12570,9 @@ impl MonitoringDaemon {
         &mut self,
         scan_queue: Option<(&Sender<ScanRequest>, &Receiver<ScanRequest>)>,
     ) {
-        use crate::daemon::notifications::NotificationDispatchOutcome;
+        use crate::daemon::notifications::{
+            NotificationDispatchOutcome, SPECIAL_LOCATION_ALERT_SCOPE,
+        };
 
         let now = Instant::now();
         let locations = self.special_locations.all().to_vec();
@@ -12660,8 +12662,10 @@ impl MonitoringDaemon {
                 if special_episode_over(previous, now, alert_interval)
                     && self.last_special_notify.remove(&location.path).is_some()
                 {
-                    self.notification_manager
-                        .forget_pending("pressure_changed", &location.path.to_string_lossy());
+                    self.notification_manager.forget_pending(
+                        SPECIAL_LOCATION_ALERT_SCOPE,
+                        &location.path.to_string_lossy(),
+                    );
                 }
                 continue;
             }
@@ -12674,13 +12678,11 @@ impl MonitoringDaemon {
                 };
                 let (notify_from, mut notified) = special_episode_step(previous, pressure_level);
                 if let Some(from) = notify_from {
-                    let outcome = self.notification_manager.notify_with_outcome(
-                        &NotificationEvent::PressureChanged {
-                            from: format!("{from:?}"),
-                            to: format!("{pressure_level:?}"),
-                            mount: location.path.to_string_lossy().into_owned(),
-                            free_pct: stats.free_pct(),
-                        },
+                    let outcome = self.notification_manager.notify_special_pressure(
+                        &location.path,
+                        from,
+                        pressure_level,
+                        stats.free_pct(),
                     );
                     if outcome != NotificationDispatchOutcome::Accepted {
                         notified = from;

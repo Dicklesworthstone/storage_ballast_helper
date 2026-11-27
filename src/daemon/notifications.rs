@@ -35,6 +35,9 @@ const RESERVE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const CHANNEL_QUEUE_CAPACITY: usize = 64;
 /// Desktop/webhook children get one bounded attempt on their channel's worker.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Special-location horizons and ordinary disk pressure can cover one mount
+/// but have different transitions, retry receipts and episode lifetimes.
+pub(super) const SPECIAL_LOCATION_ALERT_SCOPE: &str = "special_location_pressure";
 
 // ──────────────────── notification level ────────────────────
 
@@ -1297,7 +1300,7 @@ impl NotificationManager {
     pub fn notify(&mut self, event: &NotificationEvent) {
         // Independent one-shot events do not inherit a partial state-alert
         // cursor. Reserve observations always retain their transition cursor.
-        self.dispatch_at(event, Instant::now(), false);
+        self.dispatch_at(event, Instant::now(), false, event.type_key());
     }
 
     /// Report acceptance by every eligible queue. Callers can retry an ongoing
@@ -1310,6 +1313,25 @@ impl NotificationManager {
         event: &NotificationEvent,
     ) -> NotificationDispatchOutcome {
         self.notify_at(event, Instant::now())
+    }
+
+    /// Preserve the established pressure event on the wire. The horizon
+    /// monitor needs its own delivery identity even when its location is
+    /// also an ordinary mount with exactly the same pressure level.
+    pub(super) fn notify_special_pressure(
+        &mut self,
+        path: &Path,
+        from: PressureLevel,
+        to: PressureLevel,
+        free_pct: f64,
+    ) -> NotificationDispatchOutcome {
+        let event = NotificationEvent::PressureChanged {
+            from: format!("{from:?}"),
+            to: format!("{to:?}"),
+            mount: path.to_string_lossy().into_owned(),
+            free_pct,
+        };
+        self.dispatch_at(&event, Instant::now(), true, SPECIAL_LOCATION_ALERT_SCOPE)
     }
 
     /// End a caller's condition without erasing destination cooldowns. A new
@@ -1357,7 +1379,7 @@ impl NotificationManager {
         event: &NotificationEvent,
         now: Instant,
     ) -> NotificationDispatchOutcome {
-        self.dispatch_at(event, now, true)
+        self.dispatch_at(event, now, true, event.type_key())
     }
 
     fn dispatch_at(
@@ -1365,6 +1387,7 @@ impl NotificationManager {
         event: &NotificationEvent,
         now: Instant,
         retain_partial: bool,
+        category: &'static str,
     ) -> NotificationDispatchOutcome {
         if !self.enabled {
             return NotificationDispatchOutcome::Unavailable;
@@ -1378,7 +1401,7 @@ impl NotificationManager {
             });
             !channels.is_empty()
         });
-        let key = (event.type_key(), event.throttle_scope().to_owned());
+        let key = (category, event.throttle_scope().to_owned());
         let retry_retention =
             retention.max(Duration::from_secs(DEFAULT_URGENT_NOTIFY_INTERVAL_SECS));
         self.pending_notifications.retain(|_, pending| {
@@ -2786,6 +2809,52 @@ mod tests {
     }
 
     #[test]
+    fn special_and_filesystem_alerts_keep_independent_receipts_and_cooldowns() {
+        for interval in [0, 300] {
+            let mut config = partial_notification_config();
+            config.urgent_notify_interval_secs = interval;
+            let (mut manager, queues) = queued_notification_manager(&config);
+            occupy_notification_queue(&manager, 1);
+            let mount = Path::new("/dev/shm");
+            let ordinary = pressure_event("/dev/shm", NotificationLevel::Red);
+            assert_eq!(
+                manager.notify_with_outcome(&ordinary),
+                NotificationDispatchOutcome::Unavailable
+            );
+            take_notification(&queues[0]);
+
+            // The ordinary alert reached the file queue only. A special
+            // horizon at the same path and severity still owes both queues.
+            assert_eq!(
+                manager.notify_special_pressure(
+                    mount,
+                    PressureLevel::Green,
+                    PressureLevel::Red,
+                    12.5
+                ),
+                NotificationDispatchOutcome::Unavailable
+            );
+            let special = take_notification(&queues[0]);
+            assert_eq!(special.type_key(), ordinary.type_key());
+            assert!(
+                matches!(special.as_ref(), NotificationEvent::PressureChanged { free_pct, .. }
+                if (*free_pct - 12.5).abs() < f64::EPSILON)
+            );
+            manager.forget_pending(SPECIAL_LOCATION_ALERT_SCOPE, "/dev/shm");
+
+            // Ending the special episode does not reset the file's ordinary
+            // receipt. Recovery of the webhook completes the original alarm.
+            assert!(matches!(queues[1].try_recv().unwrap(), Dispatch::Drain(_)));
+            assert_eq!(
+                manager.notify_with_outcome(&ordinary),
+                NotificationDispatchOutcome::Accepted
+            );
+            assert!(queues[0].is_empty());
+            assert_eq!(take_notification(&queues[1]).summary(), ordinary.summary());
+        }
+    }
+
+    #[test]
     fn partial_enqueue_retries_only_missing_destinations_even_without_cooldowns() {
         let config = partial_notification_config();
         let (mut manager, queues) = queued_notification_manager(&config);
@@ -2938,7 +3007,7 @@ mod tests {
         let now = Instant::now();
         let exhausted = reserve_event("/data", 0, true);
         assert_eq!(
-            manager.dispatch_at(&exhausted, now, false),
+            manager.dispatch_at(&exhausted, now, false, exhausted.type_key()),
             NotificationDispatchOutcome::Unavailable
         );
         assert_eq!(
@@ -3148,7 +3217,12 @@ mod tests {
         occupy_notification_queue(&manager, 1);
         for _ in 0..2 {
             assert_eq!(
-                manager.dispatch_at(&event, now + Duration::from_secs(2001), false),
+                manager.dispatch_at(
+                    &event,
+                    now + Duration::from_secs(2001),
+                    false,
+                    event.type_key()
+                ),
                 NotificationDispatchOutcome::Unavailable
             );
             assert_eq!(
