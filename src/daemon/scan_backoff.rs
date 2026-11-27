@@ -17,6 +17,7 @@ use super::{
 };
 use crate::core::config::{ScannerConfig, ScoringConfig};
 use crate::daemon::filesystem_reclaim::FilesystemReclaimScope;
+use crate::daemon::inode_reclaim::InodeReclaimRequest;
 use crate::daemon::predictive_reclaim::PredictiveScanAdmission;
 use crate::monitor::pid::PressureLevel;
 use crate::platform::cleanup_catalog::ExpandedCatalogRoot;
@@ -83,7 +84,7 @@ struct ScanScope {
     catalog_roots: Vec<ExpandedCatalogRoot>,
     filesystem: Option<Arc<FilesystemReclaimScope>>,
     ram: bool,
-    inodes: bool,
+    inodes: Option<InodeReclaimRequest>,
     predictive_floor: Option<u64>,
 }
 
@@ -101,7 +102,7 @@ impl ScanScope {
             catalog_roots,
             filesystem: request.filesystem_reclaim.clone(),
             ram: request.ram_reclaim.is_some(),
-            inodes: request.inode_reclaim.is_some(),
+            inodes: request.inode_reclaim.clone(),
             predictive_floor: request
                 .predictive_reclaim
                 .as_ref()
@@ -113,7 +114,11 @@ impl ScanScope {
         self.paths == other.paths
             && self.catalog_roots == other.catalog_roots
             && self.ram == other.ram
-            && self.inodes == other.inodes
+            && match (&self.inodes, &other.inodes) {
+                (Some(left), Some(right)) => left.same_scan_scope(right),
+                (None, None) => true,
+                _ => false,
+            }
             && self.predictive_floor == other.predictive_floor
             && match (&self.filesystem, &other.filesystem) {
                 (Some(left), Some(right)) => left.same_scan_scope(right),
@@ -436,6 +441,51 @@ mod tests {
             !backoffs
                 .for_request(&catalog, now)
                 .cooldown_active(&catalog, false, 90, now)
+        );
+    }
+
+    #[test]
+    fn changed_inode_recovery_goal_does_not_inherit_empty_backoff() {
+        let now = Instant::now();
+        let mut backoffs = ScanBackoffs::default();
+        let mut first = request("/a", PressureLevel::Red);
+        first.inode_reclaim = Some(InodeReclaimRequest::from_observed_roots(
+            PathBuf::from("/a"),
+            42,
+            1_000,
+            200,
+            10,
+            &InodePressureConfig::default(),
+            &[],
+        ));
+        exhaust(&mut backoffs, &first, now);
+        assert!(
+            backoffs
+                .for_request(&first, now)
+                .cooldown_active(&first, false, 90, now)
+        );
+
+        let mut next = first.clone();
+        next.inode_reclaim = Some(InodeReclaimRequest::from_observed_roots(
+            PathBuf::from("/a"),
+            42,
+            1_000,
+            400,
+            10,
+            &InodePressureConfig::default(),
+            &[],
+        ));
+        assert!(
+            !backoffs
+                .for_request(&next, now)
+                .cooldown_active(&next, false, 90, now),
+            "a stricter inode recovery goal must be scanned independently"
+        );
+        assert!(
+            backoffs
+                .for_request(&first, now)
+                .cooldown_active(&first, false, 90, now),
+            "the original inode objective keeps its own empty evidence"
         );
     }
 
