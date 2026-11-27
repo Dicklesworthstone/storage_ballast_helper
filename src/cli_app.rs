@@ -17349,13 +17349,18 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
 /// Inspect the reserve that could free blocks on the checked filesystem.
 fn check_mount_ballast(cli: &Cli, config: &Config, platform: &dyn Platform, mount: &Path) -> Value {
     use storage_ballast_helper::ballast::coordinator::BallastPoolCoordinator;
+    use storage_ballast_helper::daemon::loop_main::ballast_discovery_paths;
+    use storage_ballast_helper::monitor::special_locations::SpecialLocationRegistry;
 
-    let observation = BallastPoolCoordinator::inventory_for_mount(
-        &config.ballast,
-        mount,
-        platform,
-        &config.paths.ballast_dir,
-    );
+    let observation = SpecialLocationRegistry::discover(platform, &[]).and_then(|special| {
+        BallastPoolCoordinator::inventory_for_mount(
+            &config.ballast,
+            &ballast_discovery_paths(config, &special),
+            mount,
+            platform,
+            &config.paths.ballast_dir,
+        )
+    });
     let reason = match observation {
         Ok(Some(pool)) => {
             if let Some(managed) = pool.managed_availability {

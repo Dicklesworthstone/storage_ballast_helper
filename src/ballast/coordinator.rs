@@ -1273,18 +1273,18 @@ impl BallastPoolCoordinator {
     }
 
     /// Observe the checked mount's local reserve without enumerating other
-    /// pools' files. Include the configured directory in mount selection so
-    /// a writable bind alias resolves to the same pool as its physical owner.
+    /// pools' files. Select the physical pool using all the daemon's watched
+    /// paths so an unwatched bind alias resolves to the same serving mount.
     pub fn inventory_for_mount(
         config: &BallastConfig,
+        watched_paths: &[PathBuf],
         mount: &Path,
         platform: &dyn Platform,
         configured_ballast_dir: &Path,
     ) -> Result<Option<PoolInventory>> {
-        let paths = [mount.to_owned(), configured_ballast_dir.to_owned()];
         let plan = Self::plan_pools(
             config,
-            &paths,
+            watched_paths,
             platform,
             Some(configured_ballast_dir),
             Some(mount),

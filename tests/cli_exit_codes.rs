@@ -146,6 +146,8 @@ fn check_reports_only_the_reserve_on_the_checked_filesystem() {
     let config = config_in(dir.path());
     let primary = dir.path().join("data/ballast");
     let secondary = dir.path().join("root");
+    let second_alias = dir.path().join("bind");
+    fs::create_dir(&second_alias).unwrap();
     let pool = secondary.join(".sbh/ballast");
     fs::create_dir_all(&primary).unwrap();
     fs::write(primary.join("SBH_BALLAST_FILE_00001.dat"), [1; 4096]).unwrap();
@@ -158,6 +160,7 @@ fn check_reports_only_the_reserve_on_the_checked_filesystem() {
         let mounts = serde_json::json!({"mounts": [
             { "path": dir.path(), "device": "/dev/sbh-a", "total": 100_000, "free": 90_000 },
             { "path": secondary, "device": secondary_device, "total": 100_000, "free": 90_000 },
+            { "path": second_alias, "device": secondary_device, "total": 100_000, "free": 90_000 },
         ]});
         let output = Command::new(common::sbh_bin_path())
             .arg("--config")
@@ -186,6 +189,12 @@ fn check_reports_only_the_reserve_on_the_checked_filesystem() {
     assert_eq!(partial["releasable_bytes"], 4096);
     assert_eq!(partial["missing_count"], 1);
     assert_eq!(partial["health"], "degraded");
+    // The checked bind is unwatched and on a different device from the
+    // configured primary. Only the daemon's watched roots identify its pool.
+    let bound = check(&second_alias, "/dev/sbh-b");
+    assert_eq!(bound["pool_mount_point"], secondary.to_str().unwrap());
+    assert_eq!(bound["ballast_dir"], pool.to_str().unwrap());
+    assert_eq!(bound["releasable_bytes"], 4096);
     let local = check(dir.path(), "/dev/sbh-b");
     assert_eq!(local["ballast_dir"], primary.to_str().unwrap());
     assert_eq!(local["configured_pool_bytes"], 4096);
