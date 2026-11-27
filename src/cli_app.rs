@@ -14221,6 +14221,12 @@ struct ScanReportRows {
     rejected: Vec<ScoredScanEntry>,
 }
 
+impl ScanReportRows {
+    fn displayed_candidates(&self, top: usize) -> &[ScoredScanEntry] {
+        &self.candidates[..top.min(self.candidates.len())]
+    }
+}
+
 fn scan_report_rows(
     entries: Vec<ScoredScanEntry>,
     min_score: f64,
@@ -14265,8 +14271,8 @@ fn scan_report_rows(
     });
     rows.report_only
         .sort_by_key(|entry| std::cmp::Reverse(entry.score.size_bytes));
-    rows.rejected.sort_by(|a, b| a.score.path.cmp(&b.score.path));
-    rows.candidates.truncate(top);
+    rows.rejected
+        .sort_by(|a, b| a.score.path.cmp(&b.score.path));
     rows.report_only.truncate(top);
     rows.rejected.truncate(top);
     rows
@@ -14623,11 +14629,10 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
         })
         .collect::<Vec<_>>();
 
-    let ScanReportRows {
-        candidates,
-        report_only,
-        rejected,
-    } = scan_report_rows(scored_entries, args.min_score, args.top, args.explain);
+    let rows = scan_report_rows(scored_entries, args.min_score, args.top, args.explain);
+    let candidates = rows.displayed_candidates(args.top);
+    let report_only = &rows.report_only;
+    let rejected = &rows.rejected;
 
     let elapsed = start.elapsed();
     let process_cpu_micros = cpu_start_micros
@@ -14713,13 +14718,13 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
             if args.explain {
                 if !candidates.is_empty() {
                     println!("\n  Confidence trace:");
-                    for entry in &candidates {
+                    for entry in candidates {
                         print_scan_trace(entry);
                     }
                 }
                 if !rejected.is_empty() {
                     println!("\n  Safety rejections:");
-                    for entry in &rejected {
+                    for entry in rejected {
                         print_scan_trace(entry);
                     }
                 }
@@ -14753,11 +14758,15 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 .map(|entry| scan_entry_json(entry, args.explain))
                 .collect();
 
-            // W1 planner: each filesystem owns its pressure/risk budget.
+            // --top limits the display. Every admitted row participates in
+            // its filesystem's pressure and risk budget, including at --top 0.
             let (_, scan_plan) = plan_cli_cleanup(
                 &config,
                 &root_paths,
-                candidates.iter().map(|entry| entry.score.clone()).collect(),
+                rows.candidates
+                    .into_iter()
+                    .map(|entry| entry.score)
+                    .collect(),
                 None,
                 config.scanner.max_delete_batch,
             )?;
@@ -24138,22 +24147,24 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn observed_scan_entry(score: CandidacyScore) -> ScoredScanEntry {
+        let input = CandidateInput {
+            path: score.path.clone(),
+            size_bytes: score.size_bytes,
+            age: score.age,
+            classification: score.classification.clone(),
+            signals: Default::default(),
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+        let trace = build_scan_trace(&input, &score, 0, false, &[]);
+        ScoredScanEntry { score, trace }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn scan_report_ranks_only_scopes_clear_of_every_observed_veto() {
-        let observed = |score: CandidacyScore| {
-            let input = CandidateInput {
-                path: score.path.clone(),
-                size_bytes: score.size_bytes,
-                age: score.age,
-                classification: score.classification.clone(),
-                signals: Default::default(),
-                active_references: ActiveReferenceSummary::default(),
-                is_open: false,
-                excluded: false,
-            };
-            let trace = build_scan_trace(&input, &score, 0, false, &[]);
-            ScoredScanEntry { score, trace }
-        };
         let mut parent = cli_filesystem_candidate("/a", 1, 10, 900);
         parent.total_score = 1.0;
         let mut alias = cli_filesystem_candidate("/mirror", 1, 10, 900);
@@ -24166,7 +24177,7 @@ mod tests {
         let sibling = cli_filesystem_candidate("/a/clear", 1, 12, 80);
         let entries = vec![parent, alias, held, sibling]
             .into_iter()
-            .map(observed)
+            .map(observed_scan_entry)
             .collect::<Vec<_>>();
 
         for explain in [false, true] {
@@ -24195,6 +24206,46 @@ mod tests {
             } else {
                 assert!(rows.rejected.is_empty());
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_display_limit_keeps_lower_ranked_filesystems_in_the_plan() {
+        let config = Config::default();
+        let roots = [PathBuf::from("/healthy"), PathBuf::from("/full")];
+        let mut large = cli_filesystem_candidate("/healthy/large", 1, 1, 1000);
+        large.total_score = 1.0;
+        let small = cli_filesystem_candidate("/full/small", 2, 1, 150);
+        let scores = vec![large, small];
+        for top in [0, 1, 2] {
+            let entries = scores.iter().cloned().map(observed_scan_entry).collect();
+            let rows = scan_report_rows(entries, 0.5, top, false);
+            let displayed = rows.displayed_candidates(top);
+            assert_eq!(displayed.len(), top);
+            let displayed_bytes: u64 = displayed.iter().map(|entry| entry.score.size_bytes).sum();
+            assert_eq!(displayed_bytes, [0, 1000, 1150][top]);
+            let (chosen, plan) = plan_cli_cleanup_with(
+                &config,
+                &roots,
+                rows.candidates
+                    .into_iter()
+                    .map(|entry| entry.score)
+                    .collect(),
+                None,
+                1,
+                |path| {
+                    cli_filesystem_observation(
+                        path,
+                        &scores,
+                        &[("/healthy", 1, 800), ("/full", 2, 100)],
+                    )
+                },
+            )
+            .unwrap();
+            assert_eq!(chosen.len(), 1);
+            assert_eq!(chosen[0].path, Path::new("/full/small"));
+            assert_eq!(plan.summary.planned_bytes, 150);
         }
     }
 
