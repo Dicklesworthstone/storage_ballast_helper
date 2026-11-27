@@ -224,34 +224,46 @@ mod unix {
         }) && file.metadata().is_ok_and(|after| same_file(meta, &after))
     }
 
-    /// Explicit provision may shrink an old pool. A status orphan is only a
-    /// filename hint, so apply the same ownership checks as surplus release.
-    pub(in super::super) fn prune_surplus(
+    /// Open the directory that owns the held provision lock. A capacity probe
+    /// can outlive a mount or directory replacement on the same device.
+    pub(in super::super) fn locked_directory<'a>(
         manager: &BallastManager,
-        held_lock: &File,
-    ) -> io::Result<()> {
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&manager.ballast_dir)?;
-        let named_lock = open_regular(&directory, OsStr::new(".lock"))?;
-        if !same_file(&held_lock.metadata()?, &named_lock.metadata()?) {
+        held: &'a super::super::ProvisionLock,
+    ) -> io::Result<&'a File> {
+        let current = std::fs::symlink_metadata(&manager.ballast_dir)?;
+        let opened = held.directory.metadata()?;
+        let named_lock = open_regular(&held.directory, OsStr::new(".lock"))?;
+        if !current.is_dir()
+            || current.dev() != opened.dev()
+            || current.ino() != opened.ino()
+            || !same_file(&held.lock.metadata()?, &named_lock.metadata()?)
+        {
             return Err(invalid(
                 "ballast directory no longer owns the provision lock",
             ));
         }
+        Ok(&held.directory)
+    }
+
+    /// Explicit provision may shrink an old pool. A status orphan is only a
+    /// filename hint, so apply the same ownership checks as surplus release.
+    pub(in super::super) fn prune_surplus(
+        manager: &BallastManager,
+        held_lock: &super::super::ProvisionLock,
+    ) -> io::Result<()> {
+        let directory = locked_directory(manager, held_lock)?;
         for index in existing_indices(&manager.ballast_dir, &directory.metadata()?)? {
             if index as usize <= manager.config.file_count {
                 continue;
             }
             let name = ballast_file_name(index);
             let name = OsStr::new(&name);
-            let Ok(mut file) = open_regular(&directory, name) else {
+            let Ok(mut file) = open_regular(directory, name) else {
                 continue;
             };
             let meta = file.metadata()?;
             if verify_open_file(&mut file, &meta, index, meta.len()) {
-                remove_current(&directory, name, &meta, &|| true)?;
+                remove_current(directory, name, &meta, &|| true)?;
             }
         }
         Ok(())
@@ -984,7 +996,7 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub(super) use unix::{prune_surplus, release};
+pub(super) use unix::{locked_directory, prune_surplus, release};
 
 // Preserve the portable manager behavior on non-Unix targets. The no-allocation
 // and nonblocking-flock contract above is for the supported Unix daemon hosts.

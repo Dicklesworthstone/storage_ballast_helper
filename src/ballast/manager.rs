@@ -33,6 +33,13 @@ mod emergency;
 mod observation;
 mod repair;
 
+struct ProvisionLock {
+    #[cfg(unix)]
+    directory: File,
+    #[cfg(unix)]
+    lock: nix::fcntl::Flock<File>,
+}
+
 // ──────────────────── constants ────────────────────
 
 pub const HEADER_SIZE: usize = 4096;
@@ -784,19 +791,29 @@ impl BallastManager {
     // ──────────────────── locking ────────────────────
 
     #[cfg(unix)]
-    fn acquire_lock(&self, nonblocking: bool) -> Result<nix::fcntl::Flock<File>> {
+    fn acquire_lock(&self, nonblocking: bool) -> Result<ProvisionLock> {
+        use rustix::fs::{Mode, OFlags, openat};
         // Mutating paths own directory creation; opening a manager does not.
         fs::create_dir_all(&self.ballast_dir).map_err(|e| SbhError::io(&self.ballast_dir, e))?;
-        let lock_path = self.ballast_dir.join(".lock");
-        let file = OpenOptions::new()
+        let directory = OpenOptions::new()
             .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&lock_path)
-            .map_err(|e| SbhError::io(&lock_path, e))?;
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&self.ballast_dir)
+            .map_err(|e| SbhError::io(&self.ballast_dir, e))?;
+        let lock_path = self.ballast_dir.join(".lock");
+        let file = File::from(
+            openat(
+                &directory,
+                ".lock",
+                OFlags::RDWR
+                    | OFlags::CREATE
+                    | OFlags::NOFOLLOW
+                    | OFlags::NONBLOCK
+                    | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(|e| SbhError::io(&lock_path, e.into()))?,
+        );
         if !file
             .metadata()
             .map_err(|e| SbhError::io(&lock_path, e))?
@@ -815,14 +832,16 @@ impl BallastManager {
             nix::fcntl::FlockArg::LockExclusive
         };
         #[allow(deprecated)]
-        nix::fcntl::Flock::lock(file, operation).map_err(|(_file, e)| SbhError::Runtime {
-            details: format!("failed to lock ballast dir: {e}"),
-        })
+        let lock =
+            nix::fcntl::Flock::lock(file, operation).map_err(|(_file, e)| SbhError::Runtime {
+                details: format!("failed to lock ballast dir: {e}"),
+            })?;
+        Ok(ProvisionLock { directory, lock })
     }
 
     #[cfg(not(unix))]
-    fn acquire_lock(&self, _nonblocking: bool) -> Result<()> {
-        Ok(())
+    fn acquire_lock(&self, _nonblocking: bool) -> Result<ProvisionLock> {
+        Ok(ProvisionLock {})
     }
 
     // ──────────────────── provision ────────────────────
@@ -835,10 +854,7 @@ impl BallastManager {
         &mut self,
         free_pct_check: Option<&dyn Fn() -> f64>,
     ) -> Result<ProvisionReport> {
-        #[cfg(unix)]
         let lock = self.acquire_lock(false)?;
-        #[cfg(not(unix))]
-        self.acquire_lock(false)?;
         let mut report = ProvisionReport {
             files_created: 0,
             files_skipped: 0,
@@ -894,7 +910,7 @@ impl BallastManager {
                 }
             }
 
-            match self.create_ballast_file(index, None) {
+            match self.create_ballast_file(index, None, &lock) {
                 Ok(()) => {
                     report.files_created += 1;
                     let actual_size =
@@ -1047,10 +1063,7 @@ impl BallastManager {
         free_pct_check: Option<&dyn Fn() -> f64>,
         control: Option<ProvisionControl<'_>>,
     ) -> Result<ProvisionReport> {
-        #[cfg(unix)]
         let lock = self.acquire_lock(true)?;
-        #[cfg(not(unix))]
-        self.acquire_lock(true)?;
         if let Some(control) = control {
             control.check(&self.ballast_dir)?;
         }
@@ -1125,7 +1138,7 @@ impl BallastManager {
                 report.errors.push(error.to_string());
                 break;
             }
-            match self.create_ballast_file(index, control) {
+            match self.create_ballast_file(index, control, &lock) {
                 Ok(()) => {
                     report.files_created += 1;
                     let actual_size =
@@ -1171,7 +1184,12 @@ impl BallastManager {
         observation::verify(self, path, expected_index)
     }
 
-    fn create_ballast_file(&self, index: u32, control: Option<ProvisionControl<'_>>) -> Result<()> {
+    fn create_ballast_file(
+        &self,
+        index: u32,
+        control: Option<ProvisionControl<'_>>,
+        lock: &ProvisionLock,
+    ) -> Result<()> {
         let size = self.config.file_size_bytes;
         if size < HEADER_SIZE as u64 {
             return Err(SbhError::InvalidConfig {
@@ -1185,12 +1203,12 @@ impl BallastManager {
         if let Some(control) = control {
             control.check(&self.file_path(index))?;
         }
-        if repair::existing(self, index, control)? {
+        if repair::existing(self, index, control, lock)? {
             return Ok(());
         }
         // The absent check above is advisory: creation itself must be
         // exclusive, and only its owned inode may be removed on failure.
-        creation::create(self, index, control)
+        creation::create(self, index, control, lock)
     }
 
     #[cfg(test)]
@@ -1553,6 +1571,61 @@ mod tests {
             auto_provision: true,
             overrides: std::collections::BTreeMap::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pool_replacement_during_admission_cannot_redirect_creation_or_repair() {
+        for mode in 0..3 {
+            for existing in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let pool = tmp.path().join("pool");
+                let retired = tmp.path().join("retired");
+                let mut cfg = small_config();
+                cfg.file_count = 1;
+                let mut mgr = roomy(&pool, cfg);
+                let slot = pool.join(ballast_file_name(1));
+                let admission = || {
+                    if !retired.exists() {
+                        fs::rename(&pool, &retired).unwrap();
+                        fs::create_dir(&pool).unwrap();
+                        // Keep even the original lock inode at the configured
+                        // name: matching the lock alone cannot identify a pool.
+                        fs::rename(retired.join(".lock"), pool.join(".lock")).unwrap();
+                        if existing {
+                            fs::write(&slot, b"foreign contents").unwrap();
+                        }
+                    }
+                    90.0
+                };
+                let report = match mode {
+                    0 => mgr.provision(Some(&admission)),
+                    1 => mgr.replenish_one(Some(&admission)),
+                    _ => mgr.replenish_one_guarded(Some(&admission), &|| true),
+                }
+                .unwrap();
+                assert_eq!(report.files_created, 0, "{report:?}");
+                assert!(!report.errors.is_empty(), "{report:?}");
+                if existing {
+                    assert_eq!(fs::read(&slot).unwrap(), b"foreign contents");
+                } else {
+                    assert!(!slot.exists());
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_pool_cannot_create_a_lock_in_the_link_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("unmanaged");
+        let pool = tmp.path().join("pool");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &pool).unwrap();
+        let mut mgr = roomy(&pool, small_config());
+        assert!(mgr.provision(None).is_err());
+        assert!(fs::read_dir(target).unwrap().next().is_none());
     }
 
     /// Opening a pool is read-only: no directory is created and orphans are

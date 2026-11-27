@@ -18,14 +18,17 @@ pub(super) fn existing(
     manager: &BallastManager,
     index: u32,
     control: Option<ProvisionControl<'_>>,
+    lock: &super::ProvisionLock,
 ) -> Result<bool> {
     #[cfg(unix)]
     {
-        unix::repair_with_guarded(manager, index, control, unix::prepare_storage)
+        let pool = super::emergency::locked_directory(manager, lock)
+            .map_err(|error| SbhError::io(&manager.ballast_dir, error))?;
+        unix::repair_with_guarded(manager, index, control, pool, unix::prepare_storage)
     }
     #[cfg(not(unix))]
     {
-        let _ = control;
+        let _ = (control, lock);
         let path = manager.file_path(index);
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -40,9 +43,9 @@ pub(super) fn existing(
 #[cfg(unix)]
 mod unix {
     use super::{BallastManager, Result, SbhError};
-    use std::fs::{self, File, Metadata, OpenOptions};
+    use std::fs::{self, File, Metadata};
     use std::io::{self, Seek, SeekFrom, Write};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
     use rustix::fs::OFlags;
@@ -94,15 +97,20 @@ mod unix {
         index: u32,
         prepare: impl FnOnce(&BallastManager, &mut File, &Path, u64) -> Result<()>,
     ) -> Result<bool> {
-        repair_with_guarded(manager, index, None, |manager, file, path, size, _| {
-            prepare(manager, file, path, size)
-        })
+        repair_with_guarded(
+            manager,
+            index,
+            None,
+            &File::open(&manager.ballast_dir).unwrap(),
+            |manager, file, path, size, _| prepare(manager, file, path, size),
+        )
     }
 
     pub(super) fn repair_with_guarded(
         manager: &BallastManager,
         index: u32,
         control: Option<ProvisionControl<'_>>,
+        pool: &File,
         prepare: impl FnOnce(
             &BallastManager,
             &mut File,
@@ -120,11 +128,6 @@ mod unix {
         }
         let header = ballast_header_buffer(index, size)?;
         let io = |error| SbhError::io(&path, error);
-        let pool = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&manager.ballast_dir)
-            .map_err(|error| SbhError::io(&manager.ballast_dir, error))?;
         let pool_meta = pool.metadata().map_err(io)?;
         let before = match fs::symlink_metadata(&path) {
             Ok(meta) => meta,
@@ -142,7 +145,7 @@ mod unix {
         // would write through to an external file, unlike unlink (EBUSY).
         // openat2(RESOLVE_NO_XDEV), or where seccomp blocks it (#28) openat
         // plus a mount-ID check.
-        let fd = crate::scanner::quarantine::open_beneath(&pool, name.as_ref(), flags);
+        let fd = crate::scanner::quarantine::open_beneath(pool, name.as_ref(), flags);
         let mut file = File::from(fd.map_err(io)?);
         current(manager, &path, &pool_meta, &file, &before).map_err(io)?;
         let opened = file.metadata().map_err(io)?;
@@ -234,6 +237,7 @@ mod unix {
     mod tests {
         use super::*;
         use crate::core::config::BallastConfig;
+        use std::fs::OpenOptions;
         use std::io::Read;
         use std::os::unix::fs::symlink;
 
@@ -337,6 +341,7 @@ mod unix {
                     &manager,
                     1,
                     Some(control),
+                    &File::open(&manager.ballast_dir).unwrap(),
                     |manager, file, path, size, guard| {
                         prepare_storage(manager, file, path, size, guard)?;
                         allowed.set(false);

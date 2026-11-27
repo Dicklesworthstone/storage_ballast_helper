@@ -40,14 +40,24 @@ pub(super) fn create(
     manager: &BallastManager,
     index: u32,
     control: Option<ProvisionControl<'_>>,
+    lock: &super::ProvisionLock,
 ) -> Result<()> {
     #[cfg(unix)]
     {
-        unix::create_with_guarded(manager, index, control, unix::prepare_guarded)
+        let pool = super::emergency::locked_directory(manager, lock)
+            .map_err(|error| SbhError::io(&manager.ballast_dir, error))?;
+        unix::create_with_guarded(
+            manager,
+            index,
+            control,
+            pool.try_clone()
+                .map_err(|e| SbhError::io(&manager.ballast_dir, e))?,
+            unix::prepare_guarded,
+        )
     }
     #[cfg(not(unix))]
     {
-        let _ = (manager, index, control);
+        let _ = (manager, index, control, lock);
         Err(SbhError::UnsupportedPlatform {
             details:
                 "safe ballast creation requires Unix descriptor-relative filesystem operations"
@@ -59,9 +69,9 @@ pub(super) fn create(
 #[cfg(unix)]
 mod unix {
     use super::{BallastManager, Result, SbhError};
-    use std::fs::{self, File, Metadata, OpenOptions};
+    use std::fs::{self, File, Metadata};
     use std::io::{self, Seek, SeekFrom, Write};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
     use rustix::fs::{AtFlags, Mode, OFlags, openat, statat, unlinkat};
@@ -108,11 +118,7 @@ mod unix {
     }
 
     impl NewSlot {
-        fn open(manager: &BallastManager, index: u32) -> io::Result<Self> {
-            let pool = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&manager.ballast_dir)?;
+        fn open(manager: &BallastManager, index: u32, pool: File) -> io::Result<Self> {
             let name = ballast_file_name(index);
             // No prior existence check confers permission to truncate. Even a
             // dangling symlink or a file inserted after repair's absent result
@@ -196,15 +202,20 @@ mod unix {
         index: u32,
         prepare: impl FnOnce(&BallastManager, &mut File, &Path, u64) -> Result<Reserve>,
     ) -> Result<()> {
-        create_with_guarded(manager, index, None, |manager, file, path, size, _| {
-            prepare(manager, file, path, size)
-        })
+        create_with_guarded(
+            manager,
+            index,
+            None,
+            File::open(&manager.ballast_dir).unwrap(),
+            |manager, file, path, size, _| prepare(manager, file, path, size),
+        )
     }
 
     pub(super) fn create_with_guarded(
         manager: &BallastManager,
         index: u32,
         control: Option<ProvisionControl<'_>>,
+        pool: File,
         prepare: impl FnOnce(
             &BallastManager,
             &mut File,
@@ -225,7 +236,7 @@ mod unix {
         if let Some(control) = control {
             control.check(&path)?;
         }
-        let mut slot = NewSlot::open(manager, index).map_err(io)?;
+        let mut slot = NewSlot::open(manager, index, pool).map_err(io)?;
         let guard = control
             .map(|control| {
                 Ok::<_, SbhError>(AllocationGuard {
@@ -412,6 +423,7 @@ mod unix {
                     &manager,
                     1,
                     Some(control),
+                    File::open(&manager.ballast_dir).unwrap(),
                     |manager, file, path, size, guard| {
                         let reserve = prepare_guarded(manager, file, path, size, guard)?;
                         // The kernel call may return after a policy/recovery
@@ -426,7 +438,14 @@ mod unix {
                 ));
                 assert!(!manager.file_path(1).exists());
                 allowed.set(true);
-                create_with_guarded(&manager, 1, Some(control), prepare_guarded).unwrap();
+                create_with_guarded(
+                    &manager,
+                    1,
+                    Some(control),
+                    File::open(&manager.ballast_dir).unwrap(),
+                    prepare_guarded,
+                )
+                .unwrap();
                 assert!(manager.verify_single_file(&manager.file_path(1), 1).is_ok());
             }
         }
