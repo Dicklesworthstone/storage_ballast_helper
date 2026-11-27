@@ -118,6 +118,18 @@ impl InodeReclaimRequest {
         }
     }
 
+    /// Compare inode-pressure objectives without observing the mutable deletion
+    /// allowance. A prior empty pass cannot suppress a different mount, goal,
+    /// admitted root set, or policy merely because its scan paths match.
+    pub(super) fn same_scan_scope(&self, other: &Self) -> bool {
+        self.mount == other.mount
+            && self.device_id == other.device_id
+            && self.total == other.total
+            && self.target_available == other.target_available
+            && self.policy == other.policy
+            && self.roots == other.roots
+    }
+
     /// A queued pass cannot retain permission across an inode policy change.
     pub fn authorize_policy(&self, current: &InodePressureConfig) -> Result<(), SkipReason> {
         if !current.enabled || !current.is_valid() || *current != self.policy {
