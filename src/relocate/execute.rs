@@ -332,10 +332,23 @@ To keep a tree from ever being relocated, write `relocatable = false` into its \
     )
 }
 
-fn write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let mut file = fs::File::create(path)?;
+/// Keep the sidecar bytes available to rsync without creating or consuming
+/// any named entry in the ledger directory. The descriptor is held by the
+/// parent for the entire transfer, including remote transfers.
+fn stage_record(contents: &[u8]) -> io::Result<fs::File> {
+    use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
+
+    let mut file = fs::File::from(memfd_create(
+        "sbh-relocation-record",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )?);
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
     file.write_all(contents)?;
-    file.sync_all()
+    fcntl_add_seals(
+        &file,
+        SealFlags::GROW | SealFlags::SHRINK | SealFlags::WRITE | SealFlags::SEAL,
+    )?;
+    Ok(file)
 }
 
 fn holder(platform: &dyn Platform, path: &Path) -> Option<String> {
@@ -1151,14 +1164,18 @@ fn relocate_with_hooks(
     };
     // The record goes next to the copy, never inside it, so the copy stays
     // byte-identical to the source and a later verify stays clean.
-    let staging = config.state_dir.join(format!(".record-{stamp}.json"));
-    if let Err(error) = write_file(&staging, &record_json) {
-        return fail("record", error.to_string());
-    }
+    let staging = match stage_record(&record_json) {
+        Ok(file) => file,
+        Err(error) => return fail("record", error.to_string()),
+    };
     let mut upload = rsync_command(config, remote);
     upload
+        // Only this transfer dereferences a link: its single source is our
+        // own sealed memfd. Always send the small record, even when a retry
+        // has the same length and timestamp as an earlier upload.
+        .args(["--copy-links", "--ignore-times"])
         .arg("--")
-        .arg(&staging)
+        .arg(descriptor_path(&staging))
         .arg(local_destination.as_ref().map_or_else(
             || {
                 PathBuf::from(format!(
@@ -1170,7 +1187,7 @@ fn relocate_with_hooks(
             LocalDestination::record_path,
         ));
     let uploaded = run(upload, "record");
-    let _ = fs::remove_file(&staging);
+    drop(staging);
     if let Err((stage, error)) = uploaded {
         return fail(&stage, error);
     }
@@ -1924,6 +1941,52 @@ mod tests {
             state_dir: root.join("state"),
             roots: vec![root.join("scratch")],
             ..RelocationConfig::default()
+        }
+    }
+
+    #[test]
+    fn relocation_uploads_its_record_without_consuming_a_named_staging_file() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        for symlink in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let unit = marked_tree(tmp.path());
+            let config = local_config(tmp.path());
+            fs::create_dir_all(&config.state_dir).unwrap();
+            let legacy = config.state_dir.join(".record-S.json");
+            let sentinel = tmp.path().join("saved");
+            fs::write(&sentinel, b"previous work").unwrap();
+            if symlink {
+                std::os::unix::fs::symlink(&sentinel, &legacy).unwrap();
+            } else {
+                fs::write(&legacy, b"previous work").unwrap();
+            }
+
+            let outcome = relocate(
+                &config,
+                &crate::platform::pal::MockPlatform::default(),
+                &mut Ledger::default(),
+                &candidate_for(&unit),
+                "S",
+                1_000,
+            );
+            let Outcome::Relocated { destination, .. } = outcome else {
+                panic!("relocation failed: {outcome:?}");
+            };
+            let sidecar = PathBuf::from(format!(
+                "{}{RECORD_FILENAME}",
+                destination.trim_end_matches('/')
+            ));
+            assert!(fs::symlink_metadata(&sidecar).unwrap().is_file());
+            assert_eq!(
+                fs::read(sidecar).unwrap(),
+                fs::read(unit.join(RECORD_FILENAME)).unwrap()
+            );
+            assert_eq!(fs::read(&legacy).unwrap(), b"previous work");
+            assert_eq!(fs::symlink_metadata(&legacy).unwrap().is_symlink(), symlink);
+            assert_eq!(fs::read(sentinel).unwrap(), b"previous work");
         }
     }
 
