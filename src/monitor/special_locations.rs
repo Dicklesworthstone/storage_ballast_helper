@@ -300,8 +300,13 @@ impl SpecialLocationRates {
             rate_state.rate = if stats.available_bytes >= rate_state.sample.stats.available_bytes {
                 Some(0.0)
             } else {
-                (!estimate.fallback_active && estimate.bytes_per_second.is_finite())
-                    .then(|| estimate.bytes_per_second.max(0.0))
+                // Use the same elapsed-time projection as ordinary filesystem
+                // forecasts. A short allocation can move the immediate EWMA
+                // far above a mount's sustained net drain.
+                let rate = estimate
+                    .forecast_rate_bytes_per_second
+                    .unwrap_or(estimate.bytes_per_second);
+                (!estimate.fallback_active && rate.is_finite()).then(|| rate.max(0.0))
             };
             rate_state.sample = sample.clone();
         }
@@ -638,6 +643,36 @@ mod rate_tests {
                 SpecialAlert::None,
             );
         }
+    }
+
+    #[test]
+    fn warmed_special_mount_distinguishes_a_write_burst_from_a_sustained_drain() {
+        let start = Instant::now();
+        let mut rates = SpecialLocationRates::default();
+        let mut current = sample("/", "tmpfs-a", 12 * GIB, start);
+        let rule = HorizonRule::default();
+        let mut alert = SpecialAlert::None;
+        for seconds in (0..=960).step_by(5) {
+            current.collected_at = start + Duration::from_secs(seconds);
+            if seconds > 900 {
+                // A new 20 MB/s writer on a long-idle mount. Its first
+                // thirty seconds resemble a build burst. After a minute
+                // the estimator has three independent agreeing windows.
+                current.stats.available_bytes -= 100_000_000;
+                current.stats.free_bytes = current.stats.available_bytes;
+            }
+            let rate = observe(&mut rates, &current, current.collected_at, None).unwrap();
+            alert = rule.assess(&location(), &current.stats, rate, true).alert;
+            if seconds <= 930 {
+                assert_eq!(alert, SpecialAlert::None, "elapsed={seconds}s rate={rate}");
+            }
+        }
+        assert!(current.stats.free_pct() > RAM_BACKED_MIN_FREE_PCT);
+        assert_eq!(
+            alert,
+            SpecialAlert::Critical,
+            "the sustained writer must alert"
+        );
     }
 
     #[test]

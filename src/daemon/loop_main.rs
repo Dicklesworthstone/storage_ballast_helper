@@ -9559,8 +9559,12 @@ impl MonitoringDaemon {
             // Keep this mount's own reading for the per-mount controllers.
             self.mount_rates
                 .insert(mount_path.clone(), rate_estimate.bytes_per_second);
-            self.special_rates
-                .record_mount(&sample, rate_estimate.bytes_per_second);
+            self.special_rates.record_mount(
+                &sample,
+                rate_estimate
+                    .forecast_rate_bytes_per_second
+                    .unwrap_or(rate_estimate.bytes_per_second),
+            );
             // Native sample times, not cache-hit ticks, delimit the measured
             // peak-growth windows used for reserve sizing.
             if fresh {
