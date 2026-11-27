@@ -932,7 +932,8 @@ struct CheckArgs {
     /// free space will reach this floor.
     #[arg(long, value_name = "PERCENT", value_parser = parse_free_percentage)]
     target_free: Option<f64>,
-    /// Minimum required free space. Accepts bytes or K/M/G/T suffixes, e.g. 5G.
+    /// Minimum required free space. A positive request requires a writable
+    /// filesystem. Accepts bytes or K/M/G/T suffixes, e.g. 5G.
     /// Linux RAM-backed paths also require this much observed memory headroom.
     #[arg(long, value_name = "SIZE", value_parser = parse_byte_count)]
     need: Option<u64>,
@@ -16899,9 +16900,23 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
 
     // Check 1: absolute free space requirement.
     if let Some(need_bytes) = args.need
-        && capacity.available_bytes < need_bytes
+        && need_bytes > 0
+        && (capacity.is_readonly || capacity.available_bytes < need_bytes)
     {
+        let (reason, message) = if capacity.is_readonly {
+            (
+                "read_only_filesystem",
+                "requested write is on a read-only filesystem",
+            )
+        } else {
+            ("insufficient_disk_space", "insufficient disk space")
+        };
         match output_mode(cli) {
+            OutputMode::Human if capacity.is_readonly => println!(
+                "sbh: {} is read-only and cannot accept the requested {} write",
+                capacity.mount_point.display(),
+                format_bytes(need_bytes),
+            ),
             OutputMode::Human => {
                 println!(
                     "sbh: {} has {} free but {} required. Run: sbh emergency {}",
@@ -16914,8 +16929,10 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             OutputMode::Json => {
                 let payload = json!({
                     "command": "check",
-                "schema_version": 2,
+                    "schema_version": 2,
                     "status": "critical",
+                    "reason": reason,
+                    "is_readonly": capacity.is_readonly,
                     "path": check_path.to_string_lossy(),
                     "mount_point": capacity.mount_point.to_string_lossy(),
                     "free_bytes": capacity.available_bytes,
@@ -16937,7 +16954,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             }
         }
         // C-EXIT: a pressure condition is exit 1, distinct from an I/O failure.
-        return Err(CliError::User("insufficient disk space".to_string()));
+        return Err(CliError::User(message.to_string()));
     }
 
     // What the daemon could reclaim on this mount, when it is pressured and
@@ -16945,9 +16962,10 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
     // failure of its own once the plain threshold passes (Check 2.7).
     let observed_at = chrono::Utc::now();
     let daemon_state = read_live_daemon_state(&config.paths.state_file, observed_at, None);
-    let unprotected = daemon_state.as_ref().ok().and_then(|state| {
-        unprotected_pressure_at(state, &capacity.mount_point, observed_at)
-    });
+    let unprotected = daemon_state
+        .as_ref()
+        .ok()
+        .and_then(|state| unprotected_pressure_at(state, &capacity.mount_point, observed_at));
     let unprotected_json = unprotected.as_ref().map_or(Value::Null, |u| {
         json!({
             "reason": UNPROTECTED_PRESSURE,

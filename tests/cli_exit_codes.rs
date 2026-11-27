@@ -98,6 +98,48 @@ fn check_unmet_need_is_exit_one_with_the_report_on_stdout() {
     assert_eq!(payload["status"], "critical");
 }
 
+#[test]
+fn check_positive_need_requires_a_writable_target_mount() {
+    let dir = disk_tempdir();
+    let config = config_in(dir.path());
+    let readonly = dir.path().join("root");
+    let table = serde_json::json!({
+        "mounts": [
+            { "path": dir.path(), "total": 100_000, "free": 90_000 },
+            { "path": readonly, "total": 100_000, "free": 90_000, "readonly": true },
+        ],
+    });
+    let check = |path: &Path, need: &str| {
+        Command::new(common::sbh_bin_path())
+            .arg("--config")
+            .arg(&config)
+            .args([
+                "--json",
+                "check",
+                "--target-free",
+                "0",
+                "--allow-unprotected",
+                "--need",
+                need,
+            ])
+            .arg(path)
+            .env("SBH_TEST_MODE", "1")
+            .env("SBH_TEST_FS_STATS", table.to_string())
+            .output()
+            .expect("run writable-capacity preflight")
+    };
+    let output = check(&readonly, "1");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["reason"], "read_only_filesystem");
+    assert_eq!(payload["is_readonly"], true);
+    assert_eq!(payload["free_bytes"], 90_000);
+    assert_eq!(payload["need_bytes"], 1);
+    assert_eq!(payload["exit_code"], 1);
+    assert_eq!(check(dir.path(), "1").status.code(), Some(0));
+    assert_eq!(check(&readonly, "0").status.code(), Some(0));
+}
+
 /// Plenty of apparent tmpfs blocks must not hide insufficient host/process RAM.
 /// Only mount capacity is injected; the binary reads native memory evidence.
 #[cfg(target_os = "linux")]
