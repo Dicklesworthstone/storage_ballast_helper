@@ -36,9 +36,7 @@ use storage_ballast_helper::core::config::{
 use storage_ballast_helper::daemon::loop_main::{
     DaemonArgs as RuntimeDaemonArgs, MonitoringDaemon,
 };
-use storage_ballast_helper::daemon::mount_controller::{
-    MountStateRecord, ReclaimCapability, unprotected_pressure,
-};
+use storage_ballast_helper::daemon::mount_controller::{MountStateRecord, ReclaimCapability};
 use storage_ballast_helper::daemon::process_io_history::ProcessIoHistory;
 use storage_ballast_helper::daemon::self_monitor::{
     BallastPoolState, DAEMON_STATE_STALE_THRESHOLD_SECS, PressureObservationGap,
@@ -9554,7 +9552,8 @@ fn logging_placement_doctor_check(
             None,
         );
     }
-    let level = read_fresh_daemon_state(&config.paths.state_file)
+    let level = read_live_daemon_state(&config.paths.state_file, chrono::Utc::now(), None)
+        .ok()
         .and_then(|state| {
             let records: Vec<MountStateRecord> =
                 serde_json::from_value(state.get("mount_controllers").cloned()?).ok()?;
@@ -11544,26 +11543,45 @@ fn daemon_reserve_state_is_current(
         .is_some_and(|age| age < Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS))
 }
 
-/// Reserve observations require both a live writer and a fresh document. A
-/// recently copied old state file must not restore a previous daemon's reserve.
-fn read_live_reserve_state(
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum DaemonStateUnavailable {
+    #[error("daemon state missing or unreadable")]
+    Missing,
+    #[error("daemon state stale: {age_secs}s old")]
+    Stale { age_secs: u64 },
+    #[error("daemon stopped or no longer owns its lock")]
+    Stopped,
+    #[error("daemon publication is expired, invalid, or from a different run")]
+    InvalidPublication,
+}
+
+/// Read one publication and check the opened file's age, its embedded
+/// timestamp, shutdown marker, and the running daemon's identity.
+fn read_live_daemon_state(
     state_path: &Path,
     now: chrono::DateTime<chrono::Utc>,
     service_active: Option<bool>,
-) -> Option<Value> {
+) -> Result<Value, DaemonStateUnavailable> {
+    let file = std::fs::File::open(state_path).map_err(|_| DaemonStateUnavailable::Missing)?;
+    let modified = file
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .map_err(|_| DaemonStateUnavailable::Missing)?;
+    let age = SystemTime::from(now)
+        .duration_since(modified)
+        .map_err(|_| DaemonStateUnavailable::InvalidPublication)?;
+    if age >= Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS) {
+        return Err(DaemonStateUnavailable::Stale { age_secs: age.as_secs() });
+    }
+    let state: Value = serde_json::from_reader(io::BufReader::new(file))
+        .map_err(|_| DaemonStateUnavailable::InvalidPublication)?;
     let liveness = detect_daemon_liveness(state_path, service_active);
-    if !liveness.running {
-        return None;
+    if !liveness.running || state.get("stopped_at").is_some_and(|value| !value.is_null()) {
+        return Err(DaemonStateUnavailable::Stopped);
     }
-    let modified = std::fs::metadata(state_path).ok()?.modified().ok()?;
-    if SystemTime::from(now).duration_since(modified).ok()?
-        >= Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS)
-    {
-        return None;
-    }
-    let state = serde_json::from_str(&std::fs::read_to_string(state_path).ok()?).ok()?;
     daemon_reserve_state_is_current(&state, now, liveness.lock.as_ref().map(|lock| lock.pid))
         .then_some(state)
+        .ok_or(DaemonStateUnavailable::InvalidPublication)
 }
 
 fn reserve_discovery_pending(state: &Value) -> bool {
@@ -11875,7 +11893,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
     let observation_now = chrono::Utc::now();
     let live_reserve_state =
-        read_live_reserve_state(&config.paths.state_file, observation_now, service_active);
+        read_live_daemon_state(&config.paths.state_file, observation_now, service_active).ok();
     let reserve_status = live_reserve_state
         .as_ref()
         .and_then(|state| daemon_reserve_status(state, observation_now, None))
@@ -12114,7 +12132,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
 
             // Rate estimates from daemon state (v2 `rates`): fill rate,
             // acceleration, confidence and the red horizon per mount.
-            if let Some(state) = &daemon_state
+            if let Some(state) = &live_reserve_state
                 && let Some(rates) = state.get("rates").and_then(Value::as_object)
                 && !rates.is_empty()
             {
@@ -12473,7 +12491,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 "state_stale": liveness.state_stale,
                 // The daemon's per-mount forecast (state.json v2 `rates`)
                 // with the warming flag resolved against this config.
-                "rates": daemon_state
+                "rates": live_reserve_state
                     .as_ref()
                     .and_then(|state| state.get("rates"))
                     .and_then(Value::as_object)
@@ -16924,7 +16942,11 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
     // What the daemon could reclaim on this mount, when it is pressured and
     // the answer is nothing: reported with every outcome below, and a
     // failure of its own once the plain threshold passes (Check 2.7).
-    let unprotected = unprotected_pressure_at(&config.paths.state_file, &capacity.mount_point);
+    let observed_at = chrono::Utc::now();
+    let daemon_state = read_live_daemon_state(&config.paths.state_file, observed_at, None);
+    let unprotected = daemon_state.as_ref().ok().and_then(|state| {
+        unprotected_pressure_at(state, &capacity.mount_point, observed_at)
+    });
     let unprotected_json = unprotected.as_ref().map_or(Value::Null, |u| {
         json!({
             "reason": UNPROTECTED_PRESSURE,
@@ -17131,20 +17153,10 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         });
     }
 
-    // Check 2.5: warn if state.json is stale (daemon may not be running).
-    if let Ok(meta) = std::fs::metadata(&config.paths.state_file)
-        && let Ok(modified) = meta.modified()
+    if let Err(DaemonStateUnavailable::Stale { age_secs }) = &daemon_state
+        && output_mode(cli) == OutputMode::Human
     {
-        let age = SystemTime::now()
-            .duration_since(modified)
-            .unwrap_or_default();
-        let stale_threshold = std::time::Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS);
-        if age > stale_threshold && output_mode(cli) == OutputMode::Human {
-            eprintln!(
-                "sbh: warning: state.json is {:.0}s old (daemon may not be running)",
-                age.as_secs_f64(),
-            );
-        }
+        eprintln!("sbh: warning: state.json is {age_secs}s old (daemon may not be running)");
     }
 
     // Check 2.6 (#16): warn when a configured ballast reserve is not actually
@@ -17179,9 +17191,12 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
     if let Some(predict_minutes) = args.predict {
         let window_secs = predict_minutes as f64 * 60.0;
         let min_confidence = config.pressure.prediction.min_confidence;
-        let read = read_daemon_forecast(&config.paths.state_file, &capacity.mount_point);
-        match &read {
-            ForecastRead::Fresh(Some(forecast)) => {
+        let forecast = daemon_state.as_ref().map_err(ToString::to_string).and_then(|state| {
+            mount_forecast(state, &capacity.mount_point)
+                .ok_or_else(|| "daemon has no rate for this mount".to_string())
+        });
+        match forecast {
+            Ok(forecast) => {
                 forecast_json = forecast.to_json(min_confidence);
                 let seconds_left = forecast.acting_seconds_to_red().or_else(|| {
                     (forecast.projection_rate() > 0.0).then(|| {
@@ -17272,10 +17287,9 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                     ));
                 }
             }
-            other => {
-                // No usable forecast: say so instead of pretending. Not an
-                // error; `check` still answers from the live statistics.
-                let reason = other.unknown_reason().unwrap_or_default();
+            Err(reason) => {
+                // Live capacity still answers the check when a forecast is unavailable.
+                let reason = format!("unknown ({reason})");
                 forecast_json = Value::String(reason.clone());
                 if output_mode(cli) == OutputMode::Human {
                     eprintln!("sbh: warning: no forecast for --predict: {reason}");
@@ -17347,50 +17361,36 @@ struct UnprotectedMount {
     capability: String,
 }
 
-/// `state.json` parsed, but only while it is fresh: a stale file describes
-/// a daemon that is gone, and nothing in it should gate anything.
-fn read_fresh_daemon_state(state_path: &Path) -> Option<Value> {
-    let age_secs = std::fs::metadata(state_path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .map_or(u64::MAX, |age| age.as_secs());
-    if age_secs > DAEMON_STATE_STALE_THRESHOLD_SECS {
+/// A controller's planning counters can outlive a release or refill. Only
+/// current evidence of an exhausted sole reserve can block a build.
+fn unprotected_pressure_at(
+    state: &Value,
+    mount: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<UnprotectedMount> {
+    let wanted = mount.to_str()?;
+    let mut matches = state.get("mount_controllers")?.as_array()?.iter()
+        .filter(|record| record.get("mount").and_then(Value::as_str) == Some(wanted));
+    let controller = matches.next()?;
+    if matches.next().is_some() {
         return None;
     }
-    serde_json::from_str(&std::fs::read_to_string(state_path).ok()?).ok()
-}
-
-/// The daemon's per-mount control records from a fresh `state.json`.
-fn fresh_mount_records(state_path: &Path) -> Vec<MountStateRecord> {
-    read_fresh_daemon_state(state_path)
-        .and_then(|state| state.get("mount_controllers").cloned())
-        .and_then(|records| serde_json::from_value(records).ok())
-        .unwrap_or_default()
-}
-
-/// Whether the daemon reports `mount` as pressured (Orange or worse) with
-/// nothing to reclaim. A missing, stale or silent state file gates nothing.
-fn unprotected_pressure_at(state_path: &Path, mount: &Path) -> Option<UnprotectedMount> {
-    let wanted = mount.to_string_lossy();
-    fresh_mount_records(state_path)
-        .into_iter()
-        .find(|record| record.mount == wanted.as_ref())
-        .filter(|record| {
-            matches!(record.level.as_str(), "orange" | "red" | "critical")
-                && unprotected_pressure(record)
-        })
-        .map(|record| UnprotectedMount {
-            level: record.level,
-            capability: record.reclaim_capability.as_str().to_string(),
-        })
+    let record: MountStateRecord = serde_json::from_value(controller.clone()).ok()?;
+    if !matches!(record.level.as_str(), "orange" | "red" | "critical") {
+        return None;
+    }
+    let reserve = controller_reserve_view(controller, Some(state), now, None);
+    controller_observably_unprotected(&record, &reserve).then(|| UnprotectedMount {
+        level: record.level,
+        capability: record.reclaim_capability.as_str().to_string(),
+    })
 }
 
 /// `doctor --system`: evaluate pressured mounts using current per-pool
 /// observations, not the controller's cached actuator inventory.
 fn reclaim_capability_doctor_checks(config: &Config) -> Vec<DoctorCheck> {
     let now = chrono::Utc::now();
-    let Some(state) = read_live_reserve_state(&config.paths.state_file, now, None) else {
+    let Ok(state) = read_live_daemon_state(&config.paths.state_file, now, None) else {
         return vec![doctor_check(
             "reclaim.capability",
             "Reclaim capability under pressure",
@@ -17670,56 +17670,9 @@ impl MountForecast {
     }
 }
 
-/// What the CLI found when it looked for the daemon's forecast.
-#[derive(Debug, Clone, PartialEq)]
-enum ForecastRead {
-    /// No state file, or one that does not parse.
-    Missing,
-    /// A state file older than the staleness threshold: its numbers are
-    /// history, not a forecast.
-    Stale { age_secs: u64 },
-    /// Fresh state; `None` when the daemon has no rate entry for the mount.
-    Fresh(Option<MountForecast>),
-}
-
-impl ForecastRead {
-    /// Why there is no usable forecast, for reports.
-    fn unknown_reason(&self) -> Option<String> {
-        match self {
-            Self::Missing => Some("unknown (daemon state missing)".to_string()),
-            Self::Stale { age_secs } => Some(format!(
-                "unknown (daemon state stale: {age_secs}s old, threshold {DAEMON_STATE_STALE_THRESHOLD_SECS}s)"
-            )),
-            Self::Fresh(None) => Some("unknown (daemon has no rate for this mount)".to_string()),
-            Self::Fresh(Some(_)) => None,
-        }
-    }
-}
-
-/// Read the daemon's forecast for `mount_point` from `state.json` v2.
-fn read_daemon_forecast(state_path: &Path, mount_point: &Path) -> ForecastRead {
-    let Ok(content) = std::fs::read_to_string(state_path) else {
-        return ForecastRead::Missing;
-    };
-    let age_secs = std::fs::metadata(state_path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .map_or(u64::MAX, |age| age.as_secs());
-    if age_secs > DAEMON_STATE_STALE_THRESHOLD_SECS {
-        return ForecastRead::Stale { age_secs };
-    }
-    let Ok(state) = serde_json::from_str::<Value>(&content) else {
-        return ForecastRead::Missing;
-    };
-    let mount_key = mount_point.to_string_lossy();
-    ForecastRead::Fresh(
-        state
-            .get("rates")
-            .and_then(Value::as_object)
-            .and_then(|rates| rates.get(mount_key.as_ref()))
-            .and_then(MountForecast::from_rate),
-    )
+/// Read a mount's forecast from the same publication used by the reclaim gate.
+fn mount_forecast(state: &Value, mount: &Path) -> Option<MountForecast> {
+    MountForecast::from_rate(state.get("rates")?.get(mount.to_str()?)?)
 }
 
 /// One human status line for a mount's forecast.
@@ -24229,8 +24182,12 @@ mod tests {
             )
             .unwrap();
         };
-        // No state: nothing gates.
-        assert_eq!(unprotected_pressure_at(&state_path, Path::new("/")), None);
+        let check = |mount: &Path| {
+            let now = chrono::Utc::now();
+            let state = read_live_daemon_state(&state_path, now, None).ok()?;
+            unprotected_pressure_at(&state, mount, now)
+        };
+        assert_eq!(check(Path::new("/")), None);
 
         write(
             r#"[{"mount":"/","state":"observe_only","idle_reason":"no_root_path_on_device","surface":"none","level":"orange","urgency":0.9,"reclaim_capability":"none"},
@@ -24242,11 +24199,11 @@ mod tests {
             ("/", Some(("orange", "none"))),
             ("/data", None),
             ("/srv", None), // Yellow is not a check failure.
-            ("/pool", Some(("red", "ballast_only"))),
+            ("/pool", None), // no authoritative pool observation
             ("/nope", None),
         ];
         for (mount, want) in table {
-            let got = unprotected_pressure_at(&state_path, Path::new(mount));
+            let got = check(Path::new(mount));
             assert_eq!(
                 got,
                 want.map(|(level, capability)| UnprotectedMount {
@@ -24258,8 +24215,7 @@ mod tests {
         }
 
         // Doctor still diagnoses missing reclaim surfaces, including Yellow.
-        // Controller-only cached zero cannot establish an exhausted reserve;
-        // the check gate above retains its existing controller contract.
+        // Controller-only cached zero cannot establish an exhausted reserve.
         let mut config = Config::default();
         config.paths.state_file.clone_from(&state_path);
         let checks = reclaim_capability_doctor_checks(&config);
@@ -24305,7 +24261,7 @@ mod tests {
         let old = SystemTime::now()
             - std::time::Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS + 100);
         filetime::set_file_mtime(&state_path, filetime::FileTime::from_system_time(old)).unwrap();
-        assert_eq!(unprotected_pressure_at(&state_path, Path::new("/")), None);
+        assert_eq!(check(Path::new("/")), None);
         let stale = reclaim_capability_doctor_checks(&config);
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].status, "WARN");
@@ -24314,22 +24270,22 @@ mod tests {
     #[test]
     fn forecast_read_distinguishes_fresh_stale_and_missing_state() {
         let dir = tempfile::tempdir().unwrap();
-        let state_path = dir.path().join("state.json");
-        let mount = Path::new("/data");
+        let path = dir.path().join("state.json");
         assert_eq!(
-            read_daemon_forecast(&state_path, mount),
-            ForecastRead::Missing
+            read_live_daemon_state(&path, chrono::Utc::now(), None),
+            Err(DaemonStateUnavailable::Missing)
         );
-
-        std::fs::write(
-            &state_path,
-            r#"{"schema_version":2,"rates":{"/data":{"bytes_per_sec":2048.5,"accel":1.5,"confidence":0.8,"seconds_to_red":1200.0,"seconds_to_full":4000.0}}}"#,
-        )
-        .unwrap();
-        let fresh = read_daemon_forecast(&state_path, mount);
+        let now = chrono::Utc::now();
+        std::fs::write(&path, json!({
+            "schema_version": 2,
+            "last_updated": now.to_rfc3339(),
+            "rates": {"/data": {"bytes_per_sec": 2048.5, "accel": 1.5, "confidence": 0.8,
+                                "seconds_to_red": 1200.0, "seconds_to_full": 4000.0}}
+        }).to_string()).unwrap();
+        let fresh = read_live_daemon_state(&path, chrono::Utc::now(), None).unwrap();
         assert_eq!(
-            fresh,
-            ForecastRead::Fresh(Some(MountForecast {
+            mount_forecast(&fresh, Path::new("/data")),
+            Some(MountForecast {
                 bytes_per_sec: 2048.5,
                 forecast_rate_bytes_per_sec: None,
                 accel: 1.5,
@@ -24338,29 +24294,14 @@ mod tests {
                 seconds_to_full: Some(4000.0),
                 tte_lo: None,
                 forecast: None,
-            }))
+            })
         );
-        assert_eq!(fresh.unknown_reason(), None);
-        // A mount the daemon has no rate for is "fresh, nothing".
-        let none = read_daemon_forecast(&state_path, Path::new("/srv"));
-        assert_eq!(none, ForecastRead::Fresh(None));
-        assert!(none.unknown_reason().unwrap().contains("no rate"));
-
-        // Older than the staleness threshold: the numbers are history.
-        let old = SystemTime::now()
-            - std::time::Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS + 100);
-        filetime::set_file_mtime(&state_path, filetime::FileTime::from_system_time(old)).unwrap();
-        match read_daemon_forecast(&state_path, mount) {
-            ForecastRead::Stale { age_secs } => {
-                assert!(age_secs > DAEMON_STATE_STALE_THRESHOLD_SECS);
-            }
-            other => panic!("expected stale, got {other:?}"),
-        }
-        assert!(
-            ForecastRead::Stale { age_secs: 500 }
-                .unknown_reason()
-                .unwrap()
-                .contains("stale: 500s old")
+        assert_eq!(mount_forecast(&fresh, Path::new("/srv")), None);
+        let old = SystemTime::from(now) - Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS);
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(old)).unwrap();
+        assert_eq!(
+            read_live_daemon_state(&path, now, None),
+            Err(DaemonStateUnavailable::Stale { age_secs: DAEMON_STATE_STALE_THRESHOLD_SECS })
         );
     }
 
@@ -29200,13 +29141,16 @@ mod tests {
         let mut controller = reserve_controller_fixture("/data");
         controller["reclaim_capability"] = json!("ballast_only");
         controller["surface"] = json!("ballast_only");
-        controller["reserve_state"]["present_bytes"] = json!(0);
+        // The gate must follow the observed pool even if the cached planning
+        // counts claim the opposite, in either direction.
+        controller["level"] = json!("red");
         let record = serde_json::from_value::<MountStateRecord>(controller.clone()).unwrap();
         for (bytes, authoritative, unprotected, severity) in [
             (1000, true, false, "PASS"),
             (0, false, false, "WARN"),
             (0, true, true, "FAIL"),
         ] {
+            controller["reserve_state"]["present_bytes"] = json!(if bytes == 0 { 1000 } else { 0 });
             let state = json!({
                 "pid": 42,
                 "last_updated": now.to_rfc3339(),
@@ -29216,6 +29160,10 @@ mod tests {
             let view = controller_reserve_view(&controller, Some(&state), now, Some(42));
             assert_eq!(
                 controller_observably_unprotected(&record, &view),
+                unprotected
+            );
+            assert_eq!(
+                unprotected_pressure_at(&state, Path::new("/data"), now).is_some(),
                 unprotected
             );
             let checks = reclaim_capability_checks_at(&state, now, Some(42));
@@ -29237,7 +29185,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn live_reserve_reader_rejects_copied_old_stopped_and_restarted_documents() {
+    fn live_state_reader_rejects_copied_old_stopped_and_restarted_documents() {
         use storage_ballast_helper::daemon::self_monitor::DaemonLock;
 
         let directory = tempfile::tempdir().unwrap();
@@ -29261,7 +29209,7 @@ mod tests {
         };
         let lock = DaemonLock::acquire(&state_path).unwrap();
         write(&state, now);
-        assert!(read_live_reserve_state(&state_path, now, None).is_some());
+        assert!(read_live_daemon_state(&state_path, now, None).is_ok());
         for (field, value) in [
             ("last_updated", json!("2026-11-12T12:04:30Z")),
             ("stopped_at", json!("2026-11-12T12:05:50Z")),
@@ -29270,24 +29218,24 @@ mod tests {
             let mut invalid = state.clone();
             invalid[field] = value;
             write(&invalid, now);
-            assert!(read_live_reserve_state(&state_path, now, None).is_none());
+            assert!(read_live_daemon_state(&state_path, now, None).is_err());
         }
         for modified in [
             now - chrono::Duration::seconds(90),
             now + chrono::Duration::seconds(1),
         ] {
             write(&state, modified);
-            assert!(read_live_reserve_state(&state_path, now, None).is_none());
+            assert!(read_live_daemon_state(&state_path, now, None).is_err());
         }
         write(&state, now);
         drop(lock);
         assert!(
-            read_live_reserve_state(&state_path, now, None).is_none(),
+            read_live_daemon_state(&state_path, now, None).is_err(),
             "released daemon lock retained authority"
         );
         let _restarted = DaemonLock::acquire(&state_path).unwrap();
         write(&state, now);
-        assert!(read_live_reserve_state(&state_path, now, None).is_some());
+        assert!(read_live_daemon_state(&state_path, now, None).is_ok());
     }
 
     #[test]

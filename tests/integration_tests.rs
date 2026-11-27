@@ -209,8 +209,9 @@ fn check_predict_keeps_collapsed_bounds_conservative_without_claiming_zero_runwa
         let rates = serde_json::Map::from_iter([(mount_key.clone(), rate)]);
         fs::write(
             &config.paths.state_file,
-            serde_json::to_vec(&serde_json::json!({ "schema_version": 2, "rates": rates }))
-                .unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 2, "last_updated": chrono::Utc::now().to_rfc3339(), "rates": rates
+            })).unwrap(),
         )
         .unwrap();
 
@@ -261,6 +262,32 @@ fn check_predict_keeps_collapsed_bounds_conservative_without_claiming_zero_runwa
         } else {
             assert!(stdout.contains("predicted red in"), "{stdout}");
         }
+    }
+
+    // Atomic shutdown republishes the last forecast and controller levels.
+    // Copying an old publication also makes its filesystem mtime look new.
+    // Neither can gate a build that has ample live capacity.
+    for (updated, stopped) in [
+        (chrono::Utc::now(), Some(chrono::Utc::now())),
+        (chrono::Utc::now() - chrono::Duration::hours(1), None),
+    ] {
+        let publication = serde_json::json!({
+            "schema_version": 2,
+            "last_updated": updated.to_rfc3339(),
+            "stopped_at": stopped.map(|time| time.to_rfc3339()),
+            "mount_controllers": [{
+                "mount": mount_key, "state": "observe_only", "surface": "none",
+                "level": "critical", "urgency": 1.0, "reclaim_capability": "none"
+            }],
+            "rates": { (mount_key.clone()): {"bytes_per_sec": 1_000.0, "confidence": 1.0, "seconds_to_red": 1.0} }
+        });
+        fs::write(&config.paths.state_file, serde_json::to_vec(&publication).unwrap()).unwrap();
+        let output = run(true);
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(0), "{payload}");
+        assert_eq!(payload["status"], "ok", "{payload}");
+        assert!(payload["unprotected"].is_null(), "{payload}");
+        assert!(payload["forecast"].as_str().unwrap().contains("unknown"), "{payload}");
     }
 }
 
