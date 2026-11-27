@@ -49,7 +49,7 @@ use crate::daemon::control::{
     BallastAction as ControlBallastAction, ControlBackend, ControlCommand, ControlResponse,
     ControlServer, Peer, PolicyAction, persist_policy_mode,
 };
-use crate::daemon::coverage::{UNCOVERED_REFRESH_INTERVAL, uncovered_mount_levels};
+use crate::daemon::coverage::{UncoveredMountTracker, UncoveredObservation};
 use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD, PassCpuGuard, paced_pct};
 use crate::daemon::discovery::{DiscoverySnapshot, RetainedDiscovery};
 use crate::daemon::filesystem_reclaim::FilesystemReclaimScope;
@@ -4170,7 +4170,8 @@ pub struct MonitoringDaemon {
     /// (`coverage`), re-measured every `UNCOVERED_REFRESH_INTERVAL`. They
     /// feed only the ReclaimUnavailable alert, never policy.
     uncovered_levels: HashMap<PathBuf, PressureLevel>,
-    uncovered_checked_at: Option<Instant>,
+    uncovered_unknown: HashSet<PathBuf>,
+    uncovered_tracker: UncoveredMountTracker,
     /// Derived catalog roots per mount (W1 catalog roots), refreshed every
     /// `scanner.catalog_rescan_interval_secs`.
     catalog_root_cache: HashMap<PathBuf, (Instant, Vec<ExpandedCatalogRoot>)>,
@@ -6553,7 +6554,8 @@ impl MonitoringDaemon {
             reclaim_alerts: AlertThrottle::default(),
             last_reclaim_notify: HashMap::new(),
             uncovered_levels: HashMap::new(),
-            uncovered_checked_at: None,
+            uncovered_unknown: HashSet::new(),
+            uncovered_tracker: UncoveredMountTracker::default(),
             catalog_root_cache: HashMap::new(),
             catalog_observer: None,
             pending_state_write_diagnosis: None,
@@ -7380,6 +7382,10 @@ impl MonitoringDaemon {
                 .maybe_notify(&format!("pressure={disk_level:?} status=sleeping"));
 
             let wait = remaining.min(MEMORY_PRESSURE_WAKE_INTERVAL);
+            let wait = self
+                .uncovered_tracker
+                .next_poll_delay(now)
+                .map_or(wait, |poll| wait.min(poll));
             // A control-socket command ends the sleep so the next tick runs
             // it at once instead of after the remaining interval.
             let control_rx = self.control_rx.clone();
@@ -7409,6 +7415,9 @@ impl MonitoringDaemon {
                     // Retry completion without waiting for the next pressure
                     // tick or spawning another worker over the occupied slot.
                     self.poll_ballast_control();
+                    // Consume uncovered-volume probes before their evidence
+                    // expires, without running a faster pressure-control tick.
+                    self.poll_uncovered_during_sleep();
                     if self.behavior_state.has_pending_target() {
                         self.update_behavior_mode(
                             self.behavior_state.latest_memory_level(),
@@ -11040,45 +11049,55 @@ impl MonitoringDaemon {
         if !cfg!(target_os = "linux") {
             return;
         }
-        let first = self.uncovered_checked_at.is_none() && self.uncovered_levels.is_empty();
-        if self
-            .uncovered_checked_at
-            .is_some_and(|at| now.duration_since(at) < UNCOVERED_REFRESH_INTERVAL)
-        {
+        self.uncovered_tracker
+            .set_poll_interval(Self::filesystem_observation_max_age(&self.config) / 2);
+        if !self.uncovered_tracker.poll_due(now) {
             return;
         }
-        let Ok(mounts) = self.fs_collector.mount_points() else {
-            return;
-        };
+        let first = self.uncovered_levels.is_empty();
+        let mounts = self.fs_collector.mount_points().ok();
+        // Remember only currently requested observations. The historical
+        // monitor/controller maps retain removed roots and cannot prove that
+        // a volume is still covered after a configuration change.
         let monitored: HashSet<PathBuf> = self
-            .mount_controllers
-            .keys()
-            .chain(self.mount_monitors.keys())
-            .cloned()
+            .pressure_observation_recovery
+            .sources
+            .values()
+            .map(|source| source.mount.clone())
+            .chain(
+                self.mount_responses
+                    .iter()
+                    .map(|tick| tick.filesystem_response.causing_mount.clone()),
+            )
             .collect();
-        let unavailable = std::cell::Cell::new(false);
-        let levels = uncovered_mount_levels(
-            &mounts,
+        let collector = &self.fs_collector;
+        let Some(snapshot) = self.uncovered_tracker.poll(
+            mounts.as_deref(),
             &monitored,
-            |path| {
-                self.fs_collector.collect(path).map_or_else(
-                    |_| {
-                        unavailable.set(true);
-                        None
-                    },
-                    Some,
-                )
+            |owner| {
+                let sample = collector.collect_sample(&owner.path).ok()?;
+                Some(UncoveredObservation {
+                    owner: sample.mount_owner(),
+                    collected_at: sample.collected_at,
+                    stats: sample.stats,
+                })
             },
             &self.config.pressure,
-        );
-        // The first background pass only schedules probes. Do not postpone
-        // consuming them until the minute-long refresh interval: their
-        // pressure evidence may expire well before then. Healthy peers can
-        // still publish alerts while an unavailable volume keeps retrying.
-        if !self.fs_collector.is_background() || !unavailable.get() {
-            self.uncovered_checked_at = Some(now);
+            now,
+        ) else {
+            return;
+        };
+        for mount in snapshot.retired {
+            // Ownership changed or the filesystem is now covered. Its old
+            // acknowledgement must not silence a new device at this path.
+            self.last_reclaim_notify.remove(&mount);
+            self.notification_manager
+                .forget_pending("reclaim_unavailable", &mount.to_string_lossy());
+            self.reclaim_alerts
+                .should_emit(&mount, SpecialAlert::None, now, Duration::ZERO);
         }
-        self.uncovered_levels = levels;
+        self.uncovered_levels = snapshot.levels;
+        self.uncovered_unknown = snapshot.unknown;
         if first && !self.uncovered_levels.is_empty() {
             let mut listed: Vec<String> = self
                 .uncovered_levels
@@ -11095,9 +11114,51 @@ impl MonitoringDaemon {
         }
     }
 
+    /// Finish only the bounded observation round started by a pressure tick.
+    /// The existing sleep loop already wakes for memory/control events; this
+    /// path does not renew cleanup authority or run another pressure tick.
+    fn poll_uncovered_during_sleep(&mut self) {
+        let now = Instant::now();
+        if !self.uncovered_tracker.has_pending_round() || !self.uncovered_tracker.poll_due(now) {
+            return;
+        }
+        self.refresh_uncovered_levels(now);
+        let unprotected = self.uncovered_levels.clone();
+        let mounts: Vec<_> = unprotected.keys().cloned().collect();
+        self.last_reclaim_notify.retain(|mount, _| {
+            !unprotected.contains_key(mount)
+                || self.uncovered_unknown.contains(mount)
+                || unprotected
+                    .get(mount)
+                    .is_some_and(|level| *level != PressureLevel::Green)
+        });
+        self.emit_reclaim_unavailable_on_mounts(&unprotected, mounts, now);
+    }
+
     fn emit_reclaim_unavailable(
         &mut self,
         unprotected: &HashMap<PathBuf, PressureLevel>,
+        now: Instant,
+    ) {
+        let mounts = self
+            .mount_controllers
+            .keys()
+            .chain(self.uncovered_levels.keys())
+            .cloned()
+            .collect();
+        self.last_reclaim_notify.retain(|mount, _| {
+            self.uncovered_unknown.contains(mount)
+                || unprotected
+                    .get(mount)
+                    .is_some_and(|level| *level != PressureLevel::Green)
+        });
+        self.emit_reclaim_unavailable_on_mounts(unprotected, mounts, now);
+    }
+
+    fn emit_reclaim_unavailable_on_mounts(
+        &mut self,
+        unprotected: &HashMap<PathBuf, PressureLevel>,
+        mut mounts: Vec<PathBuf>,
         now: Instant,
     ) {
         use crate::daemon::notifications::NotificationDispatchOutcome;
@@ -11108,20 +11169,14 @@ impl MonitoringDaemon {
                 .alert_interval_minutes
                 .saturating_mul(60),
         );
-        let mut mounts: Vec<PathBuf> = self
-            .mount_controllers
-            .keys()
-            .chain(self.uncovered_levels.keys())
-            .cloned()
-            .collect();
         mounts.sort();
         mounts.dedup();
-        self.last_reclaim_notify.retain(|mount, _| {
-            unprotected
-                .get(mount)
-                .is_some_and(|level| *level != PressureLevel::Green)
-        });
         for mount in mounts {
+            if self.uncovered_unknown.contains(&mount) {
+                // Missing capacity/topology evidence neither confirms recovery
+                // nor justifies repeating a retained pressure notification.
+                continue;
+            }
             let level = unprotected
                 .get(&mount)
                 .copied()
@@ -12870,7 +12925,7 @@ impl MonitoringDaemon {
                     self.invalidate_logging_ram_observations();
                     self.invalidate_catalog_observations(&new_config);
                     self.flush_pending_state_write_failure();
-                    self.uncovered_checked_at = None;
+                    self.uncovered_tracker.invalidate();
                     self.ballast_replenisher.cancel();
                     self.ballast_releaser.cancel();
                     self.cancel_ballast_control("configuration changed during the command");
@@ -22195,26 +22250,28 @@ mod tests {
         daemon.platform = Arc::new(platform);
         // No scanner root covers this volume. Its alert must remain separate
         // from pressure policy, and must arrive before the next minute tick.
+        daemon.config.pressure.poll_interval_ms = 100;
+        daemon.config.telemetry.fs_cache_ttl_ms = 100;
         daemon.fs_collector = FsStatsCollector::new_background(
             Arc::clone(&daemon.platform),
             Duration::from_millis(100),
-            Duration::from_secs(2),
+            MonitoringDaemon::filesystem_observation_max_age(&daemon.config),
         );
         let now = Instant::now();
         daemon.refresh_uncovered_levels(now);
-        assert!(daemon.uncovered_checked_at.is_none());
-        let deadline = now + Duration::from_secs(2);
-        while daemon.uncovered_levels.get(&uncovered) != Some(&PressureLevel::Critical)
-            || daemon.uncovered_checked_at.is_none()
-        {
-            daemon.refresh_uncovered_levels(Instant::now());
-            assert!(
-                Instant::now() < deadline,
-                "pending observations were deferred for a minute"
-            );
-            thread::yield_now();
-        }
-        assert!(daemon.uncovered_checked_at.is_some());
+        assert!(daemon.uncovered_tracker.has_pending_round());
+        let (_memory_tx, memory_rx) = bounded(1);
+        daemon.sleep_with_memory_pressure_events(
+            &memory_rx,
+            PressureLevel::Green,
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            daemon.uncovered_levels.get(&uncovered),
+            Some(&PressureLevel::Critical),
+            "sleep wakeups must consume pending observations before the next pressure tick"
+        );
+        assert!(!daemon.uncovered_tracker.has_pending_round());
         assert!(!daemon.mount_controllers.contains_key(&uncovered));
     }
 
@@ -32261,6 +32318,102 @@ mod tests {
                 .count(),
             1,
             "recovery is logged once: {logs:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncovered_missing_samples_retain_the_incident_without_false_recovery_or_reminders() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let notifications = fixture
+            .directory
+            .path()
+            .join("uncovered-notifications.jsonl");
+        let daemon = &mut fixture.daemon;
+        let mount = PathBuf::from("/uncovered");
+        daemon.notification_manager = NotificationManager::from_config(&NotificationConfig {
+            channels: vec!["file".into()],
+            min_notify_interval_secs: 0,
+            urgent_notify_interval_secs: 0,
+            file: FileConfig {
+                path: notifications.clone(),
+            },
+            ..NotificationConfig::default()
+        });
+        daemon
+            .uncovered_levels
+            .insert(mount.clone(), PressureLevel::Critical);
+        let mut unprotected = daemon.uncovered_levels.clone();
+        let now = Instant::now();
+        daemon.emit_reclaim_unavailable(&unprotected, now);
+        let accepted = daemon.last_reclaim_notify[&mount];
+
+        daemon.uncovered_unknown.insert(mount.clone());
+        daemon.emit_reclaim_unavailable(&HashMap::new(), now + Duration::from_secs(1));
+        assert_eq!(daemon.last_reclaim_notify[&mount], accepted);
+        daemon.uncovered_unknown.clear();
+        daemon.emit_reclaim_unavailable(&unprotected, now + Duration::from_secs(2));
+        assert_eq!(daemon.last_reclaim_notify[&mount], accepted);
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        assert_eq!(
+            std::fs::read_to_string(&notifications)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "a transient observation gap must not restart an accepted incident"
+        );
+
+        let reminder = now
+            + Duration::from_mins(daemon.config.special_locations.alert_interval_minutes)
+            + Duration::from_secs(3);
+        daemon.uncovered_unknown.insert(mount.clone());
+        daemon.emit_reclaim_unavailable_on_mounts(&unprotected, vec![mount.clone()], reminder);
+        assert_eq!(daemon.last_reclaim_notify[&mount], accepted);
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        assert_eq!(
+            std::fs::read_to_string(&notifications)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "sleep polling cannot report an unknown retained level as fresh pressure"
+        );
+        daemon.uncovered_unknown.clear();
+        for seconds in [1, 2] {
+            daemon.emit_reclaim_unavailable_on_mounts(
+                &unprotected,
+                vec![mount.clone()],
+                reminder + Duration::from_secs(seconds),
+            );
+        }
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        assert_eq!(
+            std::fs::read_to_string(&notifications)
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+
+        unprotected.insert(mount.clone(), PressureLevel::Green);
+        daemon.uncovered_levels = unprotected.clone();
+        daemon.emit_reclaim_unavailable(&unprotected, reminder + Duration::from_secs(3));
+        assert!(!daemon.last_reclaim_notify.contains_key(&mount));
+        fixture.flush_logger();
+        let logs =
+            std::fs::read_to_string(fixture.directory.path().join("activity.jsonl")).unwrap();
+        assert_eq!(
+            logs.lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter(|event| event["details"].as_str().is_some_and(|message| {
+                    message.contains("cleared, or sbh gained a reclaim surface")
+                }))
+                .count(),
+            1,
+            "only a verified healthy observation can emit recovery"
         );
     }
 
