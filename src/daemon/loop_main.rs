@@ -8425,6 +8425,7 @@ impl MonitoringDaemon {
                         shutdown_result = Err(self.rss_hard_limit_error(self_monitor_tick));
                         break;
                     }
+                    self.report_pressure_outage_alerts();
                     self.sleep_with_memory_pressure_events(
                         &memory_pressure_rx,
                         self.last_pressure_level,
@@ -8490,7 +8491,7 @@ impl MonitoringDaemon {
             self.emit_policy_transitions();
 
             // 6. Check special locations independently.
-            self.check_special_locations(&scan_tx, &scan_rx);
+            self.check_special_locations(Some((&scan_tx, &scan_rx)));
 
             // 7. Detect swap-thrash conditions and alert with cooldown.
             self.check_swap_thrash();
@@ -9803,8 +9804,12 @@ impl MonitoringDaemon {
             }));
         }
         observations.extend(self.swap_pressure_observation.clone());
+        self.report_pressure_observations(&observations, now);
+    }
+
+    fn report_pressure_observations(&mut self, observations: &[PressureObservation], now: Instant) {
         self.pressure_notifications.observe(
-            &observations,
+            observations,
             now,
             |event| self.logger_handle.send(event),
             |event| self.notification_manager.notify_with_outcome(event),
@@ -12470,15 +12475,44 @@ impl MonitoringDaemon {
         }
     }
 
+    /// Ordinary disk observations are unavailable and their permissions were
+    /// withdrawn. Independent special mounts and host memory can still supply
+    /// current evidence for alerts. Neither path may dispatch cleanup here.
+    fn report_pressure_outage_alerts(&mut self) {
+        self.check_special_locations(None);
+        if let Ok(memory) = self.platform.memory_info() {
+            let now = Instant::now();
+            if cfg!(target_os = "linux")
+                && let Some(swap) = PressureObservation::swap(
+                    &memory,
+                    self.config.pressure.free_pct_thresholds(),
+                    now,
+                )
+            {
+                self.report_pressure_observations(std::slice::from_ref(&swap), now);
+            }
+            self.report_swap_thrash(&memory, now);
+        }
+    }
+
     fn check_swap_thrash(&mut self) {
+        if let Ok(memory) = self.platform.memory_info() {
+            self.report_swap_thrash(&memory, Instant::now());
+        }
+    }
+
+    fn report_swap_thrash(&mut self, memory: &MemoryInfo, now: Instant) {
         use crate::daemon::notifications::NotificationDispatchOutcome;
 
-        let Ok(memory) = self.platform.memory_info() else {
+        // A partial native read neither starts an episode nor proves that
+        // an outstanding alert recovered.
+        if memory.total_bytes == 0
+            || memory.available_bytes > memory.total_bytes
+            || memory.swap_free_bytes > memory.swap_total_bytes
+        {
             return;
-        };
-
-        let now = Instant::now();
-        let thrash_risk = is_swap_thrash_risk(&memory);
+        }
+        let thrash_risk = is_swap_thrash_risk(memory);
         if !thrash_risk {
             self.swap_thrash_active = false;
             self.last_swap_thrash_notification = None;
@@ -12534,8 +12568,7 @@ impl MonitoringDaemon {
     #[allow(clippy::too_many_lines)]
     fn check_special_locations(
         &mut self,
-        scan_tx: &Sender<ScanRequest>,
-        scan_rx: &Receiver<ScanRequest>,
+        scan_queue: Option<(&Sender<ScanRequest>, &Receiver<ScanRequest>)>,
     ) {
         use crate::daemon::notifications::NotificationDispatchOutcome;
 
@@ -12659,6 +12692,9 @@ impl MonitoringDaemon {
                 self.last_special_notify
                     .insert(location.path.clone(), (notified, now));
 
+                let Some((scan_tx, scan_rx)) = scan_queue else {
+                    continue;
+                };
                 // Reclaim only on the special location's own filesystem.
                 // A full /dev/shm supplies no authority to delete disk-backed
                 // artifacts, even when both have configured scan roots.
@@ -22093,7 +22129,7 @@ mod tests {
             thread::yield_now();
         }
         let (scan_tx, scan_rx) = bounded(4);
-        daemon.check_special_locations(&scan_tx, &scan_rx);
+        daemon.check_special_locations(Some((&scan_tx, &scan_rx)));
         let request = scan_rx
             .try_recv()
             .expect("critical special location must dispatch known scope");
@@ -32544,7 +32580,7 @@ mod tests {
             daemon.special_rates.record_mount(&sample, rate);
             for _ in 0..2 {
                 let observed_at = Instant::now();
-                daemon.check_special_locations(&scan_tx, &scan_rx);
+                daemon.check_special_locations(Some((&scan_tx, &scan_rx)));
                 let (notified, last_seen) = daemon.last_special_notify[&special];
                 assert_eq!(notified, expected_level, "rate={rate} enabled={enabled}");
                 assert!(
@@ -32573,7 +32609,7 @@ mod tests {
         // A brief recovery retains the accepted high-water mark. Only a
         // whole clear interval ends the episode and permits a fresh alert.
         set_free(daemon, 50 << 30);
-        daemon.check_special_locations(&scan_tx, &scan_rx);
+        daemon.check_special_locations(Some((&scan_tx, &scan_rx)));
         assert_eq!(
             daemon.last_special_notify[&special].0,
             PressureLevel::Orange
@@ -32588,11 +32624,11 @@ mod tests {
         daemon.last_special_notify.get_mut(&special).unwrap().1 = Instant::now()
             .checked_sub(alert_interval)
             .expect("special-location fixture needs one prior alert interval");
-        daemon.check_special_locations(&scan_tx, &scan_rx);
+        daemon.check_special_locations(Some((&scan_tx, &scan_rx)));
         assert!(!daemon.last_special_notify.contains_key(&special));
         set_free(daemon, 10 << 30);
-        daemon.check_special_locations(&scan_tx, &scan_rx);
-        daemon.check_special_locations(&scan_tx, &scan_rx);
+        daemon.check_special_locations(Some((&scan_tx, &scan_rx)));
+        daemon.check_special_locations(Some((&scan_tx, &scan_rx)));
         assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
         let delivered: Vec<Value> = std::fs::read_to_string(&notifications)
             .unwrap()
@@ -32614,6 +32650,98 @@ mod tests {
         assert!(
             scan_rx.is_empty(),
             "notification retries admit no scan roots"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_disk_ticks_report_independent_tmpfs_and_swap_without_reclaim() {
+        use crate::daemon::notifications::{FileConfig, NotificationConfig};
+        use crate::platform::pal::{FsStats, MountPoint, PlatformPaths};
+
+        let mut fixture = RegretDaemonFixture::new();
+        let special = fixture.directory.path().join("special-only");
+        let notifications = fixture.directory.path().join("outage-alerts.jsonl");
+        std::fs::create_dir(&special).unwrap();
+        let daemon = &mut fixture.daemon;
+        let watch = MountPoint {
+            path: special.clone(),
+            device: "special-tmpfs".into(),
+            fs_type: "tmpfs".into(),
+            is_ram_backed: true,
+        };
+        let stats = FsStats {
+            fs_type: "tmpfs".into(),
+            ..disk_pressure_sample(&special.to_string_lossy(), 16 << 30, 1 << 30)
+        };
+        daemon.platform = Arc::new(MockPlatform::new(
+            vec![watch],
+            HashMap::from([(special.clone(), stats)]),
+            MemoryInfo {
+                total_bytes: 64 << 30,
+                available_bytes: 2 << 30,
+                swap_total_bytes: 8 << 30,
+                swap_free_bytes: 0,
+            },
+            PlatformPaths::default(),
+        ));
+        daemon.fs_collector = FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::ZERO);
+        daemon.special_locations = SpecialLocationRegistry::new(vec![SpecialLocation {
+            path: special.clone(),
+            kind: SpecialKind::DevShm,
+            buffer_pct: 20,
+            scan_interval: Duration::ZERO,
+            priority: 255,
+        }]);
+        let mut notify_config = NotificationConfig {
+            enabled: false,
+            channels: vec!["file".into()],
+            min_notify_interval_secs: 0,
+            urgent_notify_interval_secs: 0,
+            file: FileConfig {
+                path: notifications.clone(),
+            },
+            ..NotificationConfig::default()
+        };
+        daemon.notification_manager = NotificationManager::from_config(&notify_config);
+        for enabled in [false, true, true] {
+            notify_config.enabled = enabled;
+            daemon.notification_manager.update_config(&notify_config);
+            assert!(
+                daemon.check_pressure().is_err(),
+                "no regular filesystem is observable"
+            );
+            daemon.report_pressure_outage_alerts();
+            assert!(daemon.worst_filesystem_response().is_none());
+            assert!(daemon.mount_responses.is_empty());
+            assert!(daemon.swap_pressure_observation.is_none());
+        }
+        assert!(daemon.notification_manager.drain(Duration::from_secs(2)));
+        let events: Vec<Value> = std::fs::read_to_string(notifications)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(events[0]["type"], "pressure_changed");
+        assert_eq!(events[0]["mount"], special.to_string_lossy().as_ref());
+        assert_eq!(events[0]["to"], "Red");
+        assert_eq!(events[1]["type"], "swap_pressure_changed");
+        assert_eq!(events[1]["swap_free_bytes"], 0);
+        assert_eq!(events[2]["code"], "SBH-2010");
+
+        daemon.report_swap_thrash(
+            &MemoryInfo {
+                total_bytes: 0,
+                available_bytes: 0,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            },
+            Instant::now(),
+        );
+        assert!(
+            daemon.swap_thrash_active,
+            "missing RAM evidence cannot prove recovery"
         );
     }
 
@@ -32737,7 +32865,7 @@ mod tests {
         let sample = daemon.fs_collector.collect_sample(&tmp).unwrap();
         daemon.special_rates.record_mount(&sample, 100_000_000.0);
         let (scan_tx, scan_rx) = crossbeam_channel::bounded(4);
-        daemon.check_special_locations(&scan_tx, &scan_rx);
+        daemon.check_special_locations(Some((&scan_tx, &scan_rx)));
 
         assert_eq!(
             available(&daemon),
@@ -32841,7 +32969,7 @@ mod tests {
         daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
         assert!(daemon.mount_responses.is_empty());
         assert!(scan_rx.is_empty());
-        daemon.check_special_locations(&scan_tx, &scan_rx);
+        daemon.check_special_locations(Some((&scan_tx, &scan_rx)));
         let request = scan_rx
             .try_recv()
             .expect("the first local sample uses the current mount prior");
@@ -32860,7 +32988,7 @@ mod tests {
         assert!(daemon.check_pressure().is_err());
         daemon.fs_collector = FsStatsCollector::new(Arc::clone(&daemon.platform), Duration::ZERO);
         daemon.special_rates.forget(&special);
-        daemon.check_special_locations(&scan_tx, &scan_rx);
+        daemon.check_special_locations(Some((&scan_tx, &scan_rx)));
         assert!(
             scan_rx.is_empty(),
             "the historical mount_rates value is not renewed evidence"
@@ -32928,7 +33056,7 @@ mod tests {
         let (scan_tx, scan_rx) = crossbeam_channel::bounded(8);
         for step in 0..=4 {
             observe(daemon, 12 - step, "special-device-a");
-            daemon.check_special_locations(&scan_tx, &scan_rx);
+            daemon.check_special_locations(Some((&scan_tx, &scan_rx)));
             if step < daemon.config.telemetry.ewma_min_samples {
                 assert!(
                     !daemon.last_special_notify.contains_key(&special),
@@ -32956,13 +33084,13 @@ mod tests {
         // live, so either subsequent false alert would restore this entry.
         daemon.last_special_notify.remove(&special);
         observe(daemon, 10, "special-device-a");
-        daemon.check_special_locations(&scan_tx, &scan_rx);
+        daemon.check_special_locations(Some((&scan_tx, &scan_rx)));
         assert!(
             !daemon.last_special_notify.contains_key(&special),
             "recovery must clear the positive trailing rate"
         );
         observe(daemon, 4, "special-device-b");
-        daemon.check_special_locations(&scan_tx, &scan_rx);
+        daemon.check_special_locations(Some((&scan_tx, &scan_rx)));
         assert!(
             !daemon.last_special_notify.contains_key(&special),
             "a replacement device starts without the old drain rate"
