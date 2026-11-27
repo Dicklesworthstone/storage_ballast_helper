@@ -98,10 +98,16 @@ fn has_path_aliases<'a>(candidates: impl IntoIterator<Item = &'a CandidacyScore>
     false
 }
 
-pub(super) fn rejected_observations<'a>(
+/// Return one rejection flag per observation, in input order. Resolve hard
+/// vetoes across paths and identity aliases before ranking or discarding rows.
+#[must_use]
+pub fn rejected_observations<'a>(
     candidates: impl IntoIterator<Item = &'a CandidacyScore, IntoIter: Clone>,
 ) -> Vec<bool> {
     let candidates = candidates.into_iter();
+    if !candidates.clone().any(hard_veto) {
+        return vec![false; candidates.count()];
+    }
     // Most walks observe each physical entry at one path. Do not materialize
     // every path prefix and graph edge just because one candidate is protected.
     // Keep/invalid-score observations still participate in alias detection.

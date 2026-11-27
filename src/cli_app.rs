@@ -80,7 +80,7 @@ use storage_ballast_helper::scanner::patterns::{
     ArtifactCategory, ArtifactPatternRegistry, OpaqueTreeDisposition,
 };
 use storage_ballast_helper::scanner::planner::{
-    BatchPlan, PlanObjective, PlanRequest, admit_candidates, plan_batch,
+    BatchPlan, PlanObjective, PlanRequest, admit_candidates, plan_batch, rejected_observations,
 };
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
 use storage_ballast_helper::scanner::quarantine::{
@@ -14215,6 +14215,63 @@ fn is_report_only_scan_entry(entry: &ScoredScanEntry) -> bool {
         .is_some_and(|reason| reason.contains("cleanup rule is report-only"))
 }
 
+struct ScanReportRows {
+    candidates: Vec<ScoredScanEntry>,
+    report_only: Vec<ScoredScanEntry>,
+    rejected: Vec<ScoredScanEntry>,
+}
+
+fn scan_report_rows(
+    entries: Vec<ScoredScanEntry>,
+    min_score: f64,
+    top: usize,
+    explain: bool,
+) -> ScanReportRows {
+    // Even an unrankable observation can link an alias to a protected subtree.
+    // Resolve the complete snapshot before applying either display limit.
+    let vetoes = rejected_observations(entries.iter().map(|entry| &entry.score));
+    let mut rows = ScanReportRows {
+        candidates: Vec::new(),
+        report_only: Vec::new(),
+        rejected: Vec::new(),
+    };
+    for (mut entry, vetoed) in entries.into_iter().zip(vetoes) {
+        if vetoed {
+            if is_report_only_scan_entry(&entry) {
+                rows.report_only.push(entry);
+            } else if explain {
+                let reason = entry.score.veto_reason.get_or_insert_with(|| {
+                    if entry.score.decision.category_suspended {
+                        "cleanup is suspended for this category".into()
+                    } else if entry.score.vetoed {
+                        "hard veto from scoring".into()
+                    } else {
+                        "cleanup scope overlaps a vetoed or suspended observation, directly or through an identity alias".into()
+                    }
+                });
+                entry.trace.veto_reason = Some(reason.to_string());
+                entry.trace.final_action = "Keep".to_string();
+                rows.rejected.push(entry);
+            }
+        } else if entry.score.total_score >= min_score {
+            rows.candidates.push(entry);
+        }
+    }
+    rows.candidates.sort_by(|a, b| {
+        b.score
+            .total_score
+            .partial_cmp(&a.score.total_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rows.report_only
+        .sort_by_key(|entry| std::cmp::Reverse(entry.score.size_bytes));
+    rows.rejected.sort_by(|a, b| a.score.path.cmp(&b.score.path));
+    rows.candidates.truncate(top);
+    rows.report_only.truncate(top);
+    rows.rejected.truncate(top);
+    rows
+}
+
 fn scan_entry_json(entry: &ScoredScanEntry, explain: bool) -> Value {
     let candidate = &entry.score;
     let mut item = json!({
@@ -14521,8 +14578,8 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
             };
 
             let cheap_score = engine.score_candidate(&candidate, 0.0);
-            let should_collect_active_references =
-                args.explain && (!cheap_score.vetoed && cheap_score.total_score >= args.min_score);
+            // A low-scoring child can still veto a higher-scoring parent or alias.
+            let should_collect_active_references = args.explain && !cheap_score.vetoed;
             let active_reference_checked = if should_collect_active_references {
                 candidate.is_open = open_status_for_candidate(
                     &mut open_paths,
@@ -14566,41 +14623,11 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
         })
         .collect::<Vec<_>>();
 
-    let mut candidates = scored_entries
-        .iter()
-        .filter(|entry| !entry.score.vetoed && entry.score.total_score >= args.min_score)
-        .collect::<Vec<_>>();
-    candidates.sort_by(|a, b| {
-        b.score
-            .total_score
-            .partial_cmp(&a.score.total_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    if candidates.len() > args.top {
-        candidates.truncate(args.top);
-    }
-
-    let mut report_only = scored_entries
-        .iter()
-        .filter(|entry| is_report_only_scan_entry(entry))
-        .collect::<Vec<_>>();
-    report_only.sort_by_key(|entry| std::cmp::Reverse(entry.score.size_bytes));
-    if report_only.len() > args.top {
-        report_only.truncate(args.top);
-    }
-
-    let mut rejected = if args.explain {
-        scored_entries
-            .iter()
-            .filter(|entry| entry.score.vetoed && !is_report_only_scan_entry(entry))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    rejected.sort_by(|a, b| a.score.path.cmp(&b.score.path));
-    if rejected.len() > args.top {
-        rejected.truncate(args.top);
-    }
+    let ScanReportRows {
+        candidates,
+        report_only,
+        rejected,
+    } = scan_report_rows(scored_entries, args.min_score, args.top, args.explain);
 
     let elapsed = start.elapsed();
     let process_cpu_micros = cpu_start_micros
@@ -24108,6 +24135,67 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_report_ranks_only_scopes_clear_of_every_observed_veto() {
+        let observed = |score: CandidacyScore| {
+            let input = CandidateInput {
+                path: score.path.clone(),
+                size_bytes: score.size_bytes,
+                age: score.age,
+                classification: score.classification.clone(),
+                signals: Default::default(),
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            };
+            let trace = build_scan_trace(&input, &score, 0, false, &[]);
+            ScoredScanEntry { score, trace }
+        };
+        let mut parent = cli_filesystem_candidate("/a", 1, 10, 900);
+        parent.total_score = 1.0;
+        let mut alias = cli_filesystem_candidate("/mirror", 1, 10, 900);
+        alias.total_score = 0.01;
+        let mut held = cli_filesystem_candidate("/mirror/held", 1, 11, 200);
+        held.total_score = 0.0;
+        held.vetoed = true;
+        held.decision.action = storage_ballast_helper::scanner::scoring::DecisionAction::Keep;
+        held.veto_reason = Some("cleanup rule is report-only: inspect manually".into());
+        let sibling = cli_filesystem_candidate("/a/clear", 1, 12, 80);
+        let entries = vec![parent, alias, held, sibling]
+            .into_iter()
+            .map(observed)
+            .collect::<Vec<_>>();
+
+        for explain in [false, true] {
+            let rows = scan_report_rows(entries.clone(), 0.5, 1, explain);
+            assert_eq!(rows.candidates.len(), 1);
+            assert_eq!(rows.candidates[0].score.path, Path::new("/a/clear"));
+            assert_eq!(rows.candidates[0].score.size_bytes, 80);
+            assert_eq!(rows.report_only.len(), 1);
+            let reported = scan_entry_json(&rows.report_only[0], explain);
+            assert_eq!(reported["path"], "/mirror/held");
+            assert_eq!(
+                reported["veto_reason"],
+                "cleanup rule is report-only: inspect manually"
+            );
+            if explain {
+                assert_eq!(rows.rejected.len(), 1);
+                assert_eq!(rows.rejected[0].score.path, Path::new("/a"));
+                let trace = scan_trace_json(&rows.rejected[0].trace);
+                assert_eq!(trace["final_action"], "Keep");
+                assert!(
+                    trace["veto_reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("identity alias")
+                );
+            } else {
+                assert!(rows.rejected.is_empty());
+            }
+        }
     }
 
     #[test]
