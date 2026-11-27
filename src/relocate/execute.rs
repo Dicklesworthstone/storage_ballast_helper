@@ -1585,6 +1585,41 @@ fn restore_parent_current(parent: &fs::File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// A local backup may live on a mount point or behind a stable alias. Read
+/// through the opened root for both rsync passes; the recorded pathname is
+/// only used to confirm it still names that root.
+struct LocalRestoreBackup<'a> {
+    path: &'a Path,
+    directory: fs::File,
+}
+
+impl<'a> LocalRestoreBackup<'a> {
+    fn open(path: &'a Path, stub: &Path) -> io::Result<Self> {
+        let canonical = fs::canonicalize(path)?;
+        let stub = fs::canonicalize(stub)?;
+        if canonical.starts_with(&stub) || stub.starts_with(&canonical) {
+            return Err(restore_invalid("local restore backup overlaps the stub"));
+        }
+        let backup = Self {
+            path,
+            directory: survey::open_directory(&canonical)?,
+        };
+        backup.check_location()?;
+        Ok(backup)
+    }
+
+    fn check_location(&self) -> io::Result<()> {
+        let current = rustix::fs::statat(rustix::fs::CWD, self.path, AtFlags::empty())?;
+        if same_restore_identity(&current, &rustix::fs::fstat(&self.directory)?) {
+            Ok(())
+        } else {
+            Err(restore_invalid(
+                "local restore backup path was replaced or moved",
+            ))
+        }
+    }
+}
+
 struct RestoreWorkspace {
     directory: fs::File,
     name: String,
@@ -1703,6 +1738,11 @@ fn restore_with_hooks(stub: &Path, hooks: &RestoreHooks<'_>) -> Result<Restored,
     config
         .validate()
         .map_err(|error| format!("bad relocation settings: {error}"))?;
+    let remote = is_remote(&record.destination);
+    let backup = (!remote)
+        .then(|| LocalRestoreBackup::open(Path::new(&record.destination), stub))
+        .transpose()
+        .map_err(|error| format!("opening local restore backup: {error}"))?;
     restore_parent_current(&parent, parent_path).map_err(|error| error.to_string())?;
     let workspace = RestoreWorkspace::create(&parent, parent_path)
         .map_err(|error| format!("creating private restore staging: {error}"))?;
@@ -1729,8 +1769,21 @@ fn restore_with_hooks(stub: &Path, hooks: &RestoreHooks<'_>) -> Result<Restored,
     // Pin the payload itself, not just its parent: replacing the payload
     // entry with a symlink must never redirect even the initial rsync writes.
     let destination = format!("{}/", descriptor_path(&payload).display());
-    let remote = is_remote(&record.destination);
-    copy_tree(&config, remote, &record.destination, &destination)
+    let source = backup.as_ref().map_or_else(
+        || record.destination.clone(),
+        |local| format!("{}/", descriptor_path(&local.directory).display()),
+    );
+    // A bind alias can hide the staging subtree from canonical path checks.
+    // Refuse overlap (and nested mounts) before rsync can copy its own output.
+    let backup_evidence = backup
+        .as_ref()
+        .map(|local| {
+            let workspace_id = rustix::fs::fstat(&workspace.directory)?;
+            SourceEvidence::capture_avoiding(&local.directory, u64::MAX, Some(&workspace_id))
+        })
+        .transpose()
+        .map_err(|error| retained(format!("checking local restore backup: {error}")))?;
+    copy_tree(&config, remote, &source, &destination)
         .map_err(|(stage, error)| retained(format!("{stage}: {error}")))?;
     // Pin the staged contents *before* checksums: an edit to an entry that
     // rsync already checked must not become the baseline for publication.
@@ -1738,7 +1791,7 @@ fn restore_with_hooks(stub: &Path, hooks: &RestoreHooks<'_>) -> Result<Restored,
     // entire tree, with the fingerprint's depth and working-memory limits.
     let capture_payload = || SourceEvidence::capture(&payload, u64::MAX);
     let evidence = capture_payload().map_err(|error| retained(error.to_string()))?;
-    verify_copy(&config, remote, &record.destination, &destination)
+    verify_copy(&config, remote, &source, &destination)
         .map_err(|(stage, error)| retained(format!("{stage}: {error}")))?;
     let check_payload = || -> io::Result<()> {
         if evidence.matches(&capture_payload()?, false) {
@@ -1751,6 +1804,18 @@ fn restore_with_hooks(stub: &Path, hooks: &RestoreHooks<'_>) -> Result<Restored,
     };
     if let Some(hook) = hooks.before_swap {
         hook(stub, &workspace.location());
+    }
+    if let Some((local, initial)) = backup.as_ref().zip(backup_evidence.as_ref()) {
+        local
+            .check_location()
+            .map_err(|error| retained(error.to_string()))?;
+        let current = SourceEvidence::capture(&local.directory, u64::MAX)
+            .map_err(|error| retained(error.to_string()))?;
+        if !initial.matches(&current, false) {
+            return Err(retained(
+                "local restore backup changed during transfer".into(),
+            ));
+        }
     }
     check_payload().map_err(|error| retained(error.to_string()))?;
     let current = restore_snapshot(&locked).map_err(|error| retained(error.to_string()))?;
@@ -1824,6 +1889,11 @@ fn restore_with_hooks(stub: &Path, hooks: &RestoreHooks<'_>) -> Result<Restored,
             .map_err(|error| undo(error.to_string()))?;
     if !same_restore_identity(&payload_identity, &current_payload) {
         return Err(undo("copied tree was replaced during swap".into()));
+    }
+    if let Some(local) = &backup {
+        local
+            .check_location()
+            .map_err(|error| undo(error.to_string()))?;
     }
     rustix::fs::renameat_with(
         &workspace.directory,
@@ -3357,6 +3427,64 @@ mod tests {
             );
             assert!(error.contains(&workspace.borrow().display().to_string()));
         }
+    }
+
+    #[test]
+    fn restore_reads_the_opened_backup_and_refuses_a_rotated_source() {
+        if !rsync_available() {
+            eprintln!("skipped: rsync not installed");
+            return;
+        }
+        for after_move in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (stub, backup) = restore_fixture(tmp.path());
+            let retained = tmp.path().join("retained-backup");
+            let staging = std::cell::RefCell::new(PathBuf::new());
+            let rotate = |_: &Path, workspace: &Path| {
+                *staging.borrow_mut() = workspace.to_path_buf();
+                fs::rename(&backup, &retained).unwrap();
+                fs::create_dir(&backup).unwrap();
+                fs::write(backup.join("data"), b"unrelated backup").unwrap();
+            };
+            let hooks = if after_move {
+                RestoreHooks {
+                    after_stub_move: Some(&rotate),
+                    ..RestoreHooks::default()
+                }
+            } else {
+                RestoreHooks {
+                    before_copy: Some(&rotate),
+                    ..RestoreHooks::default()
+                }
+            };
+            let error = restore_with_hooks(&stub, &hooks).unwrap_err();
+            assert!(error.contains("backup path was replaced"), "{error}");
+            assert!(stub.join(RECORD_FILENAME).is_file());
+            assert!(!stub.join("data").exists());
+            assert_eq!(
+                fs::read(staging.borrow().join("payload/data")).unwrap(),
+                b"verified backup payload"
+            );
+            assert_eq!(fs::read(backup.join("data")).unwrap(), b"unrelated backup");
+        }
+    }
+
+    #[test]
+    fn restore_refuses_an_ancestor_backup_before_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (stub, _) = restore_fixture(tmp.path());
+        let record_path = stub.join(RECORD_FILENAME);
+        let mut record: RelocationRecord =
+            serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        let parent = stub.parent().unwrap();
+        let alias = tmp.path().join("backup-alias");
+        std::os::unix::fs::symlink(parent, &alias).unwrap();
+        record.destination = format!("{}/", alias.display());
+        fs::write(record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        let error = restore(&stub).unwrap_err();
+        assert!(error.contains("overlaps the stub"), "{error}");
+        assert_eq!(fs::read_dir(parent).unwrap().count(), 1);
     }
 
     #[test]
