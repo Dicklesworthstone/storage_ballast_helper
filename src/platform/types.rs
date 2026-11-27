@@ -134,6 +134,19 @@ pub struct Capacity {
     pub estimated_reclaimable_by_snapshot_thinning: Option<SnapshotThinningEstimate>,
 }
 
+impl Capacity {
+    /// Limit actionable headroom to what a caller can allocate on this volume.
+    /// APFS container geometry describes shared capacity, while native statfs
+    /// can report a lower per-volume limit or more recent free-space reading.
+    #[must_use]
+    pub fn with_volume_available_limit(mut self) -> Self {
+        if let Some(native) = self.volume_available_bytes {
+            self.available_bytes = self.available_bytes.min(native);
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotThinningEstimate {
     pub bytes: u64,
@@ -662,9 +675,37 @@ pub enum ServiceKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        FullDiskAccessState, FullDiskAccessStatus, PalError, SacredPath, SacredPathKind,
+        Capacity, FullDiskAccessState, FullDiskAccessStatus, PalError, SacredPath, SacredPathKind,
         SacredPathSource,
     };
+
+    #[test]
+    fn write_headroom_obeys_both_native_volume_and_shared_container_limits() {
+        let published = Capacity::from(crate::platform::pal::FsStats {
+            mount_point: "/System/Volumes/Data".into(),
+            fs_type: "apfs".into(),
+            total_bytes: 1000,
+            free_bytes: 250,
+            available_bytes: 250,
+            is_readonly: false,
+        });
+        for (volume_available, expected) in [
+            (Some(100), 100),
+            (Some(0), 0),
+            (Some(300), 250),
+            (None, 250),
+        ] {
+            let mut capacity = published.clone();
+            capacity.container_available_bytes = Some(250);
+            capacity.volume_available_bytes = volume_available;
+            capacity.purgeable_bytes = Some(500);
+            let bounded = capacity.with_volume_available_limit();
+            assert_eq!(bounded.available_bytes, expected);
+            assert_eq!(bounded.container_available_bytes, Some(250));
+            assert_eq!(bounded.volume_available_bytes, volume_available);
+            assert_eq!(bounded.total_bytes, 1000);
+        }
+    }
 
     #[test]
     fn sacred_path_exact_match_example_round_trips() {

@@ -16877,6 +16877,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
 
     let capacity = platform
         .capacity(&check_path)
+        .map(Capacity::with_volume_available_limit)
         .map_err(|e| CliError::Runtime(e.to_string()))?;
 
     let free_pct = capacity_free_pct(&capacity);

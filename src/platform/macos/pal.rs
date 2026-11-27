@@ -920,10 +920,8 @@ fn statfs_to_observed_fs_stats(
     inventory: Option<&ApfsInventory>,
 ) -> FsStats {
     let native_free_bytes = stats.free_bytes();
-    let native_available_bytes = stats.available_bytes();
-    let mut capacity = statfs_to_capacity(stats, inventory);
+    let mut capacity = statfs_to_capacity(stats, inventory).with_volume_available_limit();
     capacity.free_bytes = capacity.free_bytes.min(native_free_bytes);
-    capacity.available_bytes = capacity.available_bytes.min(native_available_bytes);
     capacity_to_fs_stats(capacity)
 }
 
