@@ -19,6 +19,7 @@ use crate::core::config::{ScannerConfig, ScoringConfig};
 use crate::daemon::filesystem_reclaim::FilesystemReclaimScope;
 use crate::daemon::inode_reclaim::InodeReclaimRequest;
 use crate::daemon::predictive_reclaim::PredictiveScanAdmission;
+use crate::daemon::ram_reclaim::RamReclaimRequest;
 use crate::monitor::pid::PressureLevel;
 use crate::platform::cleanup_catalog::ExpandedCatalogRoot;
 
@@ -83,7 +84,7 @@ struct ScanScope {
     paths: Vec<PathBuf>,
     catalog_roots: Vec<ExpandedCatalogRoot>,
     filesystem: Option<Arc<FilesystemReclaimScope>>,
-    ram: bool,
+    ram: Option<RamReclaimRequest>,
     inodes: Option<InodeReclaimRequest>,
     predictive_floor: Option<u64>,
 }
@@ -101,7 +102,7 @@ impl ScanScope {
             paths,
             catalog_roots,
             filesystem: request.filesystem_reclaim.clone(),
-            ram: request.ram_reclaim.is_some(),
+            ram: request.ram_reclaim.clone(),
             inodes: request.inode_reclaim.clone(),
             predictive_floor: request
                 .predictive_reclaim
@@ -113,7 +114,11 @@ impl ScanScope {
     fn matches(&self, other: &Self) -> bool {
         self.paths == other.paths
             && self.catalog_roots == other.catalog_roots
-            && self.ram == other.ram
+            && match (&self.ram, &other.ram) {
+                (Some(left), Some(right)) => left.same_scan_scope(right),
+                (None, None) => true,
+                _ => false,
+            }
             && match (&self.inodes, &other.inodes) {
                 (Some(left), Some(right)) => left.same_scan_scope(right),
                 (None, None) => true,
@@ -441,6 +446,44 @@ mod tests {
             !backoffs
                 .for_request(&catalog, now)
                 .cooldown_active(&catalog, false, 90, now)
+        );
+    }
+
+    #[test]
+    fn changed_ram_recovery_target_does_not_inherit_empty_backoff() {
+        let now = Instant::now();
+        let mut backoffs = ScanBackoffs::default();
+        let mut first = request("/tmpfs", PressureLevel::Red);
+        first.ram_reclaim = Some(RamReclaimRequest::from_observed_roots(
+            PathBuf::from("/tmpfs"),
+            42,
+            4096,
+            &[],
+        ));
+        exhaust(&mut backoffs, &first, now);
+        assert!(
+            backoffs
+                .for_request(&first, now)
+                .cooldown_active(&first, false, 90, now)
+        );
+
+        let mut next = first.clone();
+        next.ram_reclaim = Some(RamReclaimRequest::from_observed_roots(
+            PathBuf::from("/tmpfs"),
+            42,
+            8192,
+            &[],
+        ));
+        assert!(
+            !backoffs
+                .for_request(&next, now)
+                .cooldown_active(&next, false, 90, now),
+            "a greater swap shortfall must not inherit another pass's cooldown"
+        );
+        assert!(
+            backoffs
+                .for_request(&first, now)
+                .cooldown_active(&first, false, 90, now)
         );
     }
 
