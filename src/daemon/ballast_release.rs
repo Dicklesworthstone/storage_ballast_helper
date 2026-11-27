@@ -27,12 +27,22 @@ const WORKER_LIMIT: usize = 2;
 const FIRST_CHANCE: Duration = Duration::from_secs(2);
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Reserve authority supplied by this mount's admitted exhaustion forecast.
+/// Keep it separate from physical pressure: a small volume can fill in seconds
+/// while its percentage-based PID still has zero urgency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ForecastRelease {
+    Imminent,
+    Critical,
+}
+
 /// A physical pool's intent from this tick's original native observation.
 #[derive(Clone)]
 pub(super) struct ReleaseRequest {
     pub pool: PathBuf,
     pub response: PressureResponse,
     pub recovery: bool,
+    pub forecast: Option<ForecastRelease>,
     pub observed_at: Instant,
     pub max_age: Duration,
     pub policy_transitions: u64,
@@ -42,6 +52,7 @@ pub(super) struct ReleaseRequest {
 impl ReleaseRequest {
     fn strength(&self) -> usize {
         if self.recovery
+            || self.forecast == Some(ForecastRelease::Critical)
             || self.response.level == PressureLevel::Critical
             || self.response.urgency >= 0.9
         {
@@ -57,7 +68,11 @@ impl ReleaseRequest {
             PressureLevel::Orange => 1,
             _ => 0,
         };
-        self.response.release_ballast_files.max(urgency).max(floor)
+        self.response
+            .release_ballast_files
+            .max(urgency)
+            .max(floor)
+            .max(usize::from(self.forecast.is_some()))
     }
 
     fn fresh(&self, now: Instant) -> bool {
@@ -71,6 +86,7 @@ impl ReleaseRequest {
             && self.device_id == old.device_id
             && self.policy_transitions == old.policy_transitions
             && self.recovery == old.recovery
+            && self.forecast >= old.forecast
             && self.strength() >= old.strength()
             && self.fresh(now)
     }
@@ -101,6 +117,7 @@ struct Permission {
     cancelled: AtomicBool,
     evidence: Mutex<(Instant, Duration)>,
     policy_transitions: u64,
+    requires_forecast_policy: bool,
     context: ReleaseContext,
 }
 
@@ -110,6 +127,7 @@ impl Permission {
             cancelled: AtomicBool::new(false),
             evidence: Mutex::new((request.observed_at, request.max_age)),
             policy_transitions: request.policy_transitions,
+            requires_forecast_policy: request.forecast.is_some(),
             context,
         }
     }
@@ -134,9 +152,11 @@ impl Permission {
         let policy_allows = self.context.policy.try_lock().is_some_and(|policy| {
             !policy.config().kill_switch
                 && policy.transitions_total() == self.policy_transitions
+                && (!self.requires_forecast_policy || policy.mode().allows_deletion())
         });
-        // Observe mode may release sacrificial reserve, as on the synchronous
-        // path. A mode transition still revokes this captured authorization.
+        // Physical pressure may release sacrificial reserve in Observe mode.
+        // A forecast cannot add adaptive authority in Observe/FallbackSafe,
+        // and every mode transition revokes the captured authorization.
         let allowed = fresh
             && scanner_allows
             && policy_allows
@@ -190,8 +210,7 @@ impl BallastReleaser {
             request.device_id != old.device_id
                 || request.policy_transitions != old.policy_transitions
                 || request.strength() > old.strength()
-                || (request.strength() == old.strength()
-                    && request.observed_at > old.observed_at)
+                || (request.strength() == old.strength() && request.observed_at > old.observed_at)
         });
         if replace {
             self.requests.insert(request.pool.clone(), request);
@@ -253,9 +272,17 @@ impl BallastReleaser {
             let Some(mut task) = coordinator.prepare_release(&pool) else {
                 continue;
             };
+            let mut response = request.response.clone();
+            // The native controller must receive the same minimum request as
+            // admission. Raising strength alone would still produce a no-op
+            // when physical Green pressure recommends zero files.
+            if request.forecast.is_some() {
+                response.release_ballast_files = response.release_ballast_files.max(1);
+            }
             let plan = BallastReleasePlan {
-                response: request.response.clone(),
-                release_all: request.recovery,
+                response,
+                release_all: request.recovery
+                    || request.forecast == Some(ForecastRelease::Critical),
                 history: controller.cached_pool_history(&pool),
                 unbound_history: controller.cached_unbound_pool_history(&pool),
                 efficiency: controller.release_efficiency(&pool),
@@ -272,9 +299,10 @@ impl BallastReleaser {
                     // Unknown free space is not a zero baseline. A stalled
                     // native pre-sample retains this slot and no monitor lock.
                     let free_before = if worker_permission.allowed() {
-                        platform.fs_stats(task.mount()).ok().and_then(|stats| {
-                            (!stats.is_readonly).then_some(stats.available_bytes)
-                        })
+                        platform
+                            .fs_stats(task.mount())
+                            .ok()
+                            .and_then(|stats| (!stats.is_readonly).then_some(stats.available_bytes))
                     } else {
                         None
                     };
@@ -558,6 +586,7 @@ mod tests {
                 device_id: fs::metadata(&pool).unwrap().dev(),
                 pool,
                 recovery: false,
+                forecast: None,
                 observed_at: Instant::now(),
                 max_age: Duration::from_secs(60),
                 policy_transitions: self.context.policy.lock().transitions_total(),
@@ -576,7 +605,10 @@ mod tests {
         }
 
         fn block(&self, index: usize) {
-            self.platform.blocked.lock().insert(self.mounts[index].clone());
+            self.platform
+                .blocked
+                .lock()
+                .insert(self.mounts[index].clone());
         }
 
         fn wait_for_probe(&self, index: usize) {
@@ -607,6 +639,205 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "release worker did not finish");
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Exercise the real estimator and policy with a small mostly-empty
+    /// volume. A live writer is imminent while negative PID error still wins
+    /// over feedforward, so percentage pressure supplies no release request.
+    fn green_imminent_response(
+        mount: &Path,
+        critical: bool,
+    ) -> (PressureResponse, ForecastRelease) {
+        use crate::monitor::ewma::DiskRateEstimator;
+        use crate::monitor::pid::{PidConfig, PidPressureController, PressureReading};
+        use crate::monitor::predictive::{PredictiveAction, PredictiveActionPolicy};
+
+        let start = Instant::now()
+            .checked_sub(Duration::from_secs(1810))
+            .unwrap();
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+        let mut free = 2_500_000_000_u64;
+        let total = 3_000_000_000_u64;
+        let threshold = 300_000_000;
+        for step in 0..=360_u64 {
+            estimator.update(free, start + Duration::from_secs(step * 5), threshold);
+        }
+        let mut estimate = None;
+        let mut at = start;
+        let intervals = if critical { 2_u64 } else { 1 };
+        for step in 1..=intervals {
+            free -= 500_000_000;
+            at = start + Duration::from_secs(1800 + step * 5);
+            estimate = Some(estimator.update(free, at, threshold));
+        }
+        let estimate = estimate.unwrap();
+        let reading = PressureReading {
+            free_bytes: free,
+            total_bytes: total,
+            mount: mount.to_path_buf(),
+        };
+        let action = PredictiveActionPolicy::new(Default::default()).evaluate(
+            &estimate,
+            reading.free_pct(),
+            mount.to_path_buf(),
+        );
+        match action {
+            PredictiveAction::ImminentDanger {
+                critical: actual, ..
+            } => assert_eq!(actual, critical),
+            other => panic!("fixture must produce admitted imminent exhaustion: {other:?}"),
+        }
+        let mut pid = PidPressureController::new(&PidConfig::default(), Duration::from_secs(5));
+        pid.set_action_horizon_minutes(30.0);
+        let response = pid.update(reading, Some(estimate.seconds_to_threshold), at);
+        assert_eq!(response.level, PressureLevel::Green);
+        assert!(response.urgency.abs() < f64::EPSILON);
+        assert_eq!(response.release_ballast_files, 0);
+        (
+            response,
+            if critical {
+                ForecastRelease::Critical
+            } else {
+                ForecastRelease::Imminent
+            },
+        )
+    }
+
+    #[test]
+    fn admitted_imminence_releases_reserve_even_when_the_pid_requests_nothing() {
+        for critical in [false, true] {
+            let mut fixture = Fixture::new(1);
+            let mut releaser = BallastReleaser::default();
+            let (response, forecast) = green_imminent_response(&fixture.mounts[0], critical);
+            let mut request = fixture.request(0);
+            request.response = response;
+            // Negative control: physical Green pressure alone has no authority.
+            releaser.request(request.clone());
+            assert_eq!(fixture.start(&mut releaser), 0);
+            request.forecast = Some(forecast);
+            releaser.request(request.clone());
+            assert_eq!(fixture.start(&mut releaser), 1);
+            let completion = finish_one(&mut releaser);
+            let expected = if critical { 2 } else { 1 };
+            assert_eq!(completion.report.files_released, expected);
+            assert_eq!(completion.request.response.level, PressureLevel::Green);
+            assert!(completion.request.response.urgency.abs() < f64::EPSILON);
+            assert_eq!(completion.request.response.release_ballast_files, 0);
+            let (before, after) = completion.task.observations().unwrap();
+            fixture
+                .controller
+                .observe_pool_inventory(&fixture.mounts[0], before);
+            fixture.controller.on_released(&fixture.mounts[0], expected);
+            fixture
+                .controller
+                .observe_pool_inventory(&fixture.mounts[0], after);
+            assert!(fixture.coordinator.finish_release(completion.task));
+            assert_eq!(fixture.physical_count(0), 2 - expected);
+
+            // Non-critical imminence uses the existing cumulative allowance,
+            // rather than releasing one more file on every pressure tick.
+            if !critical {
+                releaser.begin_tick();
+                releaser.elapse_retry_interval(&fixture.mounts[0]);
+                releaser.request(request);
+                assert_eq!(fixture.start(&mut releaser), 1);
+                assert_eq!(finish_one(&mut releaser).report.files_released, 0);
+                assert_eq!(fixture.physical_count(0), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn withdrawn_or_weaker_forecast_cannot_revive_a_stalled_release() {
+        for weaker in [false, true] {
+            let mut fixture = Fixture::new(1);
+            let mut releaser = BallastReleaser::default();
+            let (response, forecast) = green_imminent_response(&fixture.mounts[0], true);
+            let mut request = fixture.request(0);
+            request.response = response;
+            request.forecast = Some(forecast);
+            fixture.block(0);
+            releaser.request(request.clone());
+            assert_eq!(fixture.start(&mut releaser), 1);
+            fixture.wait_for_probe(0);
+
+            let mut withdrawn = request.clone();
+            withdrawn.forecast = weaker.then_some(ForecastRelease::Imminent);
+            releaser.begin_tick();
+            releaser.request(withdrawn);
+            assert_eq!(fixture.start(&mut releaser), 0);
+            assert!(!releaser.waits_mount(&fixture.mounts[0], Instant::now()));
+            releaser.begin_tick();
+            releaser.request(request);
+            assert_eq!(fixture.start(&mut releaser), 0);
+            fixture.release.send(()).unwrap();
+            assert_eq!(finish_one(&mut releaser).report.files_released, 0);
+            assert_eq!(fixture.physical_count(0), 2);
+        }
+    }
+
+    #[test]
+    fn observe_and_fallback_modes_cannot_grant_forecast_only_release() {
+        use super::super::policy::{ActiveMode, PolicyConfig};
+
+        for mode in [ActiveMode::Observe, ActiveMode::FallbackSafe] {
+            let mut fixture = Fixture::new(1);
+            *fixture.context.policy.lock() = PolicyEngine::new(PolicyConfig {
+                initial_mode: mode,
+                ..Default::default()
+            });
+            let mut releaser = BallastReleaser::default();
+            let (response, forecast) = green_imminent_response(&fixture.mounts[0], true);
+            let mut request = fixture.request(0);
+            request.response = response;
+            request.forecast = Some(forecast);
+            releaser.request(request);
+            assert_eq!(fixture.start(&mut releaser), 0, "{mode:?}");
+            assert_eq!(fixture.physical_count(0), 2);
+
+            // Conservative physical-pressure rescue keeps its existing
+            // behavior even when adaptive predictions are held.
+            releaser.begin_tick();
+            releaser.request(fixture.request(0));
+            assert_eq!(fixture.start(&mut releaser), 1, "{mode:?}");
+            assert_eq!(finish_one(&mut releaser).report.files_released, 2);
+        }
+    }
+
+    #[test]
+    fn forecast_release_rechecks_mode_and_expiry_after_a_blocked_native_probe() {
+        use super::super::policy::{ActiveMode, PolicyConfig};
+
+        for mode in [
+            Some(ActiveMode::Observe),
+            Some(ActiveMode::FallbackSafe),
+            None,
+        ] {
+            let mut fixture = Fixture::new(1);
+            let mut releaser = BallastReleaser::default();
+            let (response, forecast) = green_imminent_response(&fixture.mounts[0], true);
+            let mut request = fixture.request(0);
+            request.response = response;
+            request.forecast = Some(forecast);
+            fixture.block(0);
+            releaser.request(request);
+            assert_eq!(fixture.start(&mut releaser), 1);
+            fixture.wait_for_probe(0);
+            if let Some(mode) = mode {
+                *fixture.context.policy.lock() = PolicyEngine::new(PolicyConfig {
+                    initial_mode: mode,
+                    ..Default::default()
+                });
+            } else {
+                *releaser.workers[0].permission.evidence.lock() = (
+                    Instant::now().checked_sub(Duration::from_secs(61)).unwrap(),
+                    Duration::from_secs(60),
+                );
+            }
+            fixture.release.send(()).unwrap();
+            assert_eq!(finish_one(&mut releaser).report.files_released, 0);
+            assert_eq!(fixture.physical_count(0), 2);
         }
     }
 
@@ -748,7 +979,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn observe_mode_keeps_sacrificial_reserve_relief_available() {
         let mut fixture = Fixture::new(1);
@@ -780,15 +1010,18 @@ mod tests {
             if stale == 1 {
                 // Reload invalidates publication without erasing completed
                 // unlink receipts, which the monitor must still audit.
-                fixture.coordinator.retain_release_only(
-                    &BallastConfig::default(),
-                    false,
-                );
+                fixture
+                    .coordinator
+                    .retain_release_only(&BallastConfig::default(), false);
             } else if stale == 2 {
-                fixture.coordinator.invalidate_pool_inventory(&fixture.mounts[0]);
+                fixture
+                    .coordinator
+                    .invalidate_pool_inventory(&fixture.mounts[0]);
             }
             assert_eq!(
-                fixture.coordinator.release_budget_is_current(&completion.task),
+                fixture
+                    .coordinator
+                    .release_budget_is_current(&completion.task),
                 stale == 0,
             );
             assert_eq!(
@@ -797,8 +1030,11 @@ mod tests {
             );
             if stale == 0 {
                 assert_eq!(
-                    fixture.coordinator.pool_for_mount(&fixture.mounts[0])
-                        .unwrap().available_count(),
+                    fixture
+                        .coordinator
+                        .pool_for_mount(&fixture.mounts[0])
+                        .unwrap()
+                        .available_count(),
                     0,
                 );
             }

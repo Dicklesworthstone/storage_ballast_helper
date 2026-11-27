@@ -39,7 +39,9 @@ use crate::core::errors::{Result, SbhError};
 use crate::daemon::ballast_control::{
     BallastControlWorkers, ControlBallastOutcome, ControlBallastTask,
 };
-use crate::daemon::ballast_release::{BallastReleaser, ReleaseContext, ReleaseRequest};
+use crate::daemon::ballast_release::{
+    BallastReleaser, ForecastRelease, ReleaseContext, ReleaseRequest,
+};
 use crate::daemon::ballast_replenish::BallastReplenisher;
 use crate::daemon::ballast_reserve::BallastReserveMonitor;
 use crate::daemon::compress_tier::{CompressTier, CompressionFirst};
@@ -3091,6 +3093,56 @@ fn predictive_cleanup_mount(tick: &MountTickResponse) -> Option<&Path> {
         && tick.ram_reclaim.is_none()
         && tick.inode_reclaim.is_none())
     .then_some(mount.as_path())
+}
+
+/// Translate a gated, mount-local exhaustion forecast into reserve authority.
+/// The physical response remains unchanged: forecast severity is not disk or
+/// RAM/inode pressure, and a collapsed calibration bound is not a deadline.
+fn predictive_ballast_intent(
+    tick: &MountTickResponse,
+    config: &crate::core::config::PredictionConfig,
+) -> Option<ForecastRelease> {
+    if !config.enabled
+        || !tick.prediction_confident
+        || !tick.imminent_danger
+        || tick.ram_reclaim.is_some()
+        || tick.inode_reclaim.is_some()
+        || tick.response.level != tick.filesystem_response.level
+    {
+        return None;
+    }
+    let unknown_runway = tick
+        .rate
+        .forecast
+        .as_ref()
+        .is_some_and(|forecast| forecast.runway_unknown);
+    let action = if unknown_runway {
+        tick.uncalibrated_predictive_action.as_ref()?
+    } else {
+        &tick.predictive_action
+    };
+    let PredictiveAction::ImminentDanger {
+        mount,
+        minutes_remaining,
+        critical,
+    } = action
+    else {
+        return None;
+    };
+    if mount != &tick.filesystem_response.causing_mount
+        || mount != &tick.response.causing_mount
+        || !minutes_remaining.is_finite()
+        || *minutes_remaining <= 0.0
+        || *minutes_remaining > config.imminent_danger_minutes
+        || *critical != (*minutes_remaining <= config.critical_danger_minutes)
+    {
+        return None;
+    }
+    Some(if *critical {
+        ForecastRelease::Critical
+    } else {
+        ForecastRelease::Imminent
+    })
 }
 
 /// A warning uses the same mount, exhaustion horizon and confidence as the
@@ -10263,15 +10315,7 @@ impl MonitoringDaemon {
                         && !recovery_pools.contains(&refill_mount)
                     {
                         ballast_release_attempted.insert(refill_mount.clone());
-                        let release_response = if tick.inode_reclaim.is_some()
-                            || predictive_cleanup_mount(tick).is_some()
-                        {
-                            &tick.filesystem_response
-                        } else {
-                            &tick.response
-                        };
-                        files_released =
-                            self.release_ballast(&mount, release_response).unwrap_or(0);
+                        files_released = self.release_ballast_for_tick(tick).unwrap_or(0);
                         self.last_tick_cleanup_ran |= files_released > 0;
                     }
                     if decision.scan && scan_allowed {
@@ -10367,19 +10411,17 @@ impl MonitoringDaemon {
             }
         }
 
-        // Collect Green predictive intents before starting any worker or
-        // admitting same-pool cleanup. A queued request alone never holds a scan.
+        // Collect predictive reserve intents at every physical level before
+        // starting workers or same-pool cleanup. Yellow's ordinary behavior
+        // cell may hold ballast even when this mount's own forecast is imminent.
+        // A queued request alone never holds a scan.
         for tick in &responses {
-            let Some(mount) = predictive_cleanup_mount(tick) else {
+            if predictive_ballast_intent(tick, &self.config.pressure.prediction).is_none() {
                 continue;
-            };
-            let pool = self.pool_mount(mount);
-            if tick.predictive_action.should_release_ballast()
-                && tick.imminent_danger
-                && !ballast_release_attempted.contains(&pool)
-                && !recovery_pools.contains(&pool)
-            {
-                let _ = self.release_ballast(mount, &tick.filesystem_response);
+            }
+            let pool = self.pool_mount(&tick.filesystem_response.causing_mount);
+            if !ballast_release_attempted.contains(&pool) && !recovery_pools.contains(&pool) {
+                let _ = self.release_ballast_for_tick(tick);
             }
         }
         self.start_ballast_releases(Instant::now());
@@ -11248,7 +11290,7 @@ impl MonitoringDaemon {
         }
         // An empty inventory hint can precede external provisioning. Recovery
         // needs the worker's current, locked inventory to decide what exists.
-        let _ = self.request_ballast_release(mount, response, true);
+        let _ = self.request_ballast_release(mount, response, true, None);
         // Completion, inventory and released-byte credit arrive via the worker.
         0
     }
@@ -11501,11 +11543,54 @@ impl MonitoringDaemon {
             });
     }
 
+    /// Give a current admitted forecast its own reserve request even when
+    /// percentage pressure contributes no PID urgency. The forecast retains
+    /// its original observation time and cannot borrow a newer cache sample.
+    fn release_ballast_for_tick(&mut self, tick: &MountTickResponse) -> Result<usize> {
+        let mount = &tick.filesystem_response.causing_mount;
+        let forecast = self
+            .policy_engine
+            .lock()
+            .mode()
+            .allows_deletion()
+            .then(|| predictive_ballast_intent(tick, &self.config.pressure.prediction))
+            .flatten()
+            .and_then(|intent| {
+                let sample = &self
+                    .mount_monitors
+                    .get(mount)?
+                    .last_observation
+                    .as_ref()?
+                    .sample;
+                (sample.mount_owner().path == *mount
+                    && Instant::now()
+                        .checked_duration_since(sample.collected_at)
+                        .is_some_and(|age| {
+                            age < Self::filesystem_observation_max_age(&self.config)
+                        }))
+                .then(|| (intent, sample.clone()))
+            });
+        let physical_release =
+            behavior_should_release_ballast(self.behavior_state.table().mode_for(
+                self.behavior_state.memory_level,
+                tick.filesystem_response.level,
+            ));
+        if forecast.is_none() {
+            return if physical_release {
+                self.release_ballast(mount, &tick.filesystem_response)
+            } else {
+                Ok(0)
+            };
+        }
+        self.request_ballast_release(mount, &tick.filesystem_response, false, forecast)?;
+        Ok(0)
+    }
+
     /// Queue a graduated release using only the collector's complete evidence.
     /// The production collector is background-only; native pool validation and
     /// release accounting happen on a retained worker and its completed receipt.
     fn release_ballast(&mut self, mount: &Path, response: &PressureResponse) -> Result<usize> {
-        self.request_ballast_release(mount, response, false)?;
+        self.request_ballast_release(mount, response, false, None)?;
         Ok(0)
     }
 
@@ -11514,6 +11599,7 @@ impl MonitoringDaemon {
         mount: &Path,
         response: &PressureResponse,
         recovery: bool,
+        forecast: Option<(ForecastRelease, FsStatsSample)>,
     ) -> Result<bool> {
         let pool_mount = self.pool_mount(mount);
         if self.config.policy.kill_switch
@@ -11563,11 +11649,20 @@ impl MonitoringDaemon {
         let Some(device_id) = sample.mount_device_id() else {
             return Ok(false);
         };
+        let (forecast, observed_at) = if let Some((intent, evidence)) = forecast {
+            if evidence.mount_owner().path != mount || !sample.same_filesystem_as(&evidence) {
+                return Ok(false);
+            }
+            (Some(intent), sample.collected_at.min(evidence.collected_at))
+        } else {
+            (None, sample.collected_at)
+        };
         self.ballast_releaser.request(ReleaseRequest {
             pool: pool_mount,
             response: response.clone(),
             recovery,
-            observed_at: sample.collected_at,
+            forecast,
+            observed_at,
             max_age: Self::filesystem_observation_max_age(&self.config),
             policy_transitions: self.policy_engine.lock().transitions_total(),
             device_id,
@@ -20191,7 +20286,7 @@ mod tests {
         let pressure = quarantine_tick(PressureLevel::Critical, &mount).response;
         assert!(
             !daemon
-                .request_ballast_release(&mount, &pressure, false)
+                .request_ballast_release(&mount, &pressure, false, None)
                 .unwrap()
         );
         let (release_reply, release_result) = bounded(1);
@@ -20271,7 +20366,7 @@ mod tests {
         let pressure = quarantine_tick(PressureLevel::Orange, &mount).response;
         assert!(
             !daemon
-                .request_ballast_release(&mount, &pressure, false)
+                .request_ballast_release(&mount, &pressure, false, None)
                 .unwrap()
         );
         assert!(daemon.pending_ballast_control[0].error.is_none());
@@ -20386,11 +20481,16 @@ mod tests {
         // the shared reserve's outstanding native attempt deadline.
         let mut predictive = green_predictive_tick(&alias);
         predictive.imminent_danger = true;
+        predictive.prediction_confident = true;
         predictive.predictive_action = PredictiveAction::ImminentDanger {
             mount: alias.clone(),
             minutes_remaining: 1.0,
             critical: true,
         };
+        assert_eq!(
+            predictive_ballast_intent(&predictive, &daemon.config.pressure.prediction),
+            Some(ForecastRelease::Critical),
+        );
         let alias_tick = quarantine_tick(PressureLevel::Critical, &alias);
         for alias_view in [predictive, alias_tick.clone()] {
             daemon.mount_responses = vec![alias_view.clone()];
@@ -20477,11 +20577,16 @@ mod tests {
             // mutation hold through the later Green predictive safety net.
             let mut tick = green_predictive_tick(mount);
             tick.imminent_danger = true;
+            tick.prediction_confident = true;
             tick.predictive_action = PredictiveAction::ImminentDanger {
                 mount: mount.to_path_buf(),
                 minutes_remaining: 1.0,
                 critical: true,
             };
+            assert_eq!(
+                predictive_ballast_intent(&tick, &daemon.config.pressure.prediction),
+                Some(ForecastRelease::Critical),
+            );
             let (scan_tx, scan_rx) = bounded(4);
             let (del_tx, _del_rx) = bounded(4);
             daemon.pending_recovery.insert(mount.to_path_buf());
@@ -26374,6 +26479,236 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn imminent_forecast_releases_ballast_at_green_and_yellow_with_zero_pid_urgency() {
+        for level in [PressureLevel::Green, PressureLevel::Yellow] {
+            for critical in [false, true] {
+                let (mut fixture, [steady, filling, other]) = green_predictive_fixture();
+                let daemon = &mut fixture.daemon;
+                daemon.config.scanner.quarantine_enabled = false;
+                daemon.ballast_coordinator.set_provision_floor(0.0);
+                assert_eq!(
+                    daemon
+                        .ballast_coordinator
+                        .provision_all(daemon.platform.as_ref())
+                        .unwrap()
+                        .total_files_created(),
+                    6,
+                );
+                daemon.update_behavior_mode(
+                    MemoryPressureLevel::Normal,
+                    level,
+                    "startup",
+                    Duration::ZERO,
+                );
+                assert!(!behavior_should_release_ballast(
+                    daemon.action_behavior_mode()
+                ));
+                let mut tick = green_predictive_tick(&filling);
+                tick.response.level = level;
+                tick.response.urgency = 0.0;
+                tick.response.release_ballast_files = 0;
+                tick.filesystem_response = tick.response.clone();
+                tick.prediction_confident = true;
+                tick.seconds_to_red = Some(30.0);
+                tick.imminent_danger = true;
+                tick.predictive_action = PredictiveAction::ImminentDanger {
+                    mount: filling.clone(),
+                    minutes_remaining: if critical { 1.0 } else { 3.0 },
+                    critical,
+                };
+                daemon.mount_responses = vec![tick.clone()];
+                let (scan_tx, scan_rx) = bounded(8);
+                let (del_tx, _del_rx) = bounded(2);
+                daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+                let expected = if critical { 2 } else { 1 };
+                assert_eq!(
+                    finish_ballast_releases(daemon),
+                    expected,
+                    "{level:?}, critical={critical}: admitted exhaustion needs reserve relief",
+                );
+                for (mount, remaining) in [(&filling, 2 - expected), (&steady, 2), (&other, 2)] {
+                    assert_eq!(
+                        daemon
+                            .ballast_coordinator
+                            .pool_for_mount(mount)
+                            .unwrap()
+                            .available_count(),
+                        remaining,
+                        "{level:?}, critical={critical}: {}",
+                        mount.display(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn predictive_ballast_refuses_held_missing_stale_or_mismatched_evidence() {
+        use crate::monitor::conformal::CoverageState;
+
+        for refusal in [
+            "disabled",
+            "unconfident",
+            "unconfirmed",
+            "wrong-mount",
+            "zero-runway",
+            "invalid-runway",
+            "outside-horizon",
+            "wrong-tier",
+            "unknown-runway",
+            "ram-pressure",
+            "inode-pressure",
+            "mixed-pressure",
+            "missing-observation",
+            "stale-observation",
+            "future-observation",
+            "resized-filesystem",
+            "observe",
+            "fallback",
+        ] {
+            let (mut fixture, [steady, filling, other]) = green_predictive_fixture();
+            let daemon = &mut fixture.daemon;
+            daemon.config.scanner.quarantine_enabled = false;
+            daemon.ballast_coordinator.set_provision_floor(0.0);
+            assert_eq!(
+                daemon
+                    .ballast_coordinator
+                    .provision_all(daemon.platform.as_ref())
+                    .unwrap()
+                    .total_files_created(),
+                6,
+            );
+            let mut tick = green_predictive_tick(&filling);
+            tick.response.urgency = 0.0;
+            tick.filesystem_response = tick.response.clone();
+            tick.prediction_confident = true;
+            tick.seconds_to_red = Some(30.0);
+            tick.imminent_danger = true;
+            tick.predictive_action = PredictiveAction::ImminentDanger {
+                mount: filling.clone(),
+                minutes_remaining: 1.0,
+                critical: true,
+            };
+            match refusal {
+                "disabled" => daemon.config.pressure.prediction.enabled = false,
+                "unconfident" => tick.prediction_confident = false,
+                "unconfirmed" => tick.imminent_danger = false,
+                "wrong-mount" => {
+                    if let PredictiveAction::ImminentDanger { mount, .. } =
+                        &mut tick.predictive_action
+                    {
+                        *mount = other.clone();
+                    }
+                }
+                "zero-runway" | "invalid-runway" | "outside-horizon" | "wrong-tier" => {
+                    if let PredictiveAction::ImminentDanger {
+                        minutes_remaining, ..
+                    } = &mut tick.predictive_action
+                    {
+                        *minutes_remaining = match refusal {
+                            "zero-runway" => 0.0,
+                            "invalid-runway" => f64::NAN,
+                            "outside-horizon" => 10.0,
+                            _ => 3.0,
+                        };
+                    }
+                }
+                "unknown-runway" => {
+                    tick.rate.forecast = Some(ForecastSnapshot::from_interval(
+                        &TteInterval {
+                            point_secs: 3600.0,
+                            lo_secs: 0.0,
+                            alpha: -0.4,
+                            coverage_state: CoverageState::Calibrated,
+                            samples: 83,
+                            coverage_empirical: Some(0.3),
+                        },
+                        daemon.config.pressure.prediction.coverage_target,
+                    ));
+                }
+                "ram-pressure" => {
+                    tick.ram_reclaim = Some(RamReclaimRequest::new(
+                        filling.clone(),
+                        1,
+                        8192,
+                        &daemon.config.scanner.root_paths,
+                    ));
+                }
+                "inode-pressure" => {
+                    tick.inode_reclaim = Some(InodeReclaimRequest::new(
+                        filling.clone(),
+                        1,
+                        1024,
+                        64,
+                        1,
+                        &daemon.config.pressure.inodes,
+                        &daemon.config.scanner.root_paths,
+                    ));
+                }
+                "mixed-pressure" => tick.response.level = PressureLevel::Critical,
+                "missing-observation" => {
+                    daemon.mount_monitors.remove(&filling);
+                }
+                "stale-observation" | "future-observation" | "resized-filesystem" => {
+                    let max_age = MonitoringDaemon::filesystem_observation_max_age(&daemon.config);
+                    let sample = &mut daemon
+                        .mount_monitors
+                        .get_mut(&filling)
+                        .unwrap()
+                        .last_observation
+                        .as_mut()
+                        .unwrap()
+                        .sample;
+                    if refusal == "resized-filesystem" {
+                        sample.stats.total_bytes += 1;
+                    } else {
+                        sample.collected_at = if refusal == "stale-observation" {
+                            Instant::now()
+                                .checked_sub(max_age + Duration::from_secs(1))
+                                .unwrap()
+                        } else {
+                            Instant::now() + Duration::from_secs(60)
+                        };
+                    }
+                }
+                "observe" | "fallback" => {
+                    *daemon.policy_engine.lock() = PolicyEngine::new(PolicyConfig {
+                        initial_mode: if refusal == "observe" {
+                            ActiveMode::Observe
+                        } else {
+                            ActiveMode::FallbackSafe
+                        },
+                        ..PolicyConfig::default()
+                    });
+                }
+                _ => unreachable!(),
+            }
+            // A prior global summary cannot restore this mount's missing authority.
+            daemon.last_predictive_action = tick.predictive_action.clone();
+            daemon.mount_responses = vec![tick.clone()];
+            let (scan_tx, scan_rx) = bounded(8);
+            let (del_tx, _del_rx) = bounded(2);
+            daemon.handle_pressure(&tick.response, &scan_tx, &scan_rx, &del_tx);
+            assert_eq!(finish_ballast_releases(daemon), 0, "{refusal}");
+            for mount in [&steady, &filling, &other] {
+                assert_eq!(
+                    daemon
+                        .ballast_coordinator
+                        .pool_for_mount(mount)
+                        .unwrap()
+                        .available_count(),
+                    2,
+                    "{refusal}: {}",
+                    mount.display(),
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn green_predictive_ballast_uses_its_own_response_beside_a_pressured_peer() {
         for peer_level in [
             PressureLevel::Yellow,
@@ -26458,6 +26793,7 @@ mod tests {
         worst.predictive_action = PredictiveAction::Clear;
         worst.response.urgency = 0.95;
         let mut threatened = green_predictive_tick(&filling);
+        threatened.prediction_confident = true;
         threatened.predictive_action = PredictiveAction::ImminentDanger {
             mount: filling.clone(),
             minutes_remaining: 3.0,
@@ -32675,6 +33011,18 @@ mod tests {
             .provision_all(platform.as_ref())
             .unwrap();
         assert_eq!(provisioned.total_files_created(), 4, "{provisioned:?}");
+        let observations = [&yellow, &orange]
+            .into_iter()
+            .map(|mount| {
+                (
+                    mount.clone(),
+                    daemon.fs_collector.collect_admission_sample(mount).unwrap(),
+                )
+            })
+            .collect();
+        daemon
+            .evaluate_pressure_samples(observations, Instant::now())
+            .unwrap();
 
         // Default v0.6 matrix, normal memory: Orange releases, Yellow does
         // not. The worst mount is Orange, so the tick's mode releases.
@@ -32686,6 +33034,7 @@ mod tests {
         let tick = |mount: &Path, level: PressureLevel, free_pct: f64| {
             let mut tick = quarantine_tick(level, mount);
             tick.response.free_pct = free_pct;
+            tick.filesystem_response = tick.response.clone();
             tick
         };
         let worst = tick(&orange, PressureLevel::Orange, 12.0);
@@ -32695,6 +33044,7 @@ mod tests {
 
         daemon.mount_responses = vec![tick(&yellow, PressureLevel::Yellow, 15.5), worst.clone()];
         daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+        assert_eq!(finish_ballast_releases(&mut daemon), 2);
         assert_eq!(
             available(&daemon, &yellow),
             2,
@@ -32717,10 +33067,19 @@ mod tests {
         };
         let mut endangered = tick(&yellow, PressureLevel::Yellow, 15.5);
         endangered.imminent_danger = true;
+        endangered.prediction_confident = true;
+        endangered.predictive_action = PredictiveAction::ImminentDanger {
+            mount: yellow.clone(),
+            minutes_remaining: 3.0,
+            critical: false,
+        };
         let mut worst = worst;
         worst.imminent_danger = true;
+        worst.prediction_confident = true;
+        worst.predictive_action = daemon.last_predictive_action.clone();
         daemon.mount_responses = vec![endangered, worst];
         daemon.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
+        assert!(finish_ballast_releases(&mut daemon) > 0);
         assert!(
             available(&daemon, &yellow) < 2,
             "the mount in imminent danger releases ballast"
